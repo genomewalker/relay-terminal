@@ -1,0 +1,6 @@
+.DS_Store
+.build/
+DerivedData/
+Relay.app/
+*.xcuserstate
+remote/relayd/relayd

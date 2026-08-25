@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="72" y="72" width="880" height="880" rx="210" fill="#0B111A"/>
+  <rect x="84" y="84" width="856" height="856" rx="198" fill="#29384D"/>
+  <rect x="108" y="108" width="808" height="808" rx="174" fill="#0B111A"/>
+
+  <!-- One native workspace, split into three independently managed panes. -->
+  <rect x="218" y="224" width="588" height="576" rx="76" fill="#7C9CFF"/>
+  <rect x="272" y="278" width="480" height="468" rx="28" fill="#0B111A"/>
+  <rect x="473" y="250" width="54" height="524" rx="27" fill="#7C9CFF"/>
+  <rect x="500" y="485" width="280" height="54" rx="27" fill="#7C9CFF"/>
+
+  <!-- The relay node: local UI coordinating the remote pane tree. -->
+  <circle cx="500" cy="512" r="48" fill="#59D6A5"/>
+  <circle cx="500" cy="512" r="19" fill="#0B111A"/>
+</svg>
