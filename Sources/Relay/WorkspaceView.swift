@@ -6,16 +6,15 @@ struct WorkspaceView: View {
     @ObservedObject private var preferences = RelayPreferences.shared
 
     var body: some View {
-        VStack(spacing: 0) {
-            WorkspaceBar(workspace: workspace)
-            Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(height: 1)
-            HStack(spacing: 0) {
-                if workspace.sidebarVisible {
-                    SessionManager(workspace: workspace)
-                        .frame(width: preferences.compactInterface ? 208 : 228)
-                    Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(width: 1)
-                }
-
+        HStack(spacing: 0) {
+            if workspace.sidebarVisible {
+                SessionManager(workspace: workspace)
+                    .frame(width: preferences.compactInterface ? 244 : 260)
+                Rectangle().fill(RelayTheme.line.opacity(0.38)).frame(width: 1)
+            }
+            VStack(spacing: 0) {
+                WorkspaceBar(workspace: workspace)
+                Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
                 if let tab = workspace.selectedTab {
                     WorkspaceCanvas(tab: tab, workspace: workspace)
                         .background(RelayTheme.canvas)
@@ -42,28 +41,21 @@ private struct WorkspaceBar: View {
     @ObservedObject var workspace: WorkspaceModel
 
     var body: some View {
-        HStack(spacing: 14) {
-            HStack(spacing: workspace.isFullScreen ? 6 : 9) {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 if !workspace.sidebarVisible {
                     ChromeButton(symbol: "sidebar.left", help: "Show navigator") {
                         workspace.sidebarVisible = true
                     }
                 }
                 if !workspace.isFullScreen {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(RelayTheme.blueDim)
-                            .frame(width: 30, height: 30)
-                        Image(systemName: "point.3.filled.connected.trianglepath.dotted")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(RelayTheme.blue)
+                    if !workspace.sidebarVisible {
+                        Text("Relay")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(RelayTheme.text)
                     }
-                    Text("Relay")
-                        .font(.system(size: 15, weight: .bold, design: .rounded))
-                        .foregroundStyle(RelayTheme.text)
                 }
             }
-            .frame(width: workspace.sidebarVisible && !workspace.isFullScreen ? 220 : nil, alignment: .leading)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
@@ -78,7 +70,7 @@ private struct WorkspaceBar: View {
                 }
             }
 
-            Spacer(minLength: 10)
+            Spacer(minLength: 8)
 
             HStack(spacing: 6) {
                 ChromeButton(symbol: "rectangle.split.2x1", help: "Split remote pane right · ⌘D") {
@@ -101,32 +93,25 @@ private struct WorkspaceBar: View {
                     Button {
                         workspace.presentHostLauncher()
                     } label: {
-                        HStack(spacing: 7) {
+                        HStack(spacing: 6) {
                             Image(systemName: "plus")
-                                .font(.system(size: 11, weight: .bold))
+                                .font(.system(size: 10.5, weight: .semibold))
                             Text("Connect")
-                                .font(.system(size: 11.5, weight: .semibold))
-                            Text("⌘K")
-                                .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                                .foregroundStyle(RelayTheme.textMuted)
+                                .font(.system(size: 11.5, weight: .medium))
                         }
-                        .padding(.horizontal, 11)
-                        .frame(height: 30)
-                        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 8))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 8).stroke(RelayTheme.line.opacity(0.8))
-                        }
+                        .padding(.horizontal, 12)
+                        .frame(height: 29)
+                        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(RelayTheme.text)
                 }
             }
         }
-        .padding(.leading, workspace.isFullScreen ? 10 : 76)
-        .padding(.trailing, workspace.isFullScreen ? 8 : 12)
-        .frame(height: workspace.isFullScreen ? 40 : 54)
-        .background(.ultraThinMaterial)
-        .background(RelayTheme.sidebar.opacity(0.92))
+        .padding(.leading, workspace.isFullScreen || workspace.sidebarVisible ? 10 : 76)
+        .padding(.trailing, 10)
+        .frame(height: workspace.isFullScreen ? 40 : 48)
+        .background(RelayTheme.canvas)
     }
 }
 
@@ -135,13 +120,14 @@ private struct WorkspaceTab: View {
     let isSelected: Bool
     let select: () -> Void
     let close: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         Button(action: select) {
             HStack(spacing: 7) {
                 Image(systemName: "terminal.fill")
                     .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(isSelected ? RelayTheme.blue : RelayTheme.textFaint)
+                    .foregroundStyle(isSelected ? RelayTheme.textMuted : RelayTheme.textFaint)
                 Text(tab.name)
                     .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
                     .lineLimit(1)
@@ -152,19 +138,16 @@ private struct WorkspaceTab: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
-                .opacity(isSelected ? 1 : 0)
+                .opacity(isSelected || hovering ? 1 : 0)
             }
             .padding(.horizontal, 10)
             .frame(height: 32)
             .foregroundStyle(isSelected ? RelayTheme.text : RelayTheme.textMuted)
-            .background(isSelected ? RelayTheme.elevated : Color.clear, in: RoundedRectangle(cornerRadius: 8))
-            .overlay {
-                if isSelected {
-                    RoundedRectangle(cornerRadius: 8).stroke(RelayTheme.line.opacity(0.8))
-                }
-            }
+            .background(isSelected ? RelayTheme.surface : hovering ? RelayTheme.hover.opacity(0.45) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
 
@@ -172,16 +155,18 @@ private struct ChromeButton: View {
     let symbol: String
     let help: String
     let action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 12, weight: .semibold))
                 .frame(width: 30, height: 30)
-                .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 8))
+                .background(hovering ? RelayTheme.hover : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
         .foregroundStyle(RelayTheme.textMuted)
+        .onHover { hovering = $0 }
         .help(help)
     }
 }
@@ -214,18 +199,20 @@ private struct SessionManager: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if !workspace.isFullScreen {
+                Color.clear.frame(height: 42)
+            }
             HStack(spacing: 8) {
-                Text("SESSIONS")
-                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                    .tracking(1.1)
-                    .foregroundStyle(RelayTheme.textMuted)
+                Text("Sessions")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(RelayTheme.text)
                 Spacer()
                 Button {
                     workspace.presentHostLauncher()
                 } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 24, height: 24)
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: 26, height: 26)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
@@ -234,18 +221,16 @@ private struct SessionManager: View {
                     workspace.sidebarVisible = false
                 } label: {
                     Image(systemName: "sidebar.left")
-                        .font(.system(size: 10, weight: .semibold))
-                        .frame(width: 24, height: 24)
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: 26, height: 26)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
                 .help("Hide sessions")
             }
-            .padding(.leading, 13)
-            .padding(.trailing, 8)
-            .frame(height: 40)
-
-            Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
+            .padding(.leading, 14)
+            .padding(.trailing, 10)
+            .frame(height: 44)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
@@ -253,21 +238,20 @@ private struct SessionManager: View {
                         SessionNodeSection(group: group, workspace: workspace)
                     }
                 }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
             }
 
             Spacer(minLength: 0)
-            Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
             Button {
                 workspace.presentHostLauncher()
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: "plus")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(RelayTheme.blue)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(RelayTheme.textMuted)
                     Text("New connection")
-                        .font(.system(size: 11.5, weight: .semibold))
+                        .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(RelayTheme.text)
                     Spacer()
                     Text("⌘K")
@@ -275,9 +259,11 @@ private struct SessionManager: View {
                         .foregroundStyle(RelayTheme.textFaint)
                 }
                 .padding(.horizontal, 12)
-                .frame(height: 38)
+                .frame(height: 36)
+                .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
             .buttonStyle(.plain)
+            .padding(8)
         }
         .background(RelayTheme.sidebar)
     }
@@ -300,20 +286,17 @@ private struct SessionNodeSection: View {
                 Circle()
                     .fill(nodeConnected ? RelayTheme.mint : RelayTheme.textFaint)
                     .frame(width: 6, height: 6)
-                Image(systemName: group.remote ? "server.rack" : "laptopcomputer")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(RelayTheme.textMuted)
                 Text(group.name)
-                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
                     .lineLimit(1)
                 Spacer()
                 Text("\(group.tabs.count)")
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textFaint)
             }
-            .padding(.horizontal, 7)
-            .frame(height: 28)
+            .padding(.horizontal, 8)
+            .frame(height: 30)
 
             ForEach(group.tabs) { tab in
                 AttachedSessionRow(
@@ -350,11 +333,11 @@ private struct AttachedSessionRow: View {
             Button(action: selectTab) {
                 HStack(spacing: 7) {
                     Capsule()
-                        .fill(selected ? RelayTheme.blue : Color.clear)
-                        .frame(width: 2, height: 20)
+                        .fill(selected ? RelayTheme.accent : Color.clear)
+                        .frame(width: 3, height: 18)
                     Image(systemName: "rectangle.stack")
                         .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(selected ? RelayTheme.blue : RelayTheme.textFaint)
+                        .foregroundStyle(selected ? RelayTheme.textMuted : RelayTheme.textFaint)
                     Text(tab.name)
                         .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
                         .foregroundStyle(selected ? RelayTheme.text : RelayTheme.textMuted)
@@ -368,8 +351,9 @@ private struct AttachedSessionRow: View {
                         .foregroundStyle(RelayTheme.textFaint)
                 }
                 .padding(.horizontal, 6)
-                .frame(height: 32)
-                .background(selected ? RelayTheme.surface.opacity(0.72) : Color.clear)
+                .frame(height: 34)
+                .background(selected ? RelayTheme.surface : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -413,9 +397,9 @@ private struct SessionPaneRow: View {
         VStack(spacing: 0) {
             Button(action: select) {
                 HStack(spacing: 7) {
-                Rectangle()
-                    .fill(active ? RelayTheme.blue.opacity(0.8) : RelayTheme.line.opacity(0.7))
-                    .frame(width: 1, height: 24)
+                Capsule()
+                    .fill(active ? RelayTheme.accent : Color.clear)
+                    .frame(width: 2, height: 16)
                 Image(systemName: pane.kind.symbol)
                     .font(.system(size: 9.5, weight: .semibold))
                     .foregroundStyle(pane.phase.color)
@@ -432,10 +416,11 @@ private struct SessionPaneRow: View {
                 }
                 Circle().fill(pane.connectionState.color).frame(width: 5, height: 5)
                 }
-                .padding(.leading, 25)
+                .padding(.leading, 22)
                 .padding(.trailing, 9)
-                .frame(height: 28)
-                .background(active ? RelayTheme.elevated.opacity(0.72) : hovering ? RelayTheme.surface.opacity(0.45) : Color.clear)
+                .frame(height: 29)
+                .background(active ? RelayTheme.elevated : hovering ? RelayTheme.surface.opacity(0.7) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -513,7 +498,7 @@ private struct HostLauncher: View {
                     .foregroundStyle(RelayTheme.textMuted)
                 TextField("Search hosts or enter an SSH alias…", text: $query)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 18, weight: .medium))
+                    .font(.system(size: 16, weight: .regular))
                     .foregroundStyle(RelayTheme.text)
                     .focused($searchFocused)
                     .onSubmit(connectFirstResult)
@@ -525,16 +510,16 @@ private struct HostLauncher: View {
                     .foregroundStyle(RelayTheme.textFaint)
                 }
                 Text("esc")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 4)
-                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 5))
+                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
-            .padding(.horizontal, 20)
-            .frame(height: 66)
-
-            Rectangle().fill(RelayTheme.line.opacity(0.75)).frame(height: 1)
+            .padding(.horizontal, 14)
+            .frame(height: 48)
+            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .padding(12)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
@@ -549,7 +534,7 @@ private struct HostLauncher: View {
                             title: "This Mac",
                             subtitle: "Open a local login shell",
                             symbol: "laptopcomputer",
-                            badge: "LOCAL"
+                            badge: "Local"
                         ) { workspace.newTab(profile: .local) }
                     }
 
@@ -560,7 +545,7 @@ private struct HostLauncher: View {
                                 ? "SSH config · Opens as a native Relay terminal"
                                 : profile.subtitle,
                             symbol: "server.rack",
-                            badge: profile.backend == .relay ? "PERSISTENT" : "DIRECT"
+                            badge: profile.backend == .relay ? "Persistent" : "Direct"
                         ) { workspace.newTab(profile: profile) }
                     }
 
@@ -574,7 +559,7 @@ private struct HostLauncher: View {
                             title: typedHost.host,
                             subtitle: "Use this SSH hostname or config alias",
                             symbol: "arrow.right.circle.fill",
-                            badge: "NEW"
+                            badge: "New"
                         ) { workspace.newTab(profile: typedHost) }
                     }
 
@@ -597,7 +582,6 @@ private struct HostLauncher: View {
                 .padding(12)
             }
 
-            Rectangle().fill(RelayTheme.line.opacity(0.75)).frame(height: 1)
             HStack {
                 Label("SSH config, keys and ProxyJump stay with OpenSSH", systemImage: "key.horizontal")
                     .font(.system(size: 10.5, weight: .medium))
@@ -616,6 +600,7 @@ private struct HostLauncher: View {
             }
             .padding(.horizontal, 18)
             .frame(height: 48)
+            .background(RelayTheme.surface.opacity(0.45))
         }
         .frame(width: 640, height: 520)
         .background(RelayTheme.sidebar)
@@ -646,11 +631,11 @@ private struct HostResultRow: View {
             HStack(spacing: 12) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(hovering ? RelayTheme.blueDim : RelayTheme.surface)
+                        .fill(hovering ? RelayTheme.hover : RelayTheme.surface)
                         .frame(width: 42, height: 42)
                     Image(systemName: symbol)
                         .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(hovering ? RelayTheme.blue : RelayTheme.textMuted)
+                        .foregroundStyle(RelayTheme.textMuted)
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title)
@@ -663,9 +648,8 @@ private struct HostResultRow: View {
                 }
                 Spacer()
                 Text(badge)
-                    .font(.system(size: 8.5, weight: .bold, design: .rounded))
-                    .tracking(0.5)
-                    .foregroundStyle(hovering ? RelayTheme.blue : RelayTheme.textFaint)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(hovering ? RelayTheme.textMuted : RelayTheme.textFaint)
                 Image(systemName: "arrow.turn.down.left")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(hovering ? RelayTheme.textMuted : RelayTheme.textFaint)
@@ -809,13 +793,13 @@ private struct FloatingPaneWindow: View {
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .stroke(isActive ? RelayTheme.blue.opacity(0.9) : RelayTheme.line, lineWidth: isActive ? 1.5 : 1)
+                .stroke(isActive ? RelayTheme.accent.opacity(0.45) : RelayTheme.line.opacity(0.75), lineWidth: 1)
                 .allowsHitTesting(false)
         }
         .overlay(alignment: .bottomTrailing) {
             resizeHandle
         }
-        .shadow(color: .black.opacity(0.42), radius: dragOffset == .zero ? 18 : 8, y: dragOffset == .zero ? 10 : 3)
+        .shadow(color: .black.opacity(0.32), radius: dragOffset == .zero ? 16 : 7, y: dragOffset == .zero ? 8 : 3)
         .offset(x: originX, y: originY)
         .transaction { $0.animation = nil }
     }
@@ -824,19 +808,18 @@ private struct FloatingPaneWindow: View {
         HStack(spacing: 9) {
             HStack(spacing: 9) {
                 Capsule()
-                    .fill(isActive ? RelayTheme.blue : RelayTheme.textFaint)
-                    .frame(width: 18, height: 4)
+                    .fill(isActive ? RelayTheme.accent : RelayTheme.textFaint)
+                    .frame(width: 16, height: 3)
                 Text(pane.title)
-                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                     .lineLimit(1)
-                Text(pane.profile.kind == .ssh ? pane.profile.host.uppercased() : "THIS MAC")
-                    .font(.system(size: 8.5, weight: .bold, design: .monospaced))
-                    .tracking(0.7)
-                    .foregroundStyle(RelayTheme.blue)
+                Text(pane.profile.kind == .ssh ? pane.profile.host : "This Mac")
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(RelayTheme.textMuted)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
-                    .background(RelayTheme.blueDim.opacity(0.75), in: Capsule())
+                    .background(RelayTheme.surface, in: Capsule())
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .contentShape(Rectangle())
@@ -869,28 +852,26 @@ private struct FloatingPaneWindow: View {
             .simultaneousGesture(TapGesture().onEnded(select))
 
             Button(action: dock) {
-                Image(systemName: "rectangle.portrait.and.arrow.right")
-                    .font(.system(size: 9, weight: .bold))
-                    .frame(width: 24, height: 24)
-                    .background(RelayTheme.surface, in: Circle())
+                    Image(systemName: "rectangle.portrait.and.arrow.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .help("Dock pane")
 
             Button(action: close) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .bold))
-                    .frame(width: 24, height: 24)
-                    .background(RelayTheme.surface, in: Circle())
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .help(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
         }
         .padding(.horizontal, 10)
-        .frame(height: 38)
-        .background(RelayTheme.elevated.opacity(0.92))
+        .frame(height: 36)
+        .background(RelayTheme.elevated)
     }
 
     private var resizeHandle: some View {
@@ -971,7 +952,7 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
     var body: some View {
         GeometryReader { proxy in
             let total = axis == .horizontal ? proxy.size.width : proxy.size.height
-            let divider: CGFloat = 5
+            let divider: CGFloat = 6
             let available = max(1, total - divider)
             let firstLength = available * ratio
             if axis == .horizontal {
@@ -996,10 +977,10 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
 
     private func splitDivider(total: CGFloat) -> some View {
         Rectangle()
-            .fill(RelayTheme.line.opacity(0.72))
+            .fill(RelayTheme.canvas)
             .overlay {
                 Capsule()
-                    .fill(RelayTheme.textFaint.opacity(0.65))
+                    .fill(RelayTheme.line.opacity(0.8))
                     .frame(width: axis == .horizontal ? 1 : 24, height: axis == .horizontal ? 24 : 1)
             }
             .contentShape(Rectangle().inset(by: -4))
@@ -1079,9 +1060,18 @@ private struct PaneView: View {
         }
         .background(RelayTheme.canvas)
         .overlay {
-            Rectangle()
-                .stroke(isActive ? RelayTheme.blue.opacity(0.75) : RelayTheme.line.opacity(0.5), lineWidth: isActive ? 1.5 : 1)
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .stroke(RelayTheme.line.opacity(0.55), lineWidth: 1)
                 .allowsHitTesting(false)
+        }
+        .overlay(alignment: .top) {
+            if isActive {
+                Capsule()
+                    .fill(RelayTheme.accent)
+                    .frame(width: 34, height: 2)
+                    .padding(.top, 1)
+                    .allowsHitTesting(false)
+            }
         }
         .dropDestination(for: String.self) { items, _ in
             guard let rawID = items.first, let draggedID = UUID(uuidString: rawID), let rearrange else {
@@ -1131,7 +1121,7 @@ private struct ArtifactPreview: View {
                 Image(systemName: "photo")
                     .foregroundStyle(RelayTheme.blue)
                 Text(artifact.filename)
-                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 10.5, weight: .medium))
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 Button(action: dismiss) {
@@ -1155,10 +1145,10 @@ private struct ArtifactPreview: View {
             }
         }
         .frame(width: 360)
-        .background(RelayTheme.surface)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay { RoundedRectangle(cornerRadius: 10).stroke(RelayTheme.line) }
-        .shadow(color: .black.opacity(0.45), radius: 18, y: 8)
+        .background(RelayTheme.elevated)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.55)) }
+        .shadow(color: .black.opacity(0.3), radius: 16, y: 7)
     }
 }
 
@@ -1194,8 +1184,8 @@ private struct SessionEndedOverlay: View {
             }
         }
         .padding(20)
-        .background(RelayTheme.sidebar.opacity(0.96), in: RoundedRectangle(cornerRadius: 12))
-        .overlay { RoundedRectangle(cornerRadius: 12).stroke(RelayTheme.line) }
+        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.55)) }
     }
 }
 
@@ -1212,29 +1202,29 @@ private struct ConnectionPath: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "laptopcomputer")
-                .foregroundStyle(RelayTheme.textMuted)
+            Circle()
+                .fill(pane.connectionState.color)
+                .frame(width: 6, height: 6)
+            Text(pane.profile.kind == .ssh ? pane.profile.host : "This Mac")
+                .font(.system(size: 11.5, weight: active ? .semibold : .medium))
+                .lineLimit(1)
             if pane.profile.kind == .ssh {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(RelayTheme.textFaint)
-                Text(pane.profile.host)
-                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(RelayTheme.textFaint)
-                Text(pane.profile.backend == .relay ? "remote PTY" : "direct SSH")
-                    .hidden()
-                    .overlay(alignment: .leading) {
-                        Text(pane.profile.backend == .relay ? "native terminal" : "direct SSH")
-                    }
-                    .font(.system(size: 10.5, weight: .medium))
+                Text(pane.profile.backend == .relay ? "Relay" : "SSH")
+                    .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
-            } else {
-                Text("This Mac")
-                    .font(.system(size: 11.5, weight: .semibold))
             }
-            Spacer()
+            if pane.kind != .shell {
+                Label(pane.activeSubagents > 0 ? String(pane.activeSubagents) + " agents" : pane.kind.label,
+                      systemImage: pane.kind.symbol)
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(pane.phase.color)
+            }
+            Spacer(minLength: 8)
+            if pane.connectionState != .connected {
+                Text(pane.connectionState.label)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(pane.connectionState.color)
+            }
             if let toggleFloating {
                 Button(action: toggleFloating) {
                     Image(systemName: isFloating ? "rectangle.portrait.and.arrow.right" : "macwindow.on.rectangle")
@@ -1253,23 +1243,11 @@ private struct ConnectionPath: View {
                 .foregroundStyle(RelayTheme.textMuted)
                 .help(zoomed ? "Restore pane layout" : "Zoom pane")
             }
-            if pane.kind != .shell {
-                Label(pane.activeSubagents > 0 ? "\(pane.activeSubagents) agents" : pane.kind.label, systemImage: pane.kind.symbol)
-                    .font(.system(size: 9.5, weight: .bold))
-                    .foregroundStyle(pane.phase.color)
-            }
-            HStack(spacing: 5) {
-                Image(systemName: pane.connectionState.symbol)
-                    .font(.system(size: 10, weight: .semibold))
-                Text(pane.connectionState.label)
-                    .font(.system(size: 10.5, weight: .semibold))
-            }
-            .foregroundStyle(pane.connectionState.color)
         }
         .padding(.horizontal, compact ? 9 : 12)
-        .frame(height: compact || preferences.compactInterface ? 26 : 36)
+        .frame(height: compact || preferences.compactInterface ? 28 : 34)
         .foregroundStyle(active ? RelayTheme.text : RelayTheme.textMuted)
-        .background(active ? RelayTheme.surface : RelayTheme.sidebar)
+        .background(active ? RelayTheme.surface : RelayTheme.canvas)
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
         .onTapGesture(count: 2) { toggleZoom?() }
@@ -1287,17 +1265,17 @@ private struct ConnectingOverlay: View {
         VStack(spacing: 13) {
             ProgressView()
                 .controlSize(.small)
-                .tint(RelayTheme.blue)
+                .tint(RelayTheme.accent)
             Text("Opening remote session")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(RelayTheme.text)
             Text("\(host)  →  native terminal")
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textMuted)
         }
         .padding(22)
-        .background(RelayTheme.surface.opacity(0.94), in: RoundedRectangle(cornerRadius: 14))
-        .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line) }
+        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.5)) }
     }
 }
 

@@ -14,19 +14,19 @@ struct ConnectionSheet: View {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Open a session")
-                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .font(.system(size: 19, weight: .semibold))
                     Text("The terminal runs there. The workspace stays here.")
                         .font(.system(size: 12.5))
                         .foregroundStyle(RelayTheme.textMuted)
                 }
                 Spacer()
-                Image(systemName: "point.3.filled.connected.trianglepath.dotted")
-                    .font(.system(size: 28, weight: .medium))
-                    .foregroundStyle(RelayTheme.blue)
+                Image(systemName: "terminal")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(RelayTheme.textMuted)
             }
             .padding(22)
 
-            Divider().overlay(RelayTheme.line)
+            Divider().overlay(RelayTheme.line.opacity(0.45))
 
             Form {
                 Picker("Session", selection: profile.kind) {
@@ -62,7 +62,7 @@ struct ConnectionSheet: View {
             .scrollContentBackground(.hidden)
             .padding(.horizontal, 10)
 
-            Divider().overlay(RelayTheme.line)
+            Divider().overlay(RelayTheme.line.opacity(0.45))
 
             HStack {
                 Text("Uses ~/.ssh/config, keys, agents, ProxyJump, and known_hosts.")
@@ -74,6 +74,9 @@ struct ConnectionSheet: View {
                 Button("Connect") { workspace.connectDraft(saveProfile: saveProfile) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!isValid)
+                    .buttonStyle(.borderedProminent)
+                    .tint(RelayTheme.accent)
+                    .foregroundStyle(RelayTheme.canvas)
             }
             .padding(16)
         }
