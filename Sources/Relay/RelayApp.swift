@@ -1,7 +1,15 @@
+import AppKit
 import SwiftUI
+
+final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+}
 
 @main
 struct RelayApp: App {
+    @NSApplicationDelegateAdaptor(RelayApplicationDelegate.self) private var applicationDelegate
     @StateObject private var workspace = WorkspaceModel()
 
     var body: some Scene {
