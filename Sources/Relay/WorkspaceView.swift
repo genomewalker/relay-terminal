@@ -427,6 +427,11 @@ private struct AttachedSessionRow: View {
                     Text("\(session.tabs.count) tab\(session.tabs.count == 1 ? "" : "s")")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
+                    if activeAgents > 0 {
+                        Text("\(activeAgents) agent\(activeAgents == 1 ? "" : "s")")
+                            .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(RelayTheme.mint)
+                    }
                 }
                 .padding(.horizontal, 6)
                 .frame(height: 34)
@@ -451,10 +456,10 @@ private struct AttachedSessionRow: View {
                 .help("New tab in session")
             }
 
-            if selected {
+            if selected || activeAgents > 0 {
                 ForEach(session.tabs) { tab in
                     let tabPanes = tab.allPaneIDs.compactMap { workspace.panes[$0] }
-                    let visiblePanes = tab.id == workspace.selectedTabID
+                    let visiblePanes = selected && tab.id == workspace.selectedTabID
                         ? tabPanes
                         : tabPanes.filter { $0.contentKind == .terminal && $0.kind != .shell }
                     let tabIndex = session.tabs.firstIndex(where: { $0.id == tab.id }) ?? 0

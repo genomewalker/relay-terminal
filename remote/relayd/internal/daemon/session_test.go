@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,32 @@ func TestReplayStartUsesLatestFullScreenRedrawOnlyForFreshRenderer(t *testing.T)
 	recordIndex, byteOffset = replayStart(replay, 1)
 	if recordIndex != 0 || byteOffset != 0 {
 		t.Fatalf("incremental replay must remain exact, got (%d, %d)", recordIndex, byteOffset)
+	}
+}
+
+func TestAgentObserverSnapshotsActiveSubagents(t *testing.T) {
+	session := &Session{
+		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		activeSubagents: make(map[string][]byte),
+	}
+	session.agentEvent([]byte(`{"agent":"claude","event":{"hook_event_name":"SessionStart"}}`))
+	session.agentEvent([]byte(`{"agent":"claude","event":{"hook_event_name":"SubagentStart","agent_id":"research-1","agent_type":"Explore"}}`))
+	session.agentEvent([]byte(`{"agent":"claude","event":{"hook_event_name":"PreToolUse","tool_name":"Read"}}`))
+
+	observer, snapshot := session.observeAgents()
+	defer session.detachAgentObserver(observer)
+	if len(snapshot) != 2 {
+		t.Fatalf("observer snapshot has %d frames, want root state plus active subagent", len(snapshot))
+	}
+	if !bytes.Contains(snapshot[1].Payload, []byte(`"agent_id":"research-1"`)) {
+		t.Fatalf("active subagent missing from snapshot: %s", snapshot[1].Payload)
+	}
+
+	session.agentEvent([]byte(`{"agent":"claude","event":{"hook_event_name":"SubagentStop","agent_id":"research-1"}}`))
+	secondObserver, secondSnapshot := session.observeAgents()
+	defer session.detachAgentObserver(secondObserver)
+	if len(secondSnapshot) != 1 {
+		t.Fatalf("stopped subagent remained in snapshot: %#v", secondSnapshot)
 	}
 }
 

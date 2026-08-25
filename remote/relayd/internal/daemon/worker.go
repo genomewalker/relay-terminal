@@ -166,6 +166,10 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		}
 		return
 	}
+	if hello.ObserveEvents {
+		serveAgentObserver(connection, writer, session)
+		return
+	}
 
 	viewer, replay := session.attach(hello.LastSeq)
 	defer session.detach(viewer)
@@ -228,6 +232,37 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		case <-writerDone:
 			return
 		default:
+		}
+	}
+}
+
+func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *Session) {
+	observer, snapshot := session.observeAgents()
+	defer session.detachAgentObserver(observer)
+	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+		State: "attached", WorkerPID: os.Getpid(),
+	})
+	if writer.Write(attached) != nil {
+		return
+	}
+	for _, frame := range snapshot {
+		if writer.Write(frame) != nil {
+			return
+		}
+	}
+	closed := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, connection)
+		close(closed)
+	}()
+	for {
+		select {
+		case frame := <-observer.frames:
+			if writer.Write(frame) != nil {
+				return
+			}
+		case <-closed:
+			return
 		}
 	}
 }

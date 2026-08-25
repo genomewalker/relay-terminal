@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 
 @MainActor
@@ -21,9 +22,12 @@ final class WorkspaceModel: ObservableObject {
     private let workspaceKey = "relay.workspace.v1"
     private var sidebarBeforeFullScreen = true
     private var persistenceTask: Task<Void, Never>?
+    private var paneSubscriptions: [UUID: AnyCancellable] = [:]
 
     init() {
-        if !restoreWorkspace() {
+        if restoreWorkspace() {
+            panes.values.forEach { $0.startAgentMonitoring() }
+        } else {
             newTab(profile: .local)
         }
     }
@@ -104,7 +108,7 @@ final class WorkspaceModel: ObservableObject {
 
     func newTab(profile: ConnectionProfile) {
         let pane = PaneModel(profile: profile)
-        panes[pane.id] = pane
+        storePane(pane)
         let tab = TabModel(sessionID: UUID(), name: profile.name, firstPane: pane.id)
         tabs.append(tab)
         selectedTabID = tab.id
@@ -132,7 +136,7 @@ final class WorkspaceModel: ObservableObject {
             ? (sourcePane.contentKind == .terminal ? sourcePane.id.uuidString.lowercased() : sourcePane.remoteParentSessionID)
             : nil
         let pane = PaneModel(profile: sourcePane.profile, remoteParentSessionID: parentSessionID)
-        panes[pane.id] = pane
+        storePane(pane)
         let ordinal = sessionTabs.count + 1
         let tab = TabModel(
             sessionID: sessionID,
@@ -163,7 +167,7 @@ final class WorkspaceModel: ObservableObject {
             ? active.id.uuidString.lowercased()
             : nil
         let pane = PaneModel(profile: splitProfile, remoteParentSessionID: parentSessionID)
-        panes[pane.id] = pane
+        storePane(pane)
         tab.layout = tab.layout.splitting(active.id, axis: axis, with: pane.id)
         tab.balanceSplits()
         activePaneID = pane.id
@@ -183,7 +187,7 @@ final class WorkspaceModel: ObservableObject {
             contentKind: .editor,
             remoteParentSessionID: parentSessionID
         )
-        panes[pane.id] = pane
+        storePane(pane)
         tab.layout = tab.layout.splitting(active.id, axis: .horizontal, with: pane.id)
         tab.balanceSplits()
         activePaneID = pane.id
@@ -210,7 +214,7 @@ final class WorkspaceModel: ObservableObject {
             remoteParentSessionID: open.parentSessionID,
             editorRequest: open.request
         )
-        panes[pane.id] = pane
+        storePane(pane)
         tab.layout = tab.layout.splitting(activePaneID, axis: .horizontal, with: pane.id)
         tab.balanceSplits()
         self.activePaneID = pane.id
@@ -266,7 +270,7 @@ final class WorkspaceModel: ObservableObject {
             ? active.id.uuidString.lowercased()
             : nil
         let pane = PaneModel(profile: paneProfile, remoteParentSessionID: parentSessionID)
-        panes[pane.id] = pane
+        storePane(pane)
         tab.floatingPanes.append(.initial(paneID: pane.id, index: tab.floatingPanes.count))
         activePaneID = pane.id
         persistWorkspace()
@@ -345,6 +349,7 @@ final class WorkspaceModel: ObservableObject {
             tab.floatingPanes.remove(at: floatingIndex)
             panes[activePaneID]?.stopRuntime()
             panes.removeValue(forKey: activePaneID)
+            paneSubscriptions.removeValue(forKey: activePaneID)
             self.activePaneID = tab.allPaneIDs.first
             persistWorkspace()
             return
@@ -357,6 +362,7 @@ final class WorkspaceModel: ObservableObject {
         tab.balanceSplits()
         panes[activePaneID]?.stopRuntime()
         panes.removeValue(forKey: activePaneID)
+        paneSubscriptions.removeValue(forKey: activePaneID)
         self.activePaneID = tab.layout.paneIDs.first
         persistWorkspace()
     }
@@ -368,6 +374,7 @@ final class WorkspaceModel: ObservableObject {
         for paneID in ids {
             panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
+            paneSubscriptions.removeValue(forKey: paneID)
         }
         tabs.remove(at: index)
         if tabs.isEmpty {
@@ -388,6 +395,7 @@ final class WorkspaceModel: ObservableObject {
         for paneID in closingPaneIDs {
             panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
+            paneSubscriptions.removeValue(forKey: paneID)
         }
         tabs.removeAll { closingTabIDs.contains($0.id) }
         sessionNames.removeValue(forKey: sessionID)
@@ -461,7 +469,7 @@ final class WorkspaceModel: ObservableObject {
               !snapshot.tabs.isEmpty else { return false }
 
         for savedPane in snapshot.panes {
-            panes[savedPane.id] = PaneModel(
+            let pane = PaneModel(
                 id: savedPane.id,
                 profile: savedPane.profile,
                 contentKind: savedPane.contentKind ?? .terminal,
@@ -469,6 +477,7 @@ final class WorkspaceModel: ObservableObject {
                 editorRequest: savedPane.editorRequest,
                 customName: savedPane.customName
             )
+            storePane(pane)
         }
         let restoredTabs = snapshot.tabs.compactMap { saved -> TabModel? in
             let floatingPanes = saved.floatingPanes ?? []
@@ -488,6 +497,7 @@ final class WorkspaceModel: ObservableObject {
         }
         guard !restoredTabs.isEmpty else {
             panes.removeAll()
+            paneSubscriptions.removeAll()
             return false
         }
         tabs = restoredTabs
@@ -507,6 +517,13 @@ final class WorkspaceModel: ObservableObject {
             guard let self, !Task.isCancelled else { return }
             self.persistenceTask = nil
             self.persistWorkspaceNow()
+        }
+    }
+
+    private func storePane(_ pane: PaneModel) {
+        panes[pane.id] = pane
+        paneSubscriptions[pane.id] = pane.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
         }
     }
 

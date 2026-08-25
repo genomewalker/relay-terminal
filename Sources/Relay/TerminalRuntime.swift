@@ -45,6 +45,7 @@ final class TerminalRuntime: NSObject {
         guard !started, let pane else { return }
         started = true
         guard pane.profile.kind == .ssh, pane.profile.backend == .relay else { return }
+        pane.stopAgentMonitoring()
 
         let remote = RelayRemoteTransport()
         let artifactPresentation = RelayPreferences.shared.artifactPresentation

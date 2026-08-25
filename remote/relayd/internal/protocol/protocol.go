@@ -40,6 +40,7 @@ type HelloPayload struct {
 	Rows            uint16 `json:"rows"`
 	LastSeq         uint64 `json:"last_seq"`
 	EventOnly       bool   `json:"event_only,omitempty"`
+	ObserveEvents   bool   `json:"observe_events,omitempty"`
 	Probe           bool   `json:"probe,omitempty"`
 	WorkerToken     string `json:"worker_token,omitempty"`
 }

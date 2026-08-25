@@ -129,6 +129,12 @@ func (server *Server) serveConnection(connection net.Conn) {
 	}
 	defer worker.Close()
 	hello.WorkerToken = manifest.Token
+	// Workers from before observe_events existed treat an observer as a normal
+	// attachment. Start them at the persisted tail so the compatibility path
+	// carries only the event snapshot, not terminal scrollback.
+	if hello.ObserveEvents && manifest.LastSequence > hello.LastSeq {
+		hello.LastSeq = manifest.LastSequence
+	}
 	workerHello, _ := protocol.JSONFrame(protocol.Hello, hello)
 	if err := protocol.NewWriter(worker).Write(workerHello); err != nil {
 		return
@@ -163,7 +169,7 @@ func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest,
 	} else if !errors.Is(err, os.ErrNotExist) {
 		removeManifest(manifestPath)
 	}
-	if hello.EventOnly {
+	if hello.EventOnly || hello.ObserveEvents {
 		return workerManifest{}, errors.New("Relay pane worker is not running")
 	}
 	return server.startWorker(hello, manifestPath)

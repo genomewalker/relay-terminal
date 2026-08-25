@@ -31,7 +31,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|attach|event|agent|artifact|files>")
+		fatal("usage: relayd <daemon|attach|observe|event|agent|artifact|files>")
 	}
 	switch os.Args[1] {
 	case "daemon":
@@ -40,6 +40,8 @@ func main() {
 		runWorker(os.Args[2:])
 	case "attach":
 		runAttach(os.Args[2:])
+	case "observe":
+		runObserve(os.Args[2:])
 	case "event":
 		runEvent(os.Args[2:])
 	case "agent":
@@ -592,6 +594,31 @@ func runAttach(arguments []string) {
 	}()
 	if copyErr := <-done; copyErr != nil {
 		fatal(copyErr.Error())
+	}
+}
+
+func runObserve(arguments []string) {
+	flags := flag.NewFlagSet("observe", flag.ExitOnError)
+	socket := flags.String("socket", defaultSocket(), "Unix socket path")
+	session := flags.String("session", "", "durable session ID")
+	lastSequence := flags.Uint64("last-seq", 0, "fallback replay position for older workers")
+	_ = flags.Parse(arguments)
+	if *session == "" {
+		fatal("--session is required")
+	}
+	connection, err := connectOrStart(*socket)
+	if err != nil {
+		fatal(err.Error())
+	}
+	defer connection.Close()
+	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
+		Version: 1, SessionID: *session, LastSeq: *lastSequence, ObserveEvents: true,
+	})
+	if err := protocol.NewWriter(connection).Write(hello); err != nil {
+		fatal(err.Error())
+	}
+	if _, err := io.Copy(os.Stdout, connection); err != nil {
+		fatal(err.Error())
 	}
 }
 

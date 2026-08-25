@@ -476,6 +476,7 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var editorRequest: EditorOpenRequest?
     @Published var isRestoringTerminal = false
     private var structuredAgentRunning: Bool?
+    private var agentMonitor: RelayRemoteTransport?
     let remoteParentSessionID: String?
     private var quietTask: Task<Void, Never>?
     lazy var runtime = TerminalRuntime(pane: self)
@@ -523,7 +524,46 @@ final class PaneModel: ObservableObject, Identifiable {
         }
     }
 
+    func startAgentMonitoring() {
+        guard agentMonitor == nil,
+              contentKind == .terminal,
+              profile.kind == .ssh,
+              profile.backend == .relay else { return }
+        let monitor = RelayRemoteTransport()
+        agentMonitor = monitor
+        monitor.start(
+            profile: profile,
+            sessionID: id.uuidString.lowercased(),
+            parentSessionID: nil,
+            onOutput: { _ in },
+            onStatus: { [weak self, weak monitor] status in
+                Task { @MainActor [weak self, weak monitor] in
+                    guard let self else { return }
+                    if status.state == "attached" {
+                        self.connected()
+                    } else if status.state == "exited" {
+                        self.exited(exitCode: status.exitCode)
+                    } else if status.state == "error", self.agentMonitor === monitor {
+                        self.stopAgentMonitoring()
+                    }
+                }
+            },
+            onAgentEvent: { [weak self] data in
+                Task { @MainActor [weak self] in self?.receivedAgentEvent(data) }
+            },
+            onArtifact: { _ in },
+            onDisconnect: { _ in },
+            observeAgentsOnly: true
+        )
+    }
+
+    func stopAgentMonitoring() {
+        agentMonitor?.detach()
+        agentMonitor = nil
+    }
+
     func stopRuntime() {
+        stopAgentMonitoring()
         switch contentKind {
         case .terminal: runtime.stop()
         case .editor: editorRuntime.stop()

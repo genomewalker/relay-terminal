@@ -30,7 +30,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
         onStatus: @escaping @Sendable (RelayStatus) -> Void,
         onAgentEvent: @escaping @Sendable (Data) -> Void,
         onArtifact: @escaping @Sendable (RelayArtifact) -> Void,
-        onDisconnect: @escaping @Sendable (String) -> Void
+        onDisconnect: @escaping @Sendable (String) -> Void,
+        observeAgentsOnly: Bool = false
     ) {
         let context = RelayConnectionContext(
             profile: profile,
@@ -40,7 +41,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
             onStatus: onStatus,
             onAgentEvent: onAgentEvent,
             onArtifact: onArtifact,
-            onDisconnect: onDisconnect
+            onDisconnect: onDisconnect,
+            observeAgentsOnly: observeAgentsOnly
         )
         lock.lock()
         detached = false
@@ -67,18 +69,26 @@ final class RelayRemoteTransport: @unchecked Sendable {
         lock.lock()
         let resumeSequence = lastSequence
         lock.unlock()
-        arguments += [
-            "~/.local/bin/relayd", "attach",
-            "--session", context.sessionID,
-            "--cols", "120",
-            "--rows", "36",
-            "--last-seq", String(resumeSequence)
-        ]
-        if let parentSessionID = context.parentSessionID {
-            arguments += ["--parent-session", parentSessionID]
-        }
-        if !context.profile.command.isEmpty {
-            arguments += ["--command-b64", Data(context.profile.command.utf8).base64EncodedString()]
+        if context.observeAgentsOnly {
+            arguments += [
+                "~/.local/bin/relayd", "observe",
+                "--session", context.sessionID,
+                "--last-seq", String(resumeSequence),
+            ]
+        } else {
+            arguments += [
+                "~/.local/bin/relayd", "attach",
+                "--session", context.sessionID,
+                "--cols", "120",
+                "--rows", "36",
+                "--last-seq", String(resumeSequence)
+            ]
+            if let parentSessionID = context.parentSessionID {
+                arguments += ["--parent-session", parentSessionID]
+            }
+            if !context.profile.command.isEmpty {
+                arguments += ["--command-b64", Data(context.profile.command.utf8).base64EncodedString()]
+            }
         }
         ssh.arguments = arguments
         ssh.standardInput = input
@@ -246,6 +256,7 @@ private struct RelayConnectionContext: Sendable {
     let onAgentEvent: @Sendable (Data) -> Void
     let onArtifact: @Sendable (RelayArtifact) -> Void
     let onDisconnect: @Sendable (String) -> Void
+    let observeAgentsOnly: Bool
 }
 
 private struct StatusWirePayload: Decodable {

@@ -42,9 +42,11 @@ type Session struct {
 	replay           []record
 	replayBytes      int
 	clients          map[*client]struct{}
+	agentClients     map[*client]struct{}
 	exited           bool
 	exitCode         int
 	latestAgentEvent []byte
+	activeSubagents  map[string][]byte
 	artifactDetector artifactDetector
 	done             chan struct{}
 }
@@ -84,7 +86,8 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	}
 	session := &Session{
 		id: id, command: command, pty: terminal, process: child,
-		clients: make(map[*client]struct{}), done: make(chan struct{}),
+		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		activeSubagents: make(map[string][]byte), done: make(chan struct{}),
 	}
 	go session.readOutput()
 	go session.wait()
@@ -346,6 +349,12 @@ func (session *Session) wait() {
 		default:
 		}
 	}
+	for observer := range session.agentClients {
+		select {
+		case observer.frames <- protocol.Frame{Type: protocol.Status, Payload: status}:
+		default:
+		}
+	}
 	session.mu.Unlock()
 }
 
@@ -397,6 +406,14 @@ func (session *Session) attach(lastSequence uint64) (*client, []protocol.Frame) 
 			Payload: append([]byte(nil), session.latestAgentEvent...),
 		})
 	}
+	for _, payload := range session.activeSubagents {
+		if bytes.Equal(payload, session.latestAgentEvent) {
+			continue
+		}
+		frames = append(frames, protocol.Frame{
+			Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...),
+		})
+	}
 	return viewer, frames
 }
 
@@ -428,6 +445,39 @@ func (session *Session) detach(viewer *client) {
 	session.mu.Unlock()
 }
 
+func (session *Session) observeAgents() (*client, []protocol.Frame) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	observer := &client{frames: make(chan protocol.Frame, 64)}
+	session.agentClients[observer] = struct{}{}
+	frames := make([]protocol.Frame, 0, 2)
+	if len(session.latestAgentEvent) > 0 {
+		frames = append(frames, protocol.Frame{
+			Type:    protocol.AgentEvent,
+			Payload: append([]byte(nil), session.latestAgentEvent...),
+		})
+	}
+	for _, payload := range session.activeSubagents {
+		if bytes.Equal(payload, session.latestAgentEvent) {
+			continue
+		}
+		frames = append(frames, protocol.Frame{
+			Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...),
+		})
+	}
+	if session.exited {
+		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "exited", ExitCode: session.exitCode})
+		frames = append(frames, status)
+	}
+	return observer, frames
+}
+
+func (session *Session) detachAgentObserver(observer *client) {
+	session.mu.Lock()
+	delete(session.agentClients, observer)
+	session.mu.Unlock()
+}
+
 func (session *Session) input(data []byte) error {
 	session.mu.Lock()
 	exited := session.exited
@@ -451,10 +501,64 @@ func (session *Session) agentEvent(payload []byte) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.latestAgentEvent = append(session.latestAgentEvent[:0], payload...)
+	session.updateActiveSubagents(payload)
 	for viewer := range session.clients {
 		select {
 		case viewer.frames <- frame:
 		default:
+		}
+	}
+	for observer := range session.agentClients {
+		select {
+		case observer.frames <- frame:
+		default:
+		}
+	}
+}
+
+func (session *Session) updateActiveSubagents(payload []byte) {
+	var envelope struct {
+		Event struct {
+			HookEventName string `json:"hook_event_name"`
+			Type          string `json:"type"`
+			AgentID       string `json:"agent_id"`
+			SubagentID    string `json:"subagent_id"`
+			ThreadID      string `json:"thread_id"`
+			AgentType     string `json:"agent_type"`
+		} `json:"event"`
+	}
+	if json.Unmarshal(payload, &envelope) != nil {
+		return
+	}
+	eventName := envelope.Event.HookEventName
+	if eventName == "" {
+		eventName = envelope.Event.Type
+	}
+	identifier := envelope.Event.AgentID
+	if identifier == "" {
+		identifier = envelope.Event.SubagentID
+	}
+	if identifier == "" {
+		identifier = envelope.Event.ThreadID
+	}
+	if identifier == "" {
+		identifier = envelope.Event.AgentType
+	}
+	switch eventName {
+	case "SessionStart", "SessionEnd":
+		clear(session.activeSubagents)
+	case "SubagentStart":
+		if identifier != "" {
+			session.activeSubagents[identifier] = append([]byte(nil), payload...)
+		}
+	case "SubagentStop":
+		if identifier != "" {
+			delete(session.activeSubagents, identifier)
+		} else {
+			for key := range session.activeSubagents {
+				delete(session.activeSubagents, key)
+				break
+			}
 		}
 	}
 }
