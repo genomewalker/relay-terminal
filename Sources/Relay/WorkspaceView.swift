@@ -679,6 +679,10 @@ private struct WorkspaceCanvas: View {
                     select: { workspace.selectPane(zoomedID) },
                     toggleZoom: { workspace.togglePaneZoom(zoomedID) },
                     toggleFloating: { workspace.toggleActivePaneFloating() },
+                    close: {
+                        workspace.selectPane(zoomedID)
+                        workspace.closeActivePane()
+                    },
                     isFloating: tab.floatingPanes.contains(where: { $0.paneID == zoomedID }),
                     isZoomed: true
                 )
@@ -920,6 +924,10 @@ private struct SplitPaneTree: View {
                     rearrange: { draggedID in workspace.swapTiledPanes(draggedID, id) },
                     toggleZoom: { workspace.togglePaneZoom(id) },
                     toggleFloating: { workspace.floatTiledPane(id) },
+                    close: {
+                        workspace.selectPane(id)
+                        workspace.closeActivePane()
+                    },
                     isFloating: false
                 )
             }
@@ -1018,6 +1026,7 @@ private struct PaneView: View {
     var rearrange: ((UUID) -> Void)? = nil
     var toggleZoom: (() -> Void)? = nil
     var toggleFloating: (() -> Void)? = nil
+    var close: (() -> Void)? = nil
     var isFloating = false
     var isZoomed = false
 
@@ -1093,7 +1102,8 @@ private struct PaneView: View {
                 isFloating: isFloating,
                 select: select,
                 toggleZoom: toggleZoom,
-                toggleFloating: toggleFloating
+                toggleFloating: toggleFloating,
+                close: close
             )
                 .draggable(pane.id.uuidString)
         } else {
@@ -1105,7 +1115,8 @@ private struct PaneView: View {
                 isFloating: isFloating,
                 select: select,
                 toggleZoom: toggleZoom,
-                toggleFloating: toggleFloating
+                toggleFloating: toggleFloating,
+                close: close
             )
         }
     }
@@ -1198,6 +1209,7 @@ private struct ConnectionPath: View {
     let select: () -> Void
     let toggleZoom: (() -> Void)?
     let toggleFloating: (() -> Void)?
+    let close: (() -> Void)?
     @ObservedObject private var preferences = RelayPreferences.shared
 
     var body: some View {
@@ -1243,6 +1255,16 @@ private struct ConnectionPath: View {
                 .foregroundStyle(RelayTheme.textMuted)
                 .help(zoomed ? "Restore pane layout" : "Zoom pane")
             }
+            if let close {
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .help(pane.profile.kind == .ssh ? "Detach pane · ⌘W" : "Close pane · ⌘W")
+            }
         }
         .padding(.horizontal, compact ? 9 : 12)
         .frame(height: compact || preferences.compactInterface ? 28 : 34)
@@ -1254,6 +1276,7 @@ private struct ConnectionPath: View {
         .contextMenu {
             if let toggleZoom { Button(zoomed ? "Restore pane layout" : "Zoom pane", action: toggleZoom) }
             if let toggleFloating { Button(isFloating ? "Dock pane" : "Float pane", action: toggleFloating) }
+            if let close { Button(pane.profile.kind == .ssh ? "Detach pane" : "Close pane", action: close) }
         }
     }
 }
