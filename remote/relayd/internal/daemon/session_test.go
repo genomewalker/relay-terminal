@@ -38,6 +38,12 @@ func TestCodexTranscriptSubagentLifecycle(t *testing.T) {
 	if events := codexTranscriptEvents(progress); len(events) != 0 {
 		t.Fatalf("progress message stopped an active agent: %#v", events)
 	}
+	update := []byte(`{"timestamp":"2026-08-25T14:41:32Z","type":"response_item","payload":{"type":"agent_message","author":"/root/logic_retest","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE\nTask name: /root\nSender: /root/logic_retest\nPayload:\nChecked 42 cases."}]}}`)
+	events = codexTranscriptEvents(update)
+	if len(events) != 1 || events[0].Event.HookEventName != "SubagentUpdate" ||
+		events[0].Event.Message != "Checked 42 cases." {
+		t.Fatalf("unexpected Codex progress event: %#v", events)
+	}
 	stop := []byte(`{"type":"response_item","payload":{"type":"agent_message","author":"/root/logic_retest","recipient":"/root","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER"}]}}`)
 	events = codexTranscriptEvents(stop)
 	if len(events) != 1 || events[0].Event.HookEventName != "SubagentStop" ||
@@ -53,10 +59,11 @@ func TestClaudeTranscriptSubagentLifecycle(t *testing.T) {
 		events[0].Event.AgentID != "agent-123" || events[0].Event.AgentType != "Smoke test explore agent" {
 		t.Fatalf("unexpected Claude start event: %#v", events)
 	}
-	stop := []byte(`{"type":"user","message":{"role":"user","content":"<task-notification><task-id>agent-123</task-id><status>completed</status><summary>Agent \"Smoke test explore agent\" finished</summary></task-notification>"}}`)
+	stop := []byte(`{"timestamp":"2026-08-25T14:41:32Z","type":"user","message":{"role":"user","content":"<task-notification><task-id>agent-123</task-id><status>completed</status><summary>Agent \"Smoke test explore agent\" finished</summary><result>Checked the workspace.</result></task-notification>"}}`)
 	events = claudeTranscriptEvents(stop)
 	if len(events) != 1 || events[0].Event.HookEventName != "SubagentStop" ||
-		events[0].Event.AgentID != "agent-123" || events[0].Event.AgentType != "Smoke test explore agent" {
+		events[0].Event.AgentID != "agent-123" || events[0].Event.AgentType != "Smoke test explore agent" ||
+		events[0].Event.Message != "Checked the workspace." {
 		t.Fatalf("unexpected Claude stop event: %#v", events)
 	}
 }

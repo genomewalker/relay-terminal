@@ -261,6 +261,27 @@ func structuredSubagentLifecycle() {
 }
 
 @MainActor
+@Test("Agent thread storage handles one hundred children without truncation")
+func oneHundredSubagents() {
+    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
+    for index in 0..<100 {
+        pane.receivedAgentEvent(Data("""
+        {"agent":"codex","event":{"hook_event_name":"SubagentStart","agent_id":"worker-\(index)","agent_type":"Worker \(index)"}}
+        """.utf8))
+    }
+
+    #expect(pane.subagents.count == 100)
+    #expect(pane.activeSubagents == 100)
+
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SubagentStop","agent_id":"worker-42","agent_type":"Worker 42","message":"Validated the result."}}"#.utf8))
+    let completed = pane.subagents.first { $0.id == "worker-42" }
+    #expect(completed?.phase == .quiet)
+    #expect(completed?.updates.last?.message == "Validated the result.")
+    #expect(pane.subagents.count == 100)
+    #expect(pane.activeSubagents == 99)
+}
+
+@MainActor
 @Test("Ending an agent restores the shell and clears its sidebar thread")
 func structuredAgentSessionEnd() {
     let pane = PaneModel(profile: .sshConfigHost("hpc-login"))

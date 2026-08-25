@@ -2,6 +2,11 @@ import AppKit
 import Combine
 import Foundation
 
+struct AgentInspectorSelection: Equatable, Sendable {
+    let paneID: UUID
+    let subagentID: String
+}
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var tabs: [TabModel] = []
@@ -15,6 +20,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var draftProfile = ConnectionProfile()
     @Published var renameTarget: WorkspaceRenameTarget?
     @Published var renameDraft = ""
+    @Published var agentInspector: AgentInspectorSelection?
     @Published private(set) var sessionNames: [UUID: String] = [:]
 
     let profileStore = ProfileStore()
@@ -42,6 +48,21 @@ final class WorkspaceModel: ObservableObject {
 
     var selectedPanes: [PaneModel] {
         selectedTab?.allPaneIDs.compactMap { panes[$0] } ?? []
+    }
+
+    func inspectAgent(paneID: UUID, subagentID: String) {
+        agentInspector = AgentInspectorSelection(paneID: paneID, subagentID: subagentID)
+    }
+
+    func closeAgentInspector() {
+        agentInspector = nil
+    }
+
+    func revealPane(_ paneID: UUID) {
+        guard let tab = tabs.first(where: { $0.allPaneIDs.contains(paneID) }) else { return }
+        if selectedTabID != tab.id { selectTab(tab.id) }
+        selectPane(paneID)
+        panes[paneID]?.focus()
     }
 
     func sessionDisplayName(_ sessionID: UUID, fallback: String) -> String {
@@ -344,6 +365,7 @@ final class WorkspaceModel: ObservableObject {
 
     func closeActivePane() {
         guard let tab = selectedTab, let activePaneID else { return }
+        if agentInspector?.paneID == activePaneID { agentInspector = nil }
         if zoomedPaneID == activePaneID { zoomedPaneID = nil }
         if let floatingIndex = tab.floatingPanes.firstIndex(where: { $0.paneID == activePaneID }) {
             tab.floatingPanes.remove(at: floatingIndex)
@@ -372,6 +394,7 @@ final class WorkspaceModel: ObservableObject {
         let ids = tabs[index].allPaneIDs
         if let zoomedPaneID, ids.contains(zoomedPaneID) { self.zoomedPaneID = nil }
         for paneID in ids {
+            if agentInspector?.paneID == paneID { agentInspector = nil }
             panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
             paneSubscriptions.removeValue(forKey: paneID)
@@ -393,6 +416,7 @@ final class WorkspaceModel: ObservableObject {
         let closingTabIDs = Set(closingTabs.map(\.id))
         let closingPaneIDs = closingTabs.flatMap(\.allPaneIDs)
         for paneID in closingPaneIDs {
+            if agentInspector?.paneID == paneID { agentInspector = nil }
             panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
             paneSubscriptions.removeValue(forKey: paneID)

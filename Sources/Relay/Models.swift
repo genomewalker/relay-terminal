@@ -372,7 +372,16 @@ struct SubagentActivity: Identifiable, Equatable, Sendable {
     let id: String
     let label: String
     let startedAt: Date
+    var threadID: String? = nil
     var phase: AgentPhase = .active
+    var completedAt: Date?
+    var updates: [SubagentUpdate] = []
+}
+
+struct SubagentUpdate: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let message: String
+    let occurredAt: Date
 }
 
 struct AgentActivityItem: Identifiable, Equatable, Sendable {
@@ -459,6 +468,7 @@ struct AgentSignalDetector: Sendable {
 
 @MainActor
 final class PaneModel: ObservableObject, Identifiable {
+    private static let agentTimestampFormatter = ISO8601DateFormatter()
     let id: UUID
     let profile: ConnectionProfile
     let contentKind: PaneContentKind
@@ -670,6 +680,10 @@ final class PaneModel: ObservableObject, Identifiable {
             ?? "Agent event"
         let tool = event["tool_name"] as? String
         let agentType = event["agent_type"] as? String
+        let threadID = event["thread_id"] as? String
+        let message = (event["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let occurredAt = (event["occurred_at"] as? String)
+            .flatMap { Self.agentTimestampFormatter.date(from: $0) } ?? Date()
         let subagentID = (event["agent_id"] as? String)
             ?? (event["subagent_id"] as? String)
             ?? (event["thread_id"] as? String)
@@ -694,10 +708,11 @@ final class PaneModel: ObservableObject, Identifiable {
             subagents.append(SubagentActivity(
                 id: identifier,
                 label: agentType ?? "Subagent",
-                startedAt: Date(),
+                startedAt: occurredAt,
+                threadID: threadID,
                 phase: .active
             ))
-            subagents = Array(subagents.suffix(16))
+            pruneCompletedSubagents()
             activeSubagents = subagents.count { $0.phase == .active }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent: \(agentType ?? "working")")
             recordActivity("Started \(agentType ?? "subagent")", phase: .active)
@@ -705,21 +720,39 @@ final class PaneModel: ObservableObject, Identifiable {
             if let subagentID {
                 if let index = subagents.firstIndex(where: { $0.id == subagentID }) {
                     subagents[index].phase = .quiet
+                    subagents[index].completedAt = occurredAt
+                    if let message, !message.isEmpty {
+                        appendSubagentUpdate(message, occurredAt: occurredAt, at: index)
+                    }
                 } else {
                     subagents.append(SubagentActivity(
                         id: subagentID,
                         label: agentType ?? "Subagent",
-                        startedAt: Date(),
-                        phase: .quiet
+                        startedAt: occurredAt,
+                        threadID: threadID,
+                        phase: .quiet,
+                        completedAt: occurredAt,
+                        updates: message.map { [SubagentUpdate(id: UUID(), message: $0, occurredAt: occurredAt)] } ?? []
                     ))
                 }
             } else if let index = subagents.lastIndex(where: { $0.phase == .active }) {
                 subagents[index].phase = .quiet
+                subagents[index].completedAt = occurredAt
+                if let message, !message.isEmpty {
+                    appendSubagentUpdate(message, occurredAt: occurredAt, at: index)
+                }
             }
-            subagents = Array(subagents.suffix(16))
+            pruneCompletedSubagents()
             activeSubagents = subagents.count { $0.phase == .active }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent finished")
             recordActivity("Subagent finished", phase: .quiet)
+        case "SubagentUpdate":
+            if let subagentID,
+               let index = subagents.firstIndex(where: { $0.id == subagentID }),
+               let message, !message.isEmpty {
+                appendSubagentUpdate(message, occurredAt: occurredAt, at: index)
+                detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: subagents[index].label)
+            }
         case "PreToolUse":
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Using \(tool ?? "tool")")
             recordActivity("Using \(tool ?? "tool")", phase: .active)
@@ -773,6 +806,22 @@ final class PaneModel: ObservableObject, Identifiable {
         } else {
             agentActivities.append(item)
             agentActivities = Array(agentActivities.suffix(16))
+        }
+    }
+
+    private func appendSubagentUpdate(_ message: String, occurredAt: Date, at index: Int) {
+        guard subagents.indices.contains(index), subagents[index].updates.last?.message != message else { return }
+        subagents[index].updates.append(SubagentUpdate(id: UUID(), message: message, occurredAt: occurredAt))
+        subagents[index].updates = Array(subagents[index].updates.suffix(100))
+    }
+
+    private func pruneCompletedSubagents() {
+        guard subagents.count > 500 else { return }
+        var excess = subagents.count - 500
+        subagents.removeAll { subagent in
+            guard excess > 0, subagent.phase != .active else { return false }
+            excess -= 1
+            return true
         }
     }
 }

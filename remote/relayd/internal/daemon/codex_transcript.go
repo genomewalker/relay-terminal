@@ -119,6 +119,8 @@ type codexTranscriptEvent struct {
 	AgentID       string `json:"agent_id"`
 	AgentType     string `json:"agent_type,omitempty"`
 	ThreadID      string `json:"thread_id,omitempty"`
+	Message       string `json:"message,omitempty"`
+	OccurredAt    string `json:"occurred_at,omitempty"`
 	Source        string `json:"source"`
 }
 
@@ -131,8 +133,9 @@ func transcriptEventIdentifier(event codexTranscriptEnvelope) string {
 
 func codexTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 	var row struct {
-		Type    string          `json:"type"`
-		Payload json.RawMessage `json:"payload"`
+		Timestamp string          `json:"timestamp"`
+		Type      string          `json:"type"`
+		Payload   json.RawMessage `json:"payload"`
 	}
 	if json.Unmarshal(line, &row) != nil {
 		return nil
@@ -161,17 +164,16 @@ func codexTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 				AgentID:       payload.Item.AgentPath,
 				AgentType:     filepath.Base(payload.Item.AgentPath),
 				ThreadID:      payload.Item.AgentThreadID,
+				OccurredAt:    row.Timestamp,
 				Source:        "codex-transcript",
 			},
 		}}
 	case "response_item":
 		var payload struct {
-			Type      string `json:"type"`
-			Author    string `json:"author"`
-			Recipient string `json:"recipient"`
-			Content   []struct {
-				Text string `json:"text"`
-			} `json:"content"`
+			Type      string                   `json:"type"`
+			Author    string                   `json:"author"`
+			Recipient string                   `json:"recipient"`
+			Content   []codexTranscriptContent `json:"content"`
 		}
 		if json.Unmarshal(row.Payload, &payload) != nil || payload.Type != "agent_message" ||
 			payload.Author == "" || payload.Recipient == "" {
@@ -184,14 +186,30 @@ func codexTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 			return nil
 		}
 		finalAnswer := false
+		progressMessage := ""
 		for _, content := range payload.Content {
 			if strings.Contains(content.Text, "Message Type: FINAL_ANSWER") {
 				finalAnswer = true
-				break
+			}
+			if message := codexCollaboratorMessage(content.Text); message != "" {
+				progressMessage = message
 			}
 		}
 		if !finalAnswer {
-			return nil
+			if progressMessage == "" {
+				return nil
+			}
+			return []codexTranscriptEnvelope{{
+				Agent: "codex",
+				Event: codexTranscriptEvent{
+					HookEventName: "SubagentUpdate",
+					AgentID:       payload.Author,
+					AgentType:     filepath.Base(payload.Author),
+					Message:       progressMessage,
+					OccurredAt:    row.Timestamp,
+					Source:        "codex-transcript",
+				},
+			}}
 		}
 		return []codexTranscriptEnvelope{{
 			Agent: "codex",
@@ -199,11 +217,28 @@ func codexTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 				HookEventName: "SubagentStop",
 				AgentID:       payload.Author,
 				AgentType:     filepath.Base(payload.Author),
+				Message:       progressMessage,
+				OccurredAt:    row.Timestamp,
 				Source:        "codex-transcript",
 			},
 		}}
 	}
 	return nil
+}
+
+type codexTranscriptContent struct {
+	Text string `json:"text"`
+}
+
+func codexCollaboratorMessage(text string) string {
+	const payloadMarker = "Payload:\n"
+	if index := strings.Index(text, payloadMarker); index >= 0 {
+		return strings.TrimSpace(text[index+len(payloadMarker):])
+	}
+	if strings.Contains(text, "Message Type:") {
+		return ""
+	}
+	return strings.TrimSpace(text)
 }
 
 func codexRootTranscript(pid int) string {

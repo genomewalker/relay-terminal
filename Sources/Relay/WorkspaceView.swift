@@ -6,19 +6,33 @@ struct WorkspaceView: View {
     @ObservedObject private var preferences = RelayPreferences.shared
 
     var body: some View {
-        HStack(spacing: 0) {
-            if workspace.sidebarVisible {
-                SessionManager(workspace: workspace)
-                    .frame(width: preferences.compactInterface ? 244 : 260)
-                Rectangle().fill(RelayTheme.line.opacity(0.38)).frame(width: 1)
-            }
-            VStack(spacing: 0) {
-                WorkspaceBar(workspace: workspace)
-                Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
-                if let tab = workspace.selectedTab {
-                    WorkspaceCanvas(tab: tab, workspace: workspace)
-                        .background(RelayTheme.canvas)
+        ZStack(alignment: .topTrailing) {
+            HStack(spacing: 0) {
+                if workspace.sidebarVisible {
+                    SessionManager(workspace: workspace)
+                        .frame(width: preferences.compactInterface ? 244 : 260)
+                    Rectangle().fill(RelayTheme.line.opacity(0.38)).frame(width: 1)
                 }
+                VStack(spacing: 0) {
+                    WorkspaceBar(workspace: workspace)
+                    Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
+                    if let tab = workspace.selectedTab {
+                        WorkspaceCanvas(tab: tab, workspace: workspace)
+                            .background(RelayTheme.canvas)
+                    }
+                }
+            }
+            if let selection = workspace.agentInspector,
+               let pane = workspace.panes[selection.paneID] {
+                AgentInspectorPanel(
+                    pane: pane,
+                    subagentID: selection.subagentID,
+                    showTerminal: { workspace.revealPane(selection.paneID) },
+                    close: workspace.closeAgentInspector
+                )
+                .padding(.top, workspace.isFullScreen ? 50 : 58)
+                .padding(.trailing, 18)
+                .zIndex(500)
             }
         }
         .background(RelayTheme.canvas)
@@ -45,6 +59,162 @@ struct WorkspaceView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
             workspace.setFullScreen(false)
+        }
+    }
+}
+
+private struct AgentInspectorPanel: View {
+    @ObservedObject var pane: PaneModel
+    let subagentID: String
+    let showTerminal: () -> Void
+    let close: () -> Void
+    @State private var settledOffset: CGSize = .zero
+    @GestureState private var dragOffset: CGSize = .zero
+
+    private var agent: SubagentActivity? {
+        pane.subagents.first { $0.id == subagentID }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            inspectorTitleBar
+            Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(height: 1)
+            if let agent {
+                inspectorContent(agent)
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "person.crop.circle.badge.questionmark")
+                        .font(.system(size: 24))
+                        .foregroundStyle(RelayTheme.textFaint)
+                    Text("This agent is no longer available")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(RelayTheme.textMuted)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(width: 470, height: 410)
+        .background(RelayTheme.sidebar)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(RelayTheme.line.opacity(0.85), lineWidth: 1)
+                .allowsHitTesting(false)
+        }
+        .shadow(color: .black.opacity(0.34), radius: 22, y: 10)
+        .offset(
+            x: settledOffset.width + dragOffset.width,
+            y: settledOffset.height + dragOffset.height
+        )
+    }
+
+    private var inspectorTitleBar: some View {
+        HStack(spacing: 9) {
+            Image(systemName: pane.kind.symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(RelayTheme.textMuted)
+            Text("Agent thread")
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(RelayTheme.text)
+            Text(pane.kind.label)
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(RelayTheme.textFaint)
+            Spacer()
+            Button(action: showTerminal) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(RelayTheme.textMuted)
+            .help("Show parent terminal")
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(RelayTheme.textMuted)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 42)
+        .background(RelayTheme.surface.opacity(0.7))
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 2)
+                .updating($dragOffset) { value, state, _ in state = value.translation }
+                .onEnded { value in
+                    settledOffset.width += value.translation.width
+                    settledOffset.height += value.translation.height
+                }
+        )
+    }
+
+    private func inspectorContent(_ agent: SubagentActivity) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(agent.label)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(RelayTheme.text)
+                        .textSelection(.enabled)
+                    Spacer()
+                    HStack(spacing: 5) {
+                        Circle().fill(agent.phase.color).frame(width: 6, height: 6)
+                        Text(agent.phase == .active ? "Working" : "Finished")
+                            .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(agent.phase.color)
+                    }
+                }
+                HStack(spacing: 14) {
+                    Label(agent.startedAt.formatted(date: .omitted, time: .shortened), systemImage: "play.fill")
+                    if let completedAt = agent.completedAt {
+                        Label(completedAt.formatted(date: .omitted, time: .shortened), systemImage: "checkmark")
+                    }
+                    if let threadID = agent.threadID {
+                        Text(String(threadID.prefix(12)))
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .help(threadID)
+                    }
+                }
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(RelayTheme.textFaint)
+            }
+            .padding(16)
+
+            Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    if agent.updates.isEmpty {
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text(agent.phase == .active ? "Waiting for the first progress update" : "No result text was recorded")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(RelayTheme.textMuted)
+                            Text("Relay captured the lifecycle, but this CLI did not expose a readable progress message for this thread.")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(RelayTheme.textFaint)
+                        }
+                        .padding(.vertical, 4)
+                    } else {
+                        ForEach(agent.updates) { update in
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(update.occurredAt.formatted(date: .omitted, time: .shortened))
+                                    .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(RelayTheme.textFaint)
+                                Text(update.message)
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(RelayTheme.text)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(11)
+                            .background(RelayTheme.surface.opacity(0.62), in: RoundedRectangle(cornerRadius: 9))
+                        }
+                    }
+                }
+                .padding(14)
+            }
         }
     }
 }
@@ -503,6 +673,7 @@ private struct SessionPaneRow: View {
     @ObservedObject var workspace: WorkspaceModel
     let active: Bool
     @State private var hovering = false
+    @State private var agentThreadsExpanded = false
 
     private var tab: TabModel? { workspace.tabs.first { $0.id == tabID } }
     private var isFloating: Bool { tab?.floatingPanes.contains(where: { $0.paneID == pane.id }) == true }
@@ -555,7 +726,7 @@ private struct SessionPaneRow: View {
                 Circle().fill(pane.connectionState.color).frame(width: 5, height: 5)
                 }
                 .padding(.leading, 22)
-                .padding(.trailing, 9)
+                .padding(.trailing, pane.subagents.isEmpty ? 9 : 54)
                 .frame(height: pane.contentKind == .terminal && pane.kind != .shell ? 38 : 29)
                 .background(active ? RelayTheme.elevated : hovering ? RelayTheme.surface.opacity(0.7) : Color.clear,
                             in: RoundedRectangle(cornerRadius: 7, style: .continuous))
@@ -600,8 +771,27 @@ private struct SessionPaneRow: View {
                     workspace.closeActivePane()
                 }
             }
+            .overlay(alignment: .trailing) {
+                if pane.contentKind == .terminal && pane.kind != .shell && !pane.subagents.isEmpty {
+                    Button {
+                        agentThreadsExpanded.toggle()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("\(pane.subagents.count)")
+                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                            Image(systemName: agentThreadsExpanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 8, weight: .bold))
+                        }
+                        .frame(width: 45, height: 29)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(RelayTheme.textFaint)
+                    .padding(.trailing, 3)
+                    .help(agentThreadsExpanded ? "Collapse \(pane.subagents.count) agent threads" : "Show \(pane.subagents.count) agent threads")
+                }
+            }
 
-            if pane.contentKind == .terminal && pane.kind != .shell {
+            if pane.contentKind == .terminal && pane.kind != .shell && agentThreadsExpanded {
                 ForEach(Array(pane.agentActivities.suffix(4))) { activity in
                     AgentActivityTreeRow(activity: activity, action: revealPane)
                 }
@@ -615,28 +805,33 @@ private struct SessionPaneRow: View {
                 }
             }
 
-            ForEach(Array(pane.subagents.suffix(6))) { subagent in
-                Button(action: revealPane) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.turn.down.right")
-                            .font(.system(size: 8, weight: .semibold))
-                            .foregroundStyle(RelayTheme.textFaint)
-                        Circle().fill(subagent.phase.color).frame(width: 5, height: 5)
-                        Text(subagent.label)
-                            .font(.system(size: 9.5, weight: .medium))
-                            .foregroundStyle(RelayTheme.textMuted)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(subagent.phase == .active ? "working" : "finished")
-                            .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(subagent.phase.color)
+            if agentThreadsExpanded {
+                ForEach(pane.subagents) { subagent in
+                    Button {
+                        workspace.inspectAgent(paneID: pane.id, subagentID: subagent.id)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.turn.down.right")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(RelayTheme.textFaint)
+                            Circle().fill(subagent.phase.color).frame(width: 5, height: 5)
+                            Text(subagent.label)
+                                .font(.system(size: 9.5, weight: .medium))
+                                .foregroundStyle(RelayTheme.textMuted)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(subagent.phase == .active ? "working" : "finished")
+                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(subagent.phase.color)
+                        }
+                        .padding(.leading, 43)
+                        .padding(.trailing, 9)
+                        .frame(height: 23)
+                        .contentShape(Rectangle())
                     }
-                    .padding(.leading, 43)
-                    .padding(.trailing, 9)
-                    .frame(height: 23)
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .help("Open \(subagent.label) activity")
                 }
-                .buttonStyle(.plain)
             }
         }
     }

@@ -101,6 +101,7 @@ func (reader *claudeTranscriptReader) poll(frames chan<- protocol.Frame) {
 
 func claudeTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 	var row struct {
+		Timestamp     string `json:"timestamp"`
 		Type          string `json:"type"`
 		ToolUseResult struct {
 			IsAsync     bool   `json:"isAsync"`
@@ -127,6 +128,7 @@ func claudeTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 				HookEventName: "SubagentStart",
 				AgentID:       row.ToolUseResult.AgentID,
 				AgentType:     label,
+				OccurredAt:    row.Timestamp,
 				Source:        "claude-transcript",
 			},
 		}}
@@ -155,6 +157,8 @@ func claudeTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 			HookEventName: "SubagentStop",
 			AgentID:       identifier,
 			AgentType:     label,
+			Message:       xmlLikeValue(content, "result"),
+			OccurredAt:    row.Timestamp,
 			Source:        "claude-transcript",
 		},
 	}}
