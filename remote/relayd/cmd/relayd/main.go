@@ -51,7 +51,7 @@ func main() {
 	case "files":
 		runFiles(os.Args[2:])
 	case "--version", "version":
-		fmt.Println("relayd 0.3.2")
+		fmt.Println("relayd 0.3.3")
 	default:
 		fatal("unknown command: " + os.Args[1])
 	}

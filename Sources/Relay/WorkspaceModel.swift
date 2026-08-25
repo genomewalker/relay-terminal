@@ -24,8 +24,8 @@ final class WorkspaceModel: ObservableObject {
     private var persistenceTask: Task<Void, Never>?
     private var paneSubscriptions: [UUID: AnyCancellable] = [:]
 
-    init() {
-        if restoreWorkspace() {
+    init(restoreSavedWorkspace: Bool = true) {
+        if restoreSavedWorkspace && restoreWorkspace() {
             panes.values.forEach { $0.startAgentMonitoring() }
         } else {
             newTab(profile: .local)

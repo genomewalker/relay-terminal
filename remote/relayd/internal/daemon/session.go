@@ -216,6 +216,11 @@ func (session *Session) publishDetectedAgent(agent, eventName string) {
 }
 
 func descendantAgent(rootPID int) string {
+	agent, _ := descendantAgentProcess(rootPID)
+	return agent
+}
+
+func descendantAgentProcess(rootPID int) (string, int) {
 	stack := []int{rootPID}
 	seen := make(map[int]bool)
 	for len(stack) > 0 {
@@ -228,7 +233,7 @@ func descendantAgent(rootPID int) string {
 		command, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm"))
 		arguments, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
 		if agent := classifyAgentProcess(string(command), string(arguments)); agent != "" {
-			return agent
+			return agent, pid
 		}
 		children, _ := os.ReadFile(filepath.Join(
 			"/proc", strconv.Itoa(pid), "task", strconv.Itoa(pid), "children",
@@ -239,7 +244,7 @@ func descendantAgent(rootPID int) string {
 			}
 		}
 	}
-	return ""
+	return "", 0
 }
 
 func classifyAgentProcess(command, arguments string) string {

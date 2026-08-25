@@ -27,6 +27,40 @@ func TestClassifyAgentProcess(t *testing.T) {
 	}
 }
 
+func TestCodexTranscriptSubagentLifecycle(t *testing.T) {
+	start := []byte(`{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"SubAgentActivity","id":"call-1","kind":"started","agent_thread_id":"thread-1","agent_path":"/root/logic_retest"}}}`)
+	events := codexTranscriptEvents(start)
+	if len(events) != 1 || events[0].Event.HookEventName != "SubagentStart" ||
+		events[0].Event.AgentID != "/root/logic_retest" || events[0].Event.ThreadID != "thread-1" {
+		t.Fatalf("unexpected Codex start event: %#v", events)
+	}
+	progress := []byte(`{"type":"response_item","payload":{"type":"agent_message","author":"/root/logic_retest","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE"}]}}`)
+	if events := codexTranscriptEvents(progress); len(events) != 0 {
+		t.Fatalf("progress message stopped an active agent: %#v", events)
+	}
+	stop := []byte(`{"type":"response_item","payload":{"type":"agent_message","author":"/root/logic_retest","recipient":"/root","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER"}]}}`)
+	events = codexTranscriptEvents(stop)
+	if len(events) != 1 || events[0].Event.HookEventName != "SubagentStop" ||
+		events[0].Event.AgentID != "/root/logic_retest" {
+		t.Fatalf("unexpected Codex stop event: %#v", events)
+	}
+}
+
+func TestClaudeTranscriptSubagentLifecycle(t *testing.T) {
+	start := []byte(`{"type":"user","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"agent-123","description":"Smoke test explore agent"},"message":{"role":"user","content":[]}}`)
+	events := claudeTranscriptEvents(start)
+	if len(events) != 1 || events[0].Event.HookEventName != "SubagentStart" ||
+		events[0].Event.AgentID != "agent-123" || events[0].Event.AgentType != "Smoke test explore agent" {
+		t.Fatalf("unexpected Claude start event: %#v", events)
+	}
+	stop := []byte(`{"type":"user","message":{"role":"user","content":"<task-notification><task-id>agent-123</task-id><status>completed</status><summary>Agent \"Smoke test explore agent\" finished</summary></task-notification>"}}`)
+	events = claudeTranscriptEvents(stop)
+	if len(events) != 1 || events[0].Event.HookEventName != "SubagentStop" ||
+		events[0].Event.AgentID != "agent-123" || events[0].Event.AgentType != "Smoke test explore agent" {
+		t.Fatalf("unexpected Claude stop event: %#v", events)
+	}
+}
+
 func TestReplayStartUsesLatestFullScreenRedrawOnlyForFreshRenderer(t *testing.T) {
 	replay := []record{
 		{sequence: 1, data: []byte("old output\x1b[2Jfirst redraw")},

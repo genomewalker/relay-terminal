@@ -96,7 +96,7 @@ func tabIncludesFloatingPanes() {
 @MainActor
 @Test("Remote editors join the active tab and inherit its pane session")
 func remoteEditorPane() {
-    let workspace = WorkspaceModel()
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
     let profile = ConnectionProfile.sshConfigHost("editor-test-host")
     workspace.newTab(profile: profile)
     let terminalID = workspace.activePaneID
@@ -113,7 +113,7 @@ func remoteEditorPane() {
 @MainActor
 @Test("A session owns multiple tabs with separate pane workers")
 func multipleTabsPerSession() {
-    let workspace = WorkspaceModel()
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
     workspace.newTab(profile: .sshConfigHost("tabs-test-host"))
     let firstTab = workspace.selectedTab
     let firstPaneID = workspace.activePaneID
@@ -129,7 +129,7 @@ func multipleTabsPerSession() {
 @MainActor
 @Test("Sessions, tabs, and panes can be renamed independently")
 func workspaceRenaming() {
-    let workspace = WorkspaceModel()
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
     workspace.newTab(profile: .sshConfigHost("rename-test-host"))
     let sessionID = workspace.selectedTab!.sessionID
     let tabID = workspace.selectedTab!.id
@@ -154,7 +154,7 @@ func workspaceRenaming() {
 @MainActor
 @Test("Full screen hides and restores the session navigator")
 func fullScreenChrome() {
-    let workspace = WorkspaceModel()
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
     workspace.sidebarVisible = true
 
     workspace.setFullScreen(true)
@@ -255,7 +255,8 @@ func structuredSubagentLifecycle() {
 
     pane.receivedAgentEvent(Data(#"{"agent":"claude","event":{"hook_event_name":"SubagentStop","agent_id":"research-1"}}"#.utf8))
     #expect(pane.activeSubagents == 0)
-    #expect(pane.subagents.isEmpty)
+    #expect(pane.subagents.first?.phase == .quiet)
+    #expect(pane.subagents.first?.label == "Explore")
 
 }
 

@@ -405,7 +405,12 @@ private struct AttachedSessionRow: View {
     private var panes: [PaneModel] {
         session.tabs.flatMap(\.allPaneIDs).compactMap { workspace.panes[$0] }
     }
-    private var activeAgents: Int { panes.filter { $0.contentKind == .terminal && $0.kind != .shell }.count }
+    private var agentThreads: Int {
+        panes.reduce(into: 0) { count, pane in
+            guard pane.contentKind == .terminal, pane.kind != .shell else { return }
+            count += 1 + pane.subagents.count
+        }
+    }
     var body: some View {
         VStack(spacing: 1) {
             HStack(spacing: 3) {
@@ -427,8 +432,8 @@ private struct AttachedSessionRow: View {
                     Text("\(session.tabs.count) tab\(session.tabs.count == 1 ? "" : "s")")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
-                    if activeAgents > 0 {
-                        Text("\(activeAgents) agent\(activeAgents == 1 ? "" : "s")")
+                    if agentThreads > 0 {
+                        Text("\(agentThreads) thread\(agentThreads == 1 ? "" : "s")")
                             .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
                             .foregroundStyle(RelayTheme.mint)
                     }
@@ -456,7 +461,7 @@ private struct AttachedSessionRow: View {
                 .help("New tab in session")
             }
 
-            if selected || activeAgents > 0 {
+            if selected || agentThreads > 0 {
                 ForEach(session.tabs) { tab in
                     let tabPanes = tab.allPaneIDs.compactMap { workspace.panes[$0] }
                     let visiblePanes = selected && tab.id == workspace.selectedTabID
@@ -476,7 +481,7 @@ private struct AttachedSessionRow: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(label), \(session.tabs.count) tabs, \(panes.count) panes, \(activeAgents) agents")
+        .accessibilityLabel("\(label), \(session.tabs.count) tabs, \(panes.count) panes, \(agentThreads) agent threads")
     }
 }
 
@@ -610,21 +615,21 @@ private struct SessionPaneRow: View {
                 }
             }
 
-            ForEach(pane.subagents.prefix(4)) { subagent in
+            ForEach(Array(pane.subagents.suffix(6))) { subagent in
                 Button(action: revealPane) {
                     HStack(spacing: 6) {
                         Image(systemName: "arrow.turn.down.right")
                             .font(.system(size: 8, weight: .semibold))
                             .foregroundStyle(RelayTheme.textFaint)
-                        Circle().fill(RelayTheme.mint).frame(width: 5, height: 5)
+                        Circle().fill(subagent.phase.color).frame(width: 5, height: 5)
                         Text(subagent.label)
                             .font(.system(size: 9.5, weight: .medium))
                             .foregroundStyle(RelayTheme.textMuted)
                             .lineLimit(1)
                         Spacer()
-                        Text("working")
+                        Text(subagent.phase == .active ? "working" : "finished")
                             .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(RelayTheme.mint)
+                            .foregroundStyle(subagent.phase.color)
                     }
                     .padding(.leading, 43)
                     .padding(.trailing, 9)

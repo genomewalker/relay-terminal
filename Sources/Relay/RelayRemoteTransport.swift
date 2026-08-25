@@ -22,6 +22,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var inputBacklog = Data()
     private var latestResize: (UInt16, UInt16)?
 
+    deinit {
+        process?.terminate()
+    }
+
     func start(
         profile: ConnectionProfile,
         sessionID: String,

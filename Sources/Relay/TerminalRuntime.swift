@@ -246,6 +246,7 @@ private final class TerminalIOBridge: @unchecked Sendable {
     private var replayBuffer = Data()
     private var replayGeneration: UInt64 = 0
     private var legacyReplayGeneration: UInt64 = 0
+    private var legacyReplayHardDeadline = DispatchTime.distantFuture
     private var filterDeviceResponsesUntil = Date.distantPast
     private let legacyReplayTimer: DispatchSourceTimer
 
@@ -298,6 +299,11 @@ private final class TerminalIOBridge: @unchecked Sendable {
         replaying = true
         suppressingTerminalWrites = true
         filterDeviceResponsesUntil = Date().addingTimeInterval(5)
+        // Pre-caught_up workers can redraw continuously (Codex and Claude do),
+        // so an idle-only boundary would leave the opaque restore layer up
+        // forever. Bound that compatibility path while newer workers still end
+        // reconstruction immediately with their explicit caught_up status.
+        legacyReplayHardDeadline = .now() + .milliseconds(750)
         replayGeneration &+= 1
         replayLock.unlock()
         scheduleLegacyReplayEnd()
@@ -314,6 +320,7 @@ private final class TerminalIOBridge: @unchecked Sendable {
         let generation = replayGeneration
         let buffered = replayBuffer
         replayBuffer.removeAll(keepingCapacity: true)
+        legacyReplayHardDeadline = .distantFuture
         legacyReplayTimer.schedule(deadline: .distantFuture)
         replayLock.unlock()
 
@@ -362,13 +369,14 @@ private final class TerminalIOBridge: @unchecked Sendable {
         }
         replayGeneration &+= 1
         legacyReplayGeneration = replayGeneration
-        legacyReplayTimer.schedule(deadline: .now() + .seconds(1))
+        legacyReplayTimer.schedule(deadline: min(.now() + .seconds(1), legacyReplayHardDeadline))
         replayLock.unlock()
     }
 
     private func finishLegacyReplayIfIdle() {
         replayLock.lock()
-        let shouldFinish = replaying && replayGeneration == legacyReplayGeneration
+        let hardDeadlineReached = DispatchTime.now() >= legacyReplayHardDeadline
+        let shouldFinish = replaying && (replayGeneration == legacyReplayGeneration || hardDeadlineReached)
         replayLock.unlock()
         if shouldFinish { endReplay() }
     }

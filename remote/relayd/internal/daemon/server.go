@@ -139,6 +139,10 @@ func (server *Server) serveConnection(connection net.Conn) {
 	if err := protocol.NewWriter(worker).Write(workerHello); err != nil {
 		return
 	}
+	if hello.ObserveEvents {
+		serveObservedConnection(connection, worker, manifest)
+		return
+	}
 
 	completed := make(chan struct{}, 2)
 	go func() {
@@ -153,6 +157,74 @@ func (server *Server) serveConnection(connection net.Conn) {
 		completed <- struct{}{}
 	}()
 	<-completed
+}
+
+type observedWorkerFrame struct {
+	frame protocol.Frame
+	err   error
+}
+
+// The supervisor owns observer multiplexing so a newly installed relayd can
+// recover structured agent threads from durable pane workers created by an
+// older binary. Terminal output from their compatibility attachment is dropped
+// before it reaches the macOS app.
+func serveObservedConnection(connection, worker net.Conn, manifest workerManifest) {
+	workerFrames := make(chan observedWorkerFrame, 32)
+	go func() {
+		for {
+			frame, err := protocol.ReadFrame(worker)
+			workerFrames <- observedWorkerFrame{frame: frame, err: err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	clientDone := make(chan struct{}, 1)
+	go func() {
+		_, _ = io.Copy(worker, connection)
+		if unix, ok := worker.(*net.UnixConn); ok {
+			_ = unix.CloseWrite()
+		}
+		clientDone <- struct{}{}
+	}()
+
+	codexFrames, stopCodex := observeCodexTranscript(manifest.ShellPID)
+	defer stopCodex()
+	claudeFrames, stopClaude := observeClaudeTranscript(manifest.ShellPID)
+	defer stopClaude()
+	writer := protocol.NewWriter(connection)
+	for {
+		select {
+		case result := <-workerFrames:
+			if result.err != nil {
+				return
+			}
+			if result.frame.Type == protocol.Output {
+				continue
+			}
+			if writer.Write(result.frame) != nil {
+				return
+			}
+		case frame, ok := <-codexFrames:
+			if !ok {
+				codexFrames = nil
+				continue
+			}
+			if writer.Write(frame) != nil {
+				return
+			}
+		case frame, ok := <-claudeFrames:
+			if !ok {
+				claudeFrames = nil
+				continue
+			}
+			if writer.Write(frame) != nil {
+				return
+			}
+		case <-clientDone:
+			return
+		}
+	}
 }
 
 func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest, error) {

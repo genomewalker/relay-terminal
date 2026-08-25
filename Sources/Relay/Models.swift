@@ -372,6 +372,7 @@ struct SubagentActivity: Identifiable, Equatable, Sendable {
     let id: String
     let label: String
     let startedAt: Date
+    var phase: AgentPhase = .active
 }
 
 struct AgentActivityItem: Identifiable, Equatable, Sendable {
@@ -689,23 +690,34 @@ final class PaneModel: ObservableObject, Identifiable {
             recordActivity(event["message"] as? String ?? "Needs input", phase: .needsInput)
         case "SubagentStart":
             let identifier = subagentID ?? UUID().uuidString
-            if !subagents.contains(where: { $0.id == identifier }) {
-                subagents.append(SubagentActivity(
-                    id: identifier,
-                    label: agentType ?? "Subagent",
-                    startedAt: Date()
-                ))
-            }
-            activeSubagents = subagents.count
+            subagents.removeAll { $0.id == identifier }
+            subagents.append(SubagentActivity(
+                id: identifier,
+                label: agentType ?? "Subagent",
+                startedAt: Date(),
+                phase: .active
+            ))
+            subagents = Array(subagents.suffix(16))
+            activeSubagents = subagents.count { $0.phase == .active }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent: \(agentType ?? "working")")
             recordActivity("Started \(agentType ?? "subagent")", phase: .active)
         case "SubagentStop":
             if let subagentID {
-                subagents.removeAll { $0.id == subagentID }
-            } else if !subagents.isEmpty {
-                subagents.removeLast()
+                if let index = subagents.firstIndex(where: { $0.id == subagentID }) {
+                    subagents[index].phase = .quiet
+                } else {
+                    subagents.append(SubagentActivity(
+                        id: subagentID,
+                        label: agentType ?? "Subagent",
+                        startedAt: Date(),
+                        phase: .quiet
+                    ))
+                }
+            } else if let index = subagents.lastIndex(where: { $0.phase == .active }) {
+                subagents[index].phase = .quiet
             }
-            activeSubagents = subagents.count
+            subagents = Array(subagents.suffix(16))
+            activeSubagents = subagents.count { $0.phase == .active }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent finished")
             recordActivity("Subagent finished", phase: .quiet)
         case "PreToolUse":
