@@ -54,25 +54,28 @@ Workers publish atomic permission-`0600` manifests containing the session UUID, 
 
 If the supervisor crashes or is upgraded, the workers and their PTYs continue. If an individual worker crashes, its PTY is lost because an open kernel file descriptor cannot be reconstructed from a disk record. Workers therefore stay deliberately tiny and, where the cluster permits it, outside the memory-heavy agent's cgroup. Node reboot recovery belongs to the scheduler/checkpoint layer.
 
-The current implementation uses a per-user supervisor, detached per-pane workers, atomic worker manifests, boot/PID/socket identity validation, and sequence-based reattachment. Workspace-level catalog metadata and explicit worker garbage collection remain to be added.
+The current implementation uses a per-user supervisor, detached per-pane workers, atomic worker manifests, boot/PID/socket identity validation, and sequence-based reattachment. Local workspace snapshots now model session -> tabs -> panes. Remote workspace-level catalog metadata and explicit worker garbage collection remain to be added.
 
-## Web workspace panes
+## Quick editor panes
 
-A web editor is a separate pane renderer, not a terminal escape-sequence feature:
+The editor is a separate pane renderer, not a terminal escape-sequence feature:
 
 ```text
-Relay editor pane (WKWebView)
-        │ Relay's authenticated SSH transport
-        │ loopback forwarding; no public listener
+Relay editor pane (bundled Monaco in WKWebView)
+        │ Relay's SSH transport
         ▼
-detached editor worker -> Code-OSS/OpenVSCode Server -> remote files/extensions/processes
+relayd file RPC -> remote filesystem
 ```
 
-Editor panes participate in the same tab, split, floating, zoom, and persistence model as terminal and agent panes. The remote server binds to loopback with a per-worker token; Relay forwards it inside the existing node connection and loads it in a dedicated `WKWebView`. The pane manifest records its workspace directory and editor-worker identity.
+Editor panes participate in the same tab, split, floating, zoom, and persistence model as terminal and agent panes. Monaco is bundled with the Mac app and supplies syntax highlighting, multiple cursors, find/replace, minimap, diff rendering, and editor keybindings. There is no Node process, web server, or editor renderer on the cluster.
 
-Relay should not embed Microsoft's proprietary VS Code Server as a non-VS-Code client. Code - OSS is MIT-licensed, while Microsoft's distribution and server include separately licensed components and a client handshake. OpenVSCode Server is the practical initial backend. On clusters where installing it is disallowed, Relay falls back to terminal and native lightweight editor panes.
+`rcode file` sends a structured open-file event from a Relay-managed remote shell to the Mac app. `rcode --diff file` compares the working file with Git `HEAD`; two path arguments compare arbitrary files. Reads and saves go through `relayd`, and saves include the open-time modification timestamp so an external change is never overwritten silently.
 
-The editor's integrated terminal is owned by the editor server and has a different crash boundary. Relay terminal panes remain the durable option until an editor extension can delegate integrated terminals to Relay workers.
+The quick editor deliberately does not reproduce the VS Code workbench, extension host, debugger, or integrated terminal. Shells and agents remain durable Relay terminal panes beside the editor.
+
+## Agent activity
+
+Relay worker shells prepend a private shim directory to `PATH`. Invoking `claude` or `codex` in those shells runs the real binary with Relay hook configuration; shells opened outside Relay are unchanged. Hook payloads travel in `AgentEvent` frames beside terminal output and drive the pane's working/ready/approval state, recent activity tree, and nested subagent rows. A Linux process-tree monitor and throttled output heuristics cover agents launched outside the shim path.
 
 ## Attach flow
 

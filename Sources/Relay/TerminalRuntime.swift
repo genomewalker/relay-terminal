@@ -197,7 +197,7 @@ private final class TerminalActivityCoalescer: @unchecked Sendable {
         deliveryScheduled = true
         lock.unlock()
 
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(24)) { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(80)) { [weak self] in
             guard let self else { return }
             self.lock.lock()
             let batch = self.pendingText
@@ -337,13 +337,26 @@ extension Notification.Name {
     static let relaySplitRight = Notification.Name("relay.split-right")
     static let relaySplitDown = Notification.Name("relay.split-down")
     static let relayClosePane = Notification.Name("relay.close-pane")
+    static let relayOpenRemoteFile = Notification.Name("relay.open-remote-file")
 }
 
-struct TerminalSurface: NSViewRepresentable {
-    @ObservedObject var pane: PaneModel
+@MainActor
+struct TerminalSurface: NSViewRepresentable, Equatable {
+    let pane: PaneModel
+    nonisolated let identity: UUID
+
+    init(pane: PaneModel) {
+        self.pane = pane
+        self.identity = pane.id
+    }
+
+    nonisolated static func == (lhs: TerminalSurface, rhs: TerminalSurface) -> Bool {
+        lhs.identity == rhs.identity
+    }
 
     func makeNSView(context: Context) -> RelayGhosttyView {
-        pane.runtime.view
+        pane.runtime.startIfNeeded()
+        return pane.runtime.view
     }
 
     func updateNSView(_ nsView: RelayGhosttyView, context: Context) {

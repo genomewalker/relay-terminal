@@ -21,20 +21,31 @@ struct RelayApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: .relayClosePane)) { _ in
                     workspace.closeActivePane()
                 }
+                .onReceive(NotificationCenter.default.publisher(for: .relayOpenRemoteFile)) { note in
+                    if let request = note.object as? RemoteFileOpenRequest {
+                        workspace.openRemoteFile(request)
+                    }
+                }
                 .onDisappear { workspace.shutdown() }
         }
         .defaultSize(width: 1320, height: 820)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("New local tab") { workspace.newTab(profile: .local) }
+                Button("New tab in session") { workspace.newTabInActiveSession() }
                     .keyboardShortcut("t", modifiers: .command)
+                Button("New local session") { workspace.newTab(profile: .local) }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
                 Button("Find SSH host…") { workspace.presentHostLauncher() }
                     .keyboardShortcut("k", modifiers: .command)
                 Button("Connect to host…") { workspace.presentConnectionSheet() }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
             }
             CommandMenu("Pane") {
+                Button("Open remote editor") { workspace.openEditorForActive() }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(workspace.activePane?.profile.kind != .ssh || workspace.activePane?.profile.backend != .relay)
+                Divider()
                 Button(workspace.zoomedPaneID == workspace.activePaneID ? "Restore pane layout" : "Zoom active pane") {
                     workspace.toggleActivePaneZoom()
                 }

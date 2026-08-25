@@ -62,7 +62,14 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	if workingDirectory != "" {
 		child.Dir = workingDirectory
 	}
-	child.Env = append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor", "RELAY_SESSION="+id)
+	home, _ := os.UserHomeDir()
+	shimPath := filepath.Join(home, ".local", "share", "relay", "shims")
+	child.Env = environmentWithOverrides(os.Environ(), map[string]string{
+		"TERM":          "xterm-256color",
+		"COLORTERM":     "truecolor",
+		"RELAY_SESSION": id,
+		"PATH":          shimPath + string(os.PathListSeparator) + os.Getenv("PATH"),
+	})
 	if cols == 0 {
 		cols = 120
 	}
@@ -81,6 +88,23 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	go session.wait()
 	go session.monitorAgentProcesses()
 	return session, nil
+}
+
+func environmentWithOverrides(environment []string, overrides map[string]string) []string {
+	result := make([]string, 0, len(environment)+len(overrides))
+	for _, entry := range environment {
+		name, _, found := strings.Cut(entry, "=")
+		if found {
+			if _, replaced := overrides[name]; replaced {
+				continue
+			}
+		}
+		result = append(result, entry)
+	}
+	for name, value := range overrides {
+		result = append(result, name+"="+value)
+	}
+	return result
 }
 
 func (session *Session) monitorAgentProcesses() {

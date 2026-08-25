@@ -1,0 +1,106 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <style>
+    html, body, #editor { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #181818; }
+    #empty { position: fixed; inset: 0; display: grid; place-items: center; color: #777; font: 12px -apple-system, sans-serif; pointer-events: none; }
+    body.ready #empty { display: none; }
+  </style>
+</head>
+<body>
+  <div id="editor"></div>
+  <div id="empty">Choose a file or run <code>&nbsp;rcode file&nbsp;</code> in a Relay terminal</div>
+  <script src="vs/loader.js"></script>
+  <script>
+    const bridge = (type, data = {}) => window.webkit.messageHandlers.relay.postMessage({ type, ...data });
+    let editor = null, diffEditor = null, currentModel = null, originalModel = null;
+    let savedText = '', documentPayload = null, suppressDirty = false, lastDirty = false;
+    require.config({ paths: { vs: 'vs' } });
+    require(['vs/editor/editor.main'], function () {
+      monaco.editor.defineTheme('relay-dark', {
+        base: 'vs-dark', inherit: true,
+        rules: [
+          { token: 'comment', foreground: '777777', fontStyle: 'italic' },
+          { token: 'keyword', foreground: 'C7A0F8' },
+          { token: 'string', foreground: 'A8CC8C' },
+          { token: 'number', foreground: 'D7BA7D' }
+        ],
+        colors: {
+          'editor.background': '#181818', 'editor.foreground': '#ECECEC',
+          'editorLineNumber.foreground': '#595959', 'editorLineNumber.activeForeground': '#A6A6A6',
+          'editorCursor.foreground': '#10A37F', 'editor.selectionBackground': '#285A4D',
+          'editor.inactiveSelectionBackground': '#243D37', 'editor.lineHighlightBackground': '#202020',
+          'editorIndentGuide.background1': '#2D2D2D', 'editorIndentGuide.activeBackground1': '#555555',
+          'editorGutter.background': '#181818', 'minimap.background': '#181818',
+          'scrollbarSlider.background': '#55555555', 'scrollbarSlider.hoverBackground': '#6A6A6A77'
+        }
+      });
+      bridge('ready');
+    });
+    const options = {
+      theme: 'relay-dark', automaticLayout: true, fontFamily: 'SFMono-Regular, Menlo, monospace',
+      fontSize: 13, lineHeight: 21, fontLigatures: true, minimap: { enabled: true, maxColumn: 90 },
+      stickyScroll: { enabled: true }, smoothScrolling: false, cursorSmoothCaretAnimation: 'off',
+      bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true },
+      padding: { top: 10, bottom: 10 }, renderWhitespace: 'selection', roundedSelection: false,
+      scrollBeyondLastLine: false, wordWrap: 'off'
+    };
+    function uriFor(path, suffix = '') { return monaco.Uri.parse('file://' + path + suffix); }
+    function disposeEditors() {
+      if (editor) editor.dispose(); if (diffEditor) diffEditor.dispose();
+      if (currentModel) currentModel.dispose(); if (originalModel) originalModel.dispose();
+      editor = diffEditor = currentModel = originalModel = null;
+    }
+    function installCommands(instance) {
+      instance.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => relayRequestSave());
+      const modified = instance.getModifiedEditor ? instance.getModifiedEditor() : instance;
+      modified.onDidChangeModelContent(() => {
+        if (suppressDirty) return;
+        const dirty = modified.getValue() !== savedText;
+        if (dirty !== lastDirty) { lastDirty = dirty; bridge('dirty', { dirty }); }
+      });
+    }
+    function openSingle(payload) {
+      disposeEditors();
+      currentModel = monaco.editor.createModel(payload.content, payload.language, uriFor(payload.path));
+      editor = monaco.editor.create(document.getElementById('editor'), { ...options, model: currentModel });
+      installCommands(editor); editor.focus();
+    }
+    function openDiff(payload) {
+      disposeEditors();
+      originalModel = monaco.editor.createModel(payload.original || '', payload.language, uriFor(payload.path, '.relay-original'));
+      currentModel = monaco.editor.createModel(payload.content, payload.language, uriFor(payload.path));
+      diffEditor = monaco.editor.createDiffEditor(document.getElementById('editor'), { ...options, renderSideBySide: true });
+      diffEditor.setModel({ original: originalModel, modified: currentModel });
+      installCommands(diffEditor); diffEditor.getModifiedEditor().focus();
+    }
+    window.relayOpenDocument = function (payload) {
+      documentPayload = payload; savedText = payload.content; suppressDirty = true;
+      payload.diff ? openDiff(payload) : openSingle(payload);
+      suppressDirty = false; document.body.classList.add('ready');
+      lastDirty = false; bridge('dirty', { dirty: false }); bridge('mode', { diff: !!payload.diff });
+    };
+    window.relayRequestSave = function () {
+      const target = diffEditor ? diffEditor.getModifiedEditor() : editor;
+      if (target) bridge('save', { content: target.getValue() });
+    };
+    window.relayMarkSaved = function () {
+      const target = diffEditor ? diffEditor.getModifiedEditor() : editor;
+      if (target) savedText = target.getValue();
+      lastDirty = false;
+      bridge('dirty', { dirty: false });
+    };
+    window.relayToggleLocalDiff = function () {
+      if (!documentPayload) return;
+      const target = diffEditor ? diffEditor.getModifiedEditor() : editor;
+      const current = target ? target.getValue() : documentPayload.content;
+      const showDiff = !diffEditor;
+      documentPayload = { ...documentPayload, content: current, original: savedText, diff: showDiff };
+      showDiff ? openDiff(documentPayload) : openSingle(documentPayload);
+      bridge('mode', { diff: showDiff });
+    };
+  </script>
+</body>
+</html>

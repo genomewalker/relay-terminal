@@ -21,6 +21,6 @@ cd "$project_root/remote/relayd"
 CGO_ENABLED=0 GOOS=linux GOARCH="$go_arch" \
     go build -trimpath -ldflags='-s -w' -o "$build_dir/relayd" ./cmd/relayd
 
-ssh "$target_host" 'mkdir -p ~/.local/bin && chmod 700 ~/.local/bin'
+ssh "$target_host" 'mkdir -p ~/.local/bin ~/.local/share/relay/shims && chmod 700 ~/.local/bin ~/.local/share/relay/shims'
 scp "$build_dir/relayd" "$target_host:~/.local/bin/relayd.next"
-ssh "$target_host" 'chmod 700 ~/.local/bin/relayd.next && mv ~/.local/bin/relayd.next ~/.local/bin/relayd && ~/.local/bin/relayd --version'
+ssh "$target_host" 'chmod 700 ~/.local/bin/relayd.next && mv ~/.local/bin/relayd.next ~/.local/bin/relayd && ln -sfn ~/.local/bin/relayd ~/.local/bin/rcode && ln -sfn ~/.local/bin/relayd ~/.local/share/relay/shims/claude && ln -sfn ~/.local/bin/relayd ~/.local/share/relay/shims/codex && ~/.local/bin/relayd --version'

@@ -22,6 +22,25 @@ func TestClassifyAgentProcess(t *testing.T) {
 	}
 }
 
+func TestEnvironmentOverridesReplaceHotPathVariables(t *testing.T) {
+	environment := environmentWithOverrides(
+		[]string{"PATH=/old", "TERM=old", "UNCHANGED=yes"},
+		map[string]string{"PATH": "/relay:/old", "TERM": "xterm-256color"},
+	)
+	values := make(map[string]string)
+	for _, entry := range environment {
+		for index := range entry {
+			if entry[index] == '=' {
+				values[entry[:index]] = entry[index+1:]
+				break
+			}
+		}
+	}
+	if values["PATH"] != "/relay:/old" || values["TERM"] != "xterm-256color" || values["UNCHANGED"] != "yes" {
+		t.Fatalf("unexpected environment: %#v", values)
+	}
+}
+
 func TestExitedSessionIsReplacedOnNextAttach(t *testing.T) {
 	first, err := startSession("restart-test", "exit 0", "", 80, 24)
 	if err != nil {

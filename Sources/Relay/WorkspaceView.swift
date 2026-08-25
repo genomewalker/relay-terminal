@@ -28,6 +28,18 @@ struct WorkspaceView: View {
         .sheet(isPresented: $workspace.isConnectionSheetPresented) {
             ConnectionSheet(workspace: workspace)
         }
+        .alert(
+            workspace.renameTarget?.title ?? "Rename",
+            isPresented: Binding(
+                get: { workspace.renameTarget != nil },
+                set: { if !$0 { workspace.cancelRename() } }
+            )
+        ) {
+            TextField("Name", text: $workspace.renameDraft)
+            Button("Cancel", role: .cancel) { workspace.cancelRename() }
+            Button("Rename") { workspace.commitRename() }
+                .disabled(workspace.renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
             workspace.setFullScreen(true)
         }
@@ -40,8 +52,21 @@ struct WorkspaceView: View {
 private struct WorkspaceBar: View {
     @ObservedObject var workspace: WorkspaceModel
 
+    private var sessionTabs: [TabModel] {
+        guard let sessionID = workspace.selectedTab?.sessionID else { return [] }
+        return workspace.tabs.filter { $0.sessionID == sessionID }
+    }
+
+    private var sessionName: String {
+        guard let tab = workspace.selectedTab,
+              let paneID = tab.allPaneIDs.first,
+              let pane = workspace.panes[paneID] else { return "Session" }
+        let fallback = pane.profile.kind == .ssh ? pane.profile.host : "This Mac"
+        return workspace.sessionDisplayName(tab.sessionID, fallback: fallback)
+    }
+
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             HStack(spacing: 8) {
                 if !workspace.sidebarVisible {
                     ChromeButton(symbol: "sidebar.left", help: "Show navigator") {
@@ -57,15 +82,29 @@ private struct WorkspaceBar: View {
                 }
             }
 
+            Text(sessionName)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(RelayTheme.textMuted)
+                .lineLimit(1)
+
+            Rectangle()
+                .fill(RelayTheme.line.opacity(0.65))
+                .frame(width: 1, height: 18)
+
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(workspace.tabs) { tab in
+                HStack(spacing: 2) {
+                    ForEach(Array(sessionTabs.enumerated()), id: \.element.id) { index, tab in
                         WorkspaceTab(
                             tab: tab,
+                            label: index == 0 ? "Main" : "Tab \(index + 1)",
                             isSelected: tab.id == workspace.selectedTabID,
                             select: { workspace.selectTab(tab.id) },
+                            rename: { workspace.beginRenameTab(tab.id) },
                             close: { workspace.closeTab(tab.id) }
                         )
+                    }
+                    ChromeButton(symbol: "plus", help: "New tab in this session · ⌘T") {
+                        workspace.newTabInActiveSession()
                     }
                 }
             }
@@ -73,6 +112,12 @@ private struct WorkspaceBar: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 6) {
+                if workspace.activePane?.profile.kind == .ssh,
+                   workspace.activePane?.profile.backend == .relay {
+                    ChromeButton(symbol: "curlybraces", help: "Open remote editor · ⇧⌘E") {
+                        workspace.openEditorForActive()
+                    }
+                }
                 ChromeButton(symbol: "rectangle.split.2x1", help: "Split remote pane right · ⌘D") {
                     workspace.splitActive(axis: .horizontal)
                 }
@@ -82,9 +127,21 @@ private struct WorkspaceBar: View {
                 ChromeButton(symbol: "rectangle.on.rectangle", help: "New floating remote pane · ⌥⌘F") {
                     workspace.newFloatingPane()
                 }
-                ChromeButton(symbol: "rectangle.split.3x1", help: "Balance pane layout · ⌥⌘=") {
-                    workspace.balanceActiveTabPanes()
+                Menu {
+                    Button("Balance pane layout") { workspace.balanceActiveTabPanes() }
+                    Button("Zoom active pane") { workspace.toggleActivePaneZoom() }
+                    Button("Float or dock active pane") { workspace.toggleActivePaneFloating() }
+                    Divider()
+                    Button("New local session") { workspace.newTab(profile: .local) }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 30, height: 30)
                 }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .foregroundStyle(RelayTheme.textMuted)
+                .help("More workspace actions")
                 if workspace.isFullScreen {
                     ChromeButton(symbol: "plus", help: "Connect to a host · ⌘K") {
                         workspace.presentHostLauncher()
@@ -110,44 +167,58 @@ private struct WorkspaceBar: View {
         }
         .padding(.leading, workspace.isFullScreen || workspace.sidebarVisible ? 10 : 76)
         .padding(.trailing, 10)
-        .frame(height: workspace.isFullScreen ? 40 : 48)
+        .frame(height: workspace.isFullScreen ? 38 : 44)
         .background(RelayTheme.canvas)
     }
 }
 
 private struct WorkspaceTab: View {
     @ObservedObject var tab: TabModel
+    let label: String
     let isSelected: Bool
     let select: () -> Void
+    let rename: () -> Void
     let close: () -> Void
     @State private var hovering = false
 
     var body: some View {
-        Button(action: select) {
-            HStack(spacing: 7) {
-                Image(systemName: "terminal.fill")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(isSelected ? RelayTheme.textMuted : RelayTheme.textFaint)
-                Text(tab.name)
-                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+        HStack(spacing: 1) {
+            Button(action: select) {
+                Text(label)
+                    .font(.system(size: 11.5, weight: isSelected ? .semibold : .medium))
                     .lineLimit(1)
-                Button(action: close) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
-                        .frame(width: 16, height: 16)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .opacity(isSelected || hovering ? 1 : 0)
+                    .padding(.leading, 9)
+                    .padding(.trailing, 4)
+                    .frame(height: 29)
+                    .contentShape(Rectangle())
             }
-            .padding(.horizontal, 10)
-            .frame(height: 32)
-            .foregroundStyle(isSelected ? RelayTheme.text : RelayTheme.textMuted)
-            .background(isSelected ? RelayTheme.surface : hovering ? RelayTheme.hover.opacity(0.45) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .buttonStyle(.plain)
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 7.5, weight: .bold))
+                    .frame(width: 18, height: 29)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(RelayTheme.textMuted)
+            .opacity(isSelected || hovering ? 1 : 0)
         }
-        .buttonStyle(.plain)
+        .foregroundStyle(isSelected ? RelayTheme.text : RelayTheme.textMuted)
+        .background(hovering ? RelayTheme.hover.opacity(0.45) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(alignment: .bottom) {
+            if isSelected {
+                Capsule()
+                    .fill(RelayTheme.accent)
+                    .frame(height: 2)
+                    .padding(.horizontal, 7)
+                }
+        }
         .onHover { hovering = $0 }
+        .contextMenu {
+            Button("Rename tab…", action: rename)
+            Divider()
+            Button("Close tab", action: close)
+        }
     }
 }
 
@@ -175,6 +246,11 @@ private struct SessionNodeGroup: Identifiable {
     let id: String
     let name: String
     let remote: Bool
+    var sessions: [SessionTabGroup]
+}
+
+private struct SessionTabGroup: Identifiable {
+    let id: UUID
     var tabs: [TabModel]
 }
 
@@ -188,10 +264,19 @@ private struct SessionManager: View {
             let remote = pane.profile.kind == .ssh
             let key = remote ? "ssh:\(pane.profile.host)" : "local"
             let name = remote ? pane.profile.host : "This Mac"
-            if let index = groups.firstIndex(where: { $0.id == key }) {
-                groups[index].tabs.append(tab)
+            if let nodeIndex = groups.firstIndex(where: { $0.id == key }) {
+                if let sessionIndex = groups[nodeIndex].sessions.firstIndex(where: { $0.id == tab.sessionID }) {
+                    groups[nodeIndex].sessions[sessionIndex].tabs.append(tab)
+                } else {
+                    groups[nodeIndex].sessions.append(SessionTabGroup(id: tab.sessionID, tabs: [tab]))
+                }
             } else {
-                groups.append(SessionNodeGroup(id: key, name: name, remote: remote, tabs: [tab]))
+                groups.append(SessionNodeGroup(
+                    id: key,
+                    name: name,
+                    remote: remote,
+                    sessions: [SessionTabGroup(id: tab.sessionID, tabs: [tab])]
+                ))
             }
         }
         return groups
@@ -274,7 +359,7 @@ private struct SessionNodeSection: View {
     @ObservedObject var workspace: WorkspaceModel
 
     private var nodeConnected: Bool {
-        group.tabs.flatMap(\.allPaneIDs).compactMap { workspace.panes[$0] }.contains { pane in
+        group.sessions.flatMap(\.tabs).flatMap(\.allPaneIDs).compactMap { workspace.panes[$0] }.contains { pane in
             if case .connected = pane.connectionState { return true }
             return false
         }
@@ -287,29 +372,23 @@ private struct SessionNodeSection: View {
                     .fill(nodeConnected ? RelayTheme.mint : RelayTheme.textFaint)
                     .frame(width: 6, height: 6)
                 Text(group.name)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(RelayTheme.textMuted)
                     .lineLimit(1)
                 Spacer()
-                Text("\(group.tabs.count)")
+                Text("\(group.sessions.count)")
                     .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textFaint)
             }
             .padding(.horizontal, 8)
             .frame(height: 30)
 
-            ForEach(group.tabs) { tab in
+            ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
+                let fallback = group.sessions.count == 1 ? "Session" : "Session \(index + 1)"
                 AttachedSessionRow(
-                    tab: tab,
-                    panes: tab.allPaneIDs.compactMap { workspace.panes[$0] },
-                    selected: workspace.selectedTabID == tab.id,
-                    activePaneID: workspace.activePaneID,
-                    selectTab: { workspace.selectTab(tab.id) },
-                    selectPane: { pane in
-                        workspace.selectPane(pane.id)
-                        pane.runtime.focus()
-                    },
-                    detach: { workspace.closeTab(tab.id) }
+                    session: session,
+                    label: workspace.sessionDisplayName(session.id, fallback: fallback),
+                    workspace: workspace
                 )
             }
         }
@@ -318,61 +397,76 @@ private struct SessionNodeSection: View {
 }
 
 private struct AttachedSessionRow: View {
-    @ObservedObject var tab: TabModel
-    let panes: [PaneModel]
-    let selected: Bool
-    let activePaneID: UUID?
-    let selectTab: () -> Void
-    let selectPane: (PaneModel) -> Void
-    let detach: () -> Void
+    let session: SessionTabGroup
+    let label: String
+    @ObservedObject var workspace: WorkspaceModel
 
-    private var activeAgents: Int { panes.filter { $0.kind != .shell }.count }
+    private var selected: Bool { session.tabs.contains { $0.id == workspace.selectedTabID } }
+    private var panes: [PaneModel] {
+        session.tabs.flatMap(\.allPaneIDs).compactMap { workspace.panes[$0] }
+    }
+    private var activeAgents: Int { panes.filter { $0.contentKind == .terminal && $0.kind != .shell }.count }
+    private var selectedTab: TabModel? {
+        session.tabs.first { $0.id == workspace.selectedTabID }
+    }
 
     var body: some View {
         VStack(spacing: 1) {
-            Button(action: selectTab) {
+            HStack(spacing: 3) {
+                Button {
+                    if let tab = session.tabs.first { workspace.selectTab(tab.id) }
+                } label: {
                 HStack(spacing: 7) {
                     Capsule()
                         .fill(selected ? RelayTheme.accent : Color.clear)
                         .frame(width: 3, height: 18)
                     Image(systemName: "rectangle.stack")
-                        .font(.system(size: 9.5, weight: .semibold))
+                        .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(selected ? RelayTheme.textMuted : RelayTheme.textFaint)
-                    Text(tab.name)
+                    Text(label)
                         .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
                         .foregroundStyle(selected ? RelayTheme.text : RelayTheme.textMuted)
                         .lineLimit(1)
                     Spacer(minLength: 3)
-                    ForEach(Array(panes.prefix(3))) { pane in
-                        PanePresence(pane: pane)
-                    }
-                    Text("\(panes.count)")
+                    Text("\(session.tabs.count) tab\(session.tabs.count == 1 ? "" : "s")")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
                 }
                 .padding(.horizontal, 6)
                 .frame(height: 34)
-                .background(selected ? RelayTheme.surface : Color.clear,
+                .background(selected ? RelayTheme.surface.opacity(0.82) : Color.clear,
                             in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .contextMenu {
-                Button("Detach session", action: detach)
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    Button("New tab") { workspace.newTab(inSession: session.id) }
+                    Button("Rename session…") { workspace.beginRenameSession(session.id, fallback: label) }
+                    Divider()
+                    Button("Detach session") { workspace.closeSession(session.id) }
+                }
+                Button { workspace.newTab(inSession: session.id) } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .help("New tab in session")
             }
 
             if selected {
-                ForEach(panes) { pane in
+                ForEach(selectedTab?.allPaneIDs.compactMap { workspace.panes[$0] } ?? []) { pane in
                     SessionPaneRow(
                         pane: pane,
-                        active: pane.id == activePaneID,
-                        select: { selectPane(pane) }
+                        workspace: workspace,
+                        active: pane.id == workspace.activePaneID
                     )
                 }
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(tab.name), \(panes.count) panes, \(activeAgents) agents")
+        .accessibilityLabel("\(label), \(session.tabs.count) tabs, \(panes.count) panes, \(activeAgents) agents")
     }
 }
 
@@ -389,25 +483,36 @@ private struct PanePresence: View {
 
 private struct SessionPaneRow: View {
     @ObservedObject var pane: PaneModel
+    @ObservedObject var workspace: WorkspaceModel
     let active: Bool
-    let select: () -> Void
     @State private var hovering = false
 
     var body: some View {
         VStack(spacing: 0) {
-            Button(action: select) {
+            Button {
+                workspace.selectPane(pane.id)
+                pane.focus()
+            } label: {
                 HStack(spacing: 7) {
                 Capsule()
                     .fill(active ? RelayTheme.accent : Color.clear)
                     .frame(width: 2, height: 16)
-                Image(systemName: pane.kind.symbol)
+                Image(systemName: pane.contentKind == .editor ? "curlybraces" : pane.kind.symbol)
                     .font(.system(size: 9.5, weight: .semibold))
-                    .foregroundStyle(pane.phase.color)
+                    .foregroundStyle(pane.contentKind == .editor ? RelayTheme.blue : pane.phase.color)
                     .frame(width: 14)
-                Text(pane.kind == .shell ? pane.title : pane.kind.label)
-                    .font(.system(size: 10.5, weight: active ? .semibold : .medium))
-                    .foregroundStyle(active ? RelayTheme.text : RelayTheme.textMuted)
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(pane.contentKind == .editor ? pane.displayName : pane.kind == .shell ? pane.displayName : pane.kind.label)
+                        .font(.system(size: 10.5, weight: active ? .semibold : .medium))
+                        .foregroundStyle(active ? RelayTheme.text : RelayTheme.textMuted)
+                        .lineLimit(1)
+                    if pane.contentKind == .terminal && pane.kind != .shell {
+                        Text(pane.activitySummary)
+                            .font(.system(size: 8.5, weight: .medium))
+                            .foregroundStyle(RelayTheme.textFaint)
+                            .lineLimit(1)
+                    }
+                }
                 Spacer(minLength: 0)
                 if pane.activeSubagents > 0 {
                     Text("\(pane.activeSubagents)")
@@ -418,7 +523,7 @@ private struct SessionPaneRow: View {
                 }
                 .padding(.leading, 22)
                 .padding(.trailing, 9)
-                .frame(height: 29)
+                .frame(height: pane.contentKind == .terminal && pane.kind != .shell ? 38 : 29)
                 .background(active ? RelayTheme.elevated : hovering ? RelayTheme.surface.opacity(0.7) : Color.clear,
                             in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                 .contentShape(Rectangle())
@@ -426,8 +531,50 @@ private struct SessionPaneRow: View {
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
             .contextMenu {
-                Button("Mark as \(pane.kind == .shell ? "Claude" : pane.kind == .claude ? "Codex" : "shell")") {
-                    pane.cycleAgentKind()
+                Button("Rename pane…") { workspace.beginRenamePane(pane.id) }
+                if pane.contentKind == .terminal {
+                    Menu("Agent type") {
+                        ForEach(AgentKind.allCases, id: \.self) { kind in
+                            Button {
+                                pane.setAgentKind(kind)
+                            } label: {
+                                Label(kind.label, systemImage: pane.kind == kind ? "checkmark" : kind.symbol)
+                            }
+                        }
+                    }
+                }
+                Divider()
+                Button("Split right") {
+                    workspace.selectPane(pane.id)
+                    workspace.splitActive(axis: .horizontal)
+                }
+                Button("Split down") {
+                    workspace.selectPane(pane.id)
+                    workspace.splitActive(axis: .vertical)
+                }
+                Button("Zoom pane") { workspace.togglePaneZoom(pane.id) }
+                Button(workspace.selectedTab?.floatingPanes.contains(where: { $0.paneID == pane.id }) == true ? "Dock pane" : "Float pane") {
+                    workspace.selectPane(pane.id)
+                    workspace.toggleActivePaneFloating()
+                }
+                Divider()
+                Button(pane.profile.kind == .ssh ? "Detach pane" : "Close pane") {
+                    workspace.selectPane(pane.id)
+                    workspace.closeActivePane()
+                }
+            }
+
+            if pane.contentKind == .terminal && pane.kind != .shell {
+                ForEach(Array(pane.agentActivities.suffix(4))) { activity in
+                    AgentActivityTreeRow(activity: activity)
+                }
+                if pane.agentActivities.isEmpty {
+                    AgentActivityTreeRow(activity: AgentActivityItem(
+                        id: pane.id,
+                        label: pane.activitySummary,
+                        phase: pane.phase,
+                        occurredAt: pane.lastActivity
+                    ))
                 }
             }
 
@@ -451,6 +598,32 @@ private struct SessionPaneRow: View {
                 .frame(height: 23)
             }
         }
+    }
+}
+
+private struct AgentActivityTreeRow: View {
+    let activity: AgentActivityItem
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.turn.down.right")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(RelayTheme.textFaint)
+            Circle()
+                .fill(activity.phase.color)
+                .frame(width: 5, height: 5)
+            Text(activity.label)
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(activity.phase == .quiet ? RelayTheme.textFaint : RelayTheme.textMuted)
+                .lineLimit(1)
+            Spacer(minLength: 2)
+            Text(activity.phase.label)
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(activity.phase.color)
+        }
+        .padding(.leading, 43)
+        .padding(.trailing, 9)
+        .frame(height: 23)
     }
 }
 
@@ -679,6 +852,7 @@ private struct WorkspaceCanvas: View {
                     select: { workspace.selectPane(zoomedID) },
                     toggleZoom: { workspace.togglePaneZoom(zoomedID) },
                     toggleFloating: { workspace.toggleActivePaneFloating() },
+                    rename: { workspace.beginRenamePane(zoomedID) },
                     close: {
                         workspace.selectPane(zoomedID)
                         workspace.closeActivePane()
@@ -701,7 +875,7 @@ private struct WorkspaceCanvas: View {
                             isActive: workspace.activePaneID == pane.id,
                             select: {
                                 workspace.selectPane(pane.id)
-                                pane.runtime.focus()
+                                pane.focus()
                             },
                             move: { x, y in
                                 workspace.updateFloatingPane(pane.id, originX: x, originY: y)
@@ -711,6 +885,7 @@ private struct WorkspaceCanvas: View {
                             },
                             zoom: { workspace.togglePaneZoom(pane.id) },
                             dock: { workspace.dockFloatingPane(pane.id) },
+                            rename: { workspace.beginRenamePane(pane.id) },
                             close: {
                                 workspace.selectPane(pane.id)
                                 workspace.closeActivePane()
@@ -736,6 +911,7 @@ private struct FloatingPaneWindow: View {
     let resize: (Double, Double) -> Void
     let zoom: () -> Void
     let dock: () -> Void
+    let rename: () -> Void
     let close: () -> Void
 
     @GestureState private var dragOffset: CGSize = .zero
@@ -789,6 +965,7 @@ private struct FloatingPaneWindow: View {
                 select: select,
                 toggleZoom: zoom,
                 toggleFloating: dock,
+                rename: rename,
                 isFloating: true
             )
         }
@@ -814,7 +991,7 @@ private struct FloatingPaneWindow: View {
                 Capsule()
                     .fill(isActive ? RelayTheme.accent : RelayTheme.textFaint)
                     .frame(width: 16, height: 3)
-                Text(pane.title)
+                Text(pane.displayName)
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                     .lineLimit(1)
@@ -854,6 +1031,7 @@ private struct FloatingPaneWindow: View {
                     }
             )
             .simultaneousGesture(TapGesture().onEnded(select))
+            .draggable(pane.id.uuidString)
 
             Button(action: dock) {
                     Image(systemName: "rectangle.portrait.and.arrow.right")
@@ -921,9 +1099,10 @@ private struct SplitPaneTree: View {
                     isActive: workspace.activePaneID == id,
                     compactChrome: workspace.isFullScreen,
                     select: { workspace.selectPane(id) },
-                    rearrange: { draggedID in workspace.swapTiledPanes(draggedID, id) },
+                    rearrange: { draggedID, placement in workspace.movePane(draggedID, to: id, placement: placement) },
                     toggleZoom: { workspace.togglePaneZoom(id) },
                     toggleFloating: { workspace.floatTiledPane(id) },
+                    rename: { workspace.beginRenamePane(id) },
                     close: {
                         workspace.selectPane(id)
                         workspace.closeActivePane()
@@ -1023,39 +1202,50 @@ private struct PaneView: View {
     let isActive: Bool
     let compactChrome: Bool
     let select: () -> Void
-    var rearrange: ((UUID) -> Void)? = nil
+    var rearrange: ((UUID, PaneDropPlacement) -> Void)? = nil
     var toggleZoom: (() -> Void)? = nil
     var toggleFloating: (() -> Void)? = nil
+    var rename: (() -> Void)? = nil
     var close: (() -> Void)? = nil
     var isFloating = false
     var isZoomed = false
+    @State private var paneSize: CGSize = .zero
+    @State private var isDropTarget = false
 
     var body: some View {
         VStack(spacing: 0) {
             paneHeader
             ZStack {
-                TerminalSurface(pane: pane)
-                    // A terminal backend is immutable after its NSView is created.
-                    // Key the representable by the remote session so switching tabs
-                    // cannot reuse a local-shell surface for an SSH pane.
-                    .id(pane.id)
+                if pane.contentKind == .editor {
+                    QuickEditorPane(pane: pane)
+                        .id(pane.id)
+                } else {
+                    TerminalSurface(pane: pane)
+                        .equatable()
+                        // A terminal backend is immutable after its NSView is created.
+                        // Key the representable by the remote session so switching tabs
+                        // cannot reuse a local-shell surface for an SSH pane.
+                        .id(pane.id)
+                }
                 if pane.connectionState == .connecting {
-                    ConnectingOverlay(host: pane.profile.host)
+                    ConnectingOverlay(host: pane.profile.host, contentKind: pane.contentKind)
                         .allowsHitTesting(false)
                 } else if let exitCode = pane.remoteExitCode {
                     SessionEndedOverlay(
                         exitCode: exitCode,
-                        restart: { pane.runtime.restart() },
+                        restart: { pane.restartRuntime() },
                         detach: {
                             select()
                             NotificationCenter.default.post(name: .relayClosePane, object: pane.id)
                         }
                     )
                 } else if let message = pane.connectionState.errorMessage {
-                    ConnectionErrorBanner(message: message)
+                    ConnectionErrorBanner(
+                        message: message,
+                        retry: pane.contentKind == .editor ? { pane.restartRuntime() } : nil
+                    )
                         .frame(maxHeight: .infinity, alignment: .top)
                         .padding(12)
-                        .allowsHitTesting(false)
                 }
                 if let artifact = pane.artifacts.last {
                     ArtifactPreview(artifact: artifact) {
@@ -1082,13 +1272,33 @@ private struct PaneView: View {
                     .allowsHitTesting(false)
             }
         }
-        .dropDestination(for: String.self) { items, _ in
+        .overlay {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: 3)
+                    .stroke(RelayTheme.blue.opacity(0.8), lineWidth: 2)
+                    .padding(2)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onGeometryChange(for: CGSize.self) { proxy in proxy.size } action: { paneSize = $0 }
+        .dropDestination(for: String.self) { items, location in
             guard let rawID = items.first, let draggedID = UUID(uuidString: rawID), let rearrange else {
                 return false
             }
-            rearrange(draggedID)
+            rearrange(draggedID, dropPlacement(at: location))
             return true
-        }
+        } isTargeted: { isDropTarget = $0 }
+    }
+
+    private func dropPlacement(at location: CGPoint) -> PaneDropPlacement {
+        guard paneSize.width > 0, paneSize.height > 0 else { return .center }
+        let horizontal = location.x / paneSize.width
+        let vertical = location.y / paneSize.height
+        if vertical < 0.28 { return .top }
+        if vertical > 0.72 { return .bottom }
+        if horizontal < 0.28 { return .leading }
+        if horizontal > 0.72 { return .trailing }
+        return .center
     }
 
     @ViewBuilder
@@ -1103,6 +1313,7 @@ private struct PaneView: View {
                 select: select,
                 toggleZoom: toggleZoom,
                 toggleFloating: toggleFloating,
+                rename: rename,
                 close: close
             )
                 .draggable(pane.id.uuidString)
@@ -1116,9 +1327,189 @@ private struct PaneView: View {
                 select: select,
                 toggleZoom: toggleZoom,
                 toggleFloating: toggleFloating,
+                rename: rename,
                 close: close
             )
         }
+    }
+}
+
+private struct QuickEditorPane: View {
+    @ObservedObject var pane: PaneModel
+
+    var body: some View {
+        QuickEditorContent(runtime: pane.editorRuntime)
+    }
+}
+
+private struct QuickEditorContent: View {
+    @ObservedObject var runtime: RemoteEditorRuntime
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if runtime.navigatorVisible {
+                EditorNavigator(runtime: runtime)
+                    .frame(width: 210)
+                Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(width: 1)
+            }
+            VStack(spacing: 0) {
+                editorToolbar
+                Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
+                MonacoEditorSurface(runtime: runtime)
+                editorStatus
+            }
+        }
+        .background(RelayTheme.canvas)
+    }
+
+    private var editorToolbar: some View {
+        HStack(spacing: 8) {
+            Button {
+                runtime.navigatorVisible.toggle()
+            } label: {
+                Image(systemName: "sidebar.left")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(RelayTheme.textMuted)
+            .help(runtime.navigatorVisible ? "Hide files" : "Show files")
+
+            if let path = runtime.currentPath {
+                Text(URL(fileURLWithPath: path).lastPathComponent)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(RelayTheme.text)
+                    .lineLimit(1)
+                if runtime.isDirty {
+                    Circle().fill(RelayTheme.textMuted).frame(width: 5, height: 5)
+                }
+            } else {
+                Text("Choose a file")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(RelayTheme.textMuted)
+            }
+            Spacer(minLength: 8)
+            if runtime.isBusy { ProgressView().controlSize(.mini).tint(RelayTheme.accent) }
+            Button(runtime.isDiff ? "Edit" : "Changes") { runtime.toggleDiff() }
+                .buttonStyle(.plain)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(runtime.currentPath == nil ? RelayTheme.textFaint : RelayTheme.textMuted)
+                .disabled(runtime.currentPath == nil)
+            Button("Save") { runtime.requestSave() }
+                .buttonStyle(.plain)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(runtime.isDirty ? RelayTheme.text : RelayTheme.textMuted)
+                .padding(.horizontal, 9)
+                .frame(height: 24)
+                .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 7))
+                .disabled(runtime.currentPath == nil)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 32)
+        .background(RelayTheme.canvas)
+    }
+
+    private var editorStatus: some View {
+        HStack(spacing: 8) {
+            if let error = runtime.operationError {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(RelayTheme.coral)
+                Text(error).foregroundStyle(RelayTheme.coral)
+            } else {
+                Text(runtime.status)
+                    .foregroundStyle(RelayTheme.textFaint)
+            }
+            Spacer()
+            if runtime.isDiff { Text("Diff") }
+            Text("UTF-8")
+        }
+        .font(.system(size: 9.5, weight: .medium))
+        .foregroundStyle(RelayTheme.textFaint)
+        .lineLimit(1)
+        .padding(.horizontal, 9)
+        .frame(height: 23)
+        .background(RelayTheme.surface.opacity(0.7))
+    }
+}
+
+private struct EditorNavigator: View {
+    @ObservedObject var runtime: RemoteEditorRuntime
+    @State private var query = ""
+
+    private var visibleEntries: [RemoteFileEntry] {
+        guard !query.isEmpty else { return runtime.entries }
+        return runtime.entries.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 7) {
+                Button { runtime.goUp() } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(runtime.directoryPath == runtime.workspacePath ? RelayTheme.textFaint : RelayTheme.textMuted)
+                .disabled(runtime.directoryPath == runtime.workspacePath)
+                Text(runtime.directoryPath.isEmpty ? "Files" : URL(fileURLWithPath: runtime.directoryPath).lastPathComponent)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(RelayTheme.text)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 7)
+            .frame(height: 31)
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(RelayTheme.textFaint)
+                TextField("Filter files", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(RelayTheme.text)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 27)
+            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 7))
+            .padding(.horizontal, 7)
+            .padding(.bottom, 6)
+
+            Rectangle().fill(RelayTheme.line.opacity(0.4)).frame(height: 1)
+            ScrollView {
+                LazyVStack(spacing: 1) {
+                    ForEach(visibleEntries) { entry in
+                        Button { runtime.openEntry(entry) } label: {
+                            HStack(spacing: 7) {
+                                Image(systemName: entry.directory ? "folder" : fileSymbol(entry.name))
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(entry.directory ? RelayTheme.blue : RelayTheme.textMuted)
+                                    .frame(width: 13)
+                                Text(entry.name)
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundStyle(RelayTheme.textMuted)
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 8)
+                            .frame(height: 25)
+                            .background(runtime.currentPath == entry.path ? RelayTheme.surface : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 6))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(5)
+            }
+        }
+        .background(RelayTheme.canvas)
+    }
+
+    private func fileSymbol(_ name: String) -> String {
+        let suffix = URL(fileURLWithPath: name).pathExtension.lowercased()
+        return ["swift", "go", "rs", "py", "r", "js", "ts", "c", "cpp"].contains(suffix)
+            ? "chevron.left.forwardslash.chevron.right" : "doc"
     }
 }
 
@@ -1209,6 +1600,7 @@ private struct ConnectionPath: View {
     let select: () -> Void
     let toggleZoom: (() -> Void)?
     let toggleFloating: (() -> Void)?
+    let rename: (() -> Void)?
     let close: (() -> Void)?
     @ObservedObject private var preferences = RelayPreferences.shared
 
@@ -1225,11 +1617,20 @@ private struct ConnectionPath: View {
                     .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
             }
-            if pane.kind != .shell {
+            if pane.contentKind == .editor {
+                Label("Editor", systemImage: "curlybraces")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(RelayTheme.blue)
+            } else if pane.kind != .shell {
                 Label(pane.activeSubagents > 0 ? String(pane.activeSubagents) + " agents" : pane.kind.label,
                       systemImage: pane.kind.symbol)
                     .font(.system(size: 9.5, weight: .semibold))
                     .foregroundStyle(pane.phase.color)
+                Text(pane.activitySummary)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1)
+                    .layoutPriority(-1)
             }
             Spacer(minLength: 8)
             if pane.connectionState != .connected {
@@ -1274,6 +1675,19 @@ private struct ConnectionPath: View {
         .onTapGesture(perform: select)
         .onTapGesture(count: 2) { toggleZoom?() }
         .contextMenu {
+            if let rename { Button("Rename pane…", action: rename) }
+            if pane.contentKind == .terminal {
+                Menu("Agent type") {
+                    ForEach(AgentKind.allCases, id: \.self) { kind in
+                        Button {
+                            pane.setAgentKind(kind)
+                        } label: {
+                            Label(kind.label, systemImage: pane.kind == kind ? "checkmark" : kind.symbol)
+                        }
+                    }
+                }
+            }
+            if rename != nil || pane.contentKind == .terminal { Divider() }
             if let toggleZoom { Button(zoomed ? "Restore pane layout" : "Zoom pane", action: toggleZoom) }
             if let toggleFloating { Button(isFloating ? "Dock pane" : "Float pane", action: toggleFloating) }
             if let close { Button(pane.profile.kind == .ssh ? "Detach pane" : "Close pane", action: close) }
@@ -1283,16 +1697,17 @@ private struct ConnectionPath: View {
 
 private struct ConnectingOverlay: View {
     let host: String
+    let contentKind: PaneContentKind
 
     var body: some View {
         VStack(spacing: 13) {
             ProgressView()
                 .controlSize(.small)
                 .tint(RelayTheme.accent)
-            Text("Opening remote session")
+            Text(contentKind == .editor ? "Opening remote workspace" : "Opening remote session")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(RelayTheme.text)
-            Text("\(host)  →  native terminal")
+            Text(contentKind == .editor ? "\(host)  →  code editor" : "\(host)  →  native terminal")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textMuted)
         }
@@ -1304,6 +1719,7 @@ private struct ConnectingOverlay: View {
 
 private struct ConnectionErrorBanner: View {
     let message: String
+    var retry: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 9) {
@@ -1319,6 +1735,15 @@ private struct ConnectionErrorBanner: View {
                     .lineLimit(2)
             }
             Spacer()
+            if let retry {
+                Button("Retry", action: retry)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(RelayTheme.text)
+                    .padding(.horizontal, 10)
+                    .frame(height: 26)
+                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 7))
+            }
         }
         .padding(11)
         .background(RelayTheme.surface.opacity(0.96), in: RoundedRectangle(cornerRadius: 10))

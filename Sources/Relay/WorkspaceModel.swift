@@ -12,11 +12,15 @@ final class WorkspaceModel: ObservableObject {
     @Published var isFullScreen = false
     @Published var zoomedPaneID: UUID?
     @Published var draftProfile = ConnectionProfile()
+    @Published var renameTarget: WorkspaceRenameTarget?
+    @Published var renameDraft = ""
+    @Published private(set) var sessionNames: [UUID: String] = [:]
 
     let profileStore = ProfileStore()
     private(set) var panes: [UUID: PaneModel] = [:]
     private let workspaceKey = "relay.workspace.v1"
     private var sidebarBeforeFullScreen = true
+    private var persistenceTask: Task<Void, Never>?
 
     init() {
         if !restoreWorkspace() {
@@ -34,6 +38,46 @@ final class WorkspaceModel: ObservableObject {
 
     var selectedPanes: [PaneModel] {
         selectedTab?.allPaneIDs.compactMap { panes[$0] } ?? []
+    }
+
+    func sessionDisplayName(_ sessionID: UUID, fallback: String) -> String {
+        sessionNames[sessionID] ?? fallback
+    }
+
+    func beginRenameSession(_ sessionID: UUID, fallback: String) {
+        renameDraft = sessionDisplayName(sessionID, fallback: fallback)
+        renameTarget = .session(sessionID)
+    }
+
+    func beginRenameTab(_ tabID: UUID) {
+        guard let tab = tabs.first(where: { $0.id == tabID }) else { return }
+        renameDraft = tab.name
+        renameTarget = .tab(tabID)
+    }
+
+    func beginRenamePane(_ paneID: UUID) {
+        guard let pane = panes[paneID] else { return }
+        renameDraft = pane.displayName
+        renameTarget = .pane(paneID)
+    }
+
+    func cancelRename() {
+        renameTarget = nil
+        renameDraft = ""
+    }
+
+    func commitRename() {
+        guard let renameTarget else { return }
+        let name = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        switch renameTarget {
+        case .session(let id): sessionNames[id] = name
+        case .tab(let id): tabs.first(where: { $0.id == id })?.name = name
+        case .pane(let id): panes[id]?.customName = name
+        }
+        self.renameTarget = nil
+        renameDraft = ""
+        persistWorkspace()
     }
 
     func presentConnectionSheet(prefilling profile: ConnectionProfile? = nil) {
@@ -61,7 +105,7 @@ final class WorkspaceModel: ObservableObject {
     func newTab(profile: ConnectionProfile) {
         let pane = PaneModel(profile: profile)
         panes[pane.id] = pane
-        let tab = TabModel(name: profile.name, firstPane: pane.id)
+        let tab = TabModel(sessionID: UUID(), name: profile.name, firstPane: pane.id)
         tabs.append(tab)
         selectedTabID = tab.id
         activePaneID = pane.id
@@ -70,7 +114,38 @@ final class WorkspaceModel: ObservableObject {
         persistWorkspace()
         Task { @MainActor in
             await Task.yield()
-            pane.runtime.focus()
+            pane.focus()
+        }
+    }
+
+    func newTabInActiveSession() {
+        guard let selectedTab else { return }
+        newTab(inSession: selectedTab.sessionID)
+    }
+
+    func newTab(inSession sessionID: UUID) {
+        let sessionTabs = tabs.filter { $0.sessionID == sessionID }
+        guard let sourceTab = sessionTabs.first,
+              let sourcePaneID = (selectedTab?.sessionID == sessionID ? activePaneID : sourceTab.allPaneIDs.first),
+              let sourcePane = panes[sourcePaneID] else { return }
+        let parentSessionID = sourcePane.profile.kind == .ssh && sourcePane.profile.backend == .relay
+            ? (sourcePane.contentKind == .terminal ? sourcePane.id.uuidString.lowercased() : sourcePane.remoteParentSessionID)
+            : nil
+        let pane = PaneModel(profile: sourcePane.profile, remoteParentSessionID: parentSessionID)
+        panes[pane.id] = pane
+        let ordinal = sessionTabs.count + 1
+        let tab = TabModel(
+            sessionID: sessionID,
+            name: ordinal == 1 ? sourcePane.profile.name : "\(sourcePane.profile.name) \(ordinal)",
+            firstPane: pane.id
+        )
+        tabs.append(tab)
+        selectedTabID = tab.id
+        activePaneID = pane.id
+        persistWorkspace()
+        Task { @MainActor in
+            await Task.yield()
+            pane.focus()
         }
     }
 
@@ -95,6 +170,53 @@ final class WorkspaceModel: ObservableObject {
         persistWorkspace()
     }
 
+    func openEditorForActive() {
+        guard let tab = selectedTab,
+              let active = activePane,
+              active.profile.kind == .ssh,
+              active.profile.backend == .relay else { return }
+        let parentSessionID = active.contentKind == .terminal
+            ? active.id.uuidString.lowercased()
+            : active.remoteParentSessionID
+        let pane = PaneModel(
+            profile: active.profile,
+            contentKind: .editor,
+            remoteParentSessionID: parentSessionID
+        )
+        panes[pane.id] = pane
+        tab.layout = tab.layout.splitting(active.id, axis: .horizontal, with: pane.id)
+        tab.balanceSplits()
+        activePaneID = pane.id
+        persistWorkspace()
+    }
+
+    func openRemoteFile(_ open: RemoteFileOpenRequest) {
+        guard let tab = selectedTab else { return }
+        if let existingID = tab.allPaneIDs.first(where: { id in
+            guard let pane = panes[id] else { return false }
+            return pane.contentKind == .editor && pane.profile.connectionKey == open.profile.connectionKey
+        }), let editor = panes[existingID] {
+            activePaneID = existingID
+            editor.editorRequest = open.request
+            editor.editorRuntime.open(open.request)
+            editor.focus()
+            persistWorkspace()
+            return
+        }
+        guard let activePaneID else { return }
+        let pane = PaneModel(
+            profile: open.profile,
+            contentKind: .editor,
+            remoteParentSessionID: open.parentSessionID,
+            editorRequest: open.request
+        )
+        panes[pane.id] = pane
+        tab.layout = tab.layout.splitting(activePaneID, axis: .horizontal, with: pane.id)
+        tab.balanceSplits()
+        self.activePaneID = pane.id
+        persistWorkspace()
+    }
+
     func swapTiledPanes(_ firstID: UUID, _ secondID: UUID) {
         guard firstID != secondID,
               let tab = selectedTab,
@@ -105,8 +227,36 @@ final class WorkspaceModel: ObservableObject {
         persistWorkspace()
         Task { @MainActor in
             await Task.yield()
-            panes[firstID]?.runtime.focus()
+            panes[firstID]?.focus()
         }
+    }
+
+    func movePane(_ paneID: UUID, to targetID: UUID, placement: PaneDropPlacement) {
+        guard paneID != targetID, let tab = selectedTab, tab.layout.paneIDs.contains(targetID) else { return }
+        let wasTiled = tab.layout.paneIDs.contains(paneID)
+        if placement == .center, wasTiled {
+            swapTiledPanes(paneID, targetID)
+            return
+        }
+        let baseLayout: PaneLayout
+        if wasTiled {
+            guard let removed = tab.layout.removing(paneID) else { return }
+            baseLayout = removed
+        } else if let floatingIndex = tab.floatingPanes.firstIndex(where: { $0.paneID == paneID }) {
+            tab.floatingPanes.remove(at: floatingIndex)
+            baseLayout = tab.layout
+        } else {
+            return
+        }
+        let effectivePlacement = placement == .center ? .trailing : placement
+        let axis: SplitAxis = effectivePlacement == .top || effectivePlacement == .bottom ? .vertical : .horizontal
+        let first = effectivePlacement == .leading || effectivePlacement == .top
+        tab.layout = baseLayout.splitting(targetID, axis: axis, with: paneID, newPaneFirst: first)
+        tab.balanceSplits()
+        activePaneID = paneID
+        zoomedPaneID = nil
+        persistWorkspace()
+        panes[paneID]?.focus()
     }
 
     func newFloatingPane(profile: ConnectionProfile? = nil) {
@@ -122,7 +272,7 @@ final class WorkspaceModel: ObservableObject {
         persistWorkspace()
         Task { @MainActor in
             await Task.yield()
-            pane.runtime.focus()
+            pane.focus()
         }
     }
 
@@ -145,7 +295,7 @@ final class WorkspaceModel: ObservableObject {
     func toggleActivePaneZoom() {
         guard let activePaneID else { return }
         zoomedPaneID = zoomedPaneID == activePaneID ? nil : activePaneID
-        panes[activePaneID]?.runtime.focus()
+        panes[activePaneID]?.focus()
     }
 
     func togglePaneZoom(_ paneID: UUID) {
@@ -185,7 +335,7 @@ final class WorkspaceModel: ObservableObject {
         activePaneID = paneID
         zoomedPaneID = nil
         persistWorkspace()
-        panes[paneID]?.runtime.focus()
+        panes[paneID]?.focus()
     }
 
     func closeActivePane() {
@@ -193,7 +343,7 @@ final class WorkspaceModel: ObservableObject {
         if zoomedPaneID == activePaneID { zoomedPaneID = nil }
         if let floatingIndex = tab.floatingPanes.firstIndex(where: { $0.paneID == activePaneID }) {
             tab.floatingPanes.remove(at: floatingIndex)
-            panes[activePaneID]?.runtime.stop()
+            panes[activePaneID]?.stopRuntime()
             panes.removeValue(forKey: activePaneID)
             self.activePaneID = tab.allPaneIDs.first
             persistWorkspace()
@@ -205,7 +355,7 @@ final class WorkspaceModel: ObservableObject {
         }
         tab.layout = tab.layout.removing(activePaneID) ?? tab.layout
         tab.balanceSplits()
-        panes[activePaneID]?.runtime.stop()
+        panes[activePaneID]?.stopRuntime()
         panes.removeValue(forKey: activePaneID)
         self.activePaneID = tab.layout.paneIDs.first
         persistWorkspace()
@@ -216,7 +366,7 @@ final class WorkspaceModel: ObservableObject {
         let ids = tabs[index].allPaneIDs
         if let zoomedPaneID, ids.contains(zoomedPaneID) { self.zoomedPaneID = nil }
         for paneID in ids {
-            panes[paneID]?.runtime.stop()
+            panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
         }
         tabs.remove(at: index)
@@ -227,6 +377,28 @@ final class WorkspaceModel: ObservableObject {
             selectedTabID = tabs[nextIndex].id
             activePaneID = tabs[nextIndex].layout.paneIDs.first
         }
+        persistWorkspace()
+    }
+
+    func closeSession(_ sessionID: UUID) {
+        let closingTabs = tabs.filter { $0.sessionID == sessionID }
+        guard !closingTabs.isEmpty else { return }
+        let closingTabIDs = Set(closingTabs.map(\.id))
+        let closingPaneIDs = closingTabs.flatMap(\.allPaneIDs)
+        for paneID in closingPaneIDs {
+            panes[paneID]?.stopRuntime()
+            panes.removeValue(forKey: paneID)
+        }
+        tabs.removeAll { closingTabIDs.contains($0.id) }
+        sessionNames.removeValue(forKey: sessionID)
+        if tabs.isEmpty {
+            newTab(profile: .local)
+            return
+        }
+        let next = tabs[0]
+        selectedTabID = next.id
+        activePaneID = next.layout.paneIDs.first
+        zoomedPaneID = nil
         persistWorkspace()
     }
 
@@ -254,7 +426,7 @@ final class WorkspaceModel: ObservableObject {
         guard !ids.isEmpty else { return }
         let current = ids.firstIndex(of: activePaneID ?? ids[0]) ?? 0
         activePaneID = ids[(current + offset + ids.count) % ids.count]
-        panes[activePaneID!]?.runtime.focus()
+        panes[activePaneID!]?.focus()
         persistWorkspace()
     }
 
@@ -276,8 +448,10 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func shutdown() {
-        persistWorkspace()
-        panes.values.forEach { $0.runtime.stop() }
+        persistenceTask?.cancel()
+        persistenceTask = nil
+        persistWorkspaceNow()
+        panes.values.forEach { $0.stopRuntime() }
     }
 
     @discardableResult
@@ -287,7 +461,14 @@ final class WorkspaceModel: ObservableObject {
               !snapshot.tabs.isEmpty else { return false }
 
         for savedPane in snapshot.panes {
-            panes[savedPane.id] = PaneModel(id: savedPane.id, profile: savedPane.profile)
+            panes[savedPane.id] = PaneModel(
+                id: savedPane.id,
+                profile: savedPane.profile,
+                contentKind: savedPane.contentKind ?? .terminal,
+                remoteParentSessionID: savedPane.remoteParentSessionID,
+                editorRequest: savedPane.editorRequest,
+                customName: savedPane.customName
+            )
         }
         let restoredTabs = snapshot.tabs.compactMap { saved -> TabModel? in
             let floatingPanes = saved.floatingPanes ?? []
@@ -295,6 +476,7 @@ final class WorkspaceModel: ObservableObject {
             guard allPaneIDs.allSatisfy({ panes[$0] != nil }) else { return nil }
             let tab = TabModel(
                 id: saved.id,
+                sessionID: saved.sessionID ?? saved.id,
                 name: saved.name,
                 firstPane: saved.layout.paneIDs[0],
                 floatingPanes: floatingPanes
@@ -309,6 +491,7 @@ final class WorkspaceModel: ObservableObject {
             return false
         }
         tabs = restoredTabs
+        sessionNames = snapshot.sessionNames ?? [:]
         selectedTabID = restoredTabs.contains(where: { $0.id == snapshot.selectedTabID })
             ? snapshot.selectedTabID : restoredTabs[0].id
         let validPaneIDs = Set(restoredTabs.flatMap(\.allPaneIDs))
@@ -318,11 +501,22 @@ final class WorkspaceModel: ObservableObject {
     }
 
     private func persistWorkspace() {
+        persistenceTask?.cancel()
+        persistenceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard let self, !Task.isCancelled else { return }
+            self.persistenceTask = nil
+            self.persistWorkspaceNow()
+        }
+    }
+
+    private func persistWorkspaceNow() {
         let usedPaneIDs = Set(tabs.flatMap(\.allPaneIDs))
         let snapshot = WorkspaceSnapshot(
             tabs: tabs.map {
                 TabSnapshot(
                     id: $0.id,
+                    sessionID: $0.sessionID,
                     name: $0.name,
                     layout: $0.layout,
                     floatingPanes: $0.floatingPanes,
@@ -330,8 +524,18 @@ final class WorkspaceModel: ObservableObject {
                 )
             },
             panes: usedPaneIDs.compactMap { id in
-                panes[id].map { PaneSnapshot(id: id, profile: $0.profile) }
+                panes[id].map {
+                    PaneSnapshot(
+                        id: id,
+                        profile: $0.profile,
+                        contentKind: $0.contentKind,
+                        remoteParentSessionID: $0.remoteParentSessionID,
+                        editorRequest: $0.editorRequest,
+                        customName: $0.customName
+                    )
+                }
             },
+            sessionNames: sessionNames,
             selectedTabID: selectedTabID,
             activePaneID: activePaneID
         )
@@ -343,12 +547,14 @@ final class WorkspaceModel: ObservableObject {
 private struct WorkspaceSnapshot: Codable {
     let tabs: [TabSnapshot]
     let panes: [PaneSnapshot]
+    let sessionNames: [UUID: String]?
     let selectedTabID: UUID?
     let activePaneID: UUID?
 }
 
 private struct TabSnapshot: Codable {
     let id: UUID
+    let sessionID: UUID?
     let name: String
     let layout: PaneLayout
     let floatingPanes: [FloatingPanePlacement]?
@@ -358,4 +564,8 @@ private struct TabSnapshot: Codable {
 private struct PaneSnapshot: Codable {
     let id: UUID
     let profile: ConnectionProfile
+    let contentKind: PaneContentKind?
+    let remoteParentSessionID: String?
+    let editorRequest: EditorOpenRequest?
+    let customName: String?
 }

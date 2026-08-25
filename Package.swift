@@ -18,7 +18,13 @@ let package = Package(
             dependencies: [
                 .product(name: "GhosttyTerminal", package: "libghostty-spm")
             ],
-            path: "Sources/Relay"
+            path: "Sources/Relay",
+            resources: [
+                .copy("Resources/Editor")
+            ],
+            linkerSettings: [
+                .linkedFramework("WebKit")
+            ]
         ),
         .executableTarget(
             name: "RelayBridge",

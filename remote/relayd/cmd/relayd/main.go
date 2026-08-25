@@ -19,8 +19,17 @@ import (
 )
 
 func main() {
+	invocation := filepath.Base(os.Args[0])
+	if invocation == "rcode" {
+		runRCode(os.Args[1:])
+		return
+	}
+	if invocation == "claude" || invocation == "codex" {
+		runAgent(append([]string{invocation}, os.Args[1:]...))
+		return
+	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|attach|event|agent|artifact>")
+		fatal("usage: relayd <daemon|attach|event|agent|artifact|files>")
 	}
 	switch os.Args[1] {
 	case "daemon":
@@ -35,10 +44,113 @@ func main() {
 		runAgent(os.Args[2:])
 	case "artifact":
 		runArtifact(os.Args[2:])
+	case "files":
+		runFiles(os.Args[2:])
 	case "--version", "version":
-		fmt.Println("relayd 0.2.0")
+		fmt.Println("relayd 0.3.1")
 	default:
 		fatal("unknown command: " + os.Args[1])
+	}
+}
+
+func runRCode(arguments []string) {
+	flags := flag.NewFlagSet("rcode", flag.ExitOnError)
+	diff := flags.Bool("diff", false, "open a diff; one path compares with Git HEAD, two paths compare with each other")
+	_ = flags.Parse(arguments)
+	paths := flags.Args()
+	if len(paths) == 0 || len(paths) > 2 || !*diff && len(paths) != 1 {
+		fatal("usage: rcode [--diff] <file> [other-file]")
+	}
+	resolved := make([]string, 0, len(paths))
+	for _, path := range paths {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			fatal(err.Error())
+		}
+		canonical, err := filepath.EvalSymlinks(absolute)
+		if err != nil {
+			fatal(err.Error())
+		}
+		info, err := os.Stat(canonical)
+		if err != nil || !info.Mode().IsRegular() {
+			fatal("not a regular file: " + path)
+		}
+		resolved = append(resolved, canonical)
+	}
+	session := os.Getenv("RELAY_SESSION")
+	if session == "" {
+		fatal("rcode must run inside a Relay-managed terminal pane")
+	}
+	event, err := json.Marshal(struct {
+		Type  string   `json:"type"`
+		Paths []string `json:"paths"`
+		Diff  bool     `json:"diff"`
+	}{Type: "open_file", Paths: resolved, Diff: *diff})
+	if err != nil {
+		fatal(err.Error())
+	}
+	envelope, err := json.Marshal(struct {
+		Agent string          `json:"agent"`
+		Event json.RawMessage `json:"event"`
+	}{Agent: "relay", Event: event})
+	if err != nil {
+		fatal(err.Error())
+	}
+	connection, err := connectOrStart(defaultSocket())
+	if err != nil {
+		fatal(err.Error())
+	}
+	defer connection.Close()
+	writer := protocol.NewWriter(connection)
+	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
+		Version: 1, SessionID: session, EventOnly: true,
+	})
+	if err := writer.Write(hello); err != nil {
+		fatal(err.Error())
+	}
+	if err := writer.Write(protocol.Frame{Type: protocol.AgentEvent, Payload: envelope}); err != nil {
+		fatal(err.Error())
+	}
+}
+
+func runFiles(arguments []string) {
+	if len(arguments) == 0 {
+		fatal("usage: relayd files <workspace|list|read|write|git-diff>")
+	}
+	flags := flag.NewFlagSet("files "+arguments[0], flag.ExitOnError)
+	pathBase64 := flags.String("path-b64", "", "base64-encoded absolute path")
+	parentSession := flags.String("parent-session", "", "terminal session whose working directory should be used")
+	expectedModificationNS := flags.Int64("expected-modification-ns", 0, "mtime used for conflict detection")
+	_ = flags.Parse(arguments[1:])
+	path := ""
+	if *pathBase64 != "" {
+		var err error
+		path, err = daemon.DecodePath(*pathBase64)
+		if err != nil {
+			fatal(err.Error())
+		}
+	}
+	var value any
+	var err error
+	switch arguments[0] {
+	case "workspace":
+		value, err = daemon.ResolveWorkspace(*parentSession, path)
+	case "list":
+		value, err = daemon.ListDirectory(path)
+	case "read":
+		value, err = daemon.ReadEditorFile(path)
+	case "write":
+		value, err = daemon.WriteEditorFile(path, *expectedModificationNS, os.Stdin)
+	case "git-diff":
+		value, err = daemon.ReadGitDiff(path)
+	default:
+		fatal("usage: relayd files <workspace|list|read|write|git-diff>")
+	}
+	if err != nil {
+		fatal(err.Error())
+	}
+	if err := daemon.EncodeJSON(os.Stdout, value); err != nil {
+		fatal(err.Error())
 	}
 }
 
@@ -146,7 +258,7 @@ func runClaude(arguments []string) {
 	if err := os.WriteFile(settingsPath, []byte(claudeHookSettings), 0o600); err != nil {
 		fatal(err.Error())
 	}
-	executable, err := exec.LookPath("claude")
+	executable, err := findRealAgentExecutable("claude")
 	if err != nil {
 		fatal("claude is not available on PATH")
 	}
@@ -170,7 +282,7 @@ func runCodex(arguments []string) {
 	if err := os.WriteFile(profilePath, []byte(codexHookProfile), 0o600); err != nil {
 		fatal(err.Error())
 	}
-	executable, err := exec.LookPath("codex")
+	executable, err := findRealAgentExecutable("codex")
 	if err != nil {
 		fatal("codex is not available on PATH")
 	}
@@ -179,6 +291,35 @@ func runCodex(arguments []string) {
 	if err := syscall.Exec(executable, codexArguments, os.Environ()); err != nil {
 		fatal(err.Error())
 	}
+}
+
+func findRealAgentExecutable(name string) (string, error) {
+	selfPath, selfErr := os.Executable()
+	var selfInfo os.FileInfo
+	if selfErr == nil {
+		selfInfo, _ = os.Stat(selfPath)
+	}
+	for _, directory := range filepath.SplitList(os.Getenv("PATH")) {
+		if directory == "" {
+			directory = "."
+		}
+		candidate := filepath.Join(directory, name)
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			continue
+		}
+		if selfInfo != nil && os.SameFile(selfInfo, info) {
+			continue
+		}
+		if !filepath.IsAbs(candidate) {
+			candidate, err = filepath.Abs(candidate)
+			if err != nil {
+				continue
+			}
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("%s is not available on PATH", name)
 }
 
 const codexHookCommand = `if [ -n "$RELAY_SESSION" ]; then ~/.local/bin/relayd event --session "$RELAY_SESSION" --agent codex; fi`

@@ -35,6 +35,29 @@ func splitSwap() {
     #expect(layout.swapping(a, c).paneIDs == [c, b, a])
 }
 
+@Test("Pane insertion preserves all four directional drop orders")
+func directionalPaneInsertion() {
+    let a = UUID()
+    let b = UUID()
+    let left = PaneLayout.pane(a).splitting(a, axis: .horizontal, with: b, newPaneFirst: true)
+    let right = PaneLayout.pane(a).splitting(a, axis: .horizontal, with: b)
+    let top = PaneLayout.pane(a).splitting(a, axis: .vertical, with: b, newPaneFirst: true)
+    let bottom = PaneLayout.pane(a).splitting(a, axis: .vertical, with: b)
+
+    #expect(left.paneIDs == [b, a])
+    #expect(right.paneIDs == [a, b])
+    #expect(top.paneIDs == [b, a])
+    #expect(bottom.paneIDs == [a, b])
+
+    guard case .split(_, let bottomAxis, .pane(let upper), .pane(let lower)) = bottom else {
+        Issue.record("Bottom drop did not create a split")
+        return
+    }
+    #expect(bottomAxis == .vertical)
+    #expect(upper == a)
+    #expect(lower == b)
+}
+
 @Test("Image paths are detected once in agent output")
 func imagePathDetection() {
     var detector = ImagePathDetector()
@@ -68,6 +91,64 @@ func tabIncludesFloatingPanes() {
     )
 
     #expect(tab.allPaneIDs == [tiled, floating])
+}
+
+@MainActor
+@Test("Remote editors join the active tab and inherit its pane session")
+func remoteEditorPane() {
+    let workspace = WorkspaceModel()
+    let profile = ConnectionProfile.sshConfigHost("editor-test-host")
+    workspace.newTab(profile: profile)
+    let terminalID = workspace.activePaneID
+
+    workspace.openEditorForActive()
+
+    let editor = workspace.activePane
+    #expect(editor?.contentKind == .editor)
+    #expect(editor?.remoteParentSessionID == terminalID?.uuidString.lowercased())
+    #expect(workspace.selectedTab?.layout.paneIDs.count == 2)
+    workspace.shutdown()
+}
+
+@MainActor
+@Test("A session owns multiple tabs with separate pane workers")
+func multipleTabsPerSession() {
+    let workspace = WorkspaceModel()
+    workspace.newTab(profile: .sshConfigHost("tabs-test-host"))
+    let firstTab = workspace.selectedTab
+    let firstPaneID = workspace.activePaneID
+
+    workspace.newTabInActiveSession()
+
+    #expect(workspace.selectedTab?.sessionID == firstTab?.sessionID)
+    #expect(workspace.tabs.filter { $0.sessionID == firstTab?.sessionID }.count == 2)
+    #expect(workspace.activePane?.remoteParentSessionID == firstPaneID?.uuidString.lowercased())
+    workspace.shutdown()
+}
+
+@MainActor
+@Test("Sessions, tabs, and panes can be renamed independently")
+func workspaceRenaming() {
+    let workspace = WorkspaceModel()
+    workspace.newTab(profile: .sshConfigHost("rename-test-host"))
+    let sessionID = workspace.selectedTab!.sessionID
+    let tabID = workspace.selectedTab!.id
+    let paneID = workspace.activePaneID!
+
+    workspace.beginRenameSession(sessionID, fallback: "Session")
+    workspace.renameDraft = "Research"
+    workspace.commitRename()
+    workspace.beginRenameTab(tabID)
+    workspace.renameDraft = "Training"
+    workspace.commitRename()
+    workspace.beginRenamePane(paneID)
+    workspace.renameDraft = "Codex run"
+    workspace.commitRename()
+
+    #expect(workspace.sessionDisplayName(sessionID, fallback: "Session") == "Research")
+    #expect(workspace.tabs.first(where: { $0.id == tabID })?.name == "Training")
+    #expect(workspace.panes[paneID]?.displayName == "Codex run")
+    workspace.shutdown()
 }
 
 @MainActor
@@ -143,6 +224,10 @@ func structuredCodexEvent() {
     pane.receivedAgentEvent(Data(event.utf8))
     #expect(pane.kind == .codex)
     #expect(pane.phase == .active)
+
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"PreToolUse","tool_name":"exec_command"}}"#.utf8))
+    #expect(pane.activitySummary == "Using exec_command")
+    #expect(pane.agentActivities.last?.label == "Using exec_command")
 }
 
 @MainActor

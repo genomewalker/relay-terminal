@@ -6,6 +6,28 @@ enum SplitAxis: String, Codable, Sendable {
     case vertical
 }
 
+enum PaneDropPlacement: Sendable {
+    case leading
+    case trailing
+    case top
+    case bottom
+    case center
+}
+
+enum WorkspaceRenameTarget: Equatable, Sendable {
+    case session(UUID)
+    case tab(UUID)
+    case pane(UUID)
+
+    var title: String {
+        switch self {
+        case .session: "Rename session"
+        case .tab: "Rename tab"
+        case .pane: "Rename pane"
+        }
+    }
+}
+
 indirect enum PaneLayout: Codable, Equatable, Sendable {
     case pane(UUID)
     case split(id: UUID, axis: SplitAxis, first: PaneLayout, second: PaneLayout)
@@ -19,18 +41,28 @@ indirect enum PaneLayout: Codable, Equatable, Sendable {
         }
     }
 
-    func splitting(_ target: UUID, axis: SplitAxis, with newPane: UUID) -> PaneLayout {
+    func splitting(
+        _ target: UUID,
+        axis: SplitAxis,
+        with newPane: UUID,
+        newPaneFirst: Bool = false
+    ) -> PaneLayout {
         switch self {
         case .pane(let id) where id == target:
-            return .split(id: UUID(), axis: axis, first: .pane(id), second: .pane(newPane))
+            return .split(
+                id: UUID(),
+                axis: axis,
+                first: .pane(newPaneFirst ? newPane : id),
+                second: .pane(newPaneFirst ? id : newPane)
+            )
         case .pane:
             return self
         case .split(let id, let existingAxis, let first, let second):
             return .split(
                 id: id,
                 axis: existingAxis,
-                first: first.splitting(target, axis: axis, with: newPane),
-                second: second.splitting(target, axis: axis, with: newPane)
+                first: first.splitting(target, axis: axis, with: newPane, newPaneFirst: newPaneFirst),
+                second: second.splitting(target, axis: axis, with: newPane, newPaneFirst: newPaneFirst)
             )
         }
     }
@@ -118,6 +150,36 @@ enum RemoteSessionBackend: String, Codable, CaseIterable, Identifiable, Sendable
         case .direct: "Ends when SSH disconnects"
         }
     }
+}
+
+enum PaneContentKind: String, Codable, Sendable {
+    case terminal
+    case editor
+
+    var label: String {
+        switch self {
+        case .terminal: "Terminal"
+        case .editor: "Editor"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .terminal: "terminal"
+        case .editor: "curlybraces"
+        }
+    }
+}
+
+struct EditorOpenRequest: Codable, Equatable, Sendable {
+    let paths: [String]
+    let diff: Bool
+}
+
+struct RemoteFileOpenRequest: Sendable {
+    let profile: ConnectionProfile
+    let parentSessionID: String
+    let request: EditorOpenRequest
 }
 
 struct ConnectionProfile: Identifiable, Codable, Equatable, Sendable {
@@ -221,7 +283,7 @@ struct ConnectionProfile: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
-enum AgentKind: String, Codable, Sendable {
+enum AgentKind: String, Codable, CaseIterable, Sendable {
     case shell
     case claude
     case codex
@@ -312,6 +374,13 @@ struct SubagentActivity: Identifiable, Equatable, Sendable {
     let startedAt: Date
 }
 
+struct AgentActivityItem: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let label: String
+    let phase: AgentPhase
+    let occurredAt: Date
+}
+
 struct AgentSignalDetector: Sendable {
     private(set) var kind: AgentKind = .shell
     private(set) var phase: AgentPhase = .connecting
@@ -382,24 +451,41 @@ struct AgentSignalDetector: Sendable {
 final class PaneModel: ObservableObject, Identifiable {
     let id: UUID
     let profile: ConnectionProfile
+    let contentKind: PaneContentKind
     @Published var title: String
+    @Published var customName: String?
     @Published var directory: String?
-    @Published var detector = AgentSignalDetector()
-    @Published var lastActivity = Date()
+    private(set) var detector = AgentSignalDetector()
+    private(set) var lastActivity = Date()
     @Published var activeSubagents = 0
     @Published var subagents: [SubagentActivity] = []
+    @Published var agentActivities: [AgentActivityItem] = []
     @Published var connectionState: PaneConnectionState
     @Published var remoteExitCode: Int?
     @Published var artifacts: [PaneArtifact] = []
     @Published var artifactError: String?
+    @Published var editorRequest: EditorOpenRequest?
     let remoteParentSessionID: String?
+    private var quietTask: Task<Void, Never>?
+    private var lastActivityPublish = Date.distantPast
     lazy var runtime = TerminalRuntime(pane: self)
+    lazy var editorRuntime = RemoteEditorRuntime(pane: self)
 
-    init(id: UUID = UUID(), profile: ConnectionProfile, remoteParentSessionID: String? = nil) {
+    init(
+        id: UUID = UUID(),
+        profile: ConnectionProfile,
+        contentKind: PaneContentKind = .terminal,
+        remoteParentSessionID: String? = nil,
+        editorRequest: EditorOpenRequest? = nil,
+        customName: String? = nil
+    ) {
         self.id = id
         self.profile = profile
+        self.contentKind = contentKind
         self.remoteParentSessionID = remoteParentSessionID
-        self.title = profile.name
+        self.editorRequest = editorRequest
+        self.customName = customName
+        self.title = contentKind == .editor ? "Editor" : profile.name
         self.remoteExitCode = nil
         self.connectionState = profile.kind == .ssh && profile.backend == .relay
             ? .connecting
@@ -408,16 +494,49 @@ final class PaneModel: ObservableObject, Identifiable {
 
     var kind: AgentKind { detector.kind }
     var phase: AgentPhase { detector.phase }
+    var displayName: String { customName ?? title }
+    var activitySummary: String { detector.excerpt }
+
+    func focus() {
+        switch contentKind {
+        case .terminal: runtime.focus()
+        case .editor: editorRuntime.focus()
+        }
+    }
+
+    func stopRuntime() {
+        switch contentKind {
+        case .terminal: runtime.stop()
+        case .editor: editorRuntime.stop()
+        }
+    }
+
+    func restartRuntime() {
+        switch contentKind {
+        case .terminal: runtime.restart()
+        case .editor: editorRuntime.restart()
+        }
+    }
 
     func received(_ text: String) {
-        connectionState = .connected
+        if connectionState != .connected { connectionState = .connected }
+        let previousKind = detector.kind
+        let previousPhase = detector.phase
+        let previousExcerpt = detector.excerpt
         detector.ingest(text)
-        lastActivity = Date()
-        let stamp = lastActivity
-        Task { @MainActor [weak self] in
+        let now = Date()
+        lastActivity = now
+        if previousKind != detector.kind || previousPhase != detector.phase ||
+            previousExcerpt != detector.excerpt && now.timeIntervalSince(lastActivityPublish) >= 0.25 {
+            lastActivityPublish = now
+            objectWillChange.send()
+        }
+        quietTask?.cancel()
+        quietTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(1.4))
-            guard let self, self.lastActivity == stamp else { return }
+            guard let self, !Task.isCancelled else { return }
             self.detector.markQuiet()
+            self.objectWillChange.send()
         }
     }
 
@@ -466,6 +585,20 @@ final class PaneModel: ObservableObject, Identifiable {
         guard let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let agentName = envelope["agent"] as? String,
               let event = envelope["event"] as? [String: Any] else { return }
+        if agentName == "relay",
+           event["type"] as? String == "open_file",
+           let paths = event["paths"] as? [String],
+           !paths.isEmpty {
+            NotificationCenter.default.post(
+                name: .relayOpenRemoteFile,
+                object: RemoteFileOpenRequest(
+                    profile: profile,
+                    parentSessionID: id.uuidString.lowercased(),
+                    request: EditorOpenRequest(paths: paths, diff: event["diff"] as? Bool ?? false)
+                )
+            )
+            return
+        }
         let kind: AgentKind = agentName.lowercased().contains("claude") ? .claude : .codex
         let eventName = (event["hook_event_name"] as? String)
             ?? (event["type"] as? String)
@@ -480,8 +613,10 @@ final class PaneModel: ObservableObject, Identifiable {
         switch eventName {
         case "PermissionRequest":
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Approval: \(tool ?? "permission requested")")
+            recordActivity("Approval needed for \(tool ?? "a tool")", phase: .needsInput)
         case "Notification" where notificationType == "permission_prompt" || notificationType == "idle_prompt":
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: event["message"] as? String ?? "Needs input")
+            recordActivity(event["message"] as? String ?? "Needs input", phase: .needsInput)
         case "SubagentStart":
             let identifier = subagentID ?? UUID().uuidString
             if !subagents.contains(where: { $0.id == identifier }) {
@@ -493,6 +628,7 @@ final class PaneModel: ObservableObject, Identifiable {
             }
             activeSubagents = subagents.count
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent: \(agentType ?? "working")")
+            recordActivity("Started \(agentType ?? "subagent")", phase: .active)
         case "SubagentStop":
             if let subagentID {
                 subagents.removeAll { $0.id == subagentID }
@@ -501,17 +637,35 @@ final class PaneModel: ObservableObject, Identifiable {
             }
             activeSubagents = subagents.count
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent finished")
+            recordActivity("Subagent finished", phase: .quiet)
         case "PreToolUse":
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Using \(tool ?? "tool")")
+            recordActivity("Using \(tool ?? "tool")", phase: .active)
+        case "PostToolUse":
+            detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Finished \(tool ?? "tool")")
+            recordActivity("Finished \(tool ?? "tool")", phase: .quiet)
+        case "PostToolUseFailure":
+            detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Failed \(tool ?? "tool")")
+            recordActivity("Failed \(tool ?? "tool")", phase: .needsInput)
+        case "UserPromptSubmit", "turn/started":
+            detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Thinking")
+            recordActivity("Thinking", phase: .active)
         case "Stop", "SessionEnd", "turn/completed":
             detector.applyStructuredEvent(kind: kind, phase: .quiet, excerpt: "Ready")
+            recordActivity("Ready", phase: .quiet)
+        case "SessionStart":
+            detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Started")
+            recordActivity("Started", phase: .active)
         default:
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: eventName)
+            recordActivity(eventName, phase: .active)
         }
         lastActivity = Date()
+        objectWillChange.send()
     }
 
     func cycleAgentKind() {
+        objectWillChange.send()
         let next: AgentKind = switch detector.kind {
         case .shell: .claude
         case .claude: .codex
@@ -519,11 +673,27 @@ final class PaneModel: ObservableObject, Identifiable {
         }
         detector.overrideKind(next)
     }
+
+    func setAgentKind(_ kind: AgentKind) {
+        objectWillChange.send()
+        detector.overrideKind(kind)
+    }
+
+    private func recordActivity(_ label: String, phase: AgentPhase) {
+        let item = AgentActivityItem(id: UUID(), label: label, phase: phase, occurredAt: Date())
+        if agentActivities.last?.label == label {
+            agentActivities[agentActivities.count - 1] = item
+        } else {
+            agentActivities.append(item)
+            agentActivities = Array(agentActivities.suffix(16))
+        }
+    }
 }
 
 @MainActor
 final class TabModel: ObservableObject, Identifiable {
     let id: UUID
+    let sessionID: UUID
     @Published var name: String
     @Published var layout: PaneLayout
     @Published var floatingPanes: [FloatingPanePlacement]
@@ -531,11 +701,13 @@ final class TabModel: ObservableObject, Identifiable {
 
     init(
         id: UUID = UUID(),
+        sessionID: UUID = UUID(),
         name: String,
         firstPane: UUID,
         floatingPanes: [FloatingPanePlacement] = []
     ) {
         self.id = id
+        self.sessionID = sessionID
         self.name = name
         self.layout = .pane(firstPane)
         self.floatingPanes = floatingPanes
@@ -624,7 +796,7 @@ final class ProfileStore: ObservableObject {
     }
 }
 
-private extension ConnectionProfile {
+extension ConnectionProfile {
     var connectionKey: String {
         usesSSHConfig ? "config:\(host)" : "ssh:\(destination):\(port)"
     }

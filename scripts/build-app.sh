@@ -14,6 +14,10 @@ app_path="$stage_root/Relay.app"
 mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
 cp "$binary_path/Relay" "$app_path/Contents/MacOS/Relay"
 cp "$binary_path/relay-bridge" "$app_path/Contents/MacOS/relay-bridge"
+resource_bundle="$binary_path/Relay_Relay.bundle"
+if [[ -d "$resource_bundle" ]]; then
+    ditto "$resource_bundle" "$app_path/Contents/Resources/Relay_Relay.bundle"
+fi
 
 icon_source="$project_root/Resources/RelayIcon.png"
 if [[ -f "$icon_source" ]]; then
@@ -38,7 +42,7 @@ fi
 /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string Relay" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string RelayIcon" "$app_path/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.2.0" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.3.1" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 14.0" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$app_path/Contents/Info.plist"
 
