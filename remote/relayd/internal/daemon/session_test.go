@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,64 @@ func TestClassifyAgentProcess(t *testing.T) {
 		if got := classifyAgentProcess(test.command, test.arguments); got != test.want {
 			t.Fatalf("classifyAgentProcess(%q, %q) = %q, want %q", test.command, test.arguments, got, test.want)
 		}
+	}
+}
+
+func TestAcknowledgedInputIsAppliedOnceAcrossRetry(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{pty: writer, inputSequences: make(map[[16]byte]uint64)}
+	clientID := [16]byte{7, 8, 9}
+	if err := session.acknowledgedInput(clientID, 1, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.acknowledgedInput(clientID, 1, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.acknowledgedInput(clientID, 2, []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "ab" {
+		t.Fatalf("retried input was duplicated: %q", data)
+	}
+}
+
+func TestAgentJournalSurvivesReopenAndRestoresCursor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events", "pane.jsonl")
+	first := &Session{
+		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		activeSubagents: make(map[string][]byte),
+	}
+	if err := first.enableEventJournal(path); err != nil {
+		t.Fatal(err)
+	}
+	first.agentEvent([]byte(`{"agent":"codex","event":{"type":"thread.started"}}`))
+	first.agentEvent([]byte(`{"agent":"codex","event":{"type":"item.completed"}}`))
+	if err := first.eventJournal.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := &Session{
+		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		activeSubagents: make(map[string][]byte),
+	}
+	if err := restored.enableEventJournal(path); err != nil {
+		t.Fatal(err)
+	}
+	defer restored.eventJournal.file.Close()
+	observer, frames := restored.observeAgents(1)
+	defer restored.detachAgentObserver(observer)
+	if restored.eventSequence != 2 || len(frames) != 1 || indexedAgentSequence(frames[0].Payload) != 2 {
+		t.Fatalf("journal cursor was not restored: sequence=%d frames=%#v", restored.eventSequence, frames)
 	}
 }
 
@@ -85,7 +144,7 @@ func TestReplayStartUsesLatestFullScreenRedrawOnlyForFreshRenderer(t *testing.T)
 	}
 }
 
-func TestAgentObserverSnapshotsActiveSubagents(t *testing.T) {
+func TestAgentObserverReplaysIndexedHistoryAfterCursor(t *testing.T) {
 	session := &Session{
 		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
 		activeSubagents: make(map[string][]byte),
@@ -94,20 +153,25 @@ func TestAgentObserverSnapshotsActiveSubagents(t *testing.T) {
 	session.agentEvent([]byte(`{"agent":"claude","event":{"hook_event_name":"SubagentStart","agent_id":"research-1","agent_type":"Explore"}}`))
 	session.agentEvent([]byte(`{"agent":"claude","event":{"hook_event_name":"PreToolUse","tool_name":"Read"}}`))
 
-	observer, snapshot := session.observeAgents()
+	observer, snapshot := session.observeAgents(0)
 	defer session.detachAgentObserver(observer)
-	if len(snapshot) != 2 {
-		t.Fatalf("observer snapshot has %d frames, want root state plus active subagent", len(snapshot))
+	if len(snapshot) != 3 {
+		t.Fatalf("observer snapshot has %d frames, want complete indexed history", len(snapshot))
 	}
-	if !bytes.Contains(snapshot[1].Payload, []byte(`"agent_id":"research-1"`)) {
-		t.Fatalf("active subagent missing from snapshot: %s", snapshot[1].Payload)
+	if indexedAgentSequence(snapshot[0].Payload) != 1 || indexedAgentSequence(snapshot[2].Payload) != 3 {
+		t.Fatalf("observer history is not indexed: %#v", snapshot)
+	}
+	cursorObserver, cursorSnapshot := session.observeAgents(2)
+	defer session.detachAgentObserver(cursorObserver)
+	if len(cursorSnapshot) != 1 || indexedAgentSequence(cursorSnapshot[0].Payload) != 3 {
+		t.Fatalf("cursor replay returned the wrong suffix: %#v", cursorSnapshot)
 	}
 
 	session.agentEvent([]byte(`{"agent":"claude","event":{"hook_event_name":"SubagentStop","agent_id":"research-1"}}`))
-	secondObserver, secondSnapshot := session.observeAgents()
+	secondObserver, secondSnapshot := session.observeAgents(3)
 	defer session.detachAgentObserver(secondObserver)
-	if len(secondSnapshot) != 1 {
-		t.Fatalf("stopped subagent remained in snapshot: %#v", secondSnapshot)
+	if len(secondSnapshot) != 1 || !bytes.Contains(secondSnapshot[0].Payload, []byte(`"SubagentStop"`)) {
+		t.Fatalf("new lifecycle event was not replayed after cursor: %#v", secondSnapshot)
 	}
 }
 
@@ -171,7 +235,9 @@ func TestExitedSessionIsReplacedOnNextAttach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	// Login-shell startup can include user initialization and is measurably
+	// slower on loaded CI/HPC nodes. This tests replacement, not startup latency.
+	deadline := time.Now().Add(5 * time.Second)
 	for !first.hasExited() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}

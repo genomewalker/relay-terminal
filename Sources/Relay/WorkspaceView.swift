@@ -54,6 +54,29 @@ struct WorkspaceView: View {
             Button("Rename") { workspace.commitRename() }
                 .disabled(workspace.renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
+        .alert(
+            "Terminate remote pane?",
+            isPresented: Binding(
+                get: { workspace.terminationTargetID != nil },
+                set: { if !$0 { workspace.cancelTermination() } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) { workspace.cancelTermination() }
+            Button("Terminate", role: .destructive) { workspace.confirmTermination() }
+        } message: {
+            Text("This ends the remote shell and its child processes, then removes the pane from the remote catalog. Detach keeps them running.")
+        }
+        .alert(
+            "Remote operation failed",
+            isPresented: Binding(
+                get: { workspace.operationError != nil },
+                set: { if !$0 { workspace.operationError = nil } }
+            )
+        ) {
+            Button("OK") { workspace.operationError = nil }
+        } message: {
+            Text(workspace.operationError ?? "Unknown error")
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
             workspace.setFullScreen(true)
         }
@@ -70,6 +93,9 @@ private struct AgentInspectorPanel: View {
     let close: () -> Void
     @State private var settledOffset: CGSize = .zero
     @GestureState private var dragOffset: CGSize = .zero
+    @State private var panelSize = CGSize(width: 470, height: 410)
+    @GestureState private var resizeOffset: CGSize = .zero
+    @State private var collapsed = false
 
     private var agent: SubagentActivity? {
         pane.subagents.first { $0.id == subagentID }
@@ -78,22 +104,27 @@ private struct AgentInspectorPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             inspectorTitleBar
-            Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(height: 1)
-            if let agent {
-                inspectorContent(agent)
-            } else {
-                VStack(spacing: 10) {
-                    Image(systemName: "person.crop.circle.badge.questionmark")
-                        .font(.system(size: 24))
-                        .foregroundStyle(RelayTheme.textFaint)
-                    Text("This agent is no longer available")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(RelayTheme.textMuted)
+            if !collapsed {
+                Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(height: 1)
+                if let agent {
+                    inspectorContent(agent)
+                } else {
+                    VStack(spacing: 10) {
+                        Image(systemName: "person.crop.circle.badge.questionmark")
+                            .font(.system(size: 24))
+                            .foregroundStyle(RelayTheme.textFaint)
+                        Text("This agent is no longer available")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(RelayTheme.textMuted)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(width: 470, height: 410)
+        .frame(
+            width: collapsed ? 330 : min(max(panelSize.width + resizeOffset.width, 380), 820),
+            height: collapsed ? 42 : min(max(panelSize.height + resizeOffset.height, 260), 760)
+        )
         .background(RelayTheme.sidebar)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
@@ -106,6 +137,24 @@ private struct AgentInspectorPanel: View {
             x: settledOffset.width + dragOffset.width,
             y: settledOffset.height + dragOffset.height
         )
+        .overlay(alignment: .bottomTrailing) {
+            if !collapsed {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 8.5, weight: .semibold))
+                    .foregroundStyle(RelayTheme.textFaint)
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 1)
+                            .updating($resizeOffset) { value, state, _ in state = value.translation }
+                            .onEnded { value in
+                                panelSize.width = min(max(panelSize.width + value.translation.width, 380), 820)
+                                panelSize.height = min(max(panelSize.height + value.translation.height, 260), 760)
+                            }
+                    )
+                    .help("Resize inspector")
+            }
+        }
     }
 
     private var inspectorTitleBar: some View {
@@ -120,6 +169,14 @@ private struct AgentInspectorPanel: View {
                 .font(.system(size: 9.5, weight: .medium))
                 .foregroundStyle(RelayTheme.textFaint)
             Spacer()
+            Button { collapsed.toggle() } label: {
+                Image(systemName: collapsed ? "chevron.down" : "chevron.up")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(RelayTheme.textMuted)
+            .help(collapsed ? "Expand inspector" : "Collapse inspector")
             Button(action: showTerminal) {
                 Image(systemName: "terminal")
                     .font(.system(size: 10, weight: .semibold))
@@ -770,6 +827,11 @@ private struct SessionPaneRow: View {
                     revealPane()
                     workspace.closeActivePane()
                 }
+                if pane.profile.kind == .ssh && pane.profile.backend == .relay {
+                    Button("Terminate remote pane…", role: .destructive) {
+                        workspace.requestTerminatePane(pane.id)
+                    }
+                }
             }
             .overlay(alignment: .trailing) {
                 if pane.contentKind == .terminal && pane.kind != .shell && !pane.subagents.isEmpty {
@@ -876,6 +938,10 @@ private struct HostLauncher: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var store: ProfileStore
     @State private var query = ""
+    @State private var selectedProfile: ConnectionProfile?
+    @State private var remoteCatalog: RemoteCatalogSnapshot?
+    @State private var catalogError: String?
+    @State private var loadingCatalog = false
     @FocusState private var searchFocused: Bool
 
     init(workspace: WorkspaceModel) {
@@ -914,12 +980,13 @@ private struct HostLauncher: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(RelayTheme.textMuted)
-                TextField("Search hosts or enter an SSH alias…", text: $query)
+                TextField(selectedProfile == nil ? "Search hosts or enter an SSH alias…" : "Remote sessions", text: $query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 16, weight: .regular))
                     .foregroundStyle(RelayTheme.text)
                     .focused($searchFocused)
                     .onSubmit(connectFirstResult)
+                    .disabled(selectedProfile != nil)
                 if !query.isEmpty {
                     Button { query = "" } label: {
                         Image(systemName: "xmark.circle.fill")
@@ -941,60 +1008,129 @@ private struct HostLauncher: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
-                    Text(query.isEmpty ? "Recent and configured" : "Matches")
-                        .font(.system(size: 10.5, weight: .bold))
-                        .foregroundStyle(RelayTheme.textMuted)
+                    if let selectedProfile {
+                        HStack {
+                            Button {
+                                self.selectedProfile = nil
+                                remoteCatalog = nil
+                                catalogError = nil
+                                query = ""
+                            } label: {
+                                Label("Hosts", systemImage: "chevron.left")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(RelayTheme.textMuted)
+                            Spacer()
+                            Text(selectedProfile.name)
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(RelayTheme.text)
+                        }
                         .padding(.horizontal, 8)
-                        .padding(.top, 5)
+                        .padding(.vertical, 5)
 
-                    if query.isEmpty {
-                        HostResultRow(
-                            title: "This Mac",
-                            subtitle: "Open a local login shell",
-                            symbol: "laptopcomputer",
-                            badge: "Local"
-                        ) { workspace.newTab(profile: .local) }
-                    }
+                        if loadingCatalog {
+                            HStack(spacing: 10) {
+                                ProgressView().controlSize(.small)
+                                Text("Reading remote sessions…")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(RelayTheme.textMuted)
+                            }
+                            .padding(16)
+                        } else {
+                            HostResultRow(
+                                title: "New session",
+                                subtitle: "Start a new durable workspace on \(selectedProfile.name)",
+                                symbol: "plus.rectangle.on.rectangle",
+                                badge: "New"
+                            ) { workspace.newTab(profile: selectedProfile) }
 
-                    ForEach(filteredHosts) { profile in
-                        HostResultRow(
-                            title: profile.name,
-                            subtitle: profile.usesSSHConfig
-                                ? "SSH config · Opens as a native Relay terminal"
-                                : profile.subtitle,
-                            symbol: "server.rack",
-                            badge: profile.backend == .relay ? "Persistent" : "Direct"
-                        ) { workspace.newTab(profile: profile) }
-                    }
-
-                    if let typedHost {
-                        Text("Connect directly")
+                            if let catalogError {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(catalogError)
+                                        .font(.system(size: 11.5))
+                                        .foregroundStyle(RelayTheme.coral)
+                                        .lineLimit(3)
+                                    Button("Retry") { loadCatalog(for: selectedProfile) }
+                                        .buttonStyle(.plain)
+                                        .font(.system(size: 11.5, weight: .semibold))
+                                        .foregroundStyle(RelayTheme.blue)
+                                }
+                                .padding(12)
+                            } else if let sessions = remoteCatalog?.sessions, !sessions.isEmpty {
+                                Text("On this host")
+                                    .font(.system(size: 10.5, weight: .bold))
+                                    .foregroundStyle(RelayTheme.textMuted)
+                                    .padding(.horizontal, 8)
+                                    .padding(.top, 8)
+                                ForEach(sessions) { session in
+                                    RemoteSessionResultRow(session: session) {
+                                        workspace.attachRemoteSession(profile: selectedProfile, remote: session)
+                                    }
+                                }
+                            } else {
+                                Text("No detached Relay sessions on this host.")
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(RelayTheme.textMuted)
+                                    .padding(12)
+                            }
+                        }
+                    } else {
+                        Text(query.isEmpty ? "Recent and configured" : "Matches")
                             .font(.system(size: 10.5, weight: .bold))
                             .foregroundStyle(RelayTheme.textMuted)
                             .padding(.horizontal, 8)
-                            .padding(.top, 8)
-                        HostResultRow(
-                            title: typedHost.host,
-                            subtitle: "Use this SSH hostname or config alias",
-                            symbol: "arrow.right.circle.fill",
-                            badge: "New"
-                        ) { workspace.newTab(profile: typedHost) }
-                    }
+                            .padding(.top, 5)
 
-                    if filteredHosts.isEmpty && typedHost == nil {
-                        VStack(spacing: 8) {
-                            Image(systemName: "network.slash")
-                                .font(.system(size: 24, weight: .medium))
-                                .foregroundStyle(RelayTheme.textFaint)
-                            Text("No SSH host matches “\(query)”")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(RelayTheme.text)
-                            Text("Try an alias from ~/.ssh/config or enter a hostname.")
-                                .font(.system(size: 11.5))
-                                .foregroundStyle(RelayTheme.textMuted)
+                        if query.isEmpty {
+                            HostResultRow(
+                                title: "This Mac",
+                                subtitle: "Open a local login shell",
+                                symbol: "laptopcomputer",
+                                badge: "Local"
+                            ) { workspace.newTab(profile: .local) }
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 42)
+
+                        ForEach(filteredHosts) { profile in
+                            HostResultRow(
+                                title: profile.name,
+                                subtitle: profile.usesSSHConfig ? "SSH config" : profile.subtitle,
+                                symbol: "server.rack",
+                                badge: profile.backend == .relay ? "Sessions" : "Direct"
+                            ) {
+                                if profile.backend == .relay { selectHost(profile) }
+                                else { workspace.newTab(profile: profile) }
+                            }
+                        }
+
+                        if let typedHost {
+                            Text("Connect directly")
+                                .font(.system(size: 10.5, weight: .bold))
+                                .foregroundStyle(RelayTheme.textMuted)
+                                .padding(.horizontal, 8)
+                                .padding(.top, 8)
+                            HostResultRow(
+                                title: typedHost.host,
+                                subtitle: "Use this SSH hostname or config alias",
+                                symbol: "arrow.right.circle.fill",
+                                badge: "Inspect"
+                            ) { selectHost(typedHost) }
+                        }
+
+                        if filteredHosts.isEmpty && typedHost == nil {
+                            VStack(spacing: 8) {
+                                Image(systemName: "network.slash")
+                                    .font(.system(size: 24, weight: .medium))
+                                    .foregroundStyle(RelayTheme.textFaint)
+                                Text("No SSH host matches “\(query)”")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(RelayTheme.text)
+                                Text("Try an alias from ~/.ssh/config or enter a hostname.")
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(RelayTheme.textMuted)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 42)
+                        }
                     }
                 }
                 .padding(12)
@@ -1028,11 +1164,77 @@ private struct HostLauncher: View {
     }
 
     private func connectFirstResult() {
+        guard selectedProfile == nil else { return }
         if let first = filteredHosts.first {
-            workspace.newTab(profile: first)
+            if first.backend == .relay { selectHost(first) }
+            else { workspace.newTab(profile: first) }
         } else if let typedHost {
-            workspace.newTab(profile: typedHost)
+            selectHost(typedHost)
         }
+    }
+
+    private func selectHost(_ profile: ConnectionProfile) {
+        selectedProfile = profile
+        query = ""
+        loadCatalog(for: profile)
+    }
+
+    private func loadCatalog(for profile: ConnectionProfile) {
+        loadingCatalog = true
+        catalogError = nil
+        remoteCatalog = nil
+        Task {
+            do {
+                let result = try await RemoteCatalogService.load(profile: profile)
+                guard selectedProfile?.connectionKey == profile.connectionKey else { return }
+                remoteCatalog = result
+            } catch {
+                guard selectedProfile?.connectionKey == profile.connectionKey else { return }
+                catalogError = error.localizedDescription
+            }
+            loadingCatalog = false
+        }
+    }
+}
+
+private struct RemoteSessionResultRow: View {
+    let session: RemoteSessionRecord
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(hovering ? RelayTheme.hover : RelayTheme.surface)
+                        .frame(width: 42, height: 42)
+                    Image(systemName: session.isUnfiled ? "lifepreserver" : "rectangle.stack")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(session.recoverable ? RelayTheme.mint : RelayTheme.textFaint)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(session.label)
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(session.recoverable ? RelayTheme.text : RelayTheme.textMuted)
+                    Text("\(session.tabCount) tab\(session.tabCount == 1 ? "" : "s") · \(session.panes.count) pane\(session.panes.count == 1 ? "" : "s")")
+                        .font(.system(size: 11))
+                        .foregroundStyle(RelayTheme.textMuted)
+                }
+                Spacer()
+                Text(session.recoverable ? (session.isUnfiled ? "Recover" : "Attach") : "Unavailable")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(session.recoverable ? RelayTheme.mint : RelayTheme.textFaint)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 58)
+            .background(hovering ? RelayTheme.elevated.opacity(0.6) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!session.recoverable)
+        .onHover { hovering = $0 }
     }
 }
 

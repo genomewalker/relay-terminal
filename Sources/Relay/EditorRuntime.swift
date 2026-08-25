@@ -500,11 +500,18 @@ struct MonacoEditorSurface: NSViewRepresentable {
     @ObservedObject var runtime: RemoteEditorRuntime
 
     func makeNSView(context: Context) -> RelayEditorWebView {
-        runtime.startIfNeeded()
-        return runtime.webView
+        let view = runtime.webView
+        Task { @MainActor in
+            await Task.yield()
+            runtime.startIfNeeded()
+        }
+        return view
     }
 
     func updateNSView(_ nsView: RelayEditorWebView, context: Context) {
-        runtime.startIfNeeded()
+        Task { @MainActor in
+            await Task.yield()
+            runtime.startIfNeeded()
+        }
     }
 }

@@ -40,3 +40,16 @@ func TestArtifactRoundTrip(t *testing.T) {
 		t.Fatalf("got path=%q data=%v err=%v", path, data, err)
 	}
 }
+
+func TestAcknowledgedInputRoundTrip(t *testing.T) {
+	clientID := [16]byte{1, 2, 3, 4, 5}
+	frame := InputV2Frame(clientID, 42, []byte("command\n"))
+	gotClientID, sequence, data, err := ParseInputV2(frame)
+	if err != nil || gotClientID != clientID || sequence != 42 || !bytes.Equal(data, []byte("command\n")) {
+		t.Fatalf("invalid input v2 round trip: client=%v sequence=%d data=%q err=%v", gotClientID, sequence, data, err)
+	}
+	ackClientID, ackSequence, err := ParseInputAck(InputAckFrame(clientID, sequence))
+	if err != nil || ackClientID != clientID || ackSequence != sequence {
+		t.Fatalf("invalid input ack round trip: client=%v sequence=%d err=%v", ackClientID, ackSequence, err)
+	}
+}

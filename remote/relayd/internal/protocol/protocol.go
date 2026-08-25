@@ -22,6 +22,8 @@ const (
 	Pong       Type = 8
 	AgentEvent Type = 9
 	Artifact   Type = 10
+	InputAck   Type = 11
+	InputV2    Type = 12
 )
 
 const MaxPayload = 16 << 20
@@ -35,10 +37,15 @@ type HelloPayload struct {
 	Version         int    `json:"version"`
 	SessionID       string `json:"session_id"`
 	ParentSessionID string `json:"parent_session_id,omitempty"`
+	WorkspaceID     string `json:"workspace_id,omitempty"`
+	TabID           string `json:"tab_id,omitempty"`
+	PaneTitle       string `json:"pane_title,omitempty"`
+	ContentKind     string `json:"content_kind,omitempty"`
 	Command         string `json:"command,omitempty"`
 	Cols            uint16 `json:"cols"`
 	Rows            uint16 `json:"rows"`
 	LastSeq         uint64 `json:"last_seq"`
+	LastEventSeq    uint64 `json:"last_event_seq,omitempty"`
 	EventOnly       bool   `json:"event_only,omitempty"`
 	ObserveEvents   bool   `json:"observe_events,omitempty"`
 	Probe           bool   `json:"probe,omitempty"`
@@ -46,10 +53,50 @@ type HelloPayload struct {
 }
 
 type StatusPayload struct {
-	State     string `json:"state"`
-	ExitCode  int    `json:"exit_code,omitempty"`
-	Message   string `json:"message,omitempty"`
-	WorkerPID int    `json:"worker_pid,omitempty"`
+	State        string   `json:"state"`
+	ExitCode     int      `json:"exit_code,omitempty"`
+	Message      string   `json:"message,omitempty"`
+	WorkerPID    int      `json:"worker_pid,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+const inputIdentityBytes = 16
+
+func InputV2Frame(clientID [inputIdentityBytes]byte, sequence uint64, data []byte) Frame {
+	payload := make([]byte, inputIdentityBytes+8+len(data))
+	copy(payload[:inputIdentityBytes], clientID[:])
+	binary.BigEndian.PutUint64(payload[inputIdentityBytes:inputIdentityBytes+8], sequence)
+	copy(payload[inputIdentityBytes+8:], data)
+	return Frame{Type: InputV2, Payload: payload}
+}
+
+func ParseInputV2(frame Frame) ([inputIdentityBytes]byte, uint64, []byte, error) {
+	var clientID [inputIdentityBytes]byte
+	if frame.Type != InputV2 || len(frame.Payload) < inputIdentityBytes+8 {
+		return clientID, 0, nil, errors.New("invalid acknowledged input frame")
+	}
+	copy(clientID[:], frame.Payload[:inputIdentityBytes])
+	sequence := binary.BigEndian.Uint64(frame.Payload[inputIdentityBytes : inputIdentityBytes+8])
+	if sequence == 0 {
+		return clientID, 0, nil, errors.New("invalid acknowledged input sequence")
+	}
+	return clientID, sequence, frame.Payload[inputIdentityBytes+8:], nil
+}
+
+func InputAckFrame(clientID [inputIdentityBytes]byte, sequence uint64) Frame {
+	payload := make([]byte, inputIdentityBytes+8)
+	copy(payload[:inputIdentityBytes], clientID[:])
+	binary.BigEndian.PutUint64(payload[inputIdentityBytes:], sequence)
+	return Frame{Type: InputAck, Payload: payload}
+}
+
+func ParseInputAck(frame Frame) ([inputIdentityBytes]byte, uint64, error) {
+	var clientID [inputIdentityBytes]byte
+	if frame.Type != InputAck || len(frame.Payload) != inputIdentityBytes+8 {
+		return clientID, 0, errors.New("invalid input acknowledgement")
+	}
+	copy(clientID[:], frame.Payload[:inputIdentityBytes])
+	return clientID, binary.BigEndian.Uint64(frame.Payload[inputIdentityBytes:]), nil
 }
 
 func JSONFrame[T any](typ Type, value T) (Frame, error) {

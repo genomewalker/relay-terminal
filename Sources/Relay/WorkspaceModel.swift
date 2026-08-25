@@ -21,6 +21,8 @@ final class WorkspaceModel: ObservableObject {
     @Published var renameTarget: WorkspaceRenameTarget?
     @Published var renameDraft = ""
     @Published var agentInspector: AgentInspectorSelection?
+    @Published var terminationTargetID: UUID?
+    @Published var operationError: String?
     @Published private(set) var sessionNames: [UUID: String] = [:]
 
     let profileStore = ProfileStore()
@@ -29,6 +31,7 @@ final class WorkspaceModel: ObservableObject {
     private var sidebarBeforeFullScreen = true
     private var persistenceTask: Task<Void, Never>?
     private var paneSubscriptions: [UUID: AnyCancellable] = [:]
+    private var paneChangeScheduled = false
 
     init(restoreSavedWorkspace: Bool = true) {
         if restoreSavedWorkspace && restoreWorkspace() {
@@ -56,6 +59,34 @@ final class WorkspaceModel: ObservableObject {
 
     func closeAgentInspector() {
         agentInspector = nil
+    }
+
+    var terminationTarget: PaneModel? {
+        terminationTargetID.flatMap { panes[$0] }
+    }
+
+    func requestTerminatePane(_ paneID: UUID) {
+        guard let pane = panes[paneID], pane.profile.kind == .ssh, pane.profile.backend == .relay else { return }
+        terminationTargetID = paneID
+    }
+
+    func cancelTermination() {
+        terminationTargetID = nil
+    }
+
+    func confirmTermination() {
+        guard let paneID = terminationTargetID, let pane = panes[paneID] else { return }
+        terminationTargetID = nil
+        Task {
+            do {
+                try await RemotePaneControlService.terminate(profile: pane.profile, paneID: paneID)
+                guard panes[paneID] != nil else { return }
+                revealPane(paneID)
+                closeActivePane()
+            } catch {
+                operationError = error.localizedDescription
+            }
+        }
     }
 
     func revealPane(_ paneID: UUID) {
@@ -131,6 +162,7 @@ final class WorkspaceModel: ObservableObject {
         let pane = PaneModel(profile: profile)
         storePane(pane)
         let tab = TabModel(sessionID: UUID(), name: profile.name, firstPane: pane.id)
+        pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         tabs.append(tab)
         selectedTabID = tab.id
         activePaneID = pane.id
@@ -141,6 +173,59 @@ final class WorkspaceModel: ObservableObject {
             await Task.yield()
             pane.focus()
         }
+    }
+
+    func attachRemoteSession(profile: ConnectionProfile, remote: RemoteSessionRecord) {
+        if let existingPane = remote.panes.compactMap({ UUID(uuidString: $0.paneID) })
+            .first(where: { panes[$0] != nil }) {
+            isHostLauncherPresented = false
+            revealPane(existingPane)
+            return
+        }
+
+        let sessionID = remote.workspaceID.flatMap(UUID.init(uuidString:)) ?? UUID()
+        let groupedTabs = Dictionary(grouping: remote.panes.filter(\.recoverable)) {
+            $0.tabID ?? $0.paneID
+        }
+        var attachedTabs: [TabModel] = []
+        for (remoteTabID, remotePanes) in groupedTabs.sorted(by: { $0.key < $1.key }) {
+            guard let firstRemotePane = remotePanes.first,
+                  let firstPaneID = UUID(uuidString: firstRemotePane.paneID) else { continue }
+            let tabID = UUID(uuidString: remoteTabID) ?? UUID()
+            var paneIDs: [UUID] = []
+            for remotePane in remotePanes {
+                guard let paneID = UUID(uuidString: remotePane.paneID) else { continue }
+                let pane = PaneModel(
+                    id: paneID,
+                    profile: profile,
+                    remoteParentSessionID: remotePane.parentPaneID,
+                    customName: remotePane.title
+                )
+                pane.assignRemoteHierarchy(workspaceSessionID: sessionID, tabID: tabID)
+                storePane(pane)
+                paneIDs.append(paneID)
+            }
+            guard !paneIDs.isEmpty else { continue }
+            let tab = TabModel(
+                id: tabID,
+                sessionID: sessionID,
+                name: firstRemotePane.title ?? "Remote",
+                firstPane: firstPaneID
+            )
+            for paneID in paneIDs.dropFirst() {
+                tab.layout = tab.layout.splitting(tab.layout.paneIDs.last ?? firstPaneID, axis: .horizontal, with: paneID)
+            }
+            tab.balanceSplits()
+            attachedTabs.append(tab)
+        }
+        guard !attachedTabs.isEmpty else { return }
+        tabs.append(contentsOf: attachedTabs)
+        sessionNames[sessionID] = remote.label
+        selectedTabID = attachedTabs[0].id
+        activePaneID = attachedTabs[0].layout.paneIDs.first
+        profileStore.markUsed(profile)
+        isHostLauncherPresented = false
+        persistWorkspace()
     }
 
     func newTabInActiveSession() {
@@ -164,6 +249,7 @@ final class WorkspaceModel: ObservableObject {
             name: ordinal == 1 ? sourcePane.profile.name : "\(sourcePane.profile.name) \(ordinal)",
             firstPane: pane.id
         )
+        pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         tabs.append(tab)
         selectedTabID = tab.id
         activePaneID = pane.id
@@ -188,6 +274,7 @@ final class WorkspaceModel: ObservableObject {
             ? active.id.uuidString.lowercased()
             : nil
         let pane = PaneModel(profile: splitProfile, remoteParentSessionID: parentSessionID)
+        pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         storePane(pane)
         tab.layout = tab.layout.splitting(active.id, axis: axis, with: pane.id)
         tab.balanceSplits()
@@ -208,6 +295,7 @@ final class WorkspaceModel: ObservableObject {
             contentKind: .editor,
             remoteParentSessionID: parentSessionID
         )
+        pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         storePane(pane)
         tab.layout = tab.layout.splitting(active.id, axis: .horizontal, with: pane.id)
         tab.balanceSplits()
@@ -235,6 +323,7 @@ final class WorkspaceModel: ObservableObject {
             remoteParentSessionID: open.parentSessionID,
             editorRequest: open.request
         )
+        pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         storePane(pane)
         tab.layout = tab.layout.splitting(activePaneID, axis: .horizontal, with: pane.id)
         tab.balanceSplits()
@@ -291,6 +380,7 @@ final class WorkspaceModel: ObservableObject {
             ? active.id.uuidString.lowercased()
             : nil
         let pane = PaneModel(profile: paneProfile, remoteParentSessionID: parentSessionID)
+        pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         storePane(pane)
         tab.floatingPanes.append(.initial(paneID: pane.id, index: tab.floatingPanes.count))
         activePaneID = pane.id
@@ -525,6 +615,11 @@ final class WorkspaceModel: ObservableObject {
             return false
         }
         tabs = restoredTabs
+        for tab in restoredTabs {
+            for paneID in tab.allPaneIDs {
+                panes[paneID]?.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
+            }
+        }
         sessionNames = snapshot.sessionNames ?? [:]
         selectedTabID = restoredTabs.contains(where: { $0.id == snapshot.selectedTabID })
             ? snapshot.selectedTabID : restoredTabs[0].id
@@ -547,7 +642,14 @@ final class WorkspaceModel: ObservableObject {
     private func storePane(_ pane: PaneModel) {
         panes[pane.id] = pane
         paneSubscriptions[pane.id] = pane.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            guard let self, !self.paneChangeScheduled else { return }
+            self.paneChangeScheduled = true
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                guard let self else { return }
+                self.paneChangeScheduled = false
+                self.objectWillChange.send()
+            }
         }
     }
 

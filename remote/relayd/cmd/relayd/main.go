@@ -31,7 +31,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|attach|observe|event|agent|artifact|files>")
+		fatal("usage: relayd <daemon|attach|observe|sessions|terminate|forget|event|agent|artifact|files>")
 	}
 	switch os.Args[1] {
 	case "daemon":
@@ -42,6 +42,12 @@ func main() {
 		runAttach(os.Args[2:])
 	case "observe":
 		runObserve(os.Args[2:])
+	case "sessions":
+		runSessions(os.Args[2:])
+	case "terminate":
+		runTerminate(os.Args[2:])
+	case "forget":
+		runForget(os.Args[2:])
 	case "event":
 		runEvent(os.Args[2:])
 	case "agent":
@@ -51,7 +57,7 @@ func main() {
 	case "files":
 		runFiles(os.Args[2:])
 	case "--version", "version":
-		fmt.Println("relayd 0.3.4")
+		fmt.Println("relayd 0.4.0")
 	default:
 		fatal("unknown command: " + os.Args[1])
 	}
@@ -555,10 +561,15 @@ func runAttach(arguments []string) {
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
 	session := flags.String("session", "", "durable session ID")
 	parentSession := flags.String("parent-session", "", "session whose working directory should be inherited")
+	workspace := flags.String("workspace", "", "durable workspace session ID")
+	tab := flags.String("tab", "", "durable tab ID")
+	paneTitle := flags.String("pane-title", "", "pane display name")
+	contentKind := flags.String("content-kind", "terminal", "pane content kind")
 	commandBase64 := flags.String("command-b64", "", "base64-encoded startup command")
 	cols := flags.Uint("cols", 120, "terminal columns")
 	rows := flags.Uint("rows", 36, "terminal rows")
 	lastSequence := flags.Uint64("last-seq", 0, "last received output sequence")
+	lastEventSequence := flags.Uint64("last-event-seq", 0, "last received agent event sequence")
 	_ = flags.Parse(arguments)
 	if *session == "" {
 		fatal("--session is required")
@@ -578,7 +589,8 @@ func runAttach(arguments []string) {
 	defer connection.Close()
 	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
 		Version: 1, SessionID: *session, ParentSessionID: *parentSession, Command: command,
-		Cols: uint16(*cols), Rows: uint16(*rows), LastSeq: *lastSequence,
+		WorkspaceID: *workspace, TabID: *tab, PaneTitle: *paneTitle, ContentKind: *contentKind,
+		Cols: uint16(*cols), Rows: uint16(*rows), LastSeq: *lastSequence, LastEventSeq: *lastEventSequence,
 	})
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
 		fatal(err.Error())
@@ -597,11 +609,57 @@ func runAttach(arguments []string) {
 	}
 }
 
+func runSessions(arguments []string) {
+	flags := flag.NewFlagSet("sessions", flag.ExitOnError)
+	_ = flags.Parse(arguments)
+	if flags.NArg() != 0 {
+		fatal("usage: relayd sessions")
+	}
+	snapshot, err := daemon.NewServer().CatalogSnapshot()
+	if err != nil {
+		fatal(err.Error())
+	}
+	if err := daemon.EncodeJSON(os.Stdout, snapshot); err != nil {
+		fatal(err.Error())
+	}
+}
+
+func runTerminate(arguments []string) {
+	flags := flag.NewFlagSet("terminate", flag.ExitOnError)
+	session := flags.String("session", "", "pane session ID")
+	forget := flags.Bool("forget", false, "remove the stopped pane from this node's catalog")
+	_ = flags.Parse(arguments)
+	if *session == "" || flags.NArg() != 0 {
+		fatal("usage: relayd terminate --session <pane-id>")
+	}
+	if err := daemon.NewServer().TerminatePane(*session); err != nil {
+		fatal(err.Error())
+	}
+	if *forget {
+		if err := daemon.NewServer().ForgetPane(*session); err != nil {
+			fatal(err.Error())
+		}
+	}
+}
+
+func runForget(arguments []string) {
+	flags := flag.NewFlagSet("forget", flag.ExitOnError)
+	session := flags.String("session", "", "pane session ID")
+	_ = flags.Parse(arguments)
+	if *session == "" || flags.NArg() != 0 {
+		fatal("usage: relayd forget --session <pane-id>")
+	}
+	if err := daemon.NewServer().ForgetPane(*session); err != nil {
+		fatal(err.Error())
+	}
+}
+
 func runObserve(arguments []string) {
 	flags := flag.NewFlagSet("observe", flag.ExitOnError)
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
 	session := flags.String("session", "", "durable session ID")
 	lastSequence := flags.Uint64("last-seq", 0, "fallback replay position for older workers")
+	lastEventSequence := flags.Uint64("last-event-seq", 0, "last received agent event sequence")
 	_ = flags.Parse(arguments)
 	if *session == "" {
 		fatal("--session is required")
@@ -612,13 +670,24 @@ func runObserve(arguments []string) {
 	}
 	defer connection.Close()
 	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
-		Version: 1, SessionID: *session, LastSeq: *lastSequence, ObserveEvents: true,
+		Version: 1, SessionID: *session, LastSeq: *lastSequence, LastEventSeq: *lastEventSequence, ObserveEvents: true,
 	})
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
 		fatal(err.Error())
 	}
-	if _, err := io.Copy(os.Stdout, connection); err != nil {
-		fatal(err.Error())
+	done := make(chan error, 2)
+	go func() {
+		_, copyErr := io.Copy(connection, os.Stdin)
+		done <- copyErr
+	}()
+	go func() {
+		_, copyErr := io.Copy(os.Stdout, connection)
+		done <- copyErr
+	}()
+	// Parent death closes SSH stdin. Returning here closes the remote observer
+	// instead of leaving an orphaned SSH channel that can exhaust MaxSessions.
+	if copyErr := <-done; copyErr != nil {
+		fatal(copyErr.Error())
 	}
 }
 

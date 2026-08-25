@@ -39,7 +39,9 @@ A local pane maps one-to-one to a durable remote `relayd` session UUID. Splittin
 - Structured Claude and Codex hook events for normal agent launches inside Relay, with process-tree and output fallback detection
 - Native session-rail states for working, ready, needs input, exited, and active Claude subagents
 - A clickable agent-thread tree with structured tool events and identity-aware subagents; raw terminal lines never enter the sidebar
-- Sequence-based reconnect with bounded input buffering and retained terminal surfaces
+- Node-scoped remote catalogs that discover validated detached panes before starting a new shell; older panes migrate as recoverable entries
+- Sequence-based output reconnect plus acknowledged, deduplicated input for new workers; old workers remain protocol-compatible
+- Persistent bounded agent-event journals with cursor replay, including a supervisor compatibility index for older workers
 - Inline Kitty-graphics rendering or dismissible native previews for PNG/JPEG/GIF/WebP files referenced by remote Codex or Claude output
 - Live macOS Settings (`⌘,`) for font, size, terminal padding, palette, interface density, full-screen chrome, and artifact previews
 - Workspace restoration using stable pane/session UUIDs
@@ -88,7 +90,8 @@ Drag a pane by its connection header and drop it near another pane's left, right
 - Explicit terminate/delete session RPC and remote session garbage collection
 - Native agent-pane renderer backed by Codex app-server and Claude bidirectional stream-json
 - One multiplexed transport per node plus a persisted local event/screen cache
-- Durable agent-state snapshots across a disconnected period
+- Durable remote layout mutations; detailed split/floating geometry currently remains in the Mac workspace snapshot
+- Input/layout leases for simultaneous controlling clients
 - Production Xcode packaging, bundled Ghostty resources, signing, and notarization
 
 ## License

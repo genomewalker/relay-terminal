@@ -14,21 +14,32 @@ import (
 const workerProtocolVersion = 1
 
 type workerManifest struct {
-	Version          int       `json:"version"`
-	SessionID        string    `json:"session_id"`
-	WorkerPID        int       `json:"worker_pid"`
-	WorkerStartTime  uint64    `json:"worker_start_time"`
-	ShellPID         int       `json:"shell_pid"`
-	NodeBootID       string    `json:"node_boot_id"`
-	SocketPath       string    `json:"socket_path"`
-	Token            string    `json:"token"`
-	Command          string    `json:"command,omitempty"`
-	WorkingDirectory string    `json:"working_directory,omitempty"`
-	LastSequence     uint64    `json:"last_sequence"`
-	State            string    `json:"state"`
-	ExitCode         int       `json:"exit_code,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	Version           int       `json:"version"`
+	SessionID         string    `json:"session_id"`
+	WorkerPID         int       `json:"worker_pid"`
+	WorkerStartTime   uint64    `json:"worker_start_time"`
+	ShellPID          int       `json:"shell_pid"`
+	NodeBootID        string    `json:"node_boot_id"`
+	SocketPath        string    `json:"socket_path"`
+	Token             string    `json:"token"`
+	Command           string    `json:"command,omitempty"`
+	WorkingDirectory  string    `json:"working_directory,omitempty"`
+	LastSequence      uint64    `json:"last_sequence"`
+	LastEventSequence uint64    `json:"last_event_sequence,omitempty"`
+	State             string    `json:"state"`
+	ExitCode          int       `json:"exit_code,omitempty"`
+	Capabilities      []string  `json:"capabilities,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+func (manifest workerManifest) supports(capability string) bool {
+	for _, candidate := range manifest.Capabilities {
+		if candidate == capability {
+			return true
+		}
+	}
+	return false
 }
 
 func newWorkerToken() (string, error) {

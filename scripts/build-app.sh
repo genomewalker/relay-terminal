@@ -42,7 +42,7 @@ fi
 /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string Relay" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string RelayIcon" "$app_path/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.3.4" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.4.0" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 14.0" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$app_path/Contents/Info.plist"
 
@@ -52,4 +52,11 @@ if [[ -e "$output_path" ]]; then
     /bin/mv "$output_path" "$stage_root/Relay.previous.app"
 fi
 /bin/mv "$app_path" "$output_path"
+/usr/bin/xattr -cr "$output_path"
+# Documents may be backed by File Provider, which immediately reapplies these
+# attributes after a move. codesign rejects them as resource-fork detritus.
+/usr/bin/xattr -dr com.apple.FinderInfo "$output_path" 2>/dev/null || true
+/usr/bin/xattr -dr 'com.apple.fileprovider.fpfs#P' "$output_path" 2>/dev/null || true
+/usr/bin/xattr -dr com.apple.provenance "$output_path" 2>/dev/null || true
+/usr/bin/codesign --force --deep --sign - "$output_path"
 echo "$output_path"

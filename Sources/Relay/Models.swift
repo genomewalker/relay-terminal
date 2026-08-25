@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -487,8 +488,12 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var editorRequest: EditorOpenRequest?
     @Published var isRestoringTerminal = false
     private var structuredAgentRunning: Bool?
+    private var seenAgentEventHashes: [Data: Date] = [:]
+    private var seenAgentEventOrder: [(Data, Date)] = []
     private var agentMonitor: RelayRemoteTransport?
     let remoteParentSessionID: String?
+    private(set) var remoteWorkspaceSessionID: String?
+    private(set) var remoteTabID: String?
     private var quietTask: Task<Void, Never>?
     lazy var runtime = TerminalRuntime(pane: self)
     lazy var editorRuntime = RemoteEditorRuntime(pane: self)
@@ -528,6 +533,11 @@ final class PaneModel: ObservableObject, Identifiable {
         }
     }
 
+    func assignRemoteHierarchy(workspaceSessionID: UUID, tabID: UUID) {
+        remoteWorkspaceSessionID = workspaceSessionID.uuidString.lowercased()
+        remoteTabID = tabID.uuidString.lowercased()
+    }
+
     func focus() {
         switch contentKind {
         case .terminal: runtime.focus()
@@ -546,6 +556,10 @@ final class PaneModel: ObservableObject, Identifiable {
             profile: profile,
             sessionID: id.uuidString.lowercased(),
             parentSessionID: nil,
+            workspaceSessionID: remoteWorkspaceSessionID,
+            tabID: remoteTabID,
+            paneTitle: displayName,
+            contentKind: contentKind.rawValue,
             onOutput: { _ in },
             onStatus: { [weak self, weak monitor] status in
                 Task { @MainActor [weak self, weak monitor] in
@@ -660,6 +674,23 @@ final class PaneModel: ObservableObject, Identifiable {
         guard let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let agentName = envelope["agent"] as? String,
               let event = envelope["event"] as? [String: Any] else { return }
+        var normalizedEnvelope = envelope
+        normalizedEnvelope.removeValue(forKey: "relay_event_seq")
+        normalizedEnvelope.removeValue(forKey: "relay_recorded_at")
+        if let normalized = try? JSONSerialization.data(withJSONObject: normalizedEnvelope, options: [.sortedKeys]) {
+            let digest = Data(SHA256.hash(data: normalized))
+            let now = Date()
+            if let previous = seenAgentEventHashes[digest], now.timeIntervalSince(previous) < 1 { return }
+            seenAgentEventHashes[digest] = now
+            seenAgentEventOrder.append((digest, now))
+            let expiry = now.addingTimeInterval(-1)
+            let retained = seenAgentEventOrder.drop { $0.1 < expiry }
+            if retained.startIndex != seenAgentEventOrder.startIndex || seenAgentEventOrder.count > 4_096 {
+                let keep = Array(retained.suffix(4_096))
+                seenAgentEventHashes = Dictionary(uniqueKeysWithValues: keep.map { ($0.0, $0.1) })
+                seenAgentEventOrder = keep
+            }
+        }
         if agentName == "relay",
            event["type"] as? String == "open_file",
            let paths = event["paths"] as? [String],

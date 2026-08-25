@@ -58,6 +58,10 @@ final class TerminalRuntime: NSObject {
             profile: pane.profile,
             sessionID: pane.id.uuidString.lowercased(),
             parentSessionID: pane.remoteParentSessionID,
+            workspaceSessionID: pane.remoteWorkspaceSessionID,
+            tabID: pane.remoteTabID,
+            paneTitle: pane.displayName,
+            contentKind: pane.contentKind.rawValue,
             onOutput: { [weak self] data in
                 guard io.receive(data) else { return }
                 guard let text = String(data: data, encoding: .utf8) else { return }
@@ -89,6 +93,9 @@ final class TerminalRuntime: NSObject {
                         let message = status.message ?? "Remote session error"
                         self.io.receive(Data("\r\n\u{001B}[38;2;255;139;120mRelay: \(message)\u{001B}[0m\r\n".utf8))
                         self.pane?.disconnected(message)
+                    } else if status.state == "input_dropped" {
+                        let message = status.message ?? "Some offline input was not queued."
+                        self.io.receive(Data("\r\n\u{001B}[38;2;255;184;108mRelay: \(message)\u{001B}[0m\r\n".utf8))
                     }
                 }
             },
@@ -588,12 +595,19 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
     }
 
     func makeNSView(context: Context) -> RelayGhosttyView {
-        pane.runtime.startIfNeeded()
-        return pane.runtime.view
+        let view = pane.runtime.view
+        Task { @MainActor in
+            await Task.yield()
+            pane.runtime.startIfNeeded()
+        }
+        return view
     }
 
     func updateNSView(_ nsView: RelayGhosttyView, context: Context) {
-        pane.runtime.startIfNeeded()
+        Task { @MainActor in
+            await Task.yield()
+            pane.runtime.startIfNeeded()
+        }
         nsView.fitToSize()
     }
 }

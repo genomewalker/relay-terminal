@@ -49,6 +49,11 @@ func ServeWorker(config WorkerConfig) error {
 	if err != nil {
 		return err
 	}
+	eventPath := filepath.Join(filepath.Dir(filepath.Dir(config.ManifestPath)), "events", config.SessionID+".jsonl")
+	if err := session.enableEventJournal(eventPath); err != nil {
+		_ = session.signal(syscall.SIGTERM)
+		return err
+	}
 	bootID, err := nodeBootID()
 	if err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -65,7 +70,7 @@ func ServeWorker(config WorkerConfig) error {
 		ShellPID: session.processID(), NodeBootID: bootID,
 		SocketPath: config.SocketPath, Token: config.Token,
 		Command: config.Command, WorkingDirectory: config.WorkingDirectory,
-		State: "running", CreatedAt: time.Now().UTC(),
+		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1"}, CreatedAt: time.Now().UTC(),
 	}
 	if err := storeManifest(config.ManifestPath, manifest); err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -89,6 +94,7 @@ func ServeWorker(config WorkerConfig) error {
 	go func() {
 		select {
 		case <-signals:
+			session.terminate()
 			_ = listener.Close()
 		case <-stopped:
 		}
@@ -116,15 +122,16 @@ func persistWorkerState(stopped <-chan struct{}, path string, manifest workerMan
 		case <-stopped:
 			return
 		case <-ticker.C:
-			sequence, exited, exitCode := session.snapshot()
+			sequence, eventSequence, exited, exitCode := session.snapshot()
 			state := "running"
 			if exited {
 				state = "exited"
 			}
-			if sequence == lastSequence && state == lastState {
+			if sequence == lastSequence && eventSequence == manifest.LastEventSequence && state == lastState {
 				continue
 			}
 			manifest.LastSequence = sequence
+			manifest.LastEventSequence = eventSequence
 			manifest.State = state
 			manifest.ExitCode = exitCode
 			_ = storeManifest(path, manifest)
@@ -148,7 +155,7 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	}
 	writer := protocol.NewWriter(connection)
 	if hello.Probe {
-		_, exited, exitCode := session.snapshot()
+		_, _, exited, exitCode := session.snapshot()
 		state := "ready"
 		if exited {
 			state = "exited"
@@ -167,14 +174,14 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		return
 	}
 	if hello.ObserveEvents {
-		serveAgentObserver(connection, writer, session)
+		serveAgentObserver(connection, writer, session, hello.LastEventSeq)
 		return
 	}
 
-	viewer, replay := session.attach(hello.LastSeq)
+	viewer, replay := session.attach(hello.LastSeq, hello.LastEventSeq)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(),
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1"},
 	})
 	if err := writer.Write(attached); err != nil {
 		return
@@ -216,6 +223,11 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		switch frame.Type {
 		case protocol.Input:
 			_ = session.input(frame.Payload)
+		case protocol.InputV2:
+			clientID, sequence, data, parseErr := protocol.ParseInputV2(frame)
+			if parseErr == nil && session.acknowledgedInput(clientID, sequence, data) == nil {
+				_ = writer.Write(protocol.InputAckFrame(clientID, sequence))
+			}
 		case protocol.Resize:
 			cols, rows, parseErr := protocol.ParseResize(frame)
 			if parseErr == nil {
@@ -236,11 +248,11 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	}
 }
 
-func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *Session) {
-	observer, snapshot := session.observeAgents()
+func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *Session, lastEventSequence uint64) {
+	observer, snapshot := session.observeAgents(lastEventSequence)
 	defer session.detachAgentObserver(observer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(),
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"event_cursor_v1"},
 	})
 	if writer.Write(attached) != nil {
 		return

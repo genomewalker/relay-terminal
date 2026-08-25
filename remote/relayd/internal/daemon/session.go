@@ -37,18 +37,23 @@ type Session struct {
 	pty     *os.File
 	process *exec.Cmd
 
-	mu               sync.Mutex
-	sequence         uint64
-	replay           []record
-	replayBytes      int
-	clients          map[*client]struct{}
-	agentClients     map[*client]struct{}
-	exited           bool
-	exitCode         int
-	latestAgentEvent []byte
-	activeSubagents  map[string][]byte
-	artifactDetector artifactDetector
-	done             chan struct{}
+	mu                sync.Mutex
+	sequence          uint64
+	replay            []record
+	replayBytes       int
+	clients           map[*client]struct{}
+	agentClients      map[*client]struct{}
+	exited            bool
+	exitCode          int
+	latestAgentEvent  []byte
+	activeSubagents   map[string][]byte
+	eventSequence     uint64
+	eventHistory      []protocol.Frame
+	eventHistoryBytes int
+	eventJournal      *agentEventJournal
+	inputSequences    map[[16]byte]uint64
+	artifactDetector  artifactDetector
+	done              chan struct{}
 }
 
 func startSession(id, command, workingDirectory string, cols, rows uint16) (*Session, error) {
@@ -88,6 +93,7 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 		id: id, command: command, pty: terminal, process: child,
 		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
 		activeSubagents: make(map[string][]byte), done: make(chan struct{}),
+		inputSequences: make(map[[16]byte]uint64),
 	}
 	go session.readOutput()
 	go session.wait()
@@ -208,6 +214,7 @@ func (session *Session) publishDetectedAgent(agent, eventName string) {
 		"event": map[string]any{
 			"hook_event_name": eventName,
 			"source":          "process-tree",
+			"occurred_at":     time.Now().UTC().Format(time.RFC3339Nano),
 		},
 	})
 	if err == nil {
@@ -363,10 +370,10 @@ func (session *Session) wait() {
 	session.mu.Unlock()
 }
 
-func (session *Session) snapshot() (sequence uint64, exited bool, exitCode int) {
+func (session *Session) snapshot() (sequence uint64, eventSequence uint64, exited bool, exitCode int) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.sequence, session.exited, session.exitCode
+	return session.sequence, session.eventSequence, session.exited, session.exitCode
 }
 
 func (session *Session) processID() int {
@@ -378,7 +385,7 @@ func (session *Session) processID() int {
 	return session.process.Process.Pid
 }
 
-func (session *Session) attach(lastSequence uint64) (*client, []protocol.Frame) {
+func (session *Session) attach(lastSequence, lastEventSequence uint64) (*client, []protocol.Frame) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	viewer := &client{frames: make(chan protocol.Frame, 512)}
@@ -405,20 +412,7 @@ func (session *Session) attach(lastSequence uint64) (*client, []protocol.Frame) 
 		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "exited", ExitCode: session.exitCode})
 		frames = append(frames, status)
 	}
-	if len(session.latestAgentEvent) > 0 {
-		frames = append(frames, protocol.Frame{
-			Type:    protocol.AgentEvent,
-			Payload: append([]byte(nil), session.latestAgentEvent...),
-		})
-	}
-	for _, payload := range session.activeSubagents {
-		if bytes.Equal(payload, session.latestAgentEvent) {
-			continue
-		}
-		frames = append(frames, protocol.Frame{
-			Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...),
-		})
-	}
+	frames = append(frames, session.eventFramesAfter(lastEventSequence)...)
 	return viewer, frames
 }
 
@@ -450,26 +444,12 @@ func (session *Session) detach(viewer *client) {
 	session.mu.Unlock()
 }
 
-func (session *Session) observeAgents() (*client, []protocol.Frame) {
+func (session *Session) observeAgents(lastEventSequence uint64) (*client, []protocol.Frame) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	observer := &client{frames: make(chan protocol.Frame, 64)}
 	session.agentClients[observer] = struct{}{}
-	frames := make([]protocol.Frame, 0, 2)
-	if len(session.latestAgentEvent) > 0 {
-		frames = append(frames, protocol.Frame{
-			Type:    protocol.AgentEvent,
-			Payload: append([]byte(nil), session.latestAgentEvent...),
-		})
-	}
-	for _, payload := range session.activeSubagents {
-		if bytes.Equal(payload, session.latestAgentEvent) {
-			continue
-		}
-		frames = append(frames, protocol.Frame{
-			Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...),
-		})
-	}
+	frames := session.eventFramesAfter(lastEventSequence)
 	if session.exited {
 		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "exited", ExitCode: session.exitCode})
 		frames = append(frames, status)
@@ -494,6 +474,35 @@ func (session *Session) input(data []byte) error {
 	return err
 }
 
+func (session *Session) acknowledgedInput(clientID [16]byte, sequence uint64, data []byte) error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.exited {
+		return io.ErrClosedPipe
+	}
+	if sequence <= session.inputSequences[clientID] {
+		return nil
+	}
+	remaining := data
+	for len(remaining) > 0 {
+		written, err := session.pty.Write(remaining)
+		if err != nil {
+			return err
+		}
+		remaining = remaining[written:]
+	}
+	session.inputSequences[clientID] = sequence
+	if len(session.inputSequences) > 64 {
+		for key := range session.inputSequences {
+			if key != clientID {
+				delete(session.inputSequences, key)
+				break
+			}
+		}
+	}
+	return nil
+}
+
 func (session *Session) resize(cols, rows uint16) error {
 	if cols == 0 || rows == 0 {
 		return nil
@@ -502,9 +511,15 @@ func (session *Session) resize(cols, rows uint16) error {
 }
 
 func (session *Session) agentEvent(payload []byte) {
-	frame := protocol.Frame{Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...)}
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	session.eventSequence++
+	payload = indexedAgentPayload(payload, session.eventSequence)
+	frame := protocol.Frame{Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...)}
+	if session.eventJournal != nil {
+		_ = session.eventJournal.append(session.eventSequence, payload)
+	}
+	session.appendEventHistory(frame)
 	session.latestAgentEvent = append(session.latestAgentEvent[:0], payload...)
 	session.updateActiveSubagents(payload)
 	for viewer := range session.clients {
@@ -519,6 +534,47 @@ func (session *Session) agentEvent(payload []byte) {
 		default:
 		}
 	}
+}
+
+func (session *Session) eventFramesAfter(sequence uint64) []protocol.Frame {
+	frames := make([]protocol.Frame, 0, len(session.eventHistory))
+	for _, frame := range session.eventHistory {
+		if indexedAgentSequence(frame.Payload) <= sequence {
+			continue
+		}
+		frames = append(frames, protocol.Frame{Type: protocol.AgentEvent, Payload: append([]byte(nil), frame.Payload...)})
+	}
+	return frames
+}
+
+func (session *Session) appendEventHistory(frame protocol.Frame) {
+	session.eventHistory = append(session.eventHistory, frame)
+	session.eventHistoryBytes += len(frame.Payload)
+	for (session.eventHistoryBytes > 16<<20 || len(session.eventHistory) > 10_000) && len(session.eventHistory) > 1 {
+		session.eventHistoryBytes -= len(session.eventHistory[0].Payload)
+		session.eventHistory = session.eventHistory[1:]
+	}
+}
+
+func (session *Session) enableEventJournal(path string) error {
+	journal, records, err := openAgentEventJournal(path)
+	if err != nil {
+		return err
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.eventJournal = journal
+	for _, record := range records {
+		if record.Sequence <= session.eventSequence {
+			continue
+		}
+		session.eventSequence = record.Sequence
+		frame := protocol.Frame{Type: protocol.AgentEvent, Payload: record.Payload}
+		session.appendEventHistory(frame)
+		session.latestAgentEvent = append(session.latestAgentEvent[:0], record.Payload...)
+		session.updateActiveSubagents(record.Payload)
+	}
+	return nil
 }
 
 func (session *Session) updateActiveSubagents(payload []byte) {
@@ -570,4 +626,18 @@ func (session *Session) updateActiveSubagents(payload []byte) {
 
 func (session *Session) signal(signal syscall.Signal) error {
 	return session.process.Process.Signal(signal)
+}
+
+func (session *Session) terminate() {
+	session.mu.Lock()
+	if session.exited || session.process == nil || session.process.Process == nil {
+		session.mu.Unlock()
+		return
+	}
+	pid := session.process.Process.Pid
+	session.mu.Unlock()
+	// pty.Start creates a new session/process group. Signal the group so an
+	// explicit Relay termination does not orphan agent descendants.
+	_ = syscall.Kill(-pid, syscall.SIGHUP)
+	_ = session.process.Process.Signal(syscall.SIGTERM)
 }

@@ -123,6 +123,7 @@ func (server *Server) serveConnection(connection net.Conn) {
 		}
 		return
 	}
+	_ = server.recordCatalogEntry(hello, manifest)
 	worker, err := net.DialTimeout("unix", manifest.SocketPath, time.Second)
 	if err != nil {
 		return
@@ -139,8 +140,11 @@ func (server *Server) serveConnection(connection net.Conn) {
 	if err := protocol.NewWriter(worker).Write(workerHello); err != nil {
 		return
 	}
-	if hello.ObserveEvents {
-		serveObservedConnection(connection, worker, manifest)
+	if !manifest.supports("event_cursor_v1") {
+		serveObservedConnection(
+			connection, worker, manifest, server.eventJournalPath(manifest.SessionID),
+			hello.LastEventSeq, hello.ObserveEvents,
+		)
 		return
 	}
 
@@ -168,7 +172,13 @@ type observedWorkerFrame struct {
 // recover structured agent threads from durable pane workers created by an
 // older binary. Terminal output from their compatibility attachment is dropped
 // before it reaches the macOS app.
-func serveObservedConnection(connection, worker net.Conn, manifest workerManifest) {
+func serveObservedConnection(
+	connection, worker net.Conn,
+	manifest workerManifest,
+	eventPath string,
+	lastEventSequence uint64,
+	dropTerminalOutput bool,
+) {
 	workerFrames := make(chan observedWorkerFrame, 32)
 	go func() {
 		for {
@@ -193,14 +203,25 @@ func serveObservedConnection(connection, worker net.Conn, manifest workerManifes
 	claudeFrames, stopClaude := observeClaudeTranscript(manifest.ShellPID)
 	defer stopClaude()
 	writer := protocol.NewWriter(connection)
+	index, indexErr := sharedExternalEventIndex(eventPath)
+	if indexErr == nil {
+		for _, frame := range index.framesAfter(lastEventSequence) {
+			if writer.Write(frame) != nil {
+				return
+			}
+		}
+	}
 	for {
 		select {
 		case result := <-workerFrames:
 			if result.err != nil {
 				return
 			}
-			if result.frame.Type == protocol.Output {
+			if result.frame.Type == protocol.Output && dropTerminalOutput {
 				continue
+			}
+			if result.frame.Type == protocol.AgentEvent && indexErr == nil {
+				result.frame = index.index(result.frame.Payload)
 			}
 			if writer.Write(result.frame) != nil {
 				return
@@ -210,6 +231,9 @@ func serveObservedConnection(connection, worker net.Conn, manifest workerManifes
 				codexFrames = nil
 				continue
 			}
+			if indexErr == nil {
+				frame = index.index(frame.Payload)
+			}
 			if writer.Write(frame) != nil {
 				return
 			}
@@ -218,6 +242,9 @@ func serveObservedConnection(connection, worker net.Conn, manifest workerManifes
 				claudeFrames = nil
 				continue
 			}
+			if indexErr == nil {
+				frame = index.index(frame.Payload)
+			}
 			if writer.Write(frame) != nil {
 				return
 			}
@@ -225,6 +252,10 @@ func serveObservedConnection(connection, worker net.Conn, manifest workerManifes
 			return
 		}
 	}
+}
+
+func (server *Server) eventJournalPath(sessionID string) string {
+	return filepath.Join(filepath.Dir(server.stateDir), "events", sessionID+".jsonl")
 }
 
 func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest, error) {
@@ -357,6 +388,63 @@ func (server *Server) stopValidatedWorker(manifest workerManifest) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func (server *Server) TerminatePane(sessionID string) error {
+	if !validSessionID.MatchString(sessionID) {
+		return errors.New("invalid pane session ID")
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	manifest, err := loadManifest(server.manifestPath(sessionID))
+	if err != nil {
+		return errors.New("pane is not present on this node")
+	}
+	if err := validateWorkerIdentity(manifest); err != nil {
+		return errors.New("refusing to signal an unvalidated pane worker")
+	}
+	process, err := os.FindProcess(manifest.WorkerPID)
+	if err != nil {
+		return err
+	}
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, statErr := os.Stat(manifest.SocketPath); errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return errors.New("pane worker did not terminate")
+}
+
+func (server *Server) ForgetPane(sessionID string) error {
+	if !validSessionID.MatchString(sessionID) {
+		return errors.New("invalid pane session ID")
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	catalog, err := loadStoredCatalog(server.catalogPath())
+	if err != nil {
+		return errors.New("pane is not in this node's catalog")
+	}
+	entry, exists := catalog.Panes[sessionID]
+	nodeID, _ := currentNodeIdentity()
+	if !exists || entry.NodeID != nodeID {
+		return errors.New("pane is not in this node's catalog")
+	}
+	manifestPath := server.manifestPath(sessionID)
+	if manifest, loadErr := loadManifest(manifestPath); loadErr == nil {
+		if validateWorkerIdentity(manifest) == nil {
+			return errors.New("pane is still running; terminate it first")
+		}
+		removeManifest(manifestPath)
+	}
+	delete(catalog.Panes, sessionID)
+	catalog.Revision++
+	return storeCatalog(server.catalogPath(), catalog)
 }
 
 func (server *Server) cleanStaleWorker(manifestPath string, manifest workerManifest) {

@@ -126,6 +126,54 @@ func multipleTabsPerSession() {
     workspace.shutdown()
 }
 
+@Test("Remote catalog groups durable workspaces and leaves old panes recoverable")
+func remoteCatalogGrouping() throws {
+    let data = Data(#"{"schema":1,"revision":7,"node_id":"node","node_name":"dandy-07","panes":[{"pane_id":"11111111-1111-1111-1111-111111111111","workspace_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","tab_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","content_kind":"terminal","state":"running","last_sequence":9,"recoverable":true,"unfiled":false},{"pane_id":"22222222-2222-2222-2222-222222222222","content_kind":"terminal","state":"running","last_sequence":3,"recoverable":true,"unfiled":true}]}"#.utf8)
+    let snapshot = try JSONDecoder().decode(RemoteCatalogSnapshot.self, from: data)
+
+    #expect(snapshot.sessions.count == 2)
+    #expect(snapshot.sessions.contains { $0.workspaceID == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" && $0.tabCount == 1 })
+    #expect(snapshot.sessions.contains { $0.isUnfiled && $0.recoverable })
+}
+
+@MainActor
+@Test("Attaching a remote catalog session preserves remote pane and hierarchy IDs")
+func attachRemoteCatalogSession() {
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    let sessionID = UUID()
+    let tabID = UUID()
+    let paneID = UUID()
+    let remote = RemoteSessionRecord(
+        id: "workspace:\(sessionID.uuidString.lowercased())",
+        workspaceID: sessionID.uuidString.lowercased(),
+        panes: [RemoteCatalogPane(
+            paneID: paneID.uuidString.lowercased(),
+            workspaceID: sessionID.uuidString.lowercased(),
+            tabID: tabID.uuidString.lowercased(),
+            parentPaneID: nil,
+            title: "Training",
+            contentKind: "terminal",
+            command: nil,
+            directory: "/work",
+            state: "running",
+            workerPID: 42,
+            shellPID: 43,
+            lastSequence: 8,
+            recoverable: true,
+            unfiled: false
+        )]
+    )
+
+    workspace.attachRemoteSession(profile: .sshConfigHost("dandy-07"), remote: remote)
+
+    #expect(workspace.selectedTabID == tabID)
+    #expect(workspace.selectedTab?.sessionID == sessionID)
+    #expect(workspace.activePaneID == paneID)
+    #expect(workspace.activePane?.remoteWorkspaceSessionID == sessionID.uuidString.lowercased())
+    #expect(workspace.activePane?.remoteTabID == tabID.uuidString.lowercased())
+    workspace.shutdown()
+}
+
 @MainActor
 @Test("Sessions, tabs, and panes can be renamed independently")
 func workspaceRenaming() {
@@ -231,6 +279,16 @@ func structuredCodexEvent() {
 
     pane.received("random full-screen cursor text that belongs only in the terminal")
     #expect(pane.activitySummary == "Using exec_command")
+}
+
+@MainActor
+@Test("Agent events from terminal and observer channels are deduplicated")
+func duplicateAgentChannels() {
+    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","relay_event_seq":1,"event":{"hook_event_name":"PreToolUse","tool_name":"exec_command"}}"#.utf8))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","relay_event_seq":88,"relay_recorded_at":"2026-08-25T18:00:00Z","event":{"hook_event_name":"PreToolUse","tool_name":"exec_command"}}"#.utf8))
+
+    #expect(pane.agentActivities.count == 1)
 }
 
 @MainActor

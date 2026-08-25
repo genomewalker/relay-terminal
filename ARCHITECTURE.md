@@ -54,7 +54,7 @@ Workers publish atomic permission-`0600` manifests containing the session UUID, 
 
 If the supervisor crashes or is upgraded, the workers and their PTYs continue. If an individual worker crashes, its PTY is lost because an open kernel file descriptor cannot be reconstructed from a disk record. Workers therefore stay deliberately tiny and, where the cluster permits it, outside the memory-heavy agent's cgroup. Node reboot recovery belongs to the scheduler/checkpoint layer.
 
-The current implementation uses a per-user supervisor, detached per-pane workers, atomic worker manifests, boot/PID/socket identity validation, and sequence-based reattachment. Local workspace snapshots now model session -> tabs -> panes. Remote workspace-level catalog metadata and explicit worker garbage collection remain to be added.
+The current implementation uses a per-user supervisor, detached per-pane workers, atomic worker manifests, boot/PID/socket identity validation, and sequence-based reattachment. Node-scoped catalogs store session/tab/pane hierarchy separately from worker manifests so an older live worker can be migrated without rewriting state it still owns. Local workspace snapshots retain detailed split/floating geometry. Explicit worker garbage collection and remote geometry mutations remain to be added.
 
 ## Quick editor panes
 
@@ -75,17 +75,17 @@ The quick editor deliberately does not reproduce the VS Code workbench, extensio
 
 ## Agent activity
 
-Relay worker shells prepend a private shim directory to `PATH`. Invoking `claude` or `codex` in those shells runs the real binary with Relay hook configuration; shells opened outside Relay are unchanged. Hook payloads travel in `AgentEvent` frames beside terminal output and drive the pane's working/ready/approval state, recent activity tree, and nested subagent rows. Raw terminal text is never presented as an activity-tree item. A Linux process-tree monitor and throttled output heuristics identify agents launched outside the shim path, but show only stable lifecycle state until structured events are available. Selecting an agent, activity, or subagent in the session rail selects its tab and raises its tiled or floating terminal pane.
+Relay worker shells prepend a private shim directory to `PATH`. Invoking `claude` or `codex` in those shells runs the real binary with Relay hook configuration; shells opened outside Relay are unchanged. Hook payloads travel in `AgentEvent` frames beside terminal output and drive the pane's working/ready/approval state, recent activity tree, and nested subagent rows. New workers append indexed events to bounded per-pane journals; the supervisor indexes compatibility events for older workers. Clients reconnect with an event cursor. Raw terminal text is never presented as an activity-tree item. A Linux process-tree monitor and throttled output heuristics identify agents launched outside the shim path, but show only stable lifecycle state until structured events are available. Selecting an agent, activity, or subagent in the session rail selects its tab and raises its tiled or floating terminal pane.
 
 ## Attach flow
 
-1. Relay opens one SSH transport to the selected node and asks `relayd` to list sessions.
+1. Relay asks the selected node for its node-scoped `relayd sessions` catalog over SSH.
 2. The user resumes a session or creates one.
-3. Relay receives the session manifest and reconstructs native tabs, split trees, and floating windows.
+3. Relay receives stable remote session/tab/pane identities and combines them with detailed local split/floating geometry when available. Catalog-only recovery uses a balanced native layout.
 4. Each native terminal surface attaches to its pane worker's byte/event stream.
 5. Layout edits update the remote manifest; terminal bytes never contain Relay UI chrome.
 
-Only one client holds the input/layout lease for a pane by default. Additional clients attach read-only until the user explicitly takes control. This avoids two clients racing terminal input or layout updates.
+Input/layout leases are the required production behavior but are not implemented yet. Current attachments can both send input. New workers do acknowledge and deduplicate each controlling client's input across reconnects.
 
 ## UI model
 
