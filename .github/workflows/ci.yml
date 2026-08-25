@@ -9,9 +9,9 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test Swift application
         run: swift test
       - name: Build app bundle
@@ -23,8 +23,8 @@ jobs:
   relayd:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: remote/relayd/go.mod
           cache-dependency-path: remote/relayd/go.sum
@@ -34,4 +34,3 @@ jobs:
       - name: Vet relayd
         working-directory: remote/relayd
         run: go vet ./...
-
