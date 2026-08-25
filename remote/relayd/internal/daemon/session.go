@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -371,10 +372,18 @@ func (session *Session) attach(lastSequence uint64) (*client, []protocol.Frame) 
 	if lastSequence > session.sequence {
 		lastSequence = 0
 	}
-	frames := make([]protocol.Frame, 0, len(session.replay))
-	for _, item := range session.replay {
+	startRecord, startOffset := replayStart(session.replay, lastSequence)
+	frames := make([]protocol.Frame, 0, len(session.replay)-startRecord)
+	for index, item := range session.replay {
 		if item.sequence > lastSequence {
-			frames = append(frames, protocol.OutputFrame(item.sequence, item.data))
+			if index < startRecord {
+				continue
+			}
+			data := item.data
+			if index == startRecord && startOffset > 0 {
+				data = append([]byte("\x1bc"), data[startOffset:]...)
+			}
+			frames = append(frames, protocol.OutputFrame(item.sequence, data))
 			frames = append(frames, item.artifacts...)
 		}
 	}
@@ -389,6 +398,28 @@ func (session *Session) attach(lastSequence uint64) (*client, []protocol.Frame) 
 		})
 	}
 	return viewer, frames
+}
+
+// A new local renderer only needs the latest complete terminal redraw. Sending
+// the full cursor-addressed history is both slower and incorrect when the pane
+// has changed size since the TUI emitted it. Incremental reconnects stay exact.
+func replayStart(replay []record, lastSequence uint64) (int, int) {
+	if lastSequence != 0 {
+		return 0, 0
+	}
+	clears := [][]byte{[]byte("\x1b[2J"), []byte("\x1b[3J"), []byte("\x1bc")}
+	for index := len(replay) - 1; index >= 0; index-- {
+		latest := -1
+		for _, clear := range clears {
+			if offset := bytes.LastIndex(replay[index].data, clear); offset > latest {
+				latest = offset
+			}
+		}
+		if latest >= 0 {
+			return index, latest
+		}
+	}
+	return 0, 0
 }
 
 func (session *Session) detach(viewer *client) {

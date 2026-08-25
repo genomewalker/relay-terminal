@@ -27,7 +27,13 @@ final class TerminalRuntime: NSObject {
         io.onReplayFinished = { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if !self.view.performBindingAction("scroll_to_bottom") {
+                // Ghostty applies a large replay over several render passes. Keep
+                // the overlay up until the viewport settles on the live screen.
+                for delay in [0, 32, 96] {
+                    if delay > 0 {
+                        try? await Task.sleep(for: .milliseconds(delay))
+                    }
+                    _ = self.view.performBindingAction("scroll_to_bottom")
                     _ = self.view.scrollToRow(UInt.max)
                 }
                 self.pane?.finishTerminalRestore()
@@ -52,7 +58,7 @@ final class TerminalRuntime: NSObject {
             sessionID: pane.id.uuidString.lowercased(),
             parentSessionID: pane.remoteParentSessionID,
             onOutput: { [weak self] data in
-                io.receive(data)
+                guard io.receive(data) else { return }
                 guard let text = String(data: data, encoding: .utf8) else { return }
                 self?.activityCoalescer.ingest(text) { [weak self] batch in
                     Task { @MainActor [weak self] in self?.pane?.received(batch) }
@@ -235,7 +241,28 @@ private final class TerminalIOBridge: @unchecked Sendable {
     private let receiveLock = NSLock()
     private let replayLock = NSLock()
     private var replaying = false
+    private var suppressingTerminalWrites = false
+    private var replayBuffer = Data()
     private var replayGeneration: UInt64 = 0
+    private var legacyReplayGeneration: UInt64 = 0
+    private var filterDeviceResponsesUntil = Date.distantPast
+    private let legacyReplayTimer: DispatchSourceTimer
+
+    init() {
+        legacyReplayTimer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue.global(qos: .userInitiated)
+        )
+        legacyReplayTimer.setEventHandler { [weak self] in
+            self?.finishLegacyReplayIfIdle()
+        }
+        legacyReplayTimer.schedule(deadline: .distantFuture)
+        legacyReplayTimer.resume()
+    }
+
+    deinit {
+        legacyReplayTimer.cancel()
+    }
+
     lazy var session = InMemoryTerminalSession(
         write: { [weak self] data in self?.forwardTerminalWrite(data) },
         resize: { [weak self] viewport in
@@ -247,16 +274,29 @@ private final class TerminalIOBridge: @unchecked Sendable {
         suppressesPixelOnlyResizes: true
     )
 
-    func receive(_ data: Data) {
+    /// Returns true for live output and false for buffered reconstruction data.
+    @discardableResult
+    func receive(_ data: Data) -> Bool {
+        replayLock.lock()
+        if replaying {
+            replayBuffer.append(data)
+            replayLock.unlock()
+            scheduleLegacyReplayEnd()
+            return false
+        }
+        replayLock.unlock()
         receiveLock.lock()
         defer { receiveLock.unlock() }
         session.receive(data)
-        scheduleLegacyReplayEnd()
+        return true
     }
 
     func beginReplay() {
         replayLock.lock()
+        if !replaying { replayBuffer.removeAll(keepingCapacity: true) }
         replaying = true
+        suppressingTerminalWrites = true
+        filterDeviceResponsesUntil = Date().addingTimeInterval(5)
         replayGeneration &+= 1
         replayLock.unlock()
         scheduleLegacyReplayEnd()
@@ -264,24 +304,55 @@ private final class TerminalIOBridge: @unchecked Sendable {
 
     func endReplay() {
         replayLock.lock()
-        let wasReplaying = replaying
+        guard replaying else {
+            replayLock.unlock()
+            return
+        }
         replaying = false
         replayGeneration &+= 1
+        let generation = replayGeneration
+        let buffered = replayBuffer
+        replayBuffer.removeAll(keepingCapacity: true)
+        legacyReplayTimer.schedule(deadline: .distantFuture)
         replayLock.unlock()
-        if wasReplaying { onReplayFinished?() }
+
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            guard let self else { return }
+            let reconstruction = TerminalReplayCompactor.compact(buffered)
+            if !reconstruction.isEmpty {
+                self.receiveLock.lock()
+                self.session.receive(reconstruction)
+                self.receiveLock.unlock()
+            }
+
+            // Device-query replies are produced asynchronously by the renderer.
+            // Keep them local for a couple of frames after reconstruction.
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + .milliseconds(150)
+            ) { [weak self] in
+                guard let self else { return }
+                self.replayLock.lock()
+                let finished = !self.replaying && self.replayGeneration == generation
+                if finished { self.suppressingTerminalWrites = false }
+                self.replayLock.unlock()
+                if finished { self.onReplayFinished?() }
+            }
+        }
     }
 
     private func forwardTerminalWrite(_ data: Data) {
         replayLock.lock()
-        let shouldSuppress = replaying
+        let shouldSuppress = suppressingTerminalWrites
+        let filterStartupResponse = Date() < filterDeviceResponsesUntil
         replayLock.unlock()
         guard !shouldSuppress else { return }
+        guard !filterStartupResponse || !TerminalDeviceResponseFilter.matches(data) else { return }
         transport?.sendInput(data)
     }
 
-    // Workers released before the caught_up status marker remain attachable.
-    // For those workers, a short idle boundary ends replay without allowing
-    // historical device-query replies to leak into the live shell.
+    // Workers released before the caught_up marker remain attachable. One
+    // reschedulable timer handles their idle boundary without enqueuing a timer
+    // for every replay frame.
     private func scheduleLegacyReplayEnd() {
         replayLock.lock()
         guard replaying else {
@@ -289,20 +360,16 @@ private final class TerminalIOBridge: @unchecked Sendable {
             return
         }
         replayGeneration &+= 1
-        let generation = replayGeneration
+        legacyReplayGeneration = replayGeneration
+        legacyReplayTimer.schedule(deadline: .now() + .seconds(1))
         replayLock.unlock()
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(750)) { [weak self] in
-            guard let self else { return }
-            self.replayLock.lock()
-            var finished = false
-            if self.replaying && self.replayGeneration == generation {
-                self.replaying = false
-                self.replayGeneration &+= 1
-                finished = true
-            }
-            self.replayLock.unlock()
-            if finished { self.onReplayFinished?() }
-        }
+    }
+
+    private func finishLegacyReplayIfIdle() {
+        replayLock.lock()
+        let shouldFinish = replaying && replayGeneration == legacyReplayGeneration
+        replayLock.unlock()
+        if shouldFinish { endReplay() }
     }
 
     func receiveInlineImageOrdered(_ data: Data, imageID: UInt32) {
@@ -311,6 +378,87 @@ private final class TerminalIOBridge: @unchecked Sendable {
         for packet in KittyImageEncoder.packets(for: data, imageID: imageID) {
             session.receive(packet)
         }
+    }
+}
+
+enum TerminalReplayCompactor {
+    private static let reset = Data("\u{001B}c".utf8)
+    private static let clearSequences = [
+        Data("\u{001B}[2J".utf8),
+        Data("\u{001B}[3J".utf8),
+        reset,
+    ]
+
+    /// A fresh local surface needs the current screen, not every cursor-addressed
+    /// redraw ever emitted by a TUI. Reconstruct from its latest full clear.
+    static func compact(_ data: Data) -> Data {
+        guard !data.isEmpty else { return data }
+        var latest: Data.Index?
+        for sequence in clearSequences {
+            if let range = data.range(of: sequence, options: .backwards),
+               latest == nil || range.lowerBound > latest! {
+                latest = range.lowerBound
+            }
+        }
+        guard let latest, latest > data.startIndex else { return data }
+        var result = reset
+        result.append(contentsOf: data[latest...])
+        return result
+    }
+}
+
+enum TerminalDeviceResponseFilter {
+    /// Ghostty and the shell share one in-memory write callback. During surface
+    /// startup, drop only complete terminal capability replies; ordinary input
+    /// (including arrows, mouse reports, function keys, and paste) does not
+    /// match this grammar.
+    static func matches(_ data: Data) -> Bool {
+        let bytes = Array(data)
+        guard !bytes.isEmpty else { return false }
+        var index = 0
+        while index < bytes.count {
+            guard bytes[index] == 0x1B, index + 1 < bytes.count else { return false }
+            switch bytes[index + 1] {
+            case 0x5B: // CSI
+                let parameterStart = index + 2
+                var final = parameterStart
+                while final < bytes.count && !(0x40...0x7E).contains(bytes[final]) {
+                    final += 1
+                }
+                guard final < bytes.count else { return false }
+                let parameters = bytes[parameterStart..<final]
+                switch bytes[final] {
+                case 0x63, 0x52: // device attributes or cursor position
+                    break
+                case 0x75: // kitty keyboard capability reply, always private
+                    guard parameters.contains(0x3F) || parameters.contains(0x3E) else { return false }
+                default:
+                    return false
+                }
+                index = final + 1
+            case 0x5D, 0x50: // OSC or DCS, terminated by BEL or ST
+                var end = index + 2
+                var found = false
+                while end < bytes.count {
+                    if bytes[end] == 0x07 {
+                        end += 1
+                        found = true
+                        break
+                    }
+                    if bytes[end] == 0x1B, end + 1 < bytes.count, bytes[end + 1] == 0x5C {
+                        end += 2
+                        found = true
+                        break
+                    }
+                    end += 1
+                }
+                guard found else { return false }
+                index = end
+            default:
+                return false
+            }
+        }
+        return true
     }
 }
 

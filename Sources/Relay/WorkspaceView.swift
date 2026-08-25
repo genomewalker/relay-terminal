@@ -1272,7 +1272,6 @@ private struct PaneView: View {
                         .allowsHitTesting(false)
                 } else if pane.isRestoringTerminal {
                     RestoringTerminalOverlay(host: pane.profile.host)
-                        .allowsHitTesting(false)
                 } else if let exitCode = pane.remoteExitCode {
                     SessionEndedOverlay(
                         exitCode: exitCode,

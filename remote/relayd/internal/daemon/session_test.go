@@ -26,6 +26,23 @@ func TestClassifyAgentProcess(t *testing.T) {
 	}
 }
 
+func TestReplayStartUsesLatestFullScreenRedrawOnlyForFreshRenderer(t *testing.T) {
+	replay := []record{
+		{sequence: 1, data: []byte("old output\x1b[2Jfirst redraw")},
+		{sequence: 2, data: []byte("more\x1b[2Jcurrent screen")},
+		{sequence: 3, data: []byte(" tail")},
+	}
+
+	recordIndex, byteOffset := replayStart(replay, 0)
+	if recordIndex != 1 || byteOffset != len("more") {
+		t.Fatalf("fresh replay starts at (%d, %d), want (1, %d)", recordIndex, byteOffset, len("more"))
+	}
+	recordIndex, byteOffset = replayStart(replay, 1)
+	if recordIndex != 0 || byteOffset != 0 {
+		t.Fatalf("incremental replay must remain exact, got (%d, %d)", recordIndex, byteOffset)
+	}
+}
+
 func TestEnvironmentOverridesReplaceHotPathVariables(t *testing.T) {
 	environment := environmentWithOverrides(
 		[]string{"PATH=/old", "TERM=old", "UNCHANGED=yes"},

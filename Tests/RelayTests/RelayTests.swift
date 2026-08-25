@@ -281,3 +281,25 @@ func structuredAgentSessionEnd() {
     pane.received("historical replay from OpenAI Codex CLI")
     #expect(pane.kind == .shell)
 }
+
+@Test("Terminal replay starts at the latest complete screen redraw")
+func compactTerminalReplay() {
+    let history = Data("old cursor-addressed text\u{001B}[2J\u{001B}[Hcurrent screen".utf8)
+    let compacted = TerminalReplayCompactor.compact(history)
+
+    #expect(compacted == Data("\u{001B}c\u{001B}[2J\u{001B}[Hcurrent screen".utf8))
+    #expect(TerminalReplayCompactor.compact(Data("plain shell output".utf8)) == Data("plain shell output".utf8))
+}
+
+@Test("Startup terminal replies cannot become remote shell input")
+func filterStartupDeviceResponses() {
+    #expect(TerminalDeviceResponseFilter.matches(Data("\u{001B}[?62;22;52c".utf8)))
+    #expect(TerminalDeviceResponseFilter.matches(Data("\u{001B}[12;40R".utf8)))
+    #expect(TerminalDeviceResponseFilter.matches(Data("\u{001B}]10;rgb:d0d0/d0d0/d0d0\u{001B}\\".utf8)))
+    #expect(TerminalDeviceResponseFilter.matches(Data("\u{001B}[?7u".utf8)))
+
+    #expect(!TerminalDeviceResponseFilter.matches(Data("hello".utf8)))
+    #expect(!TerminalDeviceResponseFilter.matches(Data("\u{001B}[A".utf8)))
+    #expect(!TerminalDeviceResponseFilter.matches(Data("\u{001B}[<0;12;4M".utf8)))
+    #expect(!TerminalDeviceResponseFilter.matches(Data("\u{001B}[97;5u".utf8)))
+}
