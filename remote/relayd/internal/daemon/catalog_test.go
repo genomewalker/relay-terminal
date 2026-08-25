@@ -48,6 +48,12 @@ func TestCatalogDiscoversOldWorkerAndAddsHierarchyWithoutChangingManifest(t *tes
 	if err := server.recordCatalogEntry(hello, manifest); err != nil {
 		t.Fatal(err)
 	}
+	if err := server.storeWorkspaceState(workspaceStateRecord{
+		Schema: workspaceStateSchema, WorkspaceID: "workspace-1", Revision: 1,
+		UpdatedAt: now, State: []byte(`{"tabs":["tab-1"]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	updated, err := server.CatalogSnapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +64,9 @@ func TestCatalogDiscoversOldWorkerAndAddsHierarchyWithoutChangingManifest(t *tes
 	pane := updated.Panes[0]
 	if pane.WorkspaceID != "workspace-1" || pane.TabID != "tab-1" || pane.ParentPaneID != "pane-parent" || pane.Title != "Training" || pane.Unfiled {
 		t.Fatalf("hierarchy metadata was not retained: %#v", pane)
+	}
+	if string(updated.WorkspaceStates["workspace-1"]) != `{"tabs":["tab-1"]}` {
+		t.Fatalf("workspace layout was not returned in catalog: %s", updated.WorkspaceStates["workspace-1"])
 	}
 
 	manifestBytes, err := os.ReadFile(manifestPath)

@@ -37,6 +37,12 @@ struct RemoteCatalogSnapshot: Decodable, Sendable {
     let schema: Int
     let revision: UInt64
     let panes: [RemoteCatalogPane]
+    let workspaceStates: [String: WorkspaceSnapshot]?
+
+    enum CodingKeys: String, CodingKey {
+        case schema, revision, panes
+        case workspaceStates = "workspace_states"
+    }
 
     var sessions: [RemoteSessionRecord] {
         let grouped = Dictionary(grouping: panes) { pane in
@@ -49,7 +55,8 @@ struct RemoteCatalogSnapshot: Decodable, Sendable {
                 panes: panes.sorted {
                     if $0.tabID == $1.tabID { return $0.paneID < $1.paneID }
                     return ($0.tabID ?? $0.paneID) < ($1.tabID ?? $1.paneID)
-                }
+                },
+                workspaceSnapshot: panes.first?.workspaceID.flatMap { workspaceStates?[$0] }
             )
         }
         .sorted {
@@ -63,6 +70,7 @@ struct RemoteSessionRecord: Identifiable, Sendable {
     let id: String
     let workspaceID: String?
     let panes: [RemoteCatalogPane]
+    let workspaceSnapshot: WorkspaceSnapshot?
 
     var recoverable: Bool { panes.contains(where: \.recoverable) }
     var isUnfiled: Bool { workspaceID == nil }
@@ -81,13 +89,20 @@ struct RemoteSessionRecord: Identifiable, Sendable {
 
 enum RemoteCatalogError: LocalizedError {
     case failed(String)
+    case networkUnavailable
     case invalidResponse
 
     var errorDescription: String? {
         switch self {
         case .failed(let message): message
+        case .networkUnavailable: "VPN or network route unavailable. Relay will retry automatically."
         case .invalidResponse: "The host returned an invalid Relay session catalog."
         }
+    }
+
+    var shouldRetryAutomatically: Bool {
+        if case .networkUnavailable = self { return true }
+        return false
     }
 }
 
@@ -108,21 +123,23 @@ enum RemoteCatalogService {
             ] + profile.sshConnectionArguments + ["~/.local/bin/relayd", "sessions"]
             ssh.standardOutput = output
             ssh.standardError = errors
+            let captured: CapturedProcessOutput
             do {
-                try ssh.run()
+                captured = try ProcessCapture.run(ssh, output: output, errors: errors, timeout: 12)
             } catch {
                 throw RemoteCatalogError.failed(error.localizedDescription)
             }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 12) { [weak ssh] in
-                guard let ssh, ssh.isRunning else { return }
-                ssh.terminate()
-            }
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-            ssh.waitUntilExit()
+            let data = captured.standardOutput
+            let errorData = captured.standardError
             guard ssh.terminationStatus == 0 else {
                 let message = String(data: errorData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
+                if SSHConnectionFailure.diagnose(
+                    message ?? "",
+                    terminationStatus: ssh.terminationStatus
+                ).kind == .networkRoute {
+                    throw RemoteCatalogError.networkUnavailable
+                }
                 throw RemoteCatalogError.failed(message?.isEmpty == false ? message! : "Could not read remote sessions.")
             }
             guard let snapshot = try? JSONDecoder().decode(RemoteCatalogSnapshot.self, from: data),
@@ -154,18 +171,13 @@ enum RemotePaneControlService {
             ]
             ssh.standardOutput = output
             ssh.standardError = errors
+            let captured: CapturedProcessOutput
             do {
-                try ssh.run()
+                captured = try ProcessCapture.run(ssh, output: output, errors: errors, timeout: 12)
             } catch {
                 throw RemoteCatalogError.failed(error.localizedDescription)
             }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 12) { [weak ssh] in
-                guard let ssh, ssh.isRunning else { return }
-                ssh.terminate()
-            }
-            _ = output.fileHandleForReading.readDataToEndOfFile()
-            let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-            ssh.waitUntilExit()
+            let errorData = captured.standardError
             guard ssh.terminationStatus == 0 else {
                 let message = String(data: errorData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines)

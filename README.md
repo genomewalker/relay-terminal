@@ -12,10 +12,10 @@ Relay is a macOS terminal workspace for remote HPC systems. Shells and agents ru
 Relay.app (macOS)
   native tabs + split tree + session rail
   GhosttyKit Metal terminal surface per pane
-                 │ framed protocol over `ssh -T`
+                 │ one multiplexed framed stream over `ssh -T` per node
                  ▼
 relayd supervisor (remote, static Go binary)
-  manifest discovery + connection proxy
+  session catalog + layout state + connection multiplexer
                  │ private Unix socket
                  ▼
 relay worker per pane
@@ -25,7 +25,7 @@ relay worker per pane
 
 A local pane maps one-to-one to a durable remote `relayd` session UUID. Splitting a remote pane creates another PTY on the same remote host and asks it to inherit the parent shell's working directory; only the visual divider is local. Closing a remote pane detaches it, so the process survives and the saved workspace can reattach later.
 
-`relayd` and its pane workers listen only on mode-0600 Unix sockets owned by the remote user. SSH remains the authentication and transport layer; Relay opens no remote TCP port. Killing the supervisor does not close pane PTYs. A replacement supervisor validates each worker's node boot ID, PID start time, manifest, and socket handshake before reattaching.
+`relayd` and its pane workers listen only on mode-0600 Unix sockets owned by the remote user. SSH remains the authentication and transport layer; Relay opens no remote TCP port. Killing the supervisor does not close pane PTYs. A replacement supervisor validates each worker's node boot ID, PID start time, manifest, and socket handshake before reattaching. Older relayd versions fall back to one SSH stream per pane until they are updated.
 
 ## What works
 
@@ -45,6 +45,10 @@ A local pane maps one-to-one to a durable remote `relayd` session UUID. Splittin
 - Inline Kitty-graphics rendering or dismissible native previews for PNG/JPEG/GIF/WebP files referenced by remote Codex or Claude output
 - Live macOS Settings (`⌘,`) for font, size, terminal padding, palette, interface density, full-screen chrome, and artifact previews
 - Workspace restoration using stable pane/session UUIDs
+- One persistent SSH transport per connected node, with independent virtual pane and agent channels
+- Remote workspace snapshots for tabs, split geometry, floating panes, editor panes, and selection
+- Per-pane input ownership and short remote-layout leases for safe multi-client attachment
+- Explicit terminate/forget commands and startup-bounded retention GC that never selects running panes
 
 Relay deliberately does not run Zellij or tmux for its layout. They can still run inside a pane, but doing so gives their text UI control of that pane again.
 
@@ -57,6 +61,10 @@ swift test
 ./scripts/build-app.sh release
 open Relay.app
 ```
+
+The build script installs the runnable development bundle at
+`~/Applications/Relay.app` and links `Relay.app` in the repository to it. This
+keeps code signing stable when the source tree is managed by macOS File Provider.
 
 Install or update the static remote daemon:
 
@@ -72,6 +80,16 @@ The installer adds Relay-only `claude` and `codex` shims to remote shells create
 relayd agent claude
 ```
 
+Create signed release artifacts with:
+
+```bash
+RELAY_CODESIGN_IDENTITY="Developer ID Application: …" \
+RELAY_NOTARY_PROFILE=relay-notary \
+./scripts/package-release.sh
+```
+
+The package script emits a notarized macOS archive when a notary profile is supplied, static Linux `relayd` binaries for amd64 and arm64, and SHA-256 checksums. GitHub Actions runs the Swift and Go suites on every push; tagged releases use the signing and Apple notarization secrets documented in the release workflow.
+
 ## Keyboard
 
 - `⌘D`: split right
@@ -85,14 +103,11 @@ relayd agent claude
 
 Drag a pane by its connection header and drop it near another pane's left, right, top, or bottom edge to dock it there. Drop in the center to swap tiled panes. The remote PTYs keep their identities and continue running during the move.
 
-## Near-term gaps
+## Current limits
 
-- Explicit terminate/delete session RPC and remote session garbage collection
 - Native agent-pane renderer backed by Codex app-server and Claude bidirectional stream-json
-- One multiplexed transport per node plus a persisted local event/screen cache
-- Durable remote layout mutations; detailed split/floating geometry currently remains in the Mac workspace snapshot
-- Input/layout leases for simultaneous controlling clients
-- Production Xcode packaging, bundled Ghostty resources, signing, and notarization
+- A persisted local screen/event cache beyond the worker replay ring
+- Signed public builds require the repository owner’s Developer ID and Apple notarization credentials
 
 ## License
 

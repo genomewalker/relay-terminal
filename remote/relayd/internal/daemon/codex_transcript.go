@@ -24,18 +24,42 @@ func observeCodexTranscript(rootPID int) (<-chan protocol.Frame, func()) {
 	stopped := make(chan struct{})
 	go func() {
 		defer close(frames)
-		ticker := time.NewTicker(250 * time.Millisecond)
-		defer ticker.Stop()
-		reader := codexTranscriptReader{
-			rootPID: rootPID,
-			known:   make(map[string]bool),
-			active:  make(map[string]bool),
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		readers := make(map[int]*codexTranscriptReader)
+		poll := func() bool {
+			processes := descendantAgentProcesses(rootPID)
+			for pid, agent := range processes {
+				if agent != "codex" {
+					continue
+				}
+				reader := readers[pid]
+				if reader == nil {
+					reader = &codexTranscriptReader{rootPID: pid, known: make(map[string]bool), active: make(map[string]bool)}
+					readers[pid] = reader
+				}
+				if !reader.poll(frames, stopped) {
+					return false
+				}
+			}
+			for pid := range readers {
+				if processes[pid] != "codex" {
+					delete(readers, pid)
+				}
+			}
+			return true
 		}
-		reader.poll(frames)
 		for {
 			select {
-			case <-ticker.C:
-				reader.poll(frames)
+			case <-timer.C:
+				if !poll() {
+					return
+				}
+				delay := 2 * time.Second
+				if len(readers) > 0 {
+					delay = 250 * time.Millisecond
+				}
+				timer.Reset(delay)
 			case <-stopped:
 				return
 			}
@@ -45,44 +69,32 @@ func observeCodexTranscript(rootPID int) (<-chan protocol.Frame, func()) {
 }
 
 type codexTranscriptReader struct {
-	rootPID int
-	path    string
-	offset  int64
-	known   map[string]bool
-	active  map[string]bool
+	rootPID             int
+	path                string
+	offset              int64
+	known               map[string]bool
+	active              map[string]bool
+	discardingOversized bool
+	identity            [2]uint64
 }
 
-func (reader *codexTranscriptReader) poll(frames chan<- protocol.Frame) {
-	agent, pid := descendantAgentProcess(reader.rootPID)
-	if agent != "codex" || pid == 0 {
-		return
-	}
+func (reader *codexTranscriptReader) poll(frames chan<- protocol.Frame, stopped <-chan struct{}) bool {
 	path := reader.path
 	if path == "" {
-		path = codexRootTranscript(pid)
+		path = codexRootTranscript(reader.rootPID)
 	}
 	if path == "" {
-		return
+		return true
 	}
 	if path != reader.path {
 		reader.path = path
 		reader.offset = 0
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	if _, err := file.Seek(reader.offset, io.SeekStart); err != nil {
-		return
-	}
-	scanner := bufio.NewScanner(file)
-	// Tool payloads can make a JSONL record substantially larger than Scanner's
-	// default 64 KiB token. Eight MiB is bounded and covers Codex session rows.
-	scanner.Buffer(make([]byte, 64<<10), 8<<20)
-	for scanner.Scan() {
-		line := append([]byte(nil), scanner.Bytes()...)
-		reader.offset += int64(len(line) + 1)
+	cancelled := false
+	readTranscriptLines(path, &reader.offset, &reader.discardingOversized, &reader.identity, func(line []byte) {
+		if cancelled {
+			return
+		}
 		for _, event := range codexTranscriptEvents(line) {
 			identifier := transcriptEventIdentifier(event)
 			if identifier == "" {
@@ -103,10 +115,16 @@ func (reader *codexTranscriptReader) poll(frames chan<- protocol.Frame) {
 			}
 			payload, marshalErr := json.Marshal(event)
 			if marshalErr == nil {
-				frames <- protocol.Frame{Type: protocol.AgentEvent, Payload: payload}
+				select {
+				case frames <- protocol.Frame{Type: protocol.AgentEvent, Payload: payload}:
+				case <-stopped:
+					cancelled = true
+					return
+				}
 			}
 		}
-	}
+	})
+	return !cancelled
 }
 
 type codexTranscriptEnvelope struct {
@@ -122,6 +140,11 @@ type codexTranscriptEvent struct {
 	Message       string `json:"message,omitempty"`
 	OccurredAt    string `json:"occurred_at,omitempty"`
 	Source        string `json:"source"`
+	FromPeerID    string `json:"from_peer_id,omitempty"`
+	ToPeerID      string `json:"to_peer_id,omitempty"`
+	MessageType   string `json:"message_type,omitempty"`
+	Delivery      string `json:"delivery,omitempty"`
+	Status        string `json:"status,omitempty"`
 }
 
 func transcriptEventIdentifier(event codexTranscriptEnvelope) string {
@@ -154,18 +177,32 @@ func codexTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 		}
 		if json.Unmarshal(row.Payload, &payload) != nil ||
 			payload.Type != "item_completed" || payload.Item.Type != "SubAgentActivity" ||
-			payload.Item.Kind != "started" || payload.Item.AgentPath == "" {
+			payload.Item.AgentPath == "" {
+			return nil
+		}
+		eventName := ""
+		status := ""
+		switch strings.ToLower(payload.Item.Kind) {
+		case "started":
+			eventName = "SubagentStart"
+		case "interacted":
+			eventName = "PeerInteraction"
+		case "interrupted":
+			eventName = "SubagentStop"
+			status = "interrupted"
+		default:
 			return nil
 		}
 		return []codexTranscriptEnvelope{{
 			Agent: "codex",
 			Event: codexTranscriptEvent{
-				HookEventName: "SubagentStart",
+				HookEventName: eventName,
 				AgentID:       payload.Item.AgentPath,
 				AgentType:     filepath.Base(payload.Item.AgentPath),
 				ThreadID:      payload.Item.AgentThreadID,
 				OccurredAt:    row.Timestamp,
 				Source:        "codex-transcript",
+				Status:        status,
 			},
 		}}
 	case "response_item":
@@ -179,49 +216,50 @@ func codexTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 			payload.Author == "" || payload.Recipient == "" {
 			return nil
 		}
-		// Messages sent from a descendant to its parent indicate that turn is
-		// complete. MESSAGE updates remain active; FINAL_ANSWER is represented in
-		// the parent transcript by an agent_message whose author is the child.
-		if !strings.HasPrefix(payload.Author, payload.Recipient+"/") {
-			return nil
-		}
 		finalAnswer := false
-		progressMessage := ""
+		messages := make([]string, 0, len(payload.Content))
+		messageType := "message"
 		for _, content := range payload.Content {
 			if strings.Contains(content.Text, "Message Type: FINAL_ANSWER") {
 				finalAnswer = true
+				messageType = "final_answer"
 			}
 			if message := codexCollaboratorMessage(content.Text); message != "" {
-				progressMessage = message
+				messages = append(messages, message)
 			}
 		}
-		if !finalAnswer {
-			if progressMessage == "" {
-				return nil
-			}
-			return []codexTranscriptEnvelope{{
+		progressMessage := strings.Join(messages, "\n")
+		events := make([]codexTranscriptEnvelope, 0, 2)
+		if progressMessage != "" {
+			events = append(events, codexTranscriptEnvelope{
 				Agent: "codex",
 				Event: codexTranscriptEvent{
-					HookEventName: "SubagentUpdate",
+					HookEventName: "PeerMessage",
 					AgentID:       payload.Author,
 					AgentType:     filepath.Base(payload.Author),
 					Message:       progressMessage,
 					OccurredAt:    row.Timestamp,
 					Source:        "codex-transcript",
+					FromPeerID:    payload.Author,
+					ToPeerID:      payload.Recipient,
+					MessageType:   messageType,
+					Delivery:      "async",
 				},
-			}}
+			})
 		}
-		return []codexTranscriptEnvelope{{
-			Agent: "codex",
-			Event: codexTranscriptEvent{
-				HookEventName: "SubagentStop",
-				AgentID:       payload.Author,
-				AgentType:     filepath.Base(payload.Author),
-				Message:       progressMessage,
-				OccurredAt:    row.Timestamp,
-				Source:        "codex-transcript",
-			},
-		}}
+		if finalAnswer && strings.HasPrefix(payload.Author, payload.Recipient+"/") {
+			events = append(events, codexTranscriptEnvelope{
+				Agent: "codex",
+				Event: codexTranscriptEvent{
+					HookEventName: "SubagentStop",
+					AgentID:       payload.Author,
+					AgentType:     filepath.Base(payload.Author),
+					OccurredAt:    row.Timestamp,
+					Source:        "codex-transcript",
+				},
+			})
+		}
+		return events
 	}
 	return nil
 }
@@ -233,7 +271,13 @@ type codexTranscriptContent struct {
 func codexCollaboratorMessage(text string) string {
 	const payloadMarker = "Payload:\n"
 	if index := strings.Index(text, payloadMarker); index >= 0 {
-		return strings.TrimSpace(text[index+len(payloadMarker):])
+		message := text[index+len(payloadMarker):]
+		for _, marker := range []string{"\n  hook context:", "\nhook context:"} {
+			if context := strings.Index(message, marker); context >= 0 {
+				message = message[:context]
+			}
+		}
+		return strings.TrimSpace(message)
 	}
 	if strings.Contains(text, "Message Type:") {
 		return ""

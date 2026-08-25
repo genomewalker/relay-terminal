@@ -54,6 +54,12 @@ func ServeWorker(config WorkerConfig) error {
 		_ = session.signal(syscall.SIGTERM)
 		return err
 	}
+	codexFrames, stopCodex := observeCodexTranscript(session.processID())
+	claudeFrames, stopClaude := observeClaudeTranscript(session.processID())
+	defer stopCodex()
+	defer stopClaude()
+	go forwardTranscriptEvents(session, codexFrames)
+	go forwardTranscriptEvents(session, claudeFrames)
 	bootID, err := nodeBootID()
 	if err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -70,7 +76,7 @@ func ServeWorker(config WorkerConfig) error {
 		ShellPID: session.processID(), NodeBootID: bootID,
 		SocketPath: config.SocketPath, Token: config.Token,
 		Command: config.Command, WorkingDirectory: config.WorkingDirectory,
-		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1"}, CreatedAt: time.Now().UTC(),
+		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "transcript_events_v1", "input_lease_v1"}, CreatedAt: time.Now().UTC(),
 	}
 	if err := storeManifest(config.ManifestPath, manifest); err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -112,8 +118,19 @@ func ServeWorker(config WorkerConfig) error {
 	}
 }
 
+func forwardTranscriptEvents(session *Session, frames <-chan protocol.Frame) {
+	for frame := range frames {
+		if frame.Type == protocol.AgentEvent {
+			session.agentEvent(frame.Payload)
+		}
+	}
+}
+
 func persistWorkerState(stopped <-chan struct{}, path string, manifest workerManifest, session *Session) {
-	ticker := time.NewTicker(time.Second)
+	// The manifest is recovery metadata, not a live telemetry stream. Persist
+	// only changed cursors and coalesce them to avoid waking every idle worker
+	// once per second.
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	lastSequence := manifest.LastSequence
 	lastState := manifest.State
@@ -177,11 +194,17 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		serveAgentObserver(connection, writer, session, hello.LastEventSeq)
 		return
 	}
+	controlGranted := session.acquireControl(hello.ClientID)
+	if controlGranted {
+		defer session.releaseControl(hello.ClientID)
+	}
 
-	viewer, replay := session.attach(hello.LastSeq, hello.LastEventSeq)
+	viewer, replay, outputReset, eventReset := session.attach(hello.LastSeq, hello.LastEventSeq)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "transcript_events_v1", "input_lease_v1"},
+		OutputReset: outputReset, EventReset: eventReset,
+		ControlGranted: &controlGranted,
 	})
 	if err := writer.Write(attached); err != nil {
 		return
@@ -206,6 +229,9 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 				if err := writer.Write(frame); err != nil {
 					return
 				}
+			case <-viewer.lagged:
+				_ = connection.Close()
+				return
 			case <-stopWriter:
 				return
 			}
@@ -222,15 +248,17 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		}
 		switch frame.Type {
 		case protocol.Input:
-			_ = session.input(frame.Payload)
+			if controlGranted {
+				_ = session.input(frame.Payload)
+			}
 		case protocol.InputV2:
 			clientID, sequence, data, parseErr := protocol.ParseInputV2(frame)
-			if parseErr == nil && session.acknowledgedInput(clientID, sequence, data) == nil {
+			if controlGranted && parseErr == nil && session.acknowledgedInput(clientID, sequence, data) == nil {
 				_ = writer.Write(protocol.InputAckFrame(clientID, sequence))
 			}
 		case protocol.Resize:
 			cols, rows, parseErr := protocol.ParseResize(frame)
-			if parseErr == nil {
+			if controlGranted && parseErr == nil {
 				_ = session.resize(cols, rows)
 			}
 		case protocol.Ping:
@@ -249,10 +277,11 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 }
 
 func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *Session, lastEventSequence uint64) {
-	observer, snapshot := session.observeAgents(lastEventSequence)
+	observer, snapshot, eventReset := session.observeAgents(lastEventSequence)
 	defer session.detachAgentObserver(observer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"event_cursor_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"event_cursor_v1", "state_snapshot_v1", "transcript_events_v1"},
+		EventReset: eventReset,
 	})
 	if writer.Write(attached) != nil {
 		return
@@ -273,6 +302,8 @@ func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *S
 			if writer.Write(frame) != nil {
 				return
 			}
+		case <-observer.lagged:
+			return
 		case <-closed:
 			return
 		}

@@ -9,6 +9,7 @@ final class TerminalRuntime: NSObject {
     private let io = TerminalIOBridge()
     private let activityCoalescer = TerminalActivityCoalescer()
     private var started = false
+    private var presentationLeases = Set<UUID>()
 
     private var session: InMemoryTerminalSession { io.session }
     private(set) lazy var view: RelayGhosttyView = makeView()
@@ -54,6 +55,7 @@ final class TerminalRuntime: NSObject {
         pane.beginTerminalRestore()
         io.beginReplay()
         let io = self.io
+        let activityCoalescer = self.activityCoalescer
         remote.start(
             profile: pane.profile,
             sessionID: pane.id.uuidString.lowercased(),
@@ -70,16 +72,27 @@ final class TerminalRuntime: NSObject {
                 }
             },
             onStatus: { [weak self] status in
+                if status.state == "attached" || status.state == "read_only" {
+                    // Modern workers provide authoritative process, hook, and
+                    // transcript events. Do not also parse every TUI repaint
+                    // on the main actor looking for legacy text heuristics.
+                    activityCoalescer.setEnabled(!status.capabilities.contains("event_cursor_v1"))
+                }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     if status.state == "attached" {
+                        self.pane?.beginTerminalRestore()
                         self.pane?.connected()
                     } else if status.state == "caught_up" {
                         self.io.endReplay()
                     } else if status.state == "reconnecting" {
-                        self.pane?.beginTerminalRestore()
                         self.io.beginReplay()
                         self.pane?.connectionInterrupted(status.message ?? "Reconnecting")
+                    } else if status.state == "waiting_for_network" {
+                        self.io.beginReplay()
+                        self.pane?.waitingForNetwork(status.message ?? "VPN or network route unavailable. Retrying automatically.")
+                    } else if status.state == "read_only" {
+                        self.pane?.connectionInterrupted(status.message ?? "Another client controls this pane.")
                     } else if status.state == "exited" {
                         self.io.endReplay()
                         // Keep Ghostty as a renderer. Host-managed exits do not
@@ -144,6 +157,22 @@ final class TerminalRuntime: NSObject {
 
     func focus() {
         _ = view.acquireProgrammaticFocus()
+    }
+
+    /// SwiftUI can keep an NSView alive after switching tabs or zooming a
+    /// sibling pane. Tell Ghostty about actual presentation so its display
+    /// link and Metal work stop immediately while the surface is off-screen.
+    func setPresented(_ presented: Bool, lease: UUID) {
+        let wasPresented = !presentationLeases.isEmpty
+        if presented {
+            presentationLeases.insert(lease)
+        } else {
+            presentationLeases.remove(lease)
+        }
+        let isPresented = !presentationLeases.isEmpty
+        if isPresented != wasPresented {
+            view.setSurfaceVisible(isPresented)
+        }
     }
 
     private func makeView() -> RelayGhosttyView {
@@ -220,9 +249,23 @@ private final class TerminalActivityCoalescer: @unchecked Sendable {
     private let lock = NSLock()
     private var pendingText = ""
     private var deliveryScheduled = false
+    private var enabled = true
+
+    func setEnabled(_ enabled: Bool) {
+        lock.lock()
+        self.enabled = enabled
+        if !enabled {
+            pendingText.removeAll(keepingCapacity: true)
+        }
+        lock.unlock()
+    }
 
     func ingest(_ text: String, deliver: @escaping @Sendable (String) -> Void) {
         lock.lock()
+        guard enabled else {
+            lock.unlock()
+            return
+        }
         pendingText.append(text)
         guard !deliveryScheduled else {
             lock.unlock()
@@ -594,8 +637,15 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
         lhs.identity == rhs.identity
     }
 
+    final class Coordinator {
+        let presentationLease = UUID()
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> RelayGhosttyView {
         let view = pane.runtime.view
+        pane.runtime.setPresented(true, lease: context.coordinator.presentationLease)
         Task { @MainActor in
             await Task.yield()
             pane.runtime.startIfNeeded()
@@ -604,10 +654,17 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
     }
 
     func updateNSView(_ nsView: RelayGhosttyView, context: Context) {
+        pane.runtime.setPresented(true, lease: context.coordinator.presentationLease)
         Task { @MainActor in
             await Task.yield()
             pane.runtime.startIfNeeded()
         }
-        nsView.fitToSize()
+        // AppTerminalView already synchronizes its grid from setFrameSize and
+        // layout. Calling fitToSize for every unrelated SwiftUI model update
+        // forces an immediate Metal frame even when geometry did not change.
+    }
+
+    static func dismantleNSView(_ nsView: RelayGhosttyView, coordinator: Coordinator) {
+        nsView.owner?.setPresented(false, lease: coordinator.presentationLease)
     }
 }

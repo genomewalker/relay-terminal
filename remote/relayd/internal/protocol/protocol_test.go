@@ -53,3 +53,12 @@ func TestAcknowledgedInputRoundTrip(t *testing.T) {
 		t.Fatalf("invalid input ack round trip: client=%v sequence=%d err=%v", ackClientID, ackSequence, err)
 	}
 }
+
+func TestHostEventRoundTrip(t *testing.T) {
+	inner := Frame{Type: AgentEvent, Payload: []byte(`{"agent":"codex"}`)}
+	outer := HostEventFrame("pane-123", inner)
+	session, decoded, err := ParseHostEvent(outer)
+	if err != nil || session != "pane-123" || decoded.Type != AgentEvent || !bytes.Equal(decoded.Payload, inner.Payload) {
+		t.Fatalf("invalid host event: session=%q frame=%#v err=%v", session, decoded, err)
+	}
+}

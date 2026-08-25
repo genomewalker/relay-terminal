@@ -194,7 +194,8 @@ func attachRemoteCatalogSession() {
             lastSequence: 8,
             recoverable: true,
             unfiled: false
-        )]
+        )],
+        workspaceSnapshot: nil
     )
 
     workspace.attachRemoteSession(profile: .sshConfigHost("dandy-07"), remote: remote)
@@ -204,6 +205,83 @@ func attachRemoteCatalogSession() {
     #expect(workspace.activePaneID == paneID)
     #expect(workspace.activePane?.remoteWorkspaceSessionID == sessionID.uuidString.lowercased())
     #expect(workspace.activePane?.remoteTabID == tabID.uuidString.lowercased())
+    workspace.shutdown()
+}
+
+@MainActor
+@Test("Remote workspace restore preserves tabs, split ratios, and floating editors")
+func attachRemoteWorkspaceLayout() {
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    let sessionID = UUID()
+    let tabID = UUID()
+    let terminalID = UUID()
+    let editorID = UUID()
+    let splitID = UUID()
+    let profile = ConnectionProfile.sshConfigHost("dandy-07")
+    let layout = PaneLayout.pane(terminalID)
+    let floating = FloatingPanePlacement(
+        paneID: editorID, originX: 90, originY: 70, width: 640, height: 440
+    )
+    let snapshot = WorkspaceSnapshot(
+        tabs: [TabSnapshot(
+            id: tabID,
+            sessionID: sessionID,
+            name: "Analysis",
+            layout: layout,
+            floatingPanes: [floating],
+            splitRatios: [splitID: 0.61]
+        )],
+        panes: [
+            PaneSnapshot(
+                id: terminalID,
+                profile: profile,
+                contentKind: .terminal,
+                remoteParentSessionID: nil,
+                editorRequest: nil,
+                customName: "Codex"
+            ),
+            PaneSnapshot(
+                id: editorID,
+                profile: profile,
+                contentKind: .editor,
+                remoteParentSessionID: terminalID.uuidString.lowercased(),
+                editorRequest: EditorOpenRequest(paths: ["/work/model.rs"], diff: false),
+                customName: "model.rs"
+            ),
+        ],
+        sessionNames: [sessionID: "Training"],
+        selectedTabID: tabID,
+        activePaneID: editorID
+    )
+    let remote = RemoteSessionRecord(
+        id: "workspace:\(sessionID.uuidString.lowercased())",
+        workspaceID: sessionID.uuidString.lowercased(),
+        panes: [RemoteCatalogPane(
+            paneID: terminalID.uuidString.lowercased(),
+            workspaceID: sessionID.uuidString.lowercased(),
+            tabID: tabID.uuidString.lowercased(),
+            parentPaneID: nil,
+            title: "Codex",
+            contentKind: "terminal",
+            command: "codex",
+            directory: "/work",
+            state: "running",
+            workerPID: 42,
+            shellPID: 43,
+            lastSequence: 8,
+            recoverable: true,
+            unfiled: false
+        )],
+        workspaceSnapshot: snapshot
+    )
+
+    workspace.attachRemoteSession(profile: profile, remote: remote)
+
+    #expect(workspace.selectedTab?.name == "Analysis")
+    #expect(workspace.selectedTab?.floatingPanes == [floating])
+    #expect(workspace.activePaneID == editorID)
+    #expect(workspace.activePane?.contentKind == .editor)
+    #expect(workspace.activePane?.profile == profile)
     workspace.shutdown()
 }
 
@@ -286,6 +364,45 @@ func sshConfigConnectionArguments() {
     let profile = ConnectionProfile.sshConfigHost("hpc-login")
     #expect(profile.sshConnectionArguments == ["hpc-login"])
     #expect(profile.backend == .relay)
+}
+
+@Test("SSH diagnostics distinguish VPN outages from permanent failures")
+func sshFailureDiagnosis() {
+    let noRoute = SSHConnectionFailure.diagnose("ssh: connect to host hpc port 22: No route to host", terminationStatus: 255)
+    #expect(noRoute.kind == .networkRoute)
+    #expect(noRoute.shouldRetry)
+
+    let timeout = SSHConnectionFailure.diagnose("ssh: connect to host hpc port 22: Operation timed out", terminationStatus: 255)
+    #expect(timeout.kind == .networkRoute)
+    #expect(timeout.userMessage == "VPN or network route unavailable.")
+
+    let permission = SSHConnectionFailure.diagnose("user@hpc: Permission denied (publickey).", terminationStatus: 255)
+    #expect(permission.kind == .authentication)
+    #expect(!permission.shouldRetry)
+
+    let missingRelay = SSHConnectionFailure.diagnose("bash: /home/user/.local/bin/relayd: No such file or directory", terminationStatus: 127)
+    #expect(missingRelay.kind == .remoteConfiguration)
+    #expect(!missingRelay.shouldRetry)
+
+    let oldRelay = SSHConnectionFailure.diagnose("relayd: unknown command: node", terminationStatus: 1)
+    #expect(oldRelay.kind == .remoteConfiguration)
+
+    let reset = SSHConnectionFailure.diagnose("Connection reset by peer", terminationStatus: 255)
+    #expect(reset.kind == .interrupted)
+    #expect(reset.shouldRetry)
+}
+
+@Test("Pane connection state exposes non-blocking recovery labels")
+func paneConnectionRecoveryState() {
+    let vpn = PaneConnectionState.waitingForNetwork("retrying")
+    #expect(vpn.label == "VPN required")
+    #expect(vpn.isWaitingForNetwork)
+    #expect(vpn.recoveryMessage == "retrying")
+
+    let reconnecting = PaneConnectionState.reconnecting("reattaching")
+    #expect(reconnecting.label == "Reconnecting")
+    #expect(!reconnecting.isWaitingForNetwork)
+    #expect(reconnecting.recoveryMessage == "reattaching")
 }
 
 @Test("Host search tolerates omitted characters")
@@ -373,7 +490,38 @@ func oneHundredSubagents() {
 }
 
 @MainActor
-@Test("Ending an agent restores the shell and clears its sidebar thread")
+@Test("Peer messages preserve direction and attach to the related thread")
+func peerMessageDirection() {
+    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SubagentStart","agent_id":"/root/worker","agent_type":"worker"}}"#.utf8))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"PeerMessage","from_peer_id":"/root","to_peer_id":"/root/worker","message":"Check the edge case."}}"#.utf8))
+    #expect(pane.subagents.first?.updates.last?.message.contains("Received from root") == true)
+    #expect(pane.subagents.first?.updates.last?.message.contains("Check the edge case.") == true)
+}
+
+@MainActor
+@Test("Child-to-child peer messages are visible in both agent threads")
+func peerMessageBetweenChildren() {
+    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"PeerMessage","from_peer_id":"/root/one","to_peer_id":"/root/two","message":"Cross-check this."}}"#.utf8))
+    #expect(pane.subagents.count == 2)
+    #expect(pane.subagents.first { $0.id == "/root/one" }?.updates.last?.message.contains("Sent to two") == true)
+    #expect(pane.subagents.first { $0.id == "/root/two" }?.updates.last?.message.contains("Received from one") == true)
+}
+
+@MainActor
+@Test("Agent state snapshots remove stale threads before restoring active children")
+func agentStateSnapshot() {
+    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
+    pane.receivedAgentEvent(Data(#"{"agent":"claude","event":{"hook_event_name":"SubagentStart","agent_id":"stale","agent_type":"stale"}}"#.utf8))
+    pane.receivedAgentEvent(Data(#"{"agent":"relay","relay_event_seq":20,"event":{"type":"RelayStateSnapshot","events":[{"agent":"codex","event":{"hook_event_name":"SubagentStart","agent_id":"active","agent_type":"active"}}]}}"#.utf8))
+    #expect(pane.subagents.count == 1)
+    #expect(pane.subagents.first?.id == "active")
+    #expect(pane.activeSubagents == 1)
+}
+
+@MainActor
+@Test("Ending an agent restores the shell and records the lifecycle transition")
 func structuredAgentSessionEnd() {
     let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
     pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"PreToolUse","tool_name":"exec_command"}}"#.utf8))
@@ -387,12 +535,28 @@ func structuredAgentSessionEnd() {
 
     #expect(pane.kind == .shell)
     #expect(pane.phase == .quiet)
-    #expect(pane.agentActivities.isEmpty)
+    #expect(pane.agentActivities.last?.label == "Codex session ended")
     #expect(pane.activeSubagents == 0)
     #expect(pane.subagents.isEmpty)
 
     pane.received("historical replay from OpenAI Codex CLI")
     #expect(pane.kind == .shell)
+}
+
+@MainActor
+@Test("Ending one of two provider roots keeps the other agent thread active")
+func multipleAgentRootLifecycle() {
+    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SessionStart","root_id":"codex:1"}}"#.utf8))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SessionStart","root_id":"codex:2"}}"#.utf8))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SubagentStart","agent_id":"worker-1","agent_type":"Explore"}}"#.utf8))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SessionEnd","root_id":"codex:1"}}"#.utf8))
+    #expect(pane.kind == .codex)
+    #expect(pane.activeSubagents == 1)
+
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SessionEnd","root_id":"codex:2"}}"#.utf8))
+    #expect(pane.kind == .shell)
+    #expect(pane.activeSubagents == 0)
 }
 
 @Test("Terminal replay starts at the latest complete screen redraw")

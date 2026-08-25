@@ -184,6 +184,10 @@ final class WorkspaceModel: ObservableObject {
         }
 
         let sessionID = remote.workspaceID.flatMap(UUID.init(uuidString:)) ?? UUID()
+        if let snapshot = remote.workspaceSnapshot,
+           attachRemoteWorkspaceSnapshot(snapshot, profile: profile, sessionID: sessionID, remote: remote) {
+            return
+        }
         let groupedTabs = Dictionary(grouping: remote.panes.filter(\.recoverable)) {
             $0.tabID ?? $0.paneID
         }
@@ -226,6 +230,78 @@ final class WorkspaceModel: ObservableObject {
         profileStore.markUsed(profile)
         isHostLauncherPresented = false
         persistWorkspace()
+    }
+
+    private func attachRemoteWorkspaceSnapshot(
+        _ snapshot: WorkspaceSnapshot,
+        profile: ConnectionProfile,
+        sessionID: UUID,
+        remote: RemoteSessionRecord
+    ) -> Bool {
+        let recoverableTerminalIDs = Set(remote.panes.filter(\.recoverable).compactMap { UUID(uuidString: $0.paneID) })
+        var savedPanes: [UUID: PaneSnapshot] = [:]
+        for saved in snapshot.panes {
+            guard savedPanes.updateValue(saved, forKey: saved.id) == nil else { return false }
+        }
+        let sessionTabs = snapshot.tabs.filter { ($0.sessionID ?? $0.id) == sessionID }
+        guard !sessionTabs.isEmpty else { return false }
+        let requiredIDs = Set(sessionTabs.flatMap { tab in
+            tab.layout.paneIDs + (tab.floatingPanes ?? []).map(\.paneID)
+        })
+        guard requiredIDs.allSatisfy({ id in
+            guard let saved = savedPanes[id] else { return false }
+            return saved.contentKind == .editor || recoverableTerminalIDs.contains(id)
+        }) else { return false }
+
+        for paneID in requiredIDs {
+            guard let saved = savedPanes[paneID] else { return false }
+            let remotePane = remote.panes.first { UUID(uuidString: $0.paneID) == paneID }
+            let pane = PaneModel(
+                id: paneID,
+                profile: profile,
+                contentKind: saved.contentKind ?? .terminal,
+                remoteParentSessionID: remotePane?.parentPaneID ?? saved.remoteParentSessionID,
+                editorRequest: saved.editorRequest,
+                customName: remotePane?.title ?? saved.customName
+            )
+            storePane(pane)
+        }
+
+        let restoredTabs = sessionTabs.compactMap { saved -> TabModel? in
+            guard let first = saved.layout.paneIDs.first else { return nil }
+            let tab = TabModel(
+                id: saved.id,
+                sessionID: sessionID,
+                name: saved.name,
+                firstPane: first,
+                floatingPanes: saved.floatingPanes ?? []
+            )
+            tab.layout = saved.layout
+            tab.splitRatios = saved.splitRatios ?? [:]
+            if tab.splitRatios.isEmpty { tab.balanceSplits() }
+            for paneID in tab.allPaneIDs {
+                panes[paneID]?.assignRemoteHierarchy(workspaceSessionID: sessionID, tabID: tab.id)
+            }
+            return tab
+        }
+        guard !restoredTabs.isEmpty else {
+            for paneID in requiredIDs {
+                panes.removeValue(forKey: paneID)
+                paneSubscriptions.removeValue(forKey: paneID)
+            }
+            return false
+        }
+        tabs.append(contentsOf: restoredTabs)
+        sessionNames[sessionID] = snapshot.sessionNames?[sessionID] ?? remote.label
+        selectedTabID = snapshot.selectedTabID.flatMap { selected in
+            restoredTabs.contains(where: { $0.id == selected }) ? selected : nil
+        } ?? restoredTabs[0].id
+        activePaneID = snapshot.activePaneID.flatMap { requiredIDs.contains($0) ? $0 : nil }
+            ?? restoredTabs.first(where: { $0.id == selectedTabID })?.layout.paneIDs.first
+        profileStore.markUsed(profile)
+        isHostLauncherPresented = false
+        persistWorkspace()
+        return true
     }
 
     func newTabInActiveSession() {
@@ -682,10 +758,30 @@ final class WorkspaceModel: ObservableObject {
         )
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         UserDefaults.standard.set(data, forKey: workspaceKey)
+        persistRemoteWorkspaceStates(snapshot)
+    }
+
+    private func persistRemoteWorkspaceStates(_ snapshot: WorkspaceSnapshot) {
+        for sessionID in Set(tabs.map(\.sessionID)) {
+            let sessionTabs = tabs.filter { $0.sessionID == sessionID }
+            let paneIDs = Set(sessionTabs.flatMap(\.allPaneIDs))
+            guard let remotePane = paneIDs.compactMap({ panes[$0] }).first(where: {
+                $0.profile.kind == .ssh && $0.profile.backend == .relay
+            }) else { continue }
+            let remoteSnapshot = WorkspaceSnapshot(
+                tabs: snapshot.tabs.filter { ($0.sessionID ?? $0.id) == sessionID },
+                panes: snapshot.panes.filter { paneIDs.contains($0.id) },
+                sessionNames: sessionNames[sessionID].map { [sessionID: $0] },
+                selectedTabID: sessionTabs.contains(where: { $0.id == selectedTabID }) ? selectedTabID : sessionTabs.first?.id,
+                activePaneID: activePaneID.flatMap { paneIDs.contains($0) ? $0 : nil }
+            )
+            guard let state = try? JSONEncoder().encode(remoteSnapshot) else { continue }
+            RelayRemoteWorkspaceSync.shared.put(profile: remotePane.profile, workspaceID: sessionID, state: state)
+        }
     }
 }
 
-private struct WorkspaceSnapshot: Codable {
+struct WorkspaceSnapshot: Codable, Sendable {
     let tabs: [TabSnapshot]
     let panes: [PaneSnapshot]
     let sessionNames: [UUID: String]?
@@ -693,7 +789,7 @@ private struct WorkspaceSnapshot: Codable {
     let activePaneID: UUID?
 }
 
-private struct TabSnapshot: Codable {
+struct TabSnapshot: Codable, Sendable {
     let id: UUID
     let sessionID: UUID?
     let name: String
@@ -702,7 +798,7 @@ private struct TabSnapshot: Codable {
     let splitRatios: [UUID: Double]?
 }
 
-private struct PaneSnapshot: Codable {
+struct PaneSnapshot: Codable, Sendable {
     let id: UUID
     let profile: ConnectionProfile
     let contentKind: PaneContentKind?

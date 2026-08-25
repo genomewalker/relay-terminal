@@ -20,12 +20,13 @@ const catalogSchemaVersion = 1
 // CatalogSnapshot is safe to return to an untrusted local client: worker
 // tokens and private socket paths never leave relayd's state directory.
 type CatalogSnapshot struct {
-	Schema      int           `json:"schema"`
-	Revision    uint64        `json:"revision"`
-	NodeID      string        `json:"node_id"`
-	NodeName    string        `json:"node_name"`
-	GeneratedAt time.Time     `json:"generated_at"`
-	Panes       []CatalogPane `json:"panes"`
+	Schema          int                        `json:"schema"`
+	Revision        uint64                     `json:"revision"`
+	NodeID          string                     `json:"node_id"`
+	NodeName        string                     `json:"node_name"`
+	GeneratedAt     time.Time                  `json:"generated_at"`
+	Panes           []CatalogPane              `json:"panes"`
+	WorkspaceStates map[string]json.RawMessage `json:"workspace_states,omitempty"`
 }
 
 type CatalogPane struct {
@@ -145,9 +146,21 @@ func (server *Server) CatalogSnapshot() (CatalogSnapshot, error) {
 		}
 		return panes[i].UpdatedAt.After(panes[j].UpdatedAt)
 	})
+	workspaceStates := make(map[string]json.RawMessage)
+	for _, pane := range panes {
+		if pane.WorkspaceID == "" {
+			continue
+		}
+		if _, loaded := workspaceStates[pane.WorkspaceID]; loaded {
+			continue
+		}
+		if record, loadErr := server.loadWorkspaceState(pane.WorkspaceID); loadErr == nil {
+			workspaceStates[pane.WorkspaceID] = append(json.RawMessage(nil), record.State...)
+		}
+	}
 	return CatalogSnapshot{
 		Schema: catalogSchemaVersion, Revision: catalog.Revision, NodeID: nodeID, NodeName: nodeName,
-		GeneratedAt: time.Now().UTC(), Panes: panes,
+		GeneratedAt: time.Now().UTC(), Panes: panes, WorkspaceStates: workspaceStates,
 	}, nil
 }
 

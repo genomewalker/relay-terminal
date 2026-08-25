@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -149,6 +150,29 @@ func indexedAgentPayload(payload []byte, sequence uint64) []byte {
 	if json.Unmarshal(payload, &envelope) != nil {
 		envelope = map[string]any{"agent": "unknown", "event": map[string]any{"type": "InvalidEvent"}}
 	}
+	envelope = sanitizeAgentObject(envelope).(map[string]any)
+	// Provider hooks can include full prompts, shell commands, tool responses,
+	// and transcript paths. Relay's activity UI does not need those values, so
+	// keep only its structured lifecycle/peer fields on disk and on the wire.
+	if agent, _ := envelope["agent"].(string); agent == "codex" || agent == "claude" {
+		if event, ok := envelope["event"].(map[string]any); ok {
+			allowed := map[string]bool{
+				"hook_event_name": true, "type": true, "tool_name": true,
+				"notification_type": true, "message": true, "agent_id": true,
+				"subagent_id": true, "agent_type": true, "thread_id": true,
+				"root_id": true, "source": true, "occurred_at": true,
+				"status": true, "from_peer_id": true, "to_peer_id": true,
+				"message_type": true, "delivery": true,
+			}
+			minimal := make(map[string]any, len(event))
+			for key, value := range event {
+				if allowed[key] {
+					minimal[key] = value
+				}
+			}
+			envelope["event"] = minimal
+		}
+	}
 	envelope["relay_event_seq"] = sequence
 	envelope["relay_recorded_at"] = time.Now().UTC().Format(time.RFC3339Nano)
 	encoded, err := json.Marshal(envelope)
@@ -156,6 +180,37 @@ func indexedAgentPayload(payload []byte, sequence uint64) []byte {
 		return append([]byte(nil), payload...)
 	}
 	return encoded
+}
+
+func sanitizeAgentObject(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			lower := strings.ToLower(key)
+			if strings.Contains(lower, "password") || strings.Contains(lower, "secret") ||
+				strings.Contains(lower, "token") || strings.Contains(lower, "authorization") ||
+				strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") {
+				result[key] = "[redacted]"
+				continue
+			}
+			result[key] = sanitizeAgentObject(item)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, item := range typed {
+			result[index] = sanitizeAgentObject(item)
+		}
+		return result
+	case string:
+		if len(typed) > 64<<10 {
+			return typed[:64<<10] + "\n[truncated by Relay]"
+		}
+		return typed
+	default:
+		return value
+	}
 }
 
 func indexedAgentSequence(payload []byte) uint64 {

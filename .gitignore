@@ -2,5 +2,7 @@
 .build/
 DerivedData/
 Relay.app/
+Relay.app
 *.xcuserstate
 remote/relayd/relayd
+dist/

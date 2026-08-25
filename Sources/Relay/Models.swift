@@ -337,12 +337,16 @@ enum AgentPhase: String, Sendable {
 enum PaneConnectionState: Equatable, Sendable {
     case connecting
     case connected
+    case reconnecting(String)
+    case waitingForNetwork(String)
     case disconnected(String)
 
     var label: String {
         switch self {
         case .connecting: "Connecting"
         case .connected: "Connected"
+        case .reconnecting: "Reconnecting"
+        case .waitingForNetwork: "VPN required"
         case .disconnected: "Connection lost"
         }
     }
@@ -351,6 +355,8 @@ enum PaneConnectionState: Equatable, Sendable {
         switch self {
         case .connecting: "arrow.trianglehead.2.clockwise.rotate.90"
         case .connected: "checkmark.circle.fill"
+        case .reconnecting: "arrow.trianglehead.2.clockwise.rotate.90"
+        case .waitingForNetwork: "network.slash"
         case .disconnected: "exclamationmark.triangle.fill"
         }
     }
@@ -359,6 +365,8 @@ enum PaneConnectionState: Equatable, Sendable {
         switch self {
         case .connecting: RelayTheme.blue
         case .connected: RelayTheme.mint
+        case .reconnecting: RelayTheme.blue
+        case .waitingForNetwork: RelayTheme.coral
         case .disconnected: RelayTheme.coral
         }
     }
@@ -367,12 +375,25 @@ enum PaneConnectionState: Equatable, Sendable {
         if case .disconnected(let message) = self { return message }
         return nil
     }
+
+    var recoveryMessage: String? {
+        switch self {
+        case .reconnecting(let message), .waitingForNetwork(let message): message
+        default: nil
+        }
+    }
+
+    var isWaitingForNetwork: Bool {
+        if case .waitingForNetwork = self { return true }
+        return false
+    }
 }
 
 struct SubagentActivity: Identifiable, Equatable, Sendable {
     let id: String
     let label: String
     let startedAt: Date
+    var provider: AgentKind = .shell
     var threadID: String? = nil
     var phase: AgentPhase = .active
     var completedAt: Date?
@@ -427,8 +448,11 @@ struct AgentSignalDetector: Sendable {
         excerpt = Self.lastReadableLine(in: buffer) ?? "Receiving output…"
     }
 
-    mutating func markQuiet() {
-        if phase == .active { phase = .quiet }
+    @discardableResult
+    mutating func markQuiet() -> Bool {
+        guard phase == .active else { return false }
+        phase = .quiet
+        return true
     }
 
     mutating func markExited() {
@@ -488,9 +512,10 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var editorRequest: EditorOpenRequest?
     @Published var isRestoringTerminal = false
     private var structuredAgentRunning: Bool?
+    private var activeAgentRoots: [String: AgentKind] = [:]
     private var seenAgentEventHashes: [Data: Date] = [:]
     private var seenAgentEventOrder: [(Data, Date)] = []
-    private var agentMonitor: RelayRemoteTransport?
+    private var agentMonitor: RelayHostAgentMonitorToken?
     let remoteParentSessionID: String?
     private(set) var remoteWorkspaceSessionID: String?
     private(set) var remoteTabID: String?
@@ -550,40 +575,16 @@ final class PaneModel: ObservableObject, Identifiable {
               contentKind == .terminal,
               profile.kind == .ssh,
               profile.backend == .relay else { return }
-        let monitor = RelayRemoteTransport()
-        agentMonitor = monitor
-        monitor.start(
+        agentMonitor = RelayHostAgentMonitor.shared.subscribe(
             profile: profile,
             sessionID: id.uuidString.lowercased(),
-            parentSessionID: nil,
-            workspaceSessionID: remoteWorkspaceSessionID,
-            tabID: remoteTabID,
-            paneTitle: displayName,
-            contentKind: contentKind.rawValue,
-            onOutput: { _ in },
-            onStatus: { [weak self, weak monitor] status in
-                Task { @MainActor [weak self, weak monitor] in
-                    guard let self else { return }
-                    if status.state == "attached" {
-                        self.connected()
-                    } else if status.state == "exited" {
-                        self.exited(exitCode: status.exitCode)
-                    } else if status.state == "error", self.agentMonitor === monitor {
-                        self.stopAgentMonitoring()
-                    }
-                }
-            },
-            onAgentEvent: { [weak self] data in
-                Task { @MainActor [weak self] in self?.receivedAgentEvent(data) }
-            },
-            onArtifact: { _ in },
-            onDisconnect: { _ in },
-            observeAgentsOnly: true
+            onEvent: { [weak self] data in self?.receivedAgentEvent(data) },
+            onAttached: { [weak self] in self?.connected() }
         )
     }
 
     func stopAgentMonitoring() {
-        agentMonitor?.detach()
+        agentMonitor?.stop()
         agentMonitor = nil
     }
 
@@ -611,12 +612,26 @@ final class PaneModel: ObservableObject, Identifiable {
         if previousKind != detector.kind || previousPhase != detector.phase {
             objectWillChange.send()
         }
+        // Shell TUIs can repaint many times per second. They do not need an
+        // agent quiet timer, and repeatedly cancelling/creating one forces
+        // otherwise unrelated SwiftUI updates. Structured agent events own
+        // their own lifecycle; keep this fallback only for legacy raw-output
+        // detection.
+        let needsLegacyQuietTimer = structuredAgentRunning == nil &&
+            detector.kind != .shell && detector.phase == .active
+        guard needsLegacyQuietTimer else {
+            quietTask?.cancel()
+            quietTask = nil
+            return
+        }
         quietTask?.cancel()
         quietTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(1.4))
             guard let self, !Task.isCancelled else { return }
-            self.detector.markQuiet()
-            self.objectWillChange.send()
+            self.quietTask = nil
+            if self.detector.markQuiet() {
+                self.objectWillChange.send()
+            }
         }
     }
 
@@ -658,7 +673,11 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func connectionInterrupted(_ message: String) {
-        connectionState = .connecting
+        connectionState = .reconnecting(message)
+    }
+
+    func waitingForNetwork(_ message: String) {
+        connectionState = .waitingForNetwork(message)
     }
 
     func disconnected(_ message: String) {
@@ -674,6 +693,22 @@ final class PaneModel: ObservableObject, Identifiable {
         guard let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let agentName = envelope["agent"] as? String,
               let event = envelope["event"] as? [String: Any] else { return }
+        let incomingEventName = (event["hook_event_name"] as? String) ?? (event["type"] as? String)
+        if incomingEventName == "RelayStateSnapshot" {
+            subagents.removeAll(keepingCapacity: true)
+            activeSubagents = 0
+            activeAgentRoots.removeAll(keepingCapacity: true)
+            seenAgentEventHashes.removeAll(keepingCapacity: true)
+            seenAgentEventOrder.removeAll(keepingCapacity: true)
+            for embedded in event["events"] as? [[String: Any]] ?? [] {
+                guard JSONSerialization.isValidJSONObject(embedded),
+                      let encoded = try? JSONSerialization.data(withJSONObject: embedded) else { continue }
+                receivedAgentEvent(encoded)
+            }
+            activeSubagents = subagents.count { $0.phase == .active }
+            objectWillChange.send()
+            return
+        }
         var normalizedEnvelope = envelope
         normalizedEnvelope.removeValue(forKey: "relay_event_seq")
         normalizedEnvelope.removeValue(forKey: "relay_recorded_at")
@@ -719,10 +754,11 @@ final class PaneModel: ObservableObject, Identifiable {
             ?? (event["subagent_id"] as? String)
             ?? (event["thread_id"] as? String)
         let notificationType = event["notification_type"] as? String
+        let fromPeerID = event["from_peer_id"] as? String
+        let toPeerID = event["to_peer_id"] as? String
+        let rootID = (event["root_id"] as? String) ?? kind.rawValue
 
-        if eventName == "SessionEnd" {
-            structuredAgentRunning = false
-        } else {
+        if eventName != "SessionEnd" {
             structuredAgentRunning = true
         }
 
@@ -730,9 +766,11 @@ final class PaneModel: ObservableObject, Identifiable {
         case "PermissionRequest":
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Approval: \(tool ?? "permission requested")")
             recordActivity("Approval needed for \(tool ?? "a tool")", phase: .needsInput)
+            announceAgentAttention("Approval needed for \(tool ?? "an agent tool")")
         case "Notification" where notificationType == "permission_prompt" || notificationType == "idle_prompt":
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: event["message"] as? String ?? "Needs input")
             recordActivity(event["message"] as? String ?? "Needs input", phase: .needsInput)
+            announceAgentAttention(event["message"] as? String ?? "Agent needs input")
         case "SubagentStart":
             let identifier = subagentID ?? UUID().uuidString
             subagents.removeAll { $0.id == identifier }
@@ -740,6 +778,7 @@ final class PaneModel: ObservableObject, Identifiable {
                 id: identifier,
                 label: agentType ?? "Subagent",
                 startedAt: occurredAt,
+                provider: kind,
                 threadID: threadID,
                 phase: .active
             ))
@@ -760,6 +799,7 @@ final class PaneModel: ObservableObject, Identifiable {
                         id: subagentID,
                         label: agentType ?? "Subagent",
                         startedAt: occurredAt,
+                        provider: kind,
                         threadID: threadID,
                         phase: .quiet,
                         completedAt: occurredAt,
@@ -784,6 +824,43 @@ final class PaneModel: ObservableObject, Identifiable {
                 appendSubagentUpdate(message, occurredAt: occurredAt, at: index)
                 detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: subagents[index].label)
             }
+        case "PeerMessage":
+            let rootNames: Set<String> = ["root", "/root", "claude-root", "codex-root"]
+            var peerIDs: [String] = []
+            for candidate in [fromPeerID, toPeerID].compactMap({ $0 }) where !rootNames.contains(candidate) {
+                if !peerIDs.contains(candidate) { peerIDs.append(candidate) }
+            }
+            if peerIDs.isEmpty, let fallback = fromPeerID ?? toPeerID { peerIDs = [fallback] }
+            for peerID in peerIDs {
+                let peerLabel = URL(fileURLWithPath: peerID).lastPathComponent.isEmpty
+                    ? peerID : URL(fileURLWithPath: peerID).lastPathComponent
+                let index: Int
+                if let existing = subagents.firstIndex(where: { $0.id == peerID || $0.threadID == peerID }) {
+                    index = existing
+                } else {
+                    subagents.append(SubagentActivity(
+                        id: peerID, label: peerLabel, startedAt: occurredAt,
+                        provider: kind, threadID: peerID, phase: .active
+                    ))
+                    index = subagents.count - 1
+                }
+                if let message, !message.isEmpty {
+                    let otherID = peerID == fromPeerID ? toPeerID : fromPeerID
+                    let otherLabel = otherID.map {
+                        let component = URL(fileURLWithPath: $0).lastPathComponent
+                        return component.isEmpty ? $0 : component
+                    } ?? "peer"
+                    let direction = peerID == fromPeerID ? "Sent to \(otherLabel)" : "Received from \(otherLabel)"
+                    appendSubagentUpdate("\(direction)\n\(message)", occurredAt: occurredAt, at: index)
+                }
+            }
+            let summary = peerIDs.last.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "peer"
+            detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Peer: \(summary)")
+            recordActivity("Peer message · \(summary)", phase: .active)
+        case "PeerInteraction":
+            let label = agentType ?? subagentID ?? "peer"
+            detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Contacted \(label)")
+            recordActivity("Contacted \(label)", phase: .active)
         case "PreToolUse":
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Using \(tool ?? "tool")")
             recordActivity("Using \(tool ?? "tool")", phase: .active)
@@ -800,11 +877,25 @@ final class PaneModel: ObservableObject, Identifiable {
             detector.applyStructuredEvent(kind: kind, phase: .quiet, excerpt: "Ready")
             recordActivity("Ready", phase: .quiet)
         case "SessionEnd":
-            detector.resetToShell()
-            subagents.removeAll()
-            activeSubagents = 0
-            agentActivities.removeAll()
+            activeAgentRoots.removeValue(forKey: rootID)
+            let providerStillRunning = activeAgentRoots.values.contains(kind)
+            if !providerStillRunning {
+                subagents.removeAll { $0.provider == kind }
+            }
+            activeSubagents = subagents.count { $0.phase == .active }
+            if providerStillRunning {
+                detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Working")
+                structuredAgentRunning = true
+            } else if let remaining = subagents.last(where: { $0.phase == .active }) {
+                detector.applyStructuredEvent(kind: remaining.provider, phase: .active, excerpt: remaining.label)
+                structuredAgentRunning = true
+            } else {
+                detector.resetToShell()
+                structuredAgentRunning = false
+            }
+            recordActivity("\(kind.label) session ended", phase: .quiet)
         case "SessionStart":
+            activeAgentRoots[rootID] = kind
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Started")
             recordActivity("Started", phase: .active)
         default:
@@ -840,9 +931,22 @@ final class PaneModel: ObservableObject, Identifiable {
         }
     }
 
+    private func announceAgentAttention(_ message: String) {
+        guard let window = NSApp.mainWindow else { return }
+        NSAccessibility.post(
+            element: window,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
+    }
+
     private func appendSubagentUpdate(_ message: String, occurredAt: Date, at index: Int) {
-        guard subagents.indices.contains(index), subagents[index].updates.last?.message != message else { return }
-        subagents[index].updates.append(SubagentUpdate(id: UUID(), message: message, occurredAt: occurredAt))
+        let bounded = String(message.prefix(16_384))
+        guard subagents.indices.contains(index), subagents[index].updates.last?.message != bounded else { return }
+        subagents[index].updates.append(SubagentUpdate(id: UUID(), message: bounded, occurredAt: occurredAt))
         subagents[index].updates = Array(subagents[index].updates.suffix(100))
     }
 

@@ -29,6 +29,16 @@ type record struct {
 
 type client struct {
 	frames chan protocol.Frame
+	lagged chan struct{}
+	once   sync.Once
+}
+
+func newClient(capacity int) *client {
+	return &client{frames: make(chan protocol.Frame, capacity), lagged: make(chan struct{})}
+}
+
+func (viewer *client) markLagged() {
+	viewer.once.Do(func() { close(viewer.lagged) })
 }
 
 type Session struct {
@@ -37,23 +47,65 @@ type Session struct {
 	pty     *os.File
 	process *exec.Cmd
 
-	mu                sync.Mutex
-	sequence          uint64
-	replay            []record
-	replayBytes       int
-	clients           map[*client]struct{}
-	agentClients      map[*client]struct{}
-	exited            bool
-	exitCode          int
-	latestAgentEvent  []byte
-	activeSubagents   map[string][]byte
-	eventSequence     uint64
-	eventHistory      []protocol.Frame
-	eventHistoryBytes int
-	eventJournal      *agentEventJournal
-	inputSequences    map[[16]byte]uint64
-	artifactDetector  artifactDetector
-	done              chan struct{}
+	mu                 sync.Mutex
+	sequence           uint64
+	replay             []record
+	replayBytes        int
+	clients            map[*client]struct{}
+	agentClients       map[*client]struct{}
+	exited             bool
+	exitCode           int
+	latestAgentEvent   []byte
+	activeSubagents    map[string][]byte
+	activeAgentRoots   map[string][]byte
+	eventSequence      uint64
+	eventHistory       []protocol.Frame
+	eventHistoryBytes  int
+	eventJournal       *agentEventJournal
+	eventHashes        map[[32]byte]struct{}
+	eventHashOrder     [][32]byte
+	eventJournalError  string
+	inputSequences     map[[16]byte]uint64
+	artifactDetector   artifactDetector
+	controlClientID    string
+	controlConnections int
+	controlGraceUntil  time.Time
+	done               chan struct{}
+}
+
+func (session *Session) acquireControl(clientID string) bool {
+	if clientID == "" {
+		clientID = "legacy"
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	now := time.Now()
+	if session.controlClientID == clientID {
+		session.controlConnections++
+		return true
+	}
+	if session.controlClientID == "" || session.controlConnections == 0 && !session.controlGraceUntil.After(now) {
+		session.controlClientID = clientID
+		session.controlConnections = 1
+		session.controlGraceUntil = time.Time{}
+		return true
+	}
+	return false
+}
+
+func (session *Session) releaseControl(clientID string) {
+	if clientID == "" {
+		clientID = "legacy"
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.controlClientID != clientID || session.controlConnections == 0 {
+		return
+	}
+	session.controlConnections--
+	if session.controlConnections == 0 {
+		session.controlGraceUntil = time.Now().Add(5 * time.Second)
+	}
 }
 
 func startSession(id, command, workingDirectory string, cols, rows uint16) (*Session, error) {
@@ -76,6 +128,7 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	child.Env = environmentWithOverrides(os.Environ(), map[string]string{
 		"TERM":          "xterm-256color",
 		"COLORTERM":     "truecolor",
+		"TERM_PROGRAM":  "relay",
 		"RELAY_SESSION": id,
 		"PATH":          shimPath + string(os.PathListSeparator) + os.Getenv("PATH"),
 	})
@@ -92,8 +145,9 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	session := &Session{
 		id: id, command: command, pty: terminal, process: child,
 		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
-		activeSubagents: make(map[string][]byte), done: make(chan struct{}),
+		activeSubagents: make(map[string][]byte), activeAgentRoots: make(map[string][]byte), done: make(chan struct{}),
 		inputSequences: make(map[[16]byte]uint64),
+		eventHashes:    make(map[[32]byte]struct{}),
 	}
 	go session.readOutput()
 	go session.wait()
@@ -138,7 +192,8 @@ func writeZshIntegration(home, shimPath string) (string, error) {
 	contents := "# Managed by Relay Terminal.\n" +
 		"if [ -r \"${RELAY_ORIGINAL_ZDOTDIR:-$HOME}/.zshrc\" ]; then source \"${RELAY_ORIGINAL_ZDOTDIR:-$HOME}/.zshrc\"; fi\n" +
 		"export PATH=" + shellQuote(shimPath) + ":$PATH\n" +
-		"rehash 2>/dev/null || true\n"
+		"rehash 2>/dev/null || true\n" +
+		zshSemanticPromptIntegration
 	if err := os.WriteFile(filepath.Join(directory, ".zshrc"), []byte(contents), 0o600); err != nil {
 		return "", err
 	}
@@ -154,12 +209,107 @@ func writeBashIntegration(home, shimPath string) (string, error) {
 	contents := "# Managed by Relay Terminal.\n" +
 		"if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n" +
 		"export PATH=" + shellQuote(shimPath) + ":$PATH\n" +
-		"hash -r 2>/dev/null || true\n"
+		"hash -r 2>/dev/null || true\n" +
+		bashSemanticPromptIntegration
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
 }
+
+// OSC 133 divides terminal output into prompt, input, and command-output
+// regions. Besides making scrollback structurally useful, Ghostty uses the
+// prompt/input region to implement exact click-to-move for readline and ZLE.
+// Keep this integration owned by Relay: remote nodes need only the relayd
+// binary, and a user's shell configuration remains the source of their prompt.
+const bashSemanticPromptIntegration = `
+# Relay semantic prompt integration (OSC 133).
+if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+  __relay_command_active=""
+
+  __relay_preexec() {
+    builtin printf '\e]133;C\a'
+    __relay_command_active=1
+  }
+
+  __relay_prompt_hook() {
+    builtin local command_status=$?
+
+    if [[ "$__relay_command_active" == "1" ]]; then
+      builtin printf '\e]133;D;%s\a' "$command_status"
+    fi
+
+    # Restore the clean prompt before running this hook again. This lets
+    # dynamic prompt tools replace PS1 without accumulating markers.
+    if [[ -n "${__relay_marked_ps1+x}" && "$PS1" == "$__relay_marked_ps1" ]]; then
+      PS1="$__relay_clean_ps1"
+      PS2="$__relay_clean_ps2"
+    fi
+    __relay_clean_ps1="$PS1"
+    __relay_clean_ps2="$PS2"
+    PS1='\[\e]133;P;k=i\a\]'"$PS1"'\[\e]133;B\a\]'
+    PS2='\[\e]133;P;k=s\a\]'"$PS2"'\[\e]133;B\a\]'
+    __relay_marked_ps1="$PS1"
+
+    builtin printf '\e]133;A;redraw=last;cl=line\a'
+    __relay_command_active=0
+
+    if [[ "$PS0" != *"__relay_preexec"* ]]; then
+      # Bash 4.4 is common on HPC nodes. Command substitution is the portable
+      # preexec hook there; redirecting to the TTY keeps OSC out of substitution.
+      PS0+='$(__relay_preexec >/dev/tty)'
+    fi
+  }
+
+  if [[ ";${PROMPT_COMMAND[*]:-};" != *";__relay_prompt_hook 2>/dev/null;"* ]]; then
+    if [[ -z "${PROMPT_COMMAND[*]:-}" ]]; then
+      PROMPT_COMMAND="__relay_prompt_hook 2>/dev/null"
+    elif [[ $(builtin declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then
+      PROMPT_COMMAND+=("__relay_prompt_hook 2>/dev/null")
+    else
+      [[ "$PROMPT_COMMAND" =~ (\;[[:space:]]*|$'\n')$ ]] || PROMPT_COMMAND+=';'
+      PROMPT_COMMAND+="__relay_prompt_hook 2>/dev/null"
+    fi
+  fi
+fi
+`
+
+const zshSemanticPromptIntegration = `
+# Relay semantic prompt integration (OSC 133).
+if [[ -o interactive ]]; then
+  autoload -Uz add-zsh-hook
+  typeset -g __relay_command_active=0
+
+  __relay_precmd() {
+    local command_status=$?
+    if (( __relay_command_active )); then
+      print -rn -- $'\e]133;D;'${command_status}$'\a' > /dev/tty
+    fi
+
+    if [[ -n ${__relay_marked_ps1+x} && $PS1 == $__relay_marked_ps1 ]]; then
+      PS1=$__relay_clean_ps1
+      PS2=$__relay_clean_ps2
+    fi
+    __relay_clean_ps1=$PS1
+    __relay_clean_ps2=$PS2
+    local primary=$'%{\e]133;A;cl=line\a%}'
+    local secondary=$'%{\e]133;P;k=s\a%}'
+    local input=$'%{\e]133;B\a%}'
+    PS1=${primary}${PS1}${input}
+    PS2=${secondary}${PS2}${input}
+    __relay_marked_ps1=$PS1
+    __relay_command_active=0
+  }
+
+  __relay_preexec() {
+    print -rn -- $'\e]133;C\a' > /dev/tty
+    __relay_command_active=1
+  }
+
+  add-zsh-hook precmd __relay_precmd
+  add-zsh-hook preexec __relay_preexec
+fi
+`
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
@@ -185,7 +335,7 @@ func environmentWithOverrides(environment []string, overrides map[string]string)
 func (session *Session) monitorAgentProcesses() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	lastAgent := ""
+	known := make(map[int]string)
 	for range ticker.C {
 		session.mu.Lock()
 		exited := session.exited
@@ -194,26 +344,29 @@ func (session *Session) monitorAgentProcesses() {
 		if exited {
 			return
 		}
-		agent := descendantAgent(rootPID)
-		if agent == lastAgent {
-			continue
+		current := descendantAgentProcesses(rootPID)
+		for pid, agent := range known {
+			if _, exists := current[pid]; !exists {
+				session.publishDetectedAgent(agent, "SessionEnd", pid)
+			}
 		}
-		if lastAgent != "" {
-			session.publishDetectedAgent(lastAgent, "SessionEnd")
+		for pid, agent := range current {
+			if known[pid] != agent {
+				session.publishDetectedAgent(agent, "SessionStart", pid)
+			}
 		}
-		if agent != "" {
-			session.publishDetectedAgent(agent, "SessionStart")
-		}
-		lastAgent = agent
+		known = current
 	}
 }
 
-func (session *Session) publishDetectedAgent(agent, eventName string) {
+func (session *Session) publishDetectedAgent(agent, eventName string, pid int) {
+	startTime, _ := processStartTime(pid)
 	payload, err := json.Marshal(map[string]any{
 		"agent": agent,
 		"event": map[string]any{
 			"hook_event_name": eventName,
 			"source":          "process-tree",
+			"root_id":         fmt.Sprintf("%s:%d:%d", agent, pid, startTime),
 			"occurred_at":     time.Now().UTC().Format(time.RFC3339Nano),
 		},
 	})
@@ -225,6 +378,32 @@ func (session *Session) publishDetectedAgent(agent, eventName string) {
 func descendantAgent(rootPID int) string {
 	agent, _ := descendantAgentProcess(rootPID)
 	return agent
+}
+
+func descendantAgentProcesses(rootPID int) map[int]string {
+	result := make(map[int]string)
+	stack := []int{rootPID}
+	seen := make(map[int]bool)
+	for len(stack) > 0 {
+		pid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		command, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm"))
+		arguments, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+		if agent := classifyAgentProcess(string(command), string(arguments)); agent != "" {
+			result[pid] = agent
+		}
+		children, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "task", strconv.Itoa(pid), "children"))
+		for _, value := range strings.Fields(string(children)) {
+			if child, err := strconv.Atoi(value); err == nil {
+				stack = append(stack, child)
+			}
+		}
+	}
+	return result
 }
 
 func descendantAgentProcess(rootPID int) (string, int) {
@@ -306,6 +485,7 @@ func (session *Session) publish(data []byte) {
 	for _, path := range session.artifactDetector.ingest(copyOfData) {
 		if image, err := loadInlineArtifact(path); err == nil {
 			artifactFrames = append(artifactFrames, protocol.ArtifactFrame(path, image))
+			session.artifactDetector.markLoaded(path)
 		}
 	}
 	session.mu.Lock()
@@ -325,16 +505,17 @@ func (session *Session) publish(data []byte) {
 	}
 	frame := protocol.OutputFrame(session.sequence, copyOfData)
 	for viewer := range session.clients {
-		select {
-		case viewer.frames <- frame:
-		default:
-			// A stalled viewer may miss frames; its next reconnect repairs the gap from replay.
+		// Delivery is all-or-nothing for a replay record. In particular, never
+		// deliver the output sequence while dropping a following artifact: the
+		// client's resume cursor would otherwise skip that artifact forever.
+		if cap(viewer.frames)-len(viewer.frames) < 1+len(artifactFrames) {
+			viewer.markLagged()
+			delete(session.clients, viewer)
+			continue
 		}
+		viewer.frames <- frame
 		for _, artifact := range artifactFrames {
-			select {
-			case viewer.frames <- artifact:
-			default:
-			}
+			viewer.frames <- artifact
 		}
 	}
 }
@@ -356,16 +537,20 @@ func (session *Session) wait() {
 	session.exited = true
 	session.exitCode = exitCode
 	for viewer := range session.clients {
-		select {
-		case viewer.frames <- protocol.Frame{Type: protocol.Status, Payload: status}:
-		default:
+		if cap(viewer.frames)-len(viewer.frames) < 1 {
+			viewer.markLagged()
+			delete(session.clients, viewer)
+			continue
 		}
+		viewer.frames <- protocol.Frame{Type: protocol.Status, Payload: status}
 	}
 	for observer := range session.agentClients {
-		select {
-		case observer.frames <- protocol.Frame{Type: protocol.Status, Payload: status}:
-		default:
+		if cap(observer.frames)-len(observer.frames) < 1 {
+			observer.markLagged()
+			delete(session.agentClients, observer)
+			continue
 		}
+		observer.frames <- protocol.Frame{Type: protocol.Status, Payload: status}
 	}
 	session.mu.Unlock()
 }
@@ -385,12 +570,16 @@ func (session *Session) processID() int {
 	return session.process.Process.Pid
 }
 
-func (session *Session) attach(lastSequence, lastEventSequence uint64) (*client, []protocol.Frame) {
+func (session *Session) attach(lastSequence, lastEventSequence uint64) (*client, []protocol.Frame, bool, bool) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	viewer := &client{frames: make(chan protocol.Frame, 512)}
+	viewer := newClient(512)
 	session.clients[viewer] = struct{}{}
+	outputReset := replayCursorHasGap(session.replay, lastSequence)
 	if lastSequence > session.sequence {
+		outputReset = true
+	}
+	if outputReset {
 		lastSequence = 0
 	}
 	startRecord, startOffset := replayStart(session.replay, lastSequence)
@@ -412,8 +601,22 @@ func (session *Session) attach(lastSequence, lastEventSequence uint64) (*client,
 		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "exited", ExitCode: session.exitCode})
 		frames = append(frames, status)
 	}
+	eventReset := session.eventCursorHasGap(lastEventSequence)
+	if eventReset || lastEventSequence == 0 {
+		frames = append(frames, session.agentStateSnapshot())
+		if eventReset {
+			lastEventSequence = 0
+		}
+	}
 	frames = append(frames, session.eventFramesAfter(lastEventSequence)...)
-	return viewer, frames
+	return viewer, frames, outputReset, eventReset
+}
+
+func replayCursorHasGap(replay []record, sequence uint64) bool {
+	if sequence == 0 || len(replay) == 0 {
+		return false
+	}
+	return sequence+1 < replay[0].sequence
 }
 
 // A new local renderer only needs the latest complete terminal redraw. Sending
@@ -444,17 +647,24 @@ func (session *Session) detach(viewer *client) {
 	session.mu.Unlock()
 }
 
-func (session *Session) observeAgents(lastEventSequence uint64) (*client, []protocol.Frame) {
+func (session *Session) observeAgents(lastEventSequence uint64) (*client, []protocol.Frame, bool) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	observer := &client{frames: make(chan protocol.Frame, 64)}
+	observer := newClient(256)
 	session.agentClients[observer] = struct{}{}
+	eventReset := session.eventCursorHasGap(lastEventSequence)
 	frames := session.eventFramesAfter(lastEventSequence)
+	if eventReset || lastEventSequence == 0 {
+		if eventReset {
+			frames = session.eventFramesAfter(0)
+		}
+		frames = append([]protocol.Frame{session.agentStateSnapshot()}, frames...)
+	}
 	if session.exited {
 		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "exited", ExitCode: session.exitCode})
 		frames = append(frames, status)
 	}
-	return observer, frames
+	return observer, frames, eventReset
 }
 
 func (session *Session) detachAgentObserver(observer *client) {
@@ -513,27 +723,74 @@ func (session *Session) resize(cols, rows uint16) error {
 func (session *Session) agentEvent(payload []byte) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	if session.eventHashes == nil {
+		session.eventHashes = make(map[[32]byte]struct{})
+	}
+	hash := semanticAgentEventHash(payload)
+	if _, duplicate := session.eventHashes[hash]; duplicate {
+		return
+	}
+	session.eventHashes[hash] = struct{}{}
+	session.eventHashOrder = append(session.eventHashOrder, hash)
+	if len(session.eventHashOrder) > 4_096 {
+		oldest := session.eventHashOrder[0]
+		session.eventHashOrder = session.eventHashOrder[1:]
+		delete(session.eventHashes, oldest)
+	}
 	session.eventSequence++
 	payload = indexedAgentPayload(payload, session.eventSequence)
 	frame := protocol.Frame{Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...)}
 	if session.eventJournal != nil {
-		_ = session.eventJournal.append(session.eventSequence, payload)
+		if err := session.eventJournal.append(session.eventSequence, payload); err != nil {
+			session.eventJournalError = err.Error()
+			fmt.Fprintf(os.Stderr, "relay: agent journal append failed: %v\n", err)
+		}
 	}
 	session.appendEventHistory(frame)
 	session.latestAgentEvent = append(session.latestAgentEvent[:0], payload...)
 	session.updateActiveSubagents(payload)
 	for viewer := range session.clients {
-		select {
-		case viewer.frames <- frame:
-		default:
+		if cap(viewer.frames)-len(viewer.frames) < 1 {
+			viewer.markLagged()
+			delete(session.clients, viewer)
+			continue
 		}
+		viewer.frames <- frame
 	}
 	for observer := range session.agentClients {
-		select {
-		case observer.frames <- frame:
-		default:
+		if cap(observer.frames)-len(observer.frames) < 1 {
+			observer.markLagged()
+			delete(session.agentClients, observer)
+			continue
 		}
+		observer.frames <- frame
 	}
+}
+
+func (session *Session) eventCursorHasGap(sequence uint64) bool {
+	if sequence == 0 || len(session.eventHistory) == 0 {
+		return false
+	}
+	return sequence+1 < indexedAgentSequence(session.eventHistory[0].Payload)
+}
+
+func (session *Session) agentStateSnapshot() protocol.Frame {
+	events := make([]json.RawMessage, 0, len(session.activeAgentRoots)+len(session.activeSubagents))
+	for _, payload := range session.activeAgentRoots {
+		events = append(events, append(json.RawMessage(nil), payload...))
+	}
+	for _, payload := range session.activeSubagents {
+		events = append(events, append(json.RawMessage(nil), payload...))
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"agent":           "relay",
+		"relay_event_seq": session.eventSequence,
+		"event": map[string]any{
+			"type":   "RelayStateSnapshot",
+			"events": events,
+		},
+	})
+	return protocol.Frame{Type: protocol.AgentEvent, Payload: payload}
 }
 
 func (session *Session) eventFramesAfter(sequence uint64) []protocol.Frame {
@@ -578,7 +835,14 @@ func (session *Session) enableEventJournal(path string) error {
 }
 
 func (session *Session) updateActiveSubagents(payload []byte) {
+	if session.activeSubagents == nil {
+		session.activeSubagents = make(map[string][]byte)
+	}
+	if session.activeAgentRoots == nil {
+		session.activeAgentRoots = make(map[string][]byte)
+	}
 	var envelope struct {
+		Agent string `json:"agent"`
 		Event struct {
 			HookEventName string `json:"hook_event_name"`
 			Type          string `json:"type"`
@@ -586,6 +850,7 @@ func (session *Session) updateActiveSubagents(payload []byte) {
 			SubagentID    string `json:"subagent_id"`
 			ThreadID      string `json:"thread_id"`
 			AgentType     string `json:"agent_type"`
+			RootID        string `json:"root_id"`
 		} `json:"event"`
 	}
 	if json.Unmarshal(payload, &envelope) != nil {
@@ -606,19 +871,56 @@ func (session *Session) updateActiveSubagents(payload []byte) {
 		identifier = envelope.Event.AgentType
 	}
 	switch eventName {
-	case "SessionStart", "SessionEnd":
-		clear(session.activeSubagents)
+	case "SessionStart":
+		rootID := envelope.Event.RootID
+		if rootID == "" {
+			rootID = envelope.Agent
+		}
+		if rootID != "" {
+			session.activeAgentRoots[rootID] = append([]byte(nil), payload...)
+		}
+	case "SessionEnd":
+		rootID := envelope.Event.RootID
+		if rootID == "" {
+			rootID = envelope.Agent
+		}
+		delete(session.activeAgentRoots, rootID)
+		providerStillRunning := false
+		for _, activePayload := range session.activeAgentRoots {
+			var activeEnvelope struct {
+				Agent string `json:"agent"`
+			}
+			if json.Unmarshal(activePayload, &activeEnvelope) == nil && activeEnvelope.Agent == envelope.Agent {
+				providerStillRunning = true
+				break
+			}
+		}
+		if !providerStillRunning {
+			for key, activePayload := range session.activeSubagents {
+				var activeEnvelope struct {
+					Agent string `json:"agent"`
+				}
+				if json.Unmarshal(activePayload, &activeEnvelope) == nil && activeEnvelope.Agent == envelope.Agent {
+					delete(session.activeSubagents, key)
+				}
+			}
+		}
 	case "SubagentStart":
 		if identifier != "" {
-			session.activeSubagents[identifier] = append([]byte(nil), payload...)
+			session.activeSubagents[envelope.Agent+"\x00"+identifier] = append([]byte(nil), payload...)
 		}
 	case "SubagentStop":
 		if identifier != "" {
-			delete(session.activeSubagents, identifier)
+			delete(session.activeSubagents, envelope.Agent+"\x00"+identifier)
 		} else {
-			for key := range session.activeSubagents {
-				delete(session.activeSubagents, key)
-				break
+			for key, activePayload := range session.activeSubagents {
+				var activeEnvelope struct {
+					Agent string `json:"agent"`
+				}
+				if json.Unmarshal(activePayload, &activeEnvelope) == nil && activeEnvelope.Agent == envelope.Agent {
+					delete(session.activeSubagents, key)
+					break
+				}
 			}
 		}
 	}

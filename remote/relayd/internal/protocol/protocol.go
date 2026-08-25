@@ -12,18 +12,20 @@ import (
 type Type byte
 
 const (
-	Hello      Type = 1
-	Input      Type = 2
-	Resize     Type = 3
-	Output     Type = 4
-	Status     Type = 5
-	Detach     Type = 6
-	Ping       Type = 7
-	Pong       Type = 8
-	AgentEvent Type = 9
-	Artifact   Type = 10
-	InputAck   Type = 11
-	InputV2    Type = 12
+	Hello          Type = 1
+	Input          Type = 2
+	Resize         Type = 3
+	Output         Type = 4
+	Status         Type = 5
+	Detach         Type = 6
+	Ping           Type = 7
+	Pong           Type = 8
+	AgentEvent     Type = 9
+	Artifact       Type = 10
+	InputAck       Type = 11
+	InputV2        Type = 12
+	HostEvent      Type = 13
+	WorkspaceState Type = 14
 )
 
 const MaxPayload = 16 << 20
@@ -31,6 +33,29 @@ const MaxPayload = 16 << 20
 type Frame struct {
 	Type    Type
 	Payload []byte
+}
+
+func HostEventFrame(sessionID string, inner Frame) Frame {
+	session := []byte(sessionID)
+	payload := make([]byte, 3+len(session)+len(inner.Payload))
+	binary.BigEndian.PutUint16(payload[:2], uint16(len(session)))
+	payload[2] = byte(inner.Type)
+	copy(payload[3:], session)
+	copy(payload[3+len(session):], inner.Payload)
+	return Frame{Type: HostEvent, Payload: payload}
+}
+
+func ParseHostEvent(frame Frame) (string, Frame, error) {
+	if frame.Type != HostEvent || len(frame.Payload) < 3 {
+		return "", Frame{}, errors.New("invalid host event frame")
+	}
+	length := int(binary.BigEndian.Uint16(frame.Payload[:2]))
+	if length <= 0 || 3+length > len(frame.Payload) {
+		return "", Frame{}, errors.New("invalid host event session")
+	}
+	return string(frame.Payload[3 : 3+length]), Frame{
+		Type: Type(frame.Payload[2]), Payload: append([]byte(nil), frame.Payload[3+length:]...),
+	}, nil
 }
 
 type HelloPayload struct {
@@ -50,14 +75,19 @@ type HelloPayload struct {
 	ObserveEvents   bool   `json:"observe_events,omitempty"`
 	Probe           bool   `json:"probe,omitempty"`
 	WorkerToken     string `json:"worker_token,omitempty"`
+	NodeMux         bool   `json:"node_mux,omitempty"`
+	ClientID        string `json:"client_id,omitempty"`
 }
 
 type StatusPayload struct {
-	State        string   `json:"state"`
-	ExitCode     int      `json:"exit_code,omitempty"`
-	Message      string   `json:"message,omitempty"`
-	WorkerPID    int      `json:"worker_pid,omitempty"`
-	Capabilities []string `json:"capabilities,omitempty"`
+	State          string   `json:"state"`
+	ExitCode       int      `json:"exit_code,omitempty"`
+	Message        string   `json:"message,omitempty"`
+	WorkerPID      int      `json:"worker_pid,omitempty"`
+	Capabilities   []string `json:"capabilities,omitempty"`
+	OutputReset    bool     `json:"output_reset,omitempty"`
+	EventReset     bool     `json:"event_reset,omitempty"`
+	ControlGranted *bool    `json:"control_granted,omitempty"`
 }
 
 const inputIdentityBytes = 16

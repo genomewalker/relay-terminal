@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,23 +32,29 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|attach|observe|sessions|terminate|forget|event|agent|artifact|files>")
+		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|artifact|files>")
 	}
 	switch os.Args[1] {
 	case "daemon":
 		runDaemon(os.Args[2:])
+	case "node":
+		runNode(os.Args[2:])
 	case "worker":
 		runWorker(os.Args[2:])
 	case "attach":
 		runAttach(os.Args[2:])
 	case "observe":
 		runObserve(os.Args[2:])
+	case "observe-many":
+		runObserveMany(os.Args[2:])
 	case "sessions":
 		runSessions(os.Args[2:])
 	case "terminate":
 		runTerminate(os.Args[2:])
 	case "forget":
 		runForget(os.Args[2:])
+	case "gc":
+		runGC(os.Args[2:])
 	case "event":
 		runEvent(os.Args[2:])
 	case "agent":
@@ -57,7 +64,7 @@ func main() {
 	case "files":
 		runFiles(os.Args[2:])
 	case "--version", "version":
-		fmt.Println("relayd 0.4.0")
+		fmt.Println("relayd 0.5.0")
 	default:
 		fatal("unknown command: " + os.Args[1])
 	}
@@ -609,6 +616,39 @@ func runAttach(arguments []string) {
 	}
 }
 
+// runNode exposes one framed, bidirectional stream for every pane on a node.
+// HostEvent is the channel envelope; its inner frame is exactly the existing
+// per-pane protocol, which keeps workers and old manifests compatible.
+func runNode(arguments []string) {
+	flags := flag.NewFlagSet("node", flag.ExitOnError)
+	socket := flags.String("socket", defaultSocket(), "Unix socket path")
+	_ = flags.Parse(arguments)
+	if flags.NArg() != 0 {
+		fatal("usage: relayd node")
+	}
+	connection, err := connectOrStart(*socket)
+	if err != nil {
+		fatal(err.Error())
+	}
+	defer connection.Close()
+	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{Version: 1, NodeMux: true})
+	if err := protocol.NewWriter(connection).Write(hello); err != nil {
+		fatal(err.Error())
+	}
+	done := make(chan error, 2)
+	go func() {
+		_, copyErr := io.Copy(connection, os.Stdin)
+		done <- copyErr
+	}()
+	go func() {
+		_, copyErr := io.Copy(os.Stdout, connection)
+		done <- copyErr
+	}()
+	if copyErr := <-done; copyErr != nil {
+		fatal(copyErr.Error())
+	}
+}
+
 func runSessions(arguments []string) {
 	flags := flag.NewFlagSet("sessions", flag.ExitOnError)
 	_ = flags.Parse(arguments)
@@ -654,6 +694,23 @@ func runForget(arguments []string) {
 	}
 }
 
+func runGC(arguments []string) {
+	flags := flag.NewFlagSet("gc", flag.ExitOnError)
+	olderThan := flags.Duration("older-than", 30*24*time.Hour, "minimum age for exited or stale panes")
+	dryRun := flags.Bool("dry-run", false, "list eligible pane IDs without deleting them")
+	_ = flags.Parse(arguments)
+	if flags.NArg() != 0 || *olderThan < time.Hour {
+		fatal("usage: relayd gc [--older-than 720h] [--dry-run]")
+	}
+	removed, err := daemon.NewServer().CollectGarbage(*olderThan, *dryRun)
+	if err != nil {
+		fatal(err.Error())
+	}
+	for _, id := range removed {
+		fmt.Println(id)
+	}
+}
+
 func runObserve(arguments []string) {
 	flags := flag.NewFlagSet("observe", flag.ExitOnError)
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
@@ -691,12 +748,126 @@ func runObserve(arguments []string) {
 	}
 }
 
+func runObserveMany(arguments []string) {
+	flags := flag.NewFlagSet("observe-many", flag.ExitOnError)
+	socket := flags.String("socket", defaultSocket(), "Unix socket path")
+	sessionList := flags.String("sessions", "", "comma-separated session IDs, optionally followed by :last-event-seq")
+	_ = flags.Parse(arguments)
+	sessions := parseObservedSessions(*sessionList)
+	if len(sessions) == 0 {
+		fatal("--sessions is required")
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		close(done)
+	}()
+	writer := protocol.NewWriter(os.Stdout)
+	var workers sync.WaitGroup
+	for _, observed := range sessions {
+		workers.Add(1)
+		go func(observed observedSession) {
+			defer workers.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				connection, err := connectOrStart(*socket)
+				if err == nil {
+					connectionFinished := make(chan struct{})
+					go func() {
+						select {
+						case <-done:
+							// Unblock a quiet observer immediately when its SSH
+							// channel closes; otherwise ReadFrame can wait forever.
+							_ = connection.Close()
+						case <-connectionFinished:
+						}
+					}()
+					hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
+						Version: 1, SessionID: observed.id, LastEventSeq: observed.lastEventSequence, ObserveEvents: true,
+					})
+					err = protocol.NewWriter(connection).Write(hello)
+					for err == nil {
+						frame, readErr := protocol.ReadFrame(connection)
+						if readErr != nil {
+							err = readErr
+							break
+						}
+						if frame.Type == protocol.AgentEvent || frame.Type == protocol.Status {
+							if writer.Write(protocol.HostEventFrame(observed.id, frame)) != nil {
+								_ = connection.Close()
+								return
+							}
+						}
+					}
+					_ = connection.Close()
+					close(connectionFinished)
+				}
+				select {
+				case <-done:
+					return
+				case <-time.After(time.Second):
+				}
+			}
+		}(observed)
+	}
+	workers.Wait()
+}
+
+type observedSession struct {
+	id                string
+	lastEventSequence uint64
+}
+
+func parseObservedSessions(value string) []observedSession {
+	seen := make(map[string]bool)
+	sessions := make([]observedSession, 0)
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		id := item
+		var sequence uint64
+		if separator := strings.LastIndexByte(item, ':'); separator > 0 {
+			if parsed, err := strconv.ParseUint(item[separator+1:], 10, 64); err == nil {
+				id = item[:separator]
+				sequence = parsed
+			}
+		}
+		if id != "" && !seen[id] {
+			seen[id] = true
+			sessions = append(sessions, observedSession{id: id, lastEventSequence: sequence})
+		}
+	}
+	return sessions
+}
+
 func connectOrStart(socket string) (net.Conn, error) {
 	if probeDaemon(socket) {
 		return net.Dial("unix", socket)
 	}
 	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
 		return nil, err
+	}
+	// Many panes commonly reconnect at once after a VPN interruption or an app
+	// restart. Serialize supervisor startup so they do not all fork a daemon;
+	// the losing children otherwise become zombies for the lifetime of their
+	// SSH channel and can eventually exhaust the user's process allowance.
+	startLock, err := os.OpenFile(socket+".start.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer startLock.Close()
+	if err := syscall.Flock(int(startLock.Fd()), syscall.LOCK_EX); err != nil {
+		return nil, err
+	}
+	defer syscall.Flock(int(startLock.Fd()), syscall.LOCK_UN)
+	if probeDaemon(socket) {
+		return net.Dial("unix", socket)
 	}
 	logPath := filepath.Join(filepath.Dir(socket), "relayd.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)

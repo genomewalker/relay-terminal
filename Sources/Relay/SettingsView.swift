@@ -35,6 +35,7 @@ struct RelaySettingsView: View {
                         .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     valueSlider("Size", value: $preferences.fontSize, range: 9...24, suffix: "pt")
                     valueSlider("Padding", value: $preferences.terminalPadding, range: 0...20, suffix: "px")
+                    Toggle("Blink cursor", isOn: $preferences.cursorBlink)
                 }
 
                 settingSection("Workspace") {

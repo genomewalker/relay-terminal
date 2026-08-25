@@ -9,7 +9,7 @@ enum RelayTheme {
     static let elevated = Color(hex: 0x353535)
     static let hover = Color(hex: 0x2A2A2A)
     static let line = Color(hex: 0x3D3D3D)
-    static let accent = Color(hex: 0x10A37F)
+    static let accent = Color(hex: 0x2FC6A0)
     static let accentDim = Color(hex: 0x173D35)
     // Retain the old names while view code migrates to semantic tokens.
     static let blue = accent
@@ -19,7 +19,9 @@ enum RelayTheme {
     static let red = Color(hex: 0xD86F68)
     static let text = Color(hex: 0xECECEC)
     static let textMuted = Color(hex: 0xB4B4B4)
-    static let textFaint = Color(hex: 0x777777)
+    // Small metadata text uses this token extensively. #9D9D9D remains above
+    // 4.5:1 even on the elevated #353535 surface.
+    static let textFaint = Color(hex: 0x9D9D9D)
 }
 
 extension Color {

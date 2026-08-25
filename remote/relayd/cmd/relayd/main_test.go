@@ -68,3 +68,11 @@ func TestCodexHookProfile(t *testing.T) {
 		t.Fatalf("Codex hook trust hash changed: %s", got)
 	}
 }
+
+func TestParseObservedSessionsPreservesEventCursors(t *testing.T) {
+	sessions := parseObservedSessions("pane-a:42,pane-b,pane-a:99")
+	if len(sessions) != 2 || sessions[0].id != "pane-a" || sessions[0].lastEventSequence != 42 ||
+		sessions[1].id != "pane-b" || sessions[1].lastEventSequence != 0 {
+		t.Fatalf("unexpected observed sessions: %#v", sessions)
+	}
+}

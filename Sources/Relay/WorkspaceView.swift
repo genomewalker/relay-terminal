@@ -177,6 +177,7 @@ private struct AgentInspectorPanel: View {
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .help(collapsed ? "Expand inspector" : "Collapse inspector")
+            .accessibilityLabel(collapsed ? "Expand agent inspector" : "Collapse agent inspector")
             Button(action: showTerminal) {
                 Image(systemName: "terminal")
                     .font(.system(size: 10, weight: .semibold))
@@ -185,6 +186,7 @@ private struct AgentInspectorPanel: View {
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .help("Show parent terminal")
+            .accessibilityLabel("Show parent terminal")
             Button(action: close) {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))
@@ -192,6 +194,7 @@ private struct AgentInspectorPanel: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
+            .accessibilityLabel("Close agent inspector")
         }
         .padding(.horizontal, 12)
         .frame(height: 42)
@@ -205,6 +208,12 @@ private struct AgentInspectorPanel: View {
                     settledOffset.height += value.translation.height
                 }
         )
+        .focusable()
+        .accessibilityLabel("Movable agent inspector")
+        .onKeyPress(.leftArrow) { settledOffset.width -= 20; return .handled }
+        .onKeyPress(.rightArrow) { settledOffset.width += 20; return .handled }
+        .onKeyPress(.upArrow) { settledOffset.height -= 20; return .handled }
+        .onKeyPress(.downArrow) { settledOffset.height += 20; return .handled }
     }
 
     private func inspectorContent(_ agent: SubagentActivity) -> some View {
@@ -428,6 +437,9 @@ private struct WorkspaceTab: View {
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .opacity(isSelected || hovering ? 1 : 0)
+            .allowsHitTesting(isSelected || hovering)
+            .accessibilityHidden(!isSelected && !hovering)
+            .accessibilityLabel("Close \(label) tab")
         }
         .foregroundStyle(isSelected ? RelayTheme.text : RelayTheme.textMuted)
         .background(hovering ? RelayTheme.hover.opacity(0.45) : Color.clear,
@@ -466,6 +478,7 @@ private struct ChromeButton: View {
         .foregroundStyle(RelayTheme.textMuted)
         .onHover { hovering = $0 }
         .help(help)
+        .accessibilityLabel(Text(help.split(separator: "·").first.map(String.init) ?? help))
     }
 }
 
@@ -720,6 +733,7 @@ private struct PanePresence: View {
             .fill(pane.phase == .needsInput ? RelayTheme.coral : pane.kind == .shell ? RelayTheme.textFaint : RelayTheme.mint)
             .frame(width: 5, height: 5)
             .help("\(pane.kind.label): \(pane.phase.label)")
+            .accessibilityLabel("\(pane.kind.label): \(pane.phase.label)")
     }
 }
 
@@ -942,6 +956,7 @@ private struct HostLauncher: View {
     @State private var remoteCatalog: RemoteCatalogSnapshot?
     @State private var catalogError: String?
     @State private var loadingCatalog = false
+    @State private var catalogRetryTask: Task<Void, Never>?
     @FocusState private var searchFocused: Bool
 
     init(workspace: WorkspaceModel) {
@@ -1160,6 +1175,7 @@ private struct HostLauncher: View {
         .background(RelayTheme.sidebar)
         .preferredColorScheme(.dark)
         .onAppear { searchFocused = true }
+        .onDisappear { catalogRetryTask?.cancel() }
         .onExitCommand { workspace.isHostLauncherPresented = false }
     }
 
@@ -1180,6 +1196,8 @@ private struct HostLauncher: View {
     }
 
     private func loadCatalog(for profile: ConnectionProfile) {
+        catalogRetryTask?.cancel()
+        catalogRetryTask = nil
         loadingCatalog = true
         catalogError = nil
         remoteCatalog = nil
@@ -1191,6 +1209,15 @@ private struct HostLauncher: View {
             } catch {
                 guard selectedProfile?.connectionKey == profile.connectionKey else { return }
                 catalogError = error.localizedDescription
+                if let remoteError = error as? RemoteCatalogError,
+                   remoteError.shouldRetryAutomatically {
+                    catalogRetryTask = Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(3))
+                        guard !Task.isCancelled,
+                              selectedProfile?.connectionKey == profile.connectionKey else { return }
+                        loadCatalog(for: profile)
+                    }
+                }
             }
             loadingCatalog = false
         }
@@ -1479,6 +1506,20 @@ private struct FloatingPaneWindow: View {
             )
             .simultaneousGesture(TapGesture().onEnded(select))
             .draggable(pane.id.uuidString)
+            .focusable()
+            .accessibilityLabel("Move floating pane \(pane.displayName)")
+            .onKeyPress(.leftArrow) {
+                move(Double(max(edgeInset, baseOriginX - 20)), Double(baseOriginY)); return .handled
+            }
+            .onKeyPress(.rightArrow) {
+                move(Double(min(bounds.width - baseWidth - edgeInset, baseOriginX + 20)), Double(baseOriginY)); return .handled
+            }
+            .onKeyPress(.upArrow) {
+                move(Double(baseOriginX), Double(max(edgeInset, baseOriginY - 20))); return .handled
+            }
+            .onKeyPress(.downArrow) {
+                move(Double(baseOriginX), Double(min(bounds.height - baseHeight - edgeInset, baseOriginY + 20))); return .handled
+            }
 
             Button(action: dock) {
                     Image(systemName: "rectangle.portrait.and.arrow.right")
@@ -1488,6 +1529,7 @@ private struct FloatingPaneWindow: View {
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .help("Dock pane")
+            .accessibilityLabel("Dock floating pane")
 
             Button(action: close) {
                     Image(systemName: "xmark")
@@ -1497,6 +1539,7 @@ private struct FloatingPaneWindow: View {
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .help(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
+            .accessibilityLabel(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
         }
         .padding(.horizontal, 10)
         .frame(height: 36)
@@ -1529,6 +1572,18 @@ private struct FloatingPaneWindow: View {
                     }
             )
             .help("Resize floating pane")
+            .focusable()
+            .accessibilityLabel("Resize floating pane")
+            .accessibilityValue("\(Int(baseWidth)) by \(Int(baseHeight))")
+            .accessibilityAdjustableAction { direction in
+                let delta: CGFloat = direction == .increment ? 24 : -24
+                let maximumWidth = max(minimumWidth, bounds.width - baseOriginX - edgeInset)
+                let maximumHeight = max(minimumHeight, bounds.height - baseOriginY - edgeInset)
+                resize(
+                    Double(min(max(baseWidth + delta, minimumWidth), maximumWidth)),
+                    Double(min(max(baseHeight + delta, minimumHeight), maximumHeight))
+                )
+            }
     }
 }
 
@@ -1641,6 +1696,37 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                     }
             )
             .help("Drag to resize · double-click to center")
+            .focusable()
+            .accessibilityElement()
+            .accessibilityLabel(axis == .horizontal ? "Vertical pane divider" : "Horizontal pane divider")
+            .accessibilityValue("\(Int(ratio * 100)) percent")
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: update(min(0.9, ratio + 0.05), true)
+                case .decrement: update(max(0.1, ratio - 0.05), true)
+                @unknown default: break
+                }
+            }
+            .onKeyPress(.leftArrow) {
+                guard axis == .horizontal else { return .ignored }
+                update(max(0.1, ratio - 0.05), true)
+                return .handled
+            }
+            .onKeyPress(.rightArrow) {
+                guard axis == .horizontal else { return .ignored }
+                update(min(0.9, ratio + 0.05), true)
+                return .handled
+            }
+            .onKeyPress(.upArrow) {
+                guard axis == .vertical else { return .ignored }
+                update(max(0.1, ratio - 0.05), true)
+                return .handled
+            }
+            .onKeyPress(.downArrow) {
+                guard axis == .vertical else { return .ignored }
+                update(min(0.9, ratio + 0.05), true)
+                return .handled
+            }
     }
 }
 
@@ -1677,6 +1763,14 @@ private struct PaneView: View {
                 if pane.connectionState == .connecting {
                     ConnectingOverlay(host: pane.profile.host, contentKind: pane.contentKind)
                         .allowsHitTesting(false)
+                } else if let message = pane.connectionState.recoveryMessage {
+                    ConnectionRecoveryBanner(
+                        host: pane.profile.host,
+                        message: message,
+                        waitingForNetwork: pane.connectionState.isWaitingForNetwork
+                    )
+                        .frame(maxHeight: .infinity, alignment: .top)
+                        .padding(12)
                 } else if pane.isRestoringTerminal {
                     RestoringTerminalOverlay(host: pane.profile.host)
                 } else if let exitCode = pane.remoteExitCode {
@@ -1989,6 +2083,7 @@ private struct ArtifactPreview: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
+                .accessibilityLabel("Close image preview")
             }
             .padding(.horizontal, 10)
             .frame(height: 34)
@@ -2000,6 +2095,7 @@ private struct ArtifactPreview: View {
                     .scaledToFit()
                     .frame(maxWidth: 360, maxHeight: 320)
                     .background(Color.black.opacity(0.24))
+                    .accessibilityLabel("Generated image: \(artifact.filename)")
             }
         }
         .frame(width: 360)
@@ -2102,6 +2198,7 @@ private struct ConnectionPath: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
                 .help(isFloating ? "Dock pane" : "Float pane")
+                .accessibilityLabel(isFloating ? "Dock pane" : "Float pane")
             }
             if let toggleZoom {
                 Button(action: toggleZoom) {
@@ -2111,6 +2208,7 @@ private struct ConnectionPath: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
                 .help(zoomed ? "Restore pane layout" : "Zoom pane")
+                .accessibilityLabel(zoomed ? "Restore pane layout" : "Zoom pane")
             }
             if let close {
                 Button(action: close) {
@@ -2121,6 +2219,7 @@ private struct ConnectionPath: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
                 .help(pane.profile.kind == .ssh ? "Detach pane · ⌘W" : "Close pane · ⌘W")
+                .accessibilityLabel(pane.profile.kind == .ssh ? "Detach pane" : "Close pane")
             }
         }
         .padding(.horizontal, compact ? 9 : 12)
@@ -2229,5 +2328,37 @@ private struct ConnectionErrorBanner: View {
         .padding(11)
         .background(RelayTheme.surface.opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
         .overlay { RoundedRectangle(cornerRadius: 10).stroke(RelayTheme.coral.opacity(0.35)) }
+    }
+}
+
+private struct ConnectionRecoveryBanner: View {
+    let host: String
+    let message: String
+    let waitingForNetwork: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: waitingForNetwork ? "network.slash" : "arrow.trianglehead.2.clockwise.rotate.90")
+                .foregroundStyle(waitingForNetwork ? RelayTheme.coral : RelayTheme.blue)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(waitingForNetwork ? "VPN or network unavailable" : "Reconnecting to \(host)")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(RelayTheme.text)
+                Text(message)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(RelayTheme.textMuted)
+                    .lineLimit(2)
+            }
+            Spacer()
+            ProgressView()
+                .controlSize(.small)
+                .tint(RelayTheme.accent)
+        }
+        .padding(11)
+        .background(RelayTheme.surface.opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke((waitingForNetwork ? RelayTheme.coral : RelayTheme.blue).opacity(0.32))
+        }
     }
 }

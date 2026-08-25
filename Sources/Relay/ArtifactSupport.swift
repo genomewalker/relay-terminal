@@ -79,10 +79,9 @@ enum RemoteArtifactLoader {
             process.arguments = arguments
             process.standardOutput = output
             process.standardError = errors
-            try process.run()
-            let data = try output.fileHandleForReading.readToEnd() ?? Data()
-            process.waitUntilExit()
-            let errorData = try errors.fileHandleForReading.readToEnd() ?? Data()
+            let captured = try ProcessCapture.run(process, output: output, errors: errors)
+            let data = captured.standardOutput
+            let errorData = captured.standardError
             guard process.terminationStatus == 0 else {
                 let message = String(data: errorData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines)

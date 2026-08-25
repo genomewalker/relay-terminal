@@ -1,9 +1,7 @@
 package daemon
 
 import (
-	"bufio"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,18 +17,42 @@ func observeClaudeTranscript(rootPID int) (<-chan protocol.Frame, func()) {
 	stopped := make(chan struct{})
 	go func() {
 		defer close(frames)
-		ticker := time.NewTicker(250 * time.Millisecond)
-		defer ticker.Stop()
-		reader := claudeTranscriptReader{
-			rootPID: rootPID,
-			known:   make(map[string]bool),
-			active:  make(map[string]bool),
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		readers := make(map[int]*claudeTranscriptReader)
+		poll := func() bool {
+			processes := descendantAgentProcesses(rootPID)
+			for pid, agent := range processes {
+				if agent != "claude" {
+					continue
+				}
+				reader := readers[pid]
+				if reader == nil {
+					reader = &claudeTranscriptReader{rootPID: pid, known: make(map[string]bool), active: make(map[string]bool)}
+					readers[pid] = reader
+				}
+				if !reader.poll(frames, stopped) {
+					return false
+				}
+			}
+			for pid := range readers {
+				if processes[pid] != "claude" {
+					delete(readers, pid)
+				}
+			}
+			return true
 		}
-		reader.poll(frames)
 		for {
 			select {
-			case <-ticker.C:
-				reader.poll(frames)
+			case <-timer.C:
+				if !poll() {
+					return
+				}
+				delay := 2 * time.Second
+				if len(readers) > 0 {
+					delay = 250 * time.Millisecond
+				}
+				timer.Reset(delay)
 			case <-stopped:
 				return
 			}
@@ -40,42 +62,32 @@ func observeClaudeTranscript(rootPID int) (<-chan protocol.Frame, func()) {
 }
 
 type claudeTranscriptReader struct {
-	rootPID int
-	path    string
-	offset  int64
-	known   map[string]bool
-	active  map[string]bool
+	rootPID             int
+	path                string
+	offset              int64
+	known               map[string]bool
+	active              map[string]bool
+	discardingOversized bool
+	identity            [2]uint64
 }
 
-func (reader *claudeTranscriptReader) poll(frames chan<- protocol.Frame) {
-	agent, pid := descendantAgentProcess(reader.rootPID)
-	if agent != "claude" || pid == 0 {
-		return
-	}
+func (reader *claudeTranscriptReader) poll(frames chan<- protocol.Frame, stopped <-chan struct{}) bool {
 	path := reader.path
 	if path == "" {
-		path = claudeRootTranscript(pid)
+		path = claudeRootTranscript(reader.rootPID)
 	}
 	if path == "" {
-		return
+		return true
 	}
 	if path != reader.path {
 		reader.path = path
 		reader.offset = 0
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	if _, err := file.Seek(reader.offset, io.SeekStart); err != nil {
-		return
-	}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64<<10), 8<<20)
-	for scanner.Scan() {
-		line := append([]byte(nil), scanner.Bytes()...)
-		reader.offset += int64(len(line) + 1)
+	cancelled := false
+	readTranscriptLines(path, &reader.offset, &reader.discardingOversized, &reader.identity, func(line []byte) {
+		if cancelled {
+			return
+		}
 		for _, event := range claudeTranscriptEvents(line) {
 			identifier := transcriptEventIdentifier(event)
 			if event.Event.HookEventName == "SubagentStart" {
@@ -93,10 +105,16 @@ func (reader *claudeTranscriptReader) poll(frames chan<- protocol.Frame) {
 			}
 			payload, marshalErr := json.Marshal(event)
 			if marshalErr == nil {
-				frames <- protocol.Frame{Type: protocol.AgentEvent, Payload: payload}
+				select {
+				case frames <- protocol.Frame{Type: protocol.AgentEvent, Payload: payload}:
+				case <-stopped:
+					cancelled = true
+					return
+				}
 			}
 		}
-	}
+	})
+	return !cancelled
 }
 
 func claudeTranscriptEvents(line []byte) []codexTranscriptEnvelope {
@@ -134,6 +152,23 @@ func claudeTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 		}}
 	}
 	content := claudeMessageText(row.Message.Content)
+	if row.Type == "assistant" {
+		if events := claudePeerToolEvents(row.Message.Content, row.Timestamp); len(events) > 0 {
+			return events
+		}
+	}
+	if row.Type == "user" {
+		if sender, message := claudeTeammateMessage(content); sender != "" && message != "" {
+			return []codexTranscriptEnvelope{{
+				Agent: "claude",
+				Event: codexTranscriptEvent{
+					HookEventName: "PeerMessage", AgentID: sender, AgentType: sender,
+					Message: message, OccurredAt: row.Timestamp, Source: "claude-transcript",
+					FromPeerID: sender, ToPeerID: "claude-root", MessageType: "message", Delivery: "async",
+				},
+			}}
+		}
+	}
 	if row.Type != "user" || !strings.Contains(content, "<task-notification>") ||
 		!strings.Contains(content, "<status>completed</status>") {
 		return nil
@@ -162,6 +197,78 @@ func claudeTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 			Source:        "claude-transcript",
 		},
 	}}
+}
+
+func claudePeerToolEvents(content any, occurredAt string) []codexTranscriptEnvelope {
+	items, ok := content.([]any)
+	if !ok {
+		return nil
+	}
+	events := make([]codexTranscriptEnvelope, 0)
+	for _, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok || object["type"] != "tool_use" {
+			continue
+		}
+		name, _ := object["name"].(string)
+		if name != "SendMessage" && name != "send_message" && name != "send_message_to_thread" {
+			continue
+		}
+		input, _ := object["input"].(map[string]any)
+		recipient := firstString(input, "recipient", "target", "thread_id", "agent_id")
+		message := firstString(input, "message", "content", "prompt")
+		if recipient == "" || message == "" {
+			continue
+		}
+		events = append(events, codexTranscriptEnvelope{
+			Agent: "claude",
+			Event: codexTranscriptEvent{
+				HookEventName: "PeerMessage", AgentID: recipient, AgentType: recipient,
+				Message: message, OccurredAt: occurredAt, Source: "claude-transcript",
+				FromPeerID: "claude-root", ToPeerID: recipient, MessageType: "message", Delivery: "async",
+			},
+		})
+	}
+	return events
+}
+
+func firstString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := values[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func claudeTeammateMessage(content string) (string, string) {
+	const marker = `<teammate-message`
+	start := strings.Index(content, marker)
+	if start < 0 {
+		return "", ""
+	}
+	remainder := content[start+len(marker):]
+	endTag := strings.Index(remainder, ">")
+	if endTag < 0 {
+		return "", ""
+	}
+	header := remainder[:endTag]
+	sender := ""
+	for _, attribute := range []string{"teammate_id", "agent_id", "sender"} {
+		needle := attribute + `="`
+		if index := strings.Index(header, needle); index >= 0 {
+			value := header[index+len(needle):]
+			if end := strings.Index(value, `"`); end >= 0 {
+				sender = value[:end]
+				break
+			}
+		}
+	}
+	body := remainder[endTag+1:]
+	if end := strings.Index(body, "</teammate-message>"); end >= 0 {
+		body = body[:end]
+	}
+	return strings.TrimSpace(sender), strings.TrimSpace(body)
 }
 
 func claudeMessageText(content any) string {
@@ -199,6 +306,29 @@ func xmlLikeValue(text, tag string) string {
 }
 
 func claudeRootTranscript(pid int) string {
+	if entries, err := os.ReadDir(filepath.Join("/proc", strconv.Itoa(pid), "fd")); err == nil {
+		type openCandidate struct {
+			path    string
+			updated time.Time
+		}
+		candidates := make([]openCandidate, 0)
+		seen := make(map[string]bool)
+		for _, entry := range entries {
+			target, readErr := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "fd", entry.Name()))
+			if readErr != nil || seen[target] || !strings.HasSuffix(target, ".jsonl") ||
+				!strings.Contains(target, string(filepath.Separator)+".claude"+string(filepath.Separator)+"projects"+string(filepath.Separator)) {
+				continue
+			}
+			seen[target] = true
+			if info, statErr := os.Stat(target); statErr == nil {
+				candidates = append(candidates, openCandidate{path: target, updated: info.ModTime()})
+			}
+		}
+		sort.Slice(candidates, func(left, right int) bool { return candidates[left].updated.After(candidates[right].updated) })
+		if len(candidates) > 0 {
+			return candidates[0].path
+		}
+	}
 	cwd, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
 	if err != nil || cwd == "" {
 		return ""

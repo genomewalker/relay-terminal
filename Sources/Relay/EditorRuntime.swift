@@ -410,7 +410,7 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         let view = RelayEditorWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = self
         view.owner = self
-        view.allowsMagnification = false
+        view.allowsMagnification = true
         view.underPageBackgroundColor = NSColor(red: 0.094, green: 0.094, blue: 0.094, alpha: 1)
         view.setAccessibilityLabel("Remote file editor")
         return view
@@ -458,19 +458,15 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         let errors = Pipe()
         ssh.standardOutput = output
         ssh.standardError = errors
-        if let input {
+        if input != nil {
             let writer = Pipe()
             ssh.standardInput = writer
-            try ssh.run()
-            writer.fileHandleForWriting.write(input)
-            try writer.fileHandleForWriting.close()
         } else {
             ssh.standardInput = FileHandle.nullDevice
-            try ssh.run()
         }
-        let outputData = output.fileHandleForReading.readDataToEndOfFile()
-        ssh.waitUntilExit()
-        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+        let captured = try ProcessCapture.run(ssh, output: output, errors: errors, input: input)
+        let outputData = captured.standardOutput
+        let errorData = captured.standardError
         guard ssh.terminationStatus == 0 else {
             let message = String(data: errorData, encoding: .utf8)?.split(separator: "\n").last.map(String.init)
                 ?? "Remote file operation failed"

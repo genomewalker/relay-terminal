@@ -1,8 +1,8 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     html, body, #editor { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #181818; }
     #empty { position: fixed; inset: 0; display: grid; place-items: center; color: #777; font: 12px -apple-system, sans-serif; pointer-events: none; }
@@ -41,8 +41,10 @@
     });
     const options = {
       theme: 'relay-dark', automaticLayout: true, fontFamily: 'Menlo',
+      accessibilitySupport: 'auto', ariaLabel: 'Remote file editor',
       fontSize: 13, lineHeight: 20, fontLigatures: true, minimap: { enabled: true, maxColumn: 90 },
       stickyScroll: { enabled: true }, smoothScrolling: false, cursorSmoothCaretAnimation: 'off',
+      cursorBlinking: 'solid',
       bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true },
       padding: { top: 10, bottom: 10 }, renderWhitespace: 'selection', roundedSelection: false,
       scrollBeyondLastLine: false, wordWrap: 'off'

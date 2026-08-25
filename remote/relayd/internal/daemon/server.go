@@ -22,15 +22,16 @@ import (
 var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,96}$`)
 
 type Server struct {
-	mu         sync.Mutex
-	executable string
-	stateDir   string
-	runtimeDir string
+	mu              sync.Mutex
+	executable      string
+	stateDir        string
+	runtimeDir      string
+	workspaceLeases map[string]workspaceLease
 }
 
 func NewServer() *Server {
 	executable, _ := os.Executable()
-	return &Server{executable: executable, stateDir: defaultWorkerStateDir()}
+	return &Server{executable: executable, stateDir: defaultWorkerStateDir(), workspaceLeases: make(map[string]workspaceLease)}
 }
 
 func defaultWorkerStateDir() string {
@@ -64,6 +65,11 @@ func (server *Server) Serve(socketPath string) error {
 		return fmt.Errorf("relayd is already running at %s", socketPath)
 	}
 	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	pidPath := socketPath + ".pid"
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		return err
+	}
+	defer os.Remove(pidPath)
 	if removeErr := os.Remove(socketPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 		return removeErr
 	}
@@ -76,6 +82,9 @@ func (server *Server) Serve(socketPath string) error {
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		return err
 	}
+	// Startup-only retention avoids a polling goroutine and bounds cleanup
+	// work. Running panes are never eligible.
+	_, _ = server.CollectGarbage(30*24*time.Hour, false)
 	for {
 		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {
@@ -103,8 +112,14 @@ func (server *Server) serveConnection(connection net.Conn) {
 		return
 	}
 	var hello protocol.HelloPayload
-	if err := protocol.DecodeJSON(first, &hello); err != nil ||
-		hello.Version != workerProtocolVersion || !validSessionID.MatchString(hello.SessionID) {
+	if err := protocol.DecodeJSON(first, &hello); err != nil || hello.Version != workerProtocolVersion {
+		return
+	}
+	if hello.NodeMux {
+		server.serveNodeMultiplex(connection)
+		return
+	}
+	if !validSessionID.MatchString(hello.SessionID) {
 		return
 	}
 	if hello.Probe {
@@ -140,9 +155,17 @@ func (server *Server) serveConnection(connection net.Conn) {
 	if err := protocol.NewWriter(worker).Write(workerHello); err != nil {
 		return
 	}
-	if !manifest.supports("event_cursor_v1") {
+	// Current workers capture transcript events themselves. Only compatibility
+	// workers pass through the supervisor enrichment path; otherwise every
+	// observer would duplicate process-tree and transcript polling.
+	workerOwnsTranscripts := manifest.supports("transcript_events_v1")
+	if (hello.ObserveEvents && !workerOwnsTranscripts) || !manifest.supports("event_cursor_v1") {
+		eventPath := server.eventJournalPath(manifest.SessionID)
+		if hello.ObserveEvents && manifest.supports("event_cursor_v1") {
+			eventPath = filepath.Join(filepath.Dir(server.stateDir), "observed-events", manifest.SessionID+".jsonl")
+		}
 		serveObservedConnection(
-			connection, worker, manifest, server.eventJournalPath(manifest.SessionID),
+			connection, worker, manifest, eventPath,
 			hello.LastEventSeq, hello.ObserveEvents,
 		)
 		return
@@ -161,6 +184,104 @@ func (server *Server) serveConnection(connection net.Conn) {
 		completed <- struct{}{}
 	}()
 	<-completed
+}
+
+type multiplexedSession struct {
+	connection net.Conn
+}
+
+// serveNodeMultiplex turns one SSH channel into independent virtual protocol
+// connections. Each virtual connection is fed back through serveConnection,
+// so authentication, replay, compatibility, and worker isolation retain one
+// implementation instead of growing a parallel code path.
+func (server *Server) serveNodeMultiplex(connection net.Conn) {
+	writer := protocol.NewWriter(connection)
+	ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+		State: "ready", Capabilities: []string{"node_mux_v1"},
+	})
+	if writer.Write(ready) != nil {
+		return
+	}
+
+	var sessionsMu sync.Mutex
+	sessions := make(map[string]*multiplexedSession)
+	closeSession := func(id string, expected *multiplexedSession) {
+		sessionsMu.Lock()
+		if sessions[id] == expected {
+			delete(sessions, id)
+		}
+		sessionsMu.Unlock()
+		_ = expected.connection.Close()
+	}
+	defer func() {
+		sessionsMu.Lock()
+		remaining := make([]*multiplexedSession, 0, len(sessions))
+		for _, session := range sessions {
+			remaining = append(remaining, session)
+		}
+		sessions = make(map[string]*multiplexedSession)
+		sessionsMu.Unlock()
+		for _, session := range remaining {
+			_ = session.connection.Close()
+		}
+	}()
+
+	for {
+		envelope, err := protocol.ReadFrame(connection)
+		if err != nil {
+			return
+		}
+		sessionID, inner, err := protocol.ParseHostEvent(envelope)
+		if err != nil || !validSessionID.MatchString(sessionID) {
+			return
+		}
+		if inner.Type == protocol.WorkspaceState {
+			response := server.handleWorkspaceState(sessionID, inner.Payload)
+			if writer.Write(protocol.HostEventFrame(sessionID, response)) != nil {
+				return
+			}
+			continue
+		}
+		if inner.Type == protocol.Hello {
+			var hello protocol.HelloPayload
+			if protocol.DecodeJSON(inner, &hello) != nil || hello.SessionID != sessionID || hello.NodeMux {
+				return
+			}
+			clientSide, serverSide := net.Pipe()
+			virtual := &multiplexedSession{connection: clientSide}
+			sessionsMu.Lock()
+			previous := sessions[sessionID]
+			sessions[sessionID] = virtual
+			sessionsMu.Unlock()
+			if previous != nil {
+				_ = previous.connection.Close()
+			}
+			go server.serveConnection(serverSide)
+			go func(id string, session *multiplexedSession) {
+				defer closeSession(id, session)
+				for {
+					frame, readErr := protocol.ReadFrame(session.connection)
+					if readErr != nil || writer.Write(protocol.HostEventFrame(id, frame)) != nil {
+						return
+					}
+				}
+			}(sessionID, virtual)
+			if protocol.NewWriter(clientSide).Write(inner) != nil {
+				closeSession(sessionID, virtual)
+			}
+			continue
+		}
+
+		sessionsMu.Lock()
+		virtual := sessions[sessionID]
+		sessionsMu.Unlock()
+		if virtual == nil {
+			continue
+		}
+		if protocol.NewWriter(virtual.connection).Write(inner) != nil {
+			closeSession(sessionID, virtual)
+		}
+	}
 }
 
 type observedWorkerFrame struct {
@@ -205,6 +326,7 @@ func serveObservedConnection(
 	writer := protocol.NewWriter(connection)
 	index, indexErr := sharedExternalEventIndex(eventPath)
 	if indexErr == nil {
+		defer releaseExternalEventIndex(eventPath, index)
 		for _, frame := range index.framesAfter(lastEventSequence) {
 			if writer.Write(frame) != nil {
 				return
