@@ -23,6 +23,16 @@ final class TerminalRuntime: NSObject {
 
     init(pane: PaneModel) {
         self.pane = pane
+        super.init()
+        io.onReplayFinished = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !self.view.performBindingAction("scroll_to_bottom") {
+                    _ = self.view.scrollToRow(UInt.max)
+                }
+                self.pane?.finishTerminalRestore()
+            }
+        }
     }
 
     func startIfNeeded() {
@@ -34,6 +44,8 @@ final class TerminalRuntime: NSObject {
         let artifactPresentation = RelayPreferences.shared.artifactPresentation
         let artifactsEnabled = RelayPreferences.shared.showArtifactPreviews
         io.transport = remote
+        pane.beginTerminalRestore()
+        io.beginReplay()
         let io = self.io
         remote.start(
             profile: pane.profile,
@@ -51,9 +63,14 @@ final class TerminalRuntime: NSObject {
                     guard let self else { return }
                     if status.state == "attached" {
                         self.pane?.connected()
+                    } else if status.state == "caught_up" {
+                        self.io.endReplay()
                     } else if status.state == "reconnecting" {
+                        self.pane?.beginTerminalRestore()
+                        self.io.beginReplay()
                         self.pane?.connectionInterrupted(status.message ?? "Reconnecting")
                     } else if status.state == "exited" {
+                        self.io.endReplay()
                         // Keep Ghostty as a renderer. Host-managed exits do not
                         // have exec lifecycle metadata, so forwarding finish()
                         // makes Ghostty present its generic "failed to launch"
@@ -61,6 +78,7 @@ final class TerminalRuntime: NSObject {
                         // ended-session overlay with an explicit restart action.
                         self.pane?.exited(exitCode: status.exitCode ?? 0)
                     } else if status.state == "error" {
+                        self.io.endReplay()
                         let message = status.message ?? "Remote session error"
                         self.io.receive(Data("\r\n\u{001B}[38;2;255;139;120mRelay: \(message)\u{001B}[0m\r\n".utf8))
                         self.pane?.disconnected(message)
@@ -87,6 +105,7 @@ final class TerminalRuntime: NSObject {
             onDisconnect: { [weak self] message in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
+                    self.io.endReplay()
                     self.io.receive(Data("\r\n\u{001B}[38;2;255;139;120mRelay connection: \(message)\u{001B}[0m\r\n".utf8))
                     self.pane?.disconnected(message)
                 }
@@ -95,6 +114,7 @@ final class TerminalRuntime: NSObject {
     }
 
     func stop() {
+        io.endReplay()
         io.transport?.detach()
         io.transport = nil
         started = false
@@ -211,9 +231,13 @@ private final class TerminalActivityCoalescer: @unchecked Sendable {
 
 private final class TerminalIOBridge: @unchecked Sendable {
     var transport: RelayRemoteTransport?
+    var onReplayFinished: (@Sendable () -> Void)?
     private let receiveLock = NSLock()
+    private let replayLock = NSLock()
+    private var replaying = false
+    private var replayGeneration: UInt64 = 0
     lazy var session = InMemoryTerminalSession(
-        write: { [weak self] data in self?.transport?.sendInput(data) },
+        write: { [weak self] data in self?.forwardTerminalWrite(data) },
         resize: { [weak self] viewport in
             self?.transport?.sendResize(
                 columns: UInt16(viewport.columns),
@@ -227,6 +251,58 @@ private final class TerminalIOBridge: @unchecked Sendable {
         receiveLock.lock()
         defer { receiveLock.unlock() }
         session.receive(data)
+        scheduleLegacyReplayEnd()
+    }
+
+    func beginReplay() {
+        replayLock.lock()
+        replaying = true
+        replayGeneration &+= 1
+        replayLock.unlock()
+        scheduleLegacyReplayEnd()
+    }
+
+    func endReplay() {
+        replayLock.lock()
+        let wasReplaying = replaying
+        replaying = false
+        replayGeneration &+= 1
+        replayLock.unlock()
+        if wasReplaying { onReplayFinished?() }
+    }
+
+    private func forwardTerminalWrite(_ data: Data) {
+        replayLock.lock()
+        let shouldSuppress = replaying
+        replayLock.unlock()
+        guard !shouldSuppress else { return }
+        transport?.sendInput(data)
+    }
+
+    // Workers released before the caught_up status marker remain attachable.
+    // For those workers, a short idle boundary ends replay without allowing
+    // historical device-query replies to leak into the live shell.
+    private func scheduleLegacyReplayEnd() {
+        replayLock.lock()
+        guard replaying else {
+            replayLock.unlock()
+            return
+        }
+        replayGeneration &+= 1
+        let generation = replayGeneration
+        replayLock.unlock()
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(750)) { [weak self] in
+            guard let self else { return }
+            self.replayLock.lock()
+            var finished = false
+            if self.replaying && self.replayGeneration == generation {
+                self.replaying = false
+                self.replayGeneration &+= 1
+                finished = true
+            }
+            self.replayLock.unlock()
+            if finished { self.onReplayFinished?() }
+        }
     }
 
     func receiveInlineImageOrdered(_ data: Data, imageID: UInt32) {

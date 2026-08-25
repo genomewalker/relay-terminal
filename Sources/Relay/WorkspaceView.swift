@@ -1270,6 +1270,9 @@ private struct PaneView: View {
                 if pane.connectionState == .connecting {
                     ConnectingOverlay(host: pane.profile.host, contentKind: pane.contentKind)
                         .allowsHitTesting(false)
+                } else if pane.isRestoringTerminal {
+                    RestoringTerminalOverlay(host: pane.profile.host)
+                        .allowsHitTesting(false)
                 } else if let exitCode = pane.remoteExitCode {
                     SessionEndedOverlay(
                         exitCode: exitCode,
@@ -1754,6 +1757,31 @@ private struct ConnectingOverlay: View {
         .padding(22)
         .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.5)) }
+    }
+}
+
+private struct RestoringTerminalOverlay: View {
+    let host: String
+
+    var body: some View {
+        ZStack {
+            RelayTheme.canvas
+            VStack(spacing: 13) {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(RelayTheme.accent)
+                Text("Restoring terminal")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(RelayTheme.text)
+                Text("Showing the current screen on \(host)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(RelayTheme.textMuted)
+            }
+            .padding(22)
+            .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.5)) }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

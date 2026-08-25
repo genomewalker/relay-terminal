@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,7 +49,7 @@ func main() {
 	case "files":
 		runFiles(os.Args[2:])
 	case "--version", "version":
-		fmt.Println("relayd 0.3.1")
+		fmt.Println("relayd 0.3.2")
 	default:
 		fatal("unknown command: " + os.Args[1])
 	}
@@ -279,7 +281,7 @@ func runCodex(arguments []string) {
 		fatal(err.Error())
 	}
 	profilePath := filepath.Join(configDir, "relay-terminal.config.toml")
-	if err := os.WriteFile(profilePath, []byte(codexHookProfile), 0o600); err != nil {
+	if err := os.WriteFile(profilePath, []byte(codexHookProfile(profilePath)), 0o600); err != nil {
 		fatal(err.Error())
 	}
 	executable, err := findRealAgentExecutable("codex")
@@ -324,7 +326,56 @@ func findRealAgentExecutable(name string) (string, error) {
 
 const codexHookCommand = `if [ -n "$RELAY_SESSION" ]; then ~/.local/bin/relayd event --session "$RELAY_SESSION" --agent codex; fi`
 
-const codexHookProfile = `# Managed by Relay Terminal. Remove this file to uninstall the profile.
+type codexHookSpec struct {
+	event   string
+	matcher *string
+}
+
+var codexWildcardMatcher = "*"
+
+var codexHookSpecs = []codexHookSpec{
+	{event: "session_start", matcher: &codexWildcardMatcher},
+	{event: "user_prompt_submit"},
+	{event: "pre_tool_use", matcher: &codexWildcardMatcher},
+	{event: "permission_request", matcher: &codexWildcardMatcher},
+	{event: "post_tool_use", matcher: &codexWildcardMatcher},
+	{event: "subagent_start", matcher: &codexWildcardMatcher},
+	{event: "subagent_stop", matcher: &codexWildcardMatcher},
+	{event: "stop"},
+	{event: "session_end", matcher: &codexWildcardMatcher},
+}
+
+func codexHookProfile(profilePath string) string {
+	var state strings.Builder
+	state.WriteString("# Managed by Relay Terminal. Remove this file to uninstall the profile.\n")
+	for _, spec := range codexHookSpecs {
+		key := profilePath + ":" + spec.event + ":0:0"
+		state.WriteString("[hooks.state.")
+		state.WriteString(strconv.Quote(key))
+		state.WriteString("]\ntrusted_hash = ")
+		state.WriteString(strconv.Quote(codexHookHash(spec.event, spec.matcher)))
+		state.WriteString("\n\n")
+	}
+	state.WriteString(codexHookEvents)
+	return state.String()
+}
+
+func codexHookHash(event string, matcher *string) string {
+	identity := map[string]any{
+		"event_name": event,
+		"hooks": []any{map[string]any{
+			"type": "command", "command": codexHookCommand, "async": true, "timeout": 3,
+		}},
+	}
+	if matcher != nil {
+		identity["matcher"] = *matcher
+	}
+	serialized, _ := json.Marshal(identity)
+	digest := sha256.Sum256(serialized)
+	return fmt.Sprintf("sha256:%x", digest)
+}
+
+const codexHookEvents = `
 [[hooks.SessionStart]]
 matcher = "*"
 [[hooks.SessionStart.hooks]]

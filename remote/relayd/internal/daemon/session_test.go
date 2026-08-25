@@ -1,6 +1,10 @@
 package daemon
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,6 +42,42 @@ func TestEnvironmentOverridesReplaceHotPathVariables(t *testing.T) {
 	}
 	if values["PATH"] != "/relay:/old" || values["TERM"] != "xterm-256color" || values["UNCHANGED"] != "yes" {
 		t.Fatalf("unexpected environment: %#v", values)
+	}
+}
+
+func TestBashIntegrationKeepsRelayShimsAheadOfUserPathChanges(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	home := t.TempDir()
+	realDirectory := filepath.Join(home, "real")
+	shimDirectory := filepath.Join(home, "relay shims")
+	for _, directory := range []string{realDirectory, shimDirectory} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, directory := range []string{realDirectory, shimDirectory} {
+		if err := os.WriteFile(filepath.Join(directory, "codex"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(home, ".bashrc"), []byte("export PATH='"+realDirectory+":'$PATH\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rcPath, err := writeBashIntegration(home, shimDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(bash, "--rcfile", rcPath, "-i", "-c", "command -v codex")
+	command.Env = append(os.Environ(), "HOME="+home, "PATH="+realDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bash integration failed: %v: %s", err, output)
+	}
+	if !strings.Contains(string(output), filepath.Join(shimDirectory, "codex")) {
+		t.Fatalf("Relay shim did not win command lookup: %s", output)
 	}
 }
 

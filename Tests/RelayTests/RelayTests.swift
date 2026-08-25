@@ -256,4 +256,28 @@ func structuredSubagentLifecycle() {
     pane.receivedAgentEvent(Data(#"{"agent":"claude","event":{"hook_event_name":"SubagentStop","agent_id":"research-1"}}"#.utf8))
     #expect(pane.activeSubagents == 0)
     #expect(pane.subagents.isEmpty)
+
+}
+
+@MainActor
+@Test("Ending an agent restores the shell and clears its sidebar thread")
+func structuredAgentSessionEnd() {
+    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"PreToolUse","tool_name":"exec_command"}}"#.utf8))
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SubagentStart","agent_id":"worker-1","agent_type":"Explore"}}"#.utf8))
+
+    #expect(pane.kind == .codex)
+    #expect(!pane.agentActivities.isEmpty)
+    #expect(pane.activeSubagents == 1)
+
+    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SessionEnd","source":"process-tree"}}"#.utf8))
+
+    #expect(pane.kind == .shell)
+    #expect(pane.phase == .quiet)
+    #expect(pane.agentActivities.isEmpty)
+    #expect(pane.activeSubagents == 0)
+    #expect(pane.subagents.isEmpty)
+
+    pane.received("historical replay from OpenAI Codex CLI")
+    #expect(pane.kind == .shell)
 }

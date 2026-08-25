@@ -387,15 +387,17 @@ struct AgentSignalDetector: Sendable {
     private(set) var excerpt = "Opening session…"
     private var buffer = ""
 
-    mutating func ingest(_ text: String) {
+    mutating func ingest(_ text: String, detectAgentKind: Bool = true) {
         let scanBoundary = String(buffer.suffix(512))
         buffer = String((buffer + text).suffix(12_000))
         let lower = (scanBoundary + text).lowercased()
 
-        if lower.contains("claude code") || lower.contains("claude.ai/code") || lower.contains("anthropic") {
-            kind = .claude
-        } else if lower.contains("openai codex") || lower.contains("codex cli") || lower.contains("codex>") {
-            kind = .codex
+        if detectAgentKind {
+            if lower.contains("claude code") || lower.contains("claude.ai/code") || lower.contains("anthropic") {
+                kind = .claude
+            } else if lower.contains("openai codex") || lower.contains("codex cli") || lower.contains("codex>") {
+                kind = .codex
+            }
         }
 
         let attentionSignals = [
@@ -421,6 +423,13 @@ struct AgentSignalDetector: Sendable {
     mutating func markExited() {
         phase = .exited
         excerpt = "Session ended"
+    }
+
+    mutating func resetToShell() {
+        kind = .shell
+        phase = .quiet
+        excerpt = "Shell"
+        buffer = ""
     }
 
     mutating func acknowledgeInput() {
@@ -465,6 +474,8 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var artifacts: [PaneArtifact] = []
     @Published var artifactError: String?
     @Published var editorRequest: EditorOpenRequest?
+    @Published var isRestoringTerminal = false
+    private var structuredAgentRunning: Bool?
     let remoteParentSessionID: String?
     private var quietTask: Task<Void, Never>?
     lazy var runtime = TerminalRuntime(pane: self)
@@ -530,7 +541,7 @@ final class PaneModel: ObservableObject, Identifiable {
         if connectionState != .connected { connectionState = .connected }
         let previousKind = detector.kind
         let previousPhase = detector.phase
-        detector.ingest(text)
+        detector.ingest(text, detectAgentKind: structuredAgentRunning != false)
         lastActivity = Date()
         if previousKind != detector.kind || previousPhase != detector.phase {
             objectWillChange.send()
@@ -564,6 +575,15 @@ final class PaneModel: ObservableObject, Identifiable {
     func connected() {
         remoteExitCode = nil
         connectionState = .connected
+    }
+
+    func beginTerminalRestore() {
+        guard contentKind == .terminal else { return }
+        isRestoringTerminal = true
+    }
+
+    func finishTerminalRestore() {
+        isRestoringTerminal = false
     }
 
     func reconnecting() {
@@ -614,6 +634,12 @@ final class PaneModel: ObservableObject, Identifiable {
             ?? (event["thread_id"] as? String)
         let notificationType = event["notification_type"] as? String
 
+        if eventName == "SessionEnd" {
+            structuredAgentRunning = false
+        } else {
+            structuredAgentRunning = true
+        }
+
         switch eventName {
         case "PermissionRequest":
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Approval: \(tool ?? "permission requested")")
@@ -654,9 +680,14 @@ final class PaneModel: ObservableObject, Identifiable {
         case "UserPromptSubmit", "turn/started":
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Thinking")
             recordActivity("Thinking", phase: .active)
-        case "Stop", "SessionEnd", "turn/completed":
+        case "Stop", "turn/completed":
             detector.applyStructuredEvent(kind: kind, phase: .quiet, excerpt: "Ready")
             recordActivity("Ready", phase: .quiet)
+        case "SessionEnd":
+            detector.resetToShell()
+            subagents.removeAll()
+            activeSubagents = 0
+            agentActivities.removeAll()
         case "SessionStart":
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Started")
             recordActivity("Started", phase: .active)

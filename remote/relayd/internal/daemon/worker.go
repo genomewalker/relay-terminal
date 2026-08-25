@@ -180,6 +180,10 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 			return
 		}
 	}
+	caughtUp, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "caught_up"})
+	if err := writer.Write(caughtUp); err != nil {
+		return
+	}
 	stopWriter := make(chan struct{})
 	defer close(stopWriter)
 	writerDone := make(chan struct{})

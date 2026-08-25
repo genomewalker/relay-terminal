@@ -49,21 +49,22 @@ type Session struct {
 }
 
 func startSession(id, command, workingDirectory string, cols, rows uint16) (*Session, error) {
-	var child *exec.Cmd
-	if command == "" {
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
-		child = exec.Command(shell, "-l")
-	} else {
-		child = exec.Command("/bin/sh", "-lc", command)
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	shimPath := filepath.Join(home, ".local", "share", "relay", "shims")
+	child, err := sessionCommand(shell, command, home, shimPath)
+	if err != nil {
+		return nil, err
 	}
 	if workingDirectory != "" {
 		child.Dir = workingDirectory
 	}
-	home, _ := os.UserHomeDir()
-	shimPath := filepath.Join(home, ".local", "share", "relay", "shims")
 	child.Env = environmentWithOverrides(os.Environ(), map[string]string{
 		"TERM":          "xterm-256color",
 		"COLORTERM":     "truecolor",
@@ -88,6 +89,70 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	go session.wait()
 	go session.monitorAgentProcesses()
 	return session, nil
+}
+
+func sessionCommand(shell, command, home, shimPath string) (*exec.Cmd, error) {
+	if command != "" {
+		wrapped := "export PATH=" + shellQuote(shimPath) + ":$PATH; hash -r 2>/dev/null || true; " + command
+		return exec.Command(shell, "-lc", wrapped), nil
+	}
+
+	switch filepath.Base(shell) {
+	case "bash":
+		rcPath, err := writeBashIntegration(home, shimPath)
+		if err != nil {
+			return nil, err
+		}
+		launch := "exec " + shellQuote(shell) + " --rcfile " + shellQuote(rcPath) + " -i"
+		return exec.Command(shell, "-l", "-c", launch), nil
+	case "zsh":
+		zdotDirectory, err := writeZshIntegration(home, shimPath)
+		if err != nil {
+			return nil, err
+		}
+		launch := "export RELAY_ORIGINAL_ZDOTDIR=\"${ZDOTDIR:-$HOME}\"; export ZDOTDIR=" +
+			shellQuote(zdotDirectory) + "; exec " + shellQuote(shell) + " -i"
+		return exec.Command(shell, "-l", "-c", launch), nil
+	case "fish":
+		return exec.Command(shell, "-l", "-C", "set -gx PATH "+shellQuote(shimPath)+" $PATH"), nil
+	default:
+		return exec.Command(shell, "-l"), nil
+	}
+}
+
+func writeZshIntegration(home, shimPath string) (string, error) {
+	directory := filepath.Join(home, ".local", "share", "relay", "shell", "zsh")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", err
+	}
+	contents := "# Managed by Relay Terminal.\n" +
+		"if [ -r \"${RELAY_ORIGINAL_ZDOTDIR:-$HOME}/.zshrc\" ]; then source \"${RELAY_ORIGINAL_ZDOTDIR:-$HOME}/.zshrc\"; fi\n" +
+		"export PATH=" + shellQuote(shimPath) + ":$PATH\n" +
+		"rehash 2>/dev/null || true\n"
+	if err := os.WriteFile(filepath.Join(directory, ".zshrc"), []byte(contents), 0o600); err != nil {
+		return "", err
+	}
+	return directory, nil
+}
+
+func writeBashIntegration(home, shimPath string) (string, error) {
+	directory := filepath.Join(home, ".local", "share", "relay", "shell")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(directory, "bashrc")
+	contents := "# Managed by Relay Terminal.\n" +
+		"if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n" +
+		"export PATH=" + shellQuote(shimPath) + ":$PATH\n" +
+		"hash -r 2>/dev/null || true\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func environmentWithOverrides(environment []string, overrides map[string]string) []string {

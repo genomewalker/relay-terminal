@@ -52,12 +52,19 @@ func TestFindRealAgentExecutableSkipsRelayShim(t *testing.T) {
 }
 
 func TestCodexHookProfile(t *testing.T) {
+	profile := codexHookProfile("/home/test/.codex/relay-terminal.config.toml")
 	for _, event := range []string{"SessionStart", "PermissionRequest", "SubagentStart", "SubagentStop", "SessionEnd"} {
-		if !strings.Contains(codexHookProfile, "[[hooks."+event+"]]") {
+		if !strings.Contains(profile, "[[hooks."+event+"]]") {
 			t.Fatalf("Codex hook profile is missing %s", event)
 		}
 	}
-	if !strings.Contains(codexHookProfile, "--agent codex") {
+	if !strings.Contains(profile, "--agent codex") {
 		t.Fatal("Codex hook profile does not forward events to Relay")
+	}
+	if !strings.Contains(profile, `[hooks.state."/home/test/.codex/relay-terminal.config.toml:session_start:0:0"]`) {
+		t.Fatal("Codex hook trust is not scoped to its generated SessionStart hook")
+	}
+	if got := codexHookHash("session_start", &codexWildcardMatcher); got != "sha256:0947938d6af2c56fe7cdf8b745e79997e0caaee90cd6d607a8a193f9eae6b30e" {
+		t.Fatalf("Codex hook trust hash changed: %s", got)
 	}
 }
