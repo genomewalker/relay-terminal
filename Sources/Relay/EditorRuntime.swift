@@ -71,6 +71,24 @@ private enum RemoteFileError: LocalizedError {
     }
 }
 
+struct EditorTypography: Equatable, Sendable {
+    let fontFamily: String
+    let fontSize: Double
+
+    init(fontFamily: String, fontSize: Double) {
+        let family = fontFamily.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.fontFamily = family.isEmpty ? "Menlo" : family
+        self.fontSize = min(max(fontSize, 9), 32)
+    }
+
+    var javascriptArgument: String? {
+        let payload: [String: Any] = ["fontFamily": fontFamily, "fontSize": fontSize]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
 @MainActor
 final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
     @Published private(set) var workspacePath = ""
@@ -92,6 +110,7 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
     private var savedContent = ""
     private var diffOriginalContent: String?
     private var diffOriginalLabel: String?
+    private var appliedTypography: EditorTypography?
     private var workTask: Task<Void, Never>?
     private lazy var scriptHandler = WeakEditorScriptHandler(owner: self)
     private(set) lazy var webView = makeWebView()
@@ -282,6 +301,21 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         webView.evaluateJavaScript("window.relayToggleLocalDiff && window.relayToggleLocalDiff()")
     }
 
+    func applyTypography(_ typography: EditorTypography, force: Bool = false) {
+        guard webReady, force || typography != appliedTypography,
+              let json = typography.javascriptArgument else { return }
+        appliedTypography = typography
+        webView.evaluateJavaScript("window.relaySetTypography && window.relaySetTypography(\(json))")
+    }
+
+    private func applyCurrentTypography(force: Bool = false) {
+        let preferences = RelayPreferences.shared
+        applyTypography(
+            EditorTypography(fontFamily: preferences.fontFamily, fontSize: preferences.fontSize),
+            force: force
+        )
+    }
+
     private func save(content: String) {
         guard let pane, let path = currentPath else { return }
         let profile = pane.profile
@@ -387,6 +421,8 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         switch type {
         case "ready":
             webReady = true
+            appliedTypography = nil
+            applyCurrentTypography(force: true)
             deliverCurrentDocument()
         case "dirty":
             let dirty = body["dirty"] as? Bool ?? true
@@ -498,12 +534,14 @@ final class RelayEditorWebView: WKWebView {
 
 struct MonacoEditorSurface: NSViewRepresentable {
     @ObservedObject var runtime: RemoteEditorRuntime
+    let typography: EditorTypography
 
     func makeNSView(context: Context) -> RelayEditorWebView {
         let view = runtime.webView
         Task { @MainActor in
             await Task.yield()
             runtime.startIfNeeded()
+            runtime.applyTypography(typography)
         }
         return view
     }
@@ -512,6 +550,7 @@ struct MonacoEditorSurface: NSViewRepresentable {
         Task { @MainActor in
             await Task.yield()
             runtime.startIfNeeded()
+            runtime.applyTypography(typography)
         }
     }
 }

@@ -110,6 +110,17 @@ func remoteEditorPane() {
     workspace.shutdown()
 }
 
+@Test("Quick editor typography follows terminal settings safely")
+func editorTypography() {
+    let configured = EditorTypography(fontFamily: "  Berkeley Mono  ", fontSize: 18.5)
+    #expect(configured.fontFamily == "Berkeley Mono")
+    #expect(configured.fontSize == 18.5)
+    #expect(configured.javascriptArgument?.contains("Berkeley Mono") == true)
+
+    #expect(EditorTypography(fontFamily: "  ", fontSize: 4).fontFamily == "Menlo")
+    #expect(EditorTypography(fontFamily: "Menlo", fontSize: 40).fontSize == 32)
+}
+
 @MainActor
 @Test("A session owns multiple tabs with separate pane workers")
 func multipleTabsPerSession() {

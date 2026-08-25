@@ -40,8 +40,8 @@
       bridge('ready');
     });
     const options = {
-      theme: 'relay-dark', automaticLayout: true, fontFamily: 'SFMono-Regular, Menlo, monospace',
-      fontSize: 13, lineHeight: 21, fontLigatures: true, minimap: { enabled: true, maxColumn: 90 },
+      theme: 'relay-dark', automaticLayout: true, fontFamily: 'Menlo',
+      fontSize: 13, lineHeight: 20, fontLigatures: true, minimap: { enabled: true, maxColumn: 90 },
       stickyScroll: { enabled: true }, smoothScrolling: false, cursorSmoothCaretAnimation: 'off',
       bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true },
       padding: { top: 10, bottom: 10 }, renderWhitespace: 'selection', roundedSelection: false,
@@ -91,6 +91,19 @@
       if (target) savedText = target.getValue();
       lastDirty = false;
       bridge('dirty', { dirty: false });
+    };
+    window.relaySetTypography = function (payload) {
+      if (!payload) return;
+      const fontFamily = String(payload.fontFamily || 'Menlo');
+      const fontSize = Math.min(32, Math.max(9, Number(payload.fontSize) || 13));
+      const update = { fontFamily, fontSize, lineHeight: Math.round(fontSize * 1.55) };
+      Object.assign(options, update);
+      if (editor) editor.updateOptions(update);
+      if (diffEditor) {
+        diffEditor.updateOptions(update);
+        diffEditor.getOriginalEditor().updateOptions(update);
+        diffEditor.getModifiedEditor().updateOptions(update);
+      }
     };
     window.relayToggleLocalDiff = function () {
       if (!documentPayload) return;

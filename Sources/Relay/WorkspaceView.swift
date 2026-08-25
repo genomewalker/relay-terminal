@@ -1793,6 +1793,7 @@ private struct QuickEditorPane: View {
 
 private struct QuickEditorContent: View {
     @ObservedObject var runtime: RemoteEditorRuntime
+    @ObservedObject private var preferences = RelayPreferences.shared
 
     var body: some View {
         HStack(spacing: 0) {
@@ -1804,7 +1805,13 @@ private struct QuickEditorContent: View {
             VStack(spacing: 0) {
                 editorToolbar
                 Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
-                MonacoEditorSurface(runtime: runtime)
+                MonacoEditorSurface(
+                    runtime: runtime,
+                    typography: EditorTypography(
+                        fontFamily: preferences.fontFamily,
+                        fontSize: preferences.fontSize
+                    )
+                )
                 editorStatus
             }
         }
