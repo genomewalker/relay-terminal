@@ -14,12 +14,24 @@ RELAY_VERSION="$version" \
     "$project_root/scripts/build-app.sh" release
 
 archive="$output_directory/Relay-$version-macOS.zip"
+/bin/rm -f "$archive"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$stage_root/Relay.app" "$archive"
 
 if [[ -n "${RELAY_NOTARY_PROFILE:-}" ]]; then
     /usr/bin/xcrun notarytool submit "$archive" --keychain-profile "$RELAY_NOTARY_PROFILE" --wait
     /usr/bin/xcrun stapler staple "$stage_root/Relay.app"
+    /bin/rm -f "$archive"
     /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$stage_root/Relay.app" "$archive"
+fi
+
+dmg="$output_directory/Relay-$version-macOS.dmg"
+RELAY_DMG_SIGNING_IDENTITY="${RELAY_CODESIGN_IDENTITY:-}" \
+    "$project_root/scripts/create-dmg.sh" "$stage_root/Relay.app" "$dmg"
+
+if [[ -n "${RELAY_NOTARY_PROFILE:-}" ]]; then
+    /usr/bin/xcrun notarytool submit "$dmg" --keychain-profile "$RELAY_NOTARY_PROFILE" --wait
+    /usr/bin/xcrun stapler staple "$dmg"
+    /usr/bin/xcrun stapler validate "$dmg"
 fi
 
 for architecture in amd64 arm64; do
@@ -35,6 +47,7 @@ done
 (
     cd "$output_directory"
     /usr/bin/shasum -a 256 \
+        "Relay-$version-macOS.dmg" \
         "Relay-$version-macOS.zip" \
         "relayd-$version-linux-amd64" \
         "relayd-$version-linux-arm64" \

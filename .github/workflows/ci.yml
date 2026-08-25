@@ -19,6 +19,15 @@ jobs:
           RELAY_APP_OUTPUT: ${{ runner.temp }}/Relay.app
           RELAY_SKIP_WORKSPACE_LINK: "1"
         run: ./scripts/build-app.sh release
+      - name: Build and inspect installer image
+        run: |
+          ./scripts/create-dmg.sh "${{ runner.temp }}/Relay.app" "${{ runner.temp }}/Relay.dmg"
+          mount_point="$(mktemp -d "${RUNNER_TEMP}/relay-mount.XXXXXX")"
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true; rmdir "$mount_point" >/dev/null 2>&1 || true' EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "${{ runner.temp }}/Relay.dmg" >/dev/null
+          test -x "$mount_point/Relay.app/Contents/MacOS/Relay"
+          test -L "$mount_point/Applications"
+          /usr/bin/codesign --verify --deep --strict "$mount_point/Relay.app"
 
   relayd:
     runs-on: ubuntu-latest

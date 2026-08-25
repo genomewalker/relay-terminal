@@ -88,7 +88,9 @@ RELAY_NOTARY_PROFILE=relay-notary \
 ./scripts/package-release.sh
 ```
 
-The package script emits a notarized macOS archive when a notary profile is supplied, static Linux `relayd` binaries for amd64 and arm64, and SHA-256 checksums. GitHub Actions runs the Swift and Go suites on every push; tagged releases use the signing and Apple notarization secrets documented in the release workflow.
+The package script emits a drag-to-Applications DMG, a ZIP for automated deployment, static Linux `relayd` binaries for amd64 and arm64, and SHA-256 checksums. When a notary profile is supplied, it notarizes and staples both the app and its DMG. GitHub Actions mounts every generated DMG and verifies the app executable, Applications shortcut, and code signature; tagged releases use the signing and Apple notarization secrets documented in the release workflow.
+
+Install a release by opening `Relay-<version>-macOS.dmg` and dragging Relay to Applications. macOS updates replace only the local application; remote workers and workspace state remain on their nodes and reattach on launch.
 
 ## Keyboard
 
