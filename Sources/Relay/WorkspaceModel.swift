@@ -297,8 +297,7 @@ final class WorkspaceModel: ObservableObject {
         )
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         storePane(pane)
-        tab.layout = tab.layout.splitting(active.id, axis: .horizontal, with: pane.id)
-        tab.balanceSplits()
+        tab.floatingPanes.append(.initial(paneID: pane.id, index: tab.floatingPanes.count))
         activePaneID = pane.id
         persistWorkspace()
     }
@@ -316,7 +315,7 @@ final class WorkspaceModel: ObservableObject {
             persistWorkspace()
             return
         }
-        guard let activePaneID else { return }
+        guard activePaneID != nil else { return }
         let pane = PaneModel(
             profile: open.profile,
             contentKind: .editor,
@@ -325,8 +324,7 @@ final class WorkspaceModel: ObservableObject {
         )
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         storePane(pane)
-        tab.layout = tab.layout.splitting(activePaneID, axis: .horizontal, with: pane.id)
-        tab.balanceSplits()
+        tab.floatingPanes.append(.initial(paneID: pane.id, index: tab.floatingPanes.count))
         self.activePaneID = pane.id
         persistWorkspace()
     }

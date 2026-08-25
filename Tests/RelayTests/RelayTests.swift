@@ -94,7 +94,7 @@ func tabIncludesFloatingPanes() {
 }
 
 @MainActor
-@Test("Remote editors join the active tab and inherit its pane session")
+@Test("Remote editors open floating and inherit the active pane session")
 func remoteEditorPane() {
     let workspace = WorkspaceModel(restoreSavedWorkspace: false)
     let profile = ConnectionProfile.sshConfigHost("editor-test-host")
@@ -106,7 +106,29 @@ func remoteEditorPane() {
     let editor = workspace.activePane
     #expect(editor?.contentKind == .editor)
     #expect(editor?.remoteParentSessionID == terminalID?.uuidString.lowercased())
-    #expect(workspace.selectedTab?.layout.paneIDs.count == 2)
+    #expect(workspace.selectedTab?.layout.paneIDs == [terminalID].compactMap { $0 })
+    #expect(workspace.selectedTab?.floatingPanes.map(\.paneID) == [editor?.id].compactMap { $0 })
+    workspace.shutdown()
+}
+
+@MainActor
+@Test("rcode file requests create a floating editor")
+func remoteFileRequestOpensFloatingEditor() {
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    let profile = ConnectionProfile.sshConfigHost("rcode-test-host")
+    workspace.newTab(profile: profile)
+    let terminalID = workspace.activePaneID!
+
+    workspace.openRemoteFile(RemoteFileOpenRequest(
+        profile: profile,
+        parentSessionID: terminalID.uuidString.lowercased(),
+        request: EditorOpenRequest(paths: ["/work/example.swift"], diff: false)
+    ))
+
+    #expect(workspace.selectedTab?.layout.paneIDs == [terminalID])
+    #expect(workspace.selectedTab?.floatingPanes.count == 1)
+    #expect(workspace.activePane?.contentKind == .editor)
+    #expect(workspace.activePane?.editorRequest?.paths == ["/work/example.swift"])
     workspace.shutdown()
 }
 
