@@ -75,7 +75,7 @@ The quick editor deliberately does not reproduce the VS Code workbench, extensio
 
 ## Agent activity
 
-Relay worker shells prepend a private shim directory to `PATH`. Invoking `claude` or `codex` in those shells runs the real binary with Relay hook configuration; shells opened outside Relay are unchanged. Hook payloads travel in `AgentEvent` frames beside terminal output and drive the pane's working/ready/approval state, recent activity tree, and nested subagent rows. A Linux process-tree monitor and throttled output heuristics cover agents launched outside the shim path.
+Relay worker shells prepend a private shim directory to `PATH`. Invoking `claude` or `codex` in those shells runs the real binary with Relay hook configuration; shells opened outside Relay are unchanged. Hook payloads travel in `AgentEvent` frames beside terminal output and drive the pane's working/ready/approval state, recent activity tree, and nested subagent rows. Raw terminal text is never presented as an activity-tree item. A Linux process-tree monitor and throttled output heuristics identify agents launched outside the shim path, but show only stable lifecycle state until structured events are available. Selecting an agent, activity, or subagent in the session rail selects its tab and raises its tiled or floating terminal pane.
 
 ## Attach flow
 

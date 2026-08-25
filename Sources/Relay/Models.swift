@@ -467,7 +467,6 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var editorRequest: EditorOpenRequest?
     let remoteParentSessionID: String?
     private var quietTask: Task<Void, Never>?
-    private var lastActivityPublish = Date.distantPast
     lazy var runtime = TerminalRuntime(pane: self)
     lazy var editorRuntime = RemoteEditorRuntime(pane: self)
 
@@ -495,7 +494,16 @@ final class PaneModel: ObservableObject, Identifiable {
     var kind: AgentKind { detector.kind }
     var phase: AgentPhase { detector.phase }
     var displayName: String { customName ?? title }
-    var activitySummary: String { detector.excerpt }
+    var activitySummary: String {
+        if let activity = agentActivities.last { return activity.label }
+        return switch phase {
+        case .connecting: "Starting"
+        case .active: "Working"
+        case .quiet: "Ready"
+        case .needsInput: "Needs input"
+        case .exited: "Exited"
+        }
+    }
 
     func focus() {
         switch contentKind {
@@ -522,13 +530,9 @@ final class PaneModel: ObservableObject, Identifiable {
         if connectionState != .connected { connectionState = .connected }
         let previousKind = detector.kind
         let previousPhase = detector.phase
-        let previousExcerpt = detector.excerpt
         detector.ingest(text)
-        let now = Date()
-        lastActivity = now
-        if previousKind != detector.kind || previousPhase != detector.phase ||
-            previousExcerpt != detector.excerpt && now.timeIntervalSince(lastActivityPublish) >= 0.25 {
-            lastActivityPublish = now
+        lastActivity = Date()
+        if previousKind != detector.kind || previousPhase != detector.phase {
             objectWillChange.send()
         }
         quietTask?.cancel()

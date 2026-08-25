@@ -406,10 +406,6 @@ private struct AttachedSessionRow: View {
         session.tabs.flatMap(\.allPaneIDs).compactMap { workspace.panes[$0] }
     }
     private var activeAgents: Int { panes.filter { $0.contentKind == .terminal && $0.kind != .shell }.count }
-    private var selectedTab: TabModel? {
-        session.tabs.first { $0.id == workspace.selectedTabID }
-    }
-
     var body: some View {
         VStack(spacing: 1) {
             HStack(spacing: 3) {
@@ -456,12 +452,21 @@ private struct AttachedSessionRow: View {
             }
 
             if selected {
-                ForEach(selectedTab?.allPaneIDs.compactMap { workspace.panes[$0] } ?? []) { pane in
-                    SessionPaneRow(
-                        pane: pane,
-                        workspace: workspace,
-                        active: pane.id == workspace.activePaneID
-                    )
+                ForEach(session.tabs) { tab in
+                    let tabPanes = tab.allPaneIDs.compactMap { workspace.panes[$0] }
+                    let visiblePanes = tab.id == workspace.selectedTabID
+                        ? tabPanes
+                        : tabPanes.filter { $0.contentKind == .terminal && $0.kind != .shell }
+                    let tabIndex = session.tabs.firstIndex(where: { $0.id == tab.id }) ?? 0
+                    ForEach(visiblePanes) { pane in
+                        SessionPaneRow(
+                            pane: pane,
+                            tabID: tab.id,
+                            tabLabel: tabIndex == 0 ? "Main" : "Tab \(tabIndex + 1)",
+                            workspace: workspace,
+                            active: pane.id == workspace.activePaneID && tab.id == workspace.selectedTabID
+                        )
+                    }
                 }
             }
         }
@@ -483,16 +488,24 @@ private struct PanePresence: View {
 
 private struct SessionPaneRow: View {
     @ObservedObject var pane: PaneModel
+    let tabID: UUID
+    let tabLabel: String
     @ObservedObject var workspace: WorkspaceModel
     let active: Bool
     @State private var hovering = false
 
+    private var tab: TabModel? { workspace.tabs.first { $0.id == tabID } }
+    private var isFloating: Bool { tab?.floatingPanes.contains(where: { $0.paneID == pane.id }) == true }
+
+    private func revealPane() {
+        if workspace.selectedTabID != tabID { workspace.selectTab(tabID) }
+        workspace.selectPane(pane.id)
+        pane.focus()
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            Button {
-                workspace.selectPane(pane.id)
-                pane.focus()
-            } label: {
+            Button(action: revealPane) {
                 HStack(spacing: 7) {
                 Capsule()
                     .fill(active ? RelayTheme.accent : Color.clear)
@@ -518,6 +531,16 @@ private struct SessionPaneRow: View {
                     Text("\(pane.activeSubagents)")
                         .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                         .foregroundStyle(RelayTheme.mint)
+                }
+                if isFloating {
+                    Image(systemName: "macwindow.on.rectangle")
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .help("Floating pane")
+                } else if workspace.selectedTabID != tabID {
+                    Text(tabLabel)
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(RelayTheme.textFaint)
                 }
                 Circle().fill(pane.connectionState.color).frame(width: 5, height: 5)
                 }
@@ -545,28 +568,32 @@ private struct SessionPaneRow: View {
                 }
                 Divider()
                 Button("Split right") {
-                    workspace.selectPane(pane.id)
+                    revealPane()
                     workspace.splitActive(axis: .horizontal)
                 }
                 Button("Split down") {
-                    workspace.selectPane(pane.id)
+                    revealPane()
                     workspace.splitActive(axis: .vertical)
                 }
-                Button("Zoom pane") { workspace.togglePaneZoom(pane.id) }
-                Button(workspace.selectedTab?.floatingPanes.contains(where: { $0.paneID == pane.id }) == true ? "Dock pane" : "Float pane") {
-                    workspace.selectPane(pane.id)
+                Button("Show pane") { revealPane() }
+                Button("Zoom pane") {
+                    revealPane()
+                    workspace.togglePaneZoom(pane.id)
+                }
+                Button(isFloating ? "Dock pane" : "Float pane") {
+                    revealPane()
                     workspace.toggleActivePaneFloating()
                 }
                 Divider()
                 Button(pane.profile.kind == .ssh ? "Detach pane" : "Close pane") {
-                    workspace.selectPane(pane.id)
+                    revealPane()
                     workspace.closeActivePane()
                 }
             }
 
             if pane.contentKind == .terminal && pane.kind != .shell {
                 ForEach(Array(pane.agentActivities.suffix(4))) { activity in
-                    AgentActivityTreeRow(activity: activity)
+                    AgentActivityTreeRow(activity: activity, action: revealPane)
                 }
                 if pane.agentActivities.isEmpty {
                     AgentActivityTreeRow(activity: AgentActivityItem(
@@ -574,28 +601,32 @@ private struct SessionPaneRow: View {
                         label: pane.activitySummary,
                         phase: pane.phase,
                         occurredAt: pane.lastActivity
-                    ))
+                    ), action: revealPane)
                 }
             }
 
             ForEach(pane.subagents.prefix(4)) { subagent in
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.turn.down.right")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(RelayTheme.textFaint)
-                    Circle().fill(RelayTheme.mint).frame(width: 5, height: 5)
-                    Text(subagent.label)
-                        .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(RelayTheme.textMuted)
-                        .lineLimit(1)
-                    Spacer()
-                    Text("working")
-                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(RelayTheme.mint)
+                Button(action: revealPane) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.turn.down.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(RelayTheme.textFaint)
+                        Circle().fill(RelayTheme.mint).frame(width: 5, height: 5)
+                        Text(subagent.label)
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(RelayTheme.textMuted)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("working")
+                            .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(RelayTheme.mint)
+                    }
+                    .padding(.leading, 43)
+                    .padding(.trailing, 9)
+                    .frame(height: 23)
+                    .contentShape(Rectangle())
                 }
-                .padding(.leading, 43)
-                .padding(.trailing, 9)
-                .frame(height: 23)
+                .buttonStyle(.plain)
             }
         }
     }
@@ -603,27 +634,36 @@ private struct SessionPaneRow: View {
 
 private struct AgentActivityTreeRow: View {
     let activity: AgentActivityItem
+    let action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "arrow.turn.down.right")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundStyle(RelayTheme.textFaint)
-            Circle()
-                .fill(activity.phase.color)
-                .frame(width: 5, height: 5)
-            Text(activity.label)
-                .font(.system(size: 9.5, weight: .medium))
-                .foregroundStyle(activity.phase == .quiet ? RelayTheme.textFaint : RelayTheme.textMuted)
-                .lineLimit(1)
-            Spacer(minLength: 2)
-            Text(activity.phase.label)
-                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                .foregroundStyle(activity.phase.color)
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.turn.down.right")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(RelayTheme.textFaint)
+                Circle()
+                    .fill(activity.phase.color)
+                    .frame(width: 5, height: 5)
+                Text(activity.label)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(activity.phase == .quiet ? RelayTheme.textFaint : RelayTheme.textMuted)
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                Text(activity.phase.label)
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(activity.phase.color)
+            }
+            .padding(.leading, 43)
+            .padding(.trailing, 9)
+            .frame(height: 23)
+            .background(hovering ? RelayTheme.surface.opacity(0.55) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .contentShape(Rectangle())
         }
-        .padding(.leading, 43)
-        .padding(.trailing, 9)
-        .frame(height: 23)
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
 

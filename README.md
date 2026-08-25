@@ -38,7 +38,7 @@ A local pane maps one-to-one to a durable remote `relayd` session UUID. Splittin
 - Saved manual host profiles and direct SSH fallback
 - Structured Claude and Codex hook events for normal agent launches inside Relay, with process-tree and output fallback detection
 - Native session-rail states for working, ready, needs input, exited, and active Claude subagents
-- A recent activity tree and identity-aware subagent rows nested beneath each Claude/Codex pane
+- A clickable agent-thread tree with structured tool events and identity-aware subagents; raw terminal lines never enter the sidebar
 - Sequence-based reconnect with bounded input buffering and retained terminal surfaces
 - Inline Kitty-graphics rendering or dismissible native previews for PNG/JPEG/GIF/WebP files referenced by remote Codex or Claude output
 - Live macOS Settings (`⌘,`) for font, size, terminal padding, palette, interface density, full-screen chrome, and artifact previews

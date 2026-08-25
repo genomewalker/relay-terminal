@@ -228,6 +228,20 @@ func structuredCodexEvent() {
     pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"PreToolUse","tool_name":"exec_command"}}"#.utf8))
     #expect(pane.activitySummary == "Using exec_command")
     #expect(pane.agentActivities.last?.label == "Using exec_command")
+
+    pane.received("random full-screen cursor text that belongs only in the terminal")
+    #expect(pane.activitySummary == "Using exec_command")
+}
+
+@MainActor
+@Test("Raw agent terminal output never becomes sidebar activity text")
+func rawOutputIsNotSidebarActivity() {
+    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
+    pane.received("OpenAI Codex CLI\nrandom status line from the alternate screen")
+
+    #expect(pane.kind == .codex)
+    #expect(pane.activitySummary == "Working")
+    #expect(pane.agentActivities.isEmpty)
 }
 
 @MainActor
