@@ -14,8 +14,16 @@ struct ImagePathDetector {
     private var boundaryTail = ""
     private var seen = Set<String>()
     private static let regex = try! NSRegularExpression(
-        pattern: #"(?:file://)?(/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
+        pattern: #"(?:^|[^A-Za-z0-9_.-])(?:file://)?(/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
         options: [.caseInsensitive]
+    )
+    private static let claudeScratchRegex = try! NSRegularExpression(
+        pattern: #"(/tmp/claude-[0-9]+/[A-Za-z0-9_~.%+@:/-]+)(?:[\s)\]])"#,
+        options: []
+    )
+    private static let relativeCodexRegex = try! NSRegularExpression(
+        pattern: #"(?:^|[\s└])((?:\./)?\.codex/generated_images/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
+        options: [.caseInsensitive, .anchorsMatchLines]
     )
 
     mutating func ingest(_ text: String) -> [String] {
@@ -28,7 +36,10 @@ struct ImagePathDetector {
         )
         let range = NSRange(stripped.startIndex..., in: stripped)
         var discovered: [String] = []
-        for match in Self.regex.matches(in: stripped, range: range) {
+        let matches = Self.regex.matches(in: stripped, range: range)
+            + Self.claudeScratchRegex.matches(in: stripped, range: range)
+            + Self.relativeCodexRegex.matches(in: stripped, range: range)
+        for match in matches {
             guard let matchRange = Range(match.range(at: 1), in: stripped) else { continue }
             let encoded = String(stripped[matchRange])
             let path = encoded.removingPercentEncoding ?? encoded
@@ -37,6 +48,57 @@ struct ImagePathDetector {
             discovered.append(path)
         }
         return discovered
+    }
+}
+
+/// Merges structured artifact frames with a text-path compatibility fallback.
+/// A current relay worker normally sends the image bytes immediately after the
+/// output that names them. Older workers only send terminal output, so Relay
+/// fetches that path after a short grace period. A structured frame always wins
+/// if both paths discover the same image.
+final class TerminalArtifactCoordinator: @unchecked Sendable {
+    private enum State {
+        case scheduled
+        case loading
+        case presented
+    }
+
+    private let lock = NSLock()
+    private var detector = ImagePathDetector()
+    private var states: [String: State] = [:]
+
+    func discover(in text: String) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return detector.ingest(text).filter { path in
+            guard states[path] == nil else { return false }
+            states[path] = .scheduled
+            return true
+        }
+    }
+
+    func beginFallback(for path: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard states[path] == .scheduled else { return false }
+        states[path] = .loading
+        return true
+    }
+
+    func acceptFallback(for path: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard states[path] == .loading else { return false }
+        states[path] = .presented
+        return true
+    }
+
+    func acceptStructured(for path: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard states[path] != .presented else { return false }
+        states[path] = .presented
+        return true
     }
 }
 

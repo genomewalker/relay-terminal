@@ -129,8 +129,13 @@ struct SSHConnectionFailure: Equatable, Sendable {
 }
 
 enum RelayPaneAttachPolicy {
-    static let handshakeTimeoutMilliseconds = 4_000
-    static let dedicatedTransportAfterAttempt = 2
+    // The node stream itself has already completed SSH authentication before a
+    // pane hello is sent. At normal HPC latencies this response is measured in
+    // milliseconds, so a 1.5 second silence is a wedged virtual channel rather
+    // than a slow login. Fall back once instead of displaying an empty pane for
+    // two full watchdog cycles.
+    static let handshakeTimeoutMilliseconds = 1_500
+    static let dedicatedTransportAfterAttempt = 1
 
     static func retryDelayMilliseconds(attempt: Int, waitingForInputLease: Bool) -> Int {
         if waitingForInputLease {
@@ -139,7 +144,7 @@ enum RelayPaneAttachPolicy {
             // period, then continue at a quiet bounded cadence.
             return min(15_000, 5_500 + max(0, attempt - 1) * 1_500)
         }
-        return min(10_000, 500 * (1 << min(max(0, attempt - 1), 4)))
+        return min(5_000, 250 * (1 << min(max(0, attempt - 1), 4)))
     }
 
     static func shouldUseDedicatedTransport(attempt: Int) -> Bool {
@@ -160,7 +165,6 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var inputBacklog = Data()
     private var latestResize: (UInt16, UInt16)?
     private let inputClientID = RelayInputClientIdentity.id
-    private var nextInputSequence: UInt64 = 0
     private var pendingInputs: [UInt64: Data] = [:]
     private var pendingInputBytes = 0
     private var inputOverflowed = false
@@ -211,7 +215,6 @@ final class RelayRemoteTransport: @unchecked Sendable {
         lastEventSequence = 0
         reconnectAttempt = 0
         reconnectScheduled = false
-        nextInputSequence = 0
         pendingInputs.removeAll(keepingCapacity: true)
         pendingInputBytes = 0
         inputOverflowed = false
@@ -269,6 +272,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         if context.observeAgentsOnly {
             hello["observe_events"] = true
         } else {
+            hello["terminal_only"] = true
             hello["parent_session_id"] = context.parentSessionID
             hello["workspace_id"] = context.workspaceSessionID
             hello["tab_id"] = context.tabID
@@ -491,6 +495,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 arguments += ["--tab", tabID]
             }
             arguments += ["--pane-title", context.paneTitle, "--content-kind", context.contentKind]
+            arguments += ["--terminal-only"]
+            arguments += ["--client-id", inputClientID.uuidString.lowercased()]
             if !context.profile.command.isEmpty {
                 arguments += ["--command-b64", Data(context.profile.command.utf8).base64EncodedString()]
             }
@@ -645,10 +651,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let writer = self.writer
         var acknowledgedFrames = pendingInputs
         if supportsInputAcknowledgements, !backlog.isEmpty {
-            nextInputSequence += 1
-            pendingInputs[nextInputSequence] = backlog
+            let sequence = RelayInputSequenceAllocator.shared.next()
+            pendingInputs[sequence] = backlog
             pendingInputBytes += backlog.count
-            acknowledgedFrames[nextInputSequence] = backlog
+            acknowledgedFrames[sequence] = backlog
         }
         let acknowledgementsEnabled = supportsInputAcknowledgements
         let overflowed = inputOverflowed
@@ -719,9 +725,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         var inputSequence: UInt64?
         var processToRestart: Process?
         if canSend && acknowledged && pendingInputBytes + data.count <= 64 << 10 {
-            nextInputSequence += 1
-            inputSequence = nextInputSequence
-            pendingInputs[nextInputSequence] = data
+            let sequence = RelayInputSequenceAllocator.shared.next()
+            inputSequence = sequence
+            pendingInputs[sequence] = data
             pendingInputBytes += data.count
         } else if canSend && acknowledged {
             if inputBacklog.count + data.count <= 64 << 10 {

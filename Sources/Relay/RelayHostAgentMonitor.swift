@@ -46,6 +46,7 @@ final class RelayHostAgentMonitor {
     func subscribe(
         profile: ConnectionProfile,
         sessionID: String,
+        lastEventSequence: UInt64,
         onEvent: @escaping (Data) -> Void,
         onAttached: @escaping () -> Void
     ) -> RelayHostAgentMonitorToken {
@@ -56,7 +57,7 @@ final class RelayHostAgentMonitor {
         entry.subscriptions[subscriptionID] = Subscription(
             sessionID: sessionID, onEvent: onEvent, onAttached: onAttached
         )
-        if entry.eventCursors[sessionID] == nil { entry.eventCursors[sessionID] = 0 }
+        entry.eventCursors[sessionID] = max(entry.eventCursors[sessionID] ?? 0, lastEventSequence)
         scheduleRestart(key: key, entry: entry)
         return RelayHostAgentMonitorToken(hostKey: key, subscriptionID: subscriptionID)
     }

@@ -67,6 +67,40 @@ func imagePathDetection() {
     #expect(detector.ingest("not an image: /home/test/notes.txt") == [])
 }
 
+@Test("Codex viewed images are detected from relative paths")
+func relativeCodexImagePathDetection() {
+    var detector = ImagePathDetector()
+    let output = "Viewed Image\r\n  └ .codex/generated_images/demo/image.png\r\n"
+    #expect(detector.ingest(output) == [".codex/generated_images/demo/image.png"])
+}
+
+@Test("Claude extensionless scratch images are detected")
+func claudeScratchImagePathDetection() {
+    var detector = ImagePathDetector()
+    let output = "  /tmp/claude-363159793/project/run/scratchp (3.3KB)\r\n"
+    #expect(detector.ingest(output) == ["/tmp/claude-363159793/project/run/scratchp"])
+}
+
+@Test("Structured images supersede the compatibility fetch")
+func structuredArtifactWins() {
+    let coordinator = TerminalArtifactCoordinator()
+    let path = "/home/test/.codex/generated_images/demo/image.png"
+    #expect(coordinator.discover(in: "Saved to file://\(path)") == [path])
+    #expect(coordinator.acceptStructured(for: path))
+    #expect(!coordinator.beginFallback(for: path))
+    #expect(!coordinator.acceptStructured(for: path))
+}
+
+@Test("Compatibility image fetch can complete without a structured event")
+func compatibilityArtifactFallback() {
+    let coordinator = TerminalArtifactCoordinator()
+    let path = "/tmp/claude-123/project/scratchp"
+    #expect(coordinator.discover(in: "\(path) (3KB)\n") == [path])
+    #expect(coordinator.beginFallback(for: path))
+    #expect(coordinator.acceptFallback(for: path))
+    #expect(!coordinator.acceptStructured(for: path))
+}
+
 @Test("Kitty image transport is chunked and terminated")
 func kittyImagePackets() {
     let image = Data(repeating: 0xAB, count: 5_000)
@@ -415,10 +449,23 @@ func sshFailureDiagnosis() {
     #expect(closedReadyNode.shouldRetry)
 }
 
-@Test("Terminal input identity is separate from durable workspace ownership")
-func terminalInputIdentityIsProcessScoped() {
+@Test("Terminal input identity is durable and separate from workspace ownership")
+func terminalInputIdentityIsDurable() {
     #expect(RelayInputClientIdentity.id == RelayInputClientIdentity.id)
     #expect(RelayInputClientIdentity.id != RelayClientIdentity.id)
+}
+
+@Test("Input sequence reservations never overlap across launches")
+func terminalInputSequenceReservations() {
+    let suite = "relay-input-sequence-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let first = RelayInputSequenceAllocator(defaults: defaults, key: "sequence", blockSize: 4)
+    let firstValue = first.next()
+    let second = RelayInputSequenceAllocator(defaults: defaults, key: "sequence", blockSize: 4)
+    let secondValue = second.next()
+    #expect(firstValue == 1)
+    #expect(secondValue == 5)
 }
 
 @Test("Node heartbeat watchdog distinguishes delayed from stalled replies")
@@ -439,13 +486,12 @@ func nodeHeartbeatWatchdog() {
 
 @Test("A stalled pane handshake retries forever with bounded backoff")
 func paneAttachRetryPolicy() {
-    #expect(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds == 4_000)
-    #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: false) == 500)
-    #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: false) == 8_000)
+    #expect(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds == 1_500)
+    #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: false) == 250)
+    #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: false) == 4_000)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: true) == 5_500)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: true) == 15_000)
-    #expect(!RelayPaneAttachPolicy.shouldUseDedicatedTransport(attempt: 1))
-    #expect(RelayPaneAttachPolicy.shouldUseDedicatedTransport(attempt: 2))
+    #expect(RelayPaneAttachPolicy.shouldUseDedicatedTransport(attempt: 1))
 }
 
 @Test("Default keybindings are unique and close pane owns Command-W")
@@ -663,6 +709,34 @@ func compactTerminalReplay() {
 
     #expect(compacted == Data("\u{001B}c\u{001B}[2J\u{001B}[Hcurrent screen".utf8))
     #expect(TerminalReplayCompactor.compact(Data("plain shell output".utf8)) == Data("plain shell output".utf8))
+}
+
+@Test("Terminal snapshots stay bounded and self-resetting")
+func terminalSnapshotBound() {
+    var oversized = Data("old-prefix".utf8)
+    oversized.append(Data(repeating: 0x78, count: TerminalSnapshotStore.maximumBytes * 2))
+    let bounded = TerminalSnapshotStore.bounded(oversized)
+    #expect(bounded.count <= TerminalSnapshotStore.maximumBytes)
+    #expect(bounded.starts(with: Data("\u{001B}c".utf8)))
+}
+
+@Test("Persisted agent state retains its resume cursor and thread summaries")
+func persistedAgentStateRoundTrip() throws {
+    let state = PersistedAgentPaneState(
+        cursor: 417,
+        kind: .codex,
+        phase: .active,
+        summary: "Running tests",
+        subagents: [SubagentActivity(id: "child", label: "review", startedAt: Date(timeIntervalSince1970: 10))],
+        activities: [],
+        resourceUsage: AgentResourceUsage(inputTokens: 12, cachedInputTokens: 3, outputTokens: 7),
+        progressPercent: 60,
+        pendingApprovals: 1
+    )
+    let restored = try JSONDecoder().decode(PersistedAgentPaneState.self, from: JSONEncoder().encode(state))
+    #expect(restored.cursor == 417)
+    #expect(restored.subagents.first?.id == "child")
+    #expect(restored.resourceUsage?.outputTokens == 7)
 }
 
 @Test("Startup terminal replies cannot become remote shell input")

@@ -28,13 +28,16 @@ type record struct {
 }
 
 type client struct {
-	frames chan protocol.Frame
-	lagged chan struct{}
-	once   sync.Once
+	frames             chan protocol.Frame
+	lagged             chan struct{}
+	once               sync.Once
+	includeAgentEvents bool
 }
 
 func newClient(capacity int) *client {
-	return &client{frames: make(chan protocol.Frame, capacity), lagged: make(chan struct{})}
+	return &client{
+		frames: make(chan protocol.Frame, capacity), lagged: make(chan struct{}), includeAgentEvents: true,
+	}
 }
 
 func (viewer *client) markLagged() {
@@ -93,7 +96,7 @@ func (session *Session) acquireControl(clientID string) bool {
 	return false
 }
 
-func (session *Session) releaseControl(clientID string) {
+func (session *Session) releaseControl(clientID string, graceful bool) {
 	if clientID == "" {
 		clientID = "legacy"
 	}
@@ -104,7 +107,12 @@ func (session *Session) releaseControl(clientID string) {
 	}
 	session.controlConnections--
 	if session.controlConnections == 0 {
-		session.controlGraceUntil = time.Now().Add(5 * time.Second)
+		if graceful {
+			session.controlClientID = ""
+			session.controlGraceUntil = time.Time{}
+		} else {
+			session.controlGraceUntil = time.Now().Add(5 * time.Second)
+		}
 	}
 }
 
@@ -578,10 +586,14 @@ func (session *Session) processID() int {
 	return session.process.Process.Pid
 }
 
-func (session *Session) attach(lastSequence, lastEventSequence uint64) (*client, []protocol.Frame, bool, bool) {
+func (session *Session) attach(
+	lastSequence, lastEventSequence uint64,
+	includeAgentEvents bool,
+) (*client, []protocol.Frame, bool, bool) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	viewer := newClient(512)
+	viewer.includeAgentEvents = includeAgentEvents
 	session.clients[viewer] = struct{}{}
 	outputReset := replayCursorHasGap(session.replay, lastSequence)
 	if lastSequence > session.sequence {
@@ -609,14 +621,17 @@ func (session *Session) attach(lastSequence, lastEventSequence uint64) (*client,
 		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "exited", ExitCode: session.exitCode})
 		frames = append(frames, status)
 	}
-	eventReset := session.eventCursorHasGap(lastEventSequence)
-	if eventReset || lastEventSequence == 0 {
-		frames = append(frames, session.agentStateSnapshot())
-		if eventReset {
-			lastEventSequence = 0
+	eventReset := false
+	if includeAgentEvents {
+		eventReset = session.eventCursorHasGap(lastEventSequence)
+		if eventReset || lastEventSequence == 0 {
+			frames = append(frames, session.agentStateSnapshot())
+			if eventReset {
+				lastEventSequence = 0
+			}
 		}
+		frames = append(frames, session.eventFramesAfter(lastEventSequence)...)
 	}
-	frames = append(frames, session.eventFramesAfter(lastEventSequence)...)
 	return viewer, frames, outputReset, eventReset
 }
 
@@ -758,6 +773,9 @@ func (session *Session) agentEvent(payload []byte) {
 	session.latestAgentEvent = append(session.latestAgentEvent[:0], payload...)
 	session.updateActiveSubagents(payload)
 	for viewer := range session.clients {
+		if frame.Type == protocol.AgentEvent && !viewer.includeAgentEvents {
+			continue
+		}
 		if cap(viewer.frames)-len(viewer.frames) < 1 {
 			viewer.markLagged()
 			delete(session.clients, viewer)

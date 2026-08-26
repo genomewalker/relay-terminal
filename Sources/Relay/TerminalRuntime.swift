@@ -8,6 +8,7 @@ final class TerminalRuntime: NSObject {
     private weak var pane: PaneModel?
     private let io = TerminalIOBridge()
     private let activityCoalescer = TerminalActivityCoalescer()
+    private let artifactCoordinator = TerminalArtifactCoordinator()
     private var started = false
     private var presentationLeases = Set<UUID>()
 
@@ -46,7 +47,6 @@ final class TerminalRuntime: NSObject {
         guard !started, let pane else { return }
         started = true
         guard pane.profile.kind == .ssh, pane.profile.backend == .relay else { return }
-        pane.stopAgentMonitoring()
 
         let remote = RelayRemoteTransport()
         let artifactPresentation = RelayPreferences.shared.artifactPresentation
@@ -54,8 +54,12 @@ final class TerminalRuntime: NSObject {
         io.transport = remote
         pane.beginTerminalRestore()
         io.beginReplay()
+        if io.restoreSnapshot(paneID: pane.id) {
+            pane.showTerminalSnapshot()
+        }
         let io = self.io
         let activityCoalescer = self.activityCoalescer
+        let artifactCoordinator = self.artifactCoordinator
         remote.start(
             profile: pane.profile,
             sessionID: pane.id.uuidString.lowercased(),
@@ -65,8 +69,32 @@ final class TerminalRuntime: NSObject {
             paneTitle: pane.displayName,
             contentKind: pane.contentKind.rawValue,
             onOutput: { [weak self] data in
-                guard io.receive(data) else { return }
+                let isLiveOutput = io.receive(data)
                 guard let text = String(data: data, encoding: .utf8) else { return }
+                if artifactsEnabled {
+                    for path in artifactCoordinator.discover(in: text) {
+                        Task {
+                            // Modern workers put a structured artifact frame
+                            // directly after this output. Give it priority and
+                            // only open a separate SSH fetch for older workers.
+                            try? await Task.sleep(for: .milliseconds(150))
+                            guard artifactCoordinator.beginFallback(for: path) else { return }
+                            guard let data = try? await RemoteArtifactLoader.load(path: path, profile: pane.profile),
+                                  artifactCoordinator.acceptFallback(for: path) else { return }
+                            if artifactPresentation == .inline {
+                                io.receiveInlineImageOrdered(
+                                    data,
+                                    imageID: Self.stableImageID(for: path)
+                                )
+                            } else {
+                                await MainActor.run { [weak self] in
+                                    self?.pane?.receivedArtifact(path: path, data: data)
+                                }
+                            }
+                        }
+                    }
+                }
+                guard isLiveOutput else { return }
                 self?.activityCoalescer.ingest(text) { [weak self] batch in
                     Task { @MainActor [weak self] in self?.pane?.received(batch) }
                 }
@@ -123,6 +151,7 @@ final class TerminalRuntime: NSObject {
             onArtifact: { [weak self] artifact in
                 guard let self else { return }
                 guard artifactsEnabled else { return }
+                guard artifactCoordinator.acceptStructured(for: artifact.path) else { return }
                 if artifactPresentation == .inline {
                     self.io.receiveInlineImageOrdered(
                         artifact.data,
@@ -146,6 +175,7 @@ final class TerminalRuntime: NSObject {
     }
 
     func stop() {
+        io.flushSnapshot()
         io.endReplay()
         io.transport?.detach()
         io.transport = nil
@@ -308,6 +338,9 @@ private final class TerminalIOBridge: @unchecked Sendable {
     private var legacyReplayGeneration: UInt64 = 0
     private var legacyReplayHardDeadline = DispatchTime.distantFuture
     private var filterDeviceResponsesUntil = Date.distantPast
+    private var snapshotPaneID: UUID?
+    private var snapshotBuffer = Data()
+    private var snapshotGeneration: UInt64 = 0
     private let legacyReplayTimer: DispatchSourceTimer
 
     init() {
@@ -350,7 +383,32 @@ private final class TerminalIOBridge: @unchecked Sendable {
         receiveLock.lock()
         defer { receiveLock.unlock() }
         session.receive(data)
+        appendSnapshotLocked(data)
         return true
+    }
+
+    func restoreSnapshot(paneID: UUID) -> Bool {
+        snapshotPaneID = paneID
+        guard let cached = TerminalSnapshotStore.shared.load(paneID: paneID), !cached.isEmpty else {
+            return false
+        }
+        receiveLock.lock()
+        snapshotBuffer = cached
+        session.receive(cached)
+        receiveLock.unlock()
+        RelayDiagnostics.shared.record(category: "snapshot", name: "restored", details: [
+            "pane_id": paneID.uuidString.lowercased(),
+            "bytes": String(cached.count),
+        ])
+        return true
+    }
+
+    func flushSnapshot() {
+        receiveLock.lock()
+        let paneID = snapshotPaneID
+        let snapshot = snapshotBuffer
+        receiveLock.unlock()
+        if let paneID, !snapshot.isEmpty { TerminalSnapshotStore.shared.save(snapshot, paneID: paneID) }
     }
 
     func beginReplay() {
@@ -389,7 +447,11 @@ private final class TerminalIOBridge: @unchecked Sendable {
             let reconstruction = TerminalReplayCompactor.compact(buffered)
             if !reconstruction.isEmpty {
                 self.receiveLock.lock()
-                self.session.receive(reconstruction)
+                var replacement = Data("\u{001B}c".utf8)
+                replacement.append(reconstruction)
+                self.session.receive(replacement)
+                self.snapshotBuffer = TerminalSnapshotStore.bounded(replacement)
+                self.scheduleSnapshotSaveLocked()
                 self.receiveLock.unlock()
             }
 
@@ -405,6 +467,32 @@ private final class TerminalIOBridge: @unchecked Sendable {
                 self.replayLock.unlock()
                 if finished { self.onReplayFinished?() }
             }
+        }
+    }
+
+    private func appendSnapshotLocked(_ data: Data) {
+        guard snapshotPaneID != nil else { return }
+        snapshotBuffer.append(data)
+        // Avoid scanning a multi-megabyte ANSI stream for every small PTY
+        // write. Compact only when the rolling buffer crosses a generous
+        // bound; the debounced disk writer performs the normal compaction.
+        if snapshotBuffer.count > TerminalSnapshotStore.maximumBytes * 2 {
+            snapshotBuffer = TerminalSnapshotStore.bounded(snapshotBuffer)
+        }
+        scheduleSnapshotSaveLocked()
+    }
+
+    private func scheduleSnapshotSaveLocked() {
+        guard let paneID = snapshotPaneID else { return }
+        snapshotGeneration &+= 1
+        let generation = snapshotGeneration
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(350)) { [weak self] in
+            guard let self else { return }
+            self.receiveLock.lock()
+            guard self.snapshotGeneration == generation else { self.receiveLock.unlock(); return }
+            let snapshot = self.snapshotBuffer
+            self.receiveLock.unlock()
+            TerminalSnapshotStore.shared.save(snapshot, paneID: paneID)
         }
     }
 
@@ -442,11 +530,20 @@ private final class TerminalIOBridge: @unchecked Sendable {
     }
 
     func receiveInlineImageOrdered(_ data: Data, imageID: UInt32) {
-        receiveLock.lock()
-        defer { receiveLock.unlock() }
+        var encoded = Data()
         for packet in KittyImageEncoder.packets(for: data, imageID: imageID) {
-            session.receive(packet)
+            encoded.append(packet)
         }
+        replayLock.lock()
+        if replaying {
+            replayBuffer.append(encoded)
+            replayLock.unlock()
+            return
+        }
+        replayLock.unlock()
+        receiveLock.lock()
+        session.receive(encoded)
+        receiveLock.unlock()
     }
 }
 

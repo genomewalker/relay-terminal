@@ -306,7 +306,7 @@ enum AgentKind: String, Codable, CaseIterable, Sendable {
     }
 }
 
-enum AgentPhase: String, Sendable {
+enum AgentPhase: String, Codable, Sendable {
     case connecting
     case active
     case quiet
@@ -389,7 +389,7 @@ enum PaneConnectionState: Equatable, Sendable {
     }
 }
 
-struct SubagentActivity: Identifiable, Equatable, Sendable {
+struct SubagentActivity: Identifiable, Equatable, Codable, Sendable {
     let id: String
     let label: String
     let startedAt: Date
@@ -400,20 +400,20 @@ struct SubagentActivity: Identifiable, Equatable, Sendable {
     var updates: [SubagentUpdate] = []
 }
 
-struct SubagentUpdate: Identifiable, Equatable, Sendable {
+struct SubagentUpdate: Identifiable, Equatable, Codable, Sendable {
     let id: UUID
     let message: String
     let occurredAt: Date
 }
 
-struct AgentActivityItem: Identifiable, Equatable, Sendable {
+struct AgentActivityItem: Identifiable, Equatable, Codable, Sendable {
     let id: UUID
     let label: String
     let phase: AgentPhase
     let occurredAt: Date
 }
 
-struct AgentResourceUsage: Equatable, Sendable {
+struct AgentResourceUsage: Equatable, Codable, Sendable {
     var inputTokens: Int = 0
     var cachedInputTokens: Int = 0
     var outputTokens: Int = 0
@@ -524,11 +524,14 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var artifactError: String?
     @Published var editorRequest: EditorOpenRequest?
     @Published var isRestoringTerminal = false
+    @Published var hasTerminalSnapshot = false
     private var structuredAgentRunning: Bool?
     private var activeAgentRoots: [String: AgentKind] = [:]
     private var seenAgentEventHashes: [Data: Date] = [:]
     private var seenAgentEventOrder: [(Data, Date)] = []
     private var agentMonitor: RelayHostAgentMonitorToken?
+    private var agentEventCursor: UInt64 = 0
+    private var agentPersistenceTask: Task<Void, Never>?
     let remoteParentSessionID: String?
     private(set) var remoteWorkspaceSessionID: String?
     private(set) var remoteTabID: String?
@@ -555,6 +558,18 @@ final class PaneModel: ObservableObject, Identifiable {
         self.connectionState = profile.kind == .ssh && profile.backend == .relay
             ? .connecting
             : .connected
+        if profile.kind == .ssh, profile.backend == .relay,
+           let saved = AgentStateStore.shared.load(paneID: id) {
+            agentEventCursor = saved.cursor
+            subagents = saved.subagents
+            activeSubagents = saved.subagents.count { $0.phase == .active }
+            agentActivities = saved.activities
+            agentResourceUsage = saved.resourceUsage
+            agentProgressPercent = saved.progressPercent
+            pendingAgentApprovals = saved.pendingApprovals
+            detector.applyStructuredEvent(kind: saved.kind, phase: saved.phase, excerpt: saved.summary)
+            structuredAgentRunning = saved.kind == .shell ? false : true
+        }
     }
 
     var kind: AgentKind { detector.kind }
@@ -601,6 +616,7 @@ final class PaneModel: ObservableObject, Identifiable {
         agentMonitor = RelayHostAgentMonitor.shared.subscribe(
             profile: profile,
             sessionID: id.uuidString.lowercased(),
+            lastEventSequence: agentEventCursor,
             onEvent: { [weak self] data in self?.receivedAgentEvent(data) },
             onAttached: { [weak self] in self?.connected() }
         )
@@ -612,6 +628,9 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func stopRuntime() {
+        agentPersistenceTask?.cancel()
+        agentPersistenceTask = nil
+        persistAgentStateNow()
         stopAgentMonitoring()
         switch contentKind {
         case .terminal: runtime.stop()
@@ -685,7 +704,14 @@ final class PaneModel: ObservableObject, Identifiable {
         isRestoringTerminal = true
     }
 
+    func showTerminalSnapshot() {
+        guard contentKind == .terminal else { return }
+        hasTerminalSnapshot = true
+        isRestoringTerminal = false
+    }
+
     func finishTerminalRestore() {
+        hasTerminalSnapshot = true
         isRestoringTerminal = false
     }
 
@@ -716,6 +742,10 @@ final class PaneModel: ObservableObject, Identifiable {
         guard let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let agentName = envelope["agent"] as? String,
               let event = envelope["event"] as? [String: Any] else { return }
+        if let cursor = (envelope["relay_event_seq"] as? NSNumber)?.uint64Value {
+            agentEventCursor = max(agentEventCursor, cursor)
+        }
+        defer { scheduleAgentStatePersistence() }
         let incomingEventName = (event["hook_event_name"] as? String) ?? (event["type"] as? String)
         if incomingEventName == "RelayStateSnapshot" {
             subagents.removeAll(keepingCapacity: true)
@@ -953,6 +983,34 @@ final class PaneModel: ObservableObject, Identifiable {
         }
         lastActivity = Date()
         objectWillChange.send()
+    }
+
+    private func scheduleAgentStatePersistence() {
+        agentPersistenceTask?.cancel()
+        agentPersistenceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard let self, !Task.isCancelled else { return }
+            self.agentPersistenceTask = nil
+            self.persistAgentStateNow()
+        }
+    }
+
+    private func persistAgentStateNow() {
+        guard profile.kind == .ssh, profile.backend == .relay else { return }
+        AgentStateStore.shared.save(
+            PersistedAgentPaneState(
+                cursor: agentEventCursor,
+                kind: kind,
+                phase: phase,
+                summary: activitySummary,
+                subagents: subagents,
+                activities: agentActivities,
+                resourceUsage: agentResourceUsage,
+                progressPercent: agentProgressPercent,
+                pendingApprovals: pendingAgentApprovals
+            ),
+            paneID: id
+        )
     }
 
     func cycleAgentKind() {

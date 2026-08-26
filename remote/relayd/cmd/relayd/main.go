@@ -176,7 +176,7 @@ const maxArtifactBytes = 25 << 20
 
 func runArtifact(arguments []string) {
 	flags := flag.NewFlagSet("artifact", flag.ExitOnError)
-	pathBase64 := flags.String("path-b64", "", "base64-encoded absolute image path")
+	pathBase64 := flags.String("path-b64", "", "base64-encoded image path")
 	_ = flags.Parse(arguments)
 	if *pathBase64 == "" {
 		fatal("--path-b64 is required")
@@ -205,11 +205,16 @@ func runArtifact(arguments []string) {
 
 func resolveArtifactPath(requested, home string, uid int) (string, error) {
 	if !filepath.IsAbs(requested) {
-		return "", fmt.Errorf("artifact path must be absolute")
+		cleanRelative := filepath.Clean(requested)
+		codexRoot := filepath.Join(".codex", "generated_images")
+		if cleanRelative != codexRoot && !strings.HasPrefix(cleanRelative, codexRoot+string(filepath.Separator)) {
+			return "", fmt.Errorf("relative artifact path is outside .codex/generated_images")
+		}
+		requested = filepath.Join(home, cleanRelative)
 	}
 	extension := filepath.Ext(requested)
 	switch extension {
-	case ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG", ".gif", ".GIF", ".webp", ".WEBP":
+	case "", ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG", ".gif", ".GIF", ".webp", ".WEBP":
 	default:
 		return "", fmt.Errorf("unsupported artifact type")
 	}
@@ -596,6 +601,8 @@ func runAttach(arguments []string) {
 	rows := flags.Uint("rows", 36, "terminal rows")
 	lastSequence := flags.Uint64("last-seq", 0, "last received output sequence")
 	lastEventSequence := flags.Uint64("last-event-seq", 0, "last received agent event sequence")
+	terminalOnly := flags.Bool("terminal-only", false, "exclude agent events from the terminal stream")
+	clientID := flags.String("client-id", "", "durable input client identity")
 	_ = flags.Parse(arguments)
 	if *session == "" {
 		fatal("--session is required")
@@ -617,6 +624,7 @@ func runAttach(arguments []string) {
 		Version: 1, SessionID: *session, ParentSessionID: *parentSession, Command: command,
 		WorkspaceID: *workspace, TabID: *tab, PaneTitle: *paneTitle, ContentKind: *contentKind,
 		Cols: uint16(*cols), Rows: uint16(*rows), LastSeq: *lastSequence, LastEventSeq: *lastEventSequence,
+		TerminalOnly: *terminalOnly, ClientID: *clientID,
 	})
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
 		fatal(err.Error())

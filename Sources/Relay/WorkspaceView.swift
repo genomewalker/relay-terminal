@@ -1882,7 +1882,7 @@ private struct PaneView: View {
                         // cannot reuse a local-shell surface for an SSH pane.
                         .id(pane.id)
                 }
-                if pane.connectionState == .connecting {
+                if pane.connectionState == .connecting && !pane.hasTerminalSnapshot {
                     ConnectingOverlay(host: pane.profile.host, contentKind: pane.contentKind)
                         .allowsHitTesting(false)
                 } else if let message = pane.connectionState.recoveryMessage {
@@ -1893,7 +1893,7 @@ private struct PaneView: View {
                     )
                         .frame(maxHeight: .infinity, alignment: .top)
                         .padding(12)
-                } else if pane.isRestoringTerminal {
+                } else if pane.isRestoringTerminal && !pane.hasTerminalSnapshot {
                     RestoringTerminalOverlay(host: pane.profile.host)
                 } else if let exitCode = pane.remoteExitCode {
                     SessionEndedOverlay(

@@ -95,7 +95,7 @@ func TestInputControlLeaseAllowsOneClientAndReconnectGrace(t *testing.T) {
 	if session.acquireControl("client-b") {
 		t.Fatal("second client was granted simultaneous control")
 	}
-	session.releaseControl("client-a")
+	session.releaseControl("client-a", false)
 	if session.acquireControl("client-b") {
 		t.Fatal("reconnect grace was not respected")
 	}
@@ -104,6 +104,17 @@ func TestInputControlLeaseAllowsOneClientAndReconnectGrace(t *testing.T) {
 	session.mu.Unlock()
 	if !session.acquireControl("client-b") {
 		t.Fatal("expired lease was not transferred")
+	}
+}
+
+func TestCleanDetachReleasesInputControlImmediately(t *testing.T) {
+	session := &Session{}
+	if !session.acquireControl("client-a") {
+		t.Fatal("first client was not granted control")
+	}
+	session.releaseControl("client-a", true)
+	if !session.acquireControl("client-b") {
+		t.Fatal("clean detach retained the reconnect grace lease")
 	}
 }
 
@@ -224,7 +235,7 @@ func TestOldOutputCursorForcesCleanReplay(t *testing.T) {
 		activeSubagents: make(map[string][]byte), sequence: 11,
 		replay: []record{{sequence: 10, data: []byte("\x1b[2Jscreen")}, {sequence: 11, data: []byte(" tail")}},
 	}
-	viewer, frames, outputReset, _ := session.attach(3, 0)
+	viewer, frames, outputReset, _ := session.attach(3, 0, true)
 	defer session.detach(viewer)
 	if !outputReset || len(frames) < 2 {
 		t.Fatalf("old cursor did not force replay reset: reset=%v frames=%d", outputReset, len(frames))
@@ -233,6 +244,28 @@ func TestOldOutputCursorForcesCleanReplay(t *testing.T) {
 	if err != nil || sequence != 10 ||
 		(!bytes.HasPrefix(output, []byte("\x1bc")) && !bytes.HasPrefix(output, []byte("\x1b[2J"))) {
 		t.Fatalf("clean replay was not emitted: sequence=%d output=%q err=%v", sequence, output, err)
+	}
+}
+
+func TestTerminalOnlyAttachExcludesAgentHistory(t *testing.T) {
+	session := &Session{
+		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		activeAgentRoots: map[string][]byte{"codex:1": []byte(`{"agent":"codex","event":{"hook_event_name":"SessionStart"}}`)},
+		activeSubagents:  make(map[string][]byte),
+		eventSequence:    1,
+		eventHistory: []protocol.Frame{{
+			Type: protocol.AgentEvent, Payload: indexedAgentPayload([]byte(`{"agent":"codex","event":{"hook_event_name":"PreToolUse"}}`), 1),
+		}},
+	}
+	viewer, frames, _, eventReset := session.attach(0, 0, false)
+	defer session.detach(viewer)
+	if eventReset {
+		t.Fatal("terminal-only attach reported an irrelevant agent reset")
+	}
+	for _, frame := range frames {
+		if frame.Type == protocol.AgentEvent {
+			t.Fatal("terminal-only attach replayed agent history")
+		}
 	}
 }
 

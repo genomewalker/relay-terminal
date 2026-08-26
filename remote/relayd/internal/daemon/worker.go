@@ -202,11 +202,14 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		return
 	}
 	controlGranted := session.acquireControl(hello.ClientID)
+	gracefulDetach := false
 	if controlGranted {
-		defer session.releaseControl(hello.ClientID)
+		defer func() { session.releaseControl(hello.ClientID, gracefulDetach) }()
 	}
 
-	viewer, replay, outputReset, eventReset := session.attach(hello.LastSeq, hello.LastEventSeq)
+	viewer, replay, outputReset, eventReset := session.attach(
+		hello.LastSeq, hello.LastEventSeq, !hello.TerminalOnly,
+	)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
 		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1"},
@@ -271,6 +274,7 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		case protocol.Ping:
 			_ = writer.Write(protocol.Frame{Type: protocol.Pong})
 		case protocol.Detach:
+			gracefulDetach = true
 			return
 		case protocol.AgentEvent:
 			session.agentEvent(frame.Payload)

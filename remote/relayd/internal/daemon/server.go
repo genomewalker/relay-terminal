@@ -187,7 +187,8 @@ func (server *Server) serveConnection(connection net.Conn) {
 }
 
 type multiplexedSession struct {
-	connection net.Conn
+	connection   net.Conn
+	terminalOnly bool
 }
 
 // serveNodeMultiplex turns one SSH channel into independent virtual protocol
@@ -257,7 +258,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 				return
 			}
 			clientSide, serverSide := net.Pipe()
-			virtual := &multiplexedSession{connection: clientSide}
+			virtual := &multiplexedSession{connection: clientSide, terminalOnly: hello.TerminalOnly}
 			sessionsMu.Lock()
 			previous := sessions[sessionID]
 			sessions[sessionID] = virtual
@@ -270,7 +271,16 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 				defer closeSession(id, session)
 				for {
 					frame, readErr := protocol.ReadFrame(session.connection)
-					if readErr != nil || writer.Write(protocol.HostEventFrame(id, frame)) != nil {
+					if readErr != nil {
+						return
+					}
+					// Existing pane workers may predate terminal_only. Filter their
+					// agent frames here so terminal restoration never waits for a
+					// historical transcript replay.
+					if session.terminalOnly && frame.Type == protocol.AgentEvent {
+						continue
+					}
+					if writer.Write(protocol.HostEventFrame(id, frame)) != nil {
 						return
 					}
 				}

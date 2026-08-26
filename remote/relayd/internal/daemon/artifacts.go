@@ -11,7 +11,8 @@ import (
 
 const maxInlineArtifactBytes = 12 << 20
 
-var imagePathPattern = regexp.MustCompile(`(?:file://)?(/[A-Za-z0-9_~.%+@:/-]+\.(?i:png|jpe?g|gif|webp))`)
+var imagePathPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.-])(?:file://)?(/[A-Za-z0-9_~.%+@:/-]+\.(?i:png|jpe?g|gif|webp))`)
+var relativeCodexImagePathPattern = regexp.MustCompile(`(?:^|[[:space:]└])((?:\./)?\.codex/generated_images/[A-Za-z0-9_~.%+@:/-]+\.(?i:png|jpe?g|gif|webp))`)
 var claudeScratchPathPattern = regexp.MustCompile(`(/tmp/claude-[0-9]+/[A-Za-z0-9_~.%+@:/-]+)(?:[[:space:]]|[)\]])`)
 
 type artifactDetector struct {
@@ -29,7 +30,8 @@ func (detector *artifactDetector) ingest(data []byte) []string {
 	} else {
 		detector.tail = candidate
 	}
-	matches := append(imagePathPattern.FindAllStringSubmatch(candidate, -1), claudeScratchPathPattern.FindAllStringSubmatch(candidate, -1)...)
+	matches := append(imagePathPattern.FindAllStringSubmatch(candidate, -1), relativeCodexImagePathPattern.FindAllStringSubmatch(candidate, -1)...)
+	matches = append(matches, claudeScratchPathPattern.FindAllStringSubmatch(candidate, -1)...)
 	paths := make([]string, 0, len(matches))
 	returned := make(map[string]bool)
 	for _, match := range matches {
@@ -54,7 +56,11 @@ func loadInlineArtifact(requested string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	resolved, err := filepath.EvalSymlinks(filepath.Clean(requested))
+	absolute, err := filepath.Abs(filepath.Clean(requested))
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
 		return nil, err
 	}

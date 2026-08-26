@@ -25,6 +25,14 @@ func TestArtifactDetectorFindsExtensionlessClaudeScratchImage(t *testing.T) {
 	}
 }
 
+func TestArtifactDetectorFindsRelativeCodexImage(t *testing.T) {
+	var detector artifactDetector
+	got := detector.ingest([]byte("Viewed Image\r\n  └ .codex/generated_images/demo/image.png\r\n"))
+	if len(got) != 1 || got[0] != ".codex/generated_images/demo/image.png" {
+		t.Fatalf("unexpected Codex relative image match: %v", got)
+	}
+}
+
 func TestInlineImageMagic(t *testing.T) {
 	if !isInlineImage([]byte("\x89PNG\r\n\x1a\ncontent")) ||
 		!isInlineImage([]byte("RIFF1234WEBPcontent")) || isInlineImage([]byte("not an image")) {

@@ -50,3 +50,32 @@ func TestResolveArtifactPathRejectsUnsupportedType(t *testing.T) {
 		t.Fatal("expected unsupported type to be rejected")
 	}
 }
+
+func TestResolveArtifactPathAllowsRelativeCodexImage(t *testing.T) {
+	home := t.TempDir()
+	directory := filepath.Join(home, ".codex", "generated_images", "demo")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "image.png")
+	if err := os.WriteFile(path, []byte("png"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveArtifactPath(".codex/generated_images/demo/image.png", home, 501)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != want {
+		t.Fatalf("got %q, want %q", resolved, want)
+	}
+}
+
+func TestResolveArtifactPathRejectsOtherRelativePaths(t *testing.T) {
+	if _, err := resolveArtifactPath(".ssh/id_rsa", t.TempDir(), 501); err == nil {
+		t.Fatal("expected unrelated relative path to be rejected")
+	}
+}
