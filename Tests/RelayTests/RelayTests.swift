@@ -793,6 +793,7 @@ func terminalSemanticState() {
 func artifactLinksRoundTripRemotePaths() {
     let path = "/home/kbd606/.codex/generated_images/demo image.png"
     let link = ArtifactLinkResolver.link(for: path)
+    #expect(link.hasPrefix("file:///__relay_artifact__/"))
     #expect(ArtifactLinkResolver.path(from: link) == path)
     #expect(ArtifactLinkResolver.path(from: "file:///tmp/demo.png") == "/tmp/demo.png")
     #expect(ArtifactLinkResolver.path(from: "https://example.com/demo.png") == nil)
@@ -803,6 +804,6 @@ func artifactHyperlinksPreserveVisiblePath() {
     let path = "/tmp/F2D-desktop-evidence-spine.png"
     let encoded = ArtifactHyperlinkEncoder.encode(Data("saved: \(path)\r\n".utf8))
     let output = String(decoding: encoded, as: UTF8.self)
-    #expect(output.contains("\u{001B}]8;;relay-artifact://open/"))
+    #expect(output.contains("\u{001B}]8;;file:///__relay_artifact__/"))
     #expect(output.contains(path))
 }

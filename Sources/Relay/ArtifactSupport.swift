@@ -53,10 +53,13 @@ struct ImagePathDetector {
 
 enum ArtifactLinkResolver {
     private static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp"])
+    private static let internalPrefix = "file:///__relay_artifact__/"
+    private static let legacyInternalPrefix = "relay-artifact://open/"
 
     static func path(from link: String) -> String? {
-        if link.hasPrefix("relay-artifact://open/") {
-            let encoded = String(link.dropFirst("relay-artifact://open/".count))
+        if link.hasPrefix(internalPrefix) || link.hasPrefix(legacyInternalPrefix) {
+            let prefix = link.hasPrefix(internalPrefix) ? internalPrefix : legacyInternalPrefix
+            let encoded = String(link.dropFirst(prefix.count))
             guard let data = Data(base64URLEncoded: encoded),
                   let path = String(data: data, encoding: .utf8) else { return nil }
             return isImagePath(path) ? path : nil
@@ -72,7 +75,7 @@ enum ArtifactLinkResolver {
     }
 
     static func link(for path: String) -> String {
-        "relay-artifact://open/" + Data(path.utf8).base64URLEncodedString()
+        internalPrefix + Data(path.utf8).base64URLEncodedString()
     }
 
     private static func isImagePath(_ path: String) -> Bool {

@@ -726,14 +726,44 @@ extension TerminalRuntime:
 @MainActor
 final class RelayGhosttyView: TerminalView {
     weak var owner: TerminalRuntime?
+    private var suppressNextMouseUp = false
 
     override func mouseDown(with event: NSEvent) {
         owner?.selectPane()
         if event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
            owner?.openHoveredArtifact() == true {
+            suppressNextMouseUp = true
             return
         }
         super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if suppressNextMouseUp {
+            suppressNextMouseUp = false
+            return
+        }
+        super.mouseUp(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        // Ghostty intentionally discovers hover links only with Command held.
+        // Probe the same cell with Command for Relay's single-click image UX;
+        // regular terminal mouse delivery above remains unchanged.
+        guard !event.modifierFlags.contains(.command),
+              let probe = NSEvent.mouseEvent(
+                with: event.type,
+                location: event.locationInWindow,
+                modifierFlags: event.modifierFlags.union(.command),
+                timestamp: event.timestamp,
+                windowNumber: event.windowNumber,
+                context: nil,
+                eventNumber: event.eventNumber,
+                clickCount: event.clickCount,
+                pressure: event.pressure
+              ) else { return }
+        super.mouseMoved(with: probe)
     }
 
     override func rightMouseDown(with event: NSEvent) {
