@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
@@ -34,6 +35,17 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
 }
 
 enum RelayNodeTransportError: Error { case disconnected, invalidEnvelope }
+
+enum RelayHeartbeatPolicy {
+    static let intervalSeconds = 10
+    static let timeoutNanoseconds: UInt64 = 30_000_000_000
+
+    static func expired(_ pending: [UInt64: UInt64], now: UInt64) -> [UInt64] {
+        guard now >= timeoutNanoseconds else { return [] }
+        let boundary = now - timeoutNanoseconds
+        return pending.filter { $0.value <= boundary }.map(\.key)
+    }
+}
 
 final class RelayNodeTransportPool: @unchecked Sendable {
     static let shared = RelayNodeTransportPool()
@@ -169,8 +181,13 @@ final class RelayNodeConnection: @unchecked Sendable {
         ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         ssh.arguments = [
             "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1",
-            "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2",
-            "-o", "ControlMaster=auto", "-o", "ControlPersist=10m", "-o", "ControlPath=~/.ssh/relay-%C",
+            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
+            // Relay already multiplexes every pane over this one process. A
+            // persistent OpenSSH control master adds a second connection
+            // owner that can survive a VPN route change and trap retries on
+            // the stale TCP stream, so the node transport must always create
+            // a fresh connection.
+            "-o", "ControlMaster=no", "-o", "ControlPath=none",
         ] + profile.sshConnectionArguments + ["~/.local/bin/relayd", "node"]
         ssh.standardInput = input
         ssh.standardOutput = output
@@ -221,7 +238,9 @@ final class RelayNodeConnection: @unchecked Sendable {
             ready = true
             reconnectAttempt = 0
             heartbeatTimer.schedule(
-                deadline: .now() + .seconds(30), repeating: .seconds(30), leeway: .seconds(5)
+                deadline: .now() + .seconds(RelayHeartbeatPolicy.intervalSeconds),
+                repeating: .seconds(RelayHeartbeatPolicy.intervalSeconds),
+                leeway: .seconds(2)
             )
             let callbacks = subscriptions.values.map { ($0.onReady, $0.channel) }
             lock.unlock()
@@ -292,17 +311,37 @@ final class RelayNodeConnection: @unchecked Sendable {
         let now = DispatchTime.now().uptimeNanoseconds
         lock.lock()
         guard ready, let writer else { lock.unlock(); return }
-        let timeoutBoundary = now &- min(now, 90_000_000_000)
-        let timedOut = pendingHeartbeats.filter { $0.value < timeoutBoundary }.map(\.key)
+        let timedOut = RelayHeartbeatPolicy.expired(pendingHeartbeats, now: now)
         for sequence in timedOut { pendingHeartbeats.removeValue(forKey: sequence) }
+        if !timedOut.isEmpty {
+            // An alive local ssh PID does not prove that the relay protocol is
+            // moving. Stop the wedged transport so its normal termination
+            // handler creates a fresh SSH connection and resubscribes panes.
+            heartbeatTimer.schedule(deadline: .distantFuture)
+            let stalledProcess = process
+            lock.unlock()
+            for _ in timedOut {
+                RelayDiagnostics.shared.heartbeatTimedOut(connection: diagnosticConnectionID)
+            }
+            RelayDiagnostics.shared.record(category: "connection", name: "heartbeat-watchdog", details: [
+                "connection_id": diagnosticConnectionID,
+                "missed": String(timedOut.count),
+                "action": "restart-ssh",
+            ])
+            stalledProcess?.terminate()
+            if let stalledProcess {
+                let pid = stalledProcess.processIdentifier
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .seconds(1)) {
+                    if stalledProcess.isRunning { _ = Darwin.kill(pid, SIGKILL) }
+                }
+            }
+            return
+        }
         heartbeatSequence &+= 1
         let sequence = heartbeatSequence
         pendingHeartbeats[sequence] = now
         lock.unlock()
 
-        for _ in timedOut {
-            RelayDiagnostics.shared.heartbeatTimedOut(connection: diagnosticConnectionID)
-        }
         RelayDiagnostics.shared.heartbeatSent(connection: diagnosticConnectionID)
         var bigEndian = sequence.bigEndian
         let payload = withUnsafeBytes(of: &bigEndian) { Data($0) }

@@ -421,6 +421,20 @@ func terminalInputIdentityIsProcessScoped() {
     #expect(RelayInputClientIdentity.id != RelayClientIdentity.id)
 }
 
+@Test("Node heartbeat watchdog distinguishes delayed from stalled replies")
+func nodeHeartbeatWatchdog() {
+    let timeout = RelayHeartbeatPolicy.timeoutNanoseconds
+    let now = timeout + 100
+    let pending: [UInt64: UInt64] = [
+        1: 99,
+        2: 100,
+        3: 101,
+        4: now,
+    ]
+    #expect(Set(RelayHeartbeatPolicy.expired(pending, now: now)) == Set([1, 2]))
+    #expect(RelayHeartbeatPolicy.expired([1: 0], now: timeout - 1).isEmpty)
+}
+
 @Test("Pane connection state exposes non-blocking recovery labels")
 func paneConnectionRecoveryState() {
     let vpn = PaneConnectionState.waitingForNetwork("retrying")
