@@ -2197,16 +2197,32 @@ private struct EditorNavigator: View {
 private struct ArtifactPreview: View {
     let artifact: PaneArtifact
     let dismiss: () -> Void
+    @State private var offset: CGSize = .zero
+    @GestureState private var dragTranslation: CGSize = .zero
+    @State private var isExpanded = false
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 7) {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(RelayTheme.textFaint)
                 Image(systemName: "photo")
                     .foregroundStyle(RelayTheme.blue)
                 Text(artifact.filename)
                     .font(.system(size: 10.5, weight: .medium))
                     .lineLimit(1)
                 Spacer(minLength: 8)
+                Button {
+                    withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
+                } label: {
+                    Image(systemName: isExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .accessibilityLabel(isExpanded ? "Restore image size" : "Enlarge image")
                 Button(action: dismiss) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
@@ -2219,21 +2235,38 @@ private struct ArtifactPreview: View {
             .padding(.horizontal, 10)
             .frame(height: 34)
             .background(RelayTheme.elevated)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 2)
+                    .updating($dragTranslation) { value, state, _ in state = value.translation }
+                    .onEnded { value in
+                        offset.width += value.translation.width
+                        offset.height += value.translation.height
+                    }
+            )
+            .onTapGesture(count: 2) {
+                withAnimation(.easeOut(duration: 0.16)) { offset = .zero }
+            }
+            .help("Drag to move · double-click to reset")
 
             if let image = artifact.image {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
-                    .frame(maxWidth: 360, maxHeight: 320)
+                    .frame(maxWidth: isExpanded ? 560 : 360, maxHeight: isExpanded ? 520 : 320)
                     .background(Color.black.opacity(0.24))
                     .accessibilityLabel("Generated image: \(artifact.filename)")
             }
         }
-        .frame(width: 360)
+        .frame(width: isExpanded ? 560 : 360)
         .background(RelayTheme.elevated)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.55)) }
         .shadow(color: .black.opacity(0.3), radius: 16, y: 7)
+        .offset(
+            x: offset.width + dragTranslation.width,
+            y: offset.height + dragTranslation.height
+        )
     }
 }
 

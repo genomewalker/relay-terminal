@@ -80,7 +80,7 @@ final class RelayPreferences: ObservableObject {
         showArtifactPreviews = defaults.object(forKey: "relay.settings.artifact-previews") as? Bool ?? true
         artifactPresentation = RelayArtifactPresentation(
             rawValue: defaults.string(forKey: "relay.settings.artifact-presentation") ?? ""
-        ) ?? .inline
+        ) ?? .preview
         keyBindings = RelayKeyBindingStorage.load(from: defaults)
         isLoading = false
     }
