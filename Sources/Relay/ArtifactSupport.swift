@@ -51,6 +51,115 @@ struct ImagePathDetector {
     }
 }
 
+enum ArtifactLinkResolver {
+    private static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp"])
+
+    static func path(from link: String) -> String? {
+        if link.hasPrefix("relay-artifact://open/") {
+            let encoded = String(link.dropFirst("relay-artifact://open/".count))
+            guard let data = Data(base64URLEncoded: encoded),
+                  let path = String(data: data, encoding: .utf8) else { return nil }
+            return isImagePath(path) ? path : nil
+        }
+
+        let path: String
+        if let url = URL(string: link), url.isFileURL {
+            path = url.path
+        } else {
+            path = link.removingPercentEncoding ?? link
+        }
+        return isImagePath(path) ? path : nil
+    }
+
+    static func link(for path: String) -> String {
+        "relay-artifact://open/" + Data(path.utf8).base64URLEncodedString()
+    }
+
+    private static func isImagePath(_ path: String) -> Bool {
+        let cleaned = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleaned.hasPrefix("/") || cleaned.hasPrefix(".codex/") || cleaned.hasPrefix("./.codex/") else {
+            return false
+        }
+        if imageExtensions.contains(URL(fileURLWithPath: cleaned).pathExtension.lowercased()) {
+            return true
+        }
+        return cleaned.hasPrefix("/tmp/claude-")
+    }
+}
+
+enum ArtifactHyperlinkEncoder {
+    private static let patterns = [
+        try! NSRegularExpression(
+            pattern: #"(?:file://)?(/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
+            options: [.caseInsensitive]
+        ),
+        try! NSRegularExpression(
+            pattern: #"(/tmp/claude-[0-9]+/[A-Za-z0-9_~.%+@:/-]+)"#
+        ),
+        try! NSRegularExpression(
+            pattern: #"((?:\./)?\.codex/generated_images/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
+            options: [.caseInsensitive]
+        ),
+    ]
+
+    /// Adds zero-width OSC 8 links while preserving the visible terminal text.
+    /// Chunks that already contain OSC 8 are left alone to avoid nested links.
+    static func encode(_ data: Data) -> Data {
+        guard data.range(of: Data("\u{001B}]8;".utf8)) == nil,
+              let text = String(data: data, encoding: .utf8),
+              text.range(of: ".png", options: .caseInsensitive) != nil
+                || text.range(of: ".jpg", options: .caseInsensitive) != nil
+                || text.range(of: ".jpeg", options: .caseInsensitive) != nil
+                || text.range(of: ".gif", options: .caseInsensitive) != nil
+                || text.range(of: ".webp", options: .caseInsensitive) != nil
+                || text.contains("/tmp/claude-")
+        else { return data }
+
+        let mutable = NSMutableString(string: text)
+        var ranges: [(range: NSRange, path: String)] = []
+        for regex in patterns {
+            let current = mutable as String
+            let fullRange = NSRange(current.startIndex..., in: current)
+            for match in regex.matches(in: current, range: fullRange) {
+                guard let range = Range(match.range(at: 1), in: current) else { continue }
+                let encodedPath = String(current[range])
+                ranges.append((match.range(at: 1), encodedPath.removingPercentEncoding ?? encodedPath))
+            }
+        }
+
+        // Multiple patterns can recognize the same path. Replace unique ranges
+        // from the end so earlier UTF-16 offsets remain valid.
+        var seen = Set<String>()
+        for item in ranges.sorted(by: { $0.range.location > $1.range.location }) {
+            let key = "\(item.range.location):\(item.range.length)"
+            guard seen.insert(key).inserted else { continue }
+            let visible = mutable.substring(with: item.range)
+            let destination = ArtifactLinkResolver.link(for: item.path)
+            mutable.replaceCharacters(
+                in: item.range,
+                with: "\u{001B}]8;;\(destination)\u{001B}\\\(visible)\u{001B}]8;;\u{001B}\\"
+            )
+        }
+        return Data((mutable as String).utf8)
+    }
+}
+
+private extension Data {
+    init?(base64URLEncoded value: String) {
+        var base64 = value.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        self.init(base64Encoded: base64)
+    }
+
+    func base64URLEncodedString() -> String {
+        base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}
+
 /// Merges structured artifact frames with a text-path compatibility fallback.
 /// A current relay worker normally sends the image bytes immediately after the
 /// output that names them. Older workers only send terminal output, so Relay

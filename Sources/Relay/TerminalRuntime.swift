@@ -9,6 +9,8 @@ final class TerminalRuntime: NSObject {
     private let io = TerminalIOBridge()
     private let activityCoalescer = TerminalActivityCoalescer()
     private let artifactCoordinator = TerminalArtifactCoordinator()
+    private var lastArtifact: (path: String, data: Data)?
+    private var hoveredLink: String?
     private var started = false
     private var presentationLeases = Set<UUID>()
 
@@ -70,7 +72,8 @@ final class TerminalRuntime: NSObject {
             paneTitle: pane.displayName,
             contentKind: pane.contentKind.rawValue,
             onOutput: { [weak self] data in
-                let isLiveOutput = io.receive(data)
+                let displayData = artifactsEnabled ? ArtifactHyperlinkEncoder.encode(data) : data
+                let isLiveOutput = io.receive(displayData)
                 guard let text = String(data: data, encoding: .utf8) else { return }
                 if artifactsEnabled {
                     for path in artifactCoordinator.discover(in: text) {
@@ -89,7 +92,7 @@ final class TerminalRuntime: NSObject {
                                 )
                             }
                             await MainActor.run { [weak self] in
-                                self?.pane?.receivedArtifact(path: path, data: data)
+                                self?.presentArtifact(path: path, data: data)
                             }
                         }
                     }
@@ -159,7 +162,7 @@ final class TerminalRuntime: NSObject {
                     )
                 }
                 Task { @MainActor [weak self] in
-                    self?.pane?.receivedArtifact(path: artifact.path, data: artifact.data)
+                    self?.presentArtifact(path: artifact.path, data: artifact.data)
                 }
             },
             onDisconnect: { [weak self] message in
@@ -281,6 +284,37 @@ final class TerminalRuntime: NSObject {
     fileprivate func closePane() {
         selectPane()
         NotificationCenter.default.post(name: .relayClosePane, object: pane?.id)
+    }
+
+    fileprivate func openHoveredArtifact() -> Bool {
+        guard let hoveredLink, let path = ArtifactLinkResolver.path(from: hoveredLink) else { return false }
+        showArtifact(path: path)
+        return true
+    }
+
+    private func presentArtifact(path: String, data: Data) {
+        lastArtifact = (path, data)
+        pane?.receivedArtifact(path: path, data: data)
+    }
+
+    private func showArtifact(path: String) {
+        if let lastArtifact, lastArtifact.path == path {
+            pane?.receivedArtifact(path: path, data: lastArtifact.data)
+            return
+        }
+        guard let profile = pane?.profile else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let data = try await RemoteArtifactLoader.load(path: path, profile: profile)
+                self.presentArtifact(path: path, data: data)
+            } catch {
+                RelayDiagnostics.shared.record(category: "artifact", name: "open_failed", details: [
+                    "path": path,
+                    "message": error.localizedDescription,
+                ])
+            }
+        }
     }
 }
 
@@ -633,7 +667,9 @@ extension TerminalRuntime:
     TerminalSurfaceFocusDelegate,
     TerminalSurfacePwdDelegate,
     TerminalSurfaceCommandFinishedDelegate,
-    TerminalSurfaceProgressReportDelegate
+    TerminalSurfaceProgressReportDelegate,
+    TerminalSurfaceOpenURLDelegate,
+    TerminalSurfaceHoverLinkDelegate
 {
     func terminalDidChangeTitle(_ title: String) {
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -670,6 +706,21 @@ extension TerminalRuntime:
             pane?.recordTerminalProgress(state: "paused", percent: percent)
         }
     }
+
+    func terminalDidRequestOpenURL(_ url: String, kind: TerminalOpenURLKind) {
+        if let path = ArtifactLinkResolver.path(from: url) {
+            showArtifact(path: path)
+            return
+        }
+        guard let destination = URL(string: url),
+              let scheme = destination.scheme?.lowercased(),
+              ["http", "https", "mailto"].contains(scheme) else { return }
+        NSWorkspace.shared.open(destination)
+    }
+
+    func terminalDidUpdateHoverLink(_ url: String?) {
+        hoveredLink = url
+    }
 }
 
 @MainActor
@@ -678,6 +729,10 @@ final class RelayGhosttyView: TerminalView {
 
     override func mouseDown(with event: NSEvent) {
         owner?.selectPane()
+        if event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+           owner?.openHoveredArtifact() == true {
+            return
+        }
         super.mouseDown(with: event)
     }
 

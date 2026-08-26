@@ -788,3 +788,21 @@ func terminalSemanticState() {
     #expect(pane.terminalProgressState == "running")
     #expect(pane.terminalProgressPercent == 42)
 }
+
+@Test("Artifact links round-trip remote image paths")
+func artifactLinksRoundTripRemotePaths() {
+    let path = "/home/kbd606/.codex/generated_images/demo image.png"
+    let link = ArtifactLinkResolver.link(for: path)
+    #expect(ArtifactLinkResolver.path(from: link) == path)
+    #expect(ArtifactLinkResolver.path(from: "file:///tmp/demo.png") == "/tmp/demo.png")
+    #expect(ArtifactLinkResolver.path(from: "https://example.com/demo.png") == nil)
+}
+
+@Test("Artifact hyperlinks preserve visible terminal text")
+func artifactHyperlinksPreserveVisiblePath() {
+    let path = "/tmp/F2D-desktop-evidence-spine.png"
+    let encoded = ArtifactHyperlinkEncoder.encode(Data("saved: \(path)\r\n".utf8))
+    let output = String(decoding: encoded, as: UTF8.self)
+    #expect(output.contains("\u{001B}]8;;relay-artifact://open/"))
+    #expect(output.contains(path))
+}

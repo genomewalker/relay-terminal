@@ -2199,7 +2199,17 @@ private struct ArtifactPreview: View {
     let dismiss: () -> Void
     @State private var offset: CGSize = .zero
     @GestureState private var dragTranslation: CGSize = .zero
-    @State private var isExpanded = false
+    @State private var panelSize = CGSize(width: 360, height: 354)
+    @GestureState private var resizeTranslation: CGSize = .zero
+
+    private var displayedSize: CGSize {
+        CGSize(
+            width: min(760, max(260, panelSize.width + resizeTranslation.width)),
+            height: min(680, max(180, panelSize.height + resizeTranslation.height))
+        )
+    }
+
+    private var isExpanded: Bool { panelSize.width > 400 || panelSize.height > 400 }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2214,7 +2224,11 @@ private struct ArtifactPreview: View {
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 Button {
-                    withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
+                    withAnimation(.easeOut(duration: 0.16)) {
+                        panelSize = isExpanded
+                            ? CGSize(width: 360, height: 354)
+                            : CGSize(width: 560, height: 554)
+                    }
                 } label: {
                     Image(systemName: isExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                         .font(.system(size: 9, weight: .bold))
@@ -2253,16 +2267,42 @@ private struct ArtifactPreview: View {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
-                    .frame(maxWidth: isExpanded ? 560 : 360, maxHeight: isExpanded ? 520 : 320)
+                    .frame(
+                        width: displayedSize.width,
+                        height: max(1, displayedSize.height - 34)
+                    )
                     .background(Color.black.opacity(0.24))
                     .accessibilityLabel("Generated image: \(artifact.filename)")
             }
         }
-        .frame(width: isExpanded ? 560 : 360)
+        .frame(width: displayedSize.width, height: displayedSize.height)
         .background(RelayTheme.elevated)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.55)) }
         .shadow(color: .black.opacity(0.3), radius: 16, y: 7)
+        .overlay(alignment: .bottomTrailing) {
+            Image(systemName: "arrow.down.right.and.arrow.up.left")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(RelayTheme.textMuted)
+                .frame(width: 26, height: 26)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 7))
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .updating($resizeTranslation) { value, state, _ in
+                            state = value.translation
+                        }
+                        .onEnded { value in
+                            panelSize = CGSize(
+                                width: min(760, max(260, panelSize.width + value.translation.width)),
+                                height: min(680, max(180, panelSize.height + value.translation.height))
+                            )
+                        }
+                )
+                .accessibilityLabel("Resize image pane")
+                .accessibilityHint("Drag to resize")
+                .padding(6)
+        }
         .offset(
             x: offset.width + dragTranslation.width,
             y: offset.height + dragTranslation.height
