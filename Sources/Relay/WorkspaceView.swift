@@ -2195,18 +2195,65 @@ private struct EditorNavigator: View {
 }
 
 private struct ArtifactPreview: View {
+    private enum ResizeCorner: CaseIterable {
+        case topLeft, topRight, bottomLeft, bottomRight
+
+        var xDirection: CGFloat {
+            switch self {
+            case .topLeft, .bottomLeft: -1
+            case .topRight, .bottomRight: 1
+            }
+        }
+
+        var yDirection: CGFloat {
+            switch self {
+            case .topLeft, .topRight: -1
+            case .bottomLeft, .bottomRight: 1
+            }
+        }
+
+        var alignment: Alignment {
+            switch self {
+            case .topLeft: .topLeading
+            case .topRight: .topTrailing
+            case .bottomLeft: .bottomLeading
+            case .bottomRight: .bottomTrailing
+            }
+        }
+
+        var accessibilityName: String {
+            switch self {
+            case .topLeft: "top-left"
+            case .topRight: "top-right"
+            case .bottomLeft: "bottom-left"
+            case .bottomRight: "bottom-right"
+            }
+        }
+    }
+
+    private struct ResizeGestureState {
+        let corner: ResizeCorner
+        let translation: CGSize
+    }
+
+    private struct ResizeMetrics {
+        let size: CGSize
+        let centerShift: CGSize
+    }
+
     let artifact: PaneArtifact
     let dismiss: () -> Void
     @State private var offset: CGSize = .zero
     @GestureState private var dragTranslation: CGSize = .zero
     @State private var panelSize = CGSize(width: 360, height: 354)
-    @GestureState private var resizeTranslation: CGSize = .zero
+    @GestureState private var resizeGesture: ResizeGestureState?
 
     private var displayedSize: CGSize {
-        CGSize(
-            width: min(760, max(260, panelSize.width + resizeTranslation.width)),
-            height: min(680, max(180, panelSize.height + resizeTranslation.height))
-        )
+        resizeMetrics(for: resizeGesture).size
+    }
+
+    private var displayedCenterShift: CGSize {
+        resizeMetrics(for: resizeGesture).centerShift
     }
 
     private var isExpanded: Bool { panelSize.width > 400 || panelSize.height > 400 }
@@ -2280,33 +2327,64 @@ private struct ArtifactPreview: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.55)) }
         .shadow(color: .black.opacity(0.3), radius: 16, y: 7)
-        .overlay(alignment: .bottomTrailing) {
-            Image(systemName: "arrow.down.right.and.arrow.up.left")
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(RelayTheme.textMuted)
-                .frame(width: 26, height: 26)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 7))
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 1)
-                        .updating($resizeTranslation) { value, state, _ in
-                            state = value.translation
-                        }
-                        .onEnded { value in
-                            panelSize = CGSize(
-                                width: min(760, max(260, panelSize.width + value.translation.width)),
-                                height: min(680, max(180, panelSize.height + value.translation.height))
-                            )
-                        }
-                )
-                .accessibilityLabel("Resize image pane")
-                .accessibilityHint("Drag to resize")
-                .padding(6)
+        .overlay {
+            ZStack {
+                ForEach(ResizeCorner.allCases, id: \.self) { corner in
+                    resizeHandle(corner)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: corner.alignment)
+                }
+            }
         }
         .offset(
-            x: offset.width + dragTranslation.width,
-            y: offset.height + dragTranslation.height
+            x: offset.width + dragTranslation.width + displayedCenterShift.width,
+            y: offset.height + dragTranslation.height + displayedCenterShift.height
         )
+    }
+
+    private func resizeMetrics(for gesture: ResizeGestureState?) -> ResizeMetrics {
+        guard let gesture else { return ResizeMetrics(size: panelSize, centerShift: .zero) }
+        return resizeMetrics(corner: gesture.corner, translation: gesture.translation)
+    }
+
+    private func resizeMetrics(corner: ResizeCorner, translation: CGSize) -> ResizeMetrics {
+        let width = min(760, max(260, panelSize.width + translation.width * corner.xDirection))
+        let height = min(680, max(180, panelSize.height + translation.height * corner.yDirection))
+        let widthChange = width - panelSize.width
+        let heightChange = height - panelSize.height
+        return ResizeMetrics(
+            size: CGSize(width: width, height: height),
+            centerShift: CGSize(
+                width: widthChange * corner.xDirection / 2,
+                height: heightChange * corner.yDirection / 2
+            )
+        )
+    }
+
+    private func resizeHandle(_ corner: ResizeCorner) -> some View {
+        Image(systemName: "arrow.up.left.and.arrow.down.right")
+            .font(.system(size: 8, weight: .bold))
+            .rotationEffect(
+                (corner == .topRight || corner == .bottomLeft) ? .degrees(90) : .zero
+            )
+            .foregroundStyle(RelayTheme.textMuted)
+            .frame(width: 24, height: 24)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .updating($resizeGesture) { value, state, _ in
+                        state = ResizeGestureState(corner: corner, translation: value.translation)
+                    }
+                    .onEnded { value in
+                        let metrics = resizeMetrics(corner: corner, translation: value.translation)
+                        panelSize = metrics.size
+                        offset.width += metrics.centerShift.width
+                        offset.height += metrics.centerShift.height
+                    }
+            )
+            .accessibilityLabel("Resize image pane from (corner.accessibilityName) corner")
+            .accessibilityHint("Drag to resize")
+            .padding(5)
     }
 }
 
