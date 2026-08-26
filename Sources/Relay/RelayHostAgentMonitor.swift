@@ -254,9 +254,9 @@ private final class RelayLegacyHostAgentTransport: @unchecked Sendable {
         ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         ssh.arguments = [
             "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-            "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=10",
-            "-o", "ServerAliveCountMax=2", "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=10m", "-o", "ControlPath=~/.ssh/relay-%C",
+            "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=2",
+            "-o", "ServerAliveCountMax=2", "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
         ] + profile.sshConnectionArguments + [
             "~/.local/bin/relayd", "observe-many", "--sessions", sessionList,
         ]

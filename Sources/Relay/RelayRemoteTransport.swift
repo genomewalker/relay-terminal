@@ -401,11 +401,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=8",
             "-o", "ConnectionAttempts=1",
-            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveInterval=2",
             "-o", "ServerAliveCountMax=2",
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=10m",
-            "-o", "ControlPath=~/.ssh/relay-%C",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
         ]
         arguments += context.profile.sshConnectionArguments
         lock.lock()

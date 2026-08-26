@@ -52,8 +52,8 @@ enum RelayBridge {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=8",
             "-o", "ConnectionAttempts=1",
-            "-o", "ServerAliveInterval=5",
-            "-o", "ServerAliveCountMax=3",
+            "-o", "ServerAliveInterval=2",
+            "-o", "ServerAliveCountMax=2",
             // The application already multiplexes logical terminal channels.
             // Reusing an OpenSSH control master here can retain a dead TCP path
             // across VPN changes and make a reconnect look alive while no

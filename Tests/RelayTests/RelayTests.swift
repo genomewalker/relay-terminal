@@ -424,6 +424,8 @@ func terminalInputIdentityIsProcessScoped() {
 @Test("Node heartbeat watchdog distinguishes delayed from stalled replies")
 func nodeHeartbeatWatchdog() {
     let timeout = RelayHeartbeatPolicy.timeoutNanoseconds
+    #expect(RelayHeartbeatPolicy.intervalSeconds == 2)
+    #expect(timeout == 6_000_000_000)
     let now = timeout + 100
     let pending: [UInt64: UInt64] = [
         1: 99,

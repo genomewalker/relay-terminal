@@ -45,7 +45,7 @@ A local pane maps one-to-one to a durable remote `relayd` session UUID. Splittin
 - Inline Kitty-graphics rendering or dismissible native previews for PNG/JPEG/GIF/WebP files referenced by remote Codex or Claude output
 - Live macOS Settings (`⌘,`) for font, size, terminal padding, palette, interface density, full-screen chrome, and artifact previews
 - Workspace restoration using stable pane/session UUIDs
-- One persistent SSH transport per connected node, with independent virtual pane and agent channels
+- One persistent SSH transport per connected node, with independent virtual pane and agent channels; protocol heartbeats replace even a completely frozen SSH process in about ten seconds
 - Remote workspace snapshots for tabs, split geometry, floating panes, editor panes, and selection
 - Per-pane input ownership and short remote-layout leases for safe multi-client attachment
 - Explicit terminate/forget commands and startup-bounded retention GC that never selects running panes

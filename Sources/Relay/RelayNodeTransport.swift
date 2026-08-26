@@ -37,8 +37,12 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
 enum RelayNodeTransportError: Error { case disconnected, invalidEnvelope }
 
 enum RelayHeartbeatPolicy {
-    static let intervalSeconds = 10
-    static let timeoutNanoseconds: UInt64 = 30_000_000_000
+    // A half-open SSH socket is the common failure mode when a VPN route is
+    // replaced: the local process remains alive but no bytes move. Three
+    // lightweight protocol probes give the route time to recover without
+    // leaving an interactive pane frozen for the previous 30–40 seconds.
+    static let intervalSeconds = 2
+    static let timeoutNanoseconds: UInt64 = 6_000_000_000
 
     static func expired(_ pending: [UInt64: UInt64], now: UInt64) -> [UInt64] {
         guard now >= timeoutNanoseconds else { return [] }
@@ -181,7 +185,7 @@ final class RelayNodeConnection: @unchecked Sendable {
         ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         ssh.arguments = [
             "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1",
-            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
+            "-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=2",
             // Relay already multiplexes every pane over this one process. A
             // persistent OpenSSH control master adds a second connection
             // owner that can survive a VPN route change and trap retries on
