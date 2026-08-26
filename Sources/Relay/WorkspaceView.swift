@@ -2247,6 +2247,10 @@ private struct ArtifactPreview: View {
     @GestureState private var dragTranslation: CGSize = .zero
     @State private var panelSize = CGSize(width: 360, height: 354)
     @GestureState private var resizeGesture: ResizeGestureState?
+    @State private var imageZoom: CGFloat = 1
+    @GestureState private var pinchZoom: CGFloat = 1
+    @State private var imagePan: CGSize = .zero
+    @GestureState private var imagePanTranslation: CGSize = .zero
 
     private var displayedSize: CGSize {
         resizeMetrics(for: resizeGesture).size
@@ -2256,7 +2260,7 @@ private struct ArtifactPreview: View {
         resizeMetrics(for: resizeGesture).centerShift
     }
 
-    private var isExpanded: Bool { panelSize.width > 400 || panelSize.height > 400 }
+    private var displayedZoom: CGFloat { min(6, max(1, imageZoom * pinchZoom)) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2271,19 +2275,37 @@ private struct ArtifactPreview: View {
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 Button {
-                    withAnimation(.easeOut(duration: 0.16)) {
-                        panelSize = isExpanded
-                            ? CGSize(width: 360, height: 354)
-                            : CGSize(width: 560, height: 554)
-                    }
+                    setZoom(imageZoom - 0.25)
                 } label: {
-                    Image(systemName: isExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 9, weight: .bold))
-                        .frame(width: 22, height: 22)
+                    Text("−")
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(width: 18, height: 22)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
-                .accessibilityLabel(isExpanded ? "Restore image size" : "Enlarge image")
+                .disabled(imageZoom <= 1)
+                .accessibilityLabel("Zoom out")
+                Button {
+                    resetImageView()
+                } label: {
+                    Text("\(Int((imageZoom * 100).rounded()))%")
+                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                        .frame(minWidth: 34, minHeight: 22)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .accessibilityLabel("Reset image zoom")
+                Button {
+                    setZoom(imageZoom + 0.25)
+                } label: {
+                    Text("+")
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(width: 18, height: 22)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .disabled(imageZoom >= 6)
+                .accessibilityLabel("Zoom in")
                 Button(action: dismiss) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
@@ -2298,7 +2320,7 @@ private struct ArtifactPreview: View {
             .background(RelayTheme.elevated)
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 2)
+                DragGesture(minimumDistance: 2, coordinateSpace: .global)
                     .updating($dragTranslation) { value, state, _ in state = value.translation }
                     .onEnded { value in
                         offset.width += value.translation.width
@@ -2311,15 +2333,37 @@ private struct ArtifactPreview: View {
             .help("Drag to move · double-click to reset")
 
             if let image = artifact.image {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(
-                        width: displayedSize.width,
-                        height: max(1, displayedSize.height - 34)
-                    )
-                    .background(Color.black.opacity(0.24))
-                    .accessibilityLabel("Generated image: \(artifact.filename)")
+                GeometryReader { proxy in
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .scaleEffect(displayedZoom)
+                        .offset(clampedImagePan(in: proxy.size))
+                        .accessibilityLabel("Generated image: \(artifact.filename)")
+                }
+                .background(Color.black.opacity(0.24))
+                .contentShape(Rectangle())
+                .clipped()
+                .gesture(
+                    MagnificationGesture()
+                        .updating($pinchZoom) { value, state, _ in state = value }
+                        .onEnded { value in setZoom(imageZoom * value) }
+                )
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                        .updating($imagePanTranslation) { value, state, _ in
+                            guard displayedZoom > 1 else { return }
+                            state = value.translation
+                        }
+                        .onEnded { value in
+                            guard imageZoom > 1 else { return }
+                            imagePan.width += value.translation.width
+                            imagePan.height += value.translation.height
+                        }
+                )
+                .onTapGesture(count: 2) { resetImageView() }
+                .help("Pinch to zoom · drag to pan · double-click to reset")
             }
         }
         .frame(width: displayedSize.width, height: displayedSize.height)
@@ -2361,17 +2405,11 @@ private struct ArtifactPreview: View {
     }
 
     private func resizeHandle(_ corner: ResizeCorner) -> some View {
-        Image(systemName: "arrow.up.left.and.arrow.down.right")
-            .font(.system(size: 8, weight: .bold))
-            .rotationEffect(
-                (corner == .topRight || corner == .bottomLeft) ? .degrees(90) : .zero
-            )
-            .foregroundStyle(RelayTheme.textMuted)
-            .frame(width: 24, height: 24)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 7))
+        Color.clear
+            .frame(width: 14, height: 14)
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 1)
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .updating($resizeGesture) { value, state, _ in
                         state = ResizeGestureState(corner: corner, translation: value.translation)
                     }
@@ -2382,9 +2420,34 @@ private struct ArtifactPreview: View {
                         offset.height += metrics.centerShift.height
                     }
             )
-            .accessibilityLabel("Resize image pane from (corner.accessibilityName) corner")
+            .accessibilityLabel("Resize image pane from \(corner.accessibilityName) corner")
             .accessibilityHint("Drag to resize")
-            .padding(5)
+    }
+
+    private func setZoom(_ proposedZoom: CGFloat) {
+        imageZoom = min(6, max(1, proposedZoom))
+        if imageZoom == 1 { imagePan = .zero }
+    }
+
+    private func resetImageView() {
+        withAnimation(.easeOut(duration: 0.14)) {
+            imageZoom = 1
+            imagePan = .zero
+        }
+    }
+
+    private func clampedImagePan(in viewport: CGSize) -> CGSize {
+        guard displayedZoom > 1 else { return .zero }
+        let proposed = CGSize(
+            width: imagePan.width + imagePanTranslation.width,
+            height: imagePan.height + imagePanTranslation.height
+        )
+        let maximumX = viewport.width * (displayedZoom - 1) / 2
+        let maximumY = viewport.height * (displayedZoom - 1) / 2
+        return CGSize(
+            width: min(maximumX, max(-maximumX, proposed.width)),
+            height: min(maximumY, max(-maximumY, proposed.height))
+        )
     }
 }
 
