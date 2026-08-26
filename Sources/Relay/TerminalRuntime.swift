@@ -60,6 +60,7 @@ final class TerminalRuntime: NSObject {
         let io = self.io
         let activityCoalescer = self.activityCoalescer
         let artifactCoordinator = self.artifactCoordinator
+        let artifactProfile = pane.profile
         remote.start(
             profile: pane.profile,
             sessionID: pane.id.uuidString.lowercased(),
@@ -73,23 +74,22 @@ final class TerminalRuntime: NSObject {
                 guard let text = String(data: data, encoding: .utf8) else { return }
                 if artifactsEnabled {
                     for path in artifactCoordinator.discover(in: text) {
-                        Task {
+                        Task { @Sendable [weak self] in
                             // Modern workers put a structured artifact frame
                             // directly after this output. Give it priority and
                             // only open a separate SSH fetch for older workers.
                             try? await Task.sleep(for: .milliseconds(150))
                             guard artifactCoordinator.beginFallback(for: path) else { return }
-                            guard let data = try? await RemoteArtifactLoader.load(path: path, profile: pane.profile),
+                            guard let data = try? await RemoteArtifactLoader.load(path: path, profile: artifactProfile),
                                   artifactCoordinator.acceptFallback(for: path) else { return }
                             if artifactPresentation == .inline {
                                 io.receiveInlineImageOrdered(
                                     data,
                                     imageID: Self.stableImageID(for: path)
                                 )
-                            } else {
-                                await MainActor.run { [weak self] in
-                                    self?.pane?.receivedArtifact(path: path, data: data)
-                                }
+                            }
+                            await MainActor.run { [weak self] in
+                                self?.pane?.receivedArtifact(path: path, data: data)
                             }
                         }
                     }
@@ -157,10 +157,9 @@ final class TerminalRuntime: NSObject {
                         artifact.data,
                         imageID: Self.stableImageID(for: artifact.path)
                     )
-                } else {
-                    Task { @MainActor [weak self] in
-                        self?.pane?.receivedArtifact(path: artifact.path, data: artifact.data)
-                    }
+                }
+                Task { @MainActor [weak self] in
+                    self?.pane?.receivedArtifact(path: artifact.path, data: artifact.data)
                 }
             },
             onDisconnect: { [weak self] message in

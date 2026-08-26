@@ -1854,6 +1854,7 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
 
 private struct PaneView: View {
     @ObservedObject var pane: PaneModel
+    @ObservedObject private var preferences = RelayPreferences.shared
     let isActive: Bool
     let compactChrome: Bool
     let select: () -> Void
@@ -1912,7 +1913,8 @@ private struct PaneView: View {
                         .frame(maxHeight: .infinity, alignment: .top)
                         .padding(12)
                 }
-                if let artifact = pane.artifacts.last {
+                if preferences.artifactPresentation == .preview,
+                   let artifact = pane.artifacts.last {
                     ArtifactPreview(artifact: artifact) {
                         pane.dismissArtifact(artifact.id)
                     }
@@ -1920,6 +1922,13 @@ private struct PaneView: View {
                     .padding(12)
                     .zIndex(100)
                 }
+            }
+            if preferences.artifactPresentation == .inline,
+               let artifact = pane.artifacts.last {
+                InlineArtifactView(artifact: artifact) {
+                    pane.dismissArtifact(artifact.id)
+                }
+                .frame(height: min(300, max(120, paneSize.height * 0.4)))
             }
         }
         .background(RelayTheme.canvas)
@@ -2225,6 +2234,47 @@ private struct ArtifactPreview: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.55)) }
         .shadow(color: .black.opacity(0.3), radius: 16, y: 7)
+    }
+}
+
+private struct InlineArtifactView: View {
+    let artifact: PaneArtifact
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: "photo")
+                    .foregroundStyle(RelayTheme.blue)
+                Text(artifact.filename)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Button(action: dismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .accessibilityLabel("Close inline image")
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+
+            if let image = artifact.image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black.opacity(0.2))
+                    .accessibilityLabel("Generated image: \(artifact.filename)")
+            }
+        }
+        .background(RelayTheme.canvas)
+        .overlay(alignment: .top) {
+            Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(height: 1)
+        }
     }
 }
 

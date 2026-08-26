@@ -39,3 +39,12 @@ func TestInlineImageMagic(t *testing.T) {
 		t.Fatal("inline image format validation failed")
 	}
 }
+
+func TestArtifactTemporaryRootBoundary(t *testing.T) {
+	if !pathWithinRoot("/tmp/generated/image.png", "/tmp") {
+		t.Fatal("expected image below temporary root")
+	}
+	if pathWithinRoot("/tmp-other/image.png", "/tmp") {
+		t.Fatal("temporary root prefix must respect path boundaries")
+	}
+}

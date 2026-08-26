@@ -684,8 +684,10 @@ final class PaneModel: ObservableObject, Identifiable {
     func receivedArtifact(path: String, data: Data) {
         guard RelayPreferences.shared.showArtifactPreviews,
               !artifacts.contains(where: { $0.remotePath == path }) else { return }
-        artifacts.append(PaneArtifact(remotePath: path, data: data))
-        artifacts = Array(artifacts.suffix(8))
+        // The pane presents one generated asset at a time. Retaining an
+        // invisible stack made Close reveal the previous image immediately,
+        // which looked as if the button had failed.
+        artifacts = [PaneArtifact(remotePath: path, data: data)]
         artifactError = nil
     }
 

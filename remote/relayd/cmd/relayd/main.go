@@ -222,6 +222,10 @@ func resolveArtifactPath(requested, home string, uid int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
 	allowedRoots := []string{filepath.Clean(home), filepath.Join("/tmp", "claude-"+strconv.Itoa(uid))}
 	allowed := false
 	for _, root := range allowedRoots {
@@ -234,12 +238,17 @@ func resolveArtifactPath(requested, home string, uid int) (string, error) {
 			break
 		}
 	}
+	temporaryRoot := os.TempDir()
+	if canonical, rootErr := filepath.EvalSymlinks(temporaryRoot); rootErr == nil {
+		temporaryRoot = canonical
+	}
+	if !allowed && pathIsWithin(resolved, temporaryRoot) {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid == uint32(uid) {
+			allowed = true
+		}
+	}
 	if !allowed {
 		return "", fmt.Errorf("artifact path is outside allowed directories")
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", err
 	}
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("artifact is not a regular file")
@@ -248,6 +257,11 @@ func resolveArtifactPath(requested, home string, uid int) (string, error) {
 		return "", fmt.Errorf("artifact exceeds 25 MiB")
 	}
 	return resolved, nil
+}
+
+func pathIsWithin(path, root string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !filepath.IsAbs(relative) && !startsWithParent(relative)
 }
 
 func startsWithParent(path string) bool {

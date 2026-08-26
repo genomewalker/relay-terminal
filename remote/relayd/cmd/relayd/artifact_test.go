@@ -35,7 +35,9 @@ func TestResolveArtifactPathRejectsEscapingSymlink(t *testing.T) {
 	if err := os.Symlink(outside, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resolveArtifactPath(link, home, 501); err == nil {
+	// Even a path reached through an allowed-directory symlink must be
+	// rejected when the resolved temporary file belongs to another user.
+	if _, err := resolveArtifactPath(link, home, os.Getuid()+1); err == nil {
 		t.Fatal("expected escaping symlink to be rejected")
 	}
 }
@@ -77,5 +79,23 @@ func TestResolveArtifactPathAllowsRelativeCodexImage(t *testing.T) {
 func TestResolveArtifactPathRejectsOtherRelativePaths(t *testing.T) {
 	if _, err := resolveArtifactPath(".ssh/id_rsa", t.TempDir(), 501); err == nil {
 		t.Fatal("expected unrelated relative path to be rejected")
+	}
+}
+
+func TestResolveArtifactPathAllowsOwnedTemporaryImage(t *testing.T) {
+	file, err := os.CreateTemp("", "relay-owned-*.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if _, err := file.Write([]byte("png")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveArtifactPath(path, t.TempDir(), os.Getuid()); err != nil {
+		t.Fatal(err)
 	}
 }

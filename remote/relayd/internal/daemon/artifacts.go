@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const maxInlineArtifactBytes = 12 << 20
@@ -64,6 +65,10 @@ func loadInlineArtifact(requested string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxInlineArtifactBytes {
+		return nil, os.ErrInvalid
+	}
 	allowedRoots := []string{home, filepath.Join("/tmp", "claude-"+strconv.Itoa(os.Getuid()))}
 	allowed := false
 	for _, root := range allowedRoots {
@@ -76,18 +81,29 @@ func loadInlineArtifact(requested string) ([]byte, error) {
 			break
 		}
 	}
+	temporaryRoot := os.TempDir()
+	if canonical, rootErr := filepath.EvalSymlinks(temporaryRoot); rootErr == nil {
+		temporaryRoot = canonical
+	}
+	if !allowed && pathWithinRoot(resolved, temporaryRoot) {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid == uint32(os.Getuid()) {
+			allowed = true
+		}
+	}
 	if !allowed {
 		return nil, os.ErrPermission
-	}
-	info, err := os.Stat(resolved)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxInlineArtifactBytes {
-		return nil, os.ErrInvalid
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil || !isInlineImage(data) {
 		return nil, os.ErrInvalid
 	}
 	return data, nil
+}
+
+func pathWithinRoot(path, root string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !filepath.IsAbs(relative) &&
+		!strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func isInlineImage(data []byte) bool {

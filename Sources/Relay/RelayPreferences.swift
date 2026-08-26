@@ -41,7 +41,7 @@ enum RelayTerminalPalette: String, CaseIterable, Identifiable {
     }
 }
 
-enum RelayArtifactPresentation: String, CaseIterable, Identifiable {
+enum RelayArtifactPresentation: String, CaseIterable, Identifiable, Sendable {
     case inline
     case preview
 
