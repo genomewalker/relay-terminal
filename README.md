@@ -104,6 +104,8 @@ Install a release by opening `Relay-<version>-macOS.dmg` and dragging Relay to A
 - `⇧⌘↑` / `⇧⌘↓`: previous/next semantic shell prompt
 - `⌘,`: settings
 
+Change Relay shortcuts in **Settings → Keyboard → Customize shortcuts**. Relay rejects duplicate assignments, lets each action be reset independently, and reserves `⌘W` for closing or detaching the active pane instead of the workspace window.
+
 Drag a pane by its connection header and drop it near another pane's left, right, top, or bottom edge to dock it there. Drop in the center to swap tiled panes. The remote PTYs keep their identities and continue running during the move.
 
 ## Current limits

@@ -2,14 +2,35 @@ import AppKit
 import SwiftUI
 
 final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
+    private var keyboardMonitor: Any?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         RelayCrashRecovery.shared.beginLaunch()
         RelayDiagnostics.shared.record(category: "app", name: "launched", details: [
             "safe_mode": String(RelayLaunchMode.isSafeMode),
         ])
+        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard NSApp.keyWindow?.identifier == .relayWorkspaceWindow,
+                  RelayKeyBinding(event: event) == RelayCommand.closePane.defaultBinding else {
+                return event
+            }
+            let configured = RelayKeyBindingStorage.binding(
+                for: .closePane,
+                overrides: RelayKeyBindingStorage.load()
+            )
+            if configured == RelayCommand.closePane.defaultBinding {
+                NotificationCenter.default.post(name: .relayClosePane, object: nil)
+            }
+            // Never let the standard macOS Close Window handler consume ⌘W
+            // in the workspace. If the user moved Close Pane elsewhere, ⌘W
+            // becomes intentionally unassigned for this window.
+            return nil
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor) }
+        keyboardMonitor = nil
         RelayDiagnostics.shared.record(category: "app", name: "clean-shutdown")
         RelayCrashRecovery.shared.cleanShutdown()
     }
@@ -23,11 +44,17 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
 struct RelayApp: App {
     @NSApplicationDelegateAdaptor(RelayApplicationDelegate.self) private var applicationDelegate
     @StateObject private var workspace = WorkspaceModel()
+    @StateObject private var preferences = RelayPreferences.shared
+
+    private func shortcut(_ command: RelayCommand) -> RelayKeyBinding {
+        preferences.keyBinding(for: command)
+    }
 
     var body: some Scene {
         WindowGroup {
             WorkspaceView(workspace: workspace)
                 .frame(minWidth: 880, minHeight: 560)
+                .background(RelayWorkspaceWindowMarker().frame(width: 0, height: 0))
                 .preferredColorScheme(.dark)
                 .onReceive(NotificationCenter.default.publisher(for: .relaySelectPane)) { note in
                     if let id = note.object as? UUID { workspace.selectPane(id) }
@@ -53,64 +80,64 @@ struct RelayApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New tab in session") { workspace.newTabInActiveSession() }
-                    .keyboardShortcut("t", modifiers: .command)
+                    .keyboardShortcut(shortcut(.newTab).keyEquivalent, modifiers: shortcut(.newTab).eventModifiers)
                 Button("New local session") { workspace.newTab(profile: .local) }
-                    .keyboardShortcut("t", modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.newLocalSession).keyEquivalent, modifiers: shortcut(.newLocalSession).eventModifiers)
                 Button("Find SSH host…") { workspace.presentHostLauncher() }
-                    .keyboardShortcut("k", modifiers: .command)
+                    .keyboardShortcut(shortcut(.findHost).keyEquivalent, modifiers: shortcut(.findHost).eventModifiers)
                 Button("Connect to host…") { workspace.presentConnectionSheet() }
-                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.connectHost).keyEquivalent, modifiers: shortcut(.connectHost).eventModifiers)
             }
             CommandMenu("Pane") {
                 Button("Open remote editor") { workspace.openEditorForActive() }
-                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.openEditor).keyEquivalent, modifiers: shortcut(.openEditor).eventModifiers)
                     .disabled(workspace.activePane?.profile.kind != .ssh || workspace.activePane?.profile.backend != .relay)
                 Divider()
                 Button(workspace.zoomedPaneID == workspace.activePaneID ? "Restore pane layout" : "Zoom active pane") {
                     workspace.toggleActivePaneZoom()
                 }
-                    .keyboardShortcut(.return, modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.zoomPane).keyEquivalent, modifiers: shortcut(.zoomPane).eventModifiers)
                 Button("Float or dock active pane") {
                     workspace.toggleActivePaneFloating()
                 }
-                    .keyboardShortcut("p", modifiers: [.command, .option])
+                    .keyboardShortcut(shortcut(.floatPane).keyEquivalent, modifiers: shortcut(.floatPane).eventModifiers)
                 Button("Balance pane layout") { workspace.balanceActiveTabPanes() }
-                    .keyboardShortcut("=", modifiers: [.command, .option])
+                    .keyboardShortcut(shortcut(.balancePanes).keyEquivalent, modifiers: shortcut(.balancePanes).eventModifiers)
                 Divider()
                 Button("Split right") { workspace.splitActive(axis: .horizontal) }
-                    .keyboardShortcut("d", modifiers: .command)
+                    .keyboardShortcut(shortcut(.splitRight).keyEquivalent, modifiers: shortcut(.splitRight).eventModifiers)
                 Button("Split down") { workspace.splitActive(axis: .vertical) }
-                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.splitDown).keyEquivalent, modifiers: shortcut(.splitDown).eventModifiers)
                 Button("New floating pane") { workspace.newFloatingPane() }
-                    .keyboardShortcut("f", modifiers: [.command, .option])
+                    .keyboardShortcut(shortcut(.newFloatingPane).keyEquivalent, modifiers: shortcut(.newFloatingPane).eventModifiers)
                 Divider()
                 Button("Previous pane") { workspace.selectAdjacentPane(offset: -1) }
-                    .keyboardShortcut("[", modifiers: [.command, .option])
+                    .keyboardShortcut(shortcut(.previousPane).keyEquivalent, modifiers: shortcut(.previousPane).eventModifiers)
                 Button("Next pane") { workspace.selectAdjacentPane(offset: 1) }
-                    .keyboardShortcut("]", modifiers: [.command, .option])
+                    .keyboardShortcut(shortcut(.nextPane).keyEquivalent, modifiers: shortcut(.nextPane).eventModifiers)
                 Divider()
                 Button("Previous prompt") { _ = workspace.activePane?.runtime.jumpToPrompt(by: -1) }
-                    .keyboardShortcut(.upArrow, modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.previousPrompt).keyEquivalent, modifiers: shortcut(.previousPrompt).eventModifiers)
                 Button("Next prompt") { _ = workspace.activePane?.runtime.jumpToPrompt(by: 1) }
-                    .keyboardShortcut(.downArrow, modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.nextPrompt).keyEquivalent, modifiers: shortcut(.nextPrompt).eventModifiers)
                     .disabled(workspace.activePane?.contentKind != .terminal)
                 Divider()
                 Button(workspace.activePane?.profile.kind == .ssh ? "Detach pane" : "Close pane") {
                     workspace.closeActivePane()
                 }
-                    .keyboardShortcut("w", modifiers: .command)
+                    .keyboardShortcut(shortcut(.closePane).keyEquivalent, modifiers: shortcut(.closePane).eventModifiers)
             }
             CommandMenu("Tab") {
                 Button("Previous tab") { workspace.selectTab(offset: -1) }
-                    .keyboardShortcut("[", modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.previousTab).keyEquivalent, modifiers: shortcut(.previousTab).eventModifiers)
                 Button("Next tab") { workspace.selectTab(offset: 1) }
-                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcut(.nextTab).keyEquivalent, modifiers: shortcut(.nextTab).eventModifiers)
             }
             CommandGroup(after: .sidebar) {
                 Button(workspace.sidebarVisible ? "Hide session rail" : "Show session rail") {
                     workspace.sidebarVisible.toggle()
                 }
-                .keyboardShortcut("s", modifiers: [.command, .control])
+                .keyboardShortcut(shortcut(.toggleSidebar).keyEquivalent, modifiers: shortcut(.toggleSidebar).eventModifiers)
             }
             CommandMenu("Diagnostics") {
                 Button("Export diagnostics…") {

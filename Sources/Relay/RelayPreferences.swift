@@ -62,6 +62,7 @@ final class RelayPreferences: ObservableObject {
     @Published var hideSidebarInFullScreen: Bool { didSet { save() } }
     @Published var showArtifactPreviews: Bool { didSet { save() } }
     @Published var artifactPresentation: RelayArtifactPresentation { didSet { save() } }
+    @Published private(set) var keyBindings: [String: RelayKeyBinding] { didSet { save() } }
 
     private let defaults = UserDefaults.standard
     private var isLoading = true
@@ -80,7 +81,31 @@ final class RelayPreferences: ObservableObject {
         artifactPresentation = RelayArtifactPresentation(
             rawValue: defaults.string(forKey: "relay.settings.artifact-presentation") ?? ""
         ) ?? .inline
+        keyBindings = RelayKeyBindingStorage.load(from: defaults)
         isLoading = false
+    }
+
+    func keyBinding(for command: RelayCommand) -> RelayKeyBinding {
+        RelayKeyBindingStorage.binding(for: command, overrides: keyBindings)
+    }
+
+    @discardableResult
+    func setKeyBinding(_ binding: RelayKeyBinding, for command: RelayCommand) -> RelayCommand? {
+        if let conflict = RelayKeyBindingStorage.conflict(
+            for: binding, command: command, overrides: keyBindings
+        ) {
+            return conflict
+        }
+        keyBindings[command.rawValue] = binding
+        return nil
+    }
+
+    func resetKeyBinding(_ command: RelayCommand) {
+        keyBindings.removeValue(forKey: command.rawValue)
+    }
+
+    func resetAllKeyBindings() {
+        keyBindings.removeAll()
     }
 
     func terminalConfiguration() -> TerminalConfiguration {
@@ -127,5 +152,6 @@ final class RelayPreferences: ObservableObject {
         defaults.set(hideSidebarInFullScreen, forKey: "relay.settings.hide-sidebar-fullscreen")
         defaults.set(showArtifactPreviews, forKey: "relay.settings.artifact-previews")
         defaults.set(artifactPresentation.rawValue, forKey: "relay.settings.artifact-presentation")
+        RelayKeyBindingStorage.save(keyBindings, to: defaults)
     }
 }

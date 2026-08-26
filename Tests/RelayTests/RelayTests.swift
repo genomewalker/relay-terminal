@@ -437,6 +437,38 @@ func nodeHeartbeatWatchdog() {
     #expect(RelayHeartbeatPolicy.expired([1: 0], now: timeout - 1).isEmpty)
 }
 
+@Test("Default keybindings are unique and close pane owns Command-W")
+func defaultKeyBindings() {
+    let bindings = RelayCommand.allCases.map(\.defaultBinding)
+    #expect(Set(bindings).count == bindings.count)
+    #expect(RelayCommand.closePane.defaultBinding == RelayKeyBinding("w", command: true))
+    #expect(RelayCommand.closePane.defaultBinding.displayName == "⌘W")
+}
+
+@Test("Custom keybindings persist and conflicts are rejected")
+func customKeyBindings() {
+    let suite = "relay-keybindings-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let custom = RelayKeyBinding("x", command: true, option: true)
+    RelayKeyBindingStorage.save([RelayCommand.closePane.rawValue: custom], to: defaults)
+    let loaded = RelayKeyBindingStorage.load(from: defaults)
+
+    #expect(RelayKeyBindingStorage.binding(for: .closePane, overrides: loaded) == custom)
+    #expect(RelayKeyBindingStorage.conflict(
+        for: RelayCommand.splitRight.defaultBinding,
+        command: .closePane,
+        overrides: loaded
+    ) == .splitRight)
+
+    let movedClose = [RelayCommand.closePane.rawValue: RelayKeyBinding("x", command: true, shift: true)]
+    #expect(RelayKeyBindingStorage.conflict(
+        for: RelayCommand.closePane.defaultBinding,
+        command: .splitRight,
+        overrides: movedClose
+    ) == .closePane)
+}
+
 @Test("Pane connection state exposes non-blocking recovery labels")
 func paneConnectionRecoveryState() {
     let vpn = PaneConnectionState.waitingForNetwork("retrying")

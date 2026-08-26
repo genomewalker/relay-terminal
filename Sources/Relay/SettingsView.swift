@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RelaySettingsView: View {
     @ObservedObject private var preferences = RelayPreferences.shared
+    @State private var showingKeyBindings = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -14,6 +15,9 @@ struct RelaySettingsView: View {
         .frame(width: 760, height: 500)
         .background(RelayTheme.canvas)
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showingKeyBindings) {
+            RelayKeyBindingsView()
+        }
     }
 
     private var settings: some View {
@@ -47,6 +51,31 @@ struct RelaySettingsView: View {
                     .pickerStyle(.segmented)
                     Toggle("Compact interface", isOn: $preferences.compactInterface)
                     Toggle("Hide navigator in full screen", isOn: $preferences.hideSidebarInFullScreen)
+                }
+
+                settingSection("Keyboard") {
+                    Button {
+                        showingKeyBindings = true
+                    } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: "keyboard")
+                                .foregroundStyle(RelayTheme.blue)
+                            Text("Customize shortcuts")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Spacer()
+                            Text(preferences.keyBinding(for: .closePane).displayName)
+                                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                .foregroundStyle(RelayTheme.textMuted)
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(RelayTheme.textMuted)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    Text("Shortcuts are checked for conflicts and update menus immediately.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(RelayTheme.textMuted)
                 }
 
                 settingSection("Images") {
@@ -131,5 +160,166 @@ struct RelaySettingsView: View {
                 .foregroundStyle(RelayTheme.textMuted)
                 .frame(width: 57, alignment: .trailing)
         }
+    }
+}
+
+private struct RelayKeyBindingsView: View {
+    @ObservedObject private var preferences = RelayPreferences.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var conflictMessage: String?
+
+    private let sections = ["Sessions", "Tabs", "Panes", "Workspace"]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Keybindings")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text("Click a shortcut, then press a new key combination.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(RelayTheme.textMuted)
+                }
+                Spacer()
+                Button("Reset all") {
+                    preferences.resetAllKeyBindings()
+                    conflictMessage = nil
+                }
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 22)
+            .frame(height: 70)
+
+            Divider().overlay(RelayTheme.line.opacity(0.5))
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    if let conflictMessage {
+                        Label(conflictMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(RelayTheme.coral)
+                            .padding(.horizontal, 12)
+                            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                            .background(RelayTheme.coral.opacity(0.09), in: RoundedRectangle(cornerRadius: 9))
+                    }
+
+                    ForEach(sections, id: \.self) { section in
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text(section)
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(RelayTheme.textMuted)
+                                .textCase(.uppercase)
+                                .tracking(0.5)
+
+                            VStack(spacing: 0) {
+                                let commands = RelayCommand.allCases.filter { $0.section == section }
+                                ForEach(Array(commands.enumerated()), id: \.element.id) { index, command in
+                                    keyBindingRow(command)
+                                    if index < commands.count - 1 {
+                                        Divider().overlay(RelayTheme.line.opacity(0.35))
+                                    }
+                                }
+                            }
+                            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                    .stroke(RelayTheme.line.opacity(0.45))
+                            }
+                        }
+                    }
+                }
+                .padding(22)
+            }
+        }
+        .frame(width: 590, height: 560)
+        .foregroundStyle(RelayTheme.text)
+        .background(RelayTheme.sidebar)
+        .preferredColorScheme(.dark)
+    }
+
+    private func keyBindingRow(_ command: RelayCommand) -> some View {
+        HStack(spacing: 12) {
+            Text(command.label)
+                .font(.system(size: 11.5))
+            Spacer()
+            if preferences.keyBindings[command.rawValue] != nil {
+                Button {
+                    preferences.resetKeyBinding(command)
+                    conflictMessage = nil
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(RelayTheme.textMuted)
+                }
+                .buttonStyle(.plain)
+                .help("Restore default")
+            }
+            RelayShortcutRecorderButton(binding: preferences.keyBinding(for: command)) { candidate in
+                if let conflict = preferences.setKeyBinding(candidate, for: command) {
+                    conflictMessage = "\(candidate.displayName) is already assigned to \(conflict.label)."
+                    NSSound.beep()
+                } else {
+                    conflictMessage = nil
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 40)
+    }
+}
+
+private struct RelayShortcutRecorderButton: View {
+    let binding: RelayKeyBinding
+    let onCapture: (RelayKeyBinding) -> Void
+    @State private var isRecording = false
+    @State private var monitor: Any?
+
+    var body: some View {
+        Button {
+            beginRecording()
+        } label: {
+            Text(isRecording ? "Type shortcut…" : binding.displayName)
+                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                .foregroundStyle(isRecording ? RelayTheme.canvas : RelayTheme.text)
+                .frame(minWidth: 74)
+                .padding(.horizontal, 8)
+                .frame(height: 25)
+                .background(
+                    isRecording ? RelayTheme.blue : RelayTheme.elevated,
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(isRecording ? RelayTheme.blue : RelayTheme.line.opacity(0.6))
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Shortcut: \(binding.displayName)")
+        .onDisappear { stopRecording() }
+    }
+
+    private func beginRecording() {
+        guard !isRecording else { return }
+        isRecording = true
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 {
+                stopRecording()
+                return nil
+            }
+            guard let candidate = RelayKeyBinding(event: event) else {
+                NSSound.beep()
+                return nil
+            }
+            onCapture(candidate)
+            stopRecording()
+            return nil
+        }
+    }
+
+    private func stopRecording() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+        isRecording = false
     }
 }
