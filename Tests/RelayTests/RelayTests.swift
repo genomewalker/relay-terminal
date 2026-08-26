@@ -456,6 +456,15 @@ func defaultKeyBindings() {
     #expect(RelayCommand.closePane.defaultBinding.displayName == "⌘W")
 }
 
+@Test("Quit requires two deliberate presses inside the confirmation window")
+func guardedQuitShortcut() {
+    let start: UInt64 = 10_000_000_000
+    #expect(RelayQuitConfirmationPolicy.action(armedAt: nil, now: start) == .arm)
+    #expect(RelayQuitConfirmationPolicy.action(armedAt: start, now: start + 1_999_999_999) == .quit)
+    #expect(RelayQuitConfirmationPolicy.action(armedAt: start, now: start + 2_000_000_001) == .arm)
+    #expect(RelayQuitConfirmationPolicy.action(armedAt: start + 1, now: start) == .arm)
+}
+
 @Test("Custom keybindings persist and conflicts are rejected")
 func customKeyBindings() {
     let suite = "relay-keybindings-\(UUID().uuidString)"

@@ -4,6 +4,7 @@ import SwiftUI
 struct WorkspaceView: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var preferences = RelayPreferences.shared
+    @State private var showingQuitConfirmation = false
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -49,6 +50,36 @@ struct WorkspaceView: View {
             }
         }
         .background(RelayTheme.canvas)
+        .overlay(alignment: .bottom) {
+            if showingQuitConfirmation {
+                HStack(spacing: 10) {
+                    Image(systemName: "power")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(RelayTheme.coral)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Press ⌘Q again to quit")
+                            .font(.system(size: 11.5, weight: .semibold))
+                        Text("Remote sessions keep running")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(RelayTheme.textMuted)
+                    }
+                }
+                .foregroundStyle(RelayTheme.text)
+                .padding(.horizontal, 14)
+                .frame(height: 48)
+                .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(RelayTheme.line.opacity(0.9))
+                }
+                .shadow(color: .black.opacity(0.32), radius: 18, y: 8)
+                .padding(.bottom, 20)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Press Command Q again to quit. Remote sessions keep running.")
+                .allowsHitTesting(false)
+            }
+        }
         .sheet(isPresented: $workspace.isHostLauncherPresented) {
             HostLauncher(workspace: workspace)
         }
@@ -95,6 +126,11 @@ struct WorkspaceView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
             workspace.setFullScreen(false)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .relayQuitConfirmation)) { notification in
+            withAnimation(.easeOut(duration: 0.16)) {
+                showingQuitConfirmation = notification.object as? Bool ?? false
+            }
         }
     }
 }

@@ -94,6 +94,8 @@ Install a release by opening `Relay-<version>-macOS.dmg` and dragging Relay to A
 
 ## Keyboard
 
+Press `⌘Q` twice within two seconds to quit Relay. Holding the keys does not count as a second press, and remote sessions remain running.
+
 - `⌘D`: split right
 - `⇧⌘D`: split down
 - `⌘W`: detach/close the active pane

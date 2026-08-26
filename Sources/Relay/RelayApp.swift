@@ -1,17 +1,41 @@
 import AppKit
 import SwiftUI
 
+enum RelayQuitConfirmationPolicy {
+    enum Action: Equatable { case arm, quit }
+
+    static let windowNanoseconds: UInt64 = 2_000_000_000
+
+    static func action(armedAt: UInt64?, now: UInt64) -> Action {
+        guard let armedAt, now >= armedAt, now - armedAt <= windowNanoseconds else {
+            return .arm
+        }
+        return .quit
+    }
+}
+
+@MainActor
 final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     private var keyboardMonitor: Any?
+    private var quitArmedAt: UInt64?
+    private var quitConfirmationTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         RelayCrashRecovery.shared.beginLaunch()
         RelayDiagnostics.shared.record(category: "app", name: "launched", details: [
             "safe_mode": String(RelayLaunchMode.isSafeMode),
         ])
-        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            let binding = RelayKeyBinding(event: event)
+            if binding == RelayKeyBinding("q", command: true) {
+                // A held key must never count as the second deliberate press.
+                guard !event.isARepeat else { return nil }
+                self.handleQuitShortcut()
+                return nil
+            }
             guard NSApp.keyWindow?.identifier == .relayWorkspaceWindow,
-                  RelayKeyBinding(event: event) == RelayCommand.closePane.defaultBinding else {
+                  binding == RelayCommand.closePane.defaultBinding else {
                 return event
             }
             let configured = RelayKeyBindingStorage.binding(
@@ -29,6 +53,8 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        quitConfirmationTimer?.invalidate()
+        quitConfirmationTimer = nil
         if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor) }
         keyboardMonitor = nil
         RelayDiagnostics.shared.record(category: "app", name: "clean-shutdown")
@@ -38,6 +64,34 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
+
+    private func handleQuitShortcut() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        switch RelayQuitConfirmationPolicy.action(armedAt: quitArmedAt, now: now) {
+        case .quit:
+            quitArmedAt = nil
+            quitConfirmationTimer?.invalidate()
+            quitConfirmationTimer = nil
+            NotificationCenter.default.post(name: .relayQuitConfirmation, object: false)
+            NSApp.terminate(nil)
+        case .arm:
+            quitArmedAt = now
+            quitConfirmationTimer?.invalidate()
+            NotificationCenter.default.post(name: .relayQuitConfirmation, object: true)
+            quitConfirmationTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.quitArmedAt == now else { return }
+                    self.quitArmedAt = nil
+                    self.quitConfirmationTimer = nil
+                    NotificationCenter.default.post(name: .relayQuitConfirmation, object: false)
+                }
+            }
+        }
+    }
+}
+
+extension Notification.Name {
+    static let relayQuitConfirmation = Notification.Name("relay.quit-confirmation")
 }
 
 @main
