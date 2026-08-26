@@ -437,6 +437,17 @@ func nodeHeartbeatWatchdog() {
     #expect(RelayHeartbeatPolicy.expired([1: 0], now: timeout - 1).isEmpty)
 }
 
+@Test("A stalled pane handshake retries forever with bounded backoff")
+func paneAttachRetryPolicy() {
+    #expect(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds == 4_000)
+    #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: false) == 500)
+    #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: false) == 8_000)
+    #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: true) == 5_500)
+    #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: true) == 15_000)
+    #expect(!RelayPaneAttachPolicy.shouldUseDedicatedTransport(attempt: 1))
+    #expect(RelayPaneAttachPolicy.shouldUseDedicatedTransport(attempt: 2))
+}
+
 @Test("Default keybindings are unique and close pane owns Command-W")
 func defaultKeyBindings() {
     let bindings = RelayCommand.allCases.map(\.defaultBinding)

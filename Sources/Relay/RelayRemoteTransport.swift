@@ -128,6 +128,25 @@ struct SSHConnectionFailure: Equatable, Sendable {
     }
 }
 
+enum RelayPaneAttachPolicy {
+    static let handshakeTimeoutMilliseconds = 4_000
+    static let dedicatedTransportAfterAttempt = 2
+
+    static func retryDelayMilliseconds(attempt: Int, waitingForInputLease: Bool) -> Int {
+        if waitingForInputLease {
+            // The worker keeps the previous input lease for five seconds so a
+            // dropped connection can reclaim it. Retry just after that grace
+            // period, then continue at a quiet bounded cadence.
+            return min(15_000, 5_500 + max(0, attempt - 1) * 1_500)
+        }
+        return min(10_000, 500 * (1 << min(max(0, attempt - 1), 4)))
+    }
+
+    static func shouldUseDedicatedTransport(attempt: Int) -> Bool {
+        attempt >= dedicatedTransportAfterAttempt
+    }
+}
+
 final class RelayRemoteTransport: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
@@ -148,7 +167,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var attached = false
     private var supportsInputAcknowledgements = false
     private var sessionEnded = false
-    private var controlRetryCount = 0
+    private var attachRetryCount = 0
+    private var attachRetryScheduled = false
 
     deinit {
         nodeChannel?.close()
@@ -198,7 +218,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
         attached = false
         supportsInputAcknowledgements = false
         sessionEnded = false
-        controlRetryCount = 0
+        attachRetryCount = 0
+        attachRetryScheduled = false
         lock.unlock()
         connectMultiplexed(context)
     }
@@ -257,6 +278,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
         let payload = (try? JSONSerialization.data(withJSONObject: hello.compactMapValues { $0 })) ?? Data()
         channel.writeAsync(type: .hello, payload: payload)
+        scheduleAttachWatchdog(context, channel: channel)
     }
 
     private func nodeDisconnected(_ context: RelayConnectionContext, failure: SSHConnectionFailure) {
@@ -326,7 +348,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                         eventReset: decoded.eventReset ?? false,
                         capabilities: capabilities
                     ))
-                    scheduleControlRetry(context)
+                    scheduleMultiplexedRetry(context, waitingForInputLease: true)
                     return
                 }
             }
@@ -361,32 +383,64 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
     }
 
-    private func scheduleControlRetry(_ context: RelayConnectionContext) {
+    private func scheduleAttachWatchdog(_ context: RelayConnectionContext, channel: RelayNodeChannel) {
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + .milliseconds(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds)
+        ) { [weak self, weak channel] in
+            guard let self, let channel else { return }
+            self.lock.lock()
+            let waiting = !self.detached && !self.attached && !self.attachRetryScheduled && self.nodeChannel === channel
+            self.lock.unlock()
+            if waiting { self.scheduleMultiplexedRetry(context, waitingForInputLease: false) }
+        }
+    }
+
+    private func scheduleMultiplexedRetry(
+        _ context: RelayConnectionContext,
+        waitingForInputLease: Bool
+    ) {
         lock.lock()
-        guard !detached, !attached, controlRetryCount < 3, let channel = nodeChannel else {
+        guard !detached, !attached, !attachRetryScheduled, let channel = nodeChannel else {
             lock.unlock()
             return
         }
-        controlRetryCount += 1
-        let attempt = controlRetryCount
+        attachRetryScheduled = true
+        attachRetryCount += 1
+        let attempt = attachRetryCount
         lock.unlock()
 
-        // Remote workers deliberately retain an input lease for five seconds
-        // so a shaky connection can reclaim it. Reopen this one virtual pane
-        // after that grace period; the shared node SSH transport stays alive.
-        let delay = 5_500 * attempt
+        let delay = RelayPaneAttachPolicy.retryDelayMilliseconds(
+            attempt: attempt,
+            waitingForInputLease: waitingForInputLease
+        )
+        context.onStatus(RelayStatus(
+            state: "reconnecting",
+            message: waitingForInputLease
+                ? "Waiting to recover this pane's input lease."
+                : "The pane handshake stalled; reopening only this pane."
+        ))
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self, weak channel] in
             guard let self, let channel else { return }
             self.lock.lock()
             guard !self.detached, !self.attached, self.nodeChannel === channel else {
+                self.attachRetryScheduled = false
                 self.lock.unlock()
                 return
             }
             self.nodeChannel = nil
             self.writer = nil
+            self.attachRetryScheduled = false
             self.lock.unlock()
             channel.close()
-            self.connectMultiplexed(context)
+            if RelayPaneAttachPolicy.shouldUseDedicatedTransport(attempt: attempt) {
+                context.onStatus(RelayStatus(
+                    state: "reconnecting",
+                    message: "The shared pane channel did not answer; using a dedicated connection for this pane."
+                ))
+                self.connect(context)
+            } else {
+                self.connectMultiplexed(context)
+            }
         }
     }
 
@@ -582,7 +636,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
         reconnectAttempt = 0
         reconnectScheduled = false
         attached = true
-        controlRetryCount = 0
+        attachRetryCount = 0
+        attachRetryScheduled = false
         supportsInputAcknowledgements = capabilities.contains("input_ack_v1")
         let backlog = inputBacklog
         inputBacklog.removeAll(keepingCapacity: true)

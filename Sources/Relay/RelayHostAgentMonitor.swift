@@ -129,53 +129,17 @@ private final class RelayHostAgentTransport: @unchecked Sendable {
         lock.lock()
         stopped = false
         lock.unlock()
-        for (sessionID, lastEventSequence) in sessions {
-            let channel = RelayNodeTransportPool.shared.attach(
-                profile: profile,
-                sessionID: sessionID,
-                onReady: { channel in
-                    let payload = (try? JSONSerialization.data(withJSONObject: [
-                        "version": 1,
-                        "session_id": sessionID,
-                        "cols": 1,
-                        "rows": 1,
-                        "last_seq": 0,
-                        "last_event_seq": lastEventSequence,
-                        "observe_events": true,
-                    ])) ?? Data()
-                    channel.writeAsync(type: .hello, payload: payload)
-                },
-                onFrame: { frame in
-                    if frame.type == .agentEvent {
-                        onEvent(sessionID, frame.payload)
-                    } else if frame.type == .status,
-                              let status = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload),
-                              status.state == "attached" {
-                        onAttached()
-                    }
-                },
-                onDisconnect: { [weak self] failure in
-                    if failure.kind == .remoteConfiguration {
-                        self?.startLegacy(
-                            profile: profile,
-                            sessions: sessions,
-                            onEvent: onEvent,
-                            onAttached: onAttached
-                        )
-                    } else if !failure.shouldRetry {
-                        self?.stop()
-                    }
-                }
-            )
-            lock.lock()
-            if stopped {
-                lock.unlock()
-                channel.close()
-            } else {
-                channels[sessionID] = channel
-                lock.unlock()
-            }
-        }
+        // node_mux_v1 keys virtual streams by pane ID, so an event observer
+        // and the interactive terminal for the same pane replace each other.
+        // Keep one observe-many SSH stream per host until node_mux_v2 provides
+        // independent virtual connection IDs. This is still O(hosts), not
+        // O(panes), and guarantees monitoring can never steal a terminal.
+        startLegacy(
+            profile: profile,
+            sessions: sessions,
+            onEvent: onEvent,
+            onAttached: onAttached
+        )
     }
 
     func stop() {
