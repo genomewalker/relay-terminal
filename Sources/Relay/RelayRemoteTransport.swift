@@ -140,7 +140,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var reconnectScheduled = false
     private var inputBacklog = Data()
     private var latestResize: (UInt16, UInt16)?
-    private let inputClientID = RelayClientIdentity.id
+    private let inputClientID = RelayInputClientIdentity.id
     private var nextInputSequence: UInt64 = 0
     private var pendingInputs: [UInt64: Data] = [:]
     private var pendingInputBytes = 0

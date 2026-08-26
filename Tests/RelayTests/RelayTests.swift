@@ -415,6 +415,12 @@ func sshFailureDiagnosis() {
     #expect(closedReadyNode.shouldRetry)
 }
 
+@Test("Terminal input identity is separate from durable workspace ownership")
+func terminalInputIdentityIsProcessScoped() {
+    #expect(RelayInputClientIdentity.id == RelayInputClientIdentity.id)
+    #expect(RelayInputClientIdentity.id != RelayClientIdentity.id)
+}
+
 @Test("Pane connection state exposes non-blocking recovery labels")
 func paneConnectionRecoveryState() {
     let vpn = PaneConnectionState.waitingForNetwork("retrying")

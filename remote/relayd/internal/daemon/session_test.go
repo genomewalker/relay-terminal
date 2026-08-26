@@ -58,6 +58,35 @@ func TestAcknowledgedInputIsAppliedOnceAcrossRetry(t *testing.T) {
 	}
 }
 
+func TestAcknowledgedInputAcceptsFreshProcessIdentity(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{pty: writer, inputSequences: make(map[[16]byte]uint64)}
+	previousProcess := [16]byte{1}
+	freshProcess := [16]byte{2}
+	if err := session.acknowledgedInput(previousProcess, 41, []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.acknowledgedInput(previousProcess, 1, []byte("dropped")); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.acknowledgedInput(freshProcess, 1, []byte("fresh")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "oldfresh" {
+		t.Fatalf("fresh process input was not applied: %q", data)
+	}
+}
+
 func TestInputControlLeaseAllowsOneClientAndReconnectGrace(t *testing.T) {
 	session := &Session{}
 	if !session.acquireControl("client-a") {

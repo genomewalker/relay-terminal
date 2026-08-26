@@ -13,6 +13,15 @@ enum RelayClientIdentity {
     }()
 }
 
+/// Input deduplication is scoped to one running Relay process. Reusing the
+/// durable workspace controller ID after an app restart would reset the local
+/// input sequence to one while a surviving remote worker still remembers the
+/// previous high-water mark, causing fresh keystrokes to be acknowledged as
+/// retransmissions and discarded.
+enum RelayInputClientIdentity {
+    static let id = UUID()
+}
+
 final class RelayRemoteWorkspaceSync: @unchecked Sendable {
     static let shared = RelayRemoteWorkspaceSync()
     private let clientID = RelayClientIdentity.id.uuidString.lowercased()
