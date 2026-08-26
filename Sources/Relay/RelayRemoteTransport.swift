@@ -101,6 +101,24 @@ struct SSHConnectionFailure: Equatable, Sendable {
         return SSHConnectionFailure(kind: .interrupted, detail: conciseDetail(diagnostic))
     }
 
+    static func diagnoseNodeTransport(
+        _ diagnostic: String,
+        terminationStatus: Int32,
+        reachedProtocolReady: Bool
+    ) -> SSHConnectionFailure {
+        let failure = diagnose(diagnostic, terminationStatus: terminationStatus)
+        guard !reachedProtocolReady,
+              terminationStatus == 0,
+              failure.kind == .interrupted,
+              conciseDetail(diagnostic).isEmpty else {
+            return failure
+        }
+        return SSHConnectionFailure(
+            kind: .remoteConfiguration,
+            detail: "The remote Relay supervisor closed the shared node stream before its handshake."
+        )
+    }
+
     private static func conciseDetail(_ diagnostic: String) -> String {
         let lines = diagnostic
             .split(whereSeparator: \Character.isNewline)
@@ -130,6 +148,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var attached = false
     private var supportsInputAcknowledgements = false
     private var sessionEnded = false
+    private var controlRetryCount = 0
 
     deinit {
         nodeChannel?.close()
@@ -179,6 +198,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         attached = false
         supportsInputAcknowledgements = false
         sessionEnded = false
+        controlRetryCount = 0
         lock.unlock()
         connectMultiplexed(context)
     }
@@ -301,11 +321,12 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 } else {
                     context.onStatus(RelayStatus(
                         state: "read_only",
-                        message: "Another client currently controls input for this pane.",
+                        message: "Another client currently controls input for this pane. Retrying input ownership automatically.",
                         outputReset: decoded.outputReset ?? false,
                         eventReset: decoded.eventReset ?? false,
                         capabilities: capabilities
                     ))
+                    scheduleControlRetry(context)
                     return
                 }
             }
@@ -337,6 +358,35 @@ final class RelayRemoteTransport: @unchecked Sendable {
             if let artifact = RelayWireFrame.parseArtifact(frame.payload) { context.onArtifact(artifact) }
         default:
             return
+        }
+    }
+
+    private func scheduleControlRetry(_ context: RelayConnectionContext) {
+        lock.lock()
+        guard !detached, !attached, controlRetryCount < 3, let channel = nodeChannel else {
+            lock.unlock()
+            return
+        }
+        controlRetryCount += 1
+        let attempt = controlRetryCount
+        lock.unlock()
+
+        // Remote workers deliberately retain an input lease for five seconds
+        // so a shaky connection can reclaim it. Reopen this one virtual pane
+        // after that grace period; the shared node SSH transport stays alive.
+        let delay = 5_500 * attempt
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self, weak channel] in
+            guard let self, let channel else { return }
+            self.lock.lock()
+            guard !self.detached, !self.attached, self.nodeChannel === channel else {
+                self.lock.unlock()
+                return
+            }
+            self.nodeChannel = nil
+            self.writer = nil
+            self.lock.unlock()
+            channel.close()
+            self.connectMultiplexed(context)
         }
     }
 
@@ -533,6 +583,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         reconnectAttempt = 0
         reconnectScheduled = false
         attached = true
+        controlRetryCount = 0
         supportsInputAcknowledgements = capabilities.contains("input_ack_v1")
         let backlog = inputBacklog
         inputBacklog.removeAll(keepingCapacity: true)

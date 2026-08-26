@@ -255,6 +255,7 @@ final class RelayNodeConnection: @unchecked Sendable {
     private func ended(generation currentGeneration: Int, status: Int32, diagnostic: String) {
         lock.lock()
         guard generation == currentGeneration, !stopped else { lock.unlock(); return }
+        let reachedProtocolReady = ready
         ready = false
         writer = nil
         process = nil
@@ -264,7 +265,11 @@ final class RelayNodeConnection: @unchecked Sendable {
         let attempt = reconnectAttempt
         let callbacks = subscriptions.values.map(\.onDisconnect)
         lock.unlock()
-        let failure = SSHConnectionFailure.diagnose(diagnostic, terminationStatus: status)
+        let failure = SSHConnectionFailure.diagnoseNodeTransport(
+            diagnostic,
+            terminationStatus: status,
+            reachedProtocolReady: reachedProtocolReady
+        )
         RelayDiagnostics.shared.record(category: "connection", name: "disconnected", details: [
             "connection_id": diagnosticConnectionID,
             "status": String(status),

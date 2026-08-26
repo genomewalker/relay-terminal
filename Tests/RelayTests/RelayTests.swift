@@ -152,10 +152,17 @@ func multipleTabsPerSession() {
     let firstPaneID = workspace.activePaneID
 
     workspace.newTabInActiveSession()
+    let secondTabID = workspace.selectedTabID
 
     #expect(workspace.selectedTab?.sessionID == firstTab?.sessionID)
     #expect(workspace.tabs.filter { $0.sessionID == firstTab?.sessionID }.count == 2)
     #expect(workspace.activePane?.remoteParentSessionID == firstPaneID?.uuidString.lowercased())
+    workspace.selectTab(firstTab!.id)
+    #expect(workspace.selectedTabID == firstTab?.id)
+    #expect(workspace.activePaneID == firstPaneID)
+    workspace.selectTab(UUID())
+    #expect(workspace.selectedTabID == firstTab?.id)
+    workspace.selectTab(secondTabID!)
     workspace.shutdown()
 }
 
@@ -390,6 +397,22 @@ func sshFailureDiagnosis() {
     let reset = SSHConnectionFailure.diagnose("Connection reset by peer", terminationStatus: 255)
     #expect(reset.kind == .interrupted)
     #expect(reset.shouldRetry)
+
+    let staleNode = SSHConnectionFailure.diagnoseNodeTransport(
+        "",
+        terminationStatus: 0,
+        reachedProtocolReady: false
+    )
+    #expect(staleNode.kind == .remoteConfiguration)
+    #expect(!staleNode.shouldRetry)
+
+    let closedReadyNode = SSHConnectionFailure.diagnoseNodeTransport(
+        "",
+        terminationStatus: 0,
+        reachedProtocolReady: true
+    )
+    #expect(closedReadyNode.kind == .interrupted)
+    #expect(closedReadyNode.shouldRetry)
 }
 
 @Test("Pane connection state exposes non-blocking recovery labels")

@@ -600,10 +600,21 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func selectTab(_ id: UUID) {
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
         zoomedPaneID = nil
         selectedTabID = id
-        activePaneID = tabs.first(where: { $0.id == id })?.layout.paneIDs.first
+        activePaneID = tab.layout.paneIDs.first
         persistWorkspace()
+        // The previous tab's Ghostty surface can remain the AppKit first
+        // responder briefly after SwiftUI hides it. Wait for the selected
+        // surface to mount, then transfer keyboard focus explicitly.
+        if let paneID = activePaneID, let pane = panes[paneID] {
+            Task { @MainActor in
+                await Task.yield()
+                guard self.selectedTabID == id, self.activePaneID == paneID else { return }
+                pane.focus()
+            }
+        }
     }
 
     func selectPane(_ id: UUID) {
