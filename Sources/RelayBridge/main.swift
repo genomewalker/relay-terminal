@@ -49,9 +49,17 @@ enum RelayBridge {
         ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         var remoteArguments = [
             "-T",
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=10m",
-            "-o", "ControlPath=~/.ssh/relay-%C",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=8",
+            "-o", "ConnectionAttempts=1",
+            "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=3",
+            // The application already multiplexes logical terminal channels.
+            // Reusing an OpenSSH control master here can retain a dead TCP path
+            // across VPN changes and make a reconnect look alive while no
+            // protocol data moves.
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
             "-p", String(arguments.port),
             arguments.destination,
             "~/.local/bin/relayd", "attach",

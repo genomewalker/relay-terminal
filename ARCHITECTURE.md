@@ -85,7 +85,13 @@ Relay worker shells prepend a private shim directory to `PATH`. Invoking `claude
 4. Each native terminal surface attaches to its pane worker's byte/event stream.
 5. Layout edits update the remote manifest; terminal bytes never contain Relay UI chrome.
 
-Input/layout leases are the required production behavior but are not implemented yet. Current attachments can both send input. New workers do acknowledge and deduplicate each controlling client's input across reconnects.
+New workers enforce one input owner per pane. A disconnected controller keeps a
+short grace lease so a reconnect can resume without another observer stealing
+input; competing attachments remain read-only and retry ownership explicitly.
+Inputs are acknowledged and deduplicated with a process-scoped client identity
+and monotonic sequence, so an app restart cannot make surviving workers discard
+fresh keystrokes as old retransmissions. Workspace layout updates use a separate
+short lease tied to Relay's durable workspace-controller identity.
 
 ## UI model
 
