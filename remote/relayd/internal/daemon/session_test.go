@@ -439,7 +439,7 @@ func TestShellIntegrationsEnableSemanticPrompts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{"133;A;redraw=last;cl=line", "133;B", "133;C", "133;D"} {
+	for _, marker := range []string{"133;A;redraw=last;cl=line", "133;B", "133;C", "133;D", "7;file://"} {
 		if !strings.Contains(string(bashContents), marker) {
 			t.Fatalf("bash integration is missing %q", marker)
 		}

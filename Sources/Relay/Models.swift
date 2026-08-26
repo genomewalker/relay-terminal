@@ -413,6 +413,12 @@ struct AgentActivityItem: Identifiable, Equatable, Sendable {
     let occurredAt: Date
 }
 
+struct AgentResourceUsage: Equatable, Sendable {
+    var inputTokens: Int = 0
+    var cachedInputTokens: Int = 0
+    var outputTokens: Int = 0
+}
+
 struct AgentSignalDetector: Sendable {
     private(set) var kind: AgentKind = .shell
     private(set) var phase: AgentPhase = .connecting
@@ -500,11 +506,18 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var title: String
     @Published var customName: String?
     @Published var directory: String?
+    @Published var lastCommandExitCode: Int?
+    @Published var lastCommandDurationNanos: UInt64?
+    @Published var terminalProgressPercent: Int?
+    @Published var terminalProgressState: String?
     private(set) var detector = AgentSignalDetector()
     private(set) var lastActivity = Date()
     @Published var activeSubagents = 0
     @Published var subagents: [SubagentActivity] = []
     @Published var agentActivities: [AgentActivityItem] = []
+    @Published var agentResourceUsage: AgentResourceUsage?
+    @Published var agentProgressPercent: Int?
+    @Published var pendingAgentApprovals = 0
     @Published var connectionState: PaneConnectionState
     @Published var remoteExitCode: Int?
     @Published var artifacts: [PaneArtifact] = []
@@ -568,6 +581,16 @@ final class PaneModel: ObservableObject, Identifiable {
         case .terminal: runtime.focus()
         case .editor: editorRuntime.focus()
         }
+    }
+
+    func recordCommandCompletion(exitCode: Int?, durationNanos: UInt64) {
+        lastCommandExitCode = exitCode
+        lastCommandDurationNanos = durationNanos
+    }
+
+    func recordTerminalProgress(state: String?, percent: Int?) {
+        terminalProgressState = state
+        terminalProgressPercent = percent
     }
 
     func startAgentMonitoring() {
@@ -764,6 +787,7 @@ final class PaneModel: ObservableObject, Identifiable {
 
         switch eventName {
         case "PermissionRequest":
+            pendingAgentApprovals += 1
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Approval: \(tool ?? "permission requested")")
             recordActivity("Approval needed for \(tool ?? "a tool")", phase: .needsInput)
             announceAgentAttention("Approval needed for \(tool ?? "an agent tool")")
@@ -871,12 +895,37 @@ final class PaneModel: ObservableObject, Identifiable {
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Failed \(tool ?? "tool")")
             recordActivity("Failed \(tool ?? "tool")", phase: .needsInput)
         case "UserPromptSubmit", "turn/started":
+            pendingAgentApprovals = 0
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Thinking")
             recordActivity("Thinking", phase: .active)
         case "Stop", "turn/completed":
+            pendingAgentApprovals = 0
+            agentProgressPercent = nil
             detector.applyStructuredEvent(kind: kind, phase: .quiet, excerpt: "Ready")
             recordActivity("Ready", phase: .quiet)
+        case "AgentProgress":
+            agentProgressPercent = (event["progress_percent"] as? NSNumber)?.intValue
+            let label = agentProgressPercent.map { "Progress · \($0)%" } ?? "Progress update"
+            detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: label)
+            recordActivity(label, phase: .active)
+        case "ResourceUsage":
+            agentResourceUsage = AgentResourceUsage(
+                inputTokens: (event["input_tokens"] as? NSNumber)?.intValue ?? 0,
+                cachedInputTokens: (event["cached_input_tokens"] as? NSNumber)?.intValue ?? 0,
+                outputTokens: (event["output_tokens"] as? NSNumber)?.intValue ?? 0
+            )
+            recordActivity("Usage updated", phase: detector.phase)
+        case "ArtifactUpdate":
+            let artifactType = event["artifact_type"] as? String ?? "artifact"
+            recordActivity("Updated \(artifactType)", phase: .active)
+        case "ThreadStatus":
+            let status = event["status"] as? String ?? "updated"
+            let terminalStatus = ["idle", "notLoaded", "not_loaded"].contains(status)
+            detector.applyStructuredEvent(kind: kind, phase: terminalStatus ? .quiet : .active, excerpt: status)
+            recordActivity("Thread \(status)", phase: terminalStatus ? .quiet : .active)
         case "SessionEnd":
+            pendingAgentApprovals = 0
+            agentProgressPercent = nil
             activeAgentRoots.removeValue(forKey: rootID)
             let providerStillRunning = activeAgentRoots.values.contains(kind)
             if !providerStillRunning {

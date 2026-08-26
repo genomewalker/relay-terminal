@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -483,22 +484,13 @@ func runEvent(arguments []string) {
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
 	session := flags.String("session", "", "Relay session ID")
 	agent := flags.String("agent", "unknown", "agent kind")
+	source := flags.String("source", "hook", "hook, codex-app-server, claude-stream-json, or provider-native")
+	stream := flags.Bool("stream", false, "read newline-delimited provider events until EOF")
 	_ = flags.Parse(arguments)
 	if *session == "" {
 		fatal("--session is required")
 	}
-	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
-	if err != nil {
-		fatal(err.Error())
-	}
-	if len(raw) == 0 || !json.Valid(raw) {
-		raw = []byte(`{}`)
-	}
-	envelope, err := json.Marshal(struct {
-		Agent string          `json:"agent"`
-		Event json.RawMessage `json:"event"`
-	}{Agent: *agent, Event: raw})
-	if err != nil {
+	if err := daemon.ValidateNativeAgentSource(*source); err != nil {
 		fatal(err.Error())
 	}
 	connection, err := net.Dial("unix", *socket)
@@ -513,7 +505,34 @@ func runEvent(arguments []string) {
 	if err := writer.Write(hello); err != nil {
 		fatal(err.Error())
 	}
-	if err := writer.Write(protocol.Frame{Type: protocol.AgentEvent, Payload: envelope}); err != nil {
+	emit := func(raw []byte) error {
+		if len(raw) == 0 || !json.Valid(raw) {
+			return nil
+		}
+		envelope, canonicalErr := daemon.CanonicalAgentEnvelope(*agent, raw, *source)
+		if canonicalErr != nil {
+			return canonicalErr
+		}
+		return writer.Write(protocol.Frame{Type: protocol.AgentEvent, Payload: envelope})
+	}
+	if *stream {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 64<<10), 1<<20)
+		for scanner.Scan() {
+			if err := emit(scanner.Bytes()); err != nil {
+				fatal(err.Error())
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			fatal(err.Error())
+		}
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
+	if err != nil {
+		fatal(err.Error())
+	}
+	if err := emit(raw); err != nil {
 		fatal(err.Error())
 	}
 }

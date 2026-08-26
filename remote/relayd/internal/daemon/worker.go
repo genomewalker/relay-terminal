@@ -76,7 +76,7 @@ func ServeWorker(config WorkerConfig) error {
 		ShellPID: session.processID(), NodeBootID: bootID,
 		SocketPath: config.SocketPath, Token: config.Token,
 		Command: config.Command, WorkingDirectory: config.WorkingDirectory,
-		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "transcript_events_v1", "input_lease_v1"}, CreatedAt: time.Now().UTC(),
+		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1"}, CreatedAt: time.Now().UTC(),
 	}
 	if err := storeManifest(config.ManifestPath, manifest); err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -184,11 +184,18 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		return
 	}
 	if hello.EventOnly {
-		event, readErr := protocol.ReadFrame(connection)
-		if readErr == nil && event.Type == protocol.AgentEvent {
+		// One-shot hook commands close after one frame; provider-native adapters
+		// keep the same authenticated connection open and stream JSONL events.
+		for {
+			event, readErr := protocol.ReadFrame(connection)
+			if readErr != nil {
+				return
+			}
+			if event.Type != protocol.AgentEvent {
+				return
+			}
 			session.agentEvent(event.Payload)
 		}
-		return
 	}
 	if hello.ObserveEvents {
 		serveAgentObserver(connection, writer, session, hello.LastEventSeq)
@@ -202,7 +209,7 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	viewer, replay, outputReset, eventReset := session.attach(hello.LastSeq, hello.LastEventSeq)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "transcript_events_v1", "input_lease_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1"},
 		OutputReset: outputReset, EventReset: eventReset,
 		ControlGranted: &controlGranted,
 	})
@@ -280,7 +287,7 @@ func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *S
 	observer, snapshot, eventReset := session.observeAgents(lastEventSequence)
 	defer session.detachAgentObserver(observer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"event_cursor_v1", "state_snapshot_v1", "transcript_events_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1"},
 		EventReset: eventReset,
 	})
 	if writer.Write(attached) != nil {

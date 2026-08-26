@@ -73,8 +73,23 @@ final class RelayNodeConnection: @unchecked Sendable {
     private var stopped = true
     private var generation = 0
     private var reconnectAttempt = 0
+    private var heartbeatSequence: UInt64 = 0
+    private var pendingHeartbeats: [UInt64: UInt64] = [:]
+    private let heartbeatTimer: DispatchSourceTimer
+    private let diagnosticConnectionID: String
 
-    init(profile: ConnectionProfile) { self.profile = profile }
+    init(profile: ConnectionProfile) {
+        self.profile = profile
+        diagnosticConnectionID = String(
+            format: "%016llx", UInt64(bitPattern: Int64(profile.connectionKey.hashValue))
+        )
+        heartbeatTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        heartbeatTimer.schedule(deadline: .distantFuture)
+        heartbeatTimer.resume()
+        heartbeatTimer.setEventHandler { [weak self] in self?.sendHeartbeat() }
+    }
+
+    deinit { heartbeatTimer.cancel() }
 
     func add(
         sessionID: String,
@@ -107,6 +122,8 @@ final class RelayNodeConnection: @unchecked Sendable {
             stopped = true
             ready = false
             writer = nil
+            heartbeatTimer.schedule(deadline: .distantFuture)
+            pendingHeartbeats.removeAll(keepingCapacity: true)
             let process = self.process
             self.process = nil
             lock.unlock()
@@ -162,6 +179,11 @@ final class RelayNodeConnection: @unchecked Sendable {
         process = ssh
         writer = RelayWireWriter(input.fileHandleForWriting)
         ready = false
+        RelayDiagnostics.shared.record(category: "connection", name: "ssh-started", details: [
+            "connection_id": diagnosticConnectionID,
+            "profile": profile.name,
+            "generation": String(currentGeneration),
+        ])
         ssh.terminationHandler = { [weak self] process in
             _ = diagnosticsFinished.wait(timeout: .now() + .milliseconds(500))
             self?.ended(generation: currentGeneration, status: process.terminationStatus, diagnostic: diagnostics.text)
@@ -198,9 +220,29 @@ final class RelayNodeConnection: @unchecked Sendable {
             guard generation == currentGeneration, !stopped else { lock.unlock(); return }
             ready = true
             reconnectAttempt = 0
+            heartbeatTimer.schedule(
+                deadline: .now() + .seconds(30), repeating: .seconds(30), leeway: .seconds(5)
+            )
             let callbacks = subscriptions.values.map { ($0.onReady, $0.channel) }
             lock.unlock()
+            RelayDiagnostics.shared.record(category: "connection", name: "ready", details: [
+                "connection_id": diagnosticConnectionID,
+            ])
             callbacks.forEach { callback, channel in callback(channel) }
+            return
+        }
+        if frame.type == .pong, frame.payload.count == 8 {
+            let sequence = frame.payload.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            let now = DispatchTime.now().uptimeNanoseconds
+            lock.lock()
+            let sentAt = pendingHeartbeats.removeValue(forKey: sequence)
+            lock.unlock()
+            if let sentAt {
+                let milliseconds = Double(now &- sentAt) / 1_000_000
+                RelayDiagnostics.shared.heartbeatAcknowledged(
+                    connection: diagnosticConnectionID, rttMilliseconds: milliseconds
+                )
+            }
             return
         }
         guard let envelope = RelayWireFrame.parseHostEvent(frame) else { return }
@@ -217,10 +259,18 @@ final class RelayNodeConnection: @unchecked Sendable {
         writer = nil
         process = nil
         reconnectAttempt += 1
+        heartbeatTimer.schedule(deadline: .distantFuture)
+        pendingHeartbeats.removeAll(keepingCapacity: true)
         let attempt = reconnectAttempt
         let callbacks = subscriptions.values.map(\.onDisconnect)
         lock.unlock()
         let failure = SSHConnectionFailure.diagnose(diagnostic, terminationStatus: status)
+        RelayDiagnostics.shared.record(category: "connection", name: "disconnected", details: [
+            "connection_id": diagnosticConnectionID,
+            "status": String(status),
+            "reason": failure.userMessage,
+            "retry": String(failure.shouldRetry),
+        ])
         callbacks.forEach { $0(failure) }
         guard failure.shouldRetry else { return }
         let delay = min(3_000, 150 * (1 << min(attempt - 1, 4)))
@@ -231,5 +281,26 @@ final class RelayNodeConnection: @unchecked Sendable {
             self.startLocked()
             self.lock.unlock()
         }
+    }
+
+    private func sendHeartbeat() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        guard ready, let writer else { lock.unlock(); return }
+        let timeoutBoundary = now &- min(now, 90_000_000_000)
+        let timedOut = pendingHeartbeats.filter { $0.value < timeoutBoundary }.map(\.key)
+        for sequence in timedOut { pendingHeartbeats.removeValue(forKey: sequence) }
+        heartbeatSequence &+= 1
+        let sequence = heartbeatSequence
+        pendingHeartbeats[sequence] = now
+        lock.unlock()
+
+        for _ in timedOut {
+            RelayDiagnostics.shared.heartbeatTimedOut(connection: diagnosticConnectionID)
+        }
+        RelayDiagnostics.shared.heartbeatSent(connection: diagnosticConnectionID)
+        var bigEndian = sequence.bigEndian
+        let payload = withUnsafeBytes(of: &bigEndian) { Data($0) }
+        writer.writeAsync(type: .ping, payload: payload)
     }
 }

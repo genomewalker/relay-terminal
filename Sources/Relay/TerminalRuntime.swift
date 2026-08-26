@@ -50,7 +50,7 @@ final class TerminalRuntime: NSObject {
 
         let remote = RelayRemoteTransport()
         let artifactPresentation = RelayPreferences.shared.artifactPresentation
-        let artifactsEnabled = RelayPreferences.shared.showArtifactPreviews
+        let artifactsEnabled = RelayPreferences.shared.showArtifactPreviews && !RelayLaunchMode.isSafeMode
         io.transport = remote
         pane.beginTerminalRestore()
         io.beginReplay()
@@ -72,6 +72,11 @@ final class TerminalRuntime: NSObject {
                 }
             },
             onStatus: { [weak self] status in
+                RelayDiagnostics.shared.record(category: "pane", name: status.state, details: [
+                    "pane_id": pane.id.uuidString.lowercased(),
+                    "profile": pane.profile.name,
+                    "message": status.message ?? "",
+                ])
                 if status.state == "attached" || status.state == "read_only" {
                     // Modern workers provide authoritative process, hook, and
                     // transcript events. Do not also parse every TUI repaint
@@ -157,6 +162,11 @@ final class TerminalRuntime: NSObject {
 
     func focus() {
         _ = view.acquireProgrammaticFocus()
+    }
+
+    @discardableResult
+    func jumpToPrompt(by offset: Int16) -> Bool {
+        view.jumpToPrompt(by: offset)
     }
 
     /// SwiftUI can keep an NSView alive after switching tabs or zooming a
@@ -525,7 +535,9 @@ extension TerminalRuntime:
     TerminalSurfaceTitleDelegate,
     TerminalSurfaceCloseDelegate,
     TerminalSurfaceFocusDelegate,
-    TerminalSurfacePwdDelegate
+    TerminalSurfacePwdDelegate,
+    TerminalSurfaceCommandFinishedDelegate,
+    TerminalSurfaceProgressReportDelegate
 {
     func terminalDidChangeTitle(_ title: String) {
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -542,6 +554,25 @@ extension TerminalRuntime:
 
     func terminalDidChangeWorkingDirectory(_ path: String) {
         pane?.directory = path
+    }
+
+    func terminalDidFinishCommand(exitCode: Int?, durationNanos: UInt64) {
+        pane?.recordCommandCompletion(exitCode: exitCode, durationNanos: durationNanos)
+    }
+
+    func terminalDidReportProgress(state: TerminalProgressState, percent: Int?) {
+        switch state {
+        case .remove:
+            pane?.recordTerminalProgress(state: nil, percent: nil)
+        case .set:
+            pane?.recordTerminalProgress(state: "running", percent: percent)
+        case .error:
+            pane?.recordTerminalProgress(state: "error", percent: percent)
+        case .indeterminate:
+            pane?.recordTerminalProgress(state: "indeterminate", percent: nil)
+        case .pause:
+            pane?.recordTerminalProgress(state: "paused", percent: percent)
+        }
     }
 }
 
@@ -575,6 +606,9 @@ final class RelayGhosttyView: TerminalView {
         ))
         menu.addItem(item("Select All", action: #selector(selectAllRelay), key: "a", enabled: true))
         menu.addItem(.separator())
+        menu.addItem(item("Previous Prompt", action: #selector(previousPrompt), enabled: true))
+        menu.addItem(item("Next Prompt", action: #selector(nextPrompt), enabled: true))
+        menu.addItem(.separator())
         menu.addItem(item("Split Right", action: #selector(splitRight), key: "d", enabled: true))
         menu.addItem(item("Split Down", action: #selector(splitDown), key: "D", enabled: true))
         menu.addItem(.separator())
@@ -604,6 +638,8 @@ final class RelayGhosttyView: TerminalView {
     @objc private func pasteRelay() { _ = performBindingAction("paste_from_clipboard") }
     @objc private func selectAllRelay() { _ = performBindingAction("select_all") }
     @objc private func clearScrollback() { _ = performBindingAction("clear_scrollback") }
+    @objc private func previousPrompt() { _ = owner?.jumpToPrompt(by: -1) }
+    @objc private func nextPrompt() { _ = owner?.jumpToPrompt(by: 1) }
     @objc private func splitRight() { owner?.split(.horizontal) }
     @objc private func splitDown() { owner?.split(.vertical) }
     @objc private func closeRelayPane() { owner?.closePane() }

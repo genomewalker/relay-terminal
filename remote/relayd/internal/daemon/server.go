@@ -231,6 +231,15 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 		if err != nil {
 			return
 		}
+		// Node-level heartbeat frames stay outside virtual pane envelopes. This
+		// lets one low-rate probe measure the shared SSH/multiplex path instead of
+		// waking every remote worker.
+		if envelope.Type == protocol.Ping {
+			if writer.Write(protocol.Frame{Type: protocol.Pong, Payload: envelope.Payload}) != nil {
+				return
+			}
+			continue
+		}
 		sessionID, inner, err := protocol.ParseHostEvent(envelope)
 		if err != nil || !validSessionID.MatchString(sessionID) {
 			return

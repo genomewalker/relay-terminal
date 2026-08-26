@@ -239,6 +239,12 @@ if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_
       builtin printf '\e]133;D;%s\a' "$command_status"
     fi
 
+    # OSC 7 makes the working directory structured terminal state. Ghostty
+    # consumes it for directory tracking while Relay mirrors it into the pane
+    # model. HOSTNAME and PWD are shell-owned values, so no subprocess runs on
+    # every prompt.
+    builtin printf '\e]7;file://%s%s\a' "${HOSTNAME:-localhost}" "$PWD"
+
     # Restore the clean prompt before running this hook again. This lets
     # dynamic prompt tools replace PS1 without accumulating markers.
     if [[ -n "${__relay_marked_ps1+x}" && "$PS1" == "$__relay_marked_ps1" ]]; then
@@ -285,6 +291,8 @@ if [[ -o interactive ]]; then
     if (( __relay_command_active )); then
       print -rn -- $'\e]133;D;'${command_status}$'\a' > /dev/tty
     fi
+
+    print -rn -- $'\e]7;file://'${HOST:-localhost}${PWD}$'\a' > /dev/tty
 
     if [[ -n ${__relay_marked_ps1+x} && $PS1 == $__relay_marked_ps1 ]]; then
       PS1=$__relay_clean_ps1

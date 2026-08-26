@@ -580,3 +580,40 @@ func filterStartupDeviceResponses() {
     #expect(!TerminalDeviceResponseFilter.matches(Data("\u{001B}[<0;12;4M".utf8)))
     #expect(!TerminalDeviceResponseFilter.matches(Data("\u{001B}[97;5u".utf8)))
 }
+
+@Test("Diagnostics redact credentials before they are retained or exported")
+func diagnosticRedaction() throws {
+    #expect(RelayDiagnostics.redact("Bearer abc.def.secret") == "Bearer <redacted>")
+    #expect(RelayDiagnostics.redact("github_pat", key: "access_token") == "<redacted>")
+    #expect(RelayDiagnostics.redact("https://person:password@example.test/path") == "https://<redacted>@example.test/path")
+
+    let diagnostics = RelayDiagnostics()
+    diagnostics.record(category: "test", name: "redaction", details: [
+        "authorization": "Bearer must-not-survive",
+        "message": "request used ghp_abcdefghijklmnopqrstuvwxyz123456",
+    ])
+    let snapshot = diagnostics.snapshot()
+    #expect(snapshot.events.last?.details["authorization"] == "<redacted>")
+    #expect(snapshot.events.last?.details["message"] == "request used <redacted>")
+
+    let exportURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("relay-diagnostics-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: exportURL) }
+    try diagnostics.export(to: exportURL)
+    let exported = try String(contentsOf: exportURL, encoding: .utf8)
+    #expect(!exported.contains("must-not-survive"))
+    #expect(!exported.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"))
+    #expect(exported.contains("<redacted>"))
+}
+
+@MainActor
+@Test("Terminal semantic callbacks retain command and progress state")
+func terminalSemanticState() {
+    let pane = PaneModel(profile: .local)
+    pane.recordCommandCompletion(exitCode: 17, durationNanos: 2_500_000)
+    pane.recordTerminalProgress(state: "running", percent: 42)
+    #expect(pane.lastCommandExitCode == 17)
+    #expect(pane.lastCommandDurationNanos == 2_500_000)
+    #expect(pane.terminalProgressState == "running")
+    #expect(pane.terminalProgressPercent == 42)
+}

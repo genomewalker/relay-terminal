@@ -158,6 +158,9 @@ func indexedAgentPayload(payload []byte, sequence uint64) []byte {
 		if event, ok := envelope["event"].(map[string]any); ok {
 			allowed := map[string]bool{
 				"hook_event_name": true, "type": true, "tool_name": true,
+				"provider_event": true, "turn_id": true, "item_id": true,
+				"approval_id": true, "progress_percent": true, "artifact_type": true,
+				"input_tokens": true, "cached_input_tokens": true, "output_tokens": true,
 				"notification_type": true, "message": true, "agent_id": true,
 				"subagent_id": true, "agent_type": true, "thread_id": true,
 				"root_id": true, "source": true, "occurred_at": true,

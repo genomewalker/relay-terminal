@@ -6,3 +6,4 @@ Relay.app
 *.xcuserstate
 remote/relayd/relayd
 dist/
+benchmark-results/

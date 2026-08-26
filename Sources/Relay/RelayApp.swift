@@ -2,6 +2,18 @@ import AppKit
 import SwiftUI
 
 final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        RelayCrashRecovery.shared.beginLaunch()
+        RelayDiagnostics.shared.record(category: "app", name: "launched", details: [
+            "safe_mode": String(RelayLaunchMode.isSafeMode),
+        ])
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        RelayDiagnostics.shared.record(category: "app", name: "clean-shutdown")
+        RelayCrashRecovery.shared.cleanShutdown()
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
@@ -77,6 +89,12 @@ struct RelayApp: App {
                 Button("Next pane") { workspace.selectAdjacentPane(offset: 1) }
                     .keyboardShortcut("]", modifiers: [.command, .option])
                 Divider()
+                Button("Previous prompt") { _ = workspace.activePane?.runtime.jumpToPrompt(by: -1) }
+                    .keyboardShortcut(.upArrow, modifiers: [.command, .shift])
+                Button("Next prompt") { _ = workspace.activePane?.runtime.jumpToPrompt(by: 1) }
+                    .keyboardShortcut(.downArrow, modifiers: [.command, .shift])
+                    .disabled(workspace.activePane?.contentKind != .terminal)
+                Divider()
                 Button(workspace.activePane?.profile.kind == .ssh ? "Detach pane" : "Close pane") {
                     workspace.closeActivePane()
                 }
@@ -93,6 +111,25 @@ struct RelayApp: App {
                     workspace.sidebarVisible.toggle()
                 }
                 .keyboardShortcut("s", modifiers: [.command, .control])
+            }
+            CommandMenu("Diagnostics") {
+                Button("Export diagnostics…") {
+                    RelayDiagnostics.shared.presentExportPanel()
+                }
+                Button("Relaunch in safe mode…") {
+                    RelayDiagnostics.shared.record(category: "app", name: "safe-mode-relaunch-requested")
+                    let configuration = NSWorkspace.OpenConfiguration()
+                    configuration.arguments = ["--safe-mode"]
+                    NSWorkspace.shared.openApplication(
+                        at: Bundle.main.bundleURL,
+                        configuration: configuration
+                    ) { _, error in
+                        Task { @MainActor in
+                            if let error { NSAlert(error: error).runModal() }
+                            else { NSApp.terminate(nil) }
+                        }
+                    }
+                }
             }
         }
 

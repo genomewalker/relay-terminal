@@ -101,15 +101,20 @@ Install a release by opening `Relay-<version>-macOS.dmg` and dragging Relay to A
 - `⇧⌘Return`: zoom/restore the active pane
 - `⌥⌘P`: float/dock the active pane
 - `⇧⌘[` / `⇧⌘]`: previous/next tab
+- `⇧⌘↑` / `⇧⌘↓`: previous/next semantic shell prompt
 - `⌘,`: settings
 
 Drag a pane by its connection header and drop it near another pane's left, right, top, or bottom edge to dock it there. Drop in the center to swap tiled panes. The remote PTYs keep their identities and continue running during the move.
 
 ## Current limits
 
-- Native agent-pane renderer backed by Codex app-server and Claude bidirectional stream-json
+- Relay accepts versioned Codex app-server JSON-RPC and Claude stream-json events through `relayd event --stream`; the existing interactive TUIs still use structured hooks plus a transcript compatibility fallback until they emit that stream directly
 - A persisted local screen/event cache beyond the worker replay ring
 - Signed public builds require the repository owner’s Developer ID and Apple notarization credentials
+
+## Performance benchmarks
+
+`./scripts/benchmark-relay.sh` runs repeatable wire-protocol microbenchmarks and samples idle app CPU, resident memory, and thread count once per second. Set `RELAY_BENCHMARK_SECONDS` to change the sample window. The script prints an `xctrace` Energy Log command for battery measurements; the trace stays separate because Instruments needs an interactive capture session.
 
 ## License
 

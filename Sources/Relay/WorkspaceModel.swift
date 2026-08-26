@@ -34,7 +34,8 @@ final class WorkspaceModel: ObservableObject {
     private var paneChangeScheduled = false
 
     init(restoreSavedWorkspace: Bool = true) {
-        if restoreSavedWorkspace && restoreWorkspace() {
+        let shouldRestore = restoreSavedWorkspace && !RelayLaunchMode.isSafeMode
+        if shouldRestore && restoreWorkspace() {
             panes.values.forEach { $0.startAgentMonitoring() }
         } else {
             newTab(profile: .local)

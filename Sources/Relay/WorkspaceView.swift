@@ -14,6 +14,19 @@ struct WorkspaceView: View {
                     Rectangle().fill(RelayTheme.line.opacity(0.38)).frame(width: 1)
                 }
                 VStack(spacing: 0) {
+                    if RelayLaunchMode.isSafeMode {
+                        HStack(spacing: 7) {
+                            Image(systemName: "shield")
+                            Text("Safe mode · workspace restore and artifact previews are disabled")
+                            Spacer()
+                        }
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .padding(.horizontal, 12)
+                        .frame(height: 30)
+                        .background(RelayTheme.surface)
+                        .accessibilityLabel("Relay is running in safe mode")
+                    }
                     WorkspaceBar(workspace: workspace)
                     Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
                     if let tab = workspace.selectedTab {
@@ -703,25 +716,103 @@ private struct AttachedSessionRow: View {
 
             if selected || agentThreads > 0 {
                 ForEach(session.tabs) { tab in
-                    let tabPanes = tab.allPaneIDs.compactMap { workspace.panes[$0] }
-                    let visiblePanes = selected && tab.id == workspace.selectedTabID
-                        ? tabPanes
-                        : tabPanes.filter { $0.contentKind == .terminal && $0.kind != .shell }
                     let tabIndex = session.tabs.firstIndex(where: { $0.id == tab.id }) ?? 0
-                    ForEach(visiblePanes) { pane in
-                        SessionPaneRow(
-                            pane: pane,
-                            tabID: tab.id,
-                            tabLabel: tabIndex == 0 ? "Main" : "Tab \(tabIndex + 1)",
-                            workspace: workspace,
-                            active: pane.id == workspace.activePaneID && tab.id == workspace.selectedTabID
-                        )
-                    }
+                    SessionTabSection(
+                        tab: tab,
+                        fallbackLabel: tabIndex == 0 ? "Main" : "Tab \(tabIndex + 1)",
+                        workspace: workspace
+                    )
                 }
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(label), \(session.tabs.count) tabs, \(panes.count) panes, \(agentThreads) agent threads")
+    }
+}
+
+private struct SessionTabSection: View {
+    @ObservedObject var tab: TabModel
+    let fallbackLabel: String
+    @ObservedObject var workspace: WorkspaceModel
+    @State private var expanded: Bool
+
+    init(tab: TabModel, fallbackLabel: String, workspace: WorkspaceModel) {
+        self.tab = tab
+        self.fallbackLabel = fallbackLabel
+        self.workspace = workspace
+        let containsActiveAgent = tab.allPaneIDs.compactMap { workspace.panes[$0] }
+            .contains { $0.contentKind == .terminal && $0.kind != .shell }
+        _expanded = State(initialValue: tab.id == workspace.selectedTabID || containsActiveAgent)
+    }
+
+    private var panes: [PaneModel] { tab.allPaneIDs.compactMap { workspace.panes[$0] } }
+    private var activeAgents: Int {
+        panes.reduce(0) { $0 + ($1.contentKind == .terminal && $1.kind != .shell ? 1 + $1.activeSubagents : 0) }
+    }
+
+    var body: some View {
+        VStack(spacing: 1) {
+            HStack(spacing: 4) {
+                Button {
+                    expanded.toggle()
+                } label: {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .frame(width: 16, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textFaint)
+                .accessibilityLabel(expanded ? "Collapse tab" : "Expand tab")
+
+                Button {
+                    workspace.selectTab(tab.id)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "rectangle")
+                            .font(.system(size: 8.5, weight: .semibold))
+                        Text(tab.name.isEmpty ? fallbackLabel : tab.name)
+                            .font(.system(size: 10, weight: tab.id == workspace.selectedTabID ? .semibold : .medium))
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text("\(panes.count)")
+                            .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+                        if activeAgents > 0 {
+                            Circle().fill(RelayTheme.mint).frame(width: 5, height: 5)
+                        }
+                    }
+                    .foregroundStyle(tab.id == workspace.selectedTabID ? RelayTheme.text : RelayTheme.textMuted)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    Button("Rename tab…") { workspace.beginRenameTab(tab.id) }
+                    Button("Close tab") { workspace.closeTab(tab.id) }
+                }
+            }
+            .padding(.leading, 21)
+            .padding(.trailing, 9)
+            .frame(height: 27)
+            .background(
+                tab.id == workspace.selectedTabID ? RelayTheme.surface.opacity(0.5) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+            )
+
+            if expanded {
+                ForEach(panes) { pane in
+                    SessionPaneRow(
+                        pane: pane,
+                        tabID: tab.id,
+                        workspace: workspace,
+                        active: pane.id == workspace.activePaneID && tab.id == workspace.selectedTabID
+                    )
+                }
+            }
+        }
+        .onChange(of: workspace.selectedTabID) { _, selectedID in
+            if selectedID == tab.id { expanded = true }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Tab \(tab.name.isEmpty ? fallbackLabel : tab.name), \(panes.count) panes")
     }
 }
 
@@ -740,7 +831,6 @@ private struct PanePresence: View {
 private struct SessionPaneRow: View {
     @ObservedObject var pane: PaneModel
     let tabID: UUID
-    let tabLabel: String
     @ObservedObject var workspace: WorkspaceModel
     let active: Bool
     @State private var hovering = false
@@ -789,10 +879,6 @@ private struct SessionPaneRow: View {
                         .font(.system(size: 8.5, weight: .semibold))
                         .foregroundStyle(RelayTheme.textFaint)
                         .help("Floating pane")
-                } else if workspace.selectedTabID != tabID {
-                    Text(tabLabel)
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(RelayTheme.textFaint)
                 }
                 Circle().fill(pane.connectionState.color).frame(width: 5, height: 5)
                 }
@@ -2169,6 +2255,14 @@ private struct ConnectionPath: View {
                     .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
             }
+            if let directory = pane.directory, !directory.isEmpty {
+                Text(URL(fileURLWithPath: directory).lastPathComponent.isEmpty ? "/" : URL(fileURLWithPath: directory).lastPathComponent)
+                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1)
+                    .help(directory)
+                    .accessibilityLabel("Working directory \(directory)")
+            }
             if pane.contentKind == .editor {
                 Label("Editor", systemImage: "curlybraces")
                     .font(.system(size: 9.5, weight: .semibold))
@@ -2183,8 +2277,39 @@ private struct ConnectionPath: View {
                     .foregroundStyle(RelayTheme.textFaint)
                     .lineLimit(1)
                     .layoutPriority(-1)
+                if pane.pendingAgentApprovals > 0 {
+                    Image(systemName: "hand.raised.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(RelayTheme.coral)
+                        .accessibilityLabel("\(pane.pendingAgentApprovals) pending agent approvals")
+                }
+                if let usage = pane.agentResourceUsage {
+                    Text("\(usage.inputTokens + usage.outputTokens) tok")
+                        .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .help("Input \(usage.inputTokens), cached \(usage.cachedInputTokens), output \(usage.outputTokens)")
+                }
             }
             Spacer(minLength: 8)
+            if let progress = pane.terminalProgressPercent {
+                ProgressView(value: Double(progress), total: 100)
+                    .progressViewStyle(.linear)
+                    .frame(width: 42)
+                    .help("Command progress \(progress) percent")
+                    .accessibilityLabel("Command progress")
+                    .accessibilityValue("\(progress) percent")
+            } else if pane.terminalProgressState == "indeterminate" {
+                ProgressView()
+                    .controlSize(.mini)
+                    .help("Command in progress")
+            }
+            if let exitCode = pane.lastCommandExitCode {
+                Image(systemName: exitCode == 0 ? "checkmark.circle" : "xmark.circle")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(exitCode == 0 ? RelayTheme.textFaint : RelayTheme.coral)
+                    .help(commandStatusHelp(exitCode: exitCode, durationNanos: pane.lastCommandDurationNanos))
+                    .accessibilityLabel(exitCode == 0 ? "Last command succeeded" : "Last command exited with status \(exitCode)")
+            }
             if pane.connectionState != .connected {
                 Text(pane.connectionState.label)
                     .font(.system(size: 10, weight: .medium))
@@ -2247,6 +2372,12 @@ private struct ConnectionPath: View {
             if let toggleFloating { Button(isFloating ? "Dock pane" : "Float pane", action: toggleFloating) }
             if let close { Button(pane.profile.kind == .ssh ? "Detach pane" : "Close pane", action: close) }
         }
+    }
+
+    private func commandStatusHelp(exitCode: Int, durationNanos: UInt64?) -> String {
+        guard let durationNanos else { return "Last command exited with status \(exitCode)" }
+        let seconds = Double(durationNanos) / 1_000_000_000
+        return String(format: "Last command exited with status %d in %.2f s", exitCode, seconds)
     }
 }
 

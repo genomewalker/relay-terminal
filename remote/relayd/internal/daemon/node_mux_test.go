@@ -29,6 +29,15 @@ func TestNodeMultiplexRoutesVirtualProtocolConnection(t *testing.T) {
 		t.Fatalf("node multiplexer was not ready: %#v", ready)
 	}
 
+	heartbeat := []byte("heartbeat-1")
+	if err := writer.Write(protocol.Frame{Type: protocol.Ping, Payload: heartbeat}); err != nil {
+		t.Fatal(err)
+	}
+	pong, err := protocol.ReadFrame(client)
+	if err != nil || pong.Type != protocol.Pong || string(pong.Payload) != string(heartbeat) {
+		t.Fatalf("node heartbeat was not echoed: frame=%#v err=%v", pong, err)
+	}
+
 	probeHello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
 		Version: 1, SessionID: "pane-probe", Probe: true,
 	})
