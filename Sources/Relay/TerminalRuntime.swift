@@ -1284,6 +1284,8 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
         let presentationLease = UUID()
         var presentationTask: Task<Void, Never>?
         var isPresented = false
+        var candidateSize: CGSize?
+        var stableSizeSamples = 0
 
         deinit { presentationTask?.cancel() }
     }
@@ -1295,6 +1297,7 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
         // Preserve Ghostty's last settled IOSurface while SwiftUI gives the
         // reattached view its transitional sizes. Rendering those intermediate
         // grids is the source of the garbled flash when switching tabs.
+        view.alphaValue = 0
         view.setSurfaceVisible(false)
         presentAfterLayout(view, coordinator: context.coordinator)
         Task { @MainActor in
@@ -1319,6 +1322,12 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
         coordinator.presentationTask?.cancel()
         coordinator.presentationTask = nil
         coordinator.isPresented = false
+        coordinator.candidateSize = nil
+        coordinator.stableSizeSamples = 0
+        // The same durable terminal view can be reattached by another tab or
+        // zoom layout. Keep its previous IOSurface hidden until that layout is
+        // stable instead of briefly stretching the old cell grid.
+        nsView.alphaValue = 0
         nsView.owner?.setPresented(false, lease: coordinator.presentationLease)
     }
 
@@ -1326,26 +1335,54 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
         guard !coordinator.isPresented, coordinator.presentationTask == nil else { return }
         coordinator.presentationTask = Task { @MainActor [weak view, weak coordinator] in
             guard let view, let coordinator else { return }
-            for delay in [0, 8, 16, 32] {
+            for delay in [0, 8, 16, 24, 32, 48, 64] {
                 if delay == 0 {
                     await Task.yield()
                 } else {
                     try? await Task.sleep(for: .milliseconds(delay))
                 }
                 guard !Task.isCancelled else { return }
-                if view.window != nil, view.bounds.width > 1, view.bounds.height > 1 {
-                    view.fitToSize()
-                    coordinator.isPresented = true
-                    coordinator.presentationTask = nil
-                    pane.runtime.setPresented(
-                        true,
-                        lease: coordinator.presentationLease,
-                        force: true
-                    )
-                    return
+                view.superview?.layoutSubtreeIfNeeded()
+                guard view.window != nil,
+                      view.bounds.width > 1,
+                      view.bounds.height > 1 else { continue }
+
+                let size = view.bounds.size
+                if let candidate = coordinator.candidateSize,
+                   abs(candidate.width - size.width) < 0.5,
+                   abs(candidate.height - size.height) < 0.5 {
+                    coordinator.stableSizeSamples += 1
+                } else {
+                    coordinator.candidateSize = size
+                    coordinator.stableSizeSamples = 1
                 }
+
+                // Require the same geometry in two distinct layout samples.
+                // A merely non-zero size is commonly the outgoing tab's frame.
+                guard coordinator.stableSizeSamples >= 2 else { continue }
+
+                view.fitToSize()
+                pane.runtime.setPresented(
+                    true,
+                    lease: coordinator.presentationLease,
+                    force: true
+                )
+
+                // Give Ghostty one display interval to publish the correctly
+                // sized IOSurface, then reveal it as one visual transaction.
+                try? await Task.sleep(for: .milliseconds(16))
+                guard !Task.isCancelled, view.window != nil else { return }
+                view.alphaValue = 1
+                coordinator.isPresented = true
+                coordinator.presentationTask = nil
+                return
             }
+            // Extremely busy layout passes may not settle within the normal
+            // window. Retry instead of exposing a known-wrong terminal grid.
             coordinator.presentationTask = nil
+            if view.window != nil {
+                presentAfterLayout(view, coordinator: coordinator)
+            }
         }
     }
 }
