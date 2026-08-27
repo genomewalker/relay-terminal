@@ -379,9 +379,12 @@ private struct WorkspaceBar: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 2) {
                     ForEach(Array(sessionTabs.enumerated()), id: \.element.id) { index, tab in
+                        let fallbackLabel = index == 0 ? "Main" : "Tab \(index + 1)"
                         WorkspaceTab(
                             tab: tab,
-                            label: index == 0 ? "Main" : "Tab \(index + 1)",
+                            label: tab.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? fallbackLabel
+                                : tab.name,
                             isSelected: tab.id == workspace.selectedTabID,
                             select: { workspace.selectTab(tab.id) },
                             rename: { workspace.beginRenameTab(tab.id) },
@@ -478,6 +481,9 @@ private struct WorkspaceTab: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .simultaneousGesture(
+                TapGesture(count: 2).onEnded { rename() }
+            )
             Button(action: close) {
                 Image(systemName: "xmark")
                     .font(.system(size: 7.5, weight: .bold))
@@ -1576,7 +1582,7 @@ private struct FloatingPaneWindow: View {
         .overlay(alignment: .bottomTrailing) {
             resizeHandle
         }
-        .shadow(color: .black.opacity(0.32), radius: dragOffset == .zero ? 16 : 7, y: dragOffset == .zero ? 8 : 3)
+        .shadow(color: .black.opacity(0.28), radius: 14, y: 6)
         .offset(x: originX, y: originY)
         .transaction { $0.animation = nil }
     }
@@ -1591,6 +1597,7 @@ private struct FloatingPaneWindow: View {
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                     .lineLimit(1)
+                    .onTapGesture(count: 2) { rename() }
                 Text(pane.profile.kind == .ssh ? pane.profile.host : "This Mac")
                     .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
@@ -1601,7 +1608,7 @@ private struct FloatingPaneWindow: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 2)
+                DragGesture(minimumDistance: 2, coordinateSpace: .global)
                     .updating($dragOffset) { value, state, _ in state = value.translation }
                     .onEnded { value in
                         let x = min(
@@ -1627,7 +1634,6 @@ private struct FloatingPaneWindow: View {
                     }
             )
             .simultaneousGesture(TapGesture().onEnded(select))
-            .draggable(pane.id.uuidString)
             .focusable()
             .accessibilityLabel("Move floating pane \(pane.displayName)")
             .onKeyPress(.leftArrow) {
@@ -1669,20 +1675,11 @@ private struct FloatingPaneWindow: View {
     }
 
     private var resizeHandle: some View {
-        Image(systemName: "arrow.up.left.and.arrow.down.right")
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(isActive ? RelayTheme.blue : RelayTheme.textFaint)
-            .frame(width: 28, height: 28)
-            .background(
-                LinearGradient(
-                    colors: [RelayTheme.elevated.opacity(0), RelayTheme.elevated],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            )
+        Color.clear
+            .frame(width: 16, height: 16)
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 1)
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .updating($resizeOffset) { value, state, _ in state = value.translation }
                     .onEnded { value in
                         let maximumWidth = max(minimumWidth, bounds.width - baseOriginX - edgeInset)
@@ -1693,7 +1690,7 @@ private struct FloatingPaneWindow: View {
                         resize(Double(newWidth), Double(newHeight))
                     }
             )
-            .help("Resize floating pane")
+            .help("Drag to resize floating pane")
             .focusable()
             .accessibilityLabel("Resize floating pane")
             .accessibilityValue("\(Int(baseWidth)) by \(Int(baseHeight))")
@@ -1804,7 +1801,7 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
             }
             .highPriorityGesture(TapGesture(count: 2).onEnded { update(0.5, true) })
             .simultaneousGesture(
-                DragGesture(minimumDistance: 1)
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .onChanged { value in
                         let delta = axis == .horizontal ? value.translation.width : value.translation.height
                         let start = dragStartRatio ?? ratio
@@ -2547,9 +2544,16 @@ private struct ConnectionPath: View {
             Circle()
                 .fill(pane.connectionState.color)
                 .frame(width: 6, height: 6)
-            Text(pane.profile.kind == .ssh ? pane.profile.host : "This Mac")
+            Text(pane.displayName)
                 .font(.system(size: 11.5, weight: active ? .semibold : .medium))
                 .lineLimit(1)
+                .onTapGesture(count: 2) { rename?() }
+            if pane.profile.kind == .ssh, pane.displayName != pane.profile.host {
+                Text(pane.profile.host)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1)
+            }
             if pane.profile.kind == .ssh {
                 Text(pane.profile.backend == .relay ? "Relay" : "SSH")
                     .font(.system(size: 9.5, weight: .medium))
@@ -2653,7 +2657,6 @@ private struct ConnectionPath: View {
         .background(active ? RelayTheme.surface : RelayTheme.canvas)
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
-        .onTapGesture(count: 2) { toggleZoom?() }
         .contextMenu {
             if let rename { Button("Rename pane…", action: rename) }
             if pane.contentKind == .terminal {

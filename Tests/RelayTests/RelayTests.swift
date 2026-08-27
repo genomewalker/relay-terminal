@@ -807,3 +807,12 @@ func artifactHyperlinksPreserveVisiblePath() {
     #expect(output.contains("\u{001B}]8;;file:///__relay_artifact__/"))
     #expect(output.contains(path))
 }
+
+@Test("Prompt selection deletion follows drag direction")
+func promptSelectionDeletionSequence() {
+    #expect(TerminalPromptSelectionEdit.deletionSequence(for: "three words", backwards: true)
+        == String(repeating: "\u{007F}", count: 11))
+    #expect(TerminalPromptSelectionEdit.deletionSequence(for: "abc", backwards: false)
+        == String(repeating: "\u{001B}[3~", count: 3))
+    #expect(TerminalPromptSelectionEdit.deletionSequence(for: "output\nnext", backwards: false) == nil)
+}

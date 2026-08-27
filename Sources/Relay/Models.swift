@@ -119,8 +119,8 @@ struct FloatingPanePlacement: Codable, Equatable, Identifiable, Sendable {
             paneID: paneID,
             originX: 56 + cascade,
             originY: 46 + cascade,
-            width: 720,
-            height: 480
+            width: 620,
+            height: 410
         )
     }
 }

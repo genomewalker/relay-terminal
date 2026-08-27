@@ -3,6 +3,20 @@ import Foundation
 import GhosttyTerminal
 import SwiftUI
 
+enum TerminalPromptSelectionEdit {
+    static func deletionSequence(for selectedText: String, backwards: Bool) -> String? {
+        // Newlines may represent either a real multi-line command or selected
+        // output. Until Relay has cell-level prompt ranges, do not guess.
+        guard !selectedText.isEmpty,
+              !selectedText.contains("\n"),
+              !selectedText.contains("\r") else { return nil }
+        let count = selectedText.count
+        guard count > 0 else { return nil }
+        let key = backwards ? "\u{007F}" : "\u{001B}[3~"
+        return String(repeating: key, count: count)
+    }
+}
+
 @MainActor
 final class TerminalRuntime: NSObject {
     private weak var pane: PaneModel?
@@ -204,7 +218,7 @@ final class TerminalRuntime: NSObject {
     /// SwiftUI can keep an NSView alive after switching tabs or zooming a
     /// sibling pane. Tell Ghostty about actual presentation so its display
     /// link and Metal work stop immediately while the surface is off-screen.
-    func setPresented(_ presented: Bool, lease: UUID) {
+    func setPresented(_ presented: Bool, lease: UUID, force: Bool = false) {
         let wasPresented = !presentationLeases.isEmpty
         if presented {
             presentationLeases.insert(lease)
@@ -212,7 +226,7 @@ final class TerminalRuntime: NSObject {
             presentationLeases.remove(lease)
         }
         let isPresented = !presentationLeases.isEmpty
-        if isPresented != wasPresented {
+        if isPresented != wasPresented || force {
             view.setSurfaceVisible(isPresented)
         }
     }
@@ -290,6 +304,10 @@ final class TerminalRuntime: NSObject {
         guard let hoveredLink, let path = ArtifactLinkResolver.path(from: hoveredLink) else { return false }
         showArtifact(path: path)
         return true
+    }
+
+    fileprivate var allowsPromptSelectionEditing: Bool {
+        pane?.contentKind == .terminal && pane?.kind == .shell
     }
 
     private func presentArtifact(path: String, data: Data) {
@@ -375,20 +393,36 @@ private final class TerminalIOBridge: @unchecked Sendable {
     private var snapshotBuffer = Data()
     private var snapshotGeneration: UInt64 = 0
     private let legacyReplayTimer: DispatchSourceTimer
+    private let snapshotSaveTimer: DispatchSourceTimer
 
     init() {
         legacyReplayTimer = DispatchSource.makeTimerSource(
             queue: DispatchQueue.global(qos: .userInitiated)
         )
+        snapshotSaveTimer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue.global(qos: .utility)
+        )
+
         legacyReplayTimer.setEventHandler { [weak self] in
             self?.finishLegacyReplayIfIdle()
         }
         legacyReplayTimer.schedule(deadline: .distantFuture)
         legacyReplayTimer.resume()
+
+        // One reschedulable timer is a real debounce. Enqueuing a new
+        // asyncAfter closure for every PTY packet leaves thousands of dormant
+        // closures behind during agent/TUI repaint storms, increasing memory
+        // and waking utility workers only to discover stale generations.
+        snapshotSaveTimer.setEventHandler { [weak self] in
+            self?.savePendingSnapshot()
+        }
+        snapshotSaveTimer.schedule(deadline: .distantFuture)
+        snapshotSaveTimer.resume()
     }
 
     deinit {
         legacyReplayTimer.cancel()
+        snapshotSaveTimer.cancel()
     }
 
     lazy var session = InMemoryTerminalSession(
@@ -516,17 +550,35 @@ private final class TerminalIOBridge: @unchecked Sendable {
     }
 
     private func scheduleSnapshotSaveLocked() {
-        guard let paneID = snapshotPaneID else { return }
+        guard snapshotPaneID != nil else { return }
         snapshotGeneration &+= 1
-        let generation = snapshotGeneration
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(350)) { [weak self] in
-            guard let self else { return }
-            self.receiveLock.lock()
-            guard self.snapshotGeneration == generation else { self.receiveLock.unlock(); return }
-            let snapshot = self.snapshotBuffer
-            self.receiveLock.unlock()
-            TerminalSnapshotStore.shared.save(snapshot, paneID: paneID)
+        snapshotSaveTimer.schedule(
+            deadline: .now() + .milliseconds(500),
+            leeway: .milliseconds(150)
+        )
+    }
+
+    private func savePendingSnapshot() {
+        receiveLock.lock()
+        guard let paneID = snapshotPaneID, !snapshotBuffer.isEmpty else {
+            receiveLock.unlock()
+            return
         }
+        let generation = snapshotGeneration
+        let snapshot = snapshotBuffer
+        receiveLock.unlock()
+
+        TerminalSnapshotStore.shared.save(snapshot, paneID: paneID)
+
+        // If output arrived while the snapshot was compacted or queued for
+        // disk, the producer already re-armed the timer. Do not overwrite its
+        // deadline with a stale save.
+        receiveLock.lock()
+        let unchanged = snapshotGeneration == generation
+        if unchanged {
+            snapshotSaveTimer.schedule(deadline: .distantFuture)
+        }
+        receiveLock.unlock()
     }
 
     private func forwardTerminalWrite(_ data: Data) {
@@ -725,8 +777,17 @@ extension TerminalRuntime:
 
 @MainActor
 final class RelayGhosttyView: TerminalView {
+    private struct PromptSelection {
+        let text: String
+        let backwards: Bool
+        let caretLocationInWindow: CGPoint
+    }
+
     weak var owner: TerminalRuntime?
     private var suppressNextMouseUp = false
+    private var selectionStart: CGPoint?
+    private var selectionStartInWindow: CGPoint?
+    private var promptSelection: PromptSelection?
 
     override func mouseDown(with event: NSEvent) {
         owner?.selectPane()
@@ -735,15 +796,57 @@ final class RelayGhosttyView: TerminalView {
             suppressNextMouseUp = true
             return
         }
+        promptSelection = nil
+        selectionStart = owner?.allowsPromptSelectionEditing == true
+            ? terminalPoint(for: event)
+            : nil
+        selectionStartInWindow = selectionStart == nil ? nil : event.locationInWindow
         super.mouseDown(with: event)
     }
 
     override func mouseUp(with event: NSEvent) {
         if suppressNextMouseUp {
             suppressNextMouseUp = false
+            selectionStart = nil
+            selectionStartInWindow = nil
             return
         }
+        let start = selectionStart
+        let caretLocation = selectionStartInWindow
+        let end = terminalPoint(for: event)
         super.mouseUp(with: event)
+        selectionStart = nil
+        selectionStartInWindow = nil
+        guard let start, let caretLocation,
+              hypot(end.x - start.x, end.y - start.y) >= 2,
+              selectionIsNearActivePrompt(start: start, end: end),
+              copySelectedTextToPasteboard(),
+              let text = NSPasteboard.general.string(forType: .string),
+              TerminalPromptSelectionEdit.deletionSequence(for: text, backwards: false) != nil
+        else { return }
+        let backwards = end.y < start.y - 4 || (abs(end.y - start.y) <= 4 && end.x < start.x)
+        promptSelection = PromptSelection(
+            text: text,
+            backwards: backwards,
+            caretLocationInWindow: caretLocation
+        )
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if (event.keyCode == 51 || event.keyCode == 117),
+           event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+           let promptSelection,
+           let sequence = TerminalPromptSelectionEdit.deletionSequence(
+                for: promptSelection.text,
+                backwards: promptSelection.backwards
+           ) {
+            self.promptSelection = nil
+            movePromptCursor(to: promptSelection.caretLocationInWindow)
+            sendText(sequence)
+            return
+        }
+        promptSelection = nil
+        super.keyDown(with: event)
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -764,6 +867,48 @@ final class RelayGhosttyView: TerminalView {
                 pressure: event.pressure
               ) else { return }
         super.mouseMoved(with: probe)
+    }
+
+    private func terminalPoint(for event: NSEvent) -> CGPoint {
+        let point = convert(event.locationInWindow, from: nil)
+        return CGPoint(x: point.x, y: bounds.height - point.y)
+    }
+
+    private func selectionIsNearActivePrompt(start: CGPoint, end: CGPoint) -> Bool {
+        // Shell prompts normally occupy the final few rows. This conservative
+        // boundary prevents a selection in scrollback/output from becoming an
+        // edit operation while still covering wrapped command lines.
+        let promptBand = min(96, max(48, bounds.height * 0.2))
+        let top = bounds.height - promptBand
+        return start.y >= top && end.y >= top
+    }
+
+    private func movePromptCursor(to locationInWindow: CGPoint) {
+        guard let window else { return }
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        guard let down = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: locationInWindow,
+            modifierFlags: .option,
+            timestamp: timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ), let up = NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: locationInWindow,
+            modifierFlags: .option,
+            timestamp: timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 0
+        ) else { return }
+        super.mouseDown(with: down)
+        super.mouseUp(with: up)
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -856,13 +1001,21 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
 
     final class Coordinator {
         let presentationLease = UUID()
+        var presentationTask: Task<Void, Never>?
+        var isPresented = false
+
+        deinit { presentationTask?.cancel() }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> RelayGhosttyView {
         let view = pane.runtime.view
-        pane.runtime.setPresented(true, lease: context.coordinator.presentationLease)
+        // Preserve Ghostty's last settled IOSurface while SwiftUI gives the
+        // reattached view its transitional sizes. Rendering those intermediate
+        // grids is the source of the garbled flash when switching tabs.
+        view.setSurfaceVisible(false)
+        presentAfterLayout(view, coordinator: context.coordinator)
         Task { @MainActor in
             await Task.yield()
             pane.runtime.startIfNeeded()
@@ -871,7 +1024,7 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
     }
 
     func updateNSView(_ nsView: RelayGhosttyView, context: Context) {
-        pane.runtime.setPresented(true, lease: context.coordinator.presentationLease)
+        presentAfterLayout(nsView, coordinator: context.coordinator)
         Task { @MainActor in
             await Task.yield()
             pane.runtime.startIfNeeded()
@@ -882,6 +1035,36 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
     }
 
     static func dismantleNSView(_ nsView: RelayGhosttyView, coordinator: Coordinator) {
+        coordinator.presentationTask?.cancel()
+        coordinator.presentationTask = nil
+        coordinator.isPresented = false
         nsView.owner?.setPresented(false, lease: coordinator.presentationLease)
+    }
+
+    private func presentAfterLayout(_ view: RelayGhosttyView, coordinator: Coordinator) {
+        guard !coordinator.isPresented, coordinator.presentationTask == nil else { return }
+        coordinator.presentationTask = Task { @MainActor [weak view, weak coordinator] in
+            guard let view, let coordinator else { return }
+            for delay in [0, 8, 16, 32] {
+                if delay == 0 {
+                    await Task.yield()
+                } else {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                }
+                guard !Task.isCancelled else { return }
+                if view.window != nil, view.bounds.width > 1, view.bounds.height > 1 {
+                    view.fitToSize()
+                    coordinator.isPresented = true
+                    coordinator.presentationTask = nil
+                    pane.runtime.setPresented(
+                        true,
+                        lease: coordinator.presentationLease,
+                        force: true
+                    )
+                    return
+                }
+            }
+            coordinator.presentationTask = nil
+        }
     }
 }
