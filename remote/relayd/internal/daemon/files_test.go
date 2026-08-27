@@ -62,3 +62,26 @@ func TestDecodePath(t *testing.T) {
 		t.Fatalf("decoded %q with error %v", path, err)
 	}
 }
+
+func TestImportFileAvoidsOverwriteAndBoundsInput(t *testing.T) {
+	directory := t.TempDir()
+	first, err := ImportFile(directory, "notes.txt", bytes.NewBufferString("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ImportFile(directory, "notes.txt", bytes.NewBufferString("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Path == second.Path || filepath.Base(second.Path) != "notes-2.txt" {
+		t.Fatalf("repeated import overwrote its destination: %#v %#v", first, second)
+	}
+	firstData, _ := os.ReadFile(first.Path)
+	secondData, _ := os.ReadFile(second.Path)
+	if string(firstData) != "first" || string(secondData) != "second" {
+		t.Fatalf("unexpected imported contents %q %q", firstData, secondData)
+	}
+	if _, err := ImportFile(directory, "../escape.txt", bytes.NewBuffer(nil)); err == nil {
+		t.Fatal("path traversal filename was accepted")
+	}
+}

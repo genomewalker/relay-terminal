@@ -25,6 +25,7 @@ final class TerminalRuntime: NSObject {
     private let artifactCoordinator = TerminalArtifactCoordinator()
     private var lastArtifact: (path: String, data: Data)?
     private var hoveredLink: String?
+    private var fileTransferTask: Task<Void, Never>?
     private var started = false
     private var presentationLeases = Set<UUID>()
 
@@ -86,7 +87,7 @@ final class TerminalRuntime: NSObject {
             paneTitle: pane.displayName,
             contentKind: pane.contentKind.rawValue,
             onOutput: { [weak self] data in
-                let displayData = artifactsEnabled ? ArtifactHyperlinkEncoder.encode(data) : data
+                let displayData = ArtifactHyperlinkEncoder.encode(data)
                 let isLiveOutput = io.receive(displayData)
                 guard let text = String(data: data, encoding: .utf8) else { return }
                 if artifactsEnabled {
@@ -191,6 +192,8 @@ final class TerminalRuntime: NSObject {
     }
 
     func stop() {
+        fileTransferTask?.cancel()
+        fileTransferTask = nil
         io.flushSnapshot()
         io.endReplay()
         io.transport?.detach()
@@ -300,14 +303,52 @@ final class TerminalRuntime: NSObject {
         NotificationCenter.default.post(name: .relayClosePane, object: pane?.id)
     }
 
-    fileprivate func openHoveredArtifact() -> Bool {
-        guard let hoveredLink, let path = ArtifactLinkResolver.path(from: hoveredLink) else { return false }
-        showArtifact(path: path)
-        return true
+    fileprivate func openHoveredLink() -> Bool {
+        guard let hoveredLink else { return false }
+        return openTerminalLink(hoveredLink)
     }
 
     fileprivate var allowsPromptSelectionEditing: Bool {
         pane?.contentKind == .terminal && pane?.kind == .shell
+    }
+
+    fileprivate func importLocalFiles(_ urls: [URL]) -> Bool {
+        guard !urls.isEmpty, fileTransferTask == nil,
+              let pane, pane.profile.kind == .ssh, pane.profile.backend == .relay else { return false }
+        let profile = pane.profile
+        let directory = pane.directory ?? "~"
+        view.toolTip = "Uploading \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) files")…"
+        fileTransferTask = Task { @MainActor [weak self] in
+            do {
+                let imported = try await RemoteFileTransfer.upload(urls, to: directory, profile: profile)
+                guard let self, !Task.isCancelled else { return }
+                self.fileTransferTask = nil
+                self.view.toolTip = imported.count == 1
+                    ? "Uploaded \(imported[0].name)"
+                    : "Uploaded \(imported.count) files"
+                let paths = imported.map { Self.promptPath($0.path) }.joined(separator: " ") + " "
+                self.view.sendText(paths)
+                RelayDiagnostics.shared.record(category: "transfer", name: "uploaded", details: [
+                    "pane_id": pane.id.uuidString.lowercased(),
+                    "files": String(imported.count),
+                ])
+            } catch {
+                guard let self else { return }
+                self.fileTransferTask = nil
+                self.view.toolTip = error.localizedDescription
+                NSSound.beep()
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Could not upload file"
+                alert.informativeText = error.localizedDescription
+                if let window = self.view.window {
+                    alert.beginSheetModal(for: window) { _ in }
+                } else {
+                    alert.runModal()
+                }
+            }
+        }
+        return true
     }
 
     private func presentArtifact(path: String, data: Data) {
@@ -333,6 +374,43 @@ final class TerminalRuntime: NSObject {
                 ])
             }
         }
+    }
+
+    @discardableResult
+    private func openTerminalLink(_ link: String) -> Bool {
+        guard let target = TerminalLinkResolver.target(from: link) else { return false }
+        switch target {
+        case .web(let url):
+            NSWorkspace.shared.open(url)
+        case .image(let path):
+            showArtifact(path: resolvedRemotePath(path))
+        case .file(let path):
+            guard let pane else { return false }
+            NotificationCenter.default.post(
+                name: .relayOpenRemoteFile,
+                object: RemoteFileOpenRequest(
+                    profile: pane.profile,
+                    parentSessionID: pane.id.uuidString.lowercased(),
+                    request: EditorOpenRequest(paths: [resolvedRemotePath(path)], diff: false)
+                )
+            )
+        }
+        return true
+    }
+
+    private func resolvedRemotePath(_ path: String) -> String {
+        guard (path.hasPrefix("./") || path.hasPrefix("../")),
+              let directory = pane?.directory, directory.hasPrefix("/") else { return path }
+        return URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent(path)
+            .standardizedFileURL.path
+    }
+
+    private static func promptPath(_ path: String) -> String {
+        guard path.contains(where: { $0.isWhitespace || "'\"\\$`!()[]{};&|<>".contains($0) }) else {
+            return path
+        }
+        return "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 
@@ -760,14 +838,7 @@ extension TerminalRuntime:
     }
 
     func terminalDidRequestOpenURL(_ url: String, kind: TerminalOpenURLKind) {
-        if let path = ArtifactLinkResolver.path(from: url) {
-            showArtifact(path: path)
-            return
-        }
-        guard let destination = URL(string: url),
-              let scheme = destination.scheme?.lowercased(),
-              ["http", "https", "mailto"].contains(scheme) else { return }
-        NSWorkspace.shared.open(destination)
+        _ = openTerminalLink(url)
     }
 
     func terminalDidUpdateHoverLink(_ url: String?) {
@@ -789,10 +860,20 @@ final class RelayGhosttyView: TerminalView {
     private var selectionStartInWindow: CGPoint?
     private var promptSelection: PromptSelection?
 
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
     override func mouseDown(with event: NSEvent) {
         owner?.selectPane()
         if event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
-           owner?.openHoveredArtifact() == true {
+           owner?.openHoveredLink() == true {
             suppressNextMouseUp = true
             return
         }
@@ -833,6 +914,11 @@ final class RelayGhosttyView: TerminalView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "v",
+           importFiles(from: NSPasteboard.general) {
+            return
+        }
         if (event.keyCode == 51 || event.keyCode == 117),
            event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
            let promptSelection,
@@ -847,6 +933,14 @@ final class RelayGhosttyView: TerminalView {
         }
         promptSelection = nil
         super.keyDown(with: event)
+    }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        localFileURLs(from: sender.draggingPasteboard).isEmpty ? [] : .copy
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        importFiles(from: sender.draggingPasteboard)
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -929,6 +1023,7 @@ final class RelayGhosttyView: TerminalView {
             action: #selector(pasteRelay),
             key: "v",
             enabled: NSPasteboard.general.string(forType: .string) != nil
+                || !localFileURLs(from: NSPasteboard.general).isEmpty
         ))
         menu.addItem(item("Select All", action: #selector(selectAllRelay), key: "a", enabled: true))
         menu.addItem(.separator())
@@ -961,7 +1056,11 @@ final class RelayGhosttyView: TerminalView {
     }
 
     @objc private func copyRelay() { _ = copySelectedTextToPasteboard() }
-    @objc private func pasteRelay() { _ = performBindingAction("paste_from_clipboard") }
+    @objc private func pasteRelay() {
+        if !importFiles(from: NSPasteboard.general) {
+            _ = performBindingAction("paste_from_clipboard")
+        }
+    }
     @objc private func selectAllRelay() { _ = performBindingAction("select_all") }
     @objc private func clearScrollback() { _ = performBindingAction("clear_scrollback") }
     @objc private func previousPrompt() { _ = owner?.jumpToPrompt(by: -1) }
@@ -969,6 +1068,19 @@ final class RelayGhosttyView: TerminalView {
     @objc private func splitRight() { owner?.split(.horizontal) }
     @objc private func splitDown() { owner?.split(.vertical) }
     @objc private func closeRelayPane() { owner?.closePane() }
+
+    private func importFiles(from pasteboard: NSPasteboard) -> Bool {
+        let urls = localFileURLs(from: pasteboard)
+        return !urls.isEmpty && owner?.importLocalFiles(urls) == true
+    }
+
+    private func localFileURLs(from pasteboard: NSPasteboard) -> [URL] {
+        let objects = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [NSURL] ?? []
+        return objects.compactMap { $0 as URL }
+    }
 }
 
 private extension TerminalRuntime {

@@ -10,11 +10,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const maxEditorFileBytes = 16 << 20
+const maxImportedFileBytes = 64 << 20
 
 type WorkspaceInfo struct {
 	Path string `json:"path"`
@@ -167,6 +169,72 @@ func WriteEditorFile(path string, expectedModificationNS int64, reader io.Reader
 		return FileDocument{}, err
 	}
 	return ReadEditorFile(resolved)
+}
+
+// ImportFile copies a local desktop file into an existing remote directory.
+// It never overwrites: repeated drops receive a numbered filename instead.
+func ImportFile(directory, name string, reader io.Reader) (FileEntry, error) {
+	resolvedDirectory, err := resolveUserPath(directory, true)
+	if err != nil {
+		return FileEntry{}, err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
+		return FileEntry{}, errors.New("import filename is invalid")
+	}
+
+	extension := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, extension)
+	var destination string
+	var destinationFile *os.File
+	for attempt := 0; attempt < 1000; attempt++ {
+		candidateName := name
+		if attempt > 0 {
+			candidateName = stem + "-" + strconv.Itoa(attempt+1) + extension
+		}
+		candidate := filepath.Join(resolvedDirectory, candidateName)
+		destinationFile, err = os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			destination = candidate
+			break
+		}
+		if !os.IsExist(err) {
+			return FileEntry{}, err
+		}
+	}
+	if destinationFile == nil {
+		return FileEntry{}, errors.New("could not choose an unused import filename")
+	}
+	keep := false
+	defer func() {
+		_ = destinationFile.Close()
+		if !keep {
+			_ = os.Remove(destination)
+		}
+	}()
+
+	written, err := io.Copy(destinationFile, io.LimitReader(reader, maxImportedFileBytes+1))
+	if err != nil {
+		return FileEntry{}, err
+	}
+	if written > maxImportedFileBytes {
+		return FileEntry{}, errors.New("import file exceeds 64 MiB")
+	}
+	if err := destinationFile.Sync(); err != nil {
+		return FileEntry{}, err
+	}
+	if err := destinationFile.Close(); err != nil {
+		return FileEntry{}, err
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		return FileEntry{}, err
+	}
+	keep = true
+	return FileEntry{
+		Name: filepath.Base(destination), Path: destination, Size: info.Size(),
+		ModificationNS: info.ModTime().UnixNano(),
+	}, nil
 }
 
 func ReadGitDiff(path string) (FileDiff, error) {

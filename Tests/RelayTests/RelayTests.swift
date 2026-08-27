@@ -816,3 +816,33 @@ func promptSelectionDeletionSequence() {
         == String(repeating: "\u{001B}[3~", count: 3))
     #expect(TerminalPromptSelectionEdit.deletionSequence(for: "output\nnext", backwards: false) == nil)
 }
+
+@Test("Terminal links route web, image, and source paths natively")
+func terminalLinkRouting() {
+    let source = "/maps/project/Sources/main.swift"
+    let sourceLink = TerminalLinkResolver.link(forRemotePath: source)
+    #expect(TerminalLinkResolver.target(from: sourceLink) == .file(source))
+
+    let image = "/tmp/claude-1234/result.png"
+    let imageLink = TerminalLinkResolver.link(forRemotePath: image)
+    #expect(TerminalLinkResolver.target(from: imageLink) == .image(image))
+
+    let web = URL(string: "https://example.com/docs?q=relay")!
+    #expect(TerminalLinkResolver.target(from: web.absoluteString) == .web(web))
+}
+
+@Test("Code paths and URLs become clickable without changing visible output")
+func terminalHyperlinksCoverCodeAndWeb() {
+    let visible = "See /maps/project/main.rs:42 and https://example.com/docs/guide.md\n"
+    let encoded = ArtifactHyperlinkEncoder.encode(Data(visible.utf8))
+    let output = String(decoding: encoded, as: UTF8.self)
+    #expect(output.contains("file:///__relay_remote_file__/"))
+    #expect(output.components(separatedBy: "file:///__relay_remote_file__/").count == 2)
+    #expect(output.contains("\u{001B}]8;;https://example.com/docs/guide.md"))
+    let stripped = output.replacingOccurrences(
+        of: "\\u001B\\]8;;[^\\u001B]*\\u001B\\\\|\\u001B\\]8;;\\u001B\\\\",
+        with: "",
+        options: .regularExpression
+    )
+    #expect(stripped == visible)
+}

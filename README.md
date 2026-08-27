@@ -43,6 +43,8 @@ A local pane maps one-to-one to a durable remote `relayd` session UUID. Splittin
 - Sequence-based output reconnect plus acknowledged, deduplicated input for new workers; old workers remain protocol-compatible
 - Persistent bounded agent-event journals with cursor replay, including a supervisor compatibility index for older workers
 - Inline Kitty-graphics rendering or dismissible native previews for PNG/JPEG/GIF/WebP files referenced by remote Codex or Claude output
+- Type-aware terminal links: web URLs open in the local browser, remote images open in Relay's viewer, and remote source/text paths open in a floating `rcode` pane
+- Finder drag-and-drop and file paste into remote panes; Relay uploads to the pane's current directory, never overwrites, and inserts the resulting remote path at the prompt
 - Live macOS Settings (`⌘,`) for font, size, terminal padding, palette, interface density, full-screen chrome, and artifact previews
 - Workspace restoration using stable pane/session UUIDs
 - One persistent SSH transport per connected node, with independent virtual pane and agent channels; protocol heartbeats replace even a completely frozen SSH process in about ten seconds
@@ -113,6 +115,7 @@ Drag a pane by its connection header and drop it near another pane's left, right
 ## Current limits
 
 - Relay accepts versioned Codex app-server JSON-RPC and Claude stream-json events through `relayd event --stream`; the existing interactive TUIs still use structured hooks plus a transcript compatibility fallback until they emit that stream directly
+- Finder transfer currently accepts regular files up to 64 MiB each; directory and resumable transfers are not implemented yet
 - A persisted local screen/event cache beyond the worker replay ring
 - Signed public builds require the repository owner’s Developer ID and Apple notarization credentials
 

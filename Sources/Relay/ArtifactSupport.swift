@@ -51,18 +51,32 @@ struct ImagePathDetector {
     }
 }
 
-enum ArtifactLinkResolver {
-    private static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp"])
-    private static let internalPrefix = "file:///__relay_artifact__/"
-    private static let legacyInternalPrefix = "relay-artifact://open/"
+enum TerminalLinkTarget: Equatable, Sendable {
+    case web(URL)
+    case image(String)
+    case file(String)
+}
 
-    static func path(from link: String) -> String? {
-        if link.hasPrefix(internalPrefix) || link.hasPrefix(legacyInternalPrefix) {
-            let prefix = link.hasPrefix(internalPrefix) ? internalPrefix : legacyInternalPrefix
-            let encoded = String(link.dropFirst(prefix.count))
-            guard let data = Data(base64URLEncoded: encoded),
-                  let path = String(data: data, encoding: .utf8) else { return nil }
-            return isImagePath(path) ? path : nil
+enum TerminalLinkResolver {
+    static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp"])
+    private static let artifactPrefix = "file:///__relay_artifact__/"
+    private static let legacyArtifactPrefix = "relay-artifact://open/"
+    private static let filePrefix = "file:///__relay_remote_file__/"
+
+    static func target(from link: String) -> TerminalLinkTarget? {
+        if link.hasPrefix(artifactPrefix) || link.hasPrefix(legacyArtifactPrefix) {
+            let prefix = link.hasPrefix(artifactPrefix) ? artifactPrefix : legacyArtifactPrefix
+            guard let path = decodePath(String(link.dropFirst(prefix.count))) else { return nil }
+            return .image(path)
+        }
+        if link.hasPrefix(filePrefix) {
+            guard let path = decodePath(String(link.dropFirst(filePrefix.count))) else { return nil }
+            return target(forRemotePath: path)
+        }
+        if let url = URL(string: link),
+           let scheme = url.scheme?.lowercased(),
+           ["http", "https", "mailto"].contains(scheme) {
+            return .web(url)
         }
 
         let path: String
@@ -71,26 +85,51 @@ enum ArtifactLinkResolver {
         } else {
             path = link.removingPercentEncoding ?? link
         }
-        return isImagePath(path) ? path : nil
+        guard isRemotePath(path) else { return nil }
+        return target(forRemotePath: path)
+    }
+
+    static func link(forRemotePath path: String) -> String {
+        if isImagePath(path) { return artifactPrefix + Data(path.utf8).base64URLEncodedString() }
+        return filePrefix + Data(path.utf8).base64URLEncodedString()
+    }
+
+    static func isImagePath(_ path: String) -> Bool {
+        imageExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased())
+            || path.hasPrefix("/tmp/claude-")
+    }
+
+    private static func target(forRemotePath path: String) -> TerminalLinkTarget {
+        isImagePath(path) ? .image(path) : .file(path)
+    }
+
+    private static func isRemotePath(_ path: String) -> Bool {
+        let cleaned = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.hasPrefix("/") || cleaned.hasPrefix("./")
+            || cleaned.hasPrefix("../") || cleaned.hasPrefix("~/")
+            || cleaned.hasPrefix(".codex/")
+    }
+
+    private static func decodePath(_ encoded: String) -> String? {
+        guard let data = Data(base64URLEncoded: encoded) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+enum ArtifactLinkResolver {
+
+    static func path(from link: String) -> String? {
+        guard case .image(let path) = TerminalLinkResolver.target(from: link) else { return nil }
+        return path
     }
 
     static func link(for path: String) -> String {
-        internalPrefix + Data(path.utf8).base64URLEncodedString()
-    }
-
-    private static func isImagePath(_ path: String) -> Bool {
-        let cleaned = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard cleaned.hasPrefix("/") || cleaned.hasPrefix(".codex/") || cleaned.hasPrefix("./.codex/") else {
-            return false
-        }
-        if imageExtensions.contains(URL(fileURLWithPath: cleaned).pathExtension.lowercased()) {
-            return true
-        }
-        return cleaned.hasPrefix("/tmp/claude-")
+        TerminalLinkResolver.link(forRemotePath: path)
     }
 }
 
 enum ArtifactHyperlinkEncoder {
+    private static let fileExtensions = "png|jpe?g|gif|webp|txt|md|markdown|rst|log|csv|tsv|jsonl?|ya?ml|toml|ini|conf|cfg|swift|go|rs|pyw?|r|rmd|sh|bash|zsh|fish|js|mjs|cjs|jsx|ts|mts|cts|tsx|html?|css|scss|sql|c|h|cc|cpp|cxx|hpp|java|kt|kts|rb|php|pl|lua|ex|exs|erl|hrl|scala|proto|graphql|tex|bib|diff|patch|lock"
     private static let patterns = [
         try! NSRegularExpression(
             pattern: #"(?:file://)?(/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
@@ -103,6 +142,14 @@ enum ArtifactHyperlinkEncoder {
             pattern: #"((?:\./)?\.codex/generated_images/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
             options: [.caseInsensitive]
         ),
+        try! NSRegularExpression(
+            pattern: "((?<![:/])(?:file://)?(?:/|\\./|\\.\\./)[A-Za-z0-9_~.%+@:,/=\\-]+\\.(?:\(fileExtensions)))(?::[0-9]+(?::[0-9]+)?)?",
+            options: [.caseInsensitive]
+        ),
+        try! NSRegularExpression(
+            pattern: #"(https?://[^\s\]\[()<>{}\"']*[A-Za-z0-9_/#=&%+~-])"#,
+            options: [.caseInsensitive]
+        ),
     ]
 
     /// Adds zero-width OSC 8 links while preserving the visible terminal text.
@@ -110,12 +157,7 @@ enum ArtifactHyperlinkEncoder {
     static func encode(_ data: Data) -> Data {
         guard data.range(of: Data("\u{001B}]8;".utf8)) == nil,
               let text = String(data: data, encoding: .utf8),
-              text.range(of: ".png", options: .caseInsensitive) != nil
-                || text.range(of: ".jpg", options: .caseInsensitive) != nil
-                || text.range(of: ".jpeg", options: .caseInsensitive) != nil
-                || text.range(of: ".gif", options: .caseInsensitive) != nil
-                || text.range(of: ".webp", options: .caseInsensitive) != nil
-                || text.contains("/tmp/claude-")
+              text.contains("/")
         else { return data }
 
         let mutable = NSMutableString(string: text)
@@ -130,14 +172,26 @@ enum ArtifactHyperlinkEncoder {
             }
         }
 
-        // Multiple patterns can recognize the same path. Replace unique ranges
-        // from the end so earlier UTF-16 offsets remain valid.
-        var seen = Set<String>()
-        for item in ranges.sorted(by: { $0.range.location > $1.range.location }) {
-            let key = "\(item.range.location):\(item.range.length)"
-            guard seen.insert(key).inserted else { continue }
+        // A URL can contain a suffix that also looks like a remote file path.
+        // Prefer the widest match and discard every intersecting duplicate
+        // before changing string lengths.
+        var selected: [(range: NSRange, path: String)] = []
+        for item in ranges.sorted(by: {
+            if $0.range.location == $1.range.location { return $0.range.length > $1.range.length }
+            return $0.range.location < $1.range.location
+        }) where !selected.contains(where: { NSIntersectionRange($0.range, item.range).length > 0 }) {
+            selected.append(item)
+        }
+        for item in selected.sorted(by: { $0.range.location > $1.range.location }) {
             let visible = mutable.substring(with: item.range)
-            let destination = ArtifactLinkResolver.link(for: item.path)
+            let destination: String
+            switch TerminalLinkResolver.target(from: item.path) {
+            case .web(let url): destination = url.absoluteString
+            case .image(let path), .file(let path):
+                destination = TerminalLinkResolver.link(forRemotePath: path)
+            case nil:
+                destination = TerminalLinkResolver.link(forRemotePath: item.path)
+            }
             mutable.replaceCharacters(
                 in: item.range,
                 with: "\u{001B}]8;;\(destination)\u{001B}\\\(visible)\u{001B}]8;;\u{001B}\\"

@@ -133,11 +133,12 @@ func runRCode(arguments []string) {
 
 func runFiles(arguments []string) {
 	if len(arguments) == 0 {
-		fatal("usage: relayd files <workspace|list|read|write|git-diff>")
+		fatal("usage: relayd files <workspace|list|read|write|import|git-diff>")
 	}
 	flags := flag.NewFlagSet("files "+arguments[0], flag.ExitOnError)
 	pathBase64 := flags.String("path-b64", "", "base64-encoded absolute path")
 	parentSession := flags.String("parent-session", "", "terminal session whose working directory should be used")
+	nameBase64 := flags.String("name-b64", "", "base64-encoded import filename")
 	expectedModificationNS := flags.Int64("expected-modification-ns", 0, "mtime used for conflict detection")
 	_ = flags.Parse(arguments[1:])
 	path := ""
@@ -159,10 +160,16 @@ func runFiles(arguments []string) {
 		value, err = daemon.ReadEditorFile(path)
 	case "write":
 		value, err = daemon.WriteEditorFile(path, *expectedModificationNS, os.Stdin)
+	case "import":
+		name, decodeErr := daemon.DecodePath(*nameBase64)
+		if decodeErr != nil {
+			fatal(decodeErr.Error())
+		}
+		value, err = daemon.ImportFile(path, name, os.Stdin)
 	case "git-diff":
 		value, err = daemon.ReadGitDiff(path)
 	default:
-		fatal("usage: relayd files <workspace|list|read|write|git-diff>")
+		fatal("usage: relayd files <workspace|list|read|write|import|git-diff>")
 	}
 	if err != nil {
 		fatal(err.Error())
