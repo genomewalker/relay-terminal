@@ -13,41 +13,59 @@ struct PaneArtifact: Identifiable {
 struct ImagePathDetector {
     private var boundaryTail = ""
     private var seen = Set<String>()
-    private static let regex = try! NSRegularExpression(
-        pattern: #"(?:^|[^A-Za-z0-9_.-])(?:file://)?(/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
-        options: [.caseInsensitive]
-    )
-    private static let claudeScratchRegex = try! NSRegularExpression(
-        pattern: #"(/tmp/claude-[0-9]+/[A-Za-z0-9_~.%+@:/-]+)(?:[\s)\]])"#,
-        options: []
-    )
-    private static let relativeCodexRegex = try! NSRegularExpression(
-        pattern: #"(?:^|[\s└])((?:\./)?\.codex/generated_images/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
-        options: [.caseInsensitive, .anchorsMatchLines]
-    )
+    private var controlStripper = TerminalControlSequenceStripper()
 
     mutating func ingest(_ text: String) -> [String] {
-        let candidate = boundaryTail + text
+        let candidate = boundaryTail + controlStripper.ingest(text)
         boundaryTail = String(candidate.suffix(2_048))
-        let stripped = candidate.replacingOccurrences(
-            of: "\\x1B(?:[@-Z\\\\-_]|\\[[0-?]*[ -/]*[@-~])",
-            with: "",
-            options: .regularExpression
-        )
-        let range = NSRange(stripped.startIndex..., in: stripped)
         var discovered: [String] = []
-        let matches = Self.regex.matches(in: stripped, range: range)
-            + Self.claudeScratchRegex.matches(in: stripped, range: range)
-            + Self.relativeCodexRegex.matches(in: stripped, range: range)
-        for match in matches {
-            guard let matchRange = Range(match.range(at: 1), in: stripped) else { continue }
-            let encoded = String(stripped[matchRange])
+        for link in TerminalLinkScanner.links(in: candidate) {
+            guard case .image(let encoded) = TerminalLinkResolver.target(from: link.value) else { continue }
             let path = encoded.removingPercentEncoding ?? encoded
             guard !seen.contains(path) else { continue }
             seen.insert(path)
             discovered.append(path)
         }
         return discovered
+    }
+}
+
+/// Removes terminal control sequences from the artifact compatibility stream.
+/// The state survives packet boundaries, so an SGR/OSC split across SSH reads
+/// cannot leak escape bytes into a path token. The rendered stream is untouched.
+private struct TerminalControlSequenceStripper {
+    private enum State { case text, escape, csi, osc, oscEscape, controlString, controlStringEscape }
+    private var state: State = .text
+
+    mutating func ingest(_ text: String) -> String {
+        var output: [UInt8] = []
+        output.reserveCapacity(text.utf8.count)
+        for byte in text.utf8 {
+            switch state {
+            case .text:
+                if byte == 0x1B { state = .escape }
+                else { output.append(byte) }
+            case .escape:
+                switch byte {
+                case 0x5B: state = .csi              // ESC [
+                case 0x5D: state = .osc              // ESC ]
+                case 0x50, 0x5E, 0x5F: state = .controlString // DCS, PM, APC
+                default: state = .text
+                }
+            case .csi:
+                if (0x40...0x7E).contains(byte) { state = .text }
+            case .osc:
+                if byte == 0x07 { state = .text }
+                else if byte == 0x1B { state = .oscEscape }
+            case .oscEscape:
+                state = byte == 0x5C ? .text : .osc
+            case .controlString:
+                if byte == 0x1B { state = .controlStringEscape }
+            case .controlStringEscape:
+                state = byte == 0x5C ? .text : .controlString
+            }
+        }
+        return String(decoding: output, as: UTF8.self)
     }
 }
 
@@ -129,29 +147,6 @@ enum ArtifactLinkResolver {
 }
 
 enum ArtifactHyperlinkEncoder {
-    private static let fileExtensions = "png|jpe?g|gif|webp|txt|md|markdown|rst|log|csv|tsv|jsonl?|ya?ml|toml|ini|conf|cfg|swift|go|rs|pyw?|r|rmd|sh|bash|zsh|fish|js|mjs|cjs|jsx|ts|mts|cts|tsx|html?|css|scss|sql|c|h|cc|cpp|cxx|hpp|java|kt|kts|rb|php|pl|lua|ex|exs|erl|hrl|scala|proto|graphql|tex|bib|diff|patch|lock"
-    private static let patterns = [
-        try! NSRegularExpression(
-            pattern: #"(?:file://)?(/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
-            options: [.caseInsensitive]
-        ),
-        try! NSRegularExpression(
-            pattern: #"(/tmp/claude-[0-9]+/[A-Za-z0-9_~.%+@:/-]+)"#
-        ),
-        try! NSRegularExpression(
-            pattern: #"((?:\./)?\.codex/generated_images/[A-Za-z0-9_~.%+@:/-]+\.(?:png|jpe?g|gif|webp))"#,
-            options: [.caseInsensitive]
-        ),
-        try! NSRegularExpression(
-            pattern: "((?<![:/])(?:file://)?(?:/|\\./|\\.\\./)[A-Za-z0-9_~.%+@:,/=\\-]+\\.(?:\(fileExtensions)))(?::[0-9]+(?::[0-9]+)?)?",
-            options: [.caseInsensitive]
-        ),
-        try! NSRegularExpression(
-            pattern: #"(https?://[^\s\]\[()<>{}\"']*[A-Za-z0-9_/#=&%+~-])"#,
-            options: [.caseInsensitive]
-        ),
-    ]
-
     /// Adds zero-width OSC 8 links while preserving the visible terminal text.
     /// Chunks that already contain OSC 8 are left alone to avoid nested links.
     static func encode(_ data: Data) -> Data {
@@ -160,44 +155,135 @@ enum ArtifactHyperlinkEncoder {
               text.contains("/")
         else { return data }
 
-        let mutable = NSMutableString(string: text)
-        var ranges: [(range: NSRange, path: String)] = []
-        for regex in patterns {
-            let current = mutable as String
-            let fullRange = NSRange(current.startIndex..., in: current)
-            for match in regex.matches(in: current, range: fullRange) {
-                guard let range = Range(match.range(at: 1), in: current) else { continue }
-                let encodedPath = String(current[range])
-                ranges.append((match.range(at: 1), encodedPath.removingPercentEncoding ?? encodedPath))
+        let links = TerminalLinkScanner.links(in: text)
+        guard !links.isEmpty else { return data }
+        var encoded = ""
+        encoded.reserveCapacity(text.utf8.count + links.count * 48)
+        var cursor = text.startIndex
+        for link in links {
+            encoded.append(contentsOf: text[cursor..<link.range.lowerBound])
+            encoded.append("\u{001B}]8;;\(link.destination)\u{001B}\\")
+            encoded.append(contentsOf: text[link.range])
+            encoded.append("\u{001B}]8;;\u{001B}\\")
+            cursor = link.range.upperBound
+        }
+        encoded.append(contentsOf: text[cursor...])
+        return Data(encoded.utf8)
+    }
+}
+
+private struct TerminalDetectedLink {
+    let range: Range<String.Index>
+    let value: String
+    let destination: String
+}
+
+/// A bounded token scanner for the compatibility path. Modern shells and
+/// agents should emit OSC 8 or structured artifact events directly; this
+/// scanner avoids allocating Foundation regex result objects for every TUI
+/// repaint packet.
+private enum TerminalLinkScanner {
+    private static let fileExtensions: Set<String> = Set([
+        "png", "jpg", "jpeg", "gif", "webp", "txt", "md", "markdown", "rst", "log",
+        "csv", "tsv", "json", "jsonl", "yaml", "yml", "toml", "ini", "conf", "cfg",
+        "swift", "go", "rs", "py", "pyw", "r", "rmd", "sh", "bash", "zsh", "fish",
+        "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "html", "htm", "css",
+        "scss", "sql", "c", "h", "cc", "cpp", "cxx", "hpp", "java", "kt", "kts",
+        "rb", "php", "pl", "lua", "ex", "exs", "erl", "hrl", "scala", "proto",
+        "graphql", "tex", "bib", "diff", "patch", "lock",
+    ])
+    private static let tokenDelimiters = CharacterSet.whitespacesAndNewlines.union(
+        CharacterSet(charactersIn: "[](){}<>\"'`")
+    )
+    private static let trailingPunctuation = CharacterSet(charactersIn: ".,;!?…")
+
+    static func links(in text: String) -> [TerminalDetectedLink] {
+        guard text.contains("/") else { return [] }
+        var links: [TerminalDetectedLink] = []
+        var tokenStart = text.startIndex
+        var index = text.startIndex
+        while index <= text.endIndex {
+            let atEnd = index == text.endIndex
+            let delimiter = !atEnd && text[index].unicodeScalars.allSatisfy(tokenDelimiters.contains)
+            if atEnd || delimiter {
+                if tokenStart < index, let link = link(in: text, tokenRange: tokenStart..<index) {
+                    links.append(link)
+                }
+                if atEnd { break }
+                tokenStart = text.index(after: index)
             }
+            index = text.index(after: index)
+        }
+        return links
+    }
+
+    private static func link(in text: String, tokenRange: Range<String.Index>) -> TerminalDetectedLink? {
+        let token = text[tokenRange]
+        guard !token.contains("\u{001B}") else { return nil }
+        let start: String.Index
+        if let web = firstRange(of: ["https://", "http://", "file:///"], in: token) {
+            start = web.lowerBound
+        } else if token.hasPrefix(".codex/") || token.hasPrefix("./") || token.hasPrefix("../") {
+            start = token.startIndex
+        } else if let slash = token.firstIndex(of: "/") {
+            start = slash
+        } else {
+            return nil
         }
 
-        // A URL can contain a suffix that also looks like a remote file path.
-        // Prefer the widest match and discard every intersecting duplicate
-        // before changing string lengths.
-        var selected: [(range: NSRange, path: String)] = []
-        for item in ranges.sorted(by: {
-            if $0.range.location == $1.range.location { return $0.range.length > $1.range.length }
-            return $0.range.location < $1.range.location
-        }) where !selected.contains(where: { NSIntersectionRange($0.range, item.range).length > 0 }) {
-            selected.append(item)
+        var end = token.endIndex
+        while end > start {
+            let previous = token.index(before: end)
+            guard token[previous].unicodeScalars.allSatisfy(trailingPunctuation.contains) else { break }
+            end = previous
         }
-        for item in selected.sorted(by: { $0.range.location > $1.range.location }) {
-            let visible = mutable.substring(with: item.range)
-            let destination: String
-            switch TerminalLinkResolver.target(from: item.path) {
-            case .web(let url): destination = url.absoluteString
-            case .image(let path), .file(let path):
-                destination = TerminalLinkResolver.link(forRemotePath: path)
-            case nil:
-                destination = TerminalLinkResolver.link(forRemotePath: item.path)
-            }
-            mutable.replaceCharacters(
-                in: item.range,
-                with: "\u{001B}]8;;\(destination)\u{001B}\\\(visible)\u{001B}]8;;\u{001B}\\"
-            )
+        end = droppingLineAndColumnSuffix(from: token, start: start, end: end)
+        guard start < end else { return nil }
+
+        let value = String(token[start..<end])
+        let target = TerminalLinkResolver.target(from: value)
+        let destination: String
+        switch target {
+        case .web(let url):
+            destination = url.absoluteString
+        case .image(let path):
+            destination = TerminalLinkResolver.link(forRemotePath: path)
+        case .file(let path):
+            guard supportsFile(path) else { return nil }
+            destination = TerminalLinkResolver.link(forRemotePath: path)
+        case nil:
+            return nil
         }
-        return Data((mutable as String).utf8)
+        return TerminalDetectedLink(range: start..<end, value: value, destination: destination)
+    }
+
+    private static func supportsFile(_ path: String) -> Bool {
+        if path.hasPrefix("/tmp/claude-") { return true }
+        return fileExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased())
+    }
+
+    private static func firstRange(
+        of needles: [String],
+        in token: Substring
+    ) -> Range<String.Index>? {
+        needles.compactMap { token.range(of: $0, options: [.caseInsensitive]) }
+            .min { $0.lowerBound < $1.lowerBound }
+    }
+
+    private static func droppingLineAndColumnSuffix(
+        from token: Substring,
+        start: String.Index,
+        end: String.Index
+    ) -> String.Index {
+        var result = end
+        for _ in 0..<2 {
+            guard let colon = token[start..<result].lastIndex(of: ":") else { break }
+            let digitsStart = token.index(after: colon)
+            guard digitsStart < result,
+                  token[digitsStart..<result].allSatisfy({ $0.isNumber }) else { break }
+            result = colon
+        }
+        return result
     }
 }
 

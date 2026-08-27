@@ -95,37 +95,45 @@ final class TerminalRuntime: NSObject {
             paneTitle: pane.displayName,
             contentKind: pane.contentKind.rawValue,
             onOutput: { [weak self] data in
-                let displayData = ArtifactHyperlinkEncoder.encode(data)
-                let isLiveOutput = io.receive(displayData)
-                guard let text = String(data: data, encoding: .utf8) else { return }
-                if artifactsEnabled {
-                    for path in artifactCoordinator.discover(in: text) {
-                        Task { @Sendable [weak self] in
-                            // Modern workers put a structured artifact frame
-                            // directly after this output. Give it priority and
-                            // only open a separate SSH fetch for older workers.
-                            try? await Task.sleep(for: .milliseconds(150))
-                            guard artifactCoordinator.beginFallback(for: path) else { return }
-                            guard let data = try? await RemoteArtifactLoader.load(path: path, profile: artifactProfile),
-                                  artifactCoordinator.acceptFallback(for: path) else { return }
-                            if artifactPresentation == .inline {
-                                io.receiveInlineImageOrdered(
-                                    data,
-                                    imageID: Self.stableImageID(for: path)
-                                )
-                            }
-                            await MainActor.run { [weak self] in
-                                self?.presentArtifact(path: path, data: data)
+                autoreleasepool {
+                    let displayData = ArtifactHyperlinkEncoder.encode(data)
+                    let isLiveOutput = io.receive(displayData)
+                    guard let text = String(data: data, encoding: .utf8) else { return }
+                    if artifactsEnabled {
+                        for path in artifactCoordinator.discover(in: text) {
+                            Task { @Sendable [weak self] in
+                                // Modern workers put a structured artifact frame
+                                // directly after this output. Give it priority and
+                                // only open a separate SSH fetch for older workers.
+                                try? await Task.sleep(for: .milliseconds(150))
+                                guard artifactCoordinator.beginFallback(for: path) else { return }
+                                guard let data = try? await RemoteArtifactLoader.load(path: path, profile: artifactProfile),
+                                      artifactCoordinator.acceptFallback(for: path) else { return }
+                                if artifactPresentation == .inline {
+                                    io.receiveInlineImageOrdered(
+                                        data,
+                                        imageID: Self.stableImageID(for: path)
+                                    )
+                                }
+                                await MainActor.run { [weak self] in
+                                    self?.presentArtifact(path: path, data: data)
+                                }
                             }
                         }
                     }
-                }
-                guard isLiveOutput else { return }
-                self?.activityCoalescer.ingest(text) { [weak self] batch in
-                    Task { @MainActor [weak self] in self?.pane?.received(batch) }
+                    guard isLiveOutput else { return }
+                    self?.activityCoalescer.ingest(text) { [weak self] batch in
+                        Task { @MainActor [weak self] in self?.pane?.received(batch) }
+                    }
                 }
             },
             onStatus: { [weak self] status in
+                if status.state == "attached" || status.state == "read_only" {
+                    // Current workers emit an authoritative caught_up marker
+                    // after replay. Do not let the legacy timeout start feeding
+                    // reconstruction packets into Ghostty before that marker.
+                    io.setExplicitReplayBoundary(status.capabilities.contains("event_cursor_v1"))
+                }
                 RelayDiagnostics.shared.record(category: "pane", name: status.state, details: [
                     "pane_id": pane.id.uuidString.lowercased(),
                     "profile": pane.profile.name,
@@ -482,8 +490,13 @@ private final class TerminalIOBridge: @unchecked Sendable {
     var transport: RelayRemoteTransport?
     var onReplayFinished: (@Sendable () -> Void)?
     private let receiveLock = NSLock()
+    private let displayLock = NSLock()
+    private let displayQueue = DispatchQueue(label: "relay.terminal-display", qos: .userInteractive)
+    private var displayBuffer = Data()
+    private var displayDrainScheduled = false
     private let replayLock = NSLock()
     private var replaying = false
+    private var expectsExplicitReplayBoundary = false
     private var suppressingTerminalWrites = false
     private var replayBuffer = Data()
     private var replayGeneration: UInt64 = 0
@@ -543,15 +556,18 @@ private final class TerminalIOBridge: @unchecked Sendable {
         replayLock.lock()
         if replaying {
             replayBuffer.append(data)
+            if replayBuffer.count > TerminalSnapshotStore.maximumBytes * 2 {
+                replayBuffer = TerminalSnapshotStore.bounded(replayBuffer)
+            }
             replayLock.unlock()
             scheduleLegacyReplayEnd()
             return false
         }
         replayLock.unlock()
+        enqueueDisplay(data)
         receiveLock.lock()
-        defer { receiveLock.unlock() }
-        session.receive(data)
         appendSnapshotLocked(data)
+        receiveLock.unlock()
         return true
     }
 
@@ -562,8 +578,8 @@ private final class TerminalIOBridge: @unchecked Sendable {
         }
         receiveLock.lock()
         snapshotBuffer = cached
-        session.receive(cached)
         receiveLock.unlock()
+        enqueueDisplay(cached, immediate: true)
         RelayDiagnostics.shared.record(category: "snapshot", name: "restored", details: [
             "pane_id": paneID.uuidString.lowercased(),
             "bytes": String(cached.count),
@@ -589,10 +605,47 @@ private final class TerminalIOBridge: @unchecked Sendable {
         // so an idle-only boundary would leave the opaque restore layer up
         // forever. Bound that compatibility path while newer workers still end
         // reconstruction immediately with their explicit caught_up status.
-        legacyReplayHardDeadline = .now() + .milliseconds(750)
+        let explicitBoundary = expectsExplicitReplayBoundary
+        legacyReplayHardDeadline = explicitBoundary
+            ? .now() + .seconds(30)
+            : .now() + .milliseconds(750)
         replayGeneration &+= 1
+        let explicitDeadline = legacyReplayHardDeadline
         replayLock.unlock()
-        scheduleLegacyReplayEnd()
+        if explicitBoundary {
+            legacyReplayTimer.schedule(deadline: explicitDeadline, leeway: .seconds(1))
+        } else {
+            scheduleLegacyReplayEnd()
+        }
+    }
+
+    func setExplicitReplayBoundary(_ enabled: Bool) {
+        replayLock.lock()
+        expectsExplicitReplayBoundary = enabled
+        if enabled {
+            // `attached` is ordered before replay frames, but SSH setup can
+            // outlast the legacy 750 ms timer armed at launch. Re-enter replay
+            // here when that timer already fired so no frame can escape into
+            // Ghostty's per-write queue. A long failsafe prevents a broken
+            // worker from holding the restore layer forever.
+            if !replaying {
+                replayBuffer.removeAll(keepingCapacity: true)
+                replaying = true
+                suppressingTerminalWrites = true
+                filterDeviceResponsesUntil = Date().addingTimeInterval(5)
+                replayGeneration &+= 1
+            }
+            legacyReplayHardDeadline = .now() + .seconds(30)
+            legacyReplayTimer.schedule(deadline: legacyReplayHardDeadline, leeway: .seconds(1))
+        } else if replaying {
+            // A downgraded worker has no caught_up marker. Restore the bounded
+            // compatibility path instead of leaving its replay open forever.
+            legacyReplayHardDeadline = .now() + .milliseconds(750)
+            replayGeneration &+= 1
+            legacyReplayGeneration = replayGeneration
+            legacyReplayTimer.schedule(deadline: legacyReplayHardDeadline)
+        }
+        replayLock.unlock()
     }
 
     func endReplay() {
@@ -614,10 +667,10 @@ private final class TerminalIOBridge: @unchecked Sendable {
             guard let self else { return }
             let reconstruction = TerminalReplayCompactor.compact(buffered)
             if !reconstruction.isEmpty {
-                self.receiveLock.lock()
                 var replacement = Data("\u{001B}c".utf8)
                 replacement.append(reconstruction)
-                self.session.receive(replacement)
+                self.enqueueDisplay(replacement, immediate: true)
+                self.receiveLock.lock()
                 self.snapshotBuffer = TerminalSnapshotStore.bounded(replacement)
                 self.scheduleSnapshotSaveLocked()
                 self.receiveLock.unlock()
@@ -697,7 +750,7 @@ private final class TerminalIOBridge: @unchecked Sendable {
     // for every replay frame.
     private func scheduleLegacyReplayEnd() {
         replayLock.lock()
-        guard replaying else {
+        guard replaying, !expectsExplicitReplayBoundary else {
             replayLock.unlock()
             return
         }
@@ -727,9 +780,44 @@ private final class TerminalIOBridge: @unchecked Sendable {
             return
         }
         replayLock.unlock()
-        receiveLock.lock()
-        session.receive(encoded)
-        receiveLock.unlock()
+        enqueueDisplay(encoded)
+    }
+
+    /// Collapse a burst of PTY frames into one Ghostty write. The dependency's
+    /// in-memory surface queues one GCD closure per call, so forwarding every
+    /// 4–8 KiB SSH packet can retain gigabytes during a repaint storm. One
+    /// scheduled drain preserves byte order and interactive latency while a
+    /// high-water compaction makes overload memory-bounded.
+    private func enqueueDisplay(_ data: Data, immediate: Bool = false) {
+        guard !data.isEmpty else { return }
+        displayLock.lock()
+        displayBuffer.append(data)
+        if displayBuffer.count > TerminalSnapshotStore.maximumBytes * 2 {
+            displayBuffer = TerminalSnapshotStore.bounded(displayBuffer)
+            RelayDiagnostics.shared.record(category: "terminal", name: "display-overload-compacted", details: [
+                "bytes": String(displayBuffer.count),
+            ])
+        }
+        guard !displayDrainScheduled else {
+            displayLock.unlock()
+            return
+        }
+        displayDrainScheduled = true
+        displayLock.unlock()
+        let delay: DispatchTimeInterval = immediate ? .nanoseconds(0) : .milliseconds(4)
+        displayQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.drainDisplay()
+        }
+    }
+
+    private func drainDisplay() {
+        displayLock.lock()
+        let batch = displayBuffer
+        displayBuffer = Data()
+        displayDrainScheduled = false
+        displayLock.unlock()
+        guard !batch.isEmpty else { return }
+        autoreleasepool { session.receive(batch) }
     }
 }
 

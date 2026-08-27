@@ -875,16 +875,36 @@ private struct SessionPaneRow: View {
     let tabID: UUID
     @ObservedObject var workspace: WorkspaceModel
     let active: Bool
+    @StateObject private var attention = AgentAttentionController()
     @State private var hovering = false
     @State private var agentThreadsExpanded = false
+    @State private var showingAllAgents = false
+    @State private var agentQuery = ""
 
     private var tab: TabModel? { workspace.tabs.first { $0.id == tabID } }
     private var isFloating: Bool { tab?.floatingPanes.contains(where: { $0.paneID == pane.id }) == true }
+    private var focusedAgents: [SubagentActivity] {
+        attention.snapshot.visibleIDs.compactMap { id in pane.subagents.first { $0.id == id } }
+    }
+    private var searchedAgents: [SubagentActivity] {
+        let query = agentQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return pane.subagents
+            .filter { agent in
+                guard !query.isEmpty else { return true }
+                return [agent.label, agent.id, agent.provider.label, agent.updates.last?.message ?? ""]
+                    .joined(separator: " ").lowercased().contains(query)
+            }
+            .sorted { agentActivityDate($0) > agentActivityDate($1) }
+    }
 
     private func revealPane() {
         if workspace.selectedTabID != tabID { workspace.selectTab(tabID) }
         workspace.selectPane(pane.id)
         pane.focus()
+    }
+
+    private func agentActivityDate(_ agent: SubagentActivity) -> Date {
+        agent.updates.last?.occurredAt ?? agent.completedAt ?? agent.startedAt
     }
 
     var body: some View {
@@ -904,7 +924,7 @@ private struct SessionPaneRow: View {
                         .foregroundStyle(active ? RelayTheme.text : RelayTheme.textMuted)
                         .lineLimit(1)
                     if pane.contentKind == .terminal && pane.kind != .shell {
-                        Text(pane.activitySummary)
+                        Text(AgentLabelFormatter.activity(pane.activitySummary))
                             .font(.system(size: 8.5, weight: .medium))
                             .foregroundStyle(RelayTheme.textFaint)
                             .lineLimit(1)
@@ -980,99 +1000,222 @@ private struct SessionPaneRow: View {
                     Button {
                         agentThreadsExpanded.toggle()
                     } label: {
-                        HStack(spacing: 4) {
-                            Text("\(pane.subagents.count)")
-                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        HStack(spacing: 5) {
+                            AgentPulse(phase: pane.phase, activeCount: pane.activeSubagents)
+                            Text(pane.activeSubagents > 0 ? "\(pane.activeSubagents)/\(pane.subagents.count)" : "\(pane.subagents.count)")
+                                .font(.system(size: 8, weight: .semibold, design: .rounded))
                             Image(systemName: agentThreadsExpanded ? "chevron.down" : "chevron.right")
                                 .font(.system(size: 8, weight: .bold))
                         }
-                        .frame(width: 45, height: 29)
+                        .frame(minWidth: 45, minHeight: 29)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(RelayTheme.textFaint)
                     .padding(.trailing, 3)
-                    .help(agentThreadsExpanded ? "Collapse \(pane.subagents.count) agent threads" : "Show \(pane.subagents.count) agent threads")
-                }
-            }
-
-            if pane.contentKind == .terminal && pane.kind != .shell && agentThreadsExpanded {
-                ForEach(Array(pane.agentActivities.suffix(4))) { activity in
-                    AgentActivityTreeRow(activity: activity, action: revealPane)
-                }
-                if pane.agentActivities.isEmpty {
-                    AgentActivityTreeRow(activity: AgentActivityItem(
-                        id: pane.id,
-                        label: pane.activitySummary,
-                        phase: pane.phase,
-                        occurredAt: pane.lastActivity
-                    ), action: revealPane)
+                    .help(agentThreadsExpanded ? "Hide agent focus" : "Show agent focus")
+                    .accessibilityLabel(agentThreadsExpanded ? "Hide agent focus" : "Show agent focus, \(pane.activeSubagents) active")
                 }
             }
 
             if agentThreadsExpanded {
-                ForEach(pane.subagents) { subagent in
-                    Button {
-                        workspace.inspectAgent(paneID: pane.id, subagentID: subagent.id)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "arrow.turn.down.right")
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(showingAllAgents ? "THREADS" : "FOCUS")
+                            .font(.system(size: 8, weight: .bold, design: .rounded))
+                            .tracking(0.8)
+                            .foregroundStyle(RelayTheme.textFaint)
+                        if attention.snapshot.attentionCount > 0 {
+                            Text("\(attention.snapshot.attentionCount) need you")
                                 .font(.system(size: 8, weight: .semibold))
-                                .foregroundStyle(RelayTheme.textFaint)
-                            Circle().fill(subagent.phase.color).frame(width: 5, height: 5)
-                            Text(subagent.label)
-                                .font(.system(size: 9.5, weight: .medium))
-                                .foregroundStyle(RelayTheme.textMuted)
-                                .lineLimit(1)
-                            Spacer()
-                            Text(subagent.phase == .active ? "working" : "finished")
-                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(subagent.phase.color)
+                                .foregroundStyle(RelayTheme.coral)
                         }
-                        .padding(.leading, 43)
-                        .padding(.trailing, 9)
-                        .frame(height: 23)
-                        .contentShape(Rectangle())
+                        Spacer()
+                        if showingAllAgents {
+                            Button("Done") {
+                                showingAllAgents = false
+                                agentQuery = ""
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(RelayTheme.textMuted)
+                        } else {
+                            Button {
+                                attention.refine(agents: pane.subagents, paneID: pane.id)
+                            } label: {
+                                Image(systemName: attention.isRefining
+                                      ? "hourglass"
+                                      : attention.snapshot.usedSystemIntelligence
+                                      ? "wand.and.stars.inverse"
+                                      : "wand.and.stars")
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundStyle(attention.snapshot.usedSystemIntelligence
+                                                     ? RelayTheme.mint : RelayTheme.textFaint)
+                                    .frame(width: 18, height: 18)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(attention.isRefining)
+                            .help(attention.snapshot.usedSystemIntelligence
+                                  ? "Focus order refined on this Mac"
+                                  : "Refine focus on this Mac")
+                            .accessibilityLabel(attention.snapshot.usedSystemIntelligence
+                                                ? "Focus order refined on this Mac"
+                                                : "Refine focus on this Mac")
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .help("Open \(subagent.label) activity")
+                    .padding(.leading, 43)
+                    .padding(.trailing, 9)
+                    .padding(.top, 4)
+
+                    if showingAllAgents {
+                        HStack(spacing: 6) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundStyle(RelayTheme.textFaint)
+                            TextField("Find a thread", text: $agentQuery)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 10.5))
+                                .accessibilityLabel("Find an agent thread")
+                        }
+                        .padding(.horizontal, 8)
+                        .frame(height: 26)
+                        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .padding(.leading, 35)
+                        .padding(.trailing, 7)
+                    }
+
+                    ForEach(showingAllAgents ? searchedAgents : focusedAgents) { subagent in
+                        AgentFocusRow(
+                            agent: subagent,
+                            pinned: attention.isPinned(subagent.id, paneID: pane.id),
+                            open: { workspace.inspectAgent(paneID: pane.id, subagentID: subagent.id) },
+                            togglePin: { attention.togglePin(agentID: subagent.id, paneID: pane.id, agents: pane.subagents) },
+                            hide: { attention.toggleMute(agentID: subagent.id, paneID: pane.id, agents: pane.subagents) }
+                        )
+                    }
+
+                    if showingAllAgents && searchedAgents.isEmpty {
+                        Text("No matching threads")
+                            .font(.system(size: 10))
+                            .foregroundStyle(RelayTheme.textFaint)
+                            .padding(.leading, 43)
+                            .frame(height: 25)
+                    } else if !showingAllAgents && attention.snapshot.hiddenCount > 0 {
+                        Button {
+                            showingAllAgents = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "magnifyingglass")
+                                    .font(.system(size: 8.5, weight: .semibold))
+                                Text("Search \(attention.snapshot.hiddenCount) more")
+                                    .font(.system(size: 9.5, weight: .medium))
+                            }
+                            .foregroundStyle(RelayTheme.textFaint)
+                            .padding(.leading, 43)
+                            .frame(height: 25)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Shows searchable agent history")
+                    }
                 }
+                .padding(.bottom, 4)
             }
+        }
+        .onAppear {
+            attention.refresh(agents: pane.subagents, paneID: pane.id)
+            agentThreadsExpanded = active && !pane.subagents.isEmpty
+        }
+        .onChange(of: active) { _, isActive in
+            agentThreadsExpanded = isActive && !pane.subagents.isEmpty
+            if !isActive {
+                showingAllAgents = false
+                agentQuery = ""
+            }
+        }
+        .onChange(of: pane.subagents) { _, agents in
+            attention.refresh(agents: agents, paneID: pane.id)
+            if active && !agents.isEmpty { agentThreadsExpanded = true }
         }
     }
 }
 
-private struct AgentActivityTreeRow: View {
-    let activity: AgentActivityItem
-    let action: () -> Void
+private struct AgentPulse: View {
+    let phase: AgentPhase
+    let activeCount: Int
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 1.5) {
+            ForEach([4.0, 7.0, 5.0], id: \.self) { height in
+                Capsule()
+                    .fill(phase == .needsInput ? RelayTheme.coral : activeCount > 0 ? RelayTheme.mint : RelayTheme.textFaint)
+                    .frame(width: 1.5, height: height)
+            }
+        }
+        .frame(width: 8, height: 8)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct AgentFocusRow: View {
+    let agent: SubagentActivity
+    let pinned: Bool
+    let open: () -> Void
+    let togglePin: () -> Void
+    let hide: () -> Void
     @State private var hovering = false
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: "arrow.turn.down.right")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(RelayTheme.textFaint)
-                Circle()
-                    .fill(activity.phase.color)
-                    .frame(width: 5, height: 5)
-                Text(activity.label)
-                    .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(activity.phase == .quiet ? RelayTheme.textFaint : RelayTheme.textMuted)
-                    .lineLimit(1)
+        Button(action: open) {
+            HStack(spacing: 7) {
+                ZStack {
+                    Rectangle()
+                        .fill(RelayTheme.line.opacity(0.7))
+                        .frame(width: 1, height: 26)
+                    Circle()
+                        .fill(agent.phase.color)
+                        .frame(width: agent.phase == .needsInput ? 7 : 5,
+                               height: agent.phase == .needsInput ? 7 : 5)
+                }
+                .frame(width: 9)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        if pinned {
+                            Image(systemName: "pin.fill")
+                                .font(.system(size: 7))
+                                .foregroundStyle(RelayTheme.textFaint)
+                        }
+                        Text(AgentAttentionPolicy.displayLabel(for: agent))
+                            .font(.system(size: 9.75, weight: agent.phase == .needsInput ? .semibold : .medium))
+                            .foregroundStyle(agent.phase == .exited ? RelayTheme.textFaint : RelayTheme.textMuted)
+                            .lineLimit(1)
+                    }
+                    Text(agent.provider.label)
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(RelayTheme.textFaint)
+                }
                 Spacer(minLength: 2)
-                Text(activity.phase.label)
-                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(activity.phase.color)
+                Text(agent.phase.label)
+                    .font(.system(size: 8, weight: .semibold, design: .rounded))
+                    .foregroundStyle(agent.phase.color)
+                    .lineLimit(1)
             }
-            .padding(.leading, 43)
+            .padding(.leading, 39)
             .padding(.trailing, 9)
-            .frame(height: 23)
+            .frame(height: 31)
             .background(hovering ? RelayTheme.surface.opacity(0.55) : Color.clear,
                         in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+        .help("Open \(AgentAttentionPolicy.displayLabel(for: agent)) activity")
+        .contextMenu {
+            Button(pinned ? "Unpin from focus" : "Pin in focus", action: togglePin)
+            Button(agent.phase == .needsInput ? "Needs input cannot be hidden" : "Hide from focus", action: hide)
+                .disabled(agent.phase == .needsInput)
+        }
+        .accessibilityLabel("\(AgentAttentionPolicy.displayLabel(for: agent)), \(agent.provider.label), \(agent.phase.label)")
+        .accessibilityHint("Opens this agent thread in a floating panel")
     }
 }
 
@@ -2576,7 +2719,7 @@ private struct ConnectionPath: View {
                       systemImage: pane.kind.symbol)
                     .font(.system(size: 9.5, weight: .semibold))
                     .foregroundStyle(pane.phase.color)
-                Text(pane.activitySummary)
+                Text(AgentLabelFormatter.activity(pane.activitySummary))
                     .font(.system(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textFaint)
                     .lineLimit(1)

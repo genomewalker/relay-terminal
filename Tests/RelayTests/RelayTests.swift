@@ -67,6 +67,13 @@ func imagePathDetection() {
     #expect(detector.ingest("not an image: /home/test/notes.txt") == [])
 }
 
+@Test("ANSI-colored image paths remain detectable across packets")
+func coloredImagePathDetection() {
+    var detector = ImagePathDetector()
+    #expect(detector.ingest("Saved: \u{001B}[38;2;80;") == [])
+    #expect(detector.ingest("180;220m/tmp/result.png\u{001B}[0m\r\n") == ["/tmp/result.png"])
+}
+
 @Test("Codex viewed images are detected from relative paths")
 func relativeCodexImagePathDetection() {
     var detector = ImagePathDetector()
@@ -855,4 +862,36 @@ func terminalHyperlinksCoverCodeAndWeb() {
         options: .regularExpression
     )
     #expect(stripped == visible)
+}
+
+@Test("Agent focus keeps urgent work visible and bounds background history")
+func agentAttentionPolicyBoundsHistory() {
+    let now = Date()
+    var agents = (0..<20).map { index in
+        SubagentActivity(
+            id: "done-\(index)", label: "worker_\(index)",
+            startedAt: now.addingTimeInterval(Double(-index)), phase: .quiet
+        )
+    }
+    agents.append(SubagentActivity(id: "active", label: "active_worker", startedAt: now, phase: .active))
+    agents.append(SubagentActivity(id: "urgent", label: "approval", startedAt: now, phase: .needsInput))
+
+    let snapshot = AgentAttentionPolicy.select(
+        agents, limit: 5, preferredCompletedIDs: ["done-12", "done-9"]
+    )
+
+    #expect(snapshot.visibleIDs.first == "urgent")
+    #expect(snapshot.visibleIDs.contains("active"))
+    #expect(snapshot.visibleIDs.contains("done-12"))
+    #expect(snapshot.visibleIDs.count == 5)
+    #expect(snapshot.hiddenCount == 17)
+    #expect(snapshot.attentionCount == 1)
+}
+
+@Test("Agent labels hide transport-oriented identifiers")
+func agentLabelsAreHumanReadable() {
+    #expect(AgentLabelFormatter.humanize("external_peer") == "External session")
+    #expect(AgentLabelFormatter.humanize("/root/logic_retest") == "Logic retest")
+    #expect(AgentLabelFormatter.humanize("") == "Agent")
+    #expect(AgentLabelFormatter.activity("Peer message · external_peer") == "Peer message · external session")
 }
