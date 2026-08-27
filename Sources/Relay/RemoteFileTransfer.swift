@@ -21,14 +21,14 @@ enum RemoteFileTransfer {
 
     static func upload(
         _ urls: [URL],
-        to directory: String,
+        toPane paneID: String,
         profile: ConnectionProfile
     ) async throws -> [RemoteFileEntry] {
         try await Task.detached(priority: .userInitiated) {
             var imported: [RemoteFileEntry] = []
             imported.reserveCapacity(urls.count)
             for url in urls {
-                imported.append(try upload(url, to: directory, profile: profile))
+                imported.append(try upload(url, toPane: paneID, profile: profile))
             }
             return imported
         }.value
@@ -36,7 +36,7 @@ enum RemoteFileTransfer {
 
     private static func upload(
         _ url: URL,
-        to directory: String,
+        toPane paneID: String,
         profile: ConnectionProfile
     ) throws -> RemoteFileEntry {
         let accessing = url.startAccessingSecurityScopedResource()
@@ -59,7 +59,7 @@ enum RemoteFileTransfer {
         arguments += profile.sshConnectionArguments
         arguments += [
             "~/.local/bin/relayd", "files", "import",
-            "--path-b64", Data(directory.utf8).base64EncodedString(),
+            "--parent-session", paneID,
             "--name-b64", Data(name.utf8).base64EncodedString(),
         ]
         ssh.arguments = arguments

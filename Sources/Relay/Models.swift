@@ -545,7 +545,8 @@ final class PaneModel: ObservableObject, Identifiable {
         contentKind: PaneContentKind = .terminal,
         remoteParentSessionID: String? = nil,
         editorRequest: EditorOpenRequest? = nil,
-        customName: String? = nil
+        customName: String? = nil,
+        directory: String? = nil
     ) {
         self.id = id
         self.profile = profile
@@ -553,6 +554,7 @@ final class PaneModel: ObservableObject, Identifiable {
         self.remoteParentSessionID = remoteParentSessionID
         self.editorRequest = editorRequest
         self.customName = customName
+        self.directory = directory
         self.title = contentKind == .editor ? "Editor" : profile.name
         self.remoteExitCode = nil
         self.connectionState = profile.kind == .ssh && profile.backend == .relay

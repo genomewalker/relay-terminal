@@ -165,7 +165,11 @@ func runFiles(arguments []string) {
 		if decodeErr != nil {
 			fatal(decodeErr.Error())
 		}
-		value, err = daemon.ImportFile(path, name, os.Stdin)
+		workspace, resolveErr := daemon.ResolveWorkspace(*parentSession, path)
+		if resolveErr != nil {
+			fatal(resolveErr.Error())
+		}
+		value, err = daemon.ImportFile(workspace.Path, name, os.Stdin)
 	case "git-diff":
 		value, err = daemon.ReadGitDiff(path)
 	default:

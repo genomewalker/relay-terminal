@@ -246,6 +246,7 @@ func attachRemoteCatalogSession() {
     #expect(workspace.activePaneID == paneID)
     #expect(workspace.activePane?.remoteWorkspaceSessionID == sessionID.uuidString.lowercased())
     #expect(workspace.activePane?.remoteTabID == tabID.uuidString.lowercased())
+    #expect(workspace.activePane?.directory == "/work")
     workspace.shutdown()
 }
 
@@ -279,7 +280,8 @@ func attachRemoteWorkspaceLayout() {
                 contentKind: .terminal,
                 remoteParentSessionID: nil,
                 editorRequest: nil,
-                customName: "Codex"
+                customName: "Codex",
+                directory: "/stale"
             ),
             PaneSnapshot(
                 id: editorID,
@@ -323,6 +325,7 @@ func attachRemoteWorkspaceLayout() {
     #expect(workspace.activePaneID == editorID)
     #expect(workspace.activePane?.contentKind == .editor)
     #expect(workspace.activePane?.profile == profile)
+    #expect(workspace.panes[terminalID]?.directory == "/work")
     workspace.shutdown()
 }
 
@@ -810,6 +813,13 @@ func artifactHyperlinksPreserveVisiblePath() {
 
 @Test("Prompt selection deletion follows drag direction")
 func promptSelectionDeletionSequence() {
+    for kind in AgentKind.allCases {
+        #expect(TerminalPromptSelectionEdit.isEnabled(contentKind: .terminal, agentKind: kind))
+    }
+    #expect(!TerminalPromptSelectionEdit.isEnabled(contentKind: .editor, agentKind: .codex))
+    #expect(!TerminalPromptSelectionEdit.forcesLocalSelection(agentKind: .shell))
+    #expect(TerminalPromptSelectionEdit.forcesLocalSelection(agentKind: .codex))
+    #expect(TerminalPromptSelectionEdit.forcesLocalSelection(agentKind: .claude))
     #expect(TerminalPromptSelectionEdit.deletionSequence(for: "three words", backwards: true)
         == String(repeating: "\u{007F}", count: 11))
     #expect(TerminalPromptSelectionEdit.deletionSequence(for: "abc", backwards: false)

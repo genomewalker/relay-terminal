@@ -4,6 +4,14 @@ import GhosttyTerminal
 import SwiftUI
 
 enum TerminalPromptSelectionEdit {
+    static func isEnabled(contentKind: PaneContentKind, agentKind: AgentKind) -> Bool {
+        contentKind == .terminal
+    }
+
+    static func forcesLocalSelection(agentKind: AgentKind) -> Bool {
+        agentKind != .shell
+    }
+
     static func deletionSequence(for selectedText: String, backwards: Bool) -> String? {
         // Newlines may represent either a real multi-line command or selected
         // output. Until Relay has cell-level prompt ranges, do not guess.
@@ -309,20 +317,35 @@ final class TerminalRuntime: NSObject {
     }
 
     fileprivate var allowsPromptSelectionEditing: Bool {
-        pane?.contentKind == .terminal && pane?.kind == .shell
+        guard let pane else { return false }
+        return TerminalPromptSelectionEdit.isEnabled(
+            contentKind: pane.contentKind,
+            agentKind: pane.kind
+        )
+    }
+
+    fileprivate var forcesLocalPromptSelection: Bool {
+        pane.map { TerminalPromptSelectionEdit.forcesLocalSelection(agentKind: $0.kind) } ?? false
     }
 
     fileprivate func importLocalFiles(_ urls: [URL]) -> Bool {
         guard !urls.isEmpty, fileTransferTask == nil,
               let pane, pane.profile.kind == .ssh, pane.profile.backend == .relay else { return false }
         let profile = pane.profile
-        let directory = pane.directory ?? "~"
+        let paneID = pane.id.uuidString.lowercased()
         view.toolTip = "Uploading \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) files")…"
         fileTransferTask = Task { @MainActor [weak self] in
             do {
-                let imported = try await RemoteFileTransfer.upload(urls, to: directory, profile: profile)
+                let imported = try await RemoteFileTransfer.upload(
+                    urls,
+                    toPane: paneID,
+                    profile: profile
+                )
                 guard let self, !Task.isCancelled else { return }
                 self.fileTransferTask = nil
+                if let path = imported.first?.path {
+                    pane.directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
+                }
                 self.view.toolTip = imported.count == 1
                     ? "Uploaded \(imported[0].name)"
                     : "Uploaded \(imported.count) files"
@@ -859,6 +882,7 @@ final class RelayGhosttyView: TerminalView {
     private var selectionStart: CGPoint?
     private var selectionStartInWindow: CGPoint?
     private var promptSelection: PromptSelection?
+    private var forcingLocalPromptSelection = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -878,11 +902,16 @@ final class RelayGhosttyView: TerminalView {
             return
         }
         promptSelection = nil
-        selectionStart = owner?.allowsPromptSelectionEditing == true
-            ? terminalPoint(for: event)
-            : nil
+        let point = terminalPoint(for: event)
+        selectionStart = owner?.allowsPromptSelectionEditing == true && pointIsNearActivePrompt(point)
+            ? point : nil
         selectionStartInWindow = selectionStart == nil ? nil : event.locationInWindow
-        super.mouseDown(with: event)
+        forcingLocalPromptSelection = selectionStart != nil && owner?.forcesLocalPromptSelection == true
+        super.mouseDown(with: forcingLocalPromptSelection ? localSelectionEvent(from: event) ?? event : event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: forcingLocalPromptSelection ? localSelectionEvent(from: event) ?? event : event)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -895,9 +924,15 @@ final class RelayGhosttyView: TerminalView {
         let start = selectionStart
         let caretLocation = selectionStartInWindow
         let end = terminalPoint(for: event)
-        super.mouseUp(with: event)
+        let forcedLocalSelection = forcingLocalPromptSelection
+        super.mouseUp(with: forcedLocalSelection ? localSelectionEvent(from: event) ?? event : event)
         selectionStart = nil
         selectionStartInWindow = nil
+        forcingLocalPromptSelection = false
+        if forcedLocalSelection, let start, hypot(end.x - start.x, end.y - start.y) < 2 {
+            replayAgentClick(at: event.locationInWindow)
+            return
+        }
         guard let start, let caretLocation,
               hypot(end.x - start.x, end.y - start.y) >= 2,
               selectionIsNearActivePrompt(start: start, end: end),
@@ -975,6 +1010,52 @@ final class RelayGhosttyView: TerminalView {
         let promptBand = min(96, max(48, bounds.height * 0.2))
         let top = bounds.height - promptBand
         return start.y >= top && end.y >= top
+    }
+
+    private func pointIsNearActivePrompt(_ point: CGPoint) -> Bool {
+        selectionIsNearActivePrompt(start: point, end: point)
+    }
+
+    private func localSelectionEvent(from event: NSEvent) -> NSEvent? {
+        NSEvent.mouseEvent(
+            with: event.type,
+            location: event.locationInWindow,
+            modifierFlags: event.modifierFlags.union(.shift),
+            timestamp: event.timestamp,
+            windowNumber: event.windowNumber,
+            context: nil,
+            eventNumber: event.eventNumber,
+            clickCount: event.clickCount,
+            pressure: event.pressure
+        )
+    }
+
+    private func replayAgentClick(at locationInWindow: CGPoint) {
+        guard let window else { return }
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        guard let down = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: locationInWindow,
+            modifierFlags: [],
+            timestamp: timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ), let up = NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: locationInWindow,
+            modifierFlags: [],
+            timestamp: timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 0
+        ) else { return }
+        super.mouseDown(with: down)
+        super.mouseUp(with: up)
     }
 
     private func movePromptCursor(to locationInWindow: CGPoint) {

@@ -179,6 +179,10 @@ final class WorkspaceModel: ObservableObject {
     func attachRemoteSession(profile: ConnectionProfile, remote: RemoteSessionRecord) {
         if let existingPane = remote.panes.compactMap({ UUID(uuidString: $0.paneID) })
             .first(where: { panes[$0] != nil }) {
+            for remotePane in remote.panes {
+                guard let paneID = UUID(uuidString: remotePane.paneID) else { continue }
+                panes[paneID]?.directory = remotePane.directory
+            }
             isHostLauncherPresented = false
             revealPane(existingPane)
             return
@@ -204,7 +208,8 @@ final class WorkspaceModel: ObservableObject {
                     id: paneID,
                     profile: profile,
                     remoteParentSessionID: remotePane.parentPaneID,
-                    customName: remotePane.title
+                    customName: remotePane.title,
+                    directory: remotePane.directory
                 )
                 pane.assignRemoteHierarchy(workspaceSessionID: sessionID, tabID: tabID)
                 storePane(pane)
@@ -263,7 +268,8 @@ final class WorkspaceModel: ObservableObject {
                 contentKind: saved.contentKind ?? .terminal,
                 remoteParentSessionID: remotePane?.parentPaneID ?? saved.remoteParentSessionID,
                 editorRequest: saved.editorRequest,
-                customName: remotePane?.title ?? saved.customName
+                customName: remotePane?.title ?? saved.customName,
+                directory: remotePane?.directory ?? saved.directory
             )
             storePane(pane)
         }
@@ -675,7 +681,8 @@ final class WorkspaceModel: ObservableObject {
                 contentKind: savedPane.contentKind ?? .terminal,
                 remoteParentSessionID: savedPane.remoteParentSessionID,
                 editorRequest: savedPane.editorRequest,
-                customName: savedPane.customName
+                customName: savedPane.customName,
+                directory: savedPane.directory
             )
             storePane(pane)
         }
@@ -760,7 +767,8 @@ final class WorkspaceModel: ObservableObject {
                         contentKind: $0.contentKind,
                         remoteParentSessionID: $0.remoteParentSessionID,
                         editorRequest: $0.editorRequest,
-                        customName: $0.customName
+                        customName: $0.customName,
+                        directory: $0.directory
                     )
                 }
             },
@@ -817,4 +825,23 @@ struct PaneSnapshot: Codable, Sendable {
     let remoteParentSessionID: String?
     let editorRequest: EditorOpenRequest?
     let customName: String?
+    let directory: String?
+
+    init(
+        id: UUID,
+        profile: ConnectionProfile,
+        contentKind: PaneContentKind?,
+        remoteParentSessionID: String?,
+        editorRequest: EditorOpenRequest?,
+        customName: String?,
+        directory: String? = nil
+    ) {
+        self.id = id
+        self.profile = profile
+        self.contentKind = contentKind
+        self.remoteParentSessionID = remoteParentSessionID
+        self.editorRequest = editorRequest
+        self.customName = customName
+        self.directory = directory
+    }
 }
