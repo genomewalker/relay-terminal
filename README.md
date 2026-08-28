@@ -65,7 +65,7 @@ Relay deliberately does not run Zellij or tmux for its layout. They can still ru
 
 ## Build and run
 
-Requirements: macOS 14+, Xcode 16+, and Go 1.24+ for building the remote daemon.
+Requirements: macOS 14+, Xcode 26+, and Go 1.24+ for building the remote daemon.
 
 ```bash
 swift test
