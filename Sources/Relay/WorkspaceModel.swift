@@ -6,6 +6,13 @@ struct AgentInspectorSelection: Equatable, Sendable {
     let subagentID: String
 }
 
+private struct ClosedPaneRecovery {
+    let pane: PaneSnapshot
+    let tab: TabSnapshot
+    let tabIndex: Int
+    let floatingPlacement: FloatingPanePlacement?
+}
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var tabs: [TabModel] = []
@@ -26,6 +33,8 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var sessionNames: [UUID: String] = [:]
     @Published private(set) var pinnedSessionIDs = WorkspacePinStore.load(.session)
     @Published private(set) var pinnedTabIDs = WorkspacePinStore.load(.tab)
+    @Published private(set) var recentlyClosedPaneCount = 0
+    @Published private(set) var lastClosedPaneWasRemote = false
 
     let profileStore = ProfileStore()
     let activityIndex = WorkspaceActivityIndex()
@@ -34,6 +43,7 @@ final class WorkspaceModel: ObservableObject {
     private var sidebarBeforeFullScreen = true
     private var persistenceTask: Task<Void, Never>?
     private var didShutdown = false
+    private var recentlyClosedPanes: [ClosedPaneRecovery] = []
 
     init(restoreSavedWorkspace: Bool = true) {
         let shouldRestore = restoreSavedWorkspace && !RelayLaunchMode.isSafeMode
@@ -304,6 +314,64 @@ final class WorkspaceModel: ObservableObject {
         profileStore.markUsed(profile)
         isHostLauncherPresented = false
         persistWorkspace()
+    }
+
+    /// Recreates one catalogued relay pane that is still alive remotely but no
+    /// longer appears in the local layout. It is attached directly; no nested
+    /// terminal command is launched and the remote process keeps one PTY writer.
+    func attachRemotePane(
+        profile: ConnectionProfile,
+        remotePane: RemoteCatalogPane,
+        workspaceID: String?,
+        sessionLabel: String
+    ) {
+        guard remotePane.recoverable,
+              let paneID = UUID(uuidString: remotePane.paneID) else { return }
+        if panes[paneID] != nil {
+            isHostLauncherPresented = false
+            revealPane(paneID)
+            return
+        }
+
+        let sessionID = workspaceID.flatMap(UUID.init(uuidString:)) ?? UUID()
+        let tabID = remotePane.tabID.flatMap(UUID.init(uuidString:)) ?? UUID()
+        let pane = PaneModel(
+            id: paneID,
+            profile: profile,
+            contentKind: PaneContentKind(rawValue: remotePane.contentKind) ?? .terminal,
+            remoteParentSessionID: remotePane.parentPaneID,
+            customName: remotePane.title,
+            directory: remotePane.directory
+        )
+        pane.assignRemoteHierarchy(workspaceSessionID: sessionID, tabID: tabID)
+        storePane(pane)
+
+        if let tab = tabs.first(where: { $0.id == tabID }) {
+            // Do not rearrange an active working layout during recovery.
+            tab.floatingPanes.append(.initial(
+                paneID: paneID,
+                index: tab.floatingPanes.count
+            ))
+        } else {
+            let tab = TabModel(
+                id: tabID,
+                sessionID: sessionID,
+                name: remotePane.title ?? "Recovered",
+                firstPane: paneID
+            )
+            tabs.append(tab)
+        }
+
+        sessionNames[sessionID] = sessionNames[sessionID] ?? sessionLabel
+        selectedTabID = tabID
+        activePaneID = paneID
+        profileStore.markUsed(profile)
+        isHostLauncherPresented = false
+        persistWorkspace()
+        Task { @MainActor in
+            await Task.yield()
+            pane.focus()
+        }
     }
 
     private func attachRemoteWorkspaceSnapshot(
@@ -604,6 +672,7 @@ final class WorkspaceModel: ObservableObject {
 
     func closeActivePane() {
         guard let tab = selectedTab, let activePaneID else { return }
+        rememberClosedPane(activePaneID, in: tab)
         if agentInspector?.paneID == activePaneID { agentInspector = nil }
         if zoomedPaneID == activePaneID { zoomedPaneID = nil }
         if let floatingIndex = tab.floatingPanes.firstIndex(where: { $0.paneID == activePaneID }) {
@@ -626,6 +695,101 @@ final class WorkspaceModel: ObservableObject {
         activityIndex.remove(activePaneID)
         self.activePaneID = tab.layout.paneIDs.first
         persistWorkspace()
+    }
+
+    var canReopenClosedPane: Bool { recentlyClosedPaneCount > 0 }
+
+    func reopenLastClosedPane() {
+        while let recovery = recentlyClosedPanes.popLast() {
+            recentlyClosedPaneCount = recentlyClosedPanes.count
+            guard panes[recovery.pane.id] == nil else { continue }
+
+            let saved = recovery.pane
+            let pane = PaneModel(
+                id: saved.id,
+                profile: saved.profile,
+                contentKind: saved.contentKind ?? .terminal,
+                remoteParentSessionID: saved.remoteParentSessionID,
+                editorRequest: saved.editorRequest,
+                customName: saved.customName,
+                directory: saved.directory
+            )
+            let sessionID = recovery.tab.sessionID ?? recovery.tab.id
+            pane.assignRemoteHierarchy(workspaceSessionID: sessionID, tabID: recovery.tab.id)
+            storePane(pane)
+
+            let restoredTab: TabModel
+            if let existing = tabs.first(where: { $0.id == recovery.tab.id }) {
+                restoredTab = existing
+                if let placement = recovery.floatingPlacement {
+                    existing.floatingPanes.append(placement)
+                } else if let layoutWithoutPane = recovery.tab.layout.removing(saved.id),
+                          layoutWithoutPane == existing.layout {
+                    existing.layout = recovery.tab.layout
+                    existing.splitRatios = recovery.tab.splitRatios ?? [:]
+                } else if let target = existing.layout.paneIDs.first {
+                    existing.layout = existing.layout.splitting(
+                        target, axis: .horizontal, with: saved.id
+                    )
+                    existing.balanceSplits()
+                } else {
+                    existing.layout = .pane(saved.id)
+                }
+            } else {
+                let tab = TabModel(
+                    id: recovery.tab.id,
+                    sessionID: sessionID,
+                    name: recovery.tab.name,
+                    firstPane: saved.id
+                )
+                let index = min(recovery.tabIndex, tabs.count)
+                tabs.insert(tab, at: index)
+                restoredTab = tab
+            }
+
+            selectedTabID = restoredTab.id
+            activePaneID = saved.id
+            zoomedPaneID = nil
+            persistWorkspace()
+            Task { @MainActor in
+                await Task.yield()
+                pane.focus()
+            }
+            return
+        }
+    }
+
+    private func rememberClosedPane(_ paneID: UUID, in tab: TabModel) {
+        guard let pane = panes[paneID],
+              let tabIndex = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
+        let paneSnapshot = PaneSnapshot(
+            id: pane.id,
+            profile: pane.profile,
+            contentKind: pane.contentKind,
+            remoteParentSessionID: pane.remoteParentSessionID,
+            editorRequest: pane.editorRequest,
+            customName: pane.customName,
+            directory: pane.directory
+        )
+        let tabSnapshot = TabSnapshot(
+            id: tab.id,
+            sessionID: tab.sessionID,
+            name: tab.name,
+            layout: tab.layout,
+            floatingPanes: tab.floatingPanes,
+            splitRatios: tab.splitRatios
+        )
+        recentlyClosedPanes.append(ClosedPaneRecovery(
+            pane: paneSnapshot,
+            tab: tabSnapshot,
+            tabIndex: tabIndex,
+            floatingPlacement: tab.floatingPanes.first(where: { $0.paneID == paneID })
+        ))
+        if recentlyClosedPanes.count > 20 {
+            recentlyClosedPanes.removeFirst(recentlyClosedPanes.count - 20)
+        }
+        lastClosedPaneWasRemote = pane.profile.kind == .ssh && pane.profile.backend == .relay
+        recentlyClosedPaneCount = recentlyClosedPanes.count
     }
 
     func closeTab(_ id: UUID) {

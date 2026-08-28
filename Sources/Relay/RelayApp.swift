@@ -245,6 +245,9 @@ struct RelayApp: App {
                     workspace.closeActivePane()
                 }
                     .keyboardShortcut(shortcut(.closePane).keyEquivalent, modifiers: shortcut(.closePane).eventModifiers)
+                Button("Reopen closed pane") { workspace.reopenLastClosedPane() }
+                    .keyboardShortcut(shortcut(.reopenClosedPane).keyEquivalent, modifiers: shortcut(.reopenClosedPane).eventModifiers)
+                    .disabled(!workspace.canReopenClosedPane)
             }
             CommandMenu("Tab") {
                 Button("Previous tab") { workspace.selectTab(offset: -1) }

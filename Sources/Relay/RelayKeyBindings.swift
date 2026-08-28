@@ -19,6 +19,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
     case previousPrompt
     case nextPrompt
     case closePane
+    case reopenClosedPane
     case previousTab
     case nextTab
     case toggleSidebar
@@ -44,6 +45,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .previousPrompt: "Previous prompt"
         case .nextPrompt: "Next prompt"
         case .closePane: "Close pane"
+        case .reopenClosedPane: "Reopen closed pane"
         case .previousTab: "Previous tab"
         case .nextTab: "Next tab"
         case .toggleSidebar: "Show or hide navigator"
@@ -57,7 +59,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .previousTab, .nextTab: "Tabs"
         case .openEditor, .zoomPane, .floatPane, .balancePanes, .splitRight,
              .splitDown, .newFloatingPane, .previousPane, .nextPane,
-             .previousPrompt, .nextPrompt, .closePane: "Panes"
+             .previousPrompt, .nextPrompt, .closePane, .reopenClosedPane: "Panes"
         case .toggleSidebar, .agentActivity: "Workspace"
         }
     }
@@ -65,7 +67,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
     var defaultBinding: RelayKeyBinding {
         switch self {
         case .newTab: .init("t", command: true)
-        case .newLocalSession: .init("t", command: true, shift: true)
+        case .newLocalSession: .init("n", command: true, option: true)
         case .findHost: .init("k", command: true)
         case .connectHost: .init("n", command: true, shift: true)
         case .openEditor: .init("e", command: true, shift: true)
@@ -80,6 +82,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .previousPrompt: .init("up", command: true, shift: true)
         case .nextPrompt: .init("down", command: true, shift: true)
         case .closePane: .init("w", command: true)
+        case .reopenClosedPane: .init("t", command: true, shift: true)
         case .previousTab: .init("[", command: true, shift: true)
         case .nextTab: .init("]", command: true, shift: true)
         case .toggleSidebar: .init("s", command: true, control: true)

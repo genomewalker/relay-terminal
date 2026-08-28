@@ -9,6 +9,8 @@ struct WorkspaceView: View {
     @State private var showingRelaydOnboarding = false
     @State private var showingRelaydManager = false
     @State private var preferredRelaydProfile: ConnectionProfile?
+    @State private var showingPaneCloseNotice = false
+    @State private var paneCloseNoticeTask: Task<Void, Never>?
     @AppStorage("relay.relayd-onboarding-seen.v1") private var relaydOnboardingSeen = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -104,6 +106,41 @@ struct WorkspaceView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Press Command Q again to quit. Remote sessions keep running.")
                 .allowsHitTesting(false)
+            } else if showingPaneCloseNotice && workspace.canReopenClosedPane {
+                HStack(spacing: 11) {
+                    Image(systemName: workspace.lastClosedPaneWasRemote ? "rectangle.badge.minus" : "xmark.square")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(RelayTheme.textMuted)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(workspace.lastClosedPaneWasRemote ? "Pane detached" : "Pane closed")
+                            .font(.system(size: 11.5, weight: .semibold))
+                        Text(workspace.lastClosedPaneWasRemote ? "Its remote process is still running" : "You can reopen it now")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(RelayTheme.textMuted)
+                    }
+                    Button("Undo") {
+                        paneCloseNoticeTask?.cancel()
+                        showingPaneCloseNotice = false
+                        workspace.reopenLastClosedPane()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(RelayTheme.accent)
+                    .padding(.leading, 5)
+                    .accessibilityHint("Reopens the most recently closed pane")
+                }
+                .foregroundStyle(RelayTheme.text)
+                .padding(.horizontal, 14)
+                .frame(height: 48)
+                .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(RelayTheme.line.opacity(0.9))
+                }
+                .shadow(color: .black.opacity(0.32), radius: 18, y: 8)
+                .padding(.bottom, 20)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .accessibilityElement(children: .contain)
             }
         }
         .sheet(isPresented: $workspace.isHostLauncherPresented) {
@@ -186,6 +223,24 @@ struct WorkspaceView: View {
             preferredRelaydProfile = (notification.object as? ConnectionProfile)
                 ?? workspace.activePane?.profile
             showingRelaydManager = true
+        }
+        .onChange(of: workspace.recentlyClosedPaneCount) { _, count in
+            paneCloseNoticeTask?.cancel()
+            guard count > 0 else {
+                showingPaneCloseNotice = false
+                return
+            }
+            let show = { showingPaneCloseNotice = true }
+            if reduceMotion { show() } else { withAnimation(.easeOut(duration: 0.16), show) }
+            paneCloseNoticeTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(6))
+                guard !Task.isCancelled else { return }
+                if reduceMotion {
+                    showingPaneCloseNotice = false
+                } else {
+                    withAnimation(.easeOut(duration: 0.16)) { showingPaneCloseNotice = false }
+                }
+            }
         }
         .onAppear {
             if !relaydOnboardingSeen { showingRelaydOnboarding = true }
@@ -1893,9 +1948,21 @@ private struct HostLauncher: View {
                                     .padding(.horizontal, 8)
                                     .padding(.top, 8)
                                 ForEach(sessions) { session in
-                                    RemoteSessionResultRow(session: session) {
-                                        workspace.attachRemoteSession(profile: selectedProfile, remote: session)
-                                    }
+                                    RemoteSessionResultRow(
+                                        session: session,
+                                        attachedPaneIDs: Set(workspace.panes.keys),
+                                        attachSession: {
+                                            workspace.attachRemoteSession(profile: selectedProfile, remote: session)
+                                        },
+                                        recoverPane: { pane in
+                                            workspace.attachRemotePane(
+                                                profile: selectedProfile,
+                                                remotePane: pane,
+                                                workspaceID: session.workspaceID,
+                                                sessionLabel: session.label
+                                            )
+                                        }
+                                    )
                                 }
                             } else {
                                 Text("No detached Relay sessions on this host.")
@@ -2041,42 +2108,122 @@ private struct HostLauncher: View {
 
 private struct RemoteSessionResultRow: View {
     let session: RemoteSessionRecord
+    let attachedPaneIDs: Set<UUID>
+    let attachSession: () -> Void
+    let recoverPane: (RemoteCatalogPane) -> Void
+    @State private var hovering = false
+    @State private var expanded = false
+
+    private var isAttached: Bool {
+        session.panes.contains { pane in
+            UUID(uuidString: pane.paneID).map(attachedPaneIDs.contains) == true
+        }
+    }
+
+    private var detachedPanes: [RemoteCatalogPane] {
+        session.panes.filter { pane in
+            pane.recoverable
+                && UUID(uuidString: pane.paneID).map { !attachedPaneIDs.contains($0) } == true
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Button {
+                if isAttached && !detachedPanes.isEmpty {
+                    expanded.toggle()
+                } else {
+                    attachSession()
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(hovering ? RelayTheme.hover : RelayTheme.surface)
+                            .frame(width: 42, height: 42)
+                        Image(systemName: session.isUnfiled ? "lifepreserver" : "rectangle.stack")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(session.recoverable ? RelayTheme.mint : RelayTheme.textFaint)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(session.label)
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundStyle(session.recoverable ? RelayTheme.text : RelayTheme.textMuted)
+                        Text("\(session.tabCount) tab\(session.tabCount == 1 ? "" : "s") · \(session.panes.count) pane\(session.panes.count == 1 ? "" : "s")")
+                            .font(.system(size: 11))
+                            .foregroundStyle(RelayTheme.textMuted)
+                    }
+                    Spacer()
+                    if isAttached && !detachedPanes.isEmpty {
+                        Text("\(detachedPanes.count) detached")
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    } else {
+                        Text(session.recoverable ? (session.isUnfiled ? "Recover" : "Attach") : "Unavailable")
+                    }
+                }
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundStyle(session.recoverable ? RelayTheme.mint : RelayTheme.textFaint)
+                .padding(.horizontal, 8)
+                .frame(height: 58)
+                .background(hovering ? RelayTheme.elevated.opacity(0.6) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!session.recoverable)
+            .onHover { hovering = $0 }
+
+            if expanded {
+                ForEach(detachedPanes) { pane in
+                    RemotePaneRecoveryRow(pane: pane) { recoverPane(pane) }
+                        .padding(.leading, 30)
+                }
+            }
+        }
+    }
+}
+
+private struct RemotePaneRecoveryRow: View {
+    let pane: RemoteCatalogPane
     let action: () -> Void
     @State private var hovering = false
 
+    private var location: String {
+        guard let directory = pane.directory, !directory.isEmpty else { return "Remote pane" }
+        let name = URL(fileURLWithPath: directory).lastPathComponent
+        return name.isEmpty ? directory : name
+    }
+
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(hovering ? RelayTheme.hover : RelayTheme.surface)
-                        .frame(width: 42, height: 42)
-                    Image(systemName: session.isUnfiled ? "lifepreserver" : "rectangle.stack")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(session.recoverable ? RelayTheme.mint : RelayTheme.textFaint)
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(session.label)
-                        .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(session.recoverable ? RelayTheme.text : RelayTheme.textMuted)
-                    Text("\(session.tabCount) tab\(session.tabCount == 1 ? "" : "s") · \(session.panes.count) pane\(session.panes.count == 1 ? "" : "s")")
-                        .font(.system(size: 11))
+            HStack(spacing: 10) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(RelayTheme.textMuted)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(pane.title ?? "Recovered pane")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(RelayTheme.text)
+                    Text("\(location) · \(pane.paneID.prefix(8))")
+                        .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(RelayTheme.textMuted)
+                        .lineLimit(1)
                 }
                 Spacer()
-                Text(session.recoverable ? (session.isUnfiled ? "Recover" : "Attach") : "Unavailable")
+                Text("Recover")
                     .font(.system(size: 9.5, weight: .semibold))
-                    .foregroundStyle(session.recoverable ? RelayTheme.mint : RelayTheme.textFaint)
+                    .foregroundStyle(RelayTheme.mint)
             }
-            .padding(.horizontal, 8)
-            .frame(height: 58)
-            .background(hovering ? RelayTheme.elevated.opacity(0.6) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .padding(.horizontal, 10)
+            .frame(height: 46)
+            .background(hovering ? RelayTheme.elevated.opacity(0.7) : RelayTheme.surface.opacity(0.35),
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!session.recoverable)
         .onHover { hovering = $0 }
+        .accessibilityLabel("Recover \(pane.title ?? "remote pane") in \(location), pane \(pane.paneID.prefix(8))")
     }
 }
 

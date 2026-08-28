@@ -302,6 +302,85 @@ func attachRemoteCatalogSession() {
 }
 
 @MainActor
+@Test("A missing pane can be recovered individually into its open remote tab")
+func attachIndividualRemotePane() {
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    let sessionID = UUID()
+    let tabID = UUID()
+    let existingPaneID = UUID()
+    let missingPaneID = UUID()
+    let profile = ConnectionProfile.sshConfigHost("dandy-07")
+
+    func catalogPane(_ paneID: UUID, title: String) -> RemoteCatalogPane {
+        RemoteCatalogPane(
+            paneID: paneID.uuidString.lowercased(),
+            workspaceID: sessionID.uuidString.lowercased(),
+            tabID: tabID.uuidString.lowercased(),
+            parentPaneID: nil,
+            title: title,
+            contentKind: "terminal",
+            command: title.lowercased(),
+            directory: "/work",
+            state: "running",
+            workerPID: 42,
+            shellPID: 43,
+            lastSequence: 8,
+            recoverable: true,
+            unfiled: false
+        )
+    }
+
+    workspace.attachRemoteSession(
+        profile: profile,
+        remote: RemoteSessionRecord(
+            id: "workspace:\(sessionID.uuidString.lowercased())",
+            workspaceID: sessionID.uuidString.lowercased(),
+            panes: [catalogPane(existingPaneID, title: "Shell")],
+            workspaceSnapshot: nil
+        )
+    )
+    workspace.attachRemotePane(
+        profile: profile,
+        remotePane: catalogPane(missingPaneID, title: "Codex"),
+        workspaceID: sessionID.uuidString.lowercased(),
+        sessionLabel: "Training"
+    )
+
+    #expect(workspace.panes[missingPaneID] != nil)
+    #expect(workspace.selectedTabID == tabID)
+    #expect(workspace.selectedTab?.floatingPanes.contains { $0.paneID == missingPaneID } == true)
+    #expect(workspace.activePaneID == missingPaneID)
+    workspace.shutdown()
+}
+
+@MainActor
+@Test("A closed remote pane can be reopened without creating a new remote session")
+func reopenClosedRemotePane() {
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    workspace.newTab(profile: .sshConfigHost("dandy-07"))
+    let tabID = workspace.selectedTabID!
+    let paneID = workspace.activePaneID!
+
+    workspace.splitActive(axis: .horizontal)
+    let siblingID = workspace.activePaneID!
+    workspace.selectPane(paneID)
+    workspace.closeActivePane()
+
+    #expect(workspace.panes[paneID] == nil)
+    #expect(workspace.canReopenClosedPane)
+    #expect(workspace.selectedTab?.layout.paneIDs == [siblingID])
+
+    workspace.reopenLastClosedPane()
+
+    #expect(workspace.selectedTabID == tabID)
+    #expect(workspace.activePaneID == paneID)
+    #expect(workspace.selectedTab?.layout.paneIDs.contains(paneID) == true)
+    #expect(workspace.selectedTab?.layout.paneIDs.contains(siblingID) == true)
+    #expect(!workspace.canReopenClosedPane)
+    workspace.shutdown()
+}
+
+@MainActor
 @Test("Remote workspace restore preserves tabs, split ratios, and floating editors")
 func attachRemoteWorkspaceLayout() {
     let workspace = WorkspaceModel(restoreSavedWorkspace: false)
