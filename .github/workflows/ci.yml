@@ -15,12 +15,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - shard: n-o
-            filter: "RelayTests\\.[n-o]"
-          - shard: p
-            filter: "RelayTests\\.p"
-          - shard: r-s
-            filter: "RelayTests\\.[r-s]"
+          - shard: process-capture
+            filter: "RelayTests\\.processCapture"
+          - shard: other-p
+            filter: "RelayTests\\.(pane|peer|persisted|predictive|project|prompt)"
+          - shard: remote
+            filter: "RelayTests\\.r"
+          - shard: other-s
+            filter: "RelayTests\\.s"
     steps:
       - uses: actions/checkout@v7
       - name: Test Swift application
