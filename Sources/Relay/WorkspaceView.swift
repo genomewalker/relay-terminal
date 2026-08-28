@@ -2572,25 +2572,15 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
             }
 
         return accessible
-            .onKeyPress(.leftArrow) {
-                guard axis == .horizontal else { return .ignored }
-                update(max(0.1, ratio - 0.05), true)
-                return .handled
-            }
-            .onKeyPress(.rightArrow) {
-                guard axis == .horizontal else { return .ignored }
-                update(min(0.9, ratio + 0.05), true)
-                return .handled
-            }
-            .onKeyPress(.upArrow) {
-                guard axis == .vertical else { return .ignored }
-                update(max(0.1, ratio - 0.05), true)
-                return .handled
-            }
-            .onKeyPress(.downArrow) {
-                guard axis == .vertical else { return .ignored }
-                update(min(0.9, ratio + 0.05), true)
-                return .handled
+            .onMoveCommand { direction in
+                switch (axis, direction) {
+                case (.horizontal, .left), (.vertical, .up):
+                    update(max(0.1, ratio - 0.05), true)
+                case (.horizontal, .right), (.vertical, .down):
+                    update(min(0.9, ratio + 0.05), true)
+                default:
+                    break
+                }
             }
     }
 }
