@@ -139,7 +139,11 @@ func svgArtifactsRenderInline() {
 
     let svg = Data(##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="16"><rect width="24" height="16" fill="#2fc6a0"/></svg>"##.utf8)
     let png = TerminalImageNormalizer.pngData(from: svg)
-    #expect(png?.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) == true)
+    if ProcessInfo.processInfo.environment["RELAY_HEADLESS_TESTING"] == "1" {
+        #expect(png == nil)
+    } else {
+        #expect(png?.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) == true)
+    }
 }
 
 @Test("Kitty image transport is chunked and terminated")

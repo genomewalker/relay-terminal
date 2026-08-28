@@ -20,6 +20,7 @@ jobs:
       - name: Test
         env:
           RELAY_TESTING: "1"
+          RELAY_HEADLESS_TESTING: "1"
         run: |
           swift test --disable-xctest -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS
           cd remote/relayd && go test ./...

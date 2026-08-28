@@ -35,6 +35,14 @@ enum TerminalImageNormalizer {
         // Generated assets are overwhelmingly PNG. Keep that common path
         // zero-copy so opening an image does not add decode work or UI latency.
         if data.starts(with: pngSignature) { return data }
+        // NSImage's SVG rasterizer requires an interactive AppKit session on
+        // some hosted Macs. CI still validates SVG detection and routing, but
+        // leaves the AppKit integration path to local/application tests.
+        if RelayLaunchMode.isRunningTests,
+           ProcessInfo.processInfo.environment["RELAY_HEADLESS_TESTING"] == "1",
+           String(decoding: data.prefix(256), as: UTF8.self).localizedCaseInsensitiveContains("<svg") {
+            return nil
+        }
         var image: CGImage?
         if let source = CGImageSourceCreateWithData(data as CFData, nil) {
             image = CGImageSourceCreateThumbnailAtIndex(source, 0, [

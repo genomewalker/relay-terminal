@@ -106,6 +106,11 @@ enum ProcessCapture {
             guard let process, process.isRunning else { return }
             failure.record(.timedOut(seconds: timeout))
             process.terminate()
+            // The launched process may be a shell whose child inherited both
+            // descriptors. Closing our read ends prevents readers.wait() from
+            // hanging forever when that child survives the shell briefly.
+            try? output.fileHandleForReading.close()
+            try? errors.fileHandleForReading.close()
         }
         process.waitUntilExit()
         readers.wait()
@@ -131,6 +136,9 @@ enum ProcessCapture {
                     guard destination.append(chunk, limit: limit) else {
                         failure.record(.outputTooLarge(limit: limit))
                         if process.isRunning { process.terminate() }
+                        // Stop a descendant that inherited this pipe from
+                        // blocking on a full buffer after its parent exits.
+                        try? handle.close()
                         return false
                     }
                     return true
