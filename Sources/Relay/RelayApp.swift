@@ -1,6 +1,30 @@
 import AppKit
 import SwiftUI
 
+@MainActor
+enum RelayApplicationActivityState {
+    private(set) static var allowsContinuousUpdates = true
+    private static var applicationIsActive = true
+    private static var userSessionIsActive = true
+
+    static func setApplicationActive(_ active: Bool) {
+        applicationIsActive = active
+        update()
+    }
+
+    static func setUserSessionActive(_ active: Bool) {
+        userSessionIsActive = active
+        update()
+    }
+
+    private static func update() {
+        let allowed = applicationIsActive && userSessionIsActive
+        guard allowsContinuousUpdates != allowed else { return }
+        allowsContinuousUpdates = allowed
+        NotificationCenter.default.post(name: .relayApplicationActivityChanged, object: allowed)
+    }
+}
+
 enum RelayQuitConfirmationPolicy {
     enum Action: Equatable { case arm, quit }
 
@@ -19,8 +43,10 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     private var keyboardMonitor: Any?
     private var quitArmedAt: UInt64?
     private var quitConfirmationTimer: Timer?
+    private var workspaceActivityObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        RelayApplicationActivityState.setApplicationActive(NSApp.isActive)
         RelayCrashRecovery.shared.beginLaunch()
         RelayDiagnostics.shared.record(category: "app", name: "launched", details: [
             "safe_mode": String(RelayLaunchMode.isSafeMode),
@@ -50,6 +76,37 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
             // becomes intentionally unassigned for this window.
             return nil
         }
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceActivityObservers = [
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.sessionDidResignActiveNotification,
+                object: nil, queue: .main
+            ) { _ in
+                Task { @MainActor in RelayApplicationActivityState.setUserSessionActive(false) }
+            },
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.sessionDidBecomeActiveNotification,
+                object: nil, queue: .main
+            ) { _ in
+                Task { @MainActor in RelayApplicationActivityState.setUserSessionActive(true) }
+            },
+        ]
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        RelayApplicationActivityState.setApplicationActive(true)
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        RelayApplicationActivityState.setApplicationActive(false)
+    }
+
+    func applicationDidHide(_ notification: Notification) {
+        RelayApplicationActivityState.setApplicationActive(false)
+    }
+
+    func applicationDidUnhide(_ notification: Notification) {
+        RelayApplicationActivityState.setApplicationActive(NSApp.isActive)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -57,6 +114,9 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
         quitConfirmationTimer = nil
         if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor) }
         keyboardMonitor = nil
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceActivityObservers.forEach(workspaceCenter.removeObserver)
+        workspaceActivityObservers.removeAll()
         RelayDiagnostics.shared.record(category: "app", name: "clean-shutdown")
         RelayCrashRecovery.shared.cleanShutdown()
     }
@@ -92,6 +152,7 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
 
 extension Notification.Name {
     static let relayQuitConfirmation = Notification.Name("relay.quit-confirmation")
+    static let relayApplicationActivityChanged = Notification.Name("relay.application-activity-changed")
 }
 
 @main
@@ -127,7 +188,11 @@ struct RelayApp: App {
                         workspace.openRemoteFile(request)
                     }
                 }
-                .onDisappear { workspace.shutdown() }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSApplication.willTerminateNotification
+                )) { _ in
+                    workspace.shutdown()
+                }
         }
         .defaultSize(width: 1320, height: 820)
         .windowStyle(.hiddenTitleBar)
@@ -192,6 +257,24 @@ struct RelayApp: App {
                     workspace.sidebarVisible.toggle()
                 }
                 .keyboardShortcut(shortcut(.toggleSidebar).keyEquivalent, modifiers: shortcut(.toggleSidebar).eventModifiers)
+                Button(workspace.intelligencePanelVisible ? "Hide agent activity" : "Show agent activity") {
+                    workspace.toggleIntelligencePanel()
+                }
+                .keyboardShortcut(shortcut(.agentActivity).keyEquivalent, modifiers: shortcut(.agentActivity).eventModifiers)
+            }
+            CommandMenu("Remote") {
+                Button("Manage relayd…") {
+                    NotificationCenter.default.post(
+                        name: .relayManageRelayd, object: workspace.activePane?.profile
+                    )
+                }
+                Button("Check relayd on active host") {
+                    guard let profile = workspace.activePane?.profile, profile.kind == .ssh else { return }
+                    RelaydManager.shared.select(profile)
+                    RelaydManager.shared.check(profile)
+                    NotificationCenter.default.post(name: .relayManageRelayd, object: profile)
+                }
+                .disabled(workspace.activePane?.profile.kind != .ssh)
             }
             CommandMenu("Diagnostics") {
                 Button("Export diagnostics…") {

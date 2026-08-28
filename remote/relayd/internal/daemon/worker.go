@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -76,7 +77,7 @@ func ServeWorker(config WorkerConfig) error {
 		ShellPID: session.processID(), NodeBootID: bootID,
 		SocketPath: config.SocketPath, Token: config.Token,
 		Command: config.Command, WorkingDirectory: config.WorkingDirectory,
-		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1"}, CreatedAt: time.Now().UTC(),
+		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1"}, CreatedAt: time.Now().UTC(),
 	}
 	if err := storeManifest(config.ManifestPath, manifest); err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -134,6 +135,7 @@ func persistWorkerState(stopped <-chan struct{}, path string, manifest workerMan
 	defer ticker.Stop()
 	lastSequence := manifest.LastSequence
 	lastState := manifest.State
+	unchangedPolls := 0
 	for {
 		select {
 		case <-stopped:
@@ -145,8 +147,11 @@ func persistWorkerState(stopped <-chan struct{}, path string, manifest workerMan
 				state = "exited"
 			}
 			if sequence == lastSequence && eventSequence == manifest.LastEventSequence && state == lastState {
+				unchangedPolls++
+				ticker.Reset(workerManifestPollInterval(unchangedPolls))
 				continue
 			}
+			unchangedPolls = 0
 			manifest.LastSequence = sequence
 			manifest.LastEventSequence = eventSequence
 			manifest.State = state
@@ -154,8 +159,16 @@ func persistWorkerState(stopped <-chan struct{}, path string, manifest workerMan
 			_ = storeManifest(path, manifest)
 			lastSequence = sequence
 			lastState = state
+			ticker.Reset(workerManifestPollInterval(unchangedPolls))
 		}
 	}
+}
+
+func workerManifestPollInterval(unchangedPolls int) time.Duration {
+	if unchangedPolls >= 2 {
+		return 30 * time.Second
+	}
+	return 5 * time.Second
 }
 
 func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Session) {
@@ -203,8 +216,14 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	}
 	controlGranted := session.acquireControl(hello.ClientID)
 	gracefulDetach := false
+	repaintAfterSequence := uint64(0)
+	attachRedrew := false
 	if controlGranted {
 		defer func() { session.releaseControl(hello.ClientID, gracefulDetach) }()
+		// A replay is cursor-addressed for the PTY grid that produced it. Apply
+		// the native pane geometry and capture its SIGWINCH redraw before taking
+		// the attachment snapshot.
+		repaintAfterSequence, attachRedrew = session.resizeForAttach(hello.Cols, hello.Rows)
 	}
 
 	viewer, replay, outputReset, eventReset := session.attach(
@@ -212,12 +231,24 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1"},
 		OutputReset: outputReset, EventReset: eventReset,
 		ControlGranted: &controlGranted,
 	})
 	if err := writer.Write(attached); err != nil {
 		return
+	}
+	if attachRedrew && reconnectRepaintNeedsBarrier(replay, repaintAfterSequence, hello.Rows) {
+		// SIGWINCH repaints from primary-screen TUIs such as Codex and Claude
+		// are usually cursor-addressed deltas. Make this connection's captured
+		// repaint authoritative so a local renderer cannot retain stale cells
+		// from its previous presentation. This frame is deliberately not added
+		// to the session ring or broadcast to other attached clients.
+		// Sequence zero is presentation-only. It cannot move the resume cursor
+		// backwards or resurrect an invalid high cursor after output_reset.
+		if err := writer.Write(protocol.OutputFrame(0, []byte("\x1b[2J\x1b[H"))); err != nil {
+			return
+		}
 	}
 	for _, frame := range replay {
 		if err := writer.Write(frame); err != nil {
@@ -285,6 +316,67 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		default:
 		}
 	}
+}
+
+// A resize can coincide with unrelated streaming output. Only add a clear
+// barrier when the post-resize bytes look like a cursor-addressed screen
+// repaint; ordinary shell/build/tail output must retain its scrollback. A TUI
+// that already emitted its own clear is self-contained and needs no help.
+func reconnectRepaintNeedsBarrier(frames []protocol.Frame, afterSequence uint64, rows uint16) bool {
+	data := make([]byte, 0, 4096)
+	for _, frame := range frames {
+		sequence, output, err := protocol.ParseOutput(frame)
+		if err != nil || sequence <= afterSequence {
+			continue
+		}
+		data = append(data, output...)
+	}
+	if len(data) < 256 || bytes.Contains(data, []byte("\x1b[2J")) ||
+		bytes.Contains(data, []byte("\x1b[3J")) || bytes.Contains(data, []byte("\x1bc")) {
+		return false
+	}
+	addressedRows := cursorAddressedRows(data)
+	requiredRows := 3
+	if rows > 0 && rows < 5 {
+		requiredRows = 2
+	}
+	return len(addressedRows) >= requiredRows
+}
+
+func cursorAddressedRows(data []byte) map[uint16]struct{} {
+	addressed := make(map[uint16]struct{})
+	for index := 0; index+2 < len(data); index++ {
+		if data[index] != 0x1b || data[index+1] != '[' {
+			continue
+		}
+		cursor := index + 2
+		row := uint32(0)
+		hasRow := false
+		for cursor < len(data) && data[cursor] >= '0' && data[cursor] <= '9' {
+			hasRow = true
+			row = row*10 + uint32(data[cursor]-'0')
+			if row > uint32(^uint16(0)) {
+				break
+			}
+			cursor++
+		}
+		if !hasRow {
+			row = 1
+		}
+		if cursor >= len(data) || (data[cursor] != ';' && data[cursor] != 'H' && data[cursor] != 'f') {
+			continue
+		}
+		for cursor < len(data) && data[cursor] != 'H' && data[cursor] != 'f' {
+			if data[cursor] != ';' && (data[cursor] < '0' || data[cursor] > '9') {
+				break
+			}
+			cursor++
+		}
+		if cursor < len(data) && (data[cursor] == 'H' || data[cursor] == 'f') && row > 0 && row <= uint32(^uint16(0)) {
+			addressed[uint16(row)] = struct{}{}
+		}
+	}
+	return addressed
 }
 
 func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *Session, lastEventSequence uint64) {

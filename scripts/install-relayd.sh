@@ -3,6 +3,7 @@ set -euo pipefail
 
 target_host="${1:?usage: scripts/install-relayd.sh <ssh-host>}"
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
+relayd_version="${RELAYD_VERSION:-${RELAY_VERSION:-0.5.2}}"
 remote_arch="$(ssh "$target_host" uname -m)"
 
 case "$remote_arch" in
@@ -19,49 +20,85 @@ trap 'rm -rf "$build_dir"' EXIT
 
 cd "$project_root/remote/relayd"
 CGO_ENABLED=0 GOOS=linux GOARCH="$go_arch" \
-    go build -trimpath -ldflags='-s -w' -o "$build_dir/relayd" ./cmd/relayd
+    go build -trimpath -ldflags="-s -w -X main.relaydVersion=$relayd_version" \
+    -o "$build_dir/relayd" ./cmd/relayd
 
-ssh "$target_host" 'mkdir -p ~/.local/bin ~/.local/share/relay/shims && chmod 700 ~/.local/bin ~/.local/share/relay/shims'
-scp "$build_dir/relayd" "$target_host:~/.local/bin/relayd.next"
-ssh "$target_host" 'chmod 700 ~/.local/bin/relayd.next && mv ~/.local/bin/relayd.next ~/.local/bin/relayd && ln -sfn ~/.local/bin/relayd ~/.local/bin/rcode && ln -sfn ~/.local/bin/relayd ~/.local/share/relay/shims/claude && ln -sfn ~/.local/bin/relayd ~/.local/share/relay/shims/codex && ~/.local/bin/relayd --version'
-
-# A running supervisor keeps the inode it started from after the binary is
-# replaced. Restart only the validated per-user supervisor; pane workers are
-# separate session leaders and remain alive for the new supervisor to recover.
-ssh "$target_host" '
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-    relay_socket="$XDG_RUNTIME_DIR/relayd.sock"
-elif [ -n "${HOME:-}" ]; then
-    relay_socket="$HOME/.relay/relayd.sock"
+payload_hash="$(shasum -a 256 "$build_dir/relayd" | awk '{print $1}')"
+upload_token="$(date +%s)-$$"
+remote_upload=".local/share/relay/relayd-upload-$upload_token"
+ssh "$target_host" 'mkdir -p ~/.local/bin ~/.local/share/relay/bin ~/.local/share/relay/shims'
+scp "$build_dir/relayd" "$target_host:~/$remote_upload"
+ssh "$target_host" sh -s -- "$go_arch" "$remote_upload" "$payload_hash" <<'REMOTE_INSTALL'
+set -eu
+umask 077
+architecture="$1"
+upload="$HOME/$2"
+expected_hash="$3"
+bin_dir="$HOME/.local/bin"
+relay_root="$HOME/.local/share/relay"
+payload_dir="$relay_root/bin"
+shim_dir="$relay_root/shims"
+lock_dir="$relay_root/install.lock"
+temporary_launcher=
+lock_owned=0
+cleanup() {
+    rm -f "$upload" "$temporary_launcher"
+    if [ "$lock_owned" = 1 ]; then rmdir "$lock_dir" 2>/dev/null || true; fi
+}
+trap cleanup EXIT HUP INT TERM
+lock_wait=0
+while ! mkdir "$lock_dir" 2>/dev/null; do
+    lock_wait=$((lock_wait + 1))
+    if [ "$lock_wait" -ge 300 ]; then
+        echo "another Relay installation is still running" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+lock_owned=1
+if command -v sha256sum >/dev/null 2>&1; then
+    actual_hash="$(sha256sum "$upload" | awk '{print $1}')"
 else
-    relay_socket="/tmp/relayd-$(id -u).sock"
+    actual_hash="$(shasum -a 256 "$upload" | awk '{print $1}')"
 fi
-relay_pid_file="$relay_socket.pid"
-relay_supervisor_pid=""
-if [ -r "$relay_pid_file" ]; then
-    relay_supervisor_pid="$(head -n 1 "$relay_pid_file")"
+if [ "$actual_hash" != "$expected_hash" ]; then
+    echo "uploaded relayd checksum mismatch" >&2
+    exit 1
 fi
-if [ -z "$relay_supervisor_pid" ]; then
-    relay_supervisor_pid="$(pgrep -u "$(id -u)" -f "^.*/relayd daemon --socket $relay_socket$" | head -n 1 || true)"
-fi
-if [ -n "$relay_supervisor_pid" ] && [ -r "/proc/$relay_supervisor_pid/status" ]; then
-    relay_uid="$(id -u)"
-    actual_uid="$(awk "/^Uid:/{print \$2}" "/proc/$relay_supervisor_pid/status")"
-    actual_command="$(tr "\000" " " < "/proc/$relay_supervisor_pid/cmdline")"
-    case "$actual_uid:$actual_command" in
-        "$relay_uid:"*"/relayd daemon --socket $relay_socket ")
-            kill -TERM "$relay_supervisor_pid"
-            relay_wait=0
-            while kill -0 "$relay_supervisor_pid" 2>/dev/null && [ "$relay_wait" -lt 40 ]; do
-                sleep 0.05
-                relay_wait=$((relay_wait + 1))
-            done
-            ;;
-        *)
-            echo "refusing to restart unvalidated process $relay_supervisor_pid" >&2
-            exit 1
-            ;;
+chmod 700 "$upload"
+mv -f "$upload" "$payload_dir/relayd-linux-$architecture"
+temporary_launcher="$(mktemp "$bin_dir/.relayd-launcher.XXXXXX")"
+cat > "$temporary_launcher" <<'RELAY_LAUNCHER'
+#!/bin/sh
+set -eu
+case "$(uname -m 2>/dev/null || printf unknown)" in
+    x86_64|amd64) relay_arch=amd64 ;;
+    aarch64|arm64) relay_arch=arm64 ;;
+    *) echo "relayd: unsupported architecture" >&2; exit 1 ;;
+esac
+relay_payload="$HOME/.local/share/relay/bin/relayd-linux-$relay_arch"
+[ -x "$relay_payload" ] || { echo "relayd: payload for $relay_arch is not installed" >&2; exit 1; }
+RELAY_INVOKED_AS="${RELAY_INVOKED_AS:-$(basename "$0")}"
+export RELAY_INVOKED_AS
+exec "$relay_payload" "$@"
+RELAY_LAUNCHER
+chmod 700 "$temporary_launcher"
+mv -f "$temporary_launcher" "$bin_dir/relayd"
+printf 'relay-managed-v1\n' > "$relay_root/managed-v1"
+if [ ! -e "$bin_dir/rcode" ] && [ ! -L "$bin_dir/rcode" ]; then
+    ln -s "$bin_dir/relayd" "$bin_dir/rcode"
+elif [ -L "$bin_dir/rcode" ]; then
+    target="$(readlink "$bin_dir/rcode" 2>/dev/null || true)"
+    case "$target" in
+        "$bin_dir/relayd"|"$payload_dir/relayd-linux-amd64"|"$payload_dir/relayd-linux-arm64")
+            ln -sfn "$bin_dir/relayd" "$bin_dir/rcode" ;;
+        *) echo "left existing rcode symlink unchanged: $target" >&2 ;;
     esac
+else
+    echo "left existing rcode command unchanged" >&2
 fi
-printf "" | ~/.local/bin/relayd node >/dev/null 2>&1 || true
-'
+ln -sfn "$bin_dir/relayd" "$shim_dir/claude"
+ln -sfn "$bin_dir/relayd" "$shim_dir/codex"
+"$bin_dir/relayd" --version
+"$bin_dir/relayd" upgrade-supervisor --force
+REMOTE_INSTALL

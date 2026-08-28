@@ -3,6 +3,7 @@ import SwiftUI
 struct RelaySettingsView: View {
     @ObservedObject private var preferences = RelayPreferences.shared
     @State private var showingKeyBindings = false
+    @State private var learnedSuggestionsReset = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -37,6 +38,11 @@ struct RelaySettingsView: View {
                         .padding(.horizontal, 10)
                         .frame(height: 32)
                         .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    if preferences.isUsingFontFallback {
+                        Text("Font not installed — using Menlo")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(RelayTheme.coral)
+                    }
                     valueSlider("Size", value: $preferences.fontSize, range: 9...24, suffix: "pt")
                     valueSlider("Padding", value: $preferences.terminalPadding, range: 0...20, suffix: "px")
                     Toggle("Blink cursor", isOn: $preferences.cursorBlink)
@@ -92,6 +98,73 @@ struct RelaySettingsView: View {
                         .foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                settingSection("Remote sessions") {
+                    Toggle("Update relayd on approved hosts", isOn: $preferences.automaticallyUpdateRelayd)
+                    Button {
+                        NotificationCenter.default.post(name: .relayManageRelayd, object: nil)
+                    } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: "server.rack")
+                                .foregroundStyle(RelayTheme.mint)
+                            Text("Check relayd and remote sessions")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(RelayTheme.textMuted)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    Text("Relay asks before the first installation in a shared home. Nodes reuse that binary while keeping separate supervisors and sockets. Approved SSH hosts can apply verified updates automatically.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                settingSection("On-device intelligence") {
+                    Toggle("Agent activity intelligence", isOn: $preferences.intelligenceEnabled)
+                    Toggle("Complete commands from local history", isOn: $preferences.predictiveSuggestions)
+                        .disabled(!preferences.intelligenceEnabled)
+                    Toggle(isOn: $preferences.experimentalGenerativeSuggestions) {
+                        HStack(spacing: 7) {
+                            Text("Generate command and prompt completions")
+                            Text("Experimental")
+                                .font(.system(size: 8.5, weight: .semibold))
+                                .foregroundStyle(RelayTheme.coral)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(RelayTheme.coral.opacity(0.12), in: Capsule())
+                        }
+                    }
+                    .disabled(!preferences.intelligenceEnabled || !preferences.predictiveSuggestions)
+                    HStack {
+                        Button("Reset learned suggestions") {
+                            Task {
+                                await TerminalActionFeedbackStore.shared.reset()
+                                await MainActor.run { learnedSuggestionsReset = true }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(RelayTheme.blue)
+                        .disabled(!preferences.experimentalGenerativeSuggestions)
+                        Spacer()
+                        if learnedSuggestionsReset {
+                            Text("Reset")
+                                .font(.system(size: 10))
+                                .foregroundStyle(RelayTheme.mint)
+                        }
+                    }
+                    Toggle("Summarize completed work", isOn: $preferences.automaticAgentSummaries)
+                        .disabled(!preferences.intelligenceEnabled)
+                    Toggle("Semantic activity search", isOn: $preferences.semanticAgentSearch)
+                        .disabled(!preferences.intelligenceEnabled)
+                    Text("Local history completion is instant and stays enabled independently. Experimental completion inspects cached top-level project markers, then uses Apple's on-device model to choose a safe next action or suggest the next Codex/Claude message. Tab accepts and Escape rejects a project action, allowing Relay to learn coarse preferences without storing paths, commands, prompts, or terminal text. It recognizes common README, Swift, Rust, Go, Python, npm, Make, and CMake workflows. Nothing is sent to a cloud model. Model work pauses in Low Power Mode or under thermal stress.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(26)
         }
@@ -127,7 +200,7 @@ struct RelaySettingsView: View {
                     Text("_")
                         .foregroundStyle(RelayTheme.blue)
                 }
-                .font(.custom(preferences.fontFamily.isEmpty ? "Menlo" : preferences.fontFamily, size: preferences.fontSize))
+                .font(.custom(preferences.resolvedFontFamily, size: preferences.fontSize))
                 .padding(preferences.terminalPadding)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .background(Color(hex: UInt32(preferences.palette.background, radix: 16) ?? 0x0B1018))

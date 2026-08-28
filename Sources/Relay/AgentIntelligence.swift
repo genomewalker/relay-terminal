@@ -93,6 +93,18 @@ enum AgentAttentionPolicy {
         AgentLabelFormatter.humanize(agent.label, fallback: agent.id)
     }
 
+    static func hasRecentCompletedActivity(
+        _ agents: [SubagentActivity],
+        now: Date = Date(),
+        maximumAge: TimeInterval = 45
+    ) -> Bool {
+        deduplicated(agents).contains { agent in
+            guard agent.phase != .active, agent.phase != .needsInput else { return false }
+            let age = now.timeIntervalSince(activityDate(agent))
+            return age >= -5 && age <= maximumAge
+        }
+    }
+
     private static func deduplicated(_ agents: [SubagentActivity]) -> [SubagentActivity] {
         var seen = Set<String>()
         return agents.reversed().compactMap { agent in
@@ -114,8 +126,7 @@ enum AgentLabelFormatter {
     static func humanize(_ raw: String?, fallback: String = "Agent") -> String {
         var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if value.isEmpty { value = fallback }
-        let component = URL(fileURLWithPath: value).lastPathComponent
-        if !component.isEmpty { value = component }
+        value = pathComponent(value)
         value = value.replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: "-", with: " ")
         value = value.split(whereSeparator: \.isWhitespace).joined(separator: " ")
@@ -123,6 +134,10 @@ enum AgentLabelFormatter {
         if value.lowercased() == "external peer" { return "External session" }
         if value.count > 44 { value = String(value.prefix(41)) + "…" }
         return value.prefix(1).uppercased() + value.dropFirst()
+    }
+
+    static func pathComponent(_ raw: String) -> String {
+        raw.split(separator: "/", omittingEmptySubsequences: true).last.map(String.init) ?? raw
     }
 
     static func activity(_ raw: String) -> String {
@@ -156,11 +171,20 @@ final class AgentAttentionController: ObservableObject {
         snapshot = AgentAttentionPolicy.select(
             agents, limit: limit, pinnedIDs: pinned, mutedIDs: muted
         )
+        guard RelayPreferences.shared.intelligenceEnabled,
+              AgentAttentionPolicy.hasRecentCompletedActivity(agents) else { return }
+        scheduleRefinement(agents: agents, paneID: paneID, limit: limit, delay: .milliseconds(900))
     }
 
     func refine(agents: [SubagentActivity], paneID: UUID, limit: Int = 9) {
+        scheduleRefinement(agents: agents, paneID: paneID, limit: limit, delay: .zero)
+    }
+
+    private func scheduleRefinement(
+        agents: [SubagentActivity], paneID: UUID, limit: Int, delay: Duration
+    ) {
         let candidates = AgentAttentionPolicy.modelCandidates(from: agents)
-        guard candidates.count > max(4, limit / 2), !isRefining else { return }
+        guard candidates.count > max(4, limit / 2) else { return }
         rankingTask?.cancel()
         let requestFingerprint = AgentAttentionPolicy.fingerprint(agents)
         fingerprint = requestFingerprint
@@ -168,7 +192,13 @@ final class AgentAttentionController: ObservableObject {
         let muted = AgentVisibilityPreferences.ids(for: paneID, kind: .muted)
         isRefining = true
         rankingTask = Task { [weak self] in
-            let preferred = await AgentIntelligenceService.shared.rank(candidates, limit: max(3, limit / 2))
+            if delay != .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled else { return }
+            let preferred = await AgentIntelligenceService.shared.rank(
+                candidates,
+                limit: max(3, limit / 2),
+                interactive: delay == .zero
+            )
             guard let self else { return }
             self.isRefining = false
             guard !Task.isCancelled, self.fingerprint == requestFingerprint,
@@ -232,13 +262,21 @@ private actor AgentIntelligenceService {
     private var cache: [String: [String]] = [:]
     private var cacheOrder: [String] = []
 
-    func rank(_ candidates: [SubagentActivity], limit: Int) async -> [String] {
+    func rank(
+        _ candidates: [SubagentActivity],
+        limit: Int,
+        interactive: Bool = false
+    ) async -> [String] {
         guard !ProcessInfo.processInfo.isLowPowerModeEnabled,
               ProcessInfo.processInfo.thermalState != .serious,
               ProcessInfo.processInfo.thermalState != .critical else { return [] }
         let key = AgentAttentionPolicy.fingerprint(candidates) + "|\(limit)"
         if let cached = cache[key] { return cached }
-        let ranked = await rankWithSystemModel(candidates, limit: limit)
+        guard let ranked = await OnDeviceIntelligenceScheduler.shared.perform(
+            priority: interactive ? .interactive : .background,
+            minimumInterval: interactive ? 0.5 : 12,
+            operation: { await Self.rankWithSystemModel(candidates, limit: limit) }
+        ) else { return [] }
         guard !ranked.isEmpty else { return [] }
         cache[key] = ranked
         cacheOrder.append(key)
@@ -249,7 +287,9 @@ private actor AgentIntelligenceService {
         return ranked
     }
 
-    private func rankWithSystemModel(_ candidates: [SubagentActivity], limit: Int) async -> [String] {
+    private nonisolated static func rankWithSystemModel(
+        _ candidates: [SubagentActivity], limit: Int
+    ) async -> [String] {
 #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
             return await SystemAgentRanker.rank(candidates, limit: limit)

@@ -24,6 +24,8 @@ var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,96}$`)
 type Server struct {
 	mu              sync.Mutex
 	executable      string
+	buildVersion    string
+	protocolVersion int
 	stateDir        string
 	runtimeDir      string
 	workspaceLeases map[string]workspaceLease
@@ -34,13 +36,20 @@ func NewServer() *Server {
 	return &Server{executable: executable, stateDir: defaultWorkerStateDir(), workspaceLeases: make(map[string]workspaceLease)}
 }
 
+func NewServerWithBuildInfo(version string, protocolVersion int) *Server {
+	server := NewServer()
+	server.buildVersion = version
+	server.protocolVersion = protocolVersion
+	return server
+}
+
 func defaultWorkerStateDir() string {
 	if state := os.Getenv("XDG_STATE_HOME"); state != "" {
 		return filepath.Join(state, "relay", "workers")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join(os.TempDir(), "relay-"+strconv.Itoa(os.Getuid()), "workers")
+		return filepath.Join("/tmp", "relay-"+strconv.Itoa(os.Getuid()), "workers")
 	}
 	return filepath.Join(home, ".local", "state", "relay", "workers")
 }
@@ -49,14 +58,17 @@ func (server *Server) Serve(socketPath string) error {
 	if server.executable == "" {
 		return errors.New("cannot locate relayd executable")
 	}
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+	if err := EnsurePrivateRuntimeDir(filepath.Dir(socketPath)); err != nil {
 		return err
 	}
 	server.runtimeDir = workerRuntimeDir(socketPath)
-	if err := os.MkdirAll(server.runtimeDir, 0o700); err != nil {
+	if err := EnsurePrivateRuntimeDir(filepath.Dir(server.runtimeDir)); err != nil {
 		return err
 	}
-	lockFile, err := os.OpenFile(socketPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err := EnsurePrivateRuntimeDir(server.runtimeDir); err != nil {
+		return err
+	}
+	lockFile, err := OpenPrivateFile(socketPath+".lock", syscall.O_CREAT|syscall.O_RDWR)
 	if err != nil {
 		return err
 	}
@@ -66,7 +78,15 @@ func (server *Server) Serve(socketPath string) error {
 	}
 	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 	pidPath := socketPath + ".pid"
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+	pidFile, err := OpenPrivateFile(pidPath, syscall.O_CREAT|syscall.O_TRUNC|syscall.O_WRONLY)
+	if err != nil {
+		return err
+	}
+	if _, err := pidFile.WriteString(strconv.Itoa(os.Getpid()) + "\n"); err != nil {
+		_ = pidFile.Close()
+		return err
+	}
+	if err := pidFile.Close(); err != nil {
 		return err
 	}
 	defer os.Remove(pidPath)
@@ -90,6 +110,10 @@ func (server *Server) Serve(socketPath string) error {
 		if acceptErr != nil {
 			return acceptErr
 		}
+		if peerErr := RequirePeerUID(connection, os.Getuid()); peerErr != nil {
+			_ = connection.Close()
+			continue
+		}
 		go server.serveConnection(connection)
 	}
 }
@@ -102,7 +126,7 @@ func workerRuntimeDir(supervisorSocket string) string {
 		return candidate
 	}
 	digest := sha256.Sum256([]byte(supervisorSocket))
-	return filepath.Join(os.TempDir(), "relay-"+strconv.Itoa(os.Getuid()), fmt.Sprintf("%x", digest[:6]))
+	return filepath.Join("/tmp", "relay-"+strconv.Itoa(os.Getuid()), fmt.Sprintf("%x", digest[:6]))
 }
 
 func (server *Server) serveConnection(connection net.Conn) {
@@ -123,7 +147,10 @@ func (server *Server) serveConnection(connection net.Conn) {
 		return
 	}
 	if hello.Probe {
-		ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "ready"})
+		ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+			State: "ready", Version: server.buildVersion,
+			ProtocolVersion: server.protocolVersion, SupervisorPID: os.Getpid(),
+		})
 		_ = protocol.NewWriter(connection).Write(ready)
 		return
 	}
@@ -198,7 +225,9 @@ type multiplexedSession struct {
 func (server *Server) serveNodeMultiplex(connection net.Conn) {
 	writer := protocol.NewWriter(connection)
 	ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "ready", Capabilities: []string{"node_mux_v1"},
+		State: "ready", Version: server.buildVersion,
+		ProtocolVersion: server.protocolVersion, SupervisorPID: os.Getpid(),
+		Capabilities: []string{"node_mux_v1", "node_mux_v2"},
 	})
 	if writer.Write(ready) != nil {
 		return
@@ -254,7 +283,11 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 		}
 		if inner.Type == protocol.Hello {
 			var hello protocol.HelloPayload
-			if protocol.DecodeJSON(inner, &hello) != nil || hello.SessionID != sessionID || hello.NodeMux {
+			// node_mux_v2 separates the virtual route from the durable pane
+			// identity. This lets an interactive terminal and an event-only
+			// observer for the same pane coexist on one SSH stream.
+			if protocol.DecodeJSON(inner, &hello) != nil ||
+				!validSessionID.MatchString(hello.SessionID) || hello.NodeMux {
 				return
 			}
 			clientSide, serverSide := net.Pipe()

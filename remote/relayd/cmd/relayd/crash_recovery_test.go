@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -90,6 +91,141 @@ func TestSupervisorCrashPreservesPaneWorkerAndShell(t *testing.T) {
 	waitForTerminalText(t, secondConnection, "after:survived")
 }
 
+func TestSupervisorUpgradePreservesPaneWorkerAndShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relayd requires Unix sockets and PTYs")
+	}
+	temporary := t.TempDir()
+	oldBinary := filepath.Join(temporary, "relayd-old")
+	newBinary := filepath.Join(temporary, "relayd-new")
+	buildTestRelayd(t, oldBinary, "0.5.1")
+	buildTestRelayd(t, newBinary, "0.5.2")
+	runtimeDir, err := os.MkdirTemp("/tmp", "relay-upgrade-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(runtimeDir) })
+	stateDir := filepath.Join(temporary, "state")
+	environment := append(os.Environ(), "XDG_RUNTIME_DIR="+runtimeDir, "XDG_STATE_HOME="+stateDir)
+	socket := filepath.Join(runtimeDir, "relayd.sock")
+
+	oldSupervisor, oldLog := startTestSupervisor(t, oldBinary, socket, environment)
+	connection := attachTestPane(t, socket, "upgrade-pane", 0)
+	writer := protocol.NewWriter(connection)
+	if err := writer.Write(protocol.Frame{Type: protocol.Input, Payload: []byte("export RELAY_UPGRADE_TEST=survived\n")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Write(protocol.Frame{Type: protocol.Input, Payload: []byte("echo before:$RELAY_UPGRADE_TEST\n")}); err != nil {
+		t.Fatal(err)
+	}
+	lastSequence := waitForTerminalText(t, connection, "before:survived")
+	_ = connection.Close()
+
+	manifestPath := filepath.Join(stateDir, "relay", "workers", "upgrade-pane.json")
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest testWorkerManifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	upgrade := exec.Command(newBinary, "upgrade-supervisor", "--socket", socket, "--legacy-socket", "")
+	upgrade.Env = environment
+	if output, err := upgrade.CombinedOutput(); err != nil {
+		t.Fatalf("upgrade supervisor: %v\n%s\nold supervisor log: %s", err, output, oldLog.String())
+	}
+	_, _ = oldSupervisor.Process.Wait()
+
+	live, err := inspectSupervisorAt(t, newBinary, socket, environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.Status.Version != "0.5.2" || live.Status.ProtocolVersion != supervisorProtocolVersion {
+		t.Fatalf("unexpected upgraded supervisor: %#v", live.Status)
+	}
+	newSupervisorPID := live.PeerPID
+	if newSupervisorPID <= 1 {
+		newSupervisorPID = live.Status.SupervisorPID
+	}
+	if newSupervisorPID == oldSupervisor.Process.Pid {
+		t.Fatalf("supervisor pid did not change: %d", newSupervisorPID)
+	}
+	assertProcessAlive(t, manifest.WorkerPID, "pane worker")
+	assertProcessAlive(t, manifest.ShellPID, "remote shell")
+	t.Cleanup(func() {
+		_ = syscall.Kill(newSupervisorPID, syscall.SIGTERM)
+		if process, findErr := os.FindProcess(manifest.WorkerPID); findErr == nil {
+			_ = process.Signal(syscall.SIGTERM)
+		}
+	})
+
+	reconnected := attachTestPane(t, socket, "upgrade-pane", lastSequence)
+	if err := protocol.NewWriter(reconnected).Write(protocol.Frame{
+		Type: protocol.Input, Payload: []byte("echo after:$RELAY_UPGRADE_TEST\n"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForTerminalText(t, reconnected, "after:survived")
+	_ = reconnected.Close()
+
+	forceUpgrade := exec.Command(
+		newBinary, "upgrade-supervisor", "--force", "--socket", socket, "--legacy-socket", "",
+	)
+	forceUpgrade.Env = environment
+	if output, err := forceUpgrade.CombinedOutput(); err != nil {
+		t.Fatalf("force same-version upgrade: %v\n%s", err, output)
+	}
+	forcedLive, err := inspectSupervisorAt(t, newBinary, socket, environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forcedPID := forcedLive.PeerPID
+	if forcedPID <= 1 {
+		forcedPID = forcedLive.Status.SupervisorPID
+	}
+	if forcedPID == newSupervisorPID {
+		t.Fatalf("forced same-version upgrade kept supervisor pid %d", forcedPID)
+	}
+	newSupervisorPID = forcedPID
+	assertProcessAlive(t, manifest.WorkerPID, "pane worker after forced upgrade")
+	assertProcessAlive(t, manifest.ShellPID, "remote shell after forced upgrade")
+}
+
+func buildTestRelayd(t *testing.T, path, version string) {
+	t.Helper()
+	build := exec.Command("go", "build", "-ldflags", "-X main.relaydVersion="+version, "-o", path, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build relayd %s: %v\n%s", version, err, output)
+	}
+}
+
+func inspectSupervisorAt(t *testing.T, binary, socket string, environment []string) (liveSupervisor, error) {
+	t.Helper()
+	command := exec.Command(binary, "live-status", "--socket", socket)
+	command.Env = environment
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return liveSupervisor{}, fmt.Errorf("live-status: %w: %s", err, output)
+	}
+	fields := strings.Split(strings.TrimSpace(string(output)), "\t")
+	if len(fields) != 4 || fields[0] != "RELAYD_LIVE" {
+		return liveSupervisor{}, fmt.Errorf("unexpected live status: %q", output)
+	}
+	protocolVersion, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return liveSupervisor{}, err
+	}
+	pid, err := strconv.Atoi(fields[3])
+	if err != nil {
+		return liveSupervisor{}, err
+	}
+	return liveSupervisor{Status: protocol.StatusPayload{
+		State: "ready", Version: fields[1], ProtocolVersion: protocolVersion, SupervisorPID: pid,
+	}, PeerPID: pid}, nil
+}
+
 func startTestSupervisor(t *testing.T, binary, socket string, environment []string) (*exec.Cmd, *bytes.Buffer) {
 	t.Helper()
 	var log bytes.Buffer
@@ -100,7 +236,7 @@ func startTestSupervisor(t *testing.T, binary, socket string, environment []stri
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		connection, err := net.DialTimeout("unix", socket, 50*time.Millisecond)
 		if err == nil {
@@ -139,7 +275,7 @@ func attachTestPane(t *testing.T, socket, session string, lastSequence uint64) n
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
 	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
 		Version: 1, SessionID: session, Command: "exec /bin/sh",
 		Cols: 100, Rows: 30, LastSeq: lastSequence,
@@ -161,7 +297,11 @@ func attachTestPane(t *testing.T, socket, session string, lastSequence uint64) n
 
 func waitForTerminalText(t *testing.T, connection net.Conn, marker string) uint64 {
 	t.Helper()
-	_ = connection.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// Login-shell startup can be delayed substantially on loaded CI runners and
+	// shared HPC nodes. This is a crash-recovery assertion, not a shell-startup
+	// latency benchmark, so keep the deadline generous enough to avoid turning
+	// scheduler contention into a false recovery failure.
+	_ = connection.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer connection.SetReadDeadline(time.Time{})
 	var output strings.Builder
 	var lastSequence uint64

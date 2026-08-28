@@ -46,13 +46,13 @@ final class AgentStateStore: @unchecked Sendable {
 
     func save(_ state: PersistedAgentPaneState, paneID: UUID) {
         guard !Self.isRunningTests else { return }
-        guard let data = try? JSONEncoder.relayState.encode(state), data.count <= 4 << 20 else { return }
         lock.lock()
         let generation = (generations[paneID] ?? 0) &+ 1
         generations[paneID] = generation
         lock.unlock()
         queue.async { [weak self] in
             guard let self else { return }
+            guard let data = try? JSONEncoder.relayState.encode(state), data.count <= 4 << 20 else { return }
             self.lock.lock()
             let current = self.generations[paneID] == generation
             self.lock.unlock()

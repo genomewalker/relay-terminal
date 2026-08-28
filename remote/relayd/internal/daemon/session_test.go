@@ -207,6 +207,19 @@ func TestReplayStartUsesLatestFullScreenRedrawOnlyForFreshRenderer(t *testing.T)
 	}
 }
 
+func TestReplayStartDoesNotCutIntoAlternateScreen(t *testing.T) {
+	replay := []record{
+		{sequence: 1, data: []byte("old\x1b[2Jshell prompt")},
+		{sequence: 2, data: []byte("\x1b[?1049h\x1b[2Jhtop")},
+		{sequence: 3, data: []byte("\x1b[?1049lafter")},
+	}
+
+	recordIndex, byteOffset := replayStart(replay, 0)
+	if recordIndex != 0 || byteOffset != len("old") {
+		t.Fatalf("alternate screen lost its primary owner: start=(%d, %d)", recordIndex, byteOffset)
+	}
+}
+
 func TestStalledViewerIsDisconnectedBeforeSequenceGap(t *testing.T) {
 	session := &Session{
 		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
@@ -540,7 +553,7 @@ func TestExitedSessionIsReplacedOnNextAttach(t *testing.T) {
 	}
 	// Login-shell startup can include user initialization and is measurably
 	// slower on loaded CI/HPC nodes. This tests replacement, not startup latency.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for !first.hasExited() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -556,4 +569,63 @@ func TestExitedSessionIsReplacedOnNextAttach(t *testing.T) {
 		t.Fatal("exited session was reused")
 	}
 	_ = second.signal(15)
+}
+
+func TestIdleWorkerPollingBacksOffWithoutSlowingActiveAgents(t *testing.T) {
+	if agentProcessPollInterval(0) != 5*time.Second {
+		t.Fatal("idle process polling did not back off")
+	}
+	if agentProcessPollInterval(1) != time.Second {
+		t.Fatal("active process polling lost its responsive interval")
+	}
+	if transcriptPollInterval(0) != 5*time.Second || transcriptPollInterval(1) != 500*time.Millisecond {
+		t.Fatal("transcript polling policy is not activity-adaptive")
+	}
+	if workerManifestPollInterval(0) != 5*time.Second || workerManifestPollInterval(2) != 30*time.Second {
+		t.Fatal("idle manifest persistence did not back off")
+	}
+}
+
+func TestAttachResizePulsesUnchangedGridForFullRepaint(t *testing.T) {
+	unchanged := attachResizeSteps(120, 38, 120, 38)
+	if len(unchanged) != 2 || unchanged[0] != (terminalGridSize{cols: 120, rows: 37}) || unchanged[1] != (terminalGridSize{cols: 120, rows: 38}) {
+		t.Fatalf("unchanged attach resize = %#v", unchanged)
+	}
+	changed := attachResizeSteps(80, 24, 120, 38)
+	if len(changed) != 1 || changed[0] != (terminalGridSize{cols: 120, rows: 38}) {
+		t.Fatalf("changed attach resize = %#v", changed)
+	}
+}
+
+func TestReconnectRepaintBarrierRejectsOrdinaryAndPartialOutput(t *testing.T) {
+	background := []protocol.Frame{protocol.OutputFrame(11, bytes.Repeat([]byte("build output "), 40))}
+	if reconnectRepaintNeedsBarrier(background, 10, 38) {
+		t.Fatal("ordinary streaming output was classified as a screen repaint")
+	}
+
+	partial := append(bytes.Repeat([]byte("x"), 300), []byte("\x1b[36;3Hspinner\x1b[36;4H57")...)
+	if reconnectRepaintNeedsBarrier([]protocol.Frame{protocol.OutputFrame(11, partial)}, 10, 38) {
+		t.Fatal("single-row TUI activity was classified as a full repaint")
+	}
+
+	oldRepaint := append(bytes.Repeat([]byte("x"), 300), []byte("\x1b[1;1Hone\x1b[10;1Htwo\x1b[20;1Hthree")...)
+	frames := []protocol.Frame{
+		protocol.OutputFrame(10, oldRepaint),
+		protocol.OutputFrame(11, []byte("new background line")),
+	}
+	if reconnectRepaintNeedsBarrier(frames, 10, 38) {
+		t.Fatal("pre-resize repaint bytes influenced reconnect classification")
+	}
+}
+
+func TestReconnectRepaintBarrierRecognizesFullCursorAddressedRepaint(t *testing.T) {
+	full := append(bytes.Repeat([]byte("x"), 300), []byte("\x1b[1;1Hone\x1b[10;1Htwo\x1b[20;1Hthree")...)
+	if !reconnectRepaintNeedsBarrier([]protocol.Frame{protocol.OutputFrame(11, full)}, 10, 38) {
+		t.Fatal("full cursor-addressed TUI repaint did not request a presentation barrier")
+	}
+
+	selfClearing := append([]byte("\x1b[2J\x1b[H"), full...)
+	if reconnectRepaintNeedsBarrier([]protocol.Frame{protocol.OutputFrame(11, selfClearing)}, 10, 38) {
+		t.Fatal("self-clearing repaint requested a redundant presentation barrier")
+	}
 }

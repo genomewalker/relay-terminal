@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import GhosttyTerminal
 
@@ -39,6 +40,16 @@ enum RelayTerminalPalette: String, CaseIterable, Identifiable {
         case .oled: "75A7FF"
         }
     }
+
+    var selectionBackground: String {
+        switch self {
+        case .midnight: "315A78"
+        case .graphite: "4A5A70"
+        case .oled: "285B53"
+        }
+    }
+
+    var selectionForeground: String { "FFFFFF" }
 }
 
 enum RelayArtifactPresentation: String, CaseIterable, Identifiable, Sendable {
@@ -62,13 +73,19 @@ final class RelayPreferences: ObservableObject {
     @Published var hideSidebarInFullScreen: Bool { didSet { save() } }
     @Published var showArtifactPreviews: Bool { didSet { save() } }
     @Published var artifactPresentation: RelayArtifactPresentation { didSet { save() } }
+    @Published var intelligenceEnabled: Bool { didSet { save() } }
+    @Published var predictiveSuggestions: Bool { didSet { save() } }
+    @Published var experimentalGenerativeSuggestions: Bool { didSet { save() } }
+    @Published var automaticAgentSummaries: Bool { didSet { save() } }
+    @Published var semanticAgentSearch: Bool { didSet { save() } }
+    @Published var automaticallyUpdateRelayd: Bool { didSet { save() } }
     @Published private(set) var keyBindings: [String: RelayKeyBinding] { didSet { save() } }
 
     private let defaults = UserDefaults.standard
     private var isLoading = true
 
     private init() {
-        fontFamily = defaults.string(forKey: "relay.settings.font-family") ?? "Berkeley Mono"
+        fontFamily = defaults.string(forKey: "relay.settings.font-family") ?? "Menlo"
         let storedSize = defaults.double(forKey: "relay.settings.font-size")
         fontSize = storedSize == 0 ? 13.5 : storedSize
         let storedPadding = defaults.double(forKey: "relay.settings.terminal-padding")
@@ -81,6 +98,14 @@ final class RelayPreferences: ObservableObject {
         artifactPresentation = RelayArtifactPresentation(
             rawValue: defaults.string(forKey: "relay.settings.artifact-presentation") ?? ""
         ) ?? .preview
+        intelligenceEnabled = defaults.object(forKey: "relay.settings.intelligence-enabled") as? Bool ?? true
+        predictiveSuggestions = defaults.object(forKey: "relay.settings.predictive-suggestions") as? Bool ?? true
+        experimentalGenerativeSuggestions = defaults.object(
+            forKey: "relay.settings.experimental-generative-suggestions"
+        ) as? Bool ?? false
+        automaticAgentSummaries = defaults.object(forKey: "relay.settings.intelligence-summaries") as? Bool ?? true
+        semanticAgentSearch = defaults.object(forKey: "relay.settings.intelligence-search") as? Bool ?? true
+        automaticallyUpdateRelayd = defaults.object(forKey: "relay.settings.relayd-auto-update") as? Bool ?? false
         keyBindings = RelayKeyBindingStorage.load(from: defaults)
         isLoading = false
     }
@@ -109,13 +134,30 @@ final class RelayPreferences: ObservableObject {
     }
 
     func terminalConfiguration() -> TerminalConfiguration {
-        let family = fontFamily.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedFamily = family.isEmpty ? "Menlo" : family
+        let resolvedFamily = resolvedFontFamily
         return TerminalConfiguration(startingFrom: .default) { builder in
             builder.withFontFamily(resolvedFamily)
-            builder.withFontSize(Float(min(max(fontSize, 9), 32)))
+            let normalizedFontSize = String(
+                format: "%.1f",
+                locale: Locale(identifier: "en_US_POSIX"),
+                min(max(fontSize, 9), 32)
+            )
+            // Ghostty's typed numeric builder currently honors the process
+            // locale and can emit `13,5` on Danish systems. Its config parser
+            // requires a period regardless of locale.
+            builder.withCustom("font-size", normalizedFontSize)
             builder.withBackground(palette.background)
             builder.withForeground(palette.foreground)
+            // Never inherit an application's reverse-video colors for local
+            // selection. Codex and Claude often leave a dark TUI background,
+            // which previously produced black-on-dark selected text.
+            builder.withSelectionBackground(palette.selectionBackground)
+            builder.withSelectionForeground(palette.selectionForeground)
+            // Relay reads the local selection to implement prompt editing.
+            // Keep it painted after that internal copy; normal typing still
+            // clears it through Ghostty's default selection-clear-on-typing.
+            builder.withCustom("selection-clear-on-copy", "false")
+            builder.withCustom("minimum-contrast", "2.2")
             builder.withBackgroundOpacity(1)
             builder.withCursorColor(palette.cursor)
             builder.withCursorStyle(.bar)
@@ -135,6 +177,19 @@ final class RelayPreferences: ObservableObject {
         }
     }
 
+    var resolvedFontFamily: String {
+        let requested = fontFamily.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !requested.isEmpty else { return "Menlo" }
+        return NSFontManager.shared.availableFontFamilies.contains {
+            $0.caseInsensitiveCompare(requested) == .orderedSame
+        } ? requested : "Menlo"
+    }
+
+    var isUsingFontFallback: Bool {
+        let requested = fontFamily.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !requested.isEmpty && requested.caseInsensitiveCompare(resolvedFontFamily) != .orderedSame
+    }
+
     private func saveAndApply() {
         guard !isLoading else { return }
         save()
@@ -152,6 +207,15 @@ final class RelayPreferences: ObservableObject {
         defaults.set(hideSidebarInFullScreen, forKey: "relay.settings.hide-sidebar-fullscreen")
         defaults.set(showArtifactPreviews, forKey: "relay.settings.artifact-previews")
         defaults.set(artifactPresentation.rawValue, forKey: "relay.settings.artifact-presentation")
+        defaults.set(intelligenceEnabled, forKey: "relay.settings.intelligence-enabled")
+        defaults.set(predictiveSuggestions, forKey: "relay.settings.predictive-suggestions")
+        defaults.set(
+            experimentalGenerativeSuggestions,
+            forKey: "relay.settings.experimental-generative-suggestions"
+        )
+        defaults.set(automaticAgentSummaries, forKey: "relay.settings.intelligence-summaries")
+        defaults.set(semanticAgentSearch, forKey: "relay.settings.intelligence-search")
+        defaults.set(automaticallyUpdateRelayd, forKey: "relay.settings.relayd-auto-update")
         RelayKeyBindingStorage.save(keyBindings, to: defaults)
     }
 }

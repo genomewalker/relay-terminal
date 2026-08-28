@@ -180,7 +180,7 @@ changes merely because a second window observes the pane.
 
 - Restart the macOS app, SSH master, and supervisor independently while a shell
   and both agent CLIs run; output and events resume without losing identity.
-- Migrate the existing dandy-07 workers in place without killing their shell
+- Migrate existing remote workers in place without killing their shell
   process groups.
 - Load 100 active and 500 completed agents, 100 sessions, and 1,000 catalog
   entries; interaction remains responsive and memory stays bounded.
@@ -189,4 +189,3 @@ changes merely because a second window observes the pane.
 - Verify detach versus terminate, lease behavior, conditional editor writes,
   inline image anchoring, VoiceOver labels, keyboard navigation, and reduced
   motion.
-

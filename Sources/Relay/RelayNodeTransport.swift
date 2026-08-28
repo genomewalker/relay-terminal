@@ -24,6 +24,10 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
         connection?.writeAsync(sessionID: sessionID, frame: RelayWireFrame(type: type, payload: payload))
     }
 
+    func supports(_ capability: String) -> Bool {
+        connection?.supports(capability) == true
+    }
+
     func close() {
         lock.lock()
         guard !closed else { lock.unlock(); return }
@@ -56,6 +60,12 @@ final class RelayNodeTransportPool: @unchecked Sendable {
     private let lock = NSLock()
     private var nodes: [String: RelayNodeConnection] = [:]
 
+    var cachedNodeCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return nodes.count
+    }
+
     func attach(
         profile: ConnectionProfile,
         sessionID: String,
@@ -65,10 +75,23 @@ final class RelayNodeTransportPool: @unchecked Sendable {
     ) -> RelayNodeChannel {
         lock.lock()
         let key = profile.connectionKey
-        let node = nodes[key] ?? RelayNodeConnection(profile: profile)
+        let node = nodes[key] ?? RelayNodeConnection(
+            profile: profile,
+            onIdle: { [weak self] node in self?.evictIfIdle(node, key: key) }
+        )
         nodes[key] = node
         lock.unlock()
         return node.add(sessionID: sessionID, onReady: onReady, onFrame: onFrame, onDisconnect: onDisconnect)
+    }
+
+    private func evictIfIdle(_ node: RelayNodeConnection, key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard nodes[key] === node, node.isIdle else { return }
+        nodes.removeValue(forKey: key)
+        RelayDiagnostics.shared.record(category: "connection", name: "node-evicted", details: [
+            "connection_id": node.diagnosticID,
+        ])
     }
 }
 
@@ -89,13 +112,19 @@ final class RelayNodeConnection: @unchecked Sendable {
     private var stopped = true
     private var generation = 0
     private var reconnectAttempt = 0
+    private var capabilities: Set<String> = []
     private var heartbeatSequence: UInt64 = 0
     private var pendingHeartbeats: [UInt64: UInt64] = [:]
     private let heartbeatTimer: DispatchSourceTimer
     private let diagnosticConnectionID: String
+    private let onIdle: @Sendable (RelayNodeConnection) -> Void
 
-    init(profile: ConnectionProfile) {
+    init(
+        profile: ConnectionProfile,
+        onIdle: @escaping @Sendable (RelayNodeConnection) -> Void = { _ in }
+    ) {
         self.profile = profile
+        self.onIdle = onIdle
         diagnosticConnectionID = String(
             format: "%016llx", UInt64(bitPattern: Int64(profile.connectionKey.hashValue))
         )
@@ -106,6 +135,20 @@ final class RelayNodeConnection: @unchecked Sendable {
     }
 
     deinit { heartbeatTimer.cancel() }
+
+    var diagnosticID: String { diagnosticConnectionID }
+
+    var isIdle: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return subscriptions.isEmpty && stopped
+    }
+
+    func supports(_ capability: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return capabilities.contains(capability)
+    }
 
     func add(
         sessionID: String,
@@ -138,12 +181,14 @@ final class RelayNodeConnection: @unchecked Sendable {
             stopped = true
             ready = false
             writer = nil
+            capabilities.removeAll(keepingCapacity: true)
             heartbeatTimer.schedule(deadline: .distantFuture)
             pendingHeartbeats.removeAll(keepingCapacity: true)
             let process = self.process
             self.process = nil
             lock.unlock()
             process?.terminate()
+            onIdle(self)
             return
         }
         lock.unlock()
@@ -219,13 +264,23 @@ final class RelayNodeConnection: @unchecked Sendable {
         }
         DispatchQueue.global(qos: .utility).async {
             defer { diagnosticsFinished.signal() }
-            while let chunk = try? errors.fileHandleForReading.read(upToCount: 8 << 10), !chunk.isEmpty { diagnostics.append(chunk) }
+            while true {
+                let hasData = autoreleasepool { () -> Bool in
+                    guard let chunk = try? errors.fileHandleForReading.read(upToCount: 8 << 10),
+                          !chunk.isEmpty else { return false }
+                    diagnostics.append(chunk)
+                    return true
+                }
+                if !hasData { break }
+            }
         }
         DispatchQueue.global(qos: .userInteractive).async { [weak self, weak ssh] in
             do {
                 while let self, let ssh, ssh.isRunning {
-                    let frame = try RelayWireFrame.read(from: output.fileHandleForReading)
-                    self.receive(frame, generation: currentGeneration)
+                    try autoreleasepool {
+                        let frame = try RelayWireFrame.read(from: output.fileHandleForReading)
+                        self.receive(frame, generation: currentGeneration)
+                    }
                 }
             } catch {
                 if ssh?.isRunning == true { ssh?.terminate() }
@@ -240,6 +295,7 @@ final class RelayNodeConnection: @unchecked Sendable {
             lock.lock()
             guard generation == currentGeneration, !stopped else { lock.unlock(); return }
             ready = true
+            capabilities = Set(status.capabilities ?? [])
             reconnectAttempt = 0
             heartbeatTimer.schedule(
                 deadline: .now() + .seconds(RelayHeartbeatPolicy.intervalSeconds),
@@ -281,6 +337,7 @@ final class RelayNodeConnection: @unchecked Sendable {
         let reachedProtocolReady = ready
         ready = false
         writer = nil
+        capabilities.removeAll(keepingCapacity: true)
         process = nil
         reconnectAttempt += 1
         heartbeatTimer.schedule(deadline: .distantFuture)

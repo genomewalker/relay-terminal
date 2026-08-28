@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import Foundation
 
 struct AgentInspectorSelection: Equatable, Sendable {
@@ -21,17 +20,20 @@ final class WorkspaceModel: ObservableObject {
     @Published var renameTarget: WorkspaceRenameTarget?
     @Published var renameDraft = ""
     @Published var agentInspector: AgentInspectorSelection?
+    @Published var intelligencePanelVisible = false
     @Published var terminationTargetID: UUID?
     @Published var operationError: String?
     @Published private(set) var sessionNames: [UUID: String] = [:]
+    @Published private(set) var pinnedSessionIDs = WorkspacePinStore.load(.session)
+    @Published private(set) var pinnedTabIDs = WorkspacePinStore.load(.tab)
 
     let profileStore = ProfileStore()
+    let activityIndex = WorkspaceActivityIndex()
     private(set) var panes: [UUID: PaneModel] = [:]
     private let workspaceKey = "relay.workspace.v1"
     private var sidebarBeforeFullScreen = true
     private var persistenceTask: Task<Void, Never>?
-    private var paneSubscriptions: [UUID: AnyCancellable] = [:]
-    private var paneChangeScheduled = false
+    private var didShutdown = false
 
     init(restoreSavedWorkspace: Bool = true) {
         let shouldRestore = restoreSavedWorkspace && !RelayLaunchMode.isSafeMode
@@ -55,11 +57,34 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func inspectAgent(paneID: UUID, subagentID: String) {
+        intelligencePanelVisible = false
         agentInspector = AgentInspectorSelection(paneID: paneID, subagentID: subagentID)
     }
 
     func closeAgentInspector() {
         agentInspector = nil
+    }
+
+    func toggleIntelligencePanel() {
+        if !intelligencePanelVisible { agentInspector = nil }
+        intelligencePanelVisible.toggle()
+    }
+
+    func closeIntelligencePanel() {
+        intelligencePanelVisible = false
+    }
+
+    func openInboxItem(_ item: AgentInboxItem) {
+        AgentIntelligenceStore.shared.markRead(item.id)
+        guard panes[item.paneID] != nil else { return }
+        revealPane(item.paneID)
+        if let agentID = item.agentID,
+           panes[item.paneID]?.subagents.contains(where: { $0.id == agentID || $0.threadID == agentID }) == true {
+            let resolvedID = panes[item.paneID]?.subagents.first(where: {
+                $0.id == agentID || $0.threadID == agentID
+            })?.id ?? agentID
+            inspectAgent(paneID: item.paneID, subagentID: resolvedID)
+        }
     }
 
     var terminationTarget: PaneModel? {
@@ -99,6 +124,49 @@ final class WorkspaceModel: ObservableObject {
 
     func sessionDisplayName(_ sessionID: UUID, fallback: String) -> String {
         sessionNames[sessionID] ?? fallback
+    }
+
+    func isSessionPinned(_ sessionID: UUID) -> Bool { pinnedSessionIDs.contains(sessionID) }
+    func isTabPinned(_ tabID: UUID) -> Bool { pinnedTabIDs.contains(tabID) }
+
+    func toggleSessionPin(_ sessionID: UUID) {
+        if !pinnedSessionIDs.insert(sessionID).inserted { pinnedSessionIDs.remove(sessionID) }
+        WorkspacePinStore.save(pinnedSessionIDs, kind: .session)
+    }
+
+    func toggleTabPin(_ tabID: UUID) {
+        if !pinnedTabIDs.insert(tabID).inserted { pinnedTabIDs.remove(tabID) }
+        WorkspacePinStore.save(pinnedTabIDs, kind: .tab)
+    }
+
+    func orderedTabs(in sessionID: UUID) -> [TabModel] {
+        let matching = tabs.filter { $0.sessionID == sessionID }
+        return matching.filter { pinnedTabIDs.contains($0.id) } +
+            matching.filter { !pinnedTabIDs.contains($0.id) }
+    }
+
+    func tabDisplayName(_ tab: TabModel, fallback: String) -> String {
+        let trimmed = tab.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? fallback : trimmed
+        let peers = orderedTabs(in: tab.sessionID).filter {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed
+        }
+        guard peers.count > 1 else { return base }
+
+        let directories = peers.map { candidate -> String? in
+            guard let paneID = candidate.allPaneIDs.first,
+                  let directory = panes[paneID]?.directory?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !directory.isEmpty else { return nil }
+            let component = URL(fileURLWithPath: directory).lastPathComponent
+            return component.isEmpty ? nil : component
+        }
+        if let index = peers.firstIndex(where: { $0.id == tab.id }),
+           let directory = directories[index],
+           Set(directories.compactMap { $0 }).count == peers.count {
+            return "\(base) · \(directory)"
+        }
+        let index = peers.firstIndex(where: { $0.id == tab.id }) ?? 0
+        return "\(base) \(index + 1)"
     }
 
     func beginRenameSession(_ sessionID: UUID, fallback: String) {
@@ -294,7 +362,7 @@ final class WorkspaceModel: ObservableObject {
         guard !restoredTabs.isEmpty else {
             for paneID in requiredIDs {
                 panes.removeValue(forKey: paneID)
-                paneSubscriptions.removeValue(forKey: paneID)
+                activityIndex.remove(paneID)
             }
             return false
         }
@@ -542,7 +610,7 @@ final class WorkspaceModel: ObservableObject {
             tab.floatingPanes.remove(at: floatingIndex)
             panes[activePaneID]?.stopRuntime()
             panes.removeValue(forKey: activePaneID)
-            paneSubscriptions.removeValue(forKey: activePaneID)
+            activityIndex.remove(activePaneID)
             self.activePaneID = tab.allPaneIDs.first
             persistWorkspace()
             return
@@ -555,7 +623,7 @@ final class WorkspaceModel: ObservableObject {
         tab.balanceSplits()
         panes[activePaneID]?.stopRuntime()
         panes.removeValue(forKey: activePaneID)
-        paneSubscriptions.removeValue(forKey: activePaneID)
+        activityIndex.remove(activePaneID)
         self.activePaneID = tab.layout.paneIDs.first
         persistWorkspace()
     }
@@ -568,9 +636,11 @@ final class WorkspaceModel: ObservableObject {
             if agentInspector?.paneID == paneID { agentInspector = nil }
             panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
-            paneSubscriptions.removeValue(forKey: paneID)
+            activityIndex.remove(paneID)
         }
         tabs.remove(at: index)
+        pinnedTabIDs.remove(id)
+        WorkspacePinStore.save(pinnedTabIDs, kind: .tab)
         if tabs.isEmpty {
             newTab(profile: .local)
         } else {
@@ -590,10 +660,14 @@ final class WorkspaceModel: ObservableObject {
             if agentInspector?.paneID == paneID { agentInspector = nil }
             panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
-            paneSubscriptions.removeValue(forKey: paneID)
+            activityIndex.remove(paneID)
         }
         tabs.removeAll { closingTabIDs.contains($0.id) }
         sessionNames.removeValue(forKey: sessionID)
+        pinnedSessionIDs.remove(sessionID)
+        pinnedTabIDs.subtract(closingTabIDs)
+        WorkspacePinStore.save(pinnedSessionIDs, kind: .session)
+        WorkspacePinStore.save(pinnedTabIDs, kind: .tab)
         if tabs.isEmpty {
             newTab(profile: .local)
             return
@@ -662,6 +736,8 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func shutdown() {
+        guard !didShutdown else { return }
+        didShutdown = true
         persistenceTask?.cancel()
         persistenceTask = nil
         persistWorkspaceNow()
@@ -704,7 +780,7 @@ final class WorkspaceModel: ObservableObject {
         }
         guard !restoredTabs.isEmpty else {
             panes.removeAll()
-            paneSubscriptions.removeAll()
+            activityIndex.removeAll()
             return false
         }
         tabs = restoredTabs
@@ -734,16 +810,7 @@ final class WorkspaceModel: ObservableObject {
 
     private func storePane(_ pane: PaneModel) {
         panes[pane.id] = pane
-        paneSubscriptions[pane.id] = pane.objectWillChange.sink { [weak self] _ in
-            guard let self, !self.paneChangeScheduled else { return }
-            self.paneChangeScheduled = true
-            Task { @MainActor [weak self] in
-                await Task.yield()
-                guard let self else { return }
-                self.paneChangeScheduled = false
-                self.objectWillChange.send()
-            }
-        }
+        activityIndex.observe(pane)
     }
 
     private func persistWorkspaceNow() {
@@ -799,6 +866,20 @@ final class WorkspaceModel: ObservableObject {
             RelayRemoteWorkspaceSync.shared.put(profile: remotePane.profile, workspaceID: sessionID, state: state)
         }
     }
+}
+
+enum WorkspacePinStore {
+    enum Kind: String { case session, tab }
+
+    static func load(_ kind: Kind, defaults: UserDefaults = .standard) -> Set<UUID> {
+        Set((defaults.stringArray(forKey: key(kind)) ?? []).compactMap(UUID.init(uuidString:)))
+    }
+
+    static func save(_ ids: Set<UUID>, kind: Kind, defaults: UserDefaults = .standard) {
+        defaults.set(ids.map { $0.uuidString.lowercased() }.sorted(), forKey: key(kind))
+    }
+
+    private static func key(_ kind: Kind) -> String { "relay.workspace.pinned-\(kind.rawValue)s" }
 }
 
 struct WorkspaceSnapshot: Codable, Sendable {

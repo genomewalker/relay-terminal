@@ -349,10 +349,10 @@ func environmentWithOverrides(environment []string, overrides map[string]string)
 }
 
 func (session *Session) monitorAgentProcesses() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
 	known := make(map[int]string)
-	for range ticker.C {
+	for range timer.C {
 		session.mu.Lock()
 		exited := session.exited
 		rootPID := session.process.Process.Pid
@@ -372,7 +372,25 @@ func (session *Session) monitorAgentProcesses() {
 			}
 		}
 		known = current
+		timer.Reset(agentProcessPollInterval(len(current)))
 	}
+}
+
+func agentProcessPollInterval(activeAgents int) time.Duration {
+	if activeAgents > 0 {
+		return time.Second
+	}
+	// Provider hooks and transcript streams remain the fast path. Process-tree
+	// detection is a compatibility safety net, so idle shells do not need one
+	// /proc traversal per second for their entire lifetime.
+	return 5 * time.Second
+}
+
+func transcriptPollInterval(activeReaders int) time.Duration {
+	if activeReaders > 0 {
+		return 500 * time.Millisecond
+	}
+	return 5 * time.Second
 }
 
 func (session *Session) publishDetectedAgent(agent, eventName string, pid int) {
@@ -649,19 +667,59 @@ func replayStart(replay []record, lastSequence uint64) (int, int) {
 	if lastSequence != 0 {
 		return 0, 0
 	}
-	clears := [][]byte{[]byte("\x1b[2J"), []byte("\x1b[3J"), []byte("\x1bc")}
-	for index := len(replay) - 1; index >= 0; index-- {
-		latest := -1
-		for _, clear := range clears {
-			if offset := bytes.LastIndex(replay[index].data, clear); offset > latest {
-				latest = offset
+	var stream []byte
+	recordStarts := make([]int, len(replay))
+	for index, item := range replay {
+		recordStarts[index] = len(stream)
+		stream = append(stream, item.data...)
+	}
+	if latest := safePrimaryScreenReplayStart(stream); latest >= 0 {
+		for index := len(recordStarts) - 1; index >= 0; index-- {
+			if latest >= recordStarts[index] {
+				return index, latest - recordStarts[index]
 			}
-		}
-		if latest >= 0 {
-			return index, latest
 		}
 	}
 	return 0, 0
+}
+
+func safePrimaryScreenReplayStart(stream []byte) int {
+	clears := [][]byte{[]byte("\x1b[2J"), []byte("\x1b[3J"), []byte("\x1bc")}
+	alternateEntries := [][]byte{[]byte("\x1b[?1049h"), []byte("\x1b[?1047h"), []byte("\x1b[?47h")}
+	alternateExits := [][]byte{[]byte("\x1b[?1049l"), []byte("\x1b[?1047l"), []byte("\x1b[?47l")}
+	inAlternateScreen := false
+	latestPrimaryClear := -1
+
+	for index := 0; index < len(stream); {
+		if length := terminalSequenceLengthAt(stream, index, alternateEntries); length > 0 {
+			inAlternateScreen = true
+			index += length
+			continue
+		}
+		if length := terminalSequenceLengthAt(stream, index, alternateExits); length > 0 {
+			inAlternateScreen = false
+			index += length
+			continue
+		}
+		if !inAlternateScreen {
+			if length := terminalSequenceLengthAt(stream, index, clears); length > 0 {
+				latestPrimaryClear = index
+				index += length
+				continue
+			}
+		}
+		index++
+	}
+	return latestPrimaryClear
+}
+
+func terminalSequenceLengthAt(stream []byte, index int, sequences [][]byte) int {
+	for _, sequence := range sequences {
+		if index+len(sequence) <= len(stream) && bytes.Equal(stream[index:index+len(sequence)], sequence) {
+			return len(sequence)
+		}
+	}
+	return 0
 }
 
 func (session *Session) detach(viewer *client) {
@@ -741,6 +799,76 @@ func (session *Session) resize(cols, rows uint16) error {
 		return nil
 	}
 	return pty.Setsize(session.pty, &pty.Winsize{Cols: cols, Rows: rows})
+}
+
+type terminalGridSize struct {
+	cols uint16
+	rows uint16
+}
+
+// An unchanged TIOCSWINSZ does not reliably deliver SIGWINCH on Linux. Pulse
+// one row away and immediately restore the requested geometry so an attached
+// full-screen program reads only the final size but still emits a complete
+// repaint for the reconnect replay.
+func attachResizeSteps(currentCols, currentRows, cols, rows uint16) []terminalGridSize {
+	target := terminalGridSize{cols: cols, rows: rows}
+	if currentCols != cols || currentRows != rows || cols == 0 || rows == 0 {
+		return []terminalGridSize{target}
+	}
+	probe := target
+	if rows > 1 {
+		probe.rows--
+	} else if rows < ^uint16(0) {
+		probe.rows++
+	} else if cols > 1 {
+		probe.cols--
+	}
+	if probe == target {
+		return []terminalGridSize{target}
+	}
+	return []terminalGridSize{probe, target}
+}
+
+// resizeForAttach gives an interactive program a small, bounded opportunity
+// to append its new-grid redraw to replay. Shells that emit nothing take the
+// short quiet path; continuously updating programs never delay attach beyond
+// the hard deadline.
+func (session *Session) resizeForAttach(cols, rows uint16) (uint64, bool) {
+	if cols == 0 || rows == 0 {
+		return 0, false
+	}
+	before, _, _, _ := session.snapshot()
+	current, _ := pty.GetsizeFull(session.pty)
+	currentCols, currentRows := uint16(0), uint16(0)
+	if current != nil {
+		currentCols, currentRows = current.Cols, current.Rows
+	}
+	for _, step := range attachResizeSteps(currentCols, currentRows, cols, rows) {
+		if session.resize(step.cols, step.rows) != nil {
+			return before, false
+		}
+	}
+	started := time.Now()
+	deadline := started.Add(150 * time.Millisecond)
+	quietSince := started
+	lastSequence := before
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		sequence, _, _, _ := session.snapshot()
+		if sequence != lastSequence {
+			lastSequence = sequence
+			quietSince = time.Now()
+			continue
+		}
+		if sequence == before && time.Since(started) >= 20*time.Millisecond {
+			return before, false
+		}
+		if sequence != before && time.Since(quietSince) >= 15*time.Millisecond {
+			return before, true
+		}
+	}
+	sequence, _, _, _ := session.snapshot()
+	return before, sequence != before
 }
 
 func (session *Session) agentEvent(payload []byte) {

@@ -22,6 +22,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
     case previousTab
     case nextTab
     case toggleSidebar
+    case agentActivity
 
     var id: String { rawValue }
 
@@ -46,6 +47,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .previousTab: "Previous tab"
         case .nextTab: "Next tab"
         case .toggleSidebar: "Show or hide navigator"
+        case .agentActivity: "Show or hide agent activity"
         }
     }
 
@@ -56,7 +58,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .openEditor, .zoomPane, .floatPane, .balancePanes, .splitRight,
              .splitDown, .newFloatingPane, .previousPane, .nextPane,
              .previousPrompt, .nextPrompt, .closePane: "Panes"
-        case .toggleSidebar: "Workspace"
+        case .toggleSidebar, .agentActivity: "Workspace"
         }
     }
 
@@ -81,6 +83,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .previousTab: .init("[", command: true, shift: true)
         case .nextTab: .init("]", command: true, shift: true)
         case .toggleSidebar: .init("s", command: true, control: true)
+        case .agentActivity: .init("i", command: true, option: true)
         }
     }
 }
@@ -215,12 +218,28 @@ struct RelayWorkspaceWindowMarker: NSViewRepresentable {
     final class MarkerView: NSView {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            window?.identifier = .relayWorkspaceWindow
+            configureWindow()
+        }
+
+        func configureWindow() {
+            guard let window else { return }
+            window.identifier = .relayWorkspaceWindow
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.styleMask.insert(.fullSizeContentView)
+            window.isMovableByWindowBackground = true
+            // Relay draws stable, high-contrast controls inside its unified
+            // title bar. The native buttons become nearly black under
+            // hiddenTitleBar + dark appearance and remain in the hit-testing
+            // path even when visually absent, so remove that duplicate set.
+            for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                window.standardWindowButton(kind)?.isHidden = true
+            }
         }
     }
 
     func makeNSView(context: Context) -> NSView { MarkerView(frame: .zero) }
     func updateNSView(_ nsView: NSView, context: Context) {
-        nsView.window?.identifier = .relayWorkspaceWindow
+        (nsView as? MarkerView)?.configureWindow()
     }
 }

@@ -10,7 +10,10 @@ let package = Package(
         .executable(name: "relay-bridge", targets: ["RelayBridge"])
     ],
     dependencies: [
-        .package(url: "https://github.com/Lakr233/libghostty-spm.git", exact: "1.4.0")
+        .package(
+            url: "https://github.com/genomewalker/libghostty-spm.git",
+            revision: "c056eecfe327616a42f46ef29e706c604285cf6a"
+        )
     ],
     targets: [
         .executableTarget(

@@ -1,13 +1,12 @@
 {
-  "originHash" : "662ea1aee1e9bb72c28539f4ce3f01a2c741c01b578620cb77d9eb3b4dd4084e",
+  "originHash" : "22dfe73caa3b62f28034bd30c47f8cb80f7e9ce605cee101e3e025ff4209bc8f",
   "pins" : [
     {
       "identity" : "libghostty-spm",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/Lakr233/libghostty-spm.git",
+      "location" : "https://github.com/genomewalker/libghostty-spm.git",
       "state" : {
-        "revision" : "356f730bec03281fc7b83666a129b0246137ea26",
-        "version" : "1.4.0"
+        "revision" : "c056eecfe327616a42f46ef29e706c604285cf6a"
       }
     },
     {

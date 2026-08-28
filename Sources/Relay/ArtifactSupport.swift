@@ -1,13 +1,83 @@
 import AppKit
+import CryptoKit
 import Foundation
+import ImageIO
 
 struct PaneArtifact: Identifiable {
     let id = UUID()
     let remotePath: String
     let data: Data
+    let contentIdentity: String
+
+    init(remotePath: String, data: Data) {
+        self.remotePath = remotePath
+        self.data = data
+        var hasher = SHA256()
+        hasher.update(data: Data(remotePath.utf8))
+        hasher.update(data: Data([0]))
+        hasher.update(data: data)
+        contentIdentity = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
 
     var filename: String { URL(fileURLWithPath: remotePath).lastPathComponent }
     var image: NSImage? { NSImage(data: data) }
+}
+
+enum TerminalImageNormalizer {
+    private static let maximumPixelDimension = 4_096
+    private static let pngSignature = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+    /// Kitty graphics payloads declare PNG format, so JPEG, WebP, GIF and SVG
+    /// assets must be normalized before entering the terminal byte stream.
+    /// Downsampling bounds both terminal traffic and renderer memory.
+    @MainActor
+    static func pngData(from data: Data) -> Data? {
+        // Generated assets are overwhelmingly PNG. Keep that common path
+        // zero-copy so opening an image does not add decode work or UI latency.
+        if data.starts(with: pngSignature) { return data }
+        var image: CGImage?
+        if let source = CGImageSourceCreateWithData(data as CFData, nil) {
+            image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maximumPixelDimension,
+            ] as CFDictionary)
+        }
+        if image == nil, let vector = NSImage(data: data) {
+            var proposed = NSRect(origin: .zero, size: vector.size)
+            image = vector.cgImage(forProposedRect: &proposed, context: nil, hints: nil)
+        }
+        guard let image else { return nil }
+        return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    }
+}
+
+/// Remembers explicit closes without retaining remote paths or image bytes.
+/// The digest includes both path and content, so a rewritten image at the same
+/// path is still treated as a new artifact and can be presented normally.
+enum ArtifactDismissalStore {
+    private static let prefix = "relay.artifact-dismissals."
+    private static let limit = 32
+
+    static func load(paneID: UUID, defaults: UserDefaults = .standard) -> Set<String> {
+        Set(defaults.stringArray(forKey: key(paneID)) ?? [])
+    }
+
+    static func record(_ identity: String, paneID: UUID, defaults: UserDefaults = .standard) {
+        var identities = defaults.stringArray(forKey: key(paneID)) ?? []
+        identities.removeAll { $0 == identity }
+        identities.append(identity)
+        if identities.count > limit { identities.removeFirst(identities.count - limit) }
+        defaults.set(identities, forKey: key(paneID))
+    }
+
+    static func clear(paneID: UUID, defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: key(paneID))
+    }
+
+    private static func key(_ paneID: UUID) -> String {
+        prefix + paneID.uuidString.lowercased()
+    }
 }
 
 struct ImagePathDetector {
@@ -33,7 +103,7 @@ struct ImagePathDetector {
 /// Removes terminal control sequences from the artifact compatibility stream.
 /// The state survives packet boundaries, so an SGR/OSC split across SSH reads
 /// cannot leak escape bytes into a path token. The rendered stream is untouched.
-private struct TerminalControlSequenceStripper {
+struct TerminalControlSequenceStripper {
     private enum State { case text, escape, csi, osc, oscEscape, controlString, controlStringEscape }
     private var state: State = .text
 
@@ -76,7 +146,7 @@ enum TerminalLinkTarget: Equatable, Sendable {
 }
 
 enum TerminalLinkResolver {
-    static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp"])
+    static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp", "svg"])
     private static let artifactPrefix = "file:///__relay_artifact__/"
     private static let legacyArtifactPrefix = "relay-artifact://open/"
     private static let filePrefix = "file:///__relay_remote_file__/"
@@ -151,6 +221,7 @@ enum ArtifactHyperlinkEncoder {
     /// Chunks that already contain OSC 8 are left alone to avoid nested links.
     static func encode(_ data: Data) -> Data {
         guard data.range(of: Data("\u{001B}]8;".utf8)) == nil,
+              data.range(of: Data("\u{001B}_G".utf8)) == nil,
               let text = String(data: data, encoding: .utf8),
               text.contains("/")
         else { return data }
@@ -184,7 +255,7 @@ private struct TerminalDetectedLink {
 /// repaint packet.
 private enum TerminalLinkScanner {
     private static let fileExtensions: Set<String> = Set([
-        "png", "jpg", "jpeg", "gif", "webp", "txt", "md", "markdown", "rst", "log",
+        "png", "jpg", "jpeg", "gif", "webp", "svg", "txt", "md", "markdown", "rst", "log",
         "csv", "tsv", "json", "jsonl", "yaml", "yml", "toml", "ini", "conf", "cfg",
         "swift", "go", "rs", "py", "pyw", "r", "rmd", "sh", "bash", "zsh", "fish",
         "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "html", "htm", "css",

@@ -2,10 +2,21 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
-version="${RELAY_VERSION:-0.5.0}"
+version="${RELAY_VERSION:-0.5.2}"
 output_directory="${RELAY_RELEASE_OUTPUT:-$project_root/dist}"
 stage_root="$(mktemp -d "${TMPDIR:-/tmp}/relay-release.XXXXXX")"
 trap '/bin/rm -rf "$stage_root"' EXIT
+
+if [[ "${RELAY_ALLOW_UNSIGNED_RELEASE:-0}" != "1" ]]; then
+    if [[ -z "${RELAY_CODESIGN_IDENTITY:-}" || "${RELAY_CODESIGN_IDENTITY:-}" == "-" ]]; then
+        echo "RELAY_CODESIGN_IDENTITY is required for a public release" >&2
+        exit 1
+    fi
+    if [[ -z "${RELAY_NOTARY_PROFILE:-}" ]]; then
+        echo "RELAY_NOTARY_PROFILE is required for a public release" >&2
+        exit 1
+    fi
+fi
 
 mkdir -p "$output_directory"
 RELAY_APP_OUTPUT="$stage_root/Relay.app" \
@@ -36,11 +47,7 @@ fi
 
 for architecture in amd64 arm64; do
     binary="$output_directory/relayd-$version-linux-$architecture"
-    (
-        cd "$project_root/remote/relayd"
-        CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" \
-            go build -trimpath -ldflags="-s -w" -o "$binary" ./cmd/relayd
-    )
+    /bin/cp "$stage_root/Relay.app/Contents/Resources/relayd-linux-$architecture" "$binary"
     chmod 0755 "$binary"
 done
 

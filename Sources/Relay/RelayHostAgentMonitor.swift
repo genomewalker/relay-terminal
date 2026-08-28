@@ -116,6 +116,27 @@ final class RelayHostAgentMonitor {
 }
 
 private final class RelayHostAgentTransport: @unchecked Sendable {
+    private final class EventCursor: @unchecked Sendable {
+        private let lock = NSLock()
+        private var sequence: UInt64
+
+        init(_ sequence: UInt64) { self.sequence = sequence }
+
+        var value: UInt64 {
+            lock.lock()
+            defer { lock.unlock() }
+            return sequence
+        }
+
+        func observe(_ payload: Data) {
+            guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                  let number = object["relay_event_seq"] as? NSNumber else { return }
+            lock.lock()
+            sequence = max(sequence, number.uint64Value)
+            lock.unlock()
+        }
+    }
+
     private let lock = NSLock()
     private var channels: [String: RelayNodeChannel] = [:]
     private var legacyTransport: RelayLegacyHostAgentTransport?
@@ -130,17 +151,79 @@ private final class RelayHostAgentTransport: @unchecked Sendable {
         lock.lock()
         stopped = false
         lock.unlock()
-        // node_mux_v1 keys virtual streams by pane ID, so an event observer
-        // and the interactive terminal for the same pane replace each other.
-        // Keep one observe-many SSH stream per host until node_mux_v2 provides
-        // independent virtual connection IDs. This is still O(hosts), not
-        // O(panes), and guarantees monitoring can never steal a terminal.
-        startLegacy(
+        for (sessionID, cursor) in sessions {
+            startMultiplexedObserver(
+                profile: profile,
+                sessionID: sessionID,
+                cursor: cursor,
+                allSessions: sessions,
+                onEvent: onEvent,
+                onAttached: onAttached
+            )
+        }
+    }
+
+    private func startMultiplexedObserver(
+        profile: ConnectionProfile,
+        sessionID: String,
+        cursor: UInt64,
+        allSessions: [String: UInt64],
+        onEvent: @escaping @Sendable (String, Data) -> Void,
+        onAttached: @escaping @Sendable () -> Void
+    ) {
+        let routeID = "observer_" + UUID().uuidString.lowercased()
+        let eventCursor = EventCursor(cursor)
+        let created = RelayNodeTransportPool.shared.attach(
             profile: profile,
-            sessions: sessions,
-            onEvent: onEvent,
-            onAttached: onAttached
+            sessionID: routeID,
+            onReady: { [weak self] channel in
+                guard let self else { return }
+                guard channel.supports("node_mux_v2") else {
+                    self.startLegacy(
+                        profile: profile,
+                        sessions: allSessions,
+                        onEvent: onEvent,
+                        onAttached: onAttached
+                    )
+                    return
+                }
+                let hello: [String: Any] = [
+                    "version": 1,
+                    "session_id": sessionID,
+                    "cols": RelayViewport.default.columns,
+                    "rows": RelayViewport.default.rows,
+                    "last_seq": 0,
+                    "last_event_seq": eventCursor.value,
+                    "observe_events": true,
+                    "event_only": true,
+                ]
+                guard let payload = try? JSONSerialization.data(withJSONObject: hello) else { return }
+                channel.writeAsync(type: .hello, payload: payload)
+            },
+            onFrame: { frame in
+                switch frame.type {
+                case .agentEvent:
+                    eventCursor.observe(frame.payload)
+                    onEvent(sessionID, frame.payload)
+                case .status:
+                    if let status = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload),
+                       status.state == "attached" {
+                        onAttached()
+                    }
+                default:
+                    break
+                }
+            },
+            onDisconnect: { _ in }
         )
+        lock.lock()
+        if stopped || legacyTransport != nil {
+            lock.unlock()
+            created.close()
+        } else {
+            channels[sessionID] = created
+            lock.unlock()
+        }
     }
 
     func stop() {
@@ -246,9 +329,15 @@ private final class RelayLegacyHostAgentTransport: @unchecked Sendable {
     }
 
     private func readFrames(_ handle: FileHandle) {
-        while let frame = try? RelayWireFrame.read(from: handle) {
-            guard let envelope = RelayWireFrame.parseHostEvent(frame), envelope.inner.type == .agentEvent else { continue }
-            onEvent?(envelope.sessionID, envelope.inner.payload)
+        while true {
+            let received = autoreleasepool { () -> Bool in
+                guard let frame = try? RelayWireFrame.read(from: handle) else { return false }
+                guard let envelope = RelayWireFrame.parseHostEvent(frame),
+                      envelope.inner.type == .agentEvent else { return true }
+                onEvent?(envelope.sessionID, envelope.inner.payload)
+                return true
+            }
+            if !received { return }
         }
     }
 

@@ -81,14 +81,17 @@ type HelloPayload struct {
 }
 
 type StatusPayload struct {
-	State          string   `json:"state"`
-	ExitCode       int      `json:"exit_code,omitempty"`
-	Message        string   `json:"message,omitempty"`
-	WorkerPID      int      `json:"worker_pid,omitempty"`
-	Capabilities   []string `json:"capabilities,omitempty"`
-	OutputReset    bool     `json:"output_reset,omitempty"`
-	EventReset     bool     `json:"event_reset,omitempty"`
-	ControlGranted *bool    `json:"control_granted,omitempty"`
+	State           string   `json:"state"`
+	Version         string   `json:"version,omitempty"`
+	ProtocolVersion int      `json:"protocol_version,omitempty"`
+	SupervisorPID   int      `json:"supervisor_pid,omitempty"`
+	ExitCode        int      `json:"exit_code,omitempty"`
+	Message         string   `json:"message,omitempty"`
+	WorkerPID       int      `json:"worker_pid,omitempty"`
+	Capabilities    []string `json:"capabilities,omitempty"`
+	OutputReset     bool     `json:"output_reset,omitempty"`
+	EventReset      bool     `json:"event_reset,omitempty"`
+	ControlGranted  *bool    `json:"control_granted,omitempty"`
 }
 
 const inputIdentityBytes = 16

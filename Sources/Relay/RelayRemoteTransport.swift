@@ -179,6 +179,12 @@ final class RelayRemoteTransport: @unchecked Sendable {
         process?.terminate()
     }
 
+    func setInitialViewport(_ viewport: RelayViewport) {
+        lock.lock()
+        latestResize = (viewport.columns, viewport.rows)
+        lock.unlock()
+    }
+
     func start(
         profile: ConnectionProfile,
         sessionID: String,
@@ -187,7 +193,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
         tabID: String?,
         paneTitle: String,
         contentKind: String,
-        onOutput: @escaping @Sendable (Data) -> Void,
+        initialLastSequence: UInt64 = 0,
+        onOutput: @escaping @Sendable (Data, UInt64) -> Void,
         onStatus: @escaping @Sendable (RelayStatus) -> Void,
         onAgentEvent: @escaping @Sendable (Data) -> Void,
         onArtifact: @escaping @Sendable (RelayArtifact) -> Void,
@@ -211,7 +218,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         )
         lock.lock()
         detached = false
-        lastSequence = 0
+        lastSequence = initialLastSequence
         lastEventSequence = 0
         reconnectAttempt = 0
         reconnectScheduled = false
@@ -223,6 +230,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         sessionEnded = false
         attachRetryCount = 0
         attachRetryScheduled = false
+        if latestResize == nil {
+            latestResize = (RelayViewport.default.columns, RelayViewport.default.rows)
+        }
         lock.unlock()
         connectMultiplexed(context)
     }
@@ -257,14 +267,15 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
         let resumeSequence = lastSequence
         let resumeEventSequence = lastEventSequence
+        let viewport = latestResize ?? (RelayViewport.default.columns, RelayViewport.default.rows)
         attached = false
         writer = channel
         lock.unlock()
         var hello: [String: Any] = [
             "version": 1,
             "session_id": context.sessionID,
-            "cols": 120,
-            "rows": 36,
+            "cols": viewport.0,
+            "rows": viewport.1,
             "last_seq": resumeSequence,
             "last_event_seq": resumeEventSequence,
             "client_id": inputClientID.uuidString.lowercased(),
@@ -330,7 +341,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             lock.lock()
             lastSequence = max(lastSequence, sequence)
             lock.unlock()
-            context.onOutput(Data(frame.payload.dropFirst(8)))
+            context.onOutput(Data(frame.payload.dropFirst(8)), sequence)
         case .status:
             guard let decoded = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload) else { return }
             if decoded.outputReset == true || decoded.eventReset == true {
@@ -468,6 +479,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         lock.lock()
         let resumeSequence = lastSequence
         let resumeEventSequence = lastEventSequence
+        let viewport = latestResize ?? (RelayViewport.default.columns, RelayViewport.default.rows)
         lock.unlock()
         if context.observeAgentsOnly {
             arguments += [
@@ -480,8 +492,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
             arguments += [
                 "~/.local/bin/relayd", "attach",
                 "--session", context.sessionID,
-                "--cols", "120",
-                "--rows", "36",
+                "--cols", String(viewport.0),
+                "--rows", String(viewport.1),
                 "--last-seq", String(resumeSequence),
                 "--last-event-seq", String(resumeEventSequence)
             ]
@@ -534,67 +546,75 @@ final class RelayRemoteTransport: @unchecked Sendable {
 
         DispatchQueue.global(qos: .utility).async {
             defer { stderrFinished.signal() }
-            while let chunk = try? errors.fileHandleForReading.read(upToCount: 8 << 10), !chunk.isEmpty {
-                diagnostics.append(chunk)
+            while true {
+                let hasData = autoreleasepool { () -> Bool in
+                    guard let chunk = try? errors.fileHandleForReading.read(upToCount: 8 << 10),
+                          !chunk.isEmpty else { return false }
+                    diagnostics.append(chunk)
+                    return true
+                }
+                if !hasData { break }
             }
         }
 
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             do {
                 while true {
-                    let frame = try RelayWireFrame.read(from: output.fileHandleForReading)
-                    switch frame.type {
-                    case .output:
-                        guard frame.payload.count >= 8 else { continue }
-                        let sequence = frame.payload.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-                        self?.lock.lock()
-                        self?.lastSequence = max(self?.lastSequence ?? 0, sequence)
-                        self?.lock.unlock()
-                        context.onOutput(Data(frame.payload.dropFirst(8)))
-                    case .status:
-                        if let decoded = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload) {
-                            if decoded.outputReset == true || decoded.eventReset == true {
+                    try autoreleasepool {
+                        let frame = try RelayWireFrame.read(from: output.fileHandleForReading)
+                        switch frame.type {
+                        case .output:
+                            guard frame.payload.count >= 8 else { return }
+                            let sequence = frame.payload.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+                            self?.lock.lock()
+                            self?.lastSequence = max(self?.lastSequence ?? 0, sequence)
+                            self?.lock.unlock()
+                            context.onOutput(Data(frame.payload.dropFirst(8)), sequence)
+                        case .status:
+                            if let decoded = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload) {
+                                if decoded.outputReset == true || decoded.eventReset == true {
+                                    self?.lock.lock()
+                                    if decoded.outputReset == true { self?.lastSequence = 0 }
+                                    if decoded.eventReset == true { self?.lastEventSequence = 0 }
+                                    self?.lock.unlock()
+                                }
+                                if decoded.state == "attached" { self?.didAttach(context: context, capabilities: decoded.capabilities ?? []) }
+                                if decoded.state == "exited" || decoded.state == "error" { self?.markSessionEnded() }
+                                context.onStatus(RelayStatus(
+                                    state: decoded.state,
+                                    exitCode: decoded.exitCode,
+                                    message: decoded.message,
+                                    outputReset: decoded.outputReset ?? false,
+                                    eventReset: decoded.eventReset ?? false,
+                                    capabilities: decoded.capabilities ?? []
+                                ))
+                            }
+                        case .ping:
+                            try self?.writer?.write(type: .pong)
+                        case .agentEvent:
+                            if let decoded = try? JSONDecoder().decode(EventWireEnvelope.self, from: frame.payload),
+                               let sequence = decoded.sequence {
                                 self?.lock.lock()
-                                if decoded.outputReset == true { self?.lastSequence = 0 }
-                                if decoded.eventReset == true { self?.lastEventSequence = 0 }
+                                self?.lastEventSequence = max(self?.lastEventSequence ?? 0, sequence)
                                 self?.lock.unlock()
                             }
-                            if decoded.state == "attached" { self?.didAttach(context: context, capabilities: decoded.capabilities ?? []) }
-                            if decoded.state == "exited" || decoded.state == "error" { self?.markSessionEnded() }
-                            context.onStatus(RelayStatus(
-                                state: decoded.state,
-                                exitCode: decoded.exitCode,
-                                message: decoded.message,
-                                outputReset: decoded.outputReset ?? false,
-                                eventReset: decoded.eventReset ?? false,
-                                capabilities: decoded.capabilities ?? []
-                            ))
-                        }
-                    case .ping:
-                        try self?.writer?.write(type: .pong)
-                    case .agentEvent:
-                        if let decoded = try? JSONDecoder().decode(EventWireEnvelope.self, from: frame.payload),
-                           let sequence = decoded.sequence {
-                            self?.lock.lock()
-                            self?.lastEventSequence = max(self?.lastEventSequence ?? 0, sequence)
-                            self?.lock.unlock()
-                        }
-                        context.onAgentEvent(frame.payload)
-                    case .inputAck:
-                        if let acknowledgement = RelayWireFrame.parseInputAck(frame.payload),
-                           acknowledgement.clientID == self?.inputClientID {
-                            self?.lock.lock()
-                            if let removed = self?.pendingInputs.removeValue(forKey: acknowledgement.sequence) {
-                                self?.pendingInputBytes = max(0, (self?.pendingInputBytes ?? 0) - removed.count)
+                            context.onAgentEvent(frame.payload)
+                        case .inputAck:
+                            if let acknowledgement = RelayWireFrame.parseInputAck(frame.payload),
+                               acknowledgement.clientID == self?.inputClientID {
+                                self?.lock.lock()
+                                if let removed = self?.pendingInputs.removeValue(forKey: acknowledgement.sequence) {
+                                    self?.pendingInputBytes = max(0, (self?.pendingInputBytes ?? 0) - removed.count)
+                                }
+                                self?.lock.unlock()
                             }
-                            self?.lock.unlock()
+                        case .artifact:
+                            if let artifact = RelayWireFrame.parseArtifact(frame.payload) {
+                                context.onArtifact(artifact)
+                            }
+                        default:
+                            return
                         }
-                    case .artifact:
-                        if let artifact = RelayWireFrame.parseArtifact(frame.payload) {
-                            context.onArtifact(artifact)
-                        }
-                    default:
-                        continue
                     }
                 }
             } catch {
@@ -645,6 +665,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         attachRetryCount = 0
         attachRetryScheduled = false
         supportsInputAcknowledgements = capabilities.contains("input_ack_v1")
+        let needsPostAttachResize = RelayTransportCapabilityPolicy.needsPostAttachResize(capabilities)
         let backlog = inputBacklog
         inputBacklog.removeAll(keepingCapacity: true)
         let resize = latestResize
@@ -670,7 +691,12 @@ final class RelayRemoteTransport: @unchecked Sendable {
         } else if !backlog.isEmpty {
             writer?.writeAsync(type: .input, payload: backlog)
         }
-        if let (columns, rows) = resize { writeResize(columns: columns, rows: rows, using: writer) }
+        // Older workers need an explicit resize after attachment. New workers
+        // apply the Hello viewport before replay, so avoid a redundant
+        // SIGWINCH and full-screen TUI redraw on every reconnect.
+        if needsPostAttachResize, let (columns, rows) = resize {
+            writeResize(columns: columns, rows: rows, using: writer)
+        }
         if overflowed {
             context.onStatus(RelayStatus(
                 state: "input_dropped",
@@ -789,6 +815,29 @@ final class RelayRemoteTransport: @unchecked Sendable {
     }
 }
 
+struct RelayViewport: Equatable, Sendable {
+    static let `default` = RelayViewport(columns: 120, rows: 36)
+
+    let columns: UInt16
+    let rows: UInt16
+
+    init(columns: Int, rows: Int) {
+        self.columns = UInt16(clamping: max(1, columns))
+        self.rows = UInt16(clamping: max(1, rows))
+    }
+
+    init(columns: UInt16, rows: UInt16) {
+        self.columns = max(1, columns)
+        self.rows = max(1, rows)
+    }
+}
+
+enum RelayTransportCapabilityPolicy {
+    static func needsPostAttachResize(_ capabilities: [String]) -> Bool {
+        !capabilities.contains("viewport_attach_v1")
+    }
+}
+
 final class SSHDiagnosticBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
@@ -817,7 +866,7 @@ private struct RelayConnectionContext: Sendable {
     let tabID: String?
     let paneTitle: String
     let contentKind: String
-    let onOutput: @Sendable (Data) -> Void
+    let onOutput: @Sendable (Data, UInt64) -> Void
     let onStatus: @Sendable (RelayStatus) -> Void
     let onAgentEvent: @Sendable (Data) -> Void
     let onArtifact: @Sendable (RelayArtifact) -> Void

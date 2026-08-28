@@ -44,6 +44,7 @@ jobs:
       - name: Package, sign, and notarize
         env:
           RELAY_VERSION: ${{ github.ref_name }}
+          RELAY_BUILD_NUMBER: ${{ github.run_number }}
           RELAY_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
           RELAY_NOTARY_PROFILE: relay-notary
         run: |

@@ -22,8 +22,15 @@ import (
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
+var relaydVersion = "0.5.2"
+
+const supervisorProtocolVersion = 2
+
 func main() {
-	invocation := filepath.Base(os.Args[0])
+	invocation := os.Getenv("RELAY_INVOKED_AS")
+	if invocation == "" {
+		invocation = filepath.Base(os.Args[0])
+	}
 	if invocation == "rcode" {
 		runRCode(os.Args[1:])
 		return
@@ -33,7 +40,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|artifact|files>")
+		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|artifact|files|live-status|upgrade-supervisor>")
 	}
 	switch os.Args[1] {
 	case "daemon":
@@ -64,8 +71,12 @@ func main() {
 		runArtifact(os.Args[2:])
 	case "files":
 		runFiles(os.Args[2:])
+	case "live-status":
+		runLiveStatus(os.Args[2:])
+	case "upgrade-supervisor":
+		runUpgradeSupervisor(os.Args[2:])
 	case "--version", "version":
-		fmt.Println("relayd 0.5.0")
+		fmt.Println("relayd " + relaydVersion)
 	default:
 		fatal("unknown command: " + os.Args[1])
 	}
@@ -571,7 +582,7 @@ func runDaemon(arguments []string) {
 	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
 	_ = flags.Parse(arguments)
-	if err := daemon.NewServer().Serve(*socket); err != nil {
+	if err := daemon.NewServerWithBuildInfo(relaydVersion, supervisorProtocolVersion).Serve(*socket); err != nil {
 		fatal(err.Error())
 	}
 }
@@ -899,30 +910,61 @@ func parseObservedSessions(value string) []observedSession {
 }
 
 func connectOrStart(socket string) (net.Conn, error) {
-	if probeDaemon(socket) {
-		return net.Dial("unix", socket)
+	if connection, err := dialDaemon(socket, 250*time.Millisecond); err == nil {
+		return connection, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+	if err := daemon.EnsurePrivateRuntimeDir(filepath.Dir(socket)); err != nil {
 		return nil, err
 	}
 	// Many panes commonly reconnect at once after a VPN interruption or an app
 	// restart. Serialize supervisor startup so they do not all fork a daemon;
 	// the losing children otherwise become zombies for the lifetime of their
 	// SSH channel and can eventually exhaust the user's process allowance.
-	startLock, err := os.OpenFile(socket+".start.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	startLock, err := daemon.OpenPrivateFile(socket+".start.lock", syscall.O_CREAT|syscall.O_RDWR)
 	if err != nil {
 		return nil, err
 	}
 	defer startLock.Close()
-	if err := syscall.Flock(int(startLock.Fd()), syscall.LOCK_EX); err != nil {
-		return nil, err
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if err := syscall.Flock(int(startLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			break
+		}
+		if connection, dialErr := dialDaemon(socket, 100*time.Millisecond); dialErr == nil {
+			return connection, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for relayd startup lock")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	defer syscall.Flock(int(startLock.Fd()), syscall.LOCK_UN)
-	if probeDaemon(socket) {
-		return net.Dial("unix", socket)
+	if connection, err := dialDaemon(socket, 250*time.Millisecond); err == nil {
+		return connection, nil
+	}
+	// A terminating supervisor closes its socket before the process releases
+	// its lifetime lock. Starting in that narrow window makes the replacement
+	// exit immediately as a duplicate. Wait for the lock, while still accepting
+	// a supervisor that another client successfully started.
+	supervisorDeadline := time.Now().Add(3 * time.Second)
+	for {
+		available, lockErr := supervisorLockAvailable(socket)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		if available {
+			break
+		}
+		if connection, dialErr := dialDaemon(socket, 100*time.Millisecond); dialErr == nil {
+			return connection, nil
+		}
+		if time.Now().After(supervisorDeadline) {
+			return nil, fmt.Errorf("timed out waiting for previous relayd supervisor to exit")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	logPath := filepath.Join(filepath.Dir(socket), "relayd.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logFile, err := daemon.OpenPrivateFile(logPath, syscall.O_CREAT|syscall.O_APPEND|syscall.O_WRONLY)
 	if err != nil {
 		return nil, err
 	}
@@ -938,7 +980,7 @@ func connectOrStart(socket string) (net.Conn, error) {
 	_ = child.Process.Release()
 	for attempt := 0; attempt < 80; attempt++ {
 		time.Sleep(25 * time.Millisecond)
-		if connection, dialErr := net.Dial("unix", socket); dialErr == nil {
+		if connection, dialErr := dialDaemon(socket, 250*time.Millisecond); dialErr == nil {
 			return connection, nil
 		}
 	}
@@ -946,9 +988,15 @@ func connectOrStart(socket string) (net.Conn, error) {
 }
 
 func probeDaemon(socket string) bool {
-	connection, err := net.DialTimeout("unix", socket, 250*time.Millisecond)
+	_, err := probeDaemonStatus(socket)
+	return err == nil
+}
+
+func probeDaemonStatus(socket string) (protocol.StatusPayload, error) {
+	var status protocol.StatusPayload
+	connection, err := dialDaemon(socket, 250*time.Millisecond)
 	if err != nil {
-		return false
+		return status, err
 	}
 	defer connection.Close()
 	_ = connection.SetDeadline(time.Now().Add(500 * time.Millisecond))
@@ -956,25 +1004,42 @@ func probeDaemon(socket string) bool {
 		Version: 1, SessionID: "_probe", Probe: true,
 	})
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
-		return false
+		return status, err
 	}
 	frame, err := protocol.ReadFrame(connection)
 	if err != nil || frame.Type != protocol.Status {
-		return false
+		return status, fmt.Errorf("invalid relayd probe response")
 	}
-	var status protocol.StatusPayload
-	return protocol.DecodeJSON(frame, &status) == nil && status.State == "ready"
+	if err := protocol.DecodeJSON(frame, &status); err != nil || status.State != "ready" {
+		return status, fmt.Errorf("relayd is not ready")
+	}
+	return status, nil
+}
+
+func dialDaemon(socket string, timeout time.Duration) (net.Conn, error) {
+	connection, err := net.DialTimeout("unix", socket, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if err := daemon.RequirePeerUID(connection, os.Getuid()); err != nil {
+		connection.Close()
+		return nil, err
+	}
+	return connection, nil
 }
 
 func defaultSocket() string {
 	if runtime := os.Getenv("XDG_RUNTIME_DIR"); runtime != "" {
 		return filepath.Join(runtime, "relayd.sock")
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "/tmp/relayd-" + strconv.Itoa(os.Getuid()) + ".sock"
-	}
-	return filepath.Join(home, ".relay", "relayd.sock")
+	// HPC nodes commonly share $HOME. The executable and durable catalog can
+	// live there, but a Unix socket must remain local to the node that owns the
+	// supervisor and PTYs.
+	return filepath.Join("/tmp", "relay-"+strconv.Itoa(os.Getuid()), "relayd.sock")
+}
+
+func legacySocket() string {
+	return filepath.Join("/tmp", "relayd-"+strconv.Itoa(os.Getuid())+".sock")
 }
 
 func fatal(message string) {

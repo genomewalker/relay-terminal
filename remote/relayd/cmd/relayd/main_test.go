@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -74,5 +75,19 @@ func TestParseObservedSessionsPreservesEventCursors(t *testing.T) {
 	if len(sessions) != 2 || sessions[0].id != "pane-a" || sessions[0].lastEventSequence != 42 ||
 		sessions[1].id != "pane-b" || sessions[1].lastEventSequence != 0 {
 		t.Fatalf("unexpected observed sessions: %#v", sessions)
+	}
+}
+
+func TestDefaultSocketNeverUsesSharedHome(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("HOME", "/shared/home/test")
+	want := filepath.Join("/tmp", "relay-"+strconv.Itoa(os.Getuid()), "relayd.sock")
+	if got := defaultSocket(); got != want {
+		t.Fatalf("default socket = %q, want node-local %q", got, want)
+	}
+
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/123")
+	if got := defaultSocket(); got != "/run/user/123/relayd.sock" {
+		t.Fatalf("runtime socket = %q", got)
 	}
 }

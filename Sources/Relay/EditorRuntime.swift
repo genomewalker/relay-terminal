@@ -311,7 +311,7 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
     private func applyCurrentTypography(force: Bool = false) {
         let preferences = RelayPreferences.shared
         applyTypography(
-            EditorTypography(fontFamily: preferences.fontFamily, fontSize: preferences.fontSize),
+            EditorTypography(fontFamily: preferences.resolvedFontFamily, fontSize: preferences.fontSize),
             force: force
         )
     }

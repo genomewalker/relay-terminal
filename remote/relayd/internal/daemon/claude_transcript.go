@@ -48,11 +48,7 @@ func observeClaudeTranscript(rootPID int) (<-chan protocol.Frame, func()) {
 				if !poll() {
 					return
 				}
-				delay := 2 * time.Second
-				if len(readers) > 0 {
-					delay = 250 * time.Millisecond
-				}
-				timer.Reset(delay)
+				timer.Reset(transcriptPollInterval(len(readers)))
 			case <-stopped:
 				return
 			}

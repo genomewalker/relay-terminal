@@ -28,6 +28,9 @@ func TestNodeMultiplexRoutesVirtualProtocolConnection(t *testing.T) {
 	if protocol.DecodeJSON(ready, &nodeStatus) != nil || nodeStatus.State != "ready" {
 		t.Fatalf("node multiplexer was not ready: %#v", ready)
 	}
+	if !containsCapability(nodeStatus.Capabilities, "node_mux_v2") {
+		t.Fatalf("node multiplexer did not advertise independent routes: %#v", nodeStatus.Capabilities)
+	}
 
 	heartbeat := []byte("heartbeat-1")
 	if err := writer.Write(protocol.Frame{Type: protocol.Ping, Payload: heartbeat}); err != nil {
@@ -56,4 +59,28 @@ func TestNodeMultiplexRoutesVirtualProtocolConnection(t *testing.T) {
 	if protocol.DecodeJSON(response, &status) != nil || status.State != "ready" {
 		t.Fatalf("virtual probe was not routed: %#v", response)
 	}
+
+	observerHello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
+		Version: 1, SessionID: "pane-probe", Probe: true,
+	})
+	if err := writer.Write(protocol.HostEventFrame("observer-pane-probe", observerHello)); err != nil {
+		t.Fatal(err)
+	}
+	observerEnvelope, err := protocol.ReadFrame(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeID, observerResponse, err := protocol.ParseHostEvent(observerEnvelope)
+	if err != nil || routeID != "observer-pane-probe" || observerResponse.Type != protocol.Status {
+		t.Fatalf("independent observer route failed: route=%q frame=%#v err=%v", routeID, observerResponse, err)
+	}
+}
+
+func containsCapability(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }

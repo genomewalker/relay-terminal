@@ -3,7 +3,9 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 configuration="${1:-release}"
-app_version="${RELAY_VERSION:-0.5.0}"
+app_version="${RELAY_APP_VERSION:-${RELAY_VERSION:-0.5.2}}"
+relayd_version="${RELAYD_VERSION:-$app_version}"
+relayd_protocol_version="${RELAYD_PROTOCOL_VERSION:-2}"
 build_number="${RELAY_BUILD_NUMBER:-1}"
 signing_identity="${RELAY_CODESIGN_IDENTITY:--}"
 cd "$project_root"
@@ -48,6 +50,32 @@ for resource_bundle in "$binary_path"/*.bundle; do
     fi
 done
 
+# Remote installation is explicit in the UI, but it must remain offline and
+# reproducible once authorized. Bundle the exact static Linux helpers inside
+# the signed app rather than downloading an executable at connection time.
+for relay_architecture in amd64 arm64; do
+    (
+        cd "$project_root/remote/relayd"
+        CGO_ENABLED=0 GOOS=linux GOARCH="$relay_architecture" \
+            go build -trimpath -ldflags="-s -w -X main.relaydVersion=$relayd_version" \
+            -o "$app_path/Contents/Resources/relayd-linux-$relay_architecture" ./cmd/relayd
+    )
+    chmod 0555 "$app_path/Contents/Resources/relayd-linux-$relay_architecture"
+done
+
+# The Linux payloads cannot run on the build Mac. Build the same source for the
+# host once and verify the embedded helper version before signing the bundle.
+relayd_version_check="$stage_root/relayd-version-check"
+(
+    cd "$project_root/remote/relayd"
+    go build -trimpath -ldflags="-X main.relaydVersion=$relayd_version" \
+        -o "$relayd_version_check" ./cmd/relayd
+)
+if [[ "$($relayd_version_check --version)" != "relayd $relayd_version" ]]; then
+    echo "relayd version stamping failed" >&2
+    exit 1
+fi
+
 icon_source="$project_root/Resources/RelayIcon.png"
 if [[ -f "$icon_source" ]]; then
     iconset="$stage_root/RelayIcon.iconset"
@@ -73,6 +101,8 @@ fi
 /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string RelayIcon" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $app_version" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $build_number" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :RelaydVersion string $relayd_version" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :RelaydProtocolVersion integer $relayd_protocol_version" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 14.0" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$app_path/Contents/Info.plist"
 

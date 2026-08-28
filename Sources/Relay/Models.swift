@@ -7,7 +7,7 @@ enum SplitAxis: String, Codable, Sendable {
     case vertical
 }
 
-enum PaneDropPlacement: Sendable {
+enum PaneDropPlacement: Equatable, Sendable {
     case leading
     case trailing
     case top
@@ -512,16 +512,17 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var terminalProgressState: String?
     private(set) var detector = AgentSignalDetector()
     private(set) var lastActivity = Date()
-    @Published var activeSubagents = 0
-    @Published var subagents: [SubagentActivity] = []
-    @Published var agentActivities: [AgentActivityItem] = []
-    @Published var agentResourceUsage: AgentResourceUsage?
-    @Published var agentProgressPercent: Int?
-    @Published var pendingAgentApprovals = 0
+    private(set) var activeSubagents = 0
+    private(set) var subagents: [SubagentActivity] = []
+    private(set) var agentActivities: [AgentActivityItem] = []
+    private(set) var agentResourceUsage: AgentResourceUsage?
+    private(set) var agentProgressPercent: Int?
+    private(set) var pendingAgentApprovals = 0
     @Published var connectionState: PaneConnectionState
     @Published var remoteExitCode: Int?
     @Published var artifacts: [PaneArtifact] = []
     @Published var artifactError: String?
+    private var dismissedArtifactIdentities: Set<String> = []
     @Published var editorRequest: EditorOpenRequest?
     @Published var isRestoringTerminal = false
     @Published var hasTerminalSnapshot = false
@@ -529,9 +530,13 @@ final class PaneModel: ObservableObject, Identifiable {
     private var activeAgentRoots: [String: AgentKind] = [:]
     private var seenAgentEventHashes: [Data: Date] = [:]
     private var seenAgentEventOrder: [(Data, Date)] = []
+    private var conversationContext = TerminalConversationContextBuffer()
+    private(set) var conversationRevision: UInt64 = 0
+    var onAgentTurnReady: ((UInt64) -> Void)?
     private var agentMonitor: RelayHostAgentMonitorToken?
     private var agentEventCursor: UInt64 = 0
     private var agentPersistenceTask: Task<Void, Never>?
+    private var agentUIRefreshTask: Task<Void, Never>?
     let remoteParentSessionID: String?
     private(set) var remoteWorkspaceSessionID: String?
     private(set) var remoteTabID: String?
@@ -560,6 +565,7 @@ final class PaneModel: ObservableObject, Identifiable {
         self.connectionState = profile.kind == .ssh && profile.backend == .relay
             ? .connecting
             : .connected
+        dismissedArtifactIdentities = ArtifactDismissalStore.load(paneID: id)
         if profile.kind == .ssh, profile.backend == .relay,
            let saved = AgentStateStore.shared.load(paneID: id) {
             agentEventCursor = saved.cursor
@@ -576,6 +582,7 @@ final class PaneModel: ObservableObject, Identifiable {
 
     var kind: AgentKind { detector.kind }
     var phase: AgentPhase { detector.phase }
+    var recentConversationContext: [String] { conversationContext.lines }
     var displayName: String { customName ?? title }
     var activitySummary: String {
         if let activity = agentActivities.last { return activity.label }
@@ -606,6 +613,7 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func recordTerminalProgress(state: String?, percent: Int?) {
+        guard terminalProgressState != state || terminalProgressPercent != percent else { return }
         terminalProgressState = state
         terminalProgressPercent = percent
     }
@@ -632,6 +640,8 @@ final class PaneModel: ObservableObject, Identifiable {
     func stopRuntime() {
         agentPersistenceTask?.cancel()
         agentPersistenceTask = nil
+        agentUIRefreshTask?.cancel()
+        agentUIRefreshTask = nil
         persistAgentStateNow()
         stopAgentMonitoring()
         switch contentKind {
@@ -652,6 +662,9 @@ final class PaneModel: ObservableObject, Identifiable {
         let previousKind = detector.kind
         let previousPhase = detector.phase
         detector.ingest(text, detectAgentKind: structuredAgentRunning != false)
+        if previousKind != .shell || detector.kind != .shell {
+            conversationContext.ingest(text)
+        }
         lastActivity = Date()
         if previousKind != detector.kind || previousPhase != detector.phase {
             objectWillChange.send()
@@ -680,16 +693,22 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func dismissArtifact(_ id: UUID) {
+        if let artifact = artifacts.first(where: { $0.id == id }) {
+            dismissedArtifactIdentities.insert(artifact.contentIdentity)
+            ArtifactDismissalStore.record(artifact.contentIdentity, paneID: self.id)
+        }
         artifacts.removeAll { $0.id == id }
     }
 
     func receivedArtifact(path: String, data: Data) {
+        let artifact = PaneArtifact(remotePath: path, data: data)
         guard RelayPreferences.shared.showArtifactPreviews,
+              !dismissedArtifactIdentities.contains(artifact.contentIdentity),
               !artifacts.contains(where: { $0.remotePath == path }) else { return }
         // The pane presents one generated asset at a time. Retaining an
         // invisible stack made Close reveal the previous image immediately,
         // which looked as if the button had failed.
-        artifacts = [PaneArtifact(remotePath: path, data: data)]
+        artifacts = [artifact]
         artifactError = nil
     }
 
@@ -763,7 +782,7 @@ final class PaneModel: ObservableObject, Identifiable {
                 receivedAgentEvent(encoded)
             }
             activeSubagents = subagents.count { $0.phase == .active }
-            objectWillChange.send()
+            scheduleAgentUIRefresh()
             return
         }
         var normalizedEnvelope = envelope
@@ -805,8 +824,7 @@ final class PaneModel: ObservableObject, Identifiable {
         let agentType = event["agent_type"] as? String
         let threadID = event["thread_id"] as? String
         let message = (event["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let occurredAt = (event["occurred_at"] as? String)
-            .flatMap { Self.agentTimestampFormatter.date(from: $0) } ?? Date()
+        let occurredAt = Self.agentEventDate(event: event, envelope: envelope)
         let subagentID = (event["agent_id"] as? String)
             ?? (event["subagent_id"] as? String)
             ?? (event["thread_id"] as? String)
@@ -814,6 +832,8 @@ final class PaneModel: ObservableObject, Identifiable {
         let fromPeerID = event["from_peer_id"] as? String
         let toPeerID = event["to_peer_id"] as? String
         let rootID = (event["root_id"] as? String) ?? kind.rawValue
+        let intelligenceSourceID = (event["event_id"] as? String)
+            ?? (envelope["relay_event_seq"] as? NSNumber).map { "relay-seq:\($0.uint64Value)" }
 
         if eventName != "SessionEnd" {
             structuredAgentRunning = true
@@ -825,10 +845,22 @@ final class PaneModel: ObservableObject, Identifiable {
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Approval: \(tool ?? "permission requested")")
             recordActivity("Approval needed for \(tool ?? "a tool")", phase: .needsInput)
             announceAgentAttention("Approval needed for \(tool ?? "an agent tool")")
+            recordIntelligenceEvent(
+                provider: kind, agentID: subagentID ?? rootID, eventKind: .attention,
+                title: "Approval needed for \(tool ?? "an agent tool")",
+                detail: message ?? "The agent is waiting for permission before it can continue.",
+                occurredAt: occurredAt, sourceID: intelligenceSourceID
+            )
         case "Notification" where notificationType == "permission_prompt" || notificationType == "idle_prompt":
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: event["message"] as? String ?? "Needs input")
             recordActivity(event["message"] as? String ?? "Needs input", phase: .needsInput)
             announceAgentAttention(event["message"] as? String ?? "Agent needs input")
+            recordIntelligenceEvent(
+                provider: kind, agentID: subagentID ?? rootID, eventKind: .attention,
+                title: "\(kind.label) needs your input",
+                detail: message ?? "The agent is waiting for input.", occurredAt: occurredAt,
+                sourceID: intelligenceSourceID
+            )
         case "SubagentStart":
             let identifier = subagentID ?? UUID().uuidString
             subagents.removeAll { $0.id == identifier }
@@ -875,6 +907,13 @@ final class PaneModel: ObservableObject, Identifiable {
             activeSubagents = subagents.count { $0.phase == .active }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent finished")
             recordActivity("Subagent finished", phase: .quiet)
+            let completedLabel = agentType ?? subagentID ?? "Subagent"
+            recordIntelligenceEvent(
+                provider: kind, agentID: subagentID, eventKind: .completion,
+                title: "\(AgentLabelFormatter.humanize(completedLabel)) finished",
+                detail: message ?? "The subagent completed its task.", occurredAt: occurredAt,
+                sourceID: intelligenceSourceID
+            )
         case "SubagentUpdate":
             if let subagentID,
                let index = subagents.firstIndex(where: { $0.id == subagentID }),
@@ -890,8 +929,7 @@ final class PaneModel: ObservableObject, Identifiable {
             }
             if peerIDs.isEmpty, let fallback = fromPeerID ?? toPeerID { peerIDs = [fallback] }
             for peerID in peerIDs {
-                let peerLabel = URL(fileURLWithPath: peerID).lastPathComponent.isEmpty
-                    ? peerID : URL(fileURLWithPath: peerID).lastPathComponent
+                let peerLabel = AgentLabelFormatter.pathComponent(peerID)
                 let index: Int
                 if let existing = subagents.firstIndex(where: { $0.id == peerID || $0.threadID == peerID }) {
                     index = existing
@@ -904,17 +942,22 @@ final class PaneModel: ObservableObject, Identifiable {
                 }
                 if let message, !message.isEmpty {
                     let otherID = peerID == fromPeerID ? toPeerID : fromPeerID
-                    let otherLabel = otherID.map {
-                        let component = URL(fileURLWithPath: $0).lastPathComponent
-                        return component.isEmpty ? $0 : component
-                    } ?? "peer"
+                    let otherLabel = otherID.map(AgentLabelFormatter.pathComponent) ?? "peer"
                     let direction = peerID == fromPeerID ? "Sent to \(otherLabel)" : "Received from \(otherLabel)"
                     appendSubagentUpdate("\(direction)\n\(message)", occurredAt: occurredAt, at: index)
                 }
             }
-            let summary = peerIDs.last.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "peer"
+            let summary = peerIDs.last.map(AgentLabelFormatter.pathComponent) ?? "peer"
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Peer: \(summary)")
             recordActivity("Peer message · \(summary)", phase: .active)
+            let from = fromPeerID ?? rootID
+            let to = toPeerID ?? "peer"
+            recordIntelligenceEvent(
+                provider: kind, agentID: subagentID ?? threadID, eventKind: .peer,
+                title: "\(AgentLabelFormatter.humanize(from)) → \(AgentLabelFormatter.humanize(to))",
+                detail: message ?? "Peer coordination event", occurredAt: occurredAt,
+                fromPeerID: fromPeerID, toPeerID: toPeerID, sourceID: intelligenceSourceID
+            )
         case "PeerInteraction":
             let label = agentType ?? subagentID ?? "peer"
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Contacted \(label)")
@@ -928,6 +971,12 @@ final class PaneModel: ObservableObject, Identifiable {
         case "PostToolUseFailure":
             detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Failed \(tool ?? "tool")")
             recordActivity("Failed \(tool ?? "tool")", phase: .needsInput)
+            recordIntelligenceEvent(
+                provider: kind, agentID: subagentID ?? rootID, eventKind: .failure,
+                title: "\(tool ?? "Agent tool") failed",
+                detail: message ?? "The tool failed and may need attention.", occurredAt: occurredAt,
+                sourceID: intelligenceSourceID
+            )
         case "UserPromptSubmit", "turn/started":
             pendingAgentApprovals = 0
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Thinking")
@@ -937,6 +986,14 @@ final class PaneModel: ObservableObject, Identifiable {
             agentProgressPercent = nil
             detector.applyStructuredEvent(kind: kind, phase: .quiet, excerpt: "Ready")
             recordActivity("Ready", phase: .quiet)
+            conversationRevision &+= 1
+            onAgentTurnReady?(conversationRevision)
+            recordIntelligenceEvent(
+                provider: kind, agentID: subagentID ?? rootID, eventKind: .completion,
+                title: "\(kind.label) completed a turn",
+                detail: message ?? "The agent finished and is ready.", occurredAt: occurredAt,
+                sourceID: intelligenceSourceID
+            )
         case "AgentProgress":
             agentProgressPercent = (event["progress_percent"] as? NSNumber)?.intValue
             let label = agentProgressPercent.map { "Progress · \($0)%" } ?? "Progress update"
@@ -952,6 +1009,12 @@ final class PaneModel: ObservableObject, Identifiable {
         case "ArtifactUpdate":
             let artifactType = event["artifact_type"] as? String ?? "artifact"
             recordActivity("Updated \(artifactType)", phase: .active)
+            recordIntelligenceEvent(
+                provider: kind, agentID: subagentID ?? rootID, eventKind: .artifact,
+                title: "Updated \(artifactType)",
+                detail: message ?? (event["path"] as? String ?? "Agent artifact updated"), occurredAt: occurredAt,
+                sourceID: intelligenceSourceID
+            )
         case "ThreadStatus":
             let status = event["status"] as? String ?? "updated"
             let terminalStatus = ["idle", "notLoaded", "not_loaded"].contains(status)
@@ -977,6 +1040,12 @@ final class PaneModel: ObservableObject, Identifiable {
                 structuredAgentRunning = false
             }
             recordActivity("\(kind.label) session ended", phase: .quiet)
+            recordIntelligenceEvent(
+                provider: kind, agentID: rootID, eventKind: .session,
+                title: "\(kind.label) session ended",
+                detail: message ?? "The agent process exited; its activity history remains available.",
+                occurredAt: occurredAt, sourceID: intelligenceSourceID
+            )
         case "SessionStart":
             activeAgentRoots[rootID] = kind
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Started")
@@ -986,16 +1055,38 @@ final class PaneModel: ObservableObject, Identifiable {
             recordActivity(eventName, phase: .active)
         }
         lastActivity = Date()
-        objectWillChange.send()
+        let urgent = eventName == "PermissionRequest" || eventName == "PostToolUseFailure" ||
+            eventName == "SessionEnd" ||
+            (eventName == "Notification" &&
+             (notificationType == "permission_prompt" || notificationType == "idle_prompt"))
+        scheduleAgentUIRefresh(immediate: urgent)
     }
 
     private func scheduleAgentStatePersistence() {
-        agentPersistenceTask?.cancel()
+        guard agentPersistenceTask == nil else { return }
         agentPersistenceTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(350))
+            let delay = RelayApplicationActivityState.allowsContinuousUpdates ? 500 : 2_000
+            try? await Task.sleep(for: .milliseconds(delay))
             guard let self, !Task.isCancelled else { return }
             self.agentPersistenceTask = nil
             self.persistAgentStateNow()
+        }
+    }
+
+    private func scheduleAgentUIRefresh(immediate: Bool = false) {
+        if immediate {
+            agentUIRefreshTask?.cancel()
+            agentUIRefreshTask = nil
+            objectWillChange.send()
+            return
+        }
+        guard agentUIRefreshTask == nil else { return }
+        agentUIRefreshTask = Task { @MainActor [weak self] in
+            let delay = RelayApplicationActivityState.allowsContinuousUpdates ? 80 : 1_000
+            try? await Task.sleep(for: .milliseconds(delay))
+            guard let self, !Task.isCancelled else { return }
+            self.agentUIRefreshTask = nil
+            self.objectWillChange.send()
         }
     }
 
@@ -1040,6 +1131,45 @@ final class PaneModel: ObservableObject, Identifiable {
             agentActivities.append(item)
             agentActivities = Array(agentActivities.suffix(16))
         }
+    }
+
+    private func recordIntelligenceEvent(
+        provider: AgentKind,
+        agentID: String?,
+        eventKind: AgentInboxEventKind,
+        title: String,
+        detail: String,
+        occurredAt: Date,
+        fromPeerID: String? = nil,
+        toPeerID: String? = nil,
+        sourceID: String? = nil
+    ) {
+        guard RelayPreferences.shared.intelligenceEnabled else { return }
+        AgentIntelligenceStore.shared.record(AgentInboxEvent(
+            paneID: id,
+            host: profile.kind == .ssh ? profile.host : "This Mac",
+            provider: provider,
+            agentID: agentID,
+            kind: eventKind,
+            title: title,
+            detail: detail,
+            occurredAt: occurredAt,
+            fromPeerID: fromPeerID,
+            toPeerID: toPeerID,
+            sourceID: sourceID
+        ))
+    }
+
+    private static func agentEventDate(event: [String: Any], envelope: [String: Any]) -> Date {
+        if let value = (event["occurred_at"] as? String) ?? (envelope["relay_recorded_at"] as? String),
+           let date = agentTimestampFormatter.date(from: value) {
+            return date
+        }
+        if let number = (event["occurred_at"] as? NSNumber) ?? (envelope["relay_recorded_at"] as? NSNumber) {
+            let raw = number.doubleValue
+            return Date(timeIntervalSince1970: raw > 10_000_000_000 ? raw / 1_000 : raw)
+        }
+        return Date()
     }
 
     private func announceAgentAttention(_ message: String) {
