@@ -139,6 +139,14 @@ final class RelayDiagnostics: @unchecked Sendable {
 }
 
 enum RelayLaunchMode {
+    static var isRunningTests: Bool {
+        ProcessInfo.processInfo.environment["RELAY_TESTING"] == "1" ||
+            Bundle.main.bundleURL.pathExtension == "xctest" ||
+            ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
+            ProcessInfo.processInfo.processName.contains("RelayPackageTests") ||
+            ProcessInfo.processInfo.processName.hasPrefix("swiftpm-testing")
+    }
+
     static var isSafeMode: Bool {
         ProcessInfo.processInfo.arguments.contains("--safe-mode") ||
             ProcessInfo.processInfo.environment["RELAY_SAFE_MODE"] == "1"

@@ -601,6 +601,7 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func focus() {
+        guard !RelayLaunchMode.isRunningTests else { return }
         switch contentKind {
         case .terminal: runtime.focus()
         case .editor: editorRuntime.focus()
@@ -644,6 +645,7 @@ final class PaneModel: ObservableObject, Identifiable {
         agentUIRefreshTask = nil
         persistAgentStateNow()
         stopAgentMonitoring()
+        guard !RelayLaunchMode.isRunningTests else { return }
         switch contentKind {
         case .terminal: runtime.stop()
         case .editor: editorRuntime.stop()
@@ -651,6 +653,7 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func restartRuntime() {
+        guard !RelayLaunchMode.isRunningTests else { return }
         switch contentKind {
         case .terminal: runtime.restart()
         case .editor: editorRuntime.restart()

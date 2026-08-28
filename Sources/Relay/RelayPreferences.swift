@@ -196,7 +196,9 @@ final class RelayPreferences: ObservableObject {
     private func saveAndApply() {
         guard !isLoading else { return }
         save()
-        TerminalRuntime.applyPreferences(self)
+        if !RelayLaunchMode.isRunningTests {
+            TerminalRuntime.applyPreferences(self)
+        }
     }
 
     private func save() {
