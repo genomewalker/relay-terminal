@@ -1731,3 +1731,31 @@ func processCaptureReportsTimeout() throws {
     }
     #expect(timedOut)
 }
+
+@Test("Subprocess capture does not hang when a descendant inherits its pipes")
+func processCaptureBoundsInheritedPipes() throws {
+    let process = Process()
+    let output = Pipe()
+    let errors = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", "(sleep 3) & exit 0"]
+    process.standardOutput = output
+    process.standardError = errors
+
+    let started = ContinuousClock.now
+    var readFailed = false
+    do {
+        _ = try ProcessCapture.run(
+            process,
+            output: output,
+            errors: errors,
+            timeout: 0.1,
+            maximumBytesPerStream: 1_024
+        )
+    } catch let error as ProcessCaptureError {
+        if case .readFailed = error { readFailed = true }
+    }
+
+    #expect(readFailed)
+    #expect(started.duration(to: .now) < .seconds(2))
+}

@@ -113,7 +113,15 @@ enum ProcessCapture {
             try? errors.fileHandleForReading.close()
         }
         process.waitUntilExit()
-        readers.wait()
+        // A successfully exited launcher can leave a descendant holding one
+        // of its pipes open. Never let diagnostics or catalog refreshes pin a
+        // thread forever waiting for that unrelated process. The locked
+        // buffers remain safe if a reader finishes after this call returns.
+        if readers.wait(timeout: .now() + .seconds(1)) == .timedOut {
+            failure.record(.readFailed("Timed out while closing subprocess output streams."))
+            try? output.fileHandleForReading.close()
+            try? errors.fileHandleForReading.close()
+        }
         if let failure = failure.value { throw failure }
         return CapturedProcessOutput(
             standardOutput: capturedOutput.value,
