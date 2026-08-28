@@ -9,14 +9,19 @@ permissions:
   contents: read
 
 jobs:
-  macos:
-    runs-on: macos-26
+  swift-tests:
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - name: Test Swift application
         env:
           RELAY_TESTING: "1"
         run: swift test --disable-xctest -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS
+
+  macos-build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
       - name: Build app bundle
         env:
           RELAY_APP_OUTPUT: ${{ runner.temp }}/Relay.app

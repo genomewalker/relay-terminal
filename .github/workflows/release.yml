@@ -9,14 +9,26 @@ permissions:
   contents: write
 
 jobs:
-  package:
-    runs-on: macos-26
+  verify:
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: remote/relayd/go.mod
           cache-dependency-path: remote/relayd/go.sum
+      - name: Test
+        env:
+          RELAY_TESTING: "1"
+        run: |
+          swift test --disable-xctest -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS
+          cd remote/relayd && go test ./...
+
+  package:
+    needs: verify
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
       - name: Import Developer ID certificate
         env:
           CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
@@ -37,12 +49,6 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: xcrun notarytool store-credentials relay-notary --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
-      - name: Test
-        env:
-          RELAY_TESTING: "1"
-        run: |
-          swift test --disable-xctest -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS
-          cd remote/relayd && go test ./...
       - name: Package, sign, and notarize
         env:
           RELAY_VERSION: ${{ github.ref_name }}
