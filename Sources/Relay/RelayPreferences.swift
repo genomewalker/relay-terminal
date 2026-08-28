@@ -1,4 +1,4 @@
-import AppKit
+import CoreText
 import Foundation
 import GhosttyTerminal
 
@@ -63,6 +63,11 @@ enum RelayArtifactPresentation: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 final class RelayPreferences: ObservableObject {
     static let shared = RelayPreferences()
+
+    private static let availableFontFamilies: Set<String> = {
+        let families = CTFontManagerCopyAvailableFontFamilyNames() as NSArray
+        return Set(families.compactMap { ($0 as? String)?.lowercased() })
+    }()
 
     @Published var fontFamily: String { didSet { saveAndApply() } }
     @Published var fontSize: Double { didSet { saveAndApply() } }
@@ -180,9 +185,7 @@ final class RelayPreferences: ObservableObject {
     var resolvedFontFamily: String {
         let requested = fontFamily.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !requested.isEmpty else { return "Menlo" }
-        return NSFontManager.shared.availableFontFamilies.contains {
-            $0.caseInsensitiveCompare(requested) == .orderedSame
-        } ? requested : "Menlo"
+        return Self.availableFontFamilies.contains(requested.lowercased()) ? requested : "Menlo"
     }
 
     var isUsingFontFallback: Bool {
