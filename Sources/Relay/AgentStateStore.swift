@@ -21,7 +21,8 @@ final class AgentStateStore: @unchecked Sendable {
     private var generations: [UUID: UInt64] = [:]
 
     private static var isRunningTests: Bool {
-        Bundle.main.bundleURL.pathExtension == "xctest" ||
+        ProcessInfo.processInfo.environment["RELAY_TESTING"] == "1" ||
+            Bundle.main.bundleURL.pathExtension == "xctest" ||
             ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
             ProcessInfo.processInfo.processName.contains("RelayPackageTests") ||
             ProcessInfo.processInfo.processName.hasPrefix("swiftpm-testing")

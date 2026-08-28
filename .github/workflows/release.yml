@@ -38,6 +38,8 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: xcrun notarytool store-credentials relay-notary --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
       - name: Test
+        env:
+          RELAY_TESTING: "1"
         run: |
           swift test
           cd remote/relayd && go test ./...
