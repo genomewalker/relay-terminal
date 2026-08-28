@@ -16,7 +16,7 @@ jobs:
       - name: Test Swift application
         env:
           RELAY_TESTING: "1"
-        run: swift test -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS
+        run: swift test --disable-xctest -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS
       - name: Build app bundle
         env:
           RELAY_APP_OUTPUT: ${{ runner.temp }}/Relay.app
