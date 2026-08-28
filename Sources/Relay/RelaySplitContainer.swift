@@ -5,15 +5,29 @@ import SwiftUI
 /// interaction in a separate compilation unit prevents the older compiler
 /// used by the release runner from repeatedly type-checking it with the much
 /// larger workspace view hierarchy.
-struct RelaySplitContainer<First: View, Second: View>: View {
+struct RelaySplitContainer: View {
     let axis: SplitAxis
     let ratio: Double
     let update: (Double, Bool) -> Void
-    @ViewBuilder let first: () -> First
-    @ViewBuilder let second: () -> Second
+    private let first: AnyView
+    private let second: AnyView
     @State private var dragStartRatio: Double?
     @State private var dragPreviewRatio: Double?
     @FocusState private var dividerFocused: Bool
+
+    init<First: View, Second: View>(
+        axis: SplitAxis,
+        ratio: Double,
+        update: @escaping (Double, Bool) -> Void,
+        @ViewBuilder first: () -> First,
+        @ViewBuilder second: () -> Second
+    ) {
+        self.axis = axis
+        self.ratio = ratio
+        self.update = update
+        self.first = AnyView(first())
+        self.second = AnyView(second())
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -42,16 +56,16 @@ struct RelaySplitContainer<First: View, Second: View>: View {
     ) -> some View {
         if axis == .horizontal {
             HStack(spacing: 0) {
-                first().frame(width: firstLength, height: size.height)
+                first.frame(width: firstLength, height: size.height)
                 splitDivider(total: available).frame(width: divider, height: size.height)
-                second().frame(width: available - firstLength, height: size.height)
+                second.frame(width: available - firstLength, height: size.height)
             }
             .frame(width: size.width, height: size.height)
         } else {
             VStack(spacing: 0) {
-                first().frame(width: size.width, height: firstLength)
+                first.frame(width: size.width, height: firstLength)
                 splitDivider(total: available).frame(width: size.width, height: divider)
-                second().frame(width: size.width, height: available - firstLength)
+                second.frame(width: size.width, height: available - firstLength)
             }
             .frame(width: size.width, height: size.height)
         }
