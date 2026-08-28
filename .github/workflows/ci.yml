@@ -11,12 +11,24 @@ permissions:
 jobs:
   swift-tests:
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: a-f
+            filter: "RelayTests\\.[a-f]"
+          - shard: g-m
+            filter: "RelayTests\\.[g-m]"
+          - shard: n-s
+            filter: "RelayTests\\.[n-s]"
+          - shard: t-z
+            filter: "RelayTests\\.[t-z]"
     steps:
       - uses: actions/checkout@v7
       - name: Test Swift application
         env:
           RELAY_TESTING: "1"
-        run: swift test --disable-xctest -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS
+        run: swift test --disable-xctest -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS --filter '${{ matrix.filter }}'
 
   macos-build:
     runs-on: macos-26
