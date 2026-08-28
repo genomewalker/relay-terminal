@@ -327,7 +327,7 @@ final class AgentIntelligenceStore: ObservableObject {
         Bundle.main.bundleURL.pathExtension == "xctest" ||
             ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
             ProcessInfo.processInfo.processName.contains("RelayPackageTests") ||
-            ProcessInfo.processInfo.processName == "swiftpm-testing-helper"
+            ProcessInfo.processInfo.processName.hasPrefix("swiftpm-testing")
     }
 }
 
