@@ -15,14 +15,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - shard: a-f
-            filter: "RelayTests\\.[a-f]"
-          - shard: g-m
-            filter: "RelayTests\\.[g-m]"
-          - shard: n-s
-            filter: "RelayTests\\.[n-s]"
-          - shard: t-z
-            filter: "RelayTests\\.[t-z]"
+          - shard: n-o
+            filter: "RelayTests\\.[n-o]"
+          - shard: p
+            filter: "RelayTests\\.p"
+          - shard: r-s
+            filter: "RelayTests\\.[r-s]"
     steps:
       - uses: actions/checkout@v7
       - name: Test Swift application
