@@ -3,7 +3,7 @@ import Foundation
 import NaturalLanguage
 import SwiftUI
 
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
 import FoundationModels
 #endif
 
@@ -523,7 +523,7 @@ private actor AgentWorkspaceIntelligenceService {
     private nonisolated static func summarizeWithSystemModel(
         _ item: AgentInboxItem
     ) async -> AgentGeneratedSummary? {
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
         if #available(macOS 26.0, *) { return await SystemInboxIntelligence.summarize(item) }
 #endif
         return nil
@@ -532,7 +532,7 @@ private actor AgentWorkspaceIntelligenceService {
     private func rankSearchWithSystemModel(
         query: String, candidates: [AgentInboxItem], limit: Int
     ) async -> [String] {
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
         if #available(macOS 26.0, *) {
             return await OnDeviceIntelligenceScheduler.shared.perform(
                 priority: .interactive,
@@ -549,7 +549,7 @@ private actor AgentWorkspaceIntelligenceService {
     }
 }
 
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
 @available(macOS 26.0, *)
 @Generable
 private struct SystemInboxSummary {

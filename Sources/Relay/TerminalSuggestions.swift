@@ -1,6 +1,6 @@
 import Foundation
 
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
 import FoundationModels
 #endif
 
@@ -376,7 +376,7 @@ actor TerminalSuggestionService {
         context: TerminalSuggestionContext,
         history: [String]
     ) async -> String? {
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
         if #available(macOS 26.0, *) {
             return await SystemTerminalSuggestionModel.suggest(
                 prefix: prefix, context: context, history: history
@@ -390,7 +390,7 @@ actor TerminalSuggestionService {
         context: TerminalSuggestionContext,
         history: [String]
     ) async -> String? {
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
         if #available(macOS 26.0, *) {
             return await SystemTerminalSuggestionModel.suggestNextTurn(context: context, history: history)
         }
@@ -404,7 +404,7 @@ actor TerminalSuggestionService {
         history: [String],
         candidates: [TerminalProjectAction]
     ) async -> TerminalProjectActionKind? {
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
         if #available(macOS 26.0, *) {
             return await SystemTerminalSuggestionModel.chooseWorkspaceAction(
                 context: context,
@@ -418,7 +418,7 @@ actor TerminalSuggestionService {
     }
 }
 
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
 @available(macOS 26.0, *)
 @Generable
 private struct GeneratedTerminalSuggestion {

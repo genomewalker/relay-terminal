@@ -1,6 +1,6 @@
 import Foundation
 
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
 import FoundationModels
 #endif
 
@@ -290,7 +290,7 @@ private actor AgentIntelligenceService {
     private nonisolated static func rankWithSystemModel(
         _ candidates: [SubagentActivity], limit: Int
     ) async -> [String] {
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
         if #available(macOS 26.0, *) {
             return await SystemAgentRanker.rank(candidates, limit: limit)
         }
@@ -299,7 +299,7 @@ private actor AgentIntelligenceService {
     }
 }
 
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && !RELAY_DISABLE_FOUNDATION_MODELS
 @available(macOS 26.0, *)
 @Generable
 private struct SystemAgentRanking {

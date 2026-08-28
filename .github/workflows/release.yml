@@ -41,7 +41,7 @@ jobs:
         env:
           RELAY_TESTING: "1"
         run: |
-          swift test
+          swift test -Xswiftc -DRELAY_DISABLE_FOUNDATION_MODELS
           cd remote/relayd && go test ./...
       - name: Package, sign, and notarize
         env:
