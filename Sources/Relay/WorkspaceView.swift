@@ -2516,16 +2516,22 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
     }
 
     private func splitDivider(total: CGFloat) -> some View {
-        let visual = Rectangle()
-            .fill(RelayTheme.canvas)
-            .overlay {
-                Capsule()
-                    .fill(dividerFocused ? RelayTheme.accent.opacity(0.85) : RelayTheme.line.opacity(0.8))
-                    .frame(width: axis == .horizontal ? 1 : 24, height: axis == .horizontal ? 24 : 1)
-            }
-            .contentShape(Rectangle().inset(by: -4))
+        // Type-erasure boundaries keep this interaction inexpensive for older
+        // Swift compilers to build. This view exists only once per split and
+        // has stable identity, so the erased wrappers do not affect terminal
+        // rendering or drag responsiveness.
+        let visual = AnyView(
+            Rectangle()
+                .fill(RelayTheme.canvas)
+                .overlay {
+                    Capsule()
+                        .fill(dividerFocused ? RelayTheme.accent.opacity(0.85) : RelayTheme.line.opacity(0.8))
+                        .frame(width: axis == .horizontal ? 1 : 24, height: axis == .horizontal ? 24 : 1)
+                }
+                .contentShape(Rectangle().inset(by: -4))
+        )
 
-        let pointer = visual
+        let pointer = AnyView(visual
             .onHover { hovering in
                 if axis == .horizontal {
                     (hovering ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
@@ -2533,8 +2539,9 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                     (hovering ? NSCursor.resizeUpDown : NSCursor.arrow).set()
                 }
             }
+        )
 
-        let draggable = pointer
+        let draggable = AnyView(pointer
             .highPriorityGesture(TapGesture(count: 2).onEnded { update(0.5, true) })
             .simultaneousGesture(
                 DragGesture(minimumDistance: 1, coordinateSpace: .global)
@@ -2551,8 +2558,9 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                         dragPreviewRatio = nil
                     }
             )
+        )
 
-        let accessible = draggable
+        let accessible = AnyView(draggable
             .help("Drag to resize · double-click to center")
             .focusable()
             .focused($dividerFocused)
@@ -2570,8 +2578,9 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                 @unknown default: break
                 }
             }
+        )
 
-        return accessible
+        return AnyView(accessible
             .onMoveCommand { direction in
                 switch (axis, direction) {
                 case (.horizontal, .left), (.vertical, .up):
@@ -2582,6 +2591,7 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                     break
                 }
             }
+        )
     }
 }
 
