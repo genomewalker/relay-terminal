@@ -2516,7 +2516,7 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
     }
 
     private func splitDivider(total: CGFloat) -> some View {
-        Rectangle()
+        let visual = Rectangle()
             .fill(RelayTheme.canvas)
             .overlay {
                 Capsule()
@@ -2524,6 +2524,8 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                     .frame(width: axis == .horizontal ? 1 : 24, height: axis == .horizontal ? 24 : 1)
             }
             .contentShape(Rectangle().inset(by: -4))
+
+        let pointer = visual
             .onHover { hovering in
                 if axis == .horizontal {
                     (hovering ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
@@ -2531,6 +2533,8 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                     (hovering ? NSCursor.resizeUpDown : NSCursor.arrow).set()
                 }
             }
+
+        let draggable = pointer
             .highPriorityGesture(TapGesture(count: 2).onEnded { update(0.5, true) })
             .simultaneousGesture(
                 DragGesture(minimumDistance: 1, coordinateSpace: .global)
@@ -2547,6 +2551,8 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                         dragPreviewRatio = nil
                     }
             )
+
+        let accessible = draggable
             .help("Drag to resize · double-click to center")
             .focusable()
             .focused($dividerFocused)
@@ -2564,6 +2570,8 @@ private struct RelaySplitContainer<First: View, Second: View>: View {
                 @unknown default: break
                 }
             }
+
+        return accessible
             .onKeyPress(.leftArrow) {
                 guard axis == .horizontal else { return .ignored }
                 update(max(0.1, ratio - 0.05), true)

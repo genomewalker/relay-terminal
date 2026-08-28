@@ -111,7 +111,6 @@ final class TerminalRuntime: NSObject {
     private var restoreReason = "launch"
     private var presentationLeases = Set<UUID>()
     private var allowsRendering = RelayApplicationActivityState.allowsContinuousUpdates
-    private var applicationActivityTask: Task<Void, Never>?
 
     private var session: InMemoryTerminalSession { io.session }
     private(set) lazy var view: RelayGhosttyView = makeView()
@@ -156,19 +155,25 @@ final class TerminalRuntime: NSObject {
                 self.finishMeasuredRestore()
             }
         }
-        applicationActivityTask = Task { @MainActor [weak self] in
-            for await notification in NotificationCenter.default.notifications(
-                named: .relayApplicationActivityChanged
-            ) {
-                guard !Task.isCancelled else { return }
-                guard let allowed = notification.object as? Bool else { continue }
-                self?.setApplicationRenderingAllowed(allowed)
-            }
-        }
+        // Selector delivery avoids moving Foundation's non-Sendable
+        // `Notification` value across an async-sequence isolation boundary.
+        // RelayApplicationActivityState posts this notification on the main
+        // actor, where every TerminalRuntime already lives.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationActivityChanged(_:)),
+            name: .relayApplicationActivityChanged,
+            object: nil
+        )
     }
 
     deinit {
-        applicationActivityTask?.cancel()
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func applicationActivityChanged(_ notification: Notification) {
+        guard let allowed = notification.object as? Bool else { return }
+        setApplicationRenderingAllowed(allowed)
     }
 
     func startIfNeeded() {
