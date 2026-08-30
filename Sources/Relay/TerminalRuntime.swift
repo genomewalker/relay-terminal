@@ -3828,24 +3828,23 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             return
         }
         if handleKeyboardPromptSelection(event) {
-            invalidatePromptMirror()
             return
         }
+        if handleKeyboardPromptNavigation(event) { return }
         if (event.keyCode == 51 || event.keyCode == 117),
            event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
-           let promptSelection {
-            self.promptSelection = nil
-            keyboardSelectionOffset = nil
-            keyboardSelectionIsVisual = false
-            sendPromptEdit(promptSelection)
-            invalidatePromptMirror()
+           deleteCurrentPromptSelection() {
             return
         }
-        promptSelection = nil
-        keyboardSelectionOffset = nil
-        keyboardSelectionIsVisual = false
+        let hadPromptSelection = promptSelection != nil
         trackNonTextKey(event)
         super.keyDown(with: event)
+        // Printable input synchronously reaches insertText, where it replaces
+        // the selected prompt range. Navigation, Escape, and other TUI keys do
+        // not, so collapse the local selection after Ghostty handles them.
+        if hadPromptSelection, promptSelection != nil {
+            clearPromptSelection()
+        }
     }
 
     override func insertText(_ string: Any, replacementRange: NSRange) {
@@ -3861,7 +3860,15 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                 "characters": String(text.count),
             ])
             hasLocalInputSincePromptBoundary = true
-            recordPromptEdit(.typing)
+            if let promptSelection {
+                // Match native text fields: typing replaces the active
+                // selection and remains one undoable edit.
+                recordPromptEdit(.typing)
+                applyPromptEdit(promptSelection, recordHistory: false)
+                clearPromptSelection()
+            } else {
+                recordPromptEdit(.typing)
+            }
             promptBuffer.insert(text)
             if !promptBuffer.isReliable { promptHistory.reset() }
             owner?.userEnteredInput()
@@ -3933,6 +3940,9 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         // prompt selection is reliable with hardware keyboards and synthetic
         // accessibility input alike.
         if event.type == .keyDown, handleKeyboardPromptSelection(event) {
+            return true
+        }
+        if event.type == .keyDown, handleKeyboardPromptNavigation(event) {
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -4041,17 +4051,40 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         guard owner?.allowsPromptSelectionEditing == true,
               (promptEditingIsSemanticallyActive || hasLocalInputSincePromptBoundary),
               event.modifierFlags.contains(.shift),
-              event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+              !event.modifierFlags.contains(.control),
               event.keyCode == 123 || event.keyCode == 124
         else { return false }
 
-        let delta = event.keyCode == 123 ? -1 : 1
+        let usesCommand = event.modifierFlags.contains(.command)
+        let usesOption = event.modifierFlags.contains(.option)
+        guard !(usesCommand && usesOption) else { return false }
+        let direction = event.keyCode == 123 ? -1 : 1
+        let granularity: TerminalPromptBuffer.NavigationGranularity = if usesCommand {
+            .line
+        } else if usesOption {
+            .word
+        } else {
+            .character
+        }
         promptHistory.breakCoalescing()
-        let next = (keyboardSelectionOffset ?? 0) + delta
+        let current = keyboardSelectionOffset ?? 0
+        let next: Int
+        if let resolved = promptBuffer.navigationOffset(
+            from: current,
+            direction: direction,
+            granularity: granularity
+        ) {
+            next = resolved
+        } else if granularity == .character {
+            // A restored session may not have a complete local prompt mirror.
+            // Character selection is still safe because it never guesses a
+            // semantic boundary; word/line selection remains conservative.
+            next = current + direction
+        } else {
+            return false
+        }
         if next == 0 {
-            keyboardSelectionOffset = nil
-            promptSelection = nil
-            keyboardSelectionIsVisual = false
+            clearPromptSelection()
             return true
         }
 
@@ -4064,6 +4097,33 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             characterCount: abs(next),
             movementOffset: next > 0 ? next : 0
         )
+        return true
+    }
+
+    private func handleKeyboardPromptNavigation(_ event: NSEvent) -> Bool {
+        guard owner?.allowsPromptSelectionEditing == true,
+              promptEditingIsSemanticallyActive || hasLocalInputSincePromptBoundary,
+              !event.modifierFlags.contains(.shift),
+              !event.modifierFlags.contains(.control),
+              event.keyCode == 123 || event.keyCode == 124
+        else { return false }
+
+        let usesCommand = event.modifierFlags.contains(.command)
+        let usesOption = event.modifierFlags.contains(.option)
+        guard usesCommand != usesOption else { return false }
+        let direction = event.keyCode == 123 ? -1 : 1
+        let granularity: TerminalPromptBuffer.NavigationGranularity = usesCommand ? .line : .word
+        guard let movementOffset = promptBuffer.navigationOffset(
+            direction: direction,
+            granularity: granularity
+        ) else { return false }
+
+        promptHistory.breakCoalescing()
+        clearPromptSelection()
+        if movementOffset != 0 {
+            sendPromptControl(movementOffset: movementOffset)
+            promptBuffer.move(by: movementOffset)
+        }
         return true
     }
 
@@ -4408,7 +4468,21 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         return CGPoint(x: local.x, y: bounds.height - local.y)
     }
 
-    private func sendPromptEdit(_ selection: PromptSelection) {
+    @discardableResult
+    private func deleteCurrentPromptSelection() -> Bool {
+        guard let selection = promptSelection else { return false }
+        clearPromptSelection()
+        applyPromptEdit(selection, recordHistory: true)
+        return true
+    }
+
+    private func clearPromptSelection() {
+        promptSelection = nil
+        keyboardSelectionOffset = nil
+        keyboardSelectionIsVisual = false
+    }
+
+    private func applyPromptEdit(_ selection: PromptSelection, recordHistory: Bool) {
         guard selection.characterCount > 0, selection.characterCount <= 4_096,
               abs(selection.movementOffset) <= 4_096 else { return }
         sendPromptControl(
@@ -4418,7 +4492,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         let relativeOffset = selection.movementOffset > 0
             ? selection.characterCount
             : -selection.characterCount
-        recordPromptEdit(.deleting)
+        if recordHistory { recordPromptEdit(.deleting) }
         if !promptBuffer.deleteSelection(relativeToCursor: relativeOffset) {
             invalidatePromptMirror()
         }
@@ -4543,6 +4617,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                 || !localFileURLs(from: NSPasteboard.general).isEmpty
         ))
         menu.addItem(item("Select All", action: #selector(selectAllRelay), key: "a", enabled: true))
+        menu.addItem(item(
+            "Delete Prompt Selection",
+            action: #selector(deleteRelayPromptSelection),
+            enabled: promptSelection != nil
+        ))
         menu.addItem(.separator())
         menu.addItem(item("Previous Prompt", action: #selector(previousPrompt), enabled: true))
         menu.addItem(item("Next Prompt", action: #selector(nextPrompt), enabled: true))
@@ -4582,6 +4661,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     @objc private func copyRelay() { _ = copyRelaySelectionToPasteboard() }
     @objc private func pasteRelay() { _ = pasteFromClipboard() }
     @objc private func selectAllRelay() { _ = performBindingAction("select_all") }
+    @objc private func deleteRelayPromptSelection() { _ = deleteCurrentPromptSelection() }
     @objc private func clearScrollback() { _ = performBindingAction("clear_scrollback") }
     @objc private func previousPrompt() { _ = owner?.jumpToPrompt(by: -1) }
     @objc private func nextPrompt() { _ = owner?.jumpToPrompt(by: 1) }

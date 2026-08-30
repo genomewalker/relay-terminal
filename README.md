@@ -64,7 +64,7 @@ The Ghostty in-memory bridge uses one coalescing writer per surface and applies 
 - Inline Kitty-graphics rendering or dismissible native previews for PNG/JPEG/GIF/WebP files referenced by remote Codex or Claude output
 - Type-aware terminal links: web URLs open in the local browser, remote images open in Relay's viewer, and remote source/text paths open in a floating `rcode` pane
 - Finder drag-and-drop and file paste into remote panes; relayd resolves the pane process's live working directory at transfer time, never overwrites, and inserts the resulting remote path at the prompt
-- Native prompt selection in shell, Codex, and Claude panes; agent mouse reporting is bypassed only after a real selection drag begins, Delete removes the selected input, `⌘Z` / `⇧⌘Z` provide bounded prompt undo/redo, and bracketed multiline paste is preserved for agent prompts. Terminal input opts out of macOS autocorrection, inline prediction, completion, and Writing Tools
+- Native prompt editing in shell, Codex, and Claude panes; agent mouse reporting is bypassed only after a real selection drag begins, Shift/Option-Shift/Command-Shift arrows select by character/word/line, Delete removes only selected live input, typing replaces it, and `⌘Z` / `⇧⌘Z` provide bounded prompt undo/redo. Bracketed multiline paste is preserved for agent prompts. Terminal input opts out of macOS autocorrection, inline prediction, completion, and Writing Tools
 - A bundled `xterm-relay` terminal identity derived from the Ghostty capabilities Relay uses. Local and remote setup install it idempotently by content hash and set `TERM=xterm-relay` only after resolution succeeds; otherwise sessions use `xterm-256color`
 - Live macOS Settings (`⌘,`) for font, size, terminal padding, palette, interface density, full-screen chrome, and artifact previews
 - Workspace restoration using stable pane/session UUIDs
@@ -137,6 +137,10 @@ Press `⌘Q` twice within two seconds to quit Relay. Holding the keys does not c
 - `⇧⌘D`: split down
 - `⌘W`: detach/close the active pane
 - `⌘Z` / `⇧⌘Z`: undo/redo edits in the anchored terminal prompt
+- `⇧←` / `⇧→`: select prompt text by character
+- `⌥⇧←` / `⌥⇧→`: select prompt text by word
+- `⌘⇧←` / `⌘⇧→`: select to the beginning/end of the prompt line
+- `⌥←` / `⌥→` and `⌘←` / `⌘→`: move by word or to the line boundary in a live prompt
 - `⌥⌘[` / `⌥⌘]`: previous/next pane
 - `⇧⌘Return`: zoom/restore the active pane
 - `⌥⌘P`: float/dock the active pane

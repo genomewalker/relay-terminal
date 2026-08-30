@@ -2397,6 +2397,38 @@ func terminalPromptMirrorEditing() {
     #expect(!buffer.isReliable)
 }
 
+@Test("Terminal prompt navigation follows macOS character, word, and line boundaries")
+func terminalPromptMacNavigation() {
+    var buffer = TerminalPromptBuffer()
+    buffer.insert("alpha beta\nthird line")
+
+    #expect(buffer.navigationOffset(
+        direction: -1,
+        granularity: .character
+    ) == -1)
+    #expect(buffer.navigationOffset(
+        direction: -1,
+        granularity: .word
+    ) == -4)
+    #expect(buffer.navigationOffset(
+        direction: -1,
+        granularity: .line
+    ) == -10)
+    #expect(buffer.navigationOffset(
+        from: -10,
+        direction: -1,
+        granularity: .word
+    ) == -15)
+    #expect(buffer.navigationOffset(
+        from: -10,
+        direction: 1,
+        granularity: .word
+    ) == -4)
+
+    buffer.invalidate()
+    #expect(buffer.navigationOffset(direction: -1, granularity: .word) == nil)
+}
+
 @Test("Prompt history coalesces typing and preserves multiline undo and redo")
 func terminalPromptHistoryEditing() {
     var buffer = TerminalPromptBuffer()

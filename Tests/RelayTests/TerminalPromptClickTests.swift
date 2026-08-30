@@ -591,6 +591,75 @@ func relayKeyboardSelectionDoesNotWaitForAgentLabel() async throws {
 }
 
 @MainActor
+@Test("Option-Shift selects a prompt word for deletion and undo")
+func relayKeyboardWordSelectionDeletesAndUndoes() async throws {
+    _ = NSApplication.shared
+    let recorder = TerminalInputRecorder()
+    let session = InMemoryTerminalSession(
+        write: { recorder.append($0) },
+        resize: { _ in }
+    )
+    let pane = PaneModel(profile: .local)
+    pane.setAgentKind(.codex)
+    let view = pane.runtime.view
+    view.frame = NSRect(x: 0, y: 0, width: 800, height: 400)
+    view.configuration = TerminalSurfaceOptions(backend: .inMemory(session))
+
+    let window = NSWindow(
+        contentRect: view.frame,
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.contentView = view
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.orderOut(nil)
+        window.contentView = nil
+    }
+    view.fitToSize()
+    #expect(window.makeFirstResponder(view))
+    view.insertText("alpha beta", replacementRange: NSRange(location: NSNotFound, length: 0))
+
+    let arrow = String(UnicodeScalar(NSLeftArrowFunctionKey)!)
+    guard let selectWord = NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [.option, .shift],
+        timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: window.windowNumber,
+        context: nil,
+        characters: arrow,
+        charactersIgnoringModifiers: arrow,
+        isARepeat: false,
+        keyCode: 123
+    ), let delete = NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime + 0.01,
+        windowNumber: window.windowNumber,
+        context: nil,
+        characters: "\u{007F}",
+        charactersIgnoringModifiers: "\u{007F}",
+        isARepeat: false,
+        keyCode: 51
+    ) else {
+        Issue.record("AppKit could not construct prompt word-selection events")
+        return
+    }
+
+    #expect(view.performKeyEquivalent(with: selectWord))
+    view.keyDown(with: delete)
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(recorder.data.suffix(4) == Data(repeating: 0x7F, count: 4))
+
+    #expect(view.performPromptHistoryAction(redo: false))
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(recorder.data.suffix(10) == Data("alpha beta".utf8))
+}
+
+@MainActor
 @Test("Agent transcript drag selection stays local while mouse reporting is active")
 func relayAgentTranscriptSelectionCopiesLocally() async throws {
     _ = NSApplication.shared

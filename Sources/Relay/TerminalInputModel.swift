@@ -124,6 +124,12 @@ struct TerminalConversationContextBuffer: Sendable {
 /// used only for local cursor placement and selection editing. Unfamiliar
 /// cursor operations invalidate it instead of guessing remote state.
 struct TerminalPromptBuffer: Equatable, Sendable {
+    enum NavigationGranularity: Equatable, Sendable {
+        case character
+        case word
+        case line
+    }
+
     struct Snapshot: Equatable, Sendable {
         let characters: [Character]
         let cursor: Int
@@ -264,6 +270,49 @@ struct TerminalPromptBuffer: Equatable, Sendable {
         let upper = max(cursor, otherEnd)
         guard lower < upper else { return nil }
         return String(characters[lower..<upper])
+    }
+
+    /// Resolve macOS-style horizontal movement without changing the mirrored
+    /// caret. Selection keeps the remote caret fixed at its anchor, so the
+    /// returned value is always relative to that anchor even when an existing
+    /// selection is extended or contracted.
+    func navigationOffset(
+        from currentOffset: Int = 0,
+        direction: Int,
+        granularity: NavigationGranularity
+    ) -> Int? {
+        guard isReliable, direction == -1 || direction == 1 else { return nil }
+        let current = cursor + currentOffset
+        guard current >= 0, current <= characters.count else { return nil }
+
+        let target: Int
+        switch granularity {
+        case .character:
+            target = min(max(0, current + direction), characters.count)
+        case .word:
+            if direction < 0 {
+                var index = current
+                while index > 0, characters[index - 1].isWhitespace { index -= 1 }
+                while index > 0, !characters[index - 1].isWhitespace { index -= 1 }
+                target = index
+            } else {
+                var index = current
+                while index < characters.count, !characters[index].isWhitespace { index += 1 }
+                while index < characters.count, characters[index].isWhitespace { index += 1 }
+                target = index
+            }
+        case .line:
+            if direction < 0 {
+                var index = current
+                while index > 0, !characters[index - 1].isNewline { index -= 1 }
+                target = index
+            } else {
+                var index = current
+                while index < characters.count, !characters[index].isNewline { index += 1 }
+                target = index
+            }
+        }
+        return target - cursor
     }
 }
 
