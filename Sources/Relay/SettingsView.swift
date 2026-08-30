@@ -164,12 +164,12 @@ struct RelaySettingsView: View {
                 }
 
                 settingSection("Agent intelligence") {
-                    Toggle("Agent activity intelligence", isOn: $preferences.intelligenceEnabled)
+                    Toggle("On-device model refinement (experimental)", isOn: $preferences.intelligenceEnabled)
                     Toggle("Summarize completed work", isOn: $preferences.automaticAgentSummaries)
                         .disabled(!preferences.intelligenceEnabled)
                     Toggle("Semantic activity search", isOn: $preferences.semanticAgentSearch)
                         .disabled(!preferences.intelligenceEnabled)
-                    Text("This organizes agent activity and search. It does not inspect keystrokes or generate terminal completions.")
+                    Text("Off by default. Exact agent activity, subagents, peer events, and lexical search work without it. Enabling this starts local Apple Foundation Models only for summaries and ranking; it never inspects keystrokes or generates terminal completions.")
                         .font(.system(size: 10.5))
                         .foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)

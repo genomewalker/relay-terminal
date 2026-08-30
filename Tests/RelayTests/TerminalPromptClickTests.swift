@@ -39,6 +39,19 @@ func relayTerminalOwnsMouseDrags() {
 }
 
 @MainActor
+@Test("Terminal input opts out of prose correction and Writing Tools")
+func relayTerminalDisablesSystemTextPrediction() {
+    _ = NSApplication.shared
+    let view = RelayGhosttyView(frame: .zero)
+    #expect(view.autocorrectionType == .no)
+    #expect(view.textCompletionType == .no)
+    #expect(view.inlinePredictionType == .no)
+    if #available(macOS 15.0, *) {
+        #expect(view.writingToolsBehavior == .none)
+    }
+}
+
+@MainActor
 @Test("Relay moves the shell cursor using the terminal's active keyboard mode")
 func relayPromptClickMovesCursor() async throws {
     _ = NSApplication.shared

@@ -241,6 +241,11 @@ final class AgentIntelligenceStore: ObservableObject {
                 self?.summaryTasks[item.id] = nil
                 return
             }
+            guard RelayPreferences.shared.intelligenceEnabled,
+                  RelayPreferences.shared.automaticAgentSummaries else {
+                self?.summaryTasks[item.id] = nil
+                return
+            }
             let summary = await AgentWorkspaceIntelligenceService.shared.summarize(item)
             guard let self else { return }
             self.summaryTasks[item.id] = nil
@@ -471,7 +476,12 @@ final class AgentInboxSearchController: ObservableObject {
         let candidates = Array(lexical.prefix(32))
         task = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(280))
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  RelayPreferences.shared.intelligenceEnabled,
+                  RelayPreferences.shared.semanticAgentSearch else {
+                self?.isRefining = false
+                return
+            }
             let ids = await AgentWorkspaceIntelligenceService.shared.rankSearch(
                 query: trimmed, candidates: candidates, limit: min(candidates.count, 40)
             )

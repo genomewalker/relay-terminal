@@ -197,6 +197,12 @@ final class AgentAttentionController: ObservableObject {
     private func scheduleRefinement(
         agents: [SubagentActivity], paneID: UUID, limit: Int, delay: Duration
     ) {
+        guard RelayPreferences.shared.intelligenceEnabled else {
+            rankingTask?.cancel()
+            rankingTask = nil
+            isRefining = false
+            return
+        }
         let candidates = AgentAttentionPolicy.modelCandidates(from: agents)
         guard candidates.count > max(4, limit / 2) else { return }
         rankingTask?.cancel()
@@ -207,7 +213,11 @@ final class AgentAttentionController: ObservableObject {
         isRefining = true
         rankingTask = Task { [weak self] in
             if delay != .zero { try? await Task.sleep(for: delay) }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  RelayPreferences.shared.intelligenceEnabled else {
+                self?.isRefining = false
+                return
+            }
             let preferred = await AgentIntelligenceService.shared.rank(
                 candidates,
                 limit: max(3, limit / 2),

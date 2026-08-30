@@ -3498,7 +3498,7 @@ extension TerminalRuntime:
 }
 
 @MainActor
-final class RelayGhosttyView: TerminalView {
+final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     private struct PromptSelection {
         let characterCount: Int
         let movementOffset: Int
@@ -3526,6 +3526,72 @@ final class RelayGhosttyView: TerminalView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         registerForDraggedTypes([.fileURL])
+    }
+
+    // A terminal is not a prose editor. Advertising these input traits keeps
+    // AppKit from sending terminal keystrokes through autocorrection, inline
+    // prediction, or Writing Tools. Relay's optional Foundation Models agent
+    // refinement is separate and never participates in terminal input.
+    var autocorrectionType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var spellCheckingType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var grammarCheckingType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var smartQuotesType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var smartDashesType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var smartInsertDeleteType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var textReplacementType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var dataDetectionType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var linkDetectionType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    var textCompletionType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    @available(macOS 14.0, *)
+    var inlinePredictionType: NSTextInputTraitType {
+        get { .no }
+        set {}
+    }
+
+    @available(macOS 15.0, *)
+    var writingToolsBehavior: NSWritingToolsBehavior {
+        get { .none }
+        set {}
     }
 
     /// Relay uses a full-size content view and lets empty chrome move the

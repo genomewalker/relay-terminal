@@ -73,6 +73,15 @@ enum RelayArtifactPresentation: String, CaseIterable, Identifiable, Sendable {
     var label: String { self == .inline ? "Inline" : "Floating" }
 }
 
+enum RelayIntelligencePreferencePolicy {
+    static let optInRevision = 1
+
+    static func enabled(storedValue: Bool?, storedRevision: Int) -> Bool {
+        guard storedRevision >= optInRevision else { return false }
+        return storedValue ?? false
+    }
+}
+
 @MainActor
 final class RelayPreferences: ObservableObject {
     static let shared = RelayPreferences()
@@ -114,15 +123,37 @@ final class RelayPreferences: ObservableObject {
         artifactPresentation = RelayArtifactPresentation(
             rawValue: defaults.string(forKey: "relay.settings.artifact-presentation") ?? ""
         ) ?? .preview
-        intelligenceEnabled = defaults.object(forKey: "relay.settings.intelligence-enabled") as? Bool ?? true
-        automaticAgentSummaries = defaults.object(forKey: "relay.settings.intelligence-summaries") as? Bool ?? true
-        semanticAgentSearch = defaults.object(forKey: "relay.settings.intelligence-search") as? Bool ?? true
+        let intelligenceRevision = defaults.integer(forKey: "relay.settings.intelligence-opt-in-revision")
+        intelligenceEnabled = RelayIntelligencePreferencePolicy.enabled(
+            storedValue: defaults.object(forKey: "relay.settings.intelligence-enabled") as? Bool,
+            storedRevision: intelligenceRevision
+        )
+        automaticAgentSummaries = RelayIntelligencePreferencePolicy.enabled(
+            storedValue: defaults.object(forKey: "relay.settings.intelligence-summaries") as? Bool,
+            storedRevision: intelligenceRevision
+        )
+        semanticAgentSearch = RelayIntelligencePreferencePolicy.enabled(
+            storedValue: defaults.object(forKey: "relay.settings.intelligence-search") as? Bool,
+            storedRevision: intelligenceRevision
+        )
         automaticallyUpdateRelayd = defaults.object(forKey: "relay.settings.relayd-auto-update") as? Bool ?? false
         keyBindings = RelayKeyBindingStorage.load(from: defaults)
         isLoading = false
         // Remove stale completion preferences left by older builds.
         defaults.removeObject(forKey: "relay.settings.predictive-suggestions")
         defaults.removeObject(forKey: "relay.settings.experimental-generative-suggestions")
+        if intelligenceRevision < RelayIntelligencePreferencePolicy.optInRevision {
+            // Foundation Models work must be a deliberate opt-in. Earlier
+            // builds enabled it implicitly, which could create local model
+            // sessions while the user was typing in a busy terminal.
+            defaults.set(false, forKey: "relay.settings.intelligence-enabled")
+            defaults.set(false, forKey: "relay.settings.intelligence-summaries")
+            defaults.set(false, forKey: "relay.settings.intelligence-search")
+            defaults.set(
+                RelayIntelligencePreferencePolicy.optInRevision,
+                forKey: "relay.settings.intelligence-opt-in-revision"
+            )
+        }
     }
 
     func keyBinding(for command: RelayCommand) -> RelayKeyBinding {

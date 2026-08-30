@@ -4,6 +4,20 @@ import Foundation
 import Testing
 @testable import Relay
 
+@Test("On-device intelligence requires an explicit current opt-in")
+func onDeviceIntelligenceIsOptIn() {
+    #expect(!RelayIntelligencePreferencePolicy.enabled(storedValue: nil, storedRevision: 0))
+    #expect(!RelayIntelligencePreferencePolicy.enabled(storedValue: true, storedRevision: 0))
+    #expect(!RelayIntelligencePreferencePolicy.enabled(
+        storedValue: nil,
+        storedRevision: RelayIntelligencePreferencePolicy.optInRevision
+    ))
+    #expect(RelayIntelligencePreferencePolicy.enabled(
+        storedValue: true,
+        storedRevision: RelayIntelligencePreferencePolicy.optInRevision
+    ))
+}
+
 @Test("Energy policy buffers background terminals and occludes their surfaces")
 func terminalEnergyPolicyBuffersBackgroundWork() {
     #expect(!TerminalEnergyPolicy.pausesTerminalEmulation(
@@ -2497,101 +2511,104 @@ func workspacePinsPersist() {
     #expect(WorkspacePinStore.load(.tab, defaults: defaults) == [second])
 }
 
-@Test("Subprocess capture stops output that exceeds its byte budget")
-func processCaptureIsBounded() throws {
-    let process = Process()
-    let output = Pipe()
-    let errors = Pipe()
-    process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-c", "head -c 4096 /dev/zero"]
-    process.standardOutput = output
-    process.standardError = errors
+@Suite(.serialized)
+struct ProcessCaptureTests {
+    @Test("Subprocess capture stops output that exceeds its byte budget")
+    func processCaptureIsBounded() throws {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "head -c 4096 /dev/zero"]
+        process.standardOutput = output
+        process.standardError = errors
 
-    var exceeded = false
-    do {
-        _ = try ProcessCapture.run(
+        var exceeded = false
+        do {
+            _ = try ProcessCapture.run(
+                process,
+                output: output,
+                errors: errors,
+                maximumBytesPerStream: 1_024
+            )
+        } catch let error as ProcessCaptureError {
+            exceeded = error == .outputTooLarge(limit: 1_024)
+        }
+        #expect(exceeded)
+    }
+
+    @Test("Subprocess capture preserves ordinary output")
+    func processCapturePreservesOutput() throws {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "printf relay; printf warning >&2"]
+        process.standardOutput = output
+        process.standardError = errors
+
+        let captured = try ProcessCapture.run(
             process,
             output: output,
             errors: errors,
             maximumBytesPerStream: 1_024
         )
-    } catch let error as ProcessCaptureError {
-        exceeded = error == .outputTooLarge(limit: 1_024)
-    }
-    #expect(exceeded)
-}
-
-@Test("Subprocess capture preserves ordinary output")
-func processCapturePreservesOutput() throws {
-    let process = Process()
-    let output = Pipe()
-    let errors = Pipe()
-    process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-c", "printf relay; printf warning >&2"]
-    process.standardOutput = output
-    process.standardError = errors
-
-    let captured = try ProcessCapture.run(
-        process,
-        output: output,
-        errors: errors,
-        maximumBytesPerStream: 1_024
-    )
-    #expect(String(decoding: captured.standardOutput, as: UTF8.self) == "relay")
-    #expect(String(decoding: captured.standardError, as: UTF8.self) == "warning")
-}
-
-@Test("Subprocess capture reports its timeout")
-func processCaptureReportsTimeout() throws {
-    let process = Process()
-    let output = Pipe()
-    let errors = Pipe()
-    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
-    process.arguments = ["2"]
-    process.standardOutput = output
-    process.standardError = errors
-
-    var timedOut = false
-    do {
-        _ = try ProcessCapture.run(
-            process,
-            output: output,
-            errors: errors,
-            timeout: 0.05,
-            maximumBytesPerStream: 1_024
-        )
-    } catch let error as ProcessCaptureError {
-        if case .timedOut = error { timedOut = true }
-    }
-    #expect(timedOut)
-}
-
-@Test("Subprocess capture does not hang when a descendant inherits its pipes")
-func processCaptureBoundsInheritedPipes() throws {
-    let process = Process()
-    let output = Pipe()
-    let errors = Pipe()
-    process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-c", "(sleep 3) & exit 0"]
-    process.standardOutput = output
-    process.standardError = errors
-
-    let started = ContinuousClock.now
-    var readFailed = false
-    do {
-        _ = try ProcessCapture.run(
-            process,
-            output: output,
-            errors: errors,
-            timeout: 0.1,
-            maximumBytesPerStream: 1_024
-        )
-    } catch let error as ProcessCaptureError {
-        if case .readFailed = error { readFailed = true }
+        #expect(String(decoding: captured.standardOutput, as: UTF8.self) == "relay")
+        #expect(String(decoding: captured.standardError, as: UTF8.self) == "warning")
     }
 
-    #expect(readFailed)
-    #expect(started.duration(to: .now) < .seconds(2))
+    @Test("Subprocess capture reports its timeout")
+    func processCaptureReportsTimeout() throws {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["2"]
+        process.standardOutput = output
+        process.standardError = errors
+
+        var timedOut = false
+        do {
+            _ = try ProcessCapture.run(
+                process,
+                output: output,
+                errors: errors,
+                timeout: 0.05,
+                maximumBytesPerStream: 1_024
+            )
+        } catch let error as ProcessCaptureError {
+            if case .timedOut = error { timedOut = true }
+        }
+        #expect(timedOut)
+    }
+
+    @Test("Subprocess capture does not hang when a descendant inherits its pipes")
+    func processCaptureBoundsInheritedPipes() throws {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "(sleep 3) & exit 0"]
+        process.standardOutput = output
+        process.standardError = errors
+
+        let started = ContinuousClock.now
+        var readFailed = false
+        do {
+            _ = try ProcessCapture.run(
+                process,
+                output: output,
+                errors: errors,
+                timeout: 0.1,
+                maximumBytesPerStream: 1_024
+            )
+        } catch let error as ProcessCaptureError {
+            if case .readFailed = error { readFailed = true }
+        }
+
+        #expect(readFailed)
+        #expect(started.duration(to: .now) < .seconds(2))
+    }
 }
 
 @Test("Floating image controls do not overlap corner resize handles")

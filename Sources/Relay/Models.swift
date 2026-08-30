@@ -1160,7 +1160,6 @@ final class PaneModel: ObservableObject, Identifiable {
         toPeerID: String? = nil,
         sourceID: String? = nil
     ) {
-        guard RelayPreferences.shared.intelligenceEnabled else { return }
         AgentIntelligenceStore.shared.record(AgentInboxEvent(
             paneID: id,
             host: profile.kind == .ssh ? profile.host : "This Mac",

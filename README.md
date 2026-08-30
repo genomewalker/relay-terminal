@@ -57,14 +57,14 @@ The Ghostty in-memory bridge uses one coalescing writer per surface and applies 
 - A persistent, deduplicated "since you last checked" agent inbox spanning nodes, sessions, tabs, panes, Codex, and Claude
 - An authenticated loopback terminal in Codex's right panel, grouped by Relay session and tab, with the selected pane's live PTY byte stream, keyboard input, resize, images, agent/subagent state, and pane reveal; it attaches to the existing Relay pane and opens no remote port or second shell
 - Safe multi-view attachment for that terminal: the focused client owns input and the single canonical PTY geometry, while clients at other widths render the same grid as read-only clipped/scrollable views; changing focus transfers ownership with one authoritative resize instead of creating resize races
-- Battery-aware on-device summaries, automatic focus ranking, semantic activity search, and a directional peer-coordination view using Apple Foundation Models when available; exact rule-based results remain immediate
+- Exact agent summaries, focus ranking, lexical activity search, and a directional peer-coordination view that do not require a model. Optional Apple Foundation Models refinement is experimental, disabled by default, serialized, rate-limited, and never runs while Relay is inactive
 - Node-scoped remote catalogs that discover validated detached panes before starting a new shell; older panes migrate as recoverable entries
 - Sequence-based output reconnect plus acknowledged, deduplicated input for new workers; old workers remain protocol-compatible
 - Persistent bounded agent-event journals with cursor replay, including a supervisor compatibility index for older workers
 - Inline Kitty-graphics rendering or dismissible native previews for PNG/JPEG/GIF/WebP files referenced by remote Codex or Claude output
 - Type-aware terminal links: web URLs open in the local browser, remote images open in Relay's viewer, and remote source/text paths open in a floating `rcode` pane
 - Finder drag-and-drop and file paste into remote panes; relayd resolves the pane process's live working directory at transfer time, never overwrites, and inserts the resulting remote path at the prompt
-- Native prompt selection in shell, Codex, and Claude panes; agent mouse reporting is bypassed only after a real selection drag begins, Delete removes the selected input, `⌘Z` / `⇧⌘Z` provide bounded prompt undo/redo, and bracketed multiline paste is preserved for agent prompts
+- Native prompt selection in shell, Codex, and Claude panes; agent mouse reporting is bypassed only after a real selection drag begins, Delete removes the selected input, `⌘Z` / `⇧⌘Z` provide bounded prompt undo/redo, and bracketed multiline paste is preserved for agent prompts. Terminal input opts out of macOS autocorrection, inline prediction, completion, and Writing Tools
 - A bundled `xterm-relay` terminal identity derived from the Ghostty capabilities Relay uses. Local and remote setup install it idempotently by content hash and set `TERM=xterm-relay` only after resolution succeeds; otherwise sessions use `xterm-256color`
 - Live macOS Settings (`⌘,`) for font, size, terminal padding, palette, interface density, full-screen chrome, and artifact previews
 - Workspace restoration using stable pane/session UUIDs
