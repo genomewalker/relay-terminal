@@ -187,7 +187,7 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         let profile = pane.profile
         let currentGeneration = generation
         isBusy = true
-        status = "Loading \(URL(fileURLWithPath: path).lastPathComponent)…"
+        status = "Loading \(TerminalPathSyntax.lastComponent(path))…"
         operationError = nil
         workTask = Task { [weak self] in
             do {
@@ -224,7 +224,7 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
 
     func goUp() {
         guard !directoryPath.isEmpty, directoryPath != workspacePath else { return }
-        let parent = URL(fileURLWithPath: directoryPath).deletingLastPathComponent().path
+        let parent = TerminalPathSyntax.parentDirectory(directoryPath)
         guard parent == workspacePath || parent.hasPrefix(workspacePath + "/") else { return }
         loadDirectory(parent)
     }
@@ -363,7 +363,7 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         isDiff = false
         isBusy = false
         status = document.path
-        pane?.title = URL(fileURLWithPath: document.path).lastPathComponent
+        pane?.title = TerminalPathSyntax.lastComponent(document.path)
         deliverCurrentDocument()
     }
 
@@ -377,7 +377,7 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         isDiff = true
         isBusy = false
         status = "Comparing changes"
-        pane?.title = URL(fileURLWithPath: document.path).lastPathComponent
+        pane?.title = TerminalPathSyntax.lastComponent(document.path)
         deliverCurrentDocument()
     }
 
@@ -479,7 +479,7 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
     }
 
     nonisolated private static func language(for path: String) -> String {
-        switch URL(fileURLWithPath: path).pathExtension.lowercased() {
+        switch TerminalPathSyntax.pathExtension(path) {
         case "swift": "swift"
         case "go": "go"
         case "rs": "rust"

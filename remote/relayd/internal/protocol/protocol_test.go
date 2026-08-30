@@ -32,6 +32,17 @@ func TestResizeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestViewportCommitRoundTrip(t *testing.T) {
+	generation, cols, rows, err := ParseViewportCommit(ViewportCommitFrame(42, 160, 48))
+	if err != nil || generation != 42 || cols != 160 || rows != 48 {
+		t.Fatalf("viewport commit = %d %d %d, %v", generation, cols, rows, err)
+	}
+	ackGeneration, repaintSequence, err := ParseViewportAck(ViewportAckFrame(42, 9001))
+	if err != nil || ackGeneration != 42 || repaintSequence != 9001 {
+		t.Fatalf("viewport ack = %d %d, %v", ackGeneration, repaintSequence, err)
+	}
+}
+
 func TestArtifactRoundTrip(t *testing.T) {
 	wantPath := "/home/user/generated.png"
 	wantData := []byte{0x89, 'P', 'N', 'G'}

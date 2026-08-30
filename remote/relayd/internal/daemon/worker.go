@@ -55,12 +55,9 @@ func ServeWorker(config WorkerConfig) error {
 		_ = session.signal(syscall.SIGTERM)
 		return err
 	}
-	codexFrames, stopCodex := observeCodexTranscript(session.processID())
-	claudeFrames, stopClaude := observeClaudeTranscript(session.processID())
-	defer stopCodex()
-	defer stopClaude()
-	go forwardTranscriptEvents(session, codexFrames)
-	go forwardTranscriptEvents(session, claudeFrames)
+	transcriptFrames, stopTranscripts := observeAgentTranscripts(session.agentProcessSnapshot)
+	defer stopTranscripts()
+	go forwardTranscriptEvents(session, transcriptFrames)
 	bootID, err := nodeBootID()
 	if err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -77,7 +74,7 @@ func ServeWorker(config WorkerConfig) error {
 		ShellPID: session.processID(), NodeBootID: bootID,
 		SocketPath: config.SocketPath, Token: config.Token,
 		Command: config.Command, WorkingDirectory: config.WorkingDirectory,
-		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1"}, CreatedAt: time.Now().UTC(),
+		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "client_count_v1", "terminal_mode_state_v1"}, CreatedAt: time.Now().UTC(),
 	}
 	if err := storeManifest(config.ManifestPath, manifest); err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -171,6 +168,36 @@ func workerManifestPollInterval(unchangedPolls int) time.Duration {
 	return 5 * time.Second
 }
 
+type viewportOperation struct {
+	generation uint64
+	cols       uint16
+	rows       uint16
+	commit     bool
+}
+
+func enqueueViewportOperation(mailbox chan viewportOperation, operation viewportOperation) {
+	select {
+	case mailbox <- operation:
+		return
+	default:
+	}
+
+	// A queued commit is an atomic presentation boundary and must not be
+	// displaced by a later ordinary animation resize. A new commit supersedes
+	// any unstarted operation; ordinary resizes only replace ordinary resizes.
+	select {
+	case pending := <-mailbox:
+		if pending.commit && !operation.commit {
+			operation = pending
+		}
+	default:
+	}
+	select {
+	case mailbox <- operation:
+	default:
+	}
+}
+
 func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Session) {
 	defer connection.Close()
 	first, err := protocol.ReadFrame(connection)
@@ -226,14 +253,14 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		repaintAfterSequence, attachRedrew = session.resizeForAttach(hello.Cols, hello.Rows)
 	}
 
-	viewer, replay, outputReset, eventReset := session.attach(
+	viewer, replay, outputReset, eventReset, clientCount := session.attach(
 		hello.LastSeq, hello.LastEventSeq, !hello.TerminalOnly,
 	)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "client_count_v1", "terminal_mode_state_v1"},
 		OutputReset: outputReset, EventReset: eventReset,
-		ControlGranted: &controlGranted,
+		ControlGranted: &controlGranted, ClientCount: clientCount,
 	})
 	if err := writer.Write(attached); err != nil {
 		return
@@ -262,6 +289,7 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	stopWriter := make(chan struct{})
 	defer close(stopWriter)
 	writerDone := make(chan struct{})
+	viewportOperations := make(chan viewportOperation, 1)
 	go func() {
 		defer close(writerDone)
 		for {
@@ -273,6 +301,29 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 			case <-viewer.lagged:
 				_ = connection.Close()
 				return
+			case <-stopWriter:
+				return
+			}
+		}
+	}()
+	// Resize repaint detection may wait briefly for a TUI's output. Keep every
+	// geometry operation off the connection reader so keystrokes and heartbeats
+	// are never queued behind either that wait or a concurrent reconnect commit.
+	// The one-slot mailbox coalesces animation bursts to their newest useful grid.
+	go func() {
+		for {
+			select {
+			case operation := <-viewportOperations:
+				if operation.commit {
+					sequence, resizeErr := session.resizeForViewportCommit(
+						operation.cols, operation.rows,
+					)
+					if resizeErr == nil {
+						_ = writer.Write(protocol.ViewportAckFrame(operation.generation, sequence))
+					}
+				} else {
+					_ = session.resize(operation.cols, operation.rows)
+				}
 			case <-stopWriter:
 				return
 			}
@@ -300,7 +351,16 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		case protocol.Resize:
 			cols, rows, parseErr := protocol.ParseResize(frame)
 			if controlGranted && parseErr == nil {
-				_ = session.resize(cols, rows)
+				enqueueViewportOperation(viewportOperations, viewportOperation{
+					cols: cols, rows: rows,
+				})
+			}
+		case protocol.ViewportCommit:
+			generation, cols, rows, parseErr := protocol.ParseViewportCommit(frame)
+			if controlGranted && parseErr == nil {
+				enqueueViewportOperation(viewportOperations, viewportOperation{
+					generation: generation, cols: cols, rows: rows, commit: true,
+				})
 			}
 		case protocol.Ping:
 			_ = writer.Write(protocol.Frame{Type: protocol.Pong})

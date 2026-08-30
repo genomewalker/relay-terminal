@@ -248,7 +248,7 @@ func TestOldOutputCursorForcesCleanReplay(t *testing.T) {
 		activeSubagents: make(map[string][]byte), sequence: 11,
 		replay: []record{{sequence: 10, data: []byte("\x1b[2Jscreen")}, {sequence: 11, data: []byte(" tail")}},
 	}
-	viewer, frames, outputReset, _ := session.attach(3, 0, true)
+	viewer, frames, outputReset, _, _ := session.attach(3, 0, true)
 	defer session.detach(viewer)
 	if !outputReset || len(frames) < 2 {
 		t.Fatalf("old cursor did not force replay reset: reset=%v frames=%d", outputReset, len(frames))
@@ -270,7 +270,7 @@ func TestTerminalOnlyAttachExcludesAgentHistory(t *testing.T) {
 			Type: protocol.AgentEvent, Payload: indexedAgentPayload([]byte(`{"agent":"codex","event":{"hook_event_name":"PreToolUse"}}`), 1),
 		}},
 	}
-	viewer, frames, _, eventReset := session.attach(0, 0, false)
+	viewer, frames, _, eventReset, _ := session.attach(0, 0, false)
 	defer session.detach(viewer)
 	if eventReset {
 		t.Fatal("terminal-only attach reported an irrelevant agent reset")
@@ -278,6 +278,48 @@ func TestTerminalOnlyAttachExcludesAgentHistory(t *testing.T) {
 	for _, frame := range frames {
 		if frame.Type == protocol.AgentEvent {
 			t.Fatal("terminal-only attach replayed agent history")
+		}
+	}
+}
+
+func TestTerminalClientCountTracksAttachAndDetach(t *testing.T) {
+	session := &Session{
+		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		activeSubagents: make(map[string][]byte), activeAgentRoots: make(map[string][]byte),
+	}
+	first, _, _, _, firstCount := session.attach(0, 0, false)
+	if firstCount != 1 {
+		t.Fatalf("first client count = %d, want 1", firstCount)
+	}
+	second, _, _, _, secondCount := session.attach(0, 0, false)
+	if secondCount != 2 {
+		t.Fatalf("second client count = %d, want 2", secondCount)
+	}
+	if got := latestClientCount(first.frames); got != 2 {
+		t.Fatalf("first viewer saw client count %d, want 2", got)
+	}
+
+	session.detach(second)
+	if got := latestClientCount(first.frames); got != 1 {
+		t.Fatalf("remaining viewer saw client count %d after detach, want 1", got)
+	}
+	session.detach(first)
+}
+
+func latestClientCount(frames <-chan protocol.Frame) int {
+	latest := -1
+	for {
+		select {
+		case frame := <-frames:
+			if frame.Type != protocol.Status {
+				continue
+			}
+			var status protocol.StatusPayload
+			if protocol.DecodeJSON(frame, &status) == nil && status.State == "clients" {
+				latest = status.ClientCount
+			}
+		default:
+			return latest
 		}
 	}
 }
@@ -578,7 +620,9 @@ func TestIdleWorkerPollingBacksOffWithoutSlowingActiveAgents(t *testing.T) {
 	if agentProcessPollInterval(1) != time.Second {
 		t.Fatal("active process polling lost its responsive interval")
 	}
-	if transcriptPollInterval(0) != 5*time.Second || transcriptPollInterval(1) != 500*time.Millisecond {
+	if transcriptPollInterval(0, 0) != 5*time.Second ||
+		transcriptPollInterval(1, 0) != 250*time.Millisecond ||
+		transcriptPollInterval(1, 3) != 2*time.Second {
 		t.Fatal("transcript polling policy is not activity-adaptive")
 	}
 	if workerManifestPollInterval(0) != 5*time.Second || workerManifestPollInterval(2) != 30*time.Second {
@@ -586,14 +630,53 @@ func TestIdleWorkerPollingBacksOffWithoutSlowingActiveAgents(t *testing.T) {
 	}
 }
 
+func TestAgentProcessSnapshotBroadcastsOnlyRealChanges(t *testing.T) {
+	session := &Session{
+		agentProcesses:        map[int]string{41: "codex"},
+		agentProcessesChanged: make(chan struct{}),
+	}
+	snapshot, changed := session.agentProcessSnapshot()
+	snapshot[41] = "claude"
+	if current, _ := session.agentProcessSnapshot(); current[41] != "codex" {
+		t.Fatal("agent process snapshot exposed mutable session state")
+	}
+	session.updateAgentProcesses(map[int]string{41: "codex"})
+	select {
+	case <-changed:
+		t.Fatal("unchanged process set triggered transcript work")
+	default:
+	}
+	session.updateAgentProcesses(map[int]string{42: "claude"})
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("process change was not broadcast to transcript observers")
+	}
+}
+
 func TestAttachResizePulsesUnchangedGridForFullRepaint(t *testing.T) {
-	unchanged := attachResizeSteps(120, 38, 120, 38)
+	unchanged := attachResizeSteps(120, 38, 120, 38, true)
 	if len(unchanged) != 2 || unchanged[0] != (terminalGridSize{cols: 120, rows: 37}) || unchanged[1] != (terminalGridSize{cols: 120, rows: 38}) {
 		t.Fatalf("unchanged attach resize = %#v", unchanged)
 	}
-	changed := attachResizeSteps(80, 24, 120, 38)
+	changed := attachResizeSteps(80, 24, 120, 38, true)
 	if len(changed) != 1 || changed[0] != (terminalGridSize{cols: 120, rows: 38}) {
 		t.Fatalf("changed attach resize = %#v", changed)
+	}
+	if shell := attachResizeSteps(120, 38, 120, 38, false); len(shell) != 0 {
+		t.Fatalf("unchanged shell attach unexpectedly pulsed: %#v", shell)
+	}
+}
+
+func TestViewportResizeSignalsExactlyOnce(t *testing.T) {
+	if viewportResizeNeedsExplicitSignal(80, 24, 120, 38, true) {
+		t.Fatal("changed TIOCSWINSZ would receive a duplicate explicit SIGWINCH")
+	}
+	if !viewportResizeNeedsExplicitSignal(120, 38, 120, 38, true) {
+		t.Fatal("unchanged viewport commit did not request its explicit SIGWINCH")
+	}
+	if !viewportResizeNeedsExplicitSignal(0, 0, 120, 38, false) {
+		t.Fatal("unknown current viewport did not request a safe explicit SIGWINCH")
 	}
 }
 

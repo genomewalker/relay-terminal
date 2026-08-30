@@ -19,7 +19,7 @@ struct PaneArtifact: Identifiable {
         contentIdentity = hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    var filename: String { URL(fileURLWithPath: remotePath).lastPathComponent }
+    var filename: String { TerminalPathSyntax.lastComponent(remotePath) }
     var image: NSImage? { NSImage(data: data) }
 }
 
@@ -153,6 +153,75 @@ enum TerminalLinkTarget: Equatable, Sendable {
     case file(String)
 }
 
+/// Purely lexical path inspection for terminal output. Foundation's
+/// `URL(fileURLWithPath:)` may consult the filesystem to infer whether a path
+/// is a directory. That is unacceptable on Relay's display queue: an HPC/NFS
+/// path can block terminal rendering and keyboard echo for seconds. Existence
+/// and file type are resolved only after the user opens a link.
+enum TerminalPathSyntax {
+    static func lastComponent(_ path: String) -> String {
+        var end = path.endIndex
+        while end > path.startIndex {
+            let previous = path.index(before: end)
+            guard path[previous] == "/" else { break }
+            end = previous
+        }
+        guard end > path.startIndex else { return path }
+        let trimmed = path[..<end]
+        guard let slash = trimmed.lastIndex(of: "/") else { return String(trimmed) }
+        let start = path.index(after: slash)
+        return String(path[start..<end])
+    }
+
+    static func pathExtension(_ path: String) -> String {
+        let component = lastComponent(path)
+        guard let dot = component.lastIndex(of: "."),
+              dot != component.startIndex else { return "" }
+        let start = component.index(after: dot)
+        guard start < component.endIndex else { return "" }
+        return String(component[start...]).lowercased()
+    }
+
+    static func parentDirectory(_ path: String) -> String {
+        var end = path.endIndex
+        while end > path.startIndex {
+            let previous = path.index(before: end)
+            guard path[previous] == "/" else { break }
+            end = previous
+        }
+        guard end > path.startIndex else { return "/" }
+        let trimmed = path[..<end]
+        guard let slash = trimmed.lastIndex(of: "/") else { return "." }
+        return slash == path.startIndex ? "/" : String(path[..<slash])
+    }
+
+    static func resolving(_ relativePath: String, against directory: String) -> String {
+        if relativePath.hasPrefix("/") { return standardized(relativePath) }
+        return standardized(directory + "/" + relativePath)
+    }
+
+    static func standardized(_ path: String) -> String {
+        let absolute = path.hasPrefix("/")
+        var components: [Substring] = []
+        for component in path.split(separator: "/", omittingEmptySubsequences: true) {
+            switch component {
+            case ".": continue
+            case "..":
+                if components.last != "..", !components.isEmpty {
+                    components.removeLast()
+                } else if !absolute {
+                    components.append(component)
+                }
+            default:
+                components.append(component)
+            }
+        }
+        let joined = components.joined(separator: "/")
+        if absolute { return joined.isEmpty ? "/" : "/" + joined }
+        return joined.isEmpty ? "." : joined
+    }
+}
+
 enum TerminalLinkResolver {
     static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp", "svg"])
     private static let artifactPrefix = "file:///__relay_artifact__/"
@@ -191,7 +260,7 @@ enum TerminalLinkResolver {
     }
 
     static func isImagePath(_ path: String) -> Bool {
-        imageExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased())
+        imageExtensions.contains(TerminalPathSyntax.pathExtension(path))
             || path.hasPrefix("/tmp/claude-")
     }
 
@@ -225,29 +294,130 @@ enum ArtifactLinkResolver {
 }
 
 enum ArtifactHyperlinkEncoder {
+    private static let osc8Prefix = Data("\u{001B}]8;".utf8)
+    private static let kittyGraphicsPrefix = Data("\u{001B}_G".utf8)
+
     /// Adds zero-width OSC 8 links while preserving the visible terminal text.
     /// Chunks that already contain OSC 8 are left alone to avoid nested links.
+    ///
+    /// Terminal control strings are opaque. In particular, shell integration
+    /// sends paths inside OSC 7 and prompt metadata inside OSC 133. Decorating
+    /// those bytes would nest OSC 8 inside another OSC and leave the parser in
+    /// an undefined state, which presented as blank or garbled restored SSH
+    /// panes. Only ground-state printable runs are eligible for decoration.
     static func encode(_ data: Data) -> Data {
-        guard data.range(of: Data("\u{001B}]8;".utf8)) == nil,
-              data.range(of: Data("\u{001B}_G".utf8)) == nil,
-              let text = String(data: data, encoding: .utf8),
-              text.contains("/")
+        // Almost all screen-paint packets contain no path. Reject those with
+        // one allocation-free byte scan before attempting UTF-8 decoding or
+        // the more expensive control-sequence searches.
+        guard data.contains(0x2F),
+              data.range(of: osc8Prefix) == nil,
+              data.range(of: kittyGraphicsPrefix) == nil,
+              String(data: data, encoding: .utf8) != nil
         else { return data }
 
+        var encoded = Data()
+        encoded.reserveCapacity(data.count + 96)
+        var groundStart = data.startIndex
+        var index = data.startIndex
+        while index < data.endIndex {
+            guard data[index] == 0x1B else {
+                index = data.index(after: index)
+                continue
+            }
+            appendDecoratedGround(data[groundStart..<index], to: &encoded)
+            let controlEnd = terminalControlEnd(in: data, startingAt: index)
+            encoded.append(contentsOf: data[index..<controlEnd])
+            index = controlEnd
+            groundStart = controlEnd
+        }
+        appendDecoratedGround(data[groundStart..<data.endIndex], to: &encoded)
+        return encoded
+    }
+
+    private static func appendDecoratedGround(
+        _ bytes: Data.SubSequence,
+        to output: inout Data
+    ) {
+        guard !bytes.isEmpty,
+              let text = String(data: Data(bytes), encoding: .utf8),
+              text.contains("/") else {
+            output.append(contentsOf: bytes)
+            return
+        }
+
         let links = TerminalLinkScanner.links(in: text)
-        guard !links.isEmpty else { return data }
-        var encoded = ""
-        encoded.reserveCapacity(text.utf8.count + links.count * 48)
+        guard !links.isEmpty else {
+            output.append(contentsOf: bytes)
+            return
+        }
+        var decorated = ""
+        decorated.reserveCapacity(text.utf8.count + links.count * 48)
         var cursor = text.startIndex
         for link in links {
-            encoded.append(contentsOf: text[cursor..<link.range.lowerBound])
-            encoded.append("\u{001B}]8;;\(link.destination)\u{001B}\\")
-            encoded.append(contentsOf: text[link.range])
-            encoded.append("\u{001B}]8;;\u{001B}\\")
+            decorated.append(contentsOf: text[cursor..<link.range.lowerBound])
+            decorated.append("\u{001B}]8;;\(link.destination)\u{001B}\\")
+            decorated.append(contentsOf: text[link.range])
+            decorated.append("\u{001B}]8;;\u{001B}\\")
             cursor = link.range.upperBound
         }
-        encoded.append(contentsOf: text[cursor...])
-        return Data(encoded.utf8)
+        decorated.append(contentsOf: text[cursor...])
+        output.append(contentsOf: decorated.utf8)
+    }
+
+    private static func terminalControlEnd(
+        in data: Data,
+        startingAt escape: Data.Index
+    ) -> Data.Index {
+        var index = data.index(after: escape)
+        guard index < data.endIndex else { return index }
+        let introducer = data[index]
+        index = data.index(after: index)
+
+        switch introducer {
+        case 0x5B: // CSI: ESC [ ... final byte in 0x40...0x7E
+            while index < data.endIndex {
+                let byte = data[index]
+                index = data.index(after: index)
+                if (0x40...0x7E).contains(byte) { break }
+            }
+            return index
+
+        case 0x5D: // OSC: ESC ] ... BEL or ST
+            return stringControlEnd(in: data, from: index, allowsBEL: true)
+
+        case 0x50, 0x58, 0x5E, 0x5F: // DCS, SOS, PM, APC: terminated by ST
+            return stringControlEnd(in: data, from: index, allowsBEL: false)
+
+        default:
+            // ISO 2022 escape sequences may contain intermediate bytes before
+            // one final byte. Most terminal escapes are two bytes, so this is
+            // both complete and cheap for the common case.
+            if (0x20...0x2F).contains(introducer) {
+                while index < data.endIndex {
+                    let byte = data[index]
+                    index = data.index(after: index)
+                    if (0x30...0x7E).contains(byte) { break }
+                }
+            }
+            return index
+        }
+    }
+
+    private static func stringControlEnd(
+        in data: Data,
+        from start: Data.Index,
+        allowsBEL: Bool
+    ) -> Data.Index {
+        var index = start
+        while index < data.endIndex {
+            let byte = data[index]
+            index = data.index(after: index)
+            if allowsBEL, byte == 0x07 { return index }
+            if byte == 0x1B, index < data.endIndex, data[index] == 0x5C {
+                return data.index(after: index)
+            }
+        }
+        return index
     }
 }
 
@@ -338,7 +508,7 @@ private enum TerminalLinkScanner {
 
     private static func supportsFile(_ path: String) -> Bool {
         if path.hasPrefix("/tmp/claude-") { return true }
-        return fileExtensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased())
+        return fileExtensions.contains(TerminalPathSyntax.pathExtension(path))
     }
 
     private static func firstRange(

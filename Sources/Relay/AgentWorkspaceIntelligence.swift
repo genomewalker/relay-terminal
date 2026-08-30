@@ -138,9 +138,12 @@ enum AgentInboxScope: String, CaseIterable, Identifiable {
 final class AgentIntelligenceStore: ObservableObject {
     static let shared = AgentIntelligenceStore()
 
-    @Published private(set) var items: [AgentInboxItem] = []
+    private(set) var items: [AgentInboxItem] = []
+    @Published private var publicationRevision: UInt64 = 0
     private let fileURL: URL
     private let persistenceEnabled: Bool
+    private var itemIDs: Set<String> = []
+    private var publicationTask: Task<Void, Never>?
     private var persistenceTask: Task<Void, Never>?
     private var persistenceRevision: UInt64 = 0
     private var summaryTasks: [String: Task<Void, Never>] = [:]
@@ -165,6 +168,7 @@ final class AgentIntelligenceStore: ObservableObject {
     }
 
     deinit {
+        publicationTask?.cancel()
         persistenceTask?.cancel()
         summaryTasks.values.forEach { $0.cancel() }
     }
@@ -172,7 +176,7 @@ final class AgentIntelligenceStore: ObservableObject {
     @discardableResult
     func record(_ event: AgentInboxEvent) -> String {
         let eventID = Self.identity(for: event)
-        guard !items.contains(where: { $0.id == eventID }) else { return eventID }
+        guard itemIDs.insert(eventID).inserted else { return eventID }
         let item = AgentInboxItem(
             id: eventID,
             paneID: event.paneID,
@@ -190,6 +194,7 @@ final class AgentIntelligenceStore: ObservableObject {
         )
         items.insert(item, at: 0)
         prune()
+        schedulePublication()
         schedulePersistence()
         scheduleSummary(for: item)
         return eventID
@@ -198,17 +203,21 @@ final class AgentIntelligenceStore: ObservableObject {
     func markRead(_ id: String) {
         guard let index = items.firstIndex(where: { $0.id == id }), !items[index].isRead else { return }
         items[index].isRead = true
+        schedulePublication()
         schedulePersistence()
     }
 
     func markAllRead() {
         guard items.contains(where: { !$0.isRead }) else { return }
         for index in items.indices { items[index].isRead = true }
+        schedulePublication()
         schedulePersistence()
     }
 
     func removeReadItems() {
         items.removeAll { $0.isRead }
+        itemIDs = Set(items.map(\.id))
+        schedulePublication()
         schedulePersistence()
     }
 
@@ -240,19 +249,24 @@ final class AgentIntelligenceStore: ObservableObject {
             self.items[index].title = summary.title
             self.items[index].detail = summary.detail
             self.items[index].summarySource = .onDevice
+            self.schedulePublication()
             self.schedulePersistence()
         }
     }
 
     private func prune() {
+        let originalCount = items.count
         let cutoff = Date().addingTimeInterval(-60 * 60 * 24 * 45)
         items.removeAll { $0.isRead && $0.occurredAt < cutoff }
+        var replacedItems = items.count != originalCount
         if items.count > maximumItems {
             let unread = items.filter { !$0.isRead }
             let read = items.filter(\.isRead)
             items = Array((unread + read).prefix(maximumItems))
                 .sorted { $0.occurredAt > $1.occurredAt }
+            replacedItems = true
         }
+        if replacedItems { itemIDs = Set(items.map(\.id)) }
     }
 
     private func load() {
@@ -262,6 +276,21 @@ final class AgentIntelligenceStore: ObservableObject {
               let decoded = try? JSONDecoder.agentIntelligence.decode([AgentInboxItem].self, from: data) else { return }
         items = decoded.sorted { $0.occurredAt > $1.occurredAt }
         prune()
+    }
+
+    /// Agent state can arrive as a replay containing hundreds of events. A
+    /// published array used to invalidate the whole workspace once per event,
+    /// sometimes while SwiftUI was already updating the sidebar. Publish once
+    /// on the next main-actor turn so the data stays immediately available to
+    /// callers without creating an AttributeGraph feedback loop.
+    private func schedulePublication() {
+        guard publicationTask == nil else { return }
+        publicationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.publicationTask = nil
+            self.publicationRevision &+= 1
+        }
     }
 
     private func schedulePersistence() {
@@ -407,23 +436,38 @@ final class AgentInboxSearchController: ObservableObject {
     @Published private(set) var isRefining = false
     @Published private(set) var usedSystemIntelligence = false
     private var task: Task<Void, Never>?
+    private var scheduledSearchTask: Task<Void, Never>?
 
-    deinit { task?.cancel() }
+    deinit {
+        task?.cancel()
+        scheduledSearchTask?.cancel()
+    }
+
+    func scheduleSearch(items: [AgentInboxItem], query: String, scope: AgentInboxScope) {
+        scheduledSearchTask?.cancel()
+        scheduledSearchTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.scheduledSearchTask = nil
+            self.search(items: items, query: query, scope: scope)
+        }
+    }
 
     func search(items: [AgentInboxItem], query: String, scope: AgentInboxScope) {
         task?.cancel()
-        usedSystemIntelligence = false
+        if usedSystemIntelligence { usedSystemIntelligence = false }
         let lexical = AgentInboxSearch.rank(items, query: query, scope: scope)
-        visibleIDs = lexical.map(\.id)
+        let lexicalIDs = lexical.map(\.id)
+        if visibleIDs != lexicalIDs { visibleIDs = lexicalIDs }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard RelayPreferences.shared.intelligenceEnabled,
               RelayPreferences.shared.semanticAgentSearch,
               trimmed.count >= 3,
               lexical.count > 2 else {
-            isRefining = false
+            if isRefining { isRefining = false }
             return
         }
-        isRefining = true
+        if !isRefining { isRefining = true }
         let candidates = Array(lexical.prefix(32))
         task = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(280))
@@ -432,12 +476,13 @@ final class AgentInboxSearchController: ObservableObject {
                 query: trimmed, candidates: candidates, limit: min(candidates.count, 40)
             )
             guard let self, !Task.isCancelled else { return }
-            self.isRefining = false
+            if self.isRefining { self.isRefining = false }
             guard !ids.isEmpty else { return }
             let allowed = Set(candidates.map(\.id))
             let ordered = ids.filter(allowed.contains)
-            self.visibleIDs = ordered + candidates.map(\.id).filter { !Set(ordered).contains($0) }
-            self.usedSystemIntelligence = true
+            let refinedIDs = ordered + candidates.map(\.id).filter { !Set(ordered).contains($0) }
+            if self.visibleIDs != refinedIDs { self.visibleIDs = refinedIDs }
+            if !self.usedSystemIntelligence { self.usedSystemIntelligence = true }
         }
     }
 }

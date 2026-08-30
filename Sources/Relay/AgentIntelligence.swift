@@ -156,9 +156,23 @@ final class AgentAttentionController: ObservableObject {
     @Published private(set) var snapshot: AgentAttentionSnapshot = .empty
     @Published private(set) var isRefining = false
     private var rankingTask: Task<Void, Never>?
+    private var scheduledRefreshTask: Task<Void, Never>?
     private var fingerprint = ""
 
-    deinit { rankingTask?.cancel() }
+    deinit {
+        rankingTask?.cancel()
+        scheduledRefreshTask?.cancel()
+    }
+
+    func scheduleRefresh(agents: [SubagentActivity], paneID: UUID, limit: Int = 9) {
+        scheduledRefreshTask?.cancel()
+        scheduledRefreshTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.scheduledRefreshTask = nil
+            self.refresh(agents: agents, paneID: paneID, limit: limit)
+        }
+    }
 
     func refresh(agents: [SubagentActivity], paneID: UUID, limit: Int = 9) {
         let nextFingerprint = AgentAttentionPolicy.fingerprint(agents)

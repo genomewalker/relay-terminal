@@ -1,6 +1,185 @@
+import AppKit
+import Combine
 import Foundation
 import Testing
 @testable import Relay
+
+@Test("Energy policy buffers background terminals and occludes their surfaces")
+func terminalEnergyPolicyBuffersBackgroundWork() {
+    #expect(!TerminalEnergyPolicy.pausesTerminalEmulation(
+        isPresented: true,
+        applicationVisible: true
+    ))
+    #expect(TerminalEnergyPolicy.pausesTerminalEmulation(
+        isPresented: true,
+        applicationVisible: false
+    ))
+    #expect(TerminalEnergyPolicy.pausesTerminalEmulation(
+        isPresented: false,
+        applicationVisible: true
+    ))
+    #expect(TerminalEnergyPolicy.showsSurface(isPresented: true, applicationVisible: true))
+    #expect(!TerminalEnergyPolicy.showsSurface(isPresented: true, applicationVisible: false))
+    #expect(!TerminalEnergyPolicy.showsSurface(isPresented: false, applicationVisible: true))
+}
+
+@Test("Side panel HTTP parser waits for complete bodies and requires its token")
+func sidePanelRequestParsingAndAuthentication() {
+    let prefix = "POST /api/panes/00000000-0000-0000-0000-000000000001/prompt HTTP/1.1\r\n" +
+        "Host: 127.0.0.1\r\nX-Relay-Token: secret\r\nContent-Length: 12\r\n\r\n"
+    #expect(RelaySidePanelHTTPRequest.parse(Data((prefix + "{\"text\":\"a").utf8)) == .incomplete)
+    let parsed = RelaySidePanelHTTPRequest.parse(Data((prefix + "{\"text\":\"a\"}").utf8))
+    guard case .request(let request) = parsed else {
+        Issue.record("Expected a complete side-panel request")
+        return
+    }
+    #expect(request.method == "POST")
+    #expect(request.isAuthorized(token: "secret"))
+    #expect(!request.isAuthorized(token: "other"))
+    #expect(String(decoding: request.body, as: UTF8.self) == "{\"text\":\"a\"}")
+}
+
+@Test("Side panel WebSocket requires the loopback origin and both protocols")
+func sidePanelWebSocketAuthentication() {
+    let request = RelaySidePanelHTTPRequest(
+        method: "GET",
+        path: "/api/panes/00000000-0000-0000-0000-000000000001/terminal",
+        headers: [
+            "upgrade": "websocket",
+            "connection": "keep-alive, Upgrade",
+            "origin": "http://127.0.0.1:47471",
+            "sec-websocket-protocol": "relay-v1, secret",
+        ],
+        body: Data()
+    )
+    #expect(request.isAuthorizedWebSocket(token: "secret"))
+    #expect(!request.isAuthorizedWebSocket(token: "other"))
+    let hostileOrigin = RelaySidePanelHTTPRequest(
+        method: request.method,
+        path: request.path,
+        headers: request.headers.merging(["origin": "https://example.com"]) { _, new in new },
+        body: Data()
+    )
+    #expect(!hostileOrigin.isAuthorizedWebSocket(token: "secret"))
+}
+
+@Test("Side panel WebSocket framing follows RFC 6455 and rejects unsafe control frames")
+func sidePanelWebSocketFraming() {
+    #expect(
+        RelaySidePanelWebSocket.acceptValue(for: "dGhlIHNhbXBsZSBub25jZQ==") ==
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    )
+
+    let payload = Data([0x01, 0x61, 0x62, 0x63])
+    let mask: [UInt8] = [0x37, 0xFA, 0x21, 0x3D]
+    var wire = Data([0x82, 0x80 | UInt8(payload.count)])
+    wire.append(contentsOf: mask)
+    wire.append(contentsOf: payload.enumerated().map { index, byte in
+        byte ^ mask[index & 3]
+    })
+    guard case .frame(let frame) = RelaySidePanelWebSocket.parseClientFrame(&wire) else {
+        Issue.record("Expected one complete masked binary frame")
+        return
+    }
+    #expect(frame.final)
+    #expect(frame.opcode == 0x2)
+    #expect(frame.payload == payload)
+    #expect(wire.isEmpty)
+
+    // Data.removeFirst advances Data.startIndex. A second frame in the same
+    // network read must therefore use indices relative to the new start.
+    let secondPayload = Data([0x03])
+    var firstAndSecond = Data([0x82, 0x81])
+    firstAndSecond.append(contentsOf: mask)
+    firstAndSecond.append(secondPayload[secondPayload.startIndex] ^ mask[0])
+    firstAndSecond.append(Data([0x82, 0x81]))
+    firstAndSecond.append(contentsOf: mask)
+    firstAndSecond.append(secondPayload[secondPayload.startIndex] ^ mask[0])
+    guard case .frame = RelaySidePanelWebSocket.parseClientFrame(&firstAndSecond),
+          case .frame(let secondFrame) = RelaySidePanelWebSocket.parseClientFrame(&firstAndSecond) else {
+        Issue.record("Expected consecutive frames from one network read")
+        return
+    }
+    #expect(secondFrame.payload == secondPayload)
+    #expect(firstAndSecond.isEmpty)
+
+    var unmasked = Data([0x82, 0x01, 0x00])
+    guard case .invalid = RelaySidePanelWebSocket.parseClientFrame(&unmasked) else {
+        Issue.record("Client frames must be masked")
+        return
+    }
+    var fragmentedPing = Data([0x09, 0x80, 0, 0, 0, 0])
+    guard case .invalid = RelaySidePanelWebSocket.parseClientFrame(&fragmentedPing) else {
+        Issue.record("Control frames must not be fragmented")
+        return
+    }
+}
+
+@Test("Side panel keeps pane history out of the polled workspace index")
+@MainActor
+func sidePanelIndexAndDetailAreSeparated() throws {
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    let state = workspace.sidePanelState()
+    let paneID = try #require(workspace.activePaneID)
+    let detail = try #require(workspace.sidePanelDetail(for: paneID))
+
+    #expect(state.version == 3)
+    #expect(detail.id == paneID.uuidString.lowercased())
+    let encodedIndex = try JSONEncoder().encode(state)
+    let indexObject = try #require(
+        JSONSerialization.jsonObject(with: encodedIndex) as? [String: Any]
+    )
+    let sessions = try #require(indexObject["sessions"] as? [[String: Any]])
+    let tabs = try #require(sessions.first?["tabs"] as? [[String: Any]])
+    let panes = try #require(tabs.first?["panes"] as? [[String: Any]])
+    #expect(panes.first?["context"] == nil)
+    #expect(panes.first?["subagents"] == nil)
+    #expect(panes.first?["terminalAvailable"] as? Bool == false)
+}
+
+@Test("Side panel gives each pane one input and geometry owner")
+func sidePanelInputOwnershipIsLastClaimWinsAndIdentitySafe() {
+    let paneID = UUID()
+    let first = UUID()
+    let second = UUID()
+    var ownership = RelaySidePanelInputOwnership()
+
+    ownership.claim(socketID: first, paneID: paneID)
+    #expect(ownership.owns(socketID: first, paneID: paneID))
+    #expect(!ownership.owns(socketID: second, paneID: paneID))
+
+    ownership.claim(socketID: second, paneID: paneID)
+    #expect(!ownership.owns(socketID: first, paneID: paneID))
+    #expect(ownership.owns(socketID: second, paneID: paneID))
+
+    // A stale blur/close from the old client must not revoke the new owner.
+    let staleRelease = ownership.release(socketID: first, paneID: paneID)
+    #expect(!staleRelease)
+    #expect(ownership.owns(socketID: second, paneID: paneID))
+    let ownerRelease = ownership.release(socketID: second, paneID: paneID)
+    #expect(ownerRelease)
+    #expect(!ownership.owns(socketID: second, paneID: paneID))
+}
+
+@Test("Remote status decodes event-driven terminal client counts")
+func remoteStatusClientCount() throws {
+    let payload = Data(#"{"state":"clients","client_count":3}"#.utf8)
+    let status = try JSONDecoder().decode(StatusWirePayload.self, from: payload)
+    #expect(status.state == "clients")
+    #expect(status.clientCount == 3)
+}
+
+@Test("Performance counters expose cumulative terminal traffic")
+func cumulativePerformanceCounters() {
+    let before = RelayPerformance.shared.snapshot()
+    RelayPerformance.shared.recordTerminalInput(bytes: 7)
+    RelayPerformance.shared.recordTerminalBatch(bytes: 11, pendingBytes: 13)
+    let after = RelayPerformance.shared.snapshot()
+    #expect(after.terminalInputBytes >= before.terminalInputBytes + 7)
+    #expect(after.terminalOutputBytes >= before.terminalOutputBytes + 11)
+    #expect(after.terminalBatches >= before.terminalBatches + 1)
+    #expect(after.maximumPendingBytes >= 13)
+}
 
 @Test("Nested splits preserve pane ordering")
 func nestedSplits() {
@@ -164,6 +343,19 @@ func hyperlinkEncoderPreservesKittyImages() {
     #expect(ArtifactHyperlinkEncoder.encode(payload) == payload)
 }
 
+@Test("Hyperlink decoration preserves shell integration control strings")
+func hyperlinkEncoderPreservesShellIntegrationControls() {
+    let osc7 = "\u{001B}]7;file://host/maps/project\u{0007}"
+    let prompt = "\u{001B}]133;P;k=i\u{0007}[user] $ \u{001B}]133;B\u{0007}"
+    let visible = "open /maps/project/main.rs\r\n"
+    let encoded = ArtifactHyperlinkEncoder.encode(Data((osc7 + prompt + visible).utf8))
+    let output = String(decoding: encoded, as: UTF8.self)
+
+    #expect(output.hasPrefix(osc7 + prompt))
+    #expect(output.contains("\u{001B}]8;;file:///__relay_remote_file__/"))
+    #expect(!output.prefix((osc7 + prompt).count).contains("\u{001B}]8;"))
+}
+
 @MainActor
 @Test("A tab tracks tiled and floating panes together")
 func tabIncludesFloatingPanes() {
@@ -251,9 +443,37 @@ func multipleTabsPerSession() {
     workspace.shutdown()
 }
 
+@MainActor
+@Test("Tabs can be dragged in both directions and across the pinned boundary")
+func tabReordering() {
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    workspace.newTab(profile: .sshConfigHost("tab-reorder-host"))
+    let first = workspace.selectedTab!
+    workspace.newTabInActiveSession()
+    let second = workspace.selectedTab!
+    workspace.newTabInActiveSession()
+    let third = workspace.selectedTab!
+
+    workspace.moveTab(third.id, relativeTo: first.id, placement: .before)
+    #expect(workspace.orderedTabs(in: first.sessionID).map(\.id) == [third.id, first.id, second.id])
+
+    workspace.moveTab(third.id, relativeTo: second.id, placement: .after)
+    #expect(workspace.orderedTabs(in: first.sessionID).map(\.id) == [first.id, second.id, third.id])
+
+    workspace.toggleTabPin(first.id)
+    workspace.moveTab(third.id, relativeTo: first.id, placement: .before)
+    #expect(workspace.isTabPinned(third.id))
+    #expect(workspace.orderedTabs(in: first.sessionID).map(\.id) == [third.id, first.id, second.id])
+
+    workspace.moveTab(first.id, relativeTo: second.id, placement: .after)
+    #expect(!workspace.isTabPinned(first.id))
+    #expect(workspace.orderedTabs(in: first.sessionID).map(\.id) == [third.id, second.id, first.id])
+    workspace.shutdown()
+}
+
 @Test("Remote catalog groups durable workspaces and leaves old panes recoverable")
 func remoteCatalogGrouping() throws {
-    let data = Data(#"{"schema":1,"revision":7,"node_id":"node","node_name":"dandy-07","panes":[{"pane_id":"11111111-1111-1111-1111-111111111111","workspace_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","tab_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","content_kind":"terminal","state":"running","last_sequence":9,"recoverable":true,"unfiled":false},{"pane_id":"22222222-2222-2222-2222-222222222222","content_kind":"terminal","state":"running","last_sequence":3,"recoverable":true,"unfiled":true}]}"#.utf8)
+    let data = Data(#"{"schema":1,"revision":7,"node_id":"node","node_name":"hpc-login","panes":[{"pane_id":"11111111-1111-1111-1111-111111111111","workspace_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","tab_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","content_kind":"terminal","state":"running","last_sequence":9,"recoverable":true,"unfiled":false},{"pane_id":"22222222-2222-2222-2222-222222222222","content_kind":"terminal","state":"running","last_sequence":3,"recoverable":true,"unfiled":true}]}"#.utf8)
     let snapshot = try JSONDecoder().decode(RemoteCatalogSnapshot.self, from: data)
 
     #expect(snapshot.sessions.count == 2)
@@ -290,7 +510,7 @@ func attachRemoteCatalogSession() {
         workspaceSnapshot: nil
     )
 
-    workspace.attachRemoteSession(profile: .sshConfigHost("dandy-07"), remote: remote)
+    workspace.attachRemoteSession(profile: .sshConfigHost("hpc-login"), remote: remote)
 
     #expect(workspace.selectedTabID == tabID)
     #expect(workspace.selectedTab?.sessionID == sessionID)
@@ -309,7 +529,7 @@ func attachIndividualRemotePane() {
     let tabID = UUID()
     let existingPaneID = UUID()
     let missingPaneID = UUID()
-    let profile = ConnectionProfile.sshConfigHost("dandy-07")
+    let profile = ConnectionProfile.sshConfigHost("hpc-login")
 
     func catalogPane(_ paneID: UUID, title: String) -> RemoteCatalogPane {
         RemoteCatalogPane(
@@ -357,7 +577,7 @@ func attachIndividualRemotePane() {
 @Test("A closed remote pane can be reopened without creating a new remote session")
 func reopenClosedRemotePane() {
     let workspace = WorkspaceModel(restoreSavedWorkspace: false)
-    workspace.newTab(profile: .sshConfigHost("dandy-07"))
+    workspace.newTab(profile: .sshConfigHost("hpc-login"))
     let tabID = workspace.selectedTabID!
     let paneID = workspace.activePaneID!
 
@@ -389,7 +609,7 @@ func attachRemoteWorkspaceLayout() {
     let terminalID = UUID()
     let editorID = UUID()
     let splitID = UUID()
-    let profile = ConnectionProfile.sshConfigHost("dandy-07")
+    let profile = ConnectionProfile.sshConfigHost("hpc-login")
     let layout = PaneLayout.pane(terminalID)
     let floating = FloatingPanePlacement(
         paneID: editorID, originX: 90, originY: 70, width: 640, height: 440
@@ -516,6 +736,21 @@ func fullScreenChrome() {
     #expect(workspace.sidebarVisible)
 }
 
+@MainActor
+@Test("Only explicit chrome can move the workspace window")
+func workspaceBackgroundDoesNotStealContentDrags() {
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 800, height: 500),
+        styleMask: [.titled],
+        backing: .buffered,
+        defer: false
+    )
+    let marker = RelayWorkspaceWindowMarker.MarkerView(frame: .zero)
+    window.contentView = marker
+    marker.configureWindow()
+    #expect(!window.isMovableByWindowBackground)
+}
+
 @Test("Agent detector recognizes Claude and approval prompts")
 func claudeAttentionSignal() {
     var detector = AgentSignalDetector()
@@ -634,6 +869,62 @@ func nodeHeartbeatWatchdog() {
     #expect(RelayHeartbeatPolicy.expired([1: 0], now: timeout - 1).isEmpty)
 }
 
+@Test("Node pane frame dispatch preserves order without blocking sibling panes")
+func nodePaneFrameDispatchIsOrderedAndIndependent() {
+    let blockedStarted = DispatchSemaphore(value: 0)
+    let releaseBlocked = DispatchSemaphore(value: 0)
+    let siblingFinished = DispatchSemaphore(value: 0)
+    let orderedFinished = DispatchSemaphore(value: 0)
+    let values = RelayNodeFrameRecorder()
+
+    let blocked = RelayNodeFrameDispatcher(label: "relay.tests.node.blocked") { _ in
+        blockedStarted.signal()
+        releaseBlocked.wait()
+    }
+    let sibling = RelayNodeFrameDispatcher(label: "relay.tests.node.sibling") { frame in
+        values.append(Int(frame.payload.first ?? 0))
+        if frame.payload.first == 100 { siblingFinished.signal() }
+    }
+    let ordered = RelayNodeFrameDispatcher(label: "relay.tests.node.ordered") { frame in
+        values.append(Int(frame.payload.first ?? 0))
+        if frame.payload.first == 10 { orderedFinished.signal() }
+    }
+
+    blocked.enqueue(RelayWireFrame(type: .output, payload: Data([1])))
+    #expect(blockedStarted.wait(timeout: .now() + 1) == .success)
+
+    sibling.enqueue(RelayWireFrame(type: .output, payload: Data([100])))
+    #expect(siblingFinished.wait(timeout: .now() + 1) == .success)
+
+    for value in 2...10 {
+        ordered.enqueue(RelayWireFrame(type: .output, payload: Data([UInt8(value)])))
+    }
+    #expect(orderedFinished.wait(timeout: .now() + 1) == .success)
+    releaseBlocked.signal()
+    blocked.close()
+    sibling.close()
+    ordered.close()
+
+    #expect(values.snapshot == [100] + Array(2...10))
+}
+
+private final class RelayNodeFrameRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Int] = []
+
+    func append(_ value: Int) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    var snapshot: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
+
 @Test("A stalled pane handshake retries forever with bounded backoff")
 func paneAttachRetryPolicy() {
     #expect(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds == 1_500)
@@ -656,6 +947,10 @@ func viewportAttachCapabilityControlsCompatibilityResize() {
     #expect(RelayTransportCapabilityPolicy.needsPostAttachResize([]))
     #expect(RelayTransportCapabilityPolicy.needsPostAttachResize(["input_ack_v1"]))
     #expect(!RelayTransportCapabilityPolicy.needsPostAttachResize(["viewport_attach_v1"]))
+    #expect(RelayTransportCapabilityPolicy.supportsViewportCommit(["viewport_commit_v1"]))
+    #expect(RelayTransportCapabilityPolicy.supportsViewportCommit(["viewport_commit_v2"]))
+    #expect(!RelayTransportCapabilityPolicy.supportsExactViewportCommit(["viewport_commit_v1"]))
+    #expect(RelayTransportCapabilityPolicy.supportsExactViewportCommit(["viewport_commit_v2"]))
 }
 
 @Test("Default keybindings are unique and close pane owns Command-W")
@@ -736,20 +1031,6 @@ func structuredCodexEvent() {
 
     pane.received("random full-screen cursor text that belongs only in the terminal")
     #expect(pane.activitySummary == "Using exec_command")
-}
-
-@MainActor
-@Test("Each structured agent completion opens one new suggestion turn")
-func structuredAgentConversationTurns() {
-    let pane = PaneModel(profile: .sshConfigHost("hpc-login"))
-    var revisions: [UInt64] = []
-    pane.onAgentTurnReady = { revisions.append($0) }
-    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"SessionStart"}}"#.utf8))
-    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"turn/completed","turn_id":"one"}}"#.utf8))
-    pane.receivedAgentEvent(Data(#"{"agent":"codex","event":{"hook_event_name":"turn/completed","turn_id":"two"}}"#.utf8))
-
-    #expect(revisions == [1, 2])
-    #expect(pane.conversationRevision == 2)
 }
 
 @MainActor
@@ -887,6 +1168,99 @@ func compactTerminalReplay() {
 
     #expect(compacted == Data("\u{001B}c\u{001B}[2J\u{001B}[Hcurrent screen".utf8))
     #expect(TerminalReplayCompactor.compact(Data("plain shell output".utf8)) == Data("plain shell output".utf8))
+
+    let prompt = "\u{001B}]133;P;k=i\u{0007}[user host]$ \u{001B}]133;B\u{0007}pending"
+    let promptStorm = Data(("old scrollback" + prompt + prompt + prompt + "latest").utf8)
+    let compactedStorm = String(decoding: TerminalReplayCompactor.compact(promptStorm), as: UTF8.self)
+    #expect(compactedStorm.hasPrefix("\u{001B}c\u{001B}]133;P;k=i"))
+    #expect(compactedStorm.hasSuffix("pendinglatest"))
+    #expect(!compactedStorm.contains("old scrollback"))
+}
+
+@Test("Terminal replay keeps the latest complete synchronized TUI frame")
+func compactSynchronizedTerminalFrames() {
+    let first = "\u{001B}[?2026h\u{001B}[10;1Hfirst frame" +
+        String(repeating: "a", count: 600) + "\u{001B}[?2026l"
+    let latest = "\u{001B}[?2026h\u{001B}[10;1Hlatest frame" +
+        String(repeating: "b", count: 600) + "\u{001B}[?2026l"
+    let incomplete = "\u{001B}[?2026h\u{001B}[11;1Hlive tail"
+    let history = Data(("old redraws" + first + latest + incomplete).utf8)
+
+    let compacted = String(decoding: TerminalReplayCompactor.compact(history), as: UTF8.self)
+
+    #expect(compacted.hasPrefix("\u{001B}c\u{001B}[?2026h"))
+    #expect(compacted.contains("latest frame"))
+    #expect(compacted.hasSuffix("live tail"))
+    #expect(!compacted.contains("old redraws"))
+    #expect(!compacted.contains("first frame"))
+}
+
+@Test("Terminal replay retains a complete base before synchronized cursor deltas")
+func compactSynchronizedTerminalDeltas() {
+    let base = "\u{001B}[?2026h\u{001B}[Hfull frame" +
+        String(repeating: "x", count: 600) + "\u{001B}[?2026l"
+    let spinner = "\u{001B}[?2026h\u{001B}[30;3HWorking\u{001B}[?2026l"
+    let history = Data(("old redraws" + base + spinner + spinner).utf8)
+
+    let compacted = String(decoding: TerminalReplayCompactor.compact(history), as: UTF8.self)
+
+    #expect(compacted.contains("full frame"))
+    #expect(compacted.components(separatedBy: "Working").count == 3)
+    #expect(!compacted.contains("old redraws"))
+}
+
+@Test("Synchronized frames inside the alternate screen retain their owner")
+func compactAlternateScreenSynchronizedFrames() {
+    let history = Data(
+        ("shell prompt\u{001B}[?1049h" +
+            "\u{001B}[?2026h\u{001B}[Hhtop frame\u{001B}[?2026l").utf8
+    )
+
+    let compacted = String(decoding: TerminalReplayCompactor.compact(history), as: UTF8.self)
+
+    #expect(compacted.contains("shell prompt"))
+    #expect(compacted.contains("\u{001B}[?1049h"))
+    #expect(compacted.hasSuffix("\u{001B}[?2026l"))
+}
+
+@Test("Terminal replay compaction preserves active TUI input modes")
+func compactTerminalReplayPreservesInputModes() {
+    let activeModes = "\u{001B}[?1h\u{001B}[?1000h\u{001B}[?1002h" +
+        "\u{001B}[?1004h\u{001B}[?1006h\u{001B}[?1007h\u{001B}[?2004h"
+    let history = Data((activeModes + "old frame\u{001B}[2J\u{001B}[Hcurrent frame").utf8)
+    let compacted = String(decoding: TerminalReplayCompactor.compact(history), as: UTF8.self)
+
+    #expect(compacted == "\u{001B}c" + activeModes + "\u{001B}[2J\u{001B}[Hcurrent frame")
+
+    let disabledBeforeBoundary = Data(
+        ("\u{001B}[?1000h\u{001B}[?1000lold frame\u{001B}[2Jcurrent frame").utf8
+    )
+    let disabledReplay = String(
+        decoding: TerminalReplayCompactor.compact(disabledBeforeBoundary),
+        as: UTF8.self
+    )
+    #expect(!disabledReplay.contains("\u{001B}[?1000h"))
+}
+
+@Test("Terminal replay compaction preserves the negotiated keyboard protocol")
+func compactTerminalReplayPreservesKeyboardProtocol() {
+    let history = Data(
+        ("\u{001B}[>1uold frame\u{001B}[2J\u{001B}[Hcurrent composer").utf8
+    )
+    let compacted = String(decoding: TerminalReplayCompactor.compact(history), as: UTF8.self)
+    #expect(compacted == "\u{001B}c\u{001B}[=1u\u{001B}[2J\u{001B}[Hcurrent composer")
+
+    let nested = Data(
+        ("\u{001B}[>1u\u{001B}[>3u\u{001B}[<uold\u{001B}[2Jcurrent").utf8
+    )
+    let nestedReplay = String(decoding: TerminalReplayCompactor.compact(nested), as: UTF8.self)
+    #expect(nestedReplay == "\u{001B}c\u{001B}[=1u\u{001B}[2Jcurrent")
+
+    let popped = Data(
+        ("\u{001B}[>1u\u{001B}[<uold\u{001B}[2Jcurrent").utf8
+    )
+    let poppedReplay = String(decoding: TerminalReplayCompactor.compact(popped), as: UTF8.self)
+    #expect(!poppedReplay.contains("\u{001B}[=1u"))
 }
 
 @Test("Live output cannot overtake a prepared reconnect screen")
@@ -946,7 +1320,7 @@ func alternateScreenExitClearsRestoredViewport() {
     #expect(filter.transform(entry) == entry)
     #expect(
         filter.transform(exitAndPrompt)
-            == Data("\u{001B}[?1049l\u{001B}[2J\u{001B}[Hrelay$ ".utf8)
+            == Data("\u{001B}[?1049l\u{001B}[0m\u{001B}[?25h\u{001B}[0 q\u{001B}[2J\u{001B}[Hrelay$ ".utf8)
     )
 }
 
@@ -958,7 +1332,7 @@ func alternateScreenCleanupHandlesSplitPacketsAndRestore() {
     #expect(filter.transform(Data("\u{001B}[?10".utf8)).isEmpty)
     #expect(
         filter.transform(Data("49lprompt".utf8))
-            == Data("\u{001B}[?1049l\u{001B}[2J\u{001B}[Hprompt".utf8)
+            == Data("\u{001B}[?1049l\u{001B}[0m\u{001B}[?25h\u{001B}[0 q\u{001B}[2J\u{001B}[Hprompt".utf8)
     )
 
     let orphan = TerminalAlternateScreenCleanupFilter()
@@ -966,6 +1340,25 @@ func alternateScreenCleanupHandlesSplitPacketsAndRestore() {
         orphan.transform(Data("\u{001B}[?1049lunchanged".utf8))
             == Data("\u{001B}[?1049lunchanged".utf8)
     )
+}
+
+@Test("Remote semantic prompt tracking survives SSH packet boundaries")
+func semanticPromptTrackingHandlesSplitPackets() {
+    let tracker = TerminalSemanticPromptStateTracker()
+
+    #expect(tracker.observe(Data("output\u{001B}]133;".utf8)) == nil)
+    #expect(tracker.observe(Data("B\u{0007}".utf8)) == true)
+    #expect(tracker.observe(Data("prompt text".utf8)) == nil)
+    #expect(tracker.observe(Data("\u{001B}]133;C\u{001B}\\".utf8)) == false)
+}
+
+@Test("Unrelated terminal OSC data cannot enable prompt editing")
+func semanticPromptTrackingIgnoresUnrelatedOSC() {
+    let tracker = TerminalSemanticPromptStateTracker()
+    #expect(tracker.observe(Data("\u{001B}]0;133;B fake title\u{0007}".utf8)) == nil)
+    #expect(tracker.observe(Data("\u{001B}]133;P;k=i\u{0007}".utf8)) == nil)
+    #expect(tracker.observe(Data("\u{001B}]133;B\u{0007}".utf8)) == true)
+    #expect(tracker.observe(Data("\u{001B}]133;B\u{0007}".utf8)) == nil)
 }
 
 @Test("Primary-screen reconnect deltas extend the cached TUI screen")
@@ -1004,6 +1397,55 @@ func terminalSnapshotBound() {
     let bounded = TerminalSnapshotStore.bounded(oversized)
     #expect(bounded.count <= TerminalSnapshotStore.maximumBytes)
     #expect(bounded.starts(with: Data("\u{001B}c".utf8)))
+}
+
+@Test("Live snapshot compaction uses a bounded high-water window")
+func liveSnapshotCompactionUsesHighWaterWindow() {
+    #expect(!TerminalSnapshotCompactionPolicy.shouldCompact(
+        byteCount: TerminalSnapshotStore.maximumBytes
+    ))
+    #expect(!TerminalSnapshotCompactionPolicy.shouldCompact(
+        byteCount: TerminalSnapshotCompactionPolicy.highWaterBytes
+    ))
+    #expect(TerminalSnapshotCompactionPolicy.shouldCompact(
+        byteCount: TerminalSnapshotCompactionPolicy.highWaterBytes + 1
+    ))
+}
+
+@Test("Already-bounded terminal snapshots avoid replay compaction")
+func terminalSnapshotSmallPassThrough() {
+    let payload = Data("prompt\u{001B}[31m ready".utf8)
+    #expect(TerminalSnapshotStore.bounded(payload) == payload)
+}
+
+@Test("Persisted agent trees keep a useful bounded tail")
+func persistedAgentStateBound() {
+    let updates = (0..<12).map { index in
+        SubagentUpdate(
+            id: UUID(), message: String(repeating: "x", count: 3_000) + "-\(index)",
+            occurredAt: Date(timeIntervalSince1970: TimeInterval(index))
+        )
+    }
+    let subagents = (0..<120).map { index in
+        SubagentActivity(
+            id: "worker-\(index)", label: "Worker \(index)",
+            startedAt: Date(timeIntervalSince1970: TimeInterval(index)),
+            provider: .codex, phase: index >= 115 ? .active : .quiet,
+            updates: updates
+        )
+    }
+    let state = PersistedAgentPaneState(
+        cursor: 42, kind: .codex, phase: .active,
+        summary: String(repeating: "s", count: 2_000),
+        subagents: subagents, activities: [], resourceUsage: nil,
+        progressPercent: nil, pendingApprovals: 0
+    ).boundedForStorage()
+
+    #expect(state.subagents.count == 100)
+    #expect(state.subagents.filter { $0.phase == .active }.count == 5)
+    #expect(state.subagents.allSatisfy { $0.updates.count <= 10 })
+    #expect(state.subagents.flatMap(\.updates).allSatisfy { $0.message.count <= 2_048 })
+    #expect(state.summary.count == 1_024)
 }
 
 @Test("relayd status distinguishes missing, healthy, and outdated hosts")
@@ -1095,6 +1537,12 @@ func terminalSnapshotWritePolicy() {
     )
 }
 
+@Test("Live terminal output is batched at display cadence")
+func liveTerminalOutputBatchPolicy() {
+    #expect(TerminalDisplayBatchPolicy.liveMilliseconds >= 8)
+    #expect(TerminalDisplayBatchPolicy.liveMilliseconds <= 17)
+}
+
 @Test("Quit-time terminal snapshots are immediately durable")
 func terminalSnapshotSynchronousSave() throws {
     let directory = FileManager.default.temporaryDirectory
@@ -1163,6 +1611,57 @@ func filterStartupDeviceResponses() {
     #expect(!TerminalDeviceResponseFilter.matches(Data("\u{001B}[97;5u".utf8)))
 }
 
+@Test("Replay filters device replies without making the terminal read-only")
+func replayKeepsUserInputWritable() {
+    #expect(TerminalWriteForwardingPolicy.shouldForward(
+        Data("hello".utf8), filteringDeviceResponses: true
+    ))
+    #expect(TerminalWriteForwardingPolicy.shouldForward(
+        Data("\u{001B}[A".utf8), filteringDeviceResponses: true
+    ))
+    #expect(TerminalWriteForwardingPolicy.shouldForward(
+        Data("\u{001B}[<0;12;4M".utf8), filteringDeviceResponses: true
+    ))
+    #expect(!TerminalWriteForwardingPolicy.shouldForward(
+        Data("\u{001B}[?62;22;52c".utf8), filteringDeviceResponses: true
+    ))
+    #expect(TerminalWriteForwardingPolicy.shouldForward(
+        Data("\u{001B}[?62;22;52c".utf8), filteringDeviceResponses: false
+    ))
+    #expect(!TerminalWriteForwardingPolicy.shouldForward(
+        Data(), filteringDeviceResponses: false
+    ))
+}
+
+@Test("Packaged Ghostty resources resolve below the app resource directory")
+func packagedGhosttyResourcePathIsDeterministic() {
+    let resources = URL(fileURLWithPath: "/Applications/Relay.app/Contents/Resources")
+    #expect(
+        RelayBundledGhosttyResources.directory(in: resources).path
+            == "/Applications/Relay.app/Contents/Resources/"
+                + "GhosttyKit_GhosttyTerminal.bundle/Ghostty"
+    )
+}
+
+@Test("Packaged Ghostty resources configure the runtime environment")
+func packagedGhosttyResourcesConfigureEnvironment() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let ghostty = RelayBundledGhosttyResources.directory(in: root)
+    try fileManager.createDirectory(at: ghostty, withIntermediateDirectories: true)
+    defer {
+        try? fileManager.removeItem(at: root)
+        unsetenv("GHOSTTY_RESOURCES_DIR")
+    }
+
+    #expect(RelayBundledGhosttyResources.configure(
+        applicationResourcesURL: root,
+        fileManager: fileManager
+    ))
+    #expect(String(cString: getenv("GHOSTTY_RESOURCES_DIR")) == ghostty.path)
+}
+
 @Test("Diagnostics redact credentials before they are retained or exported")
 func diagnosticRedaction() throws {
     #expect(RelayDiagnostics.redact("Bearer abc.def.secret") == "Bearer <redacted>")
@@ -1228,6 +1727,26 @@ func promptSelectionDeletionSequence() {
     #expect(!TerminalPromptSelectionEdit.forcesLocalSelection(agentKind: .shell))
     #expect(TerminalPromptSelectionEdit.forcesLocalSelection(agentKind: .codex))
     #expect(TerminalPromptSelectionEdit.forcesLocalSelection(agentKind: .claude))
+    #expect(TerminalPromptSelectionEdit.allowsCursorPlacement(
+        geometryIsStable: true,
+        alternateScreenIsActive: false,
+        agentPrompt: false
+    ))
+    #expect(!TerminalPromptSelectionEdit.allowsCursorPlacement(
+        geometryIsStable: true,
+        alternateScreenIsActive: true,
+        agentPrompt: false
+    ))
+    #expect(!TerminalPromptSelectionEdit.allowsCursorPlacement(
+        geometryIsStable: true,
+        alternateScreenIsActive: true,
+        agentPrompt: true
+    ))
+    #expect(!TerminalPromptSelectionEdit.allowsCursorPlacement(
+        geometryIsStable: false,
+        alternateScreenIsActive: false,
+        agentPrompt: true
+    ))
     #expect(TerminalPromptSelectionEdit.deletionSequence(for: "three words", backwards: true)
         == String(repeating: "\u{007F}", count: 11))
     #expect(TerminalPromptSelectionEdit.deletionSequence(for: "abc", backwards: false)
@@ -1256,23 +1775,126 @@ func promptSelectionDeletionSequence() {
         agentPrompt: true
     ))
     #expect(TerminalPromptSelectionEdit.cursorMovementOffset(
-        cursor: CGPoint(x: 390, y: 150),
+        cursorOrigin: CGPoint(x: 390, y: 150),
         target: CGPoint(x: 294, y: 150),
         cellSize: CGSize(width: 6, height: 14),
-        viewportWidth: 900
+        columns: 150
     ) == -16)
     #expect(TerminalPromptSelectionEdit.cursorMovementOffset(
-        cursor: CGPoint(x: 294, y: 150),
+        cursorOrigin: CGPoint(x: 294, y: 150),
         target: CGPoint(x: 390, y: 150),
         cellSize: CGSize(width: 6, height: 14),
-        viewportWidth: 900
+        columns: 150
     ) == 16)
     #expect(TerminalPromptSelectionEdit.cursorMovementOffset(
-        cursor: CGPoint(x: 390, y: 150),
+        cursorOrigin: CGPoint(x: 390, y: 150),
         target: CGPoint(x: 294, y: 170),
         cellSize: CGSize(width: 6, height: 14),
-        viewportWidth: 900
-    ) == -16)
+        columns: 150
+    ) == 134)
+    #expect(TerminalPromptSelectionEdit.cursorMovementOffset(
+        cursorOrigin: CGPoint(x: 390, y: 150),
+        target: CGPoint(x: 395.9, y: 163.9),
+        cellSize: CGSize(width: 6, height: 14),
+        columns: 150
+    ) == 0)
+}
+
+@Test("Remote prompt editing survives agent phase changes and restored lines")
+func remotePromptEditingPolicy() {
+    // Typing into an agent prompt immediately changes its conversation phase
+    // to active. That must not make the composer mouse-inert mid-turn.
+    #expect(TerminalPromptSelectionEdit.promptEditingIsActive(
+        agentPrompt: true,
+        hasLocalInput: true,
+        agentPhaseAllowsEditing: false,
+        semanticShellPromptActive: false
+    ))
+    #expect(!TerminalPromptSelectionEdit.promptEditingIsActive(
+        agentPrompt: true,
+        hasLocalInput: false,
+        agentPhaseAllowsEditing: false,
+        semanticShellPromptActive: false
+    ))
+
+    // A restored SSH line has no trustworthy local text mirror. Its semantic
+    // prompt marker still permits one bounded visual arrow packet.
+    #expect(TerminalPromptSelectionEdit.promptEditingIsActive(
+        agentPrompt: false,
+        hasLocalInput: false,
+        agentPhaseAllowsEditing: false,
+        semanticShellPromptActive: true
+    ))
+    #expect(TerminalPromptSelectionEdit.resolvedMovementOffset(
+        visualOffset: -37,
+        mirroredOffset: nil,
+        mirrorIsReliable: false,
+        allowsRemoteVisualFallback: true
+    ) == -37)
+    #expect(TerminalPromptSelectionEdit.resolvedMovementOffset(
+        visualOffset: -37,
+        mirroredOffset: -4,
+        mirrorIsReliable: true,
+        allowsRemoteVisualFallback: true
+    ) == -4)
+    #expect(TerminalPromptSelectionEdit.resolvedMovementOffset(
+        visualOffset: -37,
+        mirroredOffset: nil,
+        mirrorIsReliable: true,
+        allowsRemoteVisualFallback: true
+    ) == nil)
+    #expect(TerminalPromptSelectionEdit.resolvedMovementOffset(
+        visualOffset: 2_000,
+        mirroredOffset: nil,
+        mirrorIsReliable: false,
+        allowsRemoteVisualFallback: true
+    ) == nil)
+}
+
+@Test("Viewport repaint barriers distinguish replacement output from ordinary output")
+func viewportRepaintBarrierPolicy() {
+    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
+        Data("\u{001B}]133;A\u{0007}$ prompt".utf8), rows: 40
+    ))
+    #expect(TerminalViewportRepaintPolicy.needsClearBarrier(
+        Data(("\u{001B}[1;1Hfirst" + String(repeating: "x", count: 80) +
+            "\u{001B}[2;1Hsecond\u{001B}[3;1Hthird").utf8), rows: 40
+    ))
+    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
+        Data("ordinary build output\r\nnext line\r\n".utf8), rows: 40
+    ))
+    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
+        Data("\r\u{001B}[2K[user@host project]$ pending input".utf8), rows: 40
+    ))
+    let coloredOutput = String(repeating: "\u{001B}[38;5;42mgreen\u{001B}[0m ", count: 12)
+    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
+        Data(coloredOutput.utf8), rows: 40
+    ))
+    let semanticPromptRepaint = "\r\u{001B}[K\u{001B}]133;P;k=i\u{0007}" +
+        String(repeating: "[user@host project] ", count: 5) +
+        "$ \u{001B}]133;B\u{0007}pending command"
+    #expect(TerminalViewportRepaintPolicy.needsClearBarrier(
+        Data(semanticPromptRepaint.utf8), rows: 40
+    ))
+    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
+        Data("\u{001B}[2J\u{001B}[Halready clears".utf8), rows: 40
+    ))
+
+    let synchronizedFrame = "\u{001B}[?2026h\u{001B}[H" +
+        String(repeating: "frame", count: 120) + "\u{001B}[?2026l"
+    #expect(TerminalViewportRepaintPolicy.hasCompleteReplacement(
+        Data(synchronizedFrame.utf8), rows: 40
+    ))
+    #expect(!TerminalViewportRepaintPolicy.hasCompleteReplacement(
+        Data("\u{001B}[2J\u{001B}[H".utf8), rows: 40
+    ))
+    #expect(TerminalViewportRepaintPolicy.hasCompleteReplacement(
+        Data(("\u{001B}[2J\u{001B}[H" + String(repeating: "content", count: 100)).utf8),
+        rows: 40
+    ))
+    #expect(!TerminalViewportRepaintPolicy.hasCompleteReplacement(
+        Data("ordinary build output\r\nnext line\r\n".utf8), rows: 40
+    ))
 }
 
 @Test("Terminal links route web, image, and source paths natively")
@@ -1287,6 +1909,21 @@ func terminalLinkRouting() {
 
     let web = URL(string: "https://example.com/docs?q=relay")!
     #expect(TerminalLinkResolver.target(from: web.absoluteString) == .web(web))
+}
+
+@Test("Terminal path classification is lexical and handles HPC paths")
+func terminalPathClassificationIsLexical() {
+    #expect(TerminalPathSyntax.lastComponent("/maps/projects/team/main.swift") == "main.swift")
+    #expect(TerminalPathSyntax.lastComponent("/maps/projects/team/") == "team")
+    #expect(TerminalPathSyntax.pathExtension("/maps/projects/team/archive.TAR.GZ") == "gz")
+    #expect(TerminalPathSyntax.pathExtension("/maps/projects/team/.env") == "")
+    #expect(TerminalPathSyntax.parentDirectory("/maps/projects/team/main.swift") == "/maps/projects/team")
+    #expect(TerminalPathSyntax.parentDirectory("/main.swift") == "/")
+    #expect(
+        TerminalPathSyntax.resolving("../shared/./main.rs", against: "/maps/projects/team")
+            == "/maps/projects/shared/main.rs"
+    )
+    #expect(TerminalLinkResolver.isImagePath("/maps/projects/team/figure.PNG"))
 }
 
 @Test("Code paths and URLs become clickable without changing visible output")
@@ -1372,11 +2009,123 @@ func terminalGeometryRejectsInvalidTransitionalViewSizes() {
     #expect(TerminalGeometry.accepts(NSSize(width: 640, height: 360)))
 }
 
+@Test("Remote viewport prediction preserves the live surface until commit")
+func remoteViewportPredictionUsesBackingPixels() {
+    let viewport = TerminalViewportGeometry.predictedViewport(
+        bounds: CGSize(width: 610, height: 400),
+        backingScaleFactor: 2,
+        cellWidthPixels: 10,
+        cellHeightPixels: 20
+    )
+    #expect(viewport == RelayViewport(columns: 122, rows: 40))
+    #expect(TerminalViewportGeometry.predictedViewport(
+        bounds: .zero,
+        backingScaleFactor: 2,
+        cellWidthPixels: 10,
+        cellHeightPixels: 20
+    ) == nil)
+}
+
+@Test("Split geometry never forwards invalid transition sizes to AppKit")
+func splitGeometrySanitizesInvalidTransitionSizes() {
+    let negative = RelaySplitGeometry(
+        proposedSize: CGSize(width: -640, height: -360),
+        axis: .horizontal,
+        ratio: 0.5
+    )
+    #expect(negative.size == .zero)
+    #expect(negative.divider == 0)
+    #expect(negative.firstLength == 0)
+    #expect(negative.secondLength == 0)
+
+    let invalidRatio = RelaySplitGeometry(
+        proposedSize: CGSize(width: 1_000, height: 600),
+        axis: .horizontal,
+        ratio: .nan
+    )
+    #expect(invalidRatio.ratio == 0.5)
+    #expect(invalidRatio.firstLength >= 0)
+    #expect(invalidRatio.secondLength >= 0)
+    #expect(invalidRatio.firstLength + invalidRatio.secondLength == invalidRatio.available)
+}
+
 @Test("Remote resize waits for committed pane geometry")
 func terminalResizePolicyWaitsForStableGeometry() {
     #expect(TerminalResizePolicy.debounceMilliseconds >= 50)
     #expect(TerminalResizePolicy.revealAfterCommitMilliseconds >= 32)
     #expect(TerminalResizePolicy.revealAfterCommitMilliseconds < 100)
+}
+
+@Test("Native terminal reclaims geometry after browser ownership")
+func nativeTerminalReclaimsGeometryAfterBrowserOwnership() {
+    let native = RelayViewport(columns: 82, rows: 28)
+    let browser = RelayViewport(columns: 127, rows: 57)
+
+    #expect(TerminalViewportOwnershipPolicy.needsNativeReclaim(
+        native: native,
+        committed: browser
+    ))
+    #expect(TerminalViewportOwnershipPolicy.needsNativeReclaim(
+        native: native,
+        committed: nil
+    ))
+    #expect(!TerminalViewportOwnershipPolicy.needsNativeReclaim(
+        native: native,
+        committed: native
+    ))
+}
+
+@Test("Terminal bottom detection is overflow safe")
+func terminalBottomDetectionIsOverflowSafe() {
+    #expect(TerminalViewportPosition.isAtBottom(.init(total: 100, offset: 76, len: 24)))
+    #expect(!TerminalViewportPosition.isAtBottom(.init(total: 100, offset: 75, len: 24)))
+    #expect(TerminalViewportPosition.isAtBottom(.init(total: 20, offset: .max, len: 5)))
+}
+
+@Test("Stale SwiftUI teardown cannot hide a newer terminal attachment")
+func staleTerminalPresentationAttachmentIsIgnored() {
+    var state = TerminalPresentationAttachmentState()
+    let outgoingLease = UUID()
+    let incomingLease = UUID()
+    let outgoingGeneration = state.begin(lease: outgoingLease)
+    let outgoingPresented = state.setPresented(
+        true, lease: outgoingLease, generation: outgoingGeneration
+    )
+    #expect(outgoingPresented)
+
+    let incomingGeneration = state.begin(lease: incomingLease)
+    let staleEndAccepted = state.end(
+        lease: outgoingLease, generation: outgoingGeneration
+    )
+    #expect(!staleEndAccepted)
+    #expect(state.currentLease == incomingLease)
+    let incomingPresented = state.setPresented(
+        true, lease: incomingLease, generation: incomingGeneration
+    )
+    #expect(incomingPresented)
+    #expect(state.isPresented)
+}
+
+@Test("Viewport transactions retain generation and final geometry")
+func viewportTransactionsRetainGenerationAndGeometry() {
+    let payload = RelayWireFrame.viewportCommitPayload(
+        generation: 42,
+        columns: 160,
+        rows: 48
+    )
+    #expect(payload.count == 12)
+    #expect(payload.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) } == 42)
+    #expect(payload.dropFirst(8).prefix(2).reduce(UInt16(0)) { ($0 << 8) | UInt16($1) } == 160)
+    #expect(payload.suffix(2).reduce(UInt16(0)) { ($0 << 8) | UInt16($1) } == 48)
+
+    var acknowledgement = Data()
+    var generation = UInt64(42).bigEndian
+    var sequence = UInt64(9_001).bigEndian
+    withUnsafeBytes(of: &generation) { acknowledgement.append(contentsOf: $0) }
+    withUnsafeBytes(of: &sequence) { acknowledgement.append(contentsOf: $0) }
+    let parsed = RelayWireFrame.parseViewportAck(acknowledgement)
+    #expect(parsed?.generation == 42)
+    #expect(parsed?.repaintSequence == 9_001)
 }
 
 @MainActor
@@ -1498,6 +2247,35 @@ func agentIntelligenceHistoryIsBounded() {
     #expect(store.items.first?.agentID == "worker-1199")
 }
 
+@MainActor
+@Test("Agent intelligence batches replay publication into one UI refresh")
+func agentIntelligenceBatchesReplayPublication() async {
+    let store = AgentIntelligenceStore(persistenceEnabled: false)
+    let paneID = UUID()
+    var publicationCount = 0
+    let observation = store.objectWillChange.sink { publicationCount += 1 }
+
+    for index in 0..<400 {
+        store.record(AgentInboxEvent(
+            paneID: paneID,
+            host: "compute-07",
+            provider: .codex,
+            kind: .peer,
+            title: "Replay event \(index)",
+            sourceID: "relay-seq:\(index)"
+        ))
+    }
+
+    #expect(publicationCount == 0)
+    let deadline = ContinuousClock.now + .seconds(2)
+    while publicationCount == 0, ContinuousClock.now < deadline {
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(publicationCount == 1)
+    withExtendedLifetime(observation) {}
+}
+
 @Test("Restored agent history never starts automatic model summaries")
 func restoredAgentHistorySkipsModelSummaries() {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -1537,6 +2315,7 @@ func onDeviceModelSchedulerRateLimitsBursts() async {
     #expect(burst == nil)
     #expect(interactive == 3)
     #expect(OnDeviceIntelligenceScheduler.backgroundIntervalFloor == 20)
+    #expect(OnDeviceIntelligenceScheduler.interactiveIntervalFloor >= 0.75)
 }
 
 @MainActor
@@ -1558,9 +2337,27 @@ func terminalSelectionColorsAreExplicit() {
         #expect(rendered.contains("font-size = \(expectedSize)"))
         #expect(rendered.contains("minimum-contrast = 2.2"))
         #expect(rendered.contains("selection-clear-on-copy = false"))
+        #expect(rendered.contains("shell-integration = "))
+        #expect(rendered.contains("cursor-click-to-move = false"))
         #expect(!rendered.contains("13,5"))
         #expect(palette.selectionBackground != palette.background)
     }
+}
+
+@Test("Login-shell wrappers use the user's actual shell integration")
+func terminalShellIntegrationUsesConfiguredShell() {
+    #expect(RelayShellIntegrationPolicy.configurationValue(
+        shellPath: "/opt/homebrew/bin/bash"
+    ) == "bash")
+    #expect(RelayShellIntegrationPolicy.configurationValue(
+        shellPath: "/bin/zsh"
+    ) == "zsh")
+    #expect(RelayShellIntegrationPolicy.configurationValue(
+        shellPath: "/opt/homebrew/bin/nu"
+    ) == "nushell")
+    #expect(RelayShellIntegrationPolicy.configurationValue(
+        shellPath: "/usr/local/bin/custom-shell"
+    ) == "detect")
 }
 
 @Test("Terminal prompt mirror handles editing without inventing state")
@@ -1586,56 +2383,93 @@ func terminalPromptMirrorEditing() {
     #expect(!buffer.isReliable)
 }
 
-@Test("Predictive suggestions return safe suffixes and reject secret input")
-func predictiveSuggestionPolicy() {
-    #expect(TerminalSuggestionPolicy.historySuffix(
-        prefix: "git st", candidates: ["git status", "git stash"]
-    ) == "atus")
-    #expect(TerminalSuggestionPolicy.sanitizeSuffix("git status", prefix: "git st") == "atus")
-    #expect(TerminalSuggestionPolicy.sanitizeSuffix("atus\nrm -rf /", prefix: "git st") == nil)
-    #expect(TerminalSuggestionPolicy.sanitizeGeneratedSuffix(".}", prefix: "git st") == nil)
-    #expect(TerminalSuggestionPolicy.sanitizeGeneratedSuffix("atus", prefix: "git st") == "atus")
-    #expect(!TerminalSuggestionPolicy.isEligible("token=sk-example-secret"))
-    #expect(TerminalSuggestionPolicy.sanitizeNextTurn(".}") == nil)
-    #expect(TerminalSuggestionPolicy.sanitizeNextTurn("- continue") == nil)
-    #expect(TerminalSuggestionPolicy.sanitizeNextTurn("Verify the change and run the focused tests.") == "Verify the change and run the focused tests.")
+@Test("Prompt history coalesces typing and preserves multiline undo and redo")
+func terminalPromptHistoryEditing() {
+    var buffer = TerminalPromptBuffer()
+    var history = TerminalPromptEditHistory()
+
+    history.record(before: buffer.snapshot!, kind: .typing, timestamp: 1)
+    buffer.insert("hello")
+    history.record(before: buffer.snapshot!, kind: .typing, timestamp: 1.2)
+    buffer.insert("\nworld")
+    #expect(buffer.text == "hello\nworld")
+
+    let edited = buffer.snapshot!
+    let original = history.undo(current: edited)
+    #expect(original?.text == "")
+    buffer.restore(original!)
+    let restored = history.redo(current: buffer.snapshot!)
+    #expect(restored == edited)
+
+    history.breakCoalescing()
+    history.record(before: edited, kind: .deleting, timestamp: 2)
+    buffer.restore(edited)
+    buffer.backspace()
+    #expect(history.canUndo)
 }
 
-@Test("Project actions prefer documentation before the detected build system")
-func projectActionSuggestions() {
-    let swift = TerminalProjectSnapshot(
-        directory: "/tmp/example",
-        names: ["README.md", "Package.swift", "Sources", "Tests"]
+@Test("Captured paste payload preserves bracketed mode across packets")
+func capturedPastePayloadTracksBracketedMode() {
+    let tracker = TerminalBracketedPasteStateTracker()
+    tracker.observe(Data("prefix\u{001B}[?20".utf8))
+    #expect(!tracker.isActive)
+    tracker.observe(Data("04h".utf8))
+    #expect(tracker.isActive)
+    #expect(TerminalPastePayload.directPayload(
+        for: "first\nsecond",
+        bracketed: tracker.isActive
+    ) == "\u{001B}[200~first\nsecond\u{001B}[201~")
+
+    tracker.observe(Data("\u{001B}[?2004l".utf8))
+    #expect(!tracker.isActive)
+    #expect(TerminalPastePayload.directPayload(for: "one line", bracketed: false) == "one line")
+    #expect(TerminalPastePayload.directPayload(for: "one\ntwo", bracketed: false) == nil)
+}
+
+@Test("Legacy Codex workers receive input-mode compatibility only during migration")
+func legacyCodexWorkersReceiveTerminalModeCompatibility() {
+    let prelude = LegacyTerminalModeCompatibility.prelude(
+        agentKind: .codex,
+        capabilities: []
     )
-    #expect(TerminalProjectActionPolicy.suggestion(
-        agentKind: .shell, snapshot: swift, recentHistory: []
-    ) == "less README.md")
-    #expect(TerminalProjectActionPolicy.suggestion(
-        agentKind: .codex, snapshot: swift, recentHistory: ["Read README.md"]
-    ) == "Inspect the project configuration, then run swift build and report any failures.")
-    #expect(TerminalProjectActionPolicy.suggestion(
-        agentKind: .shell, snapshot: swift, recentHistory: ["less README.md", "swift build"]
-    ) == "swift test")
-    #expect(TerminalProjectActionPolicy.candidates(
-        snapshot: swift, recentHistory: ["less README.md"]
-    ).map(\.kind) == [.build, .test])
+    #expect(prelude?.range(of: Data("\u{001B}[>7u".utf8)) != nil)
+    #expect(prelude?.range(of: Data("\u{001B}[?2004h".utf8)) != nil)
+    #expect(LegacyTerminalModeCompatibility.prelude(
+        agentKind: .claude,
+        capabilities: []
+    ) == nil)
+    #expect(LegacyTerminalModeCompatibility.prelude(
+        agentKind: .codex,
+        capabilities: [LegacyTerminalModeCompatibility.durableCapability]
+    ) == nil)
 }
 
-@Test("Action feedback learns only after repeated explicit choices")
-func projectActionFeedback() async {
-    let suite = "relay-tests-feedback-\(UUID().uuidString)"
-    let store = TerminalActionFeedbackStore(suiteName: suite)
-    let actions = [
-        TerminalProjectAction(kind: .readDocumentation, shellCommand: "less README.md", agentPrompt: "Read it"),
-        TerminalProjectAction(kind: .build, shellCommand: "swift build", agentPrompt: "Build it"),
-    ]
-    let buildKey = TerminalActionFeedbackStore.key("swift", .shell, .build)
-    await store.record(key: buildKey, accepted: true)
-    await store.record(key: buildKey, accepted: true)
-    #expect(await store.rank(actions, projectKind: "swift", agentKind: .shell).first?.kind == .readDocumentation)
-    await store.record(key: buildKey, accepted: true)
-    #expect(await store.rank(actions, projectKind: "swift", agentKind: .shell).first?.kind == .build)
-    await store.reset()
+@Test("Prompt cursor mapping follows logical characters across wide and wrapped text")
+func terminalPromptLogicalCursorMapping() {
+    var wide = TerminalPromptBuffer()
+    wide.insert("ab界cd")
+    #expect(wide.logicalMovementOffset(forVisualCellDelta: -2) == -2)
+    #expect(wide.logicalMovementOffset(forVisualCellDelta: -5) == -5)
+    #expect(wide.logicalMovementOffset(forVisualCellDelta: -6) == nil)
+
+    var wrapped = TerminalPromptBuffer()
+    wrapped.insert(String(repeating: "x", count: 160))
+    #expect(wrapped.logicalMovementOffset(forVisualCellDelta: -93) == -93)
+    wrapped.move(by: -40)
+    #expect(wrapped.logicalMovementOffset(forVisualCellDelta: 40) == 40)
+    #expect(wrapped.logicalMovementOffset(forVisualCellDelta: 500) == nil)
+
+    wrapped.invalidate()
+    #expect(wrapped.logicalMovementOffset(forVisualCellDelta: -1) == nil)
+
+    var selection = TerminalPromptBuffer()
+    selection.insert("copy this text")
+    selection.move(by: -5)
+    #expect(selection.selectedText(relativeToCursor: -4) == "this")
+    #expect(selection.selectedText(relativeToCursor: 5) == " text")
+    #expect(selection.selectedText(relativeToCursor: 0) == nil)
+    selection.invalidate()
+    #expect(selection.selectedText(relativeToCursor: -1) == nil)
 }
 
 @Test("Conversation context is readable, deduplicated, and bounded")
@@ -1758,4 +2592,56 @@ func processCaptureBoundsInheritedPipes() throws {
 
     #expect(readFailed)
     #expect(started.duration(to: .now) < .seconds(2))
+}
+
+@Test("Floating image controls do not overlap corner resize handles")
+func floatingImageControlsClearResizeHandles() {
+    #expect(
+        FloatingArtifactChromeMetrics.titleBarEdgeInset >=
+            FloatingArtifactChromeMetrics.resizeHandleLength
+    )
+    #expect(
+        FloatingArtifactChromeMetrics.controlLength <=
+            FloatingArtifactChromeMetrics.titleBarHeight
+    )
+}
+@Test("Relay terminfo installs idempotently and safely falls back")
+func relayTerminfoInstallation() throws {
+    let sourceRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let bundled = sourceRoot
+        .appendingPathComponent("Sources/Relay/Resources/Terminfo/78/xterm-relay")
+    let temporary = FileManager.default.temporaryDirectory
+        .appendingPathComponent("relay-terminfo-test-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+
+    let first = RelayTerminfo.install(
+        homeDirectory: temporary,
+        bundledEntry: bundled,
+        systemDatabases: [],
+        fileManager: .default
+    )
+    #expect(first.activeTerm == "xterm-relay")
+    #expect(first.installedForCurrentUser)
+    #expect(first.updatedLocations.count == 1)
+
+    let second = RelayTerminfo.install(
+        homeDirectory: temporary,
+        bundledEntry: bundled,
+        systemDatabases: [],
+        fileManager: .default
+    )
+    #expect(second.activeTerm == "xterm-relay")
+    #expect(second.updatedLocations.isEmpty)
+
+    let fallback = RelayTerminfo.install(
+        homeDirectory: temporary,
+        bundledEntry: nil,
+        systemDatabases: [],
+        fileManager: .default
+    )
+    #expect(fallback.activeTerm == "xterm-256color")
 }

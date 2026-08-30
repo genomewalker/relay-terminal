@@ -73,13 +73,9 @@ func TestSupervisorCrashPreservesPaneWorkerAndShell(t *testing.T) {
 
 	secondSupervisor, _ := startTestSupervisor(t, binary, socket, environment)
 	t.Cleanup(func() {
-		if secondSupervisor.Process != nil {
-			_ = secondSupervisor.Process.Kill()
-			_, _ = secondSupervisor.Process.Wait()
-		}
-		if process, findErr := os.FindProcess(manifest.WorkerPID); findErr == nil {
-			_ = process.Signal(syscall.SIGTERM)
-		}
+		stopTestProcess(secondSupervisor.Process)
+		stopTestPID(manifest.WorkerPID)
+		stopTestPID(manifest.ShellPID)
 	})
 	secondConnection := attachTestPane(t, socket, "crash-pane", lastSequence)
 	defer secondConnection.Close()
@@ -155,10 +151,9 @@ func TestSupervisorUpgradePreservesPaneWorkerAndShell(t *testing.T) {
 	assertProcessAlive(t, manifest.WorkerPID, "pane worker")
 	assertProcessAlive(t, manifest.ShellPID, "remote shell")
 	t.Cleanup(func() {
-		_ = syscall.Kill(newSupervisorPID, syscall.SIGTERM)
-		if process, findErr := os.FindProcess(manifest.WorkerPID); findErr == nil {
-			_ = process.Signal(syscall.SIGTERM)
-		}
+		stopTestPID(newSupervisorPID)
+		stopTestPID(manifest.WorkerPID)
+		stopTestPID(manifest.ShellPID)
 	})
 
 	reconnected := attachTestPane(t, socket, "upgrade-pane", lastSequence)
@@ -333,4 +328,31 @@ func assertProcessAlive(t *testing.T, pid int, label string) {
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Fatalf("%s pid %d did not survive supervisor crash: %v", label, pid, err)
 	}
+}
+
+// Durable workers intentionally outlive a supervisor. Tests therefore own
+// their worker and shell PIDs explicitly and must reap them even when a normal
+// SIGTERM is delayed by PTY shutdown. Leaving them behind made repeated local
+// test runs look like Relay itself had hundreds of threads.
+func stopTestProcess(process *os.Process) {
+	if process == nil {
+		return
+	}
+	stopTestPID(process.Pid)
+	_, _ = process.Wait()
+}
+
+func stopTestPID(pid int) {
+	if pid <= 1 {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
 }

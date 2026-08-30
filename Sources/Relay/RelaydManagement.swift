@@ -314,7 +314,9 @@ while ! mkdir "$lock_dir" 2>/dev/null; do
 done
 temporary=
 launcher_temporary=
-trap 'rm -f "$temporary" "$launcher_temporary"; rmdir "$lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
+claude_shim_temporary=
+codex_shim_temporary=
+trap 'rm -f "$temporary" "$launcher_temporary" "$claude_shim_temporary" "$codex_shim_temporary"; rmdir "$lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
 temporary="$(mktemp "$payload_dir/.relayd-install-#(architecture).XXXXXX")"
 launcher_temporary="$(mktemp "$bin_dir/.relayd-launcher.XXXXXX")"
 cat > "$temporary"
@@ -351,6 +353,25 @@ exec "$relay_payload" "$@"
 RELAY_LAUNCHER
 chmod 700 "$launcher_temporary"
 mv -f "$launcher_temporary" "$bin_dir/relayd"
+claude_shim_temporary="$(mktemp "$shim_dir/.claude-shim.XXXXXX")"
+codex_shim_temporary="$(mktemp "$shim_dir/.codex-shim.XXXXXX")"
+cat > "$claude_shim_temporary" <<'RELAY_CLAUDE_SHIM'
+#!/bin/sh
+set -eu
+RELAY_INVOKED_AS=claude
+export RELAY_INVOKED_AS
+exec "$HOME/.local/bin/relayd" "$@"
+RELAY_CLAUDE_SHIM
+cat > "$codex_shim_temporary" <<'RELAY_CODEX_SHIM'
+#!/bin/sh
+set -eu
+RELAY_INVOKED_AS=codex
+export RELAY_INVOKED_AS
+exec "$HOME/.local/bin/relayd" "$@"
+RELAY_CODEX_SHIM
+chmod 700 "$claude_shim_temporary" "$codex_shim_temporary"
+mv -f "$claude_shim_temporary" "$shim_dir/claude"
+mv -f "$codex_shim_temporary" "$shim_dir/codex"
 printf 'relay-managed-v1\n' > "$relay_root/managed-v1"
 if [ ! -e "$bin_dir/rcode" ] && [ ! -L "$bin_dir/rcode" ]; then
     ln -s "$bin_dir/relayd" "$bin_dir/rcode"
@@ -364,10 +385,11 @@ elif [ -L "$bin_dir/rcode" ]; then
 else
     printf 'Relay left the existing ~/.local/bin/rcode command unchanged.\n' >&2
 fi
-ln -sfn "$bin_dir/relayd" "$shim_dir/claude"
-ln -sfn "$bin_dir/relayd" "$shim_dir/codex"
 "$bin_dir/relayd" --version
-"$bin_dir/relayd" upgrade-supervisor
+if ! "$bin_dir/relayd" upgrade-supervisor --force; then
+    sleep 1
+    "$bin_dir/relayd" upgrade-supervisor
+fi
 """#
     }
 
@@ -619,6 +641,11 @@ struct RelaydFirstRunView: View {
                     symbol: "checkmark.seal",
                     title: "Verified before activation",
                     detail: "Relay uploads the binary included in the signed app, verifies SHA-256, then replaces the helper atomically."
+                )
+                firstRunRow(
+                    symbol: "terminal",
+                    title: "Relay installs its terminal definition",
+                    detail: "Normal shells use xterm-relay only after the host can resolve it, with xterm-256color as a safe fallback. Sudo compatibility is shown in Settings and never requests elevation silently."
                 )
             }
             .padding(22)

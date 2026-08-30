@@ -53,11 +53,18 @@ final class AgentStateStore: @unchecked Sendable {
         lock.unlock()
         queue.async { [weak self] in
             guard let self else { return }
-            guard let data = try? JSONEncoder.relayState.encode(state), data.count <= 4 << 20 else { return }
             self.lock.lock()
             let current = self.generations[paneID] == generation
             self.lock.unlock()
             guard current else { return }
+            let boundedState = state.boundedForStorage()
+            guard let data = try? JSONEncoder.relayState.encode(boundedState), data.count <= 4 << 20 else { return }
+            // Encoding a busy 100-agent tree is measurable. A newer event may
+            // have arrived while it ran, so avoid an obsolete atomic write too.
+            self.lock.lock()
+            let stillCurrent = self.generations[paneID] == generation
+            self.lock.unlock()
+            guard stillCurrent else { return }
             let url = self.stateURL(paneID)
             do {
                 try data.write(to: url, options: .atomic)
@@ -73,6 +80,44 @@ final class AgentStateStore: @unchecked Sendable {
 
     private func stateURL(_ paneID: UUID) -> URL {
         directory.appendingPathComponent(paneID.uuidString.lowercased() + ".json")
+    }
+}
+
+extension PersistedAgentPaneState {
+    func boundedForStorage() -> PersistedAgentPaneState {
+        let maximumSubagents = 100
+        let active = subagents.filter { $0.phase == .active }
+        let selected: [SubagentActivity]
+        if active.count >= maximumSubagents {
+            selected = Array(active.suffix(maximumSubagents))
+        } else {
+            let activeIDs = Set(active.map(\.id))
+            let completed = subagents.filter { !activeIDs.contains($0.id) }
+            let keptIDs = Set((active + completed.suffix(maximumSubagents - active.count)).map(\.id))
+            selected = subagents.filter { keptIDs.contains($0.id) }
+        }
+        let boundedSubagents = selected.map { subagent in
+            var copy = subagent
+            copy.updates = copy.updates.suffix(10).map { update in
+                SubagentUpdate(
+                    id: update.id,
+                    message: String(update.message.prefix(2_048)),
+                    occurredAt: update.occurredAt
+                )
+            }
+            return copy
+        }
+        return PersistedAgentPaneState(
+            cursor: cursor,
+            kind: kind,
+            phase: phase,
+            summary: String(summary.prefix(1_024)),
+            subagents: boundedSubagents,
+            activities: Array(activities.suffix(16)),
+            resourceUsage: resourceUsage,
+            progressPercent: progressPercent,
+            pendingApprovals: pendingApprovals
+        )
     }
 }
 

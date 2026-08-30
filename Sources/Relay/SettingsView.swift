@@ -3,7 +3,7 @@ import SwiftUI
 struct RelaySettingsView: View {
     @ObservedObject private var preferences = RelayPreferences.shared
     @State private var showingKeyBindings = false
-    @State private var learnedSuggestionsReset = false
+    @State private var terminfoStatus = RelayTerminfo.status
 
     var body: some View {
         HStack(spacing: 0) {
@@ -123,44 +123,53 @@ struct RelaySettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                settingSection("On-device intelligence") {
-                    Toggle("Agent activity intelligence", isOn: $preferences.intelligenceEnabled)
-                    Toggle("Complete commands from local history", isOn: $preferences.predictiveSuggestions)
-                        .disabled(!preferences.intelligenceEnabled)
-                    Toggle(isOn: $preferences.experimentalGenerativeSuggestions) {
-                        HStack(spacing: 7) {
-                            Text("Generate command and prompt completions")
-                            Text("Experimental")
-                                .font(.system(size: 8.5, weight: .semibold))
-                                .foregroundStyle(RelayTheme.coral)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(RelayTheme.coral.opacity(0.12), in: Capsule())
+                settingSection("Terminal compatibility") {
+                    HStack(spacing: 9) {
+                        Image(systemName: terminfoStatus.usesRelayEntry
+                            ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(terminfoStatus.usesRelayEntry
+                                ? RelayTheme.mint : RelayTheme.coral)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(terminfoStatus.activeTerm)
+                                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                            Text("SHA-256  \(String(terminfoStatus.hash.prefix(12)))")
+                                .font(.system(size: 9.5, design: .monospaced))
+                                .foregroundStyle(RelayTheme.textMuted)
                         }
+                        Spacer()
+                        Button("Recheck") { terminfoStatus = RelayTerminfo.bootstrap() }
+                            .font(.system(size: 10.5, weight: .medium))
                     }
-                    .disabled(!preferences.intelligenceEnabled || !preferences.predictiveSuggestions)
-                    HStack {
-                        Button("Reset learned suggestions") {
-                            Task {
-                                await TerminalActionFeedbackStore.shared.reset()
-                                await MainActor.run { learnedSuggestionsReset = true }
+                    Text(terminfoStatus.message)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !terminfoStatus.installedForSystemPrograms {
+                        HStack(spacing: 10) {
+                            Button("Copy sudo fallback") {
+                                copyToPasteboard(RelayTerminfo.sudoCompatibilityCommand)
+                            }
+                            if let command = RelayTerminfo.privilegedInstallCommand {
+                                Button("Copy one-time install") {
+                                    copyToPasteboard(command)
+                                }
                             }
                         }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(RelayTheme.blue)
-                        .disabled(!preferences.experimentalGenerativeSuggestions)
-                        Spacer()
-                        if learnedSuggestionsReset {
-                            Text("Reset")
-                                .font(.system(size: 10))
-                                .foregroundStyle(RelayTheme.mint)
-                        }
+                        .font(.system(size: 10.5, weight: .medium))
+                        Text("Relay never requests administrator access automatically. The fallback keeps sudo programs usable; the optional install makes xterm-relay visible to root.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(RelayTheme.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                }
+
+                settingSection("Agent intelligence") {
+                    Toggle("Agent activity intelligence", isOn: $preferences.intelligenceEnabled)
                     Toggle("Summarize completed work", isOn: $preferences.automaticAgentSummaries)
                         .disabled(!preferences.intelligenceEnabled)
                     Toggle("Semantic activity search", isOn: $preferences.semanticAgentSearch)
                         .disabled(!preferences.intelligenceEnabled)
-                    Text("Local history completion is instant and stays enabled independently. Experimental completion inspects cached top-level project markers, then uses Apple's on-device model to choose a safe next action or suggest the next Codex/Claude message. Tab accepts and Escape rejects a project action, allowing Relay to learn coarse preferences without storing paths, commands, prompts, or terminal text. It recognizes common README, Swift, Rust, Go, Python, npm, Make, and CMake workflows. Nothing is sent to a cloud model. Model work pauses in Low Power Mode or under thermal stress.")
+                    Text("This organizes agent activity and search. It does not inspect keystrokes or generate terminal completions.")
                         .font(.system(size: 10.5))
                         .foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
@@ -170,6 +179,7 @@ struct RelaySettingsView: View {
         }
         .foregroundStyle(RelayTheme.text)
         .background(RelayTheme.sidebar)
+        .onAppear { terminfoStatus = RelayTerminfo.status }
     }
 
     private var preview: some View {
@@ -233,6 +243,11 @@ struct RelaySettingsView: View {
                 .foregroundStyle(RelayTheme.textMuted)
                 .frame(width: 57, alignment: .trailing)
         }
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 }
 

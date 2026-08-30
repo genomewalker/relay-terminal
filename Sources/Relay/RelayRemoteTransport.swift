@@ -7,6 +7,7 @@ struct RelayStatus: Sendable {
     let outputReset: Bool
     let eventReset: Bool
     let capabilities: [String]
+    let clientCount: Int?
 
     init(
         state: String,
@@ -14,7 +15,8 @@ struct RelayStatus: Sendable {
         message: String? = nil,
         outputReset: Bool = false,
         eventReset: Bool = false,
-        capabilities: [String] = []
+        capabilities: [String] = [],
+        clientCount: Int? = nil
     ) {
         self.state = state
         self.exitCode = exitCode
@@ -22,6 +24,7 @@ struct RelayStatus: Sendable {
         self.outputReset = outputReset
         self.eventReset = eventReset
         self.capabilities = capabilities
+        self.clientCount = clientCount
     }
 }
 
@@ -170,9 +173,18 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var inputOverflowed = false
     private var attached = false
     private var supportsInputAcknowledgements = false
+    private var supportsViewportCommits = false
+    private var supportsSupervisorViewportCommits = false
+    private var supportsExactViewportCommits = false
+    private var supportsExactSupervisorViewportCommits = false
+    private var viewportGeneration: UInt64 = 0
+    private var pendingViewportAck: (generation: UInt64, repaintSequence: UInt64)?
+    private var onViewportCommitted: (@Sendable (UInt64) -> Void)?
     private var sessionEnded = false
     private var attachRetryCount = 0
     private var attachRetryScheduled = false
+    private var diagnosticSessionID = "unknown"
+    private var inputDiagnosticCount = 0
 
     deinit {
         nodeChannel?.close()
@@ -182,6 +194,12 @@ final class RelayRemoteTransport: @unchecked Sendable {
     func setInitialViewport(_ viewport: RelayViewport) {
         lock.lock()
         latestResize = (viewport.columns, viewport.rows)
+        lock.unlock()
+    }
+
+    func setViewportCommitHandler(_ handler: @escaping @Sendable (UInt64) -> Void) {
+        lock.lock()
+        onViewportCommitted = handler
         lock.unlock()
     }
 
@@ -217,6 +235,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
             observeAgentsOnly: observeAgentsOnly
         )
         lock.lock()
+        diagnosticSessionID = sessionID
+        inputDiagnosticCount = 0
         detached = false
         lastSequence = initialLastSequence
         lastEventSequence = 0
@@ -227,6 +247,11 @@ final class RelayRemoteTransport: @unchecked Sendable {
         inputOverflowed = false
         attached = false
         supportsInputAcknowledgements = false
+        supportsViewportCommits = false
+        supportsSupervisorViewportCommits = false
+        supportsExactViewportCommits = false
+        supportsExactSupervisorViewportCommits = false
+        pendingViewportAck = nil
         sessionEnded = false
         attachRetryCount = 0
         attachRetryScheduled = false
@@ -270,6 +295,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let viewport = latestResize ?? (RelayViewport.default.columns, RelayViewport.default.rows)
         attached = false
         writer = channel
+        supportsSupervisorViewportCommits =
+            channel.supports("viewport_commit_compat_v1") ||
+            channel.supports("viewport_commit_compat_v2")
+        supportsExactSupervisorViewportCommits = channel.supports("viewport_commit_compat_v2")
         lock.unlock()
         var hello: [String: Any] = [
             "version": 1,
@@ -307,6 +336,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
             let channel = nodeChannel
             nodeChannel = nil
             writer = nil
+            supportsSupervisorViewportCommits = false
+            supportsExactSupervisorViewportCommits = false
             lock.unlock()
             channel?.close()
             context.onStatus(RelayStatus(
@@ -320,6 +351,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
             let channel = nodeChannel
             nodeChannel = nil
             writer = nil
+            supportsSupervisorViewportCommits = false
+            supportsExactSupervisorViewportCommits = false
             lock.unlock()
             channel?.close()
             context.onStatus(RelayStatus(state: "error", message: failure.userMessage))
@@ -336,12 +369,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private func receive(_ frame: RelayWireFrame, context: RelayConnectionContext) {
         switch frame.type {
         case .output:
-            guard frame.payload.count >= 8 else { return }
-            let sequence = frame.payload.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-            lock.lock()
-            lastSequence = max(lastSequence, sequence)
-            lock.unlock()
-            context.onOutput(Data(frame.payload.dropFirst(8)), sequence)
+            receiveOutput(frame.payload, context: context)
         case .status:
             guard let decoded = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload) else { return }
             if decoded.outputReset == true || decoded.eventReset == true {
@@ -367,11 +395,24 @@ final class RelayRemoteTransport: @unchecked Sendable {
                     return
                 }
             }
+            if decoded.state == "route_closed" {
+                lock.lock()
+                let shouldRecover = !detached && !sessionEnded
+                attached = false
+                lock.unlock()
+                guard shouldRecover else { return }
+                context.onStatus(RelayStatus(
+                    state: "reconnecting",
+                    message: "This pane fell behind a fast terminal redraw; replaying its current screen."
+                ))
+                scheduleMultiplexedRetry(context, waitingForInputLease: false)
+                return
+            }
             if decoded.state == "exited" || decoded.state == "error" { markSessionEnded() }
             context.onStatus(RelayStatus(
                 state: decoded.state, exitCode: decoded.exitCode, message: decoded.message,
                 outputReset: decoded.outputReset ?? false, eventReset: decoded.eventReset ?? false,
-                capabilities: decoded.capabilities ?? []
+                capabilities: decoded.capabilities ?? [], clientCount: decoded.clientCount
             ))
         case .ping:
             try? nodeChannel?.write(type: .pong)
@@ -391,6 +432,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 }
                 lock.unlock()
             }
+        case .viewportAck:
+            receiveViewportAck(frame.payload)
         case .artifact:
             if let artifact = RelayWireFrame.parseArtifact(frame.payload) { context.onArtifact(artifact) }
         default:
@@ -444,6 +487,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
             }
             self.nodeChannel = nil
             self.writer = nil
+            self.supportsSupervisorViewportCommits = false
+            self.supportsExactSupervisorViewportCommits = false
             self.attachRetryScheduled = false
             self.lock.unlock()
             channel.close()
@@ -533,6 +578,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
         lock.lock()
         process = ssh
         writer = RelayWireWriter(input.fileHandleForWriting)
+        supportsSupervisorViewportCommits = false
+        supportsExactSupervisorViewportCommits = false
         detached = false
         attached = false
         lock.unlock()
@@ -564,12 +611,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                         let frame = try RelayWireFrame.read(from: output.fileHandleForReading)
                         switch frame.type {
                         case .output:
-                            guard frame.payload.count >= 8 else { return }
-                            let sequence = frame.payload.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-                            self?.lock.lock()
-                            self?.lastSequence = max(self?.lastSequence ?? 0, sequence)
-                            self?.lock.unlock()
-                            context.onOutput(Data(frame.payload.dropFirst(8)), sequence)
+                            self?.receiveOutput(frame.payload, context: context)
                         case .status:
                             if let decoded = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload) {
                                 if decoded.outputReset == true || decoded.eventReset == true {
@@ -586,7 +628,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
                                     message: decoded.message,
                                     outputReset: decoded.outputReset ?? false,
                                     eventReset: decoded.eventReset ?? false,
-                                    capabilities: decoded.capabilities ?? []
+                                    capabilities: decoded.capabilities ?? [],
+                                    clientCount: decoded.clientCount
                                 ))
                             }
                         case .ping:
@@ -608,6 +651,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
                                 }
                                 self?.lock.unlock()
                             }
+                        case .viewportAck:
+                            self?.receiveViewportAck(frame.payload)
                         case .artifact:
                             if let artifact = RelayWireFrame.parseArtifact(frame.payload) {
                                 context.onArtifact(artifact)
@@ -665,6 +710,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
         attachRetryCount = 0
         attachRetryScheduled = false
         supportsInputAcknowledgements = capabilities.contains("input_ack_v1")
+        supportsViewportCommits = RelayTransportCapabilityPolicy.supportsViewportCommit(capabilities)
+        supportsExactViewportCommits = RelayTransportCapabilityPolicy.supportsExactViewportCommit(capabilities)
         let needsPostAttachResize = RelayTransportCapabilityPolicy.needsPostAttachResize(capabilities)
         let backlog = inputBacklog
         inputBacklog.removeAll(keepingCapacity: true)
@@ -748,6 +795,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let writer = self.writer
         let canSend = writer != nil && attached
         let acknowledged = supportsInputAcknowledgements
+        let shouldRecordDiagnostic = inputDiagnosticCount < 8
+        if shouldRecordDiagnostic { inputDiagnosticCount += 1 }
+        let diagnosticSessionID = self.diagnosticSessionID
         var inputSequence: UInt64?
         var processToRestart: Process?
         if canSend && acknowledged && pendingInputBytes + data.count <= 64 << 10 {
@@ -771,6 +821,19 @@ final class RelayRemoteTransport: @unchecked Sendable {
             }
         }
         lock.unlock()
+        if shouldRecordDiagnostic {
+            RelayDiagnostics.shared.record(
+                category: "terminal-input",
+                name: "transport-send",
+                details: [
+                    "pane_id": diagnosticSessionID,
+                    "bytes": String(data.count),
+                    "writer": String(writer != nil),
+                    "attached": String(canSend),
+                    "acknowledged": String(acknowledged),
+                ]
+            )
+        }
         processToRestart?.terminate()
         if processToRestart != nil { return }
         guard canSend, let writer else { return }
@@ -784,12 +847,99 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
     }
 
-    func sendResize(columns: UInt16, rows: UInt16) {
+    @discardableResult
+    func sendResize(
+        columns: UInt16,
+        rows: UInt16,
+        forceRepaint: Bool = false,
+        viewportChanged: Bool = false,
+        compatibilityRepaintPulse: Bool = false
+    ) -> UInt64? {
         lock.lock()
         latestResize = (columns, rows)
         let writer = self.writer
+        // Version 1 workers applied TIOCSWINSZ and then always sent another
+        // SIGWINCH. That is correct for an unchanged grid but duplicates the
+        // kernel signal for a changed one. Version 2 promises exactly one
+        // signal, so only it may acknowledge a changed-grid atomic commit.
+        let commitIsSignalSafe = !viewportChanged || compatibilityRepaintPulse ||
+            supportsExactViewportCommits ||
+            supportsExactSupervisorViewportCommits
+        let useCommit = forceRepaint &&
+            (supportsViewportCommits || supportsSupervisorViewportCommits) &&
+            commitIsSignalSafe &&
+            attached && writer != nil
+        let generation: UInt64?
+        if useCommit {
+            viewportGeneration &+= 1
+            if viewportGeneration == 0 { viewportGeneration = 1 }
+            generation = viewportGeneration
+            pendingViewportAck = nil
+        } else {
+            generation = nil
+        }
         lock.unlock()
+        if let generation {
+            if viewportChanged && compatibilityRepaintPulse &&
+                !supportsExactViewportCommits &&
+                !supportsExactSupervisorViewportCommits {
+                // v1 peers signalled twice when a commit itself changed the
+                // grid. Apply the new size once with the ordinary frame, then
+                // request an acknowledged repaint at that now-unchanged size.
+                // Agent primary-screen TUIs need this complete repaint to
+                // replace background cells from the outgoing grid.
+                writeResize(columns: columns, rows: rows, using: writer)
+            }
+            writer?.writeAsync(
+                type: .viewportCommit,
+                payload: RelayWireFrame.viewportCommitPayload(
+                    generation: generation,
+                    columns: columns,
+                    rows: rows
+                )
+            )
+            return generation
+        }
+        // A pre-viewport_commit worker understands only the original resize
+        // frame. Send the final grid once; rapid probe/final pairs can make a
+        // TUI clear for the probe and coalesce away its useful final repaint.
         writeResize(columns: columns, rows: rows, using: writer)
+        return nil
+    }
+
+    private func receiveOutput(_ payload: Data, context: RelayConnectionContext) {
+        guard payload.count >= 8 else { return }
+        let sequence = payload.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        lock.lock()
+        lastSequence = max(lastSequence, sequence)
+        let completion = takeViewportCompletionLocked()
+        lock.unlock()
+        context.onOutput(Data(payload.dropFirst(8)), sequence)
+        if let completion { completion.handler(completion.generation) }
+    }
+
+    private func receiveViewportAck(_ payload: Data) {
+        guard let acknowledgement = RelayWireFrame.parseViewportAck(payload) else { return }
+        lock.lock()
+        guard acknowledgement.generation == viewportGeneration else {
+            lock.unlock()
+            return
+        }
+        pendingViewportAck = acknowledgement
+        let completion = takeViewportCompletionLocked()
+        lock.unlock()
+        if let completion { completion.handler(completion.generation) }
+    }
+
+    private func takeViewportCompletionLocked() -> (
+        generation: UInt64,
+        handler: @Sendable (UInt64) -> Void
+    )? {
+        guard let pendingViewportAck,
+              pendingViewportAck.repaintSequence <= lastSequence,
+              let onViewportCommitted else { return nil }
+        self.pendingViewportAck = nil
+        return (pendingViewportAck.generation, onViewportCommitted)
     }
 
     private func writeResize(columns: UInt16, rows: UInt16, using writer: (any RelayFrameWriting)?) {
@@ -835,6 +985,15 @@ struct RelayViewport: Equatable, Sendable {
 enum RelayTransportCapabilityPolicy {
     static func needsPostAttachResize(_ capabilities: [String]) -> Bool {
         !capabilities.contains("viewport_attach_v1")
+    }
+
+    static func supportsViewportCommit(_ capabilities: [String]) -> Bool {
+        capabilities.contains("viewport_commit_v1") ||
+            capabilities.contains("viewport_commit_v2")
+    }
+
+    static func supportsExactViewportCommit(_ capabilities: [String]) -> Bool {
+        capabilities.contains("viewport_commit_v2")
     }
 }
 
@@ -882,6 +1041,7 @@ struct StatusWirePayload: Decodable {
     let outputReset: Bool?
     let eventReset: Bool?
     let controlGranted: Bool?
+    let clientCount: Int?
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -890,6 +1050,7 @@ struct StatusWirePayload: Decodable {
         case outputReset = "output_reset"
         case eventReset = "event_reset"
         case controlGranted = "control_granted"
+        case clientCount = "client_count"
     }
 }
 
@@ -902,7 +1063,7 @@ private struct EventWireEnvelope: Decodable {
 }
 
 enum RelayWireType: UInt8 {
-    case hello = 1, input, resize, output, status, detach, ping, pong, agentEvent, artifact, inputAck, inputV2, hostEvent, workspaceState
+    case hello = 1, input, resize, output, status, detach, ping, pong, agentEvent, artifact, inputAck, inputV2, hostEvent, workspaceState, viewportCommit, viewportAck
 }
 
 struct RelayWireFrame {
@@ -946,6 +1107,32 @@ struct RelayWireFrame {
         withUnsafeBytes(of: &bigEndianSequence) { payload.append(contentsOf: $0) }
         payload.append(data)
         return payload
+    }
+
+    static func viewportCommitPayload(
+        generation: UInt64,
+        columns: UInt16,
+        rows: UInt16
+    ) -> Data {
+        var payload = Data()
+        var bigEndianGeneration = generation.bigEndian
+        var bigEndianColumns = columns.bigEndian
+        var bigEndianRows = rows.bigEndian
+        withUnsafeBytes(of: &bigEndianGeneration) { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: &bigEndianColumns) { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: &bigEndianRows) { payload.append(contentsOf: $0) }
+        return payload
+    }
+
+    static func parseViewportAck(_ payload: Data) -> (
+        generation: UInt64,
+        repaintSequence: UInt64
+    )? {
+        guard payload.count == 16 else { return nil }
+        let generation = payload.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        let repaintSequence = payload.dropFirst(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        guard generation > 0 else { return nil }
+        return (generation, repaintSequence)
     }
 
     static func parseInputAck(_ payload: Data) -> (clientID: UUID, sequence: UInt64)? {

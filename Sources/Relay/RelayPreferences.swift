@@ -2,6 +2,19 @@ import CoreText
 import Foundation
 import GhosttyTerminal
 
+enum RelayShellIntegrationPolicy {
+    private static let supportedShells: Set<String> = [
+        "bash", "elvish", "fish", "nu", "nushell", "zsh",
+    ]
+
+    static func configurationValue(shellPath: String?) -> String {
+        guard let shellPath else { return "detect" }
+        let name = URL(fileURLWithPath: shellPath).lastPathComponent.lowercased()
+        guard supportedShells.contains(name) else { return "detect" }
+        return name == "nu" ? "nushell" : name
+    }
+}
+
 enum RelayTerminalPalette: String, CaseIterable, Identifiable {
     case midnight
     case graphite
@@ -79,8 +92,6 @@ final class RelayPreferences: ObservableObject {
     @Published var showArtifactPreviews: Bool { didSet { save() } }
     @Published var artifactPresentation: RelayArtifactPresentation { didSet { save() } }
     @Published var intelligenceEnabled: Bool { didSet { save() } }
-    @Published var predictiveSuggestions: Bool { didSet { save() } }
-    @Published var experimentalGenerativeSuggestions: Bool { didSet { save() } }
     @Published var automaticAgentSummaries: Bool { didSet { save() } }
     @Published var semanticAgentSearch: Bool { didSet { save() } }
     @Published var automaticallyUpdateRelayd: Bool { didSet { save() } }
@@ -104,15 +115,14 @@ final class RelayPreferences: ObservableObject {
             rawValue: defaults.string(forKey: "relay.settings.artifact-presentation") ?? ""
         ) ?? .preview
         intelligenceEnabled = defaults.object(forKey: "relay.settings.intelligence-enabled") as? Bool ?? true
-        predictiveSuggestions = defaults.object(forKey: "relay.settings.predictive-suggestions") as? Bool ?? true
-        experimentalGenerativeSuggestions = defaults.object(
-            forKey: "relay.settings.experimental-generative-suggestions"
-        ) as? Bool ?? false
         automaticAgentSummaries = defaults.object(forKey: "relay.settings.intelligence-summaries") as? Bool ?? true
         semanticAgentSearch = defaults.object(forKey: "relay.settings.intelligence-search") as? Bool ?? true
         automaticallyUpdateRelayd = defaults.object(forKey: "relay.settings.relayd-auto-update") as? Bool ?? false
         keyBindings = RelayKeyBindingStorage.load(from: defaults)
         isLoading = false
+        // Remove stale completion preferences left by older builds.
+        defaults.removeObject(forKey: "relay.settings.predictive-suggestions")
+        defaults.removeObject(forKey: "relay.settings.experimental-generative-suggestions")
     }
 
     func keyBinding(for command: RelayCommand) -> RelayKeyBinding {
@@ -175,10 +185,22 @@ final class RelayPreferences: ObservableObject {
             builder.withWindowPaddingY(padding)
             builder.withCustom("copy-on-select", "clipboard")
             builder.withCustom("mouse-hide-while-typing", "true")
-            // Ghostty uses OSC 133 prompt boundaries to translate a click in
-            // an editable command line into the application's native cursor
-            // movement. relayd emits those boundaries for remote shells.
-            builder.withCustom("cursor-click-to-move", "true")
+            // libghostty's macOS exec backend starts login shells through
+            // /usr/bin/login. Auto-detection therefore sees `login` instead of
+            // the user's real shell and skips OSC 133 injection. Force the
+            // supported shell selected by $SHELL; unknown shells retain
+            // Ghostty's normal detection path.
+            builder.withCustom(
+                "shell-integration",
+                RelayShellIntegrationPolicy.configurationValue(
+                    shellPath: ProcessInfo.processInfo.environment["SHELL"]
+                )
+            )
+            // Embedded host-managed Ghostty surfaces recognize this option but
+            // do not emit the movement sequence. Relay supplies the adapter for
+            // semantic shell prompts only; alternate-screen TUIs receive their
+            // real mouse events and are never moved with guessed arrow keys.
+            builder.withCustom("cursor-click-to-move", "false")
         }
     }
 
@@ -213,11 +235,6 @@ final class RelayPreferences: ObservableObject {
         defaults.set(showArtifactPreviews, forKey: "relay.settings.artifact-previews")
         defaults.set(artifactPresentation.rawValue, forKey: "relay.settings.artifact-presentation")
         defaults.set(intelligenceEnabled, forKey: "relay.settings.intelligence-enabled")
-        defaults.set(predictiveSuggestions, forKey: "relay.settings.predictive-suggestions")
-        defaults.set(
-            experimentalGenerativeSuggestions,
-            forKey: "relay.settings.experimental-generative-suggestions"
-        )
         defaults.set(automaticAgentSummaries, forKey: "relay.settings.intelligence-summaries")
         defaults.set(semanticAgentSearch, forKey: "relay.settings.intelligence-search")
         defaults.set(automaticallyUpdateRelayd, forKey: "relay.settings.relayd-auto-update")

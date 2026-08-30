@@ -230,7 +230,11 @@ struct RelayWorkspaceWindowMarker: NSViewRepresentable {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.styleMask.insert(.fullSizeContentView)
-            window.isMovableByWindowBackground = true
+            // Full-size content includes terminals, editors, image previews,
+            // floating panes, and resize handles. Treating all of it as window
+            // background lets AppKit steal their drags. WorkspaceBar provides
+            // the one explicit drag region for moving the macOS window.
+            window.isMovableByWindowBackground = false
             // Relay draws stable, high-contrast controls inside its unified
             // title bar. The native buttons become nearly black under
             // hiddenTitleBar + dark appearance and remain in the hit-testing
@@ -245,4 +249,17 @@ struct RelayWorkspaceWindowMarker: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         (nsView as? MarkerView)?.configureWindow()
     }
+}
+
+struct RelayWindowDragRegion: NSViewRepresentable {
+    final class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { false }
+
+        override func mouseDown(with event: NSEvent) {
+            window?.performDrag(with: event)
+        }
+    }
+
+    func makeNSView(context: Context) -> NSView { DragView(frame: .zero) }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }

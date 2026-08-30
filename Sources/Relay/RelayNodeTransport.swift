@@ -40,6 +40,78 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
 
 enum RelayNodeTransportError: Error { case disconnected, invalidEnvelope }
 
+/// Keeps a busy pane from doing terminal parsing on the one shared SSH reader.
+///
+/// Node mux frames are ordered per pane, but panes are independent. Calling a
+/// pane callback inline made one large Codex/Claude repaint pause delivery to
+/// every other pane on the host. This dispatcher preserves per-pane ordering
+/// while scheduling at most one drain job, so repaint bursts do not create one
+/// retained closure per frame.
+final class RelayNodeFrameDispatcher: @unchecked Sendable {
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private let deliver: @Sendable (RelayWireFrame) -> Void
+    private var frames: [RelayWireFrame] = []
+    private var head = 0
+    private var drainScheduled = false
+    private var closed = false
+
+    init(
+        label: String,
+        deliver: @escaping @Sendable (RelayWireFrame) -> Void
+    ) {
+        queue = DispatchQueue(label: label, qos: .userInitiated)
+        self.deliver = deliver
+    }
+
+    func enqueue(_ frame: RelayWireFrame) {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return
+        }
+        frames.append(frame)
+        guard !drainScheduled else {
+            lock.unlock()
+            return
+        }
+        drainScheduled = true
+        lock.unlock()
+        queue.async { [weak self] in self?.drain() }
+    }
+
+    func close() {
+        lock.lock()
+        closed = true
+        frames.removeAll(keepingCapacity: false)
+        head = 0
+        lock.unlock()
+    }
+
+    private func drain() {
+        while true {
+            lock.lock()
+            guard !closed, head < frames.count else {
+                frames.removeAll(keepingCapacity: true)
+                head = 0
+                drainScheduled = false
+                lock.unlock()
+                return
+            }
+            let frame = frames[head]
+            head += 1
+            // Release delivered storage in bounded chunks without an O(n)
+            // removeFirst for every frame.
+            if head >= 256, head * 2 >= frames.count {
+                frames.removeFirst(head)
+                head = 0
+            }
+            lock.unlock()
+            autoreleasepool { deliver(frame) }
+        }
+    }
+}
+
 enum RelayHeartbeatPolicy {
     // A half-open SSH socket is the common failure mode when a VPN route is
     // replaced: the local process remains alive but no bytes move. Three
@@ -99,7 +171,7 @@ final class RelayNodeConnection: @unchecked Sendable {
     private struct Subscription {
         let channel: RelayNodeChannel
         let onReady: @Sendable (RelayNodeChannel) -> Void
-        let onFrame: @Sendable (RelayWireFrame) -> Void
+        let frameDispatcher: RelayNodeFrameDispatcher
         let onDisconnect: @Sendable (SSHConnectionFailure) -> Void
     }
 
@@ -157,14 +229,28 @@ final class RelayNodeConnection: @unchecked Sendable {
         onDisconnect: @escaping @Sendable (SSHConnectionFailure) -> Void
     ) -> RelayNodeChannel {
         let channel = RelayNodeChannel(sessionID: sessionID, connection: self)
+        let frameDispatcher = RelayNodeFrameDispatcher(
+            label: "relay.node-pane.\(sessionID)"
+        ) { frame in
+            onFrame(frame)
+        }
         lock.lock()
-        subscriptions[sessionID] = Subscription(channel: channel, onReady: onReady, onFrame: onFrame, onDisconnect: onDisconnect)
+        let previous = subscriptions.updateValue(
+            Subscription(
+                channel: channel,
+                onReady: onReady,
+                frameDispatcher: frameDispatcher,
+                onDisconnect: onDisconnect
+            ),
+            forKey: sessionID
+        )
         let isReady = ready
         if stopped {
             stopped = false
             startLocked()
         }
         lock.unlock()
+        previous?.frameDispatcher.close()
         if isReady { onReady(channel) }
         return channel
     }
@@ -175,7 +261,7 @@ final class RelayNodeConnection: @unchecked Sendable {
             lock.unlock()
             return
         }
-        subscriptions.removeValue(forKey: sessionID)
+        let removed = subscriptions.removeValue(forKey: sessionID)
         let activeWriter = ready ? writer : nil
         if subscriptions.isEmpty {
             stopped = true
@@ -187,11 +273,13 @@ final class RelayNodeConnection: @unchecked Sendable {
             let process = self.process
             self.process = nil
             lock.unlock()
+            removed?.frameDispatcher.close()
             process?.terminate()
             onIdle(self)
             return
         }
         lock.unlock()
+        removed?.frameDispatcher.close()
         if let envelope = RelayWireFrame.hostEvent(
             sessionID: sessionID,
             inner: RelayWireFrame(type: .detach, payload: Data())
@@ -326,9 +414,9 @@ final class RelayNodeConnection: @unchecked Sendable {
         }
         guard let envelope = RelayWireFrame.parseHostEvent(frame) else { return }
         lock.lock()
-        let callback = subscriptions[envelope.sessionID]?.onFrame
+        let dispatcher = subscriptions[envelope.sessionID]?.frameDispatcher
         lock.unlock()
-        callback?(envelope.inner)
+        dispatcher?.enqueue(envelope.inner)
     }
 
     private func ended(generation currentGeneration: Int, status: Int32, diagnostic: String) {

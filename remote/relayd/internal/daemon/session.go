@@ -14,9 +14,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/creack/pty"
 	"github.com/relay-terminal/relayd/internal/protocol"
+	relayterminfo "github.com/relay-terminal/relayd/internal/terminfo"
 )
 
 const replayLimit = 8 << 20
@@ -45,35 +47,40 @@ func (viewer *client) markLagged() {
 }
 
 type Session struct {
-	id      string
-	command string
-	pty     *os.File
-	process *exec.Cmd
+	id       string
+	command  string
+	pty      *os.File
+	process  *exec.Cmd
+	resizeMu sync.Mutex
 
-	mu                 sync.Mutex
-	sequence           uint64
-	replay             []record
-	replayBytes        int
-	clients            map[*client]struct{}
-	agentClients       map[*client]struct{}
-	exited             bool
-	exitCode           int
-	latestAgentEvent   []byte
-	activeSubagents    map[string][]byte
-	activeAgentRoots   map[string][]byte
-	eventSequence      uint64
-	eventHistory       []protocol.Frame
-	eventHistoryBytes  int
-	eventJournal       *agentEventJournal
-	eventHashes        map[[32]byte]struct{}
-	eventHashOrder     [][32]byte
-	eventJournalError  string
-	inputSequences     map[[16]byte]uint64
-	artifactDetector   artifactDetector
-	controlClientID    string
-	controlConnections int
-	controlGraceUntil  time.Time
-	done               chan struct{}
+	mu                    sync.Mutex
+	sequence              uint64
+	outputChanged         chan struct{}
+	replay                []record
+	replayBytes           int
+	clients               map[*client]struct{}
+	agentClients          map[*client]struct{}
+	exited                bool
+	exitCode              int
+	latestAgentEvent      []byte
+	activeSubagents       map[string][]byte
+	activeAgentRoots      map[string][]byte
+	agentProcesses        map[int]string
+	agentProcessesChanged chan struct{}
+	eventSequence         uint64
+	eventHistory          []protocol.Frame
+	eventHistoryBytes     int
+	eventJournal          *agentEventJournal
+	eventHashes           map[[32]byte]struct{}
+	eventHashOrder        [][32]byte
+	eventJournalError     string
+	inputSequences        map[[16]byte]uint64
+	artifactDetector      artifactDetector
+	terminalModes         terminalModeState
+	controlClientID       string
+	controlConnections    int
+	controlGraceUntil     time.Time
+	done                  chan struct{}
 }
 
 func (session *Session) acquireControl(clientID string) bool {
@@ -133,13 +140,12 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	if workingDirectory != "" {
 		child.Dir = workingDirectory
 	}
-	child.Env = environmentWithOverrides(os.Environ(), map[string]string{
-		"TERM":          "xterm-256color",
-		"COLORTERM":     "truecolor",
-		"TERM_PROGRAM":  "relay",
-		"RELAY_SESSION": id,
-		"PATH":          shimPath + string(os.PathListSeparator) + os.Getenv("PATH"),
-	})
+	environmentOverrides := relayterminfo.PreferredEnvironment()
+	environmentOverrides["COLORTERM"] = "truecolor"
+	environmentOverrides["TERM_PROGRAM"] = "relay"
+	environmentOverrides["RELAY_SESSION"] = id
+	environmentOverrides["PATH"] = shimPath + string(os.PathListSeparator) + os.Getenv("PATH")
+	child.Env = environmentWithOverrides(os.Environ(), environmentOverrides)
 	if cols == 0 {
 		cols = 120
 	}
@@ -154,9 +160,16 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 		id: id, command: command, pty: terminal, process: child,
 		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
 		activeSubagents: make(map[string][]byte), activeAgentRoots: make(map[string][]byte), done: make(chan struct{}),
+		agentProcesses: make(map[int]string), agentProcessesChanged: make(chan struct{}),
 		inputSequences: make(map[[16]byte]uint64),
 		eventHashes:    make(map[[32]byte]struct{}),
+		outputChanged:  make(chan struct{}),
+		terminalModes:  newTerminalModeState(),
 	}
+	// Seed the shared process snapshot once so transcript observers can attach
+	// immediately. Thereafter one monitor owns /proc traversal for the pane and
+	// broadcasts changes to both Codex and Claude readers.
+	session.agentProcesses = descendantAgentProcesses(child.Process.Pid)
 	go session.readOutput()
 	go session.wait()
 	go session.monitorAgentProcesses()
@@ -349,7 +362,7 @@ func environmentWithOverrides(environment []string, overrides map[string]string)
 }
 
 func (session *Session) monitorAgentProcesses() {
-	timer := time.NewTimer(time.Second)
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	known := make(map[int]string)
 	for range timer.C {
@@ -372,8 +385,46 @@ func (session *Session) monitorAgentProcesses() {
 			}
 		}
 		known = current
+		session.updateAgentProcesses(current)
 		timer.Reset(agentProcessPollInterval(len(current)))
 	}
+}
+
+func (session *Session) updateAgentProcesses(current map[int]string) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if agentProcessMapsEqual(session.agentProcesses, current) {
+		return
+	}
+	session.agentProcesses = cloneAgentProcesses(current)
+	close(session.agentProcessesChanged)
+	session.agentProcessesChanged = make(chan struct{})
+}
+
+func (session *Session) agentProcessSnapshot() (map[int]string, <-chan struct{}) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return cloneAgentProcesses(session.agentProcesses), session.agentProcessesChanged
+}
+
+func cloneAgentProcesses(source map[int]string) map[int]string {
+	result := make(map[int]string, len(source))
+	for pid, agent := range source {
+		result[pid] = agent
+	}
+	return result
+}
+
+func agentProcessMapsEqual(left, right map[int]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for pid, agent := range left {
+		if right[pid] != agent {
+			return false
+		}
+	}
+	return true
 }
 
 func agentProcessPollInterval(activeAgents int) time.Duration {
@@ -386,9 +437,21 @@ func agentProcessPollInterval(activeAgents int) time.Duration {
 	return 5 * time.Second
 }
 
-func transcriptPollInterval(activeReaders int) time.Duration {
+func transcriptPollInterval(activeReaders, idlePolls int) time.Duration {
 	if activeReaders > 0 {
-		return 500 * time.Millisecond
+		switch idlePolls {
+		case 0:
+			return 250 * time.Millisecond
+		case 1:
+			return 500 * time.Millisecond
+		case 2:
+			return time.Second
+		default:
+			// Transcript files commonly live on shared NFS. Hooks and native
+			// streams are immediate; an idle compatibility reader should not
+			// issue two NFS opens/stats every second forever.
+			return 2 * time.Second
+		}
 	}
 	return 5 * time.Second
 }
@@ -524,7 +587,12 @@ func (session *Session) publish(data []byte) {
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	session.terminalModes.ingest(copyOfData)
 	session.sequence++
+	if session.outputChanged != nil {
+		close(session.outputChanged)
+	}
+	session.outputChanged = make(chan struct{})
 	session.replay = append(session.replay, record{sequence: session.sequence, data: copyOfData, artifacts: artifactFrames})
 	session.replayBytes += len(copyOfData)
 	for _, artifact := range artifactFrames {
@@ -607,12 +675,13 @@ func (session *Session) processID() int {
 func (session *Session) attach(
 	lastSequence, lastEventSequence uint64,
 	includeAgentEvents bool,
-) (*client, []protocol.Frame, bool, bool) {
+) (*client, []protocol.Frame, bool, bool, int) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	viewer := newClient(512)
 	viewer.includeAgentEvents = includeAgentEvents
 	session.clients[viewer] = struct{}{}
+	session.broadcastClientCountLocked()
 	outputReset := replayCursorHasGap(session.replay, lastSequence)
 	if lastSequence > session.sequence {
 		outputReset = true
@@ -635,6 +704,13 @@ func (session *Session) attach(
 			frames = append(frames, item.artifacts...)
 		}
 	}
+	// Reapply input modes after the bounded screen replay. Sequence zero is
+	// presentation-only and cannot advance or invalidate the durable cursor.
+	// Emitting this after replay makes it authoritative even when the retained
+	// suffix contains an older push/pop command.
+	if prelude := session.terminalModes.presentationPrelude(); len(prelude) > 0 {
+		frames = append(frames, protocol.OutputFrame(0, prelude))
+	}
 	if session.exited {
 		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "exited", ExitCode: session.exitCode})
 		frames = append(frames, status)
@@ -650,7 +726,7 @@ func (session *Session) attach(
 		}
 		frames = append(frames, session.eventFramesAfter(lastEventSequence)...)
 	}
-	return viewer, frames, outputReset, eventReset
+	return viewer, frames, outputReset, eventReset, len(session.clients)
 }
 
 func replayCursorHasGap(replay []record, sequence uint64) bool {
@@ -724,8 +800,31 @@ func terminalSequenceLengthAt(stream []byte, index int, sequences [][]byte) int 
 
 func (session *Session) detach(viewer *client) {
 	session.mu.Lock()
-	delete(session.clients, viewer)
+	if _, attached := session.clients[viewer]; attached {
+		delete(session.clients, viewer)
+		session.broadcastClientCountLocked()
+	}
 	session.mu.Unlock()
+}
+
+// Client count is presentation state, not terminal history. It is emitted only
+// when attachments change and never enters the replay ring, so observing the
+// metric adds no polling or PTY work.
+func (session *Session) broadcastClientCountLocked() {
+	frame, err := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+		State: "clients", ClientCount: len(session.clients),
+	})
+	if err != nil {
+		return
+	}
+	for viewer := range session.clients {
+		select {
+		case viewer.frames <- frame:
+		default:
+			// A diagnostic update must never evict a terminal client. The next
+			// attachment change will refresh the value.
+		}
+	}
 }
 
 func (session *Session) observeAgents(lastEventSequence uint64) (*client, []protocol.Frame, bool) {
@@ -795,10 +894,33 @@ func (session *Session) acknowledgedInput(clientID [16]byte, sequence uint64, da
 }
 
 func (session *Session) resize(cols, rows uint16) error {
+	session.resizeMu.Lock()
+	defer session.resizeMu.Unlock()
+	return session.resizeLocked(cols, rows)
+}
+
+func (session *Session) resizeLocked(cols, rows uint16) error {
 	if cols == 0 || rows == 0 {
 		return nil
 	}
 	return pty.Setsize(session.pty, &pty.Winsize{Cols: cols, Rows: rows})
+}
+
+func (session *Session) signalForegroundResize() error {
+	var processGroup int32
+	_, _, errno := syscall.Syscall(
+		syscall.SYS_IOCTL,
+		session.pty.Fd(),
+		uintptr(syscall.TIOCGPGRP),
+		uintptr(unsafe.Pointer(&processGroup)),
+	)
+	if errno != 0 {
+		return errno
+	}
+	if processGroup <= 0 {
+		return nil
+	}
+	return syscall.Kill(-int(processGroup), syscall.SIGWINCH)
 }
 
 type terminalGridSize struct {
@@ -806,14 +928,20 @@ type terminalGridSize struct {
 	rows uint16
 }
 
-// An unchanged TIOCSWINSZ does not reliably deliver SIGWINCH on Linux. Pulse
-// one row away and immediately restore the requested geometry so an attached
-// full-screen program reads only the final size but still emits a complete
-// repaint for the reconnect replay.
-func attachResizeSteps(currentCols, currentRows, cols, rows uint16) []terminalGridSize {
+// An unchanged TIOCSWINSZ does not reliably deliver SIGWINCH on Linux. Active
+// agent TUIs need a one-row pulse so reconnect replay captures a full screen;
+// an ordinary shell already has authoritative replay and pulsing it only
+// appends duplicate prompts on every app launch.
+func attachResizeSteps(
+	currentCols, currentRows, cols, rows uint16,
+	pulseUnchanged bool,
+) []terminalGridSize {
 	target := terminalGridSize{cols: cols, rows: rows}
 	if currentCols != cols || currentRows != rows || cols == 0 || rows == 0 {
 		return []terminalGridSize{target}
+	}
+	if !pulseUnchanged {
+		return nil
 	}
 	probe := target
 	if rows > 1 {
@@ -837,38 +965,133 @@ func (session *Session) resizeForAttach(cols, rows uint16) (uint64, bool) {
 	if cols == 0 || rows == 0 {
 		return 0, false
 	}
+	session.resizeMu.Lock()
+	defer session.resizeMu.Unlock()
 	before, _, _, _ := session.snapshot()
 	current, _ := pty.GetsizeFull(session.pty)
 	currentCols, currentRows := uint16(0), uint16(0)
 	if current != nil {
 		currentCols, currentRows = current.Cols, current.Rows
 	}
-	for _, step := range attachResizeSteps(currentCols, currentRows, cols, rows) {
-		if session.resize(step.cols, step.rows) != nil {
+	steps := attachResizeSteps(
+		currentCols, currentRows, cols, rows,
+		session.requiresAttachRepaint(),
+	)
+	if len(steps) == 0 {
+		return before, false
+	}
+	for _, step := range steps {
+		if session.resizeLocked(step.cols, step.rows) != nil {
 			return before, false
 		}
 	}
+	_, repainted := session.waitForResizeRepaint(before)
+	return before, repainted
+}
+
+func (session *Session) requiresAttachRepaint() bool {
+	session.mu.Lock()
+	structuredAgentActive := len(session.activeAgentRoots) > 0 || len(session.activeSubagents) > 0
+	rootPID := 0
+	if session.process != nil && session.process.Process != nil {
+		rootPID = session.process.Process.Pid
+	}
+	session.mu.Unlock()
+	if structuredAgentActive {
+		return true
+	}
+	if rootPID <= 0 {
+		return false
+	}
+	return descendantAgent(rootPID) != ""
+}
+
+// resizeForViewportCommit is the live presentation barrier. Unlike attach it
+// does not perturb the requested grid: it applies the final winsize once,
+// explicitly notifies the active foreground process group, and acknowledges
+// the output sequence after that TUI's repaint has reached the session ring.
+func (session *Session) resizeForViewportCommit(cols, rows uint16) (uint64, error) {
+	session.resizeMu.Lock()
+	defer session.resizeMu.Unlock()
+	before, _, _, _ := session.snapshot()
+	current, currentErr := pty.GetsizeFull(session.pty)
+	knownCurrent := currentErr == nil && current != nil
+	currentCols, currentRows := uint16(0), uint16(0)
+	if knownCurrent {
+		currentCols, currentRows = current.Cols, current.Rows
+	}
+	if err := session.resizeLocked(cols, rows); err != nil {
+		return before, err
+	}
+	// Linux already delivers SIGWINCH for a changed TIOCSWINSZ. Send one
+	// explicitly only when the requested grid was unchanged (or could not be
+	// queried), otherwise readline and primary-screen TUIs receive the resize
+	// twice and can append duplicate prompts or leave an intermediate cursor.
+	if viewportResizeNeedsExplicitSignal(
+		currentCols, currentRows, cols, rows, knownCurrent,
+	) {
+		if err := session.signalForegroundResize(); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return before, err
+		}
+	}
+	sequence, _ := session.waitForResizeRepaint(before)
+	return sequence, nil
+}
+
+func viewportResizeNeedsExplicitSignal(
+	currentCols, currentRows, cols, rows uint16,
+	knownCurrent bool,
+) bool {
+	return !knownCurrent || (currentCols == cols && currentRows == rows)
+}
+
+func (session *Session) waitForResizeRepaint(before uint64) (uint64, bool) {
 	started := time.Now()
 	deadline := started.Add(150 * time.Millisecond)
 	quietSince := started
 	lastSequence := before
-	for time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-		sequence, _, _, _ := session.snapshot()
+	for {
+		sequence, exited, changed := session.outputSequenceWaitState()
 		if sequence != lastSequence {
 			lastSequence = sequence
 			quietSince = time.Now()
-			continue
 		}
-		if sequence == before && time.Since(started) >= 20*time.Millisecond {
-			return before, false
+		if exited {
+			return sequence, sequence != before
 		}
-		if sequence != before && time.Since(quietSince) >= 15*time.Millisecond {
-			return before, true
+		now := time.Now()
+		quietDeadline := started.Add(20 * time.Millisecond)
+		if sequence != before {
+			quietDeadline = quietSince.Add(15 * time.Millisecond)
+		}
+		wakeAt := quietDeadline
+		if deadline.Before(wakeAt) {
+			wakeAt = deadline
+		}
+		if !now.Before(wakeAt) {
+			return sequence, sequence != before
+		}
+		timer := time.NewTimer(time.Until(wakeAt))
+		select {
+		case <-changed:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
 		}
 	}
-	sequence, _, _, _ := session.snapshot()
-	return before, sequence != before
+}
+
+func (session *Session) outputSequenceWaitState() (uint64, bool, <-chan struct{}) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.outputChanged == nil {
+		session.outputChanged = make(chan struct{})
+	}
+	return session.sequence, session.exited, session.outputChanged
 }
 
 func (session *Session) agentEvent(payload []byte) {

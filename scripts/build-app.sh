@@ -8,9 +8,10 @@ relayd_version="${RELAYD_VERSION:-$app_version}"
 relayd_protocol_version="${RELAYD_PROTOCOL_VERSION:-2}"
 build_number="${RELAY_BUILD_NUMBER:-1}"
 signing_identity="${RELAY_CODESIGN_IDENTITY:--}"
+build_jobs="${RELAY_BUILD_JOBS:-2}"
 cd "$project_root"
-swift build -c "$configuration"
-binary_path="$(cd "$project_root" && swift build -c "$configuration" --show-bin-path)"
+swift build -c "$configuration" --jobs "$build_jobs"
+binary_path="$(cd "$project_root" && swift build -c "$configuration" --jobs "$build_jobs" --show-bin-path)"
 
 # SwiftPM generates command-line executable accessors that resolve resource
 # bundles beside Bundle.main.bundleURL. Once wrapped as a signed .app, bundles
@@ -24,15 +25,21 @@ while IFS= read -r -d '' accessor; do
     fi
 done < <(/usr/bin/find "$(dirname "$binary_path")/$configuration" -path '*/DerivedSources/resource_bundle_accessor.swift' -print0)
 if [[ "$accessor_changed" == "1" ]]; then
-    swift build -c "$configuration"
-    binary_path="$(cd "$project_root" && swift build -c "$configuration" --show-bin-path)"
+    swift build -c "$configuration" --jobs "$build_jobs"
+    binary_path="$(cd "$project_root" && swift build -c "$configuration" --jobs "$build_jobs" --show-bin-path)"
 fi
 workspace_link="$project_root/Relay.app"
 # A bundle inside Documents may be managed by File Provider, which immediately
 # reapplies extended attributes and invalidates strict code-sign verification.
-# Keep the runnable development app in the user's local Applications folder;
-# the repository path remains a convenient symlink for `open Relay.app`.
-output_path="${RELAY_APP_OUTPUT:-$HOME/Applications/Relay.app}"
+# Rebuild an existing system installation in place so Launch Services never
+# sees two physical Relay bundles with the same identifier. Before the first
+# system install, keep the development app in the user's Applications folder;
+# callers can always choose explicitly with RELAY_APP_OUTPUT.
+default_output="$HOME/Applications/Relay.app"
+if [[ -d "/Applications/Relay.app" ]]; then
+    default_output="/Applications/Relay.app"
+fi
+output_path="${RELAY_APP_OUTPUT:-$default_output}"
 stage_root="$(mktemp -d "${TMPDIR:-/tmp}/relay-app.XXXXXX")"
 trap '/bin/rm -rf "$stage_root"' EXIT
 app_path="$stage_root/Relay.app"
@@ -49,6 +56,24 @@ for resource_bundle in "$binary_path"/*.bundle; do
         ditto "$resource_bundle" "$app_path/Contents/Resources/$(basename "$resource_bundle")"
     fi
 done
+
+ghostty_bundle="$app_path/Contents/Resources/GhosttyKit_GhosttyTerminal.bundle"
+if [[ ! -d "$ghostty_bundle/Ghostty" || ! -d "$ghostty_bundle/terminfo" ]]; then
+    echo "packaged Ghostty resources are incomplete" >&2
+    exit 1
+fi
+
+relay_bundle="$app_path/Contents/Resources/Relay_Relay.bundle"
+relay_terminfo="$relay_bundle/Terminfo/78/xterm-relay"
+if [[ ! -s "$relay_terminfo" ]]; then
+    echo "packaged xterm-relay entry is missing" >&2
+    exit 1
+fi
+if ! /opt/homebrew/opt/ncurses/bin/infocmp -A "$relay_bundle/Terminfo" xterm-relay >/dev/null 2>&1 &&
+   ! /usr/bin/infocmp -A "$relay_bundle/Terminfo" xterm-relay >/dev/null 2>&1; then
+    echo "packaged xterm-relay entry is not resolvable" >&2
+    exit 1
+fi
 
 # Remote installation is explicit in the UI, but it must remain offline and
 # reproducible once authorized. Bundle the exact static Linux helpers inside

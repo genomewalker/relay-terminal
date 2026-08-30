@@ -3,6 +3,7 @@
 DerivedData/
 Relay.app/
 Relay.app
+Relay [0-9]*.app
 *.xcuserstate
 remote/relayd/relayd
 dist/

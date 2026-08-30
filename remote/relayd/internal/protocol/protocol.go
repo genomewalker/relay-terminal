@@ -26,6 +26,8 @@ const (
 	InputV2        Type = 12
 	HostEvent      Type = 13
 	WorkspaceState Type = 14
+	ViewportCommit Type = 15
+	ViewportAck    Type = 16
 )
 
 const MaxPayload = 16 << 20
@@ -92,6 +94,7 @@ type StatusPayload struct {
 	OutputReset     bool     `json:"output_reset,omitempty"`
 	EventReset      bool     `json:"event_reset,omitempty"`
 	ControlGranted  *bool    `json:"control_granted,omitempty"`
+	ClientCount     int      `json:"client_count,omitempty"`
 }
 
 const inputIdentityBytes = 16
@@ -188,6 +191,45 @@ func ParseResize(frame Frame) (uint16, uint16, error) {
 		return 0, 0, errors.New("invalid resize frame")
 	}
 	return binary.BigEndian.Uint16(frame.Payload[:2]), binary.BigEndian.Uint16(frame.Payload[2:]), nil
+}
+
+func ViewportCommitFrame(generation uint64, cols, rows uint16) Frame {
+	payload := make([]byte, 12)
+	binary.BigEndian.PutUint64(payload[:8], generation)
+	binary.BigEndian.PutUint16(payload[8:10], cols)
+	binary.BigEndian.PutUint16(payload[10:12], rows)
+	return Frame{Type: ViewportCommit, Payload: payload}
+}
+
+func ParseViewportCommit(frame Frame) (uint64, uint16, uint16, error) {
+	if frame.Type != ViewportCommit || len(frame.Payload) != 12 {
+		return 0, 0, 0, errors.New("invalid viewport commit frame")
+	}
+	generation := binary.BigEndian.Uint64(frame.Payload[:8])
+	cols := binary.BigEndian.Uint16(frame.Payload[8:10])
+	rows := binary.BigEndian.Uint16(frame.Payload[10:12])
+	if generation == 0 || cols == 0 || rows == 0 {
+		return 0, 0, 0, errors.New("invalid viewport commit values")
+	}
+	return generation, cols, rows, nil
+}
+
+func ViewportAckFrame(generation, repaintSequence uint64) Frame {
+	payload := make([]byte, 16)
+	binary.BigEndian.PutUint64(payload[:8], generation)
+	binary.BigEndian.PutUint64(payload[8:], repaintSequence)
+	return Frame{Type: ViewportAck, Payload: payload}
+}
+
+func ParseViewportAck(frame Frame) (uint64, uint64, error) {
+	if frame.Type != ViewportAck || len(frame.Payload) != 16 {
+		return 0, 0, errors.New("invalid viewport acknowledgement")
+	}
+	generation := binary.BigEndian.Uint64(frame.Payload[:8])
+	if generation == 0 {
+		return 0, 0, errors.New("invalid viewport generation")
+	}
+	return generation, binary.BigEndian.Uint64(frame.Payload[8:]), nil
 }
 
 func ReadFrame(reader io.Reader) (Frame, error) {

@@ -1,6 +1,35 @@
 import AppKit
 import SwiftUI
 
+struct RelaySplitGeometry: Equatable {
+    let size: CGSize
+    let divider: CGFloat
+    let available: CGFloat
+    let ratio: CGFloat
+    let firstLength: CGFloat
+    let secondLength: CGFloat
+
+    init(proposedSize: CGSize, axis: SplitAxis, ratio: Double, divider requestedDivider: CGFloat = 6) {
+        // SwiftUI can briefly propose negative or non-finite dimensions while
+        // replacing a tab tree or entering full screen. Passing those values
+        // into frame(width:height:) reaches AppKit before TerminalView can
+        // reject them and corrupts the whole pane hierarchy.
+        let width = proposedSize.width.isFinite ? max(0, proposedSize.width) : 0
+        let height = proposedSize.height.isFinite ? max(0, proposedSize.height) : 0
+        size = CGSize(width: width, height: height)
+
+        let total = axis == .horizontal ? width : height
+        let safeDivider = requestedDivider.isFinite ? max(0, requestedDivider) : 0
+        divider = min(safeDivider, total)
+        available = max(0, total - divider)
+
+        let finiteRatio = ratio.isFinite ? ratio : 0.5
+        self.ratio = CGFloat(min(max(finiteRatio, 0.12), 0.88))
+        firstLength = max(0, available * self.ratio)
+        secondLength = max(0, available - firstLength)
+    }
+}
+
 /// The recursive workspace can create many split containers. Keeping this
 /// interaction in a separate compilation unit prevents the older compiler
 /// used by the release runner from repeatedly type-checking it with the much
@@ -31,18 +60,23 @@ struct RelaySplitContainer: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let total = axis == .horizontal ? proxy.size.width : proxy.size.height
-            let divider: CGFloat = 6
-            let available = max(1, total - divider)
-            let firstLength = available * ratio
+            let geometry = RelaySplitGeometry(
+                proposedSize: proxy.size,
+                axis: axis,
+                ratio: ratio
+            )
             ZStack(alignment: .topLeading) {
                 paneStack(
-                    size: proxy.size,
-                    divider: divider,
-                    available: available,
-                    firstLength: firstLength
+                    size: geometry.size,
+                    divider: geometry.divider,
+                    firstLength: geometry.firstLength,
+                    secondLength: geometry.secondLength
                 )
-                preview(size: proxy.size, divider: divider, available: available)
+                preview(
+                    size: geometry.size,
+                    divider: geometry.divider,
+                    available: geometry.available
+                )
             }
         }
     }
@@ -51,21 +85,23 @@ struct RelaySplitContainer: View {
     private func paneStack(
         size: CGSize,
         divider: CGFloat,
-        available: CGFloat,
-        firstLength: CGFloat
+        firstLength: CGFloat,
+        secondLength: CGFloat
     ) -> some View {
         if axis == .horizontal {
             HStack(spacing: 0) {
                 first.frame(width: firstLength, height: size.height)
-                splitDivider(total: available).frame(width: divider, height: size.height)
-                second.frame(width: available - firstLength, height: size.height)
+                splitDivider(total: max(firstLength + secondLength, 1))
+                    .frame(width: divider, height: size.height)
+                second.frame(width: secondLength, height: size.height)
             }
             .frame(width: size.width, height: size.height)
         } else {
             VStack(spacing: 0) {
                 first.frame(width: size.width, height: firstLength)
-                splitDivider(total: available).frame(width: size.width, height: divider)
-                second.frame(width: size.width, height: available - firstLength)
+                splitDivider(total: max(firstLength + secondLength, 1))
+                    .frame(width: size.width, height: divider)
+                second.frame(width: size.width, height: secondLength)
             }
             .frame(width: size.width, height: size.height)
         }

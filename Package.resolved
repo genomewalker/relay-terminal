@@ -6,7 +6,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/genomewalker/libghostty-spm.git",
       "state" : {
-        "revision" : "c056eecfe327616a42f46ef29e706c604285cf6a"
+        "revision" : "859807b2d92ec8e2e57806b311fad23afe5f16c4"
       }
     },
     {

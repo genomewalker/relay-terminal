@@ -214,8 +214,69 @@ func (server *Server) serveConnection(connection net.Conn) {
 }
 
 type multiplexedSession struct {
-	connection   net.Conn
-	terminalOnly bool
+	connection       net.Conn
+	terminalOnly     bool
+	durableSessionID string
+	capabilitiesMu   sync.RWMutex
+	capabilitiesSeen bool
+	viewportCommitV2 bool
+	manifestCached   bool
+	manifest         workerManifest
+}
+
+func (session *multiplexedSession) observeWorkerFrame(frame protocol.Frame) {
+	if frame.Type != protocol.Status {
+		return
+	}
+	var status protocol.StatusPayload
+	if protocol.DecodeJSON(frame, &status) != nil || status.State != "attached" {
+		return
+	}
+	session.capabilitiesMu.Lock()
+	session.capabilitiesSeen = true
+	session.viewportCommitV2 = statusSupportsCapability(status.Capabilities, "viewport_commit_v2")
+	session.capabilitiesMu.Unlock()
+}
+
+func statusSupportsCapability(capabilities []string, wanted string) bool {
+	for _, capability := range capabilities {
+		if capability == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func (session *multiplexedSession) supportsExactViewportCommit() (known bool, supported bool) {
+	session.capabilitiesMu.RLock()
+	known = session.capabilitiesSeen
+	supported = session.viewportCommitV2
+	session.capabilitiesMu.RUnlock()
+	return known, supported
+}
+
+func (session *multiplexedSession) compatibilityManifest(path string) (workerManifest, error) {
+	session.capabilitiesMu.RLock()
+	if session.manifestCached {
+		manifest := session.manifest
+		session.capabilitiesMu.RUnlock()
+		return manifest, nil
+	}
+	session.capabilitiesMu.RUnlock()
+
+	manifest, err := loadManifest(path)
+	if err != nil {
+		return workerManifest{}, err
+	}
+	session.capabilitiesMu.Lock()
+	if !session.manifestCached {
+		session.manifest = manifest
+		session.manifestCached = true
+	} else {
+		manifest = session.manifest
+	}
+	session.capabilitiesMu.Unlock()
+	return manifest, nil
 }
 
 // serveNodeMultiplex turns one SSH channel into independent virtual protocol
@@ -227,7 +288,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 	ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
 		State: "ready", Version: server.buildVersion,
 		ProtocolVersion: server.protocolVersion, SupervisorPID: os.Getpid(),
-		Capabilities: []string{"node_mux_v1", "node_mux_v2"},
+		Capabilities: []string{"node_mux_v1", "node_mux_v2", "viewport_commit_compat_v1", "viewport_commit_compat_v2"},
 	})
 	if writer.Write(ready) != nil {
 		return
@@ -235,13 +296,16 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 
 	var sessionsMu sync.Mutex
 	sessions := make(map[string]*multiplexedSession)
-	closeSession := func(id string, expected *multiplexedSession) {
+	closeSession := func(id string, expected *multiplexedSession) bool {
 		sessionsMu.Lock()
+		closedCurrentRoute := false
 		if sessions[id] == expected {
 			delete(sessions, id)
+			closedCurrentRoute = true
 		}
 		sessionsMu.Unlock()
 		_ = expected.connection.Close()
+		return closedCurrentRoute
 	}
 	defer func() {
 		sessionsMu.Lock()
@@ -291,7 +355,10 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 				return
 			}
 			clientSide, serverSide := net.Pipe()
-			virtual := &multiplexedSession{connection: clientSide, terminalOnly: hello.TerminalOnly}
+			virtual := &multiplexedSession{
+				connection: clientSide, terminalOnly: hello.TerminalOnly,
+				durableSessionID: hello.SessionID,
+			}
 			sessionsMu.Lock()
 			previous := sessions[sessionID]
 			sessions[sessionID] = virtual
@@ -301,12 +368,29 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 			}
 			go server.serveConnection(serverSide)
 			go func(id string, session *multiplexedSession) {
-				defer closeSession(id, session)
+				defer func() {
+					// A pane worker deliberately disconnects a viewer whose bounded
+					// output queue fell behind. On a dedicated SSH connection that EOF
+					// naturally makes the macOS client reconnect. Under node_mux the
+					// outer SSH stream remains healthy, so silently removing this
+					// virtual route leaves input working while output and the next
+					// shell prompt disappear forever. Tell only the current route to
+					// reopen from its last acknowledged sequence. A route superseded by
+					// a newer Hello must not close that replacement.
+					if closeSession(id, session) {
+						status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+							State:   "route_closed",
+							Message: "Pane output route closed; replay is required.",
+						})
+						_ = writer.Write(protocol.HostEventFrame(id, status))
+					}
+				}()
 				for {
 					frame, readErr := protocol.ReadFrame(session.connection)
 					if readErr != nil {
 						return
 					}
+					session.observeWorkerFrame(frame)
 					// Existing pane workers may predate terminal_only. Filter their
 					// agent frames here so terminal restoration never waits for a
 					// historical transcript replay.
@@ -329,6 +413,47 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 		sessionsMu.Unlock()
 		if virtual == nil {
 			continue
+		}
+		if inner.Type == protocol.ViewportCommit {
+			known, exact := virtual.supportsExactViewportCommit()
+			if !known || !exact {
+				manifest, loadErr := virtual.compatibilityManifest(
+					server.manifestPath(virtual.durableSessionID),
+				)
+				if loadErr == nil && manifest.supports("viewport_commit_v2") {
+					// The status and manifest normally agree. Prefer the durable
+					// capability if a commit raced the routed attached status.
+					if protocol.NewWriter(virtual.connection).Write(inner) != nil {
+						closeSession(sessionID, virtual)
+					}
+					continue
+				}
+				if loadErr != nil {
+					if protocol.NewWriter(virtual.connection).Write(inner) != nil {
+						closeSession(sessionID, virtual)
+					}
+					continue
+				}
+				generation, cols, rows, parseErr := protocol.ParseViewportCommit(inner)
+				if parseErr == nil {
+					// A freshly installed supervisor can repair presentation for
+					// durable workers created by an older relayd. Run this outside
+					// the node read loop so one slow TUI repaint never stalls the
+					// other multiplexed panes or their heartbeat.
+					go func(routeID string, worker workerManifest) {
+						if commitLegacyWorkerViewport(worker, cols, rows) != nil {
+							return
+						}
+						// Give the old worker's ordinary output route time to publish
+						// the SIGWINCH repaint before the client uncovers its surface.
+						time.Sleep(150 * time.Millisecond)
+						_ = writer.Write(protocol.HostEventFrame(
+							routeID, protocol.ViewportAckFrame(generation, 0),
+						))
+					}(sessionID, manifest)
+					continue
+				}
+			}
 		}
 		if protocol.NewWriter(virtual.connection).Write(inner) != nil {
 			closeSession(sessionID, virtual)
@@ -371,10 +496,10 @@ func serveObservedConnection(
 		clientDone <- struct{}{}
 	}()
 
-	codexFrames, stopCodex := observeCodexTranscript(manifest.ShellPID)
-	defer stopCodex()
-	claudeFrames, stopClaude := observeClaudeTranscript(manifest.ShellPID)
-	defer stopClaude()
+	transcriptFrames, stopTranscripts := observeAgentTranscripts(func() (map[int]string, <-chan struct{}) {
+		return descendantAgentProcesses(manifest.ShellPID), nil
+	})
+	defer stopTranscripts()
 	writer := protocol.NewWriter(connection)
 	index, indexErr := sharedExternalEventIndex(eventPath)
 	if indexErr == nil {
@@ -400,20 +525,9 @@ func serveObservedConnection(
 			if writer.Write(result.frame) != nil {
 				return
 			}
-		case frame, ok := <-codexFrames:
+		case frame, ok := <-transcriptFrames:
 			if !ok {
-				codexFrames = nil
-				continue
-			}
-			if indexErr == nil {
-				frame = index.index(frame.Payload)
-			}
-			if writer.Write(frame) != nil {
-				return
-			}
-		case frame, ok := <-claudeFrames:
-			if !ok {
-				claudeFrames = nil
+				transcriptFrames = nil
 				continue
 			}
 			if indexErr == nil {

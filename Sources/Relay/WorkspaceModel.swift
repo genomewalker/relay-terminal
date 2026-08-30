@@ -6,6 +6,11 @@ struct AgentInspectorSelection: Equatable, Sendable {
     let subagentID: String
 }
 
+enum TabMovePlacement: Equatable, Sendable {
+    case before
+    case after
+}
+
 private struct ClosedPaneRecovery {
     let pane: PaneSnapshot
     let tab: TabSnapshot
@@ -17,7 +22,12 @@ private struct ClosedPaneRecovery {
 final class WorkspaceModel: ObservableObject {
     @Published var tabs: [TabModel] = []
     @Published var selectedTabID: UUID?
-    @Published var activePaneID: UUID?
+    @Published var activePaneID: UUID? {
+        didSet {
+            guard activePaneID != oldValue else { return }
+            updateTerminalFocusOwnership()
+        }
+    }
     @Published var isConnectionSheetPresented = false
     @Published var isHostLauncherPresented = false
     @Published var sidebarVisible = true
@@ -28,6 +38,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var renameDraft = ""
     @Published var agentInspector: AgentInspectorSelection?
     @Published var intelligencePanelVisible = false
+    @Published var performancePanelVisible = false
     @Published var terminationTargetID: UUID?
     @Published var operationError: String?
     @Published private(set) var sessionNames: [UUID: String] = [:]
@@ -42,6 +53,7 @@ final class WorkspaceModel: ObservableObject {
     private let workspaceKey = "relay.workspace.v1"
     private var sidebarBeforeFullScreen = true
     private var persistenceTask: Task<Void, Never>?
+    private var presentationFocusTask: Task<Void, Never>?
     private var didShutdown = false
     private var recentlyClosedPanes: [ClosedPaneRecovery] = []
 
@@ -66,6 +78,32 @@ final class WorkspaceModel: ObservableObject {
         selectedTab?.allPaneIDs.compactMap { panes[$0] } ?? []
     }
 
+    /// AppKit resigns the terminal first responder when Relay is hidden,
+    /// minimized, or leaves the active Space. Rendering resume and keyboard
+    /// ownership are separate operations: once presentation is usable again,
+    /// return first-responder status to exactly the workspace's active pane.
+    func applicationPresentationChanged(visible: Bool) {
+        presentationFocusTask?.cancel()
+        presentationFocusTask = nil
+        guard visible, let paneID = activePaneID else { return }
+        presentationFocusTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled,
+                  RelayApplicationActivityState.allowsContinuousUpdates,
+                  let self,
+                  self.activePaneID == paneID,
+                  let pane = self.panes[paneID] else { return }
+            // A Codex browser panel can legitimately own a different PTY grid
+            // while Relay is in the background. Every pane visible in the
+            // selected tab must reclaim its native measured grid on return;
+            // focusing only the active pane leaves sibling TUIs rendering at
+            // the browser width until an unrelated divider move.
+            self.selectedPanes.forEach { $0.runtime.reclaimNativeViewportOwnership() }
+            pane.focus()
+            self.presentationFocusTask = nil
+        }
+    }
+
     func inspectAgent(paneID: UUID, subagentID: String) {
         intelligencePanelVisible = false
         agentInspector = AgentInspectorSelection(paneID: paneID, subagentID: subagentID)
@@ -82,6 +120,14 @@ final class WorkspaceModel: ObservableObject {
 
     func closeIntelligencePanel() {
         intelligencePanelVisible = false
+    }
+
+    func togglePerformancePanel() {
+        performancePanelVisible.toggle()
+    }
+
+    func closePerformancePanel() {
+        performancePanelVisible = false
     }
 
     func openInboxItem(_ item: AgentInboxItem) {
@@ -132,6 +178,88 @@ final class WorkspaceModel: ObservableObject {
         panes[paneID]?.focus()
     }
 
+    func sidePanelState() -> RelaySidePanelState {
+        let sessions = Dictionary(grouping: tabs, by: \.sessionID)
+        let orderedSessionIDs = tabs.reduce(into: [UUID]()) { result, tab in
+            if !result.contains(tab.sessionID) { result.append(tab.sessionID) }
+        }
+        return RelaySidePanelState(
+            selectedPaneID: activePaneID?.uuidString.lowercased(),
+            terminalFontFamily: RelayPreferences.shared.resolvedFontFamily,
+            terminalFontSize: RelayPreferences.shared.fontSize,
+            sessions: orderedSessionIDs.compactMap { sessionID in
+                guard let sessionTabs = sessions[sessionID], let firstTab = sessionTabs.first else {
+                    return nil
+                }
+                return RelaySidePanelState.Session(
+                    id: sessionID.uuidString.lowercased(),
+                    name: sessionDisplayName(sessionID, fallback: firstTab.name),
+                    pinned: isSessionPinned(sessionID),
+                    tabs: sessionTabs.map { tab in
+                        RelaySidePanelState.Tab(
+                            id: tab.id.uuidString.lowercased(),
+                            name: tab.name,
+                            pinned: isTabPinned(tab.id),
+                            selected: tab.id == selectedTabID,
+                            panes: tab.allPaneIDs.compactMap { paneID in
+                                guard let pane = panes[paneID] else { return nil }
+                                return RelaySidePanelState.Pane(
+                                    id: pane.id.uuidString.lowercased(),
+                                    name: pane.displayName,
+                                    host: pane.profile.kind == .local ? "This Mac" : pane.profile.name,
+                                    directory: pane.directory,
+                                    contentKind: pane.contentKind.rawValue,
+                                    terminalAvailable: pane.contentKind == .terminal &&
+                                        pane.profile.kind == .ssh && pane.profile.backend == .relay,
+                                    agent: pane.kind.rawValue,
+                                    phase: pane.phase.rawValue,
+                                    connection: pane.connectionState.label,
+                                    selected: pane.id == activePaneID,
+                                    summary: pane.activitySummary
+                                )
+                            }
+                        )
+                    }
+                )
+            }
+        )
+    }
+
+    func sidePanelDetail(for paneID: UUID) -> RelaySidePanelPaneDetail? {
+        guard let pane = panes[paneID] else { return nil }
+        return RelaySidePanelPaneDetail(
+            id: pane.id.uuidString.lowercased(),
+            context: Array(pane.recentConversationContext.suffix(20)),
+            activities: pane.agentActivities.suffix(12).map {
+                RelaySidePanelState.Activity(
+                    id: $0.id.uuidString.lowercased(), label: $0.label,
+                    phase: $0.phase.rawValue, occurredAt: $0.occurredAt
+                )
+            },
+            subagents: pane.subagents.suffix(100).map {
+                RelaySidePanelState.Subagent(
+                    id: $0.id, label: $0.label,
+                    provider: $0.provider.rawValue, phase: $0.phase.rawValue,
+                    updates: $0.updates.suffix(5).map(\.message)
+                )
+            }
+        )
+    }
+
+    @discardableResult
+    func sidePanelReveal(_ paneID: UUID) -> Bool {
+        guard panes[paneID] != nil else { return false }
+        revealPane(paneID)
+        NSApp.activate(ignoringOtherApps: true)
+        return true
+    }
+
+    @discardableResult
+    func sidePanelSendPrompt(_ text: String, to paneID: UUID) -> Bool {
+        guard let pane = panes[paneID], pane.contentKind == .terminal else { return false }
+        return pane.runtime.sendSidePanelPrompt(text)
+    }
+
     func sessionDisplayName(_ sessionID: UUID, fallback: String) -> String {
         sessionNames[sessionID] ?? fallback
     }
@@ -155,6 +283,54 @@ final class WorkspaceModel: ObservableObject {
             matching.filter { !pinnedTabIDs.contains($0.id) }
     }
 
+    /// Reorder tabs using their visual order while keeping pinned tabs as the
+    /// leading group. Crossing that boundary pins or unpins the dragged tab,
+    /// so the dropped position remains stable instead of snapping elsewhere.
+    func moveTab(_ sourceID: UUID, relativeTo targetID: UUID, placement: TabMovePlacement) {
+        guard sourceID != targetID,
+              let source = tabs.first(where: { $0.id == sourceID }),
+              let target = tabs.first(where: { $0.id == targetID }),
+              source.sessionID == target.sessionID else { return }
+
+        let sessionID = source.sessionID
+        var visualOrder = orderedTabs(in: sessionID)
+        guard let sourceIndex = visualOrder.firstIndex(where: { $0.id == sourceID }) else { return }
+        let sourceWasPinned = pinnedTabIDs.contains(sourceID)
+        visualOrder.remove(at: sourceIndex)
+        guard let targetIndex = visualOrder.firstIndex(where: { $0.id == targetID }) else { return }
+        let insertionIndex = targetIndex + (placement == .after ? 1 : 0)
+        visualOrder.insert(source, at: insertionIndex)
+
+        let pinnedRemaining = visualOrder.reduce(into: 0) { count, tab in
+            if tab.id != sourceID, pinnedTabIDs.contains(tab.id) { count += 1 }
+        }
+        let shouldPin: Bool
+        if insertionIndex < pinnedRemaining {
+            shouldPin = true
+        } else if insertionIndex > pinnedRemaining {
+            shouldPin = false
+        } else {
+            shouldPin = sourceWasPinned
+        }
+        if shouldPin {
+            pinnedTabIDs.insert(sourceID)
+        } else {
+            pinnedTabIDs.remove(sourceID)
+        }
+        WorkspacePinStore.save(pinnedTabIDs, kind: .tab)
+
+        // Replace only this session's slots so other sessions retain their
+        // relative order even if their tabs are interleaved in the snapshot.
+        var reordered = tabs
+        var visualIndex = 0
+        for index in reordered.indices where reordered[index].sessionID == sessionID {
+            reordered[index] = visualOrder[visualIndex]
+            visualIndex += 1
+        }
+        tabs = reordered
+        persistWorkspace()
+    }
+
     func tabDisplayName(_ tab: TabModel, fallback: String) -> String {
         let trimmed = tab.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let base = trimmed.isEmpty ? fallback : trimmed
@@ -167,7 +343,7 @@ final class WorkspaceModel: ObservableObject {
             guard let paneID = candidate.allPaneIDs.first,
                   let directory = panes[paneID]?.directory?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !directory.isEmpty else { return nil }
-            let component = URL(fileURLWithPath: directory).lastPathComponent
+            let component = TerminalPathSyntax.lastComponent(directory)
             return component.isEmpty ? nil : component
         }
         if let index = peers.firstIndex(where: { $0.id == tab.id }),
@@ -626,6 +802,7 @@ final class WorkspaceModel: ObservableObject {
 
     func toggleActivePaneZoom() {
         guard let activePaneID else { return }
+        panes[activePaneID]?.runtime.beginExplicitGeometryTransition()
         zoomedPaneID = zoomedPaneID == activePaneID ? nil : activePaneID
         panes[activePaneID]?.focus()
     }
@@ -862,14 +1039,31 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func selectPane(_ id: UUID) {
-        activePaneID = id
+        var reorderedFloatingPane = false
         if let tab = selectedTab,
            let index = tab.floatingPanes.firstIndex(where: { $0.paneID == id }),
            index != tab.floatingPanes.index(before: tab.floatingPanes.endIndex) {
             let pane = tab.floatingPanes.remove(at: index)
             tab.floatingPanes.append(pane)
+            reorderedFloatingPane = true
         }
-        persistWorkspace()
+        // Avoid an unnecessary published mutation for an already-active pane,
+        // but never treat active model state as proof of AppKit keyboard
+        // ownership. A minimize, Space switch, overlay, or durable-view
+        // reparent can leave the model active while the terminal is no longer
+        // first responder.
+        if activePaneID != id || reorderedFloatingPane {
+            activePaneID = id
+            persistWorkspace()
+        }
+        guard let pane = panes[id] else { return }
+        Task { @MainActor [weak self, weak pane] in
+            await Task.yield()
+            guard let self, let pane,
+                  self.activePaneID == id,
+                  self.panes[id] === pane else { return }
+            pane.focus()
+        }
     }
 
     func selectAdjacentPane(offset: Int) {
@@ -902,6 +1096,8 @@ final class WorkspaceModel: ObservableObject {
     func shutdown() {
         guard !didShutdown else { return }
         didShutdown = true
+        presentationFocusTask?.cancel()
+        presentationFocusTask = nil
         persistenceTask?.cancel()
         persistenceTask = nil
         persistWorkspaceNow()
@@ -974,7 +1170,20 @@ final class WorkspaceModel: ObservableObject {
 
     private func storePane(_ pane: PaneModel) {
         panes[pane.id] = pane
+        pane.runtime.setKeyboardFocusEligible(pane.id == activePaneID)
         activityIndex.observe(pane)
+    }
+
+    /// Only the model-selected terminal may run delayed AppKit focus recovery.
+    /// Durable terminal views remain mounted while panes are split, floated,
+    /// zoomed, and restored. Without explicit ownership, an older pane's
+    /// bounded recovery task can steal first responder after the user clicks a
+    /// different pane, making typing and Command-C/V appear intermittently
+    /// broken in Codex and Claude.
+    private func updateTerminalFocusOwnership() {
+        for (id, pane) in panes {
+            pane.runtime.setKeyboardFocusEligible(id == activePaneID)
+        }
     }
 
     private func persistWorkspaceNow() {

@@ -519,6 +519,7 @@ final class PaneModel: ObservableObject, Identifiable {
     private(set) var agentProgressPercent: Int?
     private(set) var pendingAgentApprovals = 0
     @Published var connectionState: PaneConnectionState
+    @Published private(set) var remoteClientCount: Int?
     @Published var remoteExitCode: Int?
     @Published var artifacts: [PaneArtifact] = []
     @Published var artifactError: String?
@@ -531,12 +532,11 @@ final class PaneModel: ObservableObject, Identifiable {
     private var seenAgentEventHashes: [Data: Date] = [:]
     private var seenAgentEventOrder: [(Data, Date)] = []
     private var conversationContext = TerminalConversationContextBuffer()
-    private(set) var conversationRevision: UInt64 = 0
-    var onAgentTurnReady: ((UInt64) -> Void)?
     private var agentMonitor: RelayHostAgentMonitorToken?
     private var agentEventCursor: UInt64 = 0
     private var agentPersistenceTask: Task<Void, Never>?
     private var agentUIRefreshTask: Task<Void, Never>?
+    private var agentSnapshotReplayDepth = 0
     let remoteParentSessionID: String?
     private(set) var remoteWorkspaceSessionID: String?
     private(set) var remoteTabID: String?
@@ -725,6 +725,10 @@ final class PaneModel: ObservableObject, Identifiable {
         connectionState = .connected
     }
 
+    func recordRemoteClientCount(_ count: Int) {
+        remoteClientCount = max(0, count)
+    }
+
     func beginTerminalRestore() {
         guard contentKind == .terminal else { return }
         isRestoringTerminal = true
@@ -779,11 +783,13 @@ final class PaneModel: ObservableObject, Identifiable {
             activeAgentRoots.removeAll(keepingCapacity: true)
             seenAgentEventHashes.removeAll(keepingCapacity: true)
             seenAgentEventOrder.removeAll(keepingCapacity: true)
+            agentSnapshotReplayDepth += 1
             for embedded in event["events"] as? [[String: Any]] ?? [] {
                 guard JSONSerialization.isValidJSONObject(embedded),
                       let encoded = try? JSONSerialization.data(withJSONObject: embedded) else { continue }
                 receivedAgentEvent(encoded)
             }
+            agentSnapshotReplayDepth -= 1
             activeSubagents = subagents.count { $0.phase == .active }
             scheduleAgentUIRefresh()
             return
@@ -989,8 +995,6 @@ final class PaneModel: ObservableObject, Identifiable {
             agentProgressPercent = nil
             detector.applyStructuredEvent(kind: kind, phase: .quiet, excerpt: "Ready")
             recordActivity("Ready", phase: .quiet)
-            conversationRevision &+= 1
-            onAgentTurnReady?(conversationRevision)
             recordIntelligenceEvent(
                 provider: kind, agentID: subagentID ?? rootID, eventKind: .completion,
                 title: "\(kind.label) completed a turn",
@@ -1062,7 +1066,7 @@ final class PaneModel: ObservableObject, Identifiable {
             eventName == "SessionEnd" ||
             (eventName == "Notification" &&
              (notificationType == "permission_prompt" || notificationType == "idle_prompt"))
-        scheduleAgentUIRefresh(immediate: urgent)
+        scheduleAgentUIRefresh(immediate: urgent && agentSnapshotReplayDepth == 0)
     }
 
     private func scheduleAgentStatePersistence() {
@@ -1079,8 +1083,15 @@ final class PaneModel: ObservableObject, Identifiable {
     private func scheduleAgentUIRefresh(immediate: Bool = false) {
         if immediate {
             agentUIRefreshTask?.cancel()
-            agentUIRefreshTask = nil
-            objectWillChange.send()
+            agentUIRefreshTask = Task { @MainActor [weak self] in
+                // Even urgent status must not publish synchronously from a
+                // SwiftUI callback. One actor turn is imperceptible to the
+                // user and prevents re-entrant AttributeGraph updates.
+                await Task.yield()
+                guard let self, !Task.isCancelled else { return }
+                self.agentUIRefreshTask = nil
+                self.objectWillChange.send()
+            }
             return
         }
         guard agentUIRefreshTask == nil else { return }
@@ -1112,18 +1123,20 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func cycleAgentKind() {
-        objectWillChange.send()
         let next: AgentKind = switch detector.kind {
         case .shell: .claude
         case .claude: .codex
         case .codex: .shell
         }
-        detector.overrideKind(next)
+        setAgentKind(next)
     }
 
     func setAgentKind(_ kind: AgentKind) {
         objectWillChange.send()
         detector.overrideKind(kind)
+        if contentKind == .terminal, !RelayLaunchMode.isRunningTests {
+            runtime.agentKindDidChange(kind)
+        }
     }
 
     private func recordActivity(_ label: String, phase: AgentPhase) {
@@ -1188,10 +1201,13 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     private func appendSubagentUpdate(_ message: String, occurredAt: Date, at index: Int) {
-        let bounded = String(message.prefix(16_384))
+        // The full transcript remains authoritative on the remote host. The
+        // sidebar only needs a useful recent tail; bounding it prevents a busy
+        // peer tree from retaining tens or hundreds of megabytes locally.
+        let bounded = String(message.prefix(4_096))
         guard subagents.indices.contains(index), subagents[index].updates.last?.message != bounded else { return }
         subagents[index].updates.append(SubagentUpdate(id: UUID(), message: bounded, occurredAt: occurredAt))
-        subagents[index].updates = Array(subagents[index].updates.suffix(100))
+        subagents[index].updates = Array(subagents[index].updates.suffix(20))
     }
 
     private func pruneCompletedSubagents() {

@@ -1,0 +1,5 @@
+# Relay currently renders through Ghostty core. Resolve the complete bundled
+# Ghostty capability set at build time so the installed entry is standalone on
+# remote hosts and keeps Relay's terminal identity independent of Ghostty.
+xterm-relay|Relay terminal using Ghostty core,
+	use=xterm-ghostty,

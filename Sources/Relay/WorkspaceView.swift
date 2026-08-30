@@ -2,6 +2,10 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+private extension UTType {
+    static let relayWorkspaceTab = UTType(exportedAs: "dev.relay.workspace-tab")
+}
+
 struct WorkspaceView: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var preferences = RelayPreferences.shared
@@ -64,6 +68,15 @@ struct WorkspaceView: View {
                 .padding(.top, workspace.isFullScreen ? 50 : 58)
                 .padding(.trailing, 18)
                 .zIndex(650)
+            }
+            if workspace.performancePanelVisible {
+                RelayPerformancePanel(
+                    workspace: workspace,
+                    close: workspace.closePerformancePanel
+                )
+                .padding(.top, workspace.isFullScreen ? 50 : 58)
+                .padding(.trailing, 18)
+                .zIndex(700)
             }
 
             RelayWindowControls(isFullScreen: workspace.isFullScreen)
@@ -213,6 +226,9 @@ struct WorkspaceView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
             workspace.setFullScreen(false)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .relayApplicationActivityChanged)) { notification in
+            workspace.applicationPresentationChanged(visible: notification.object as? Bool ?? false)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .relayQuitConfirmation)) { notification in
             let update = {
                 showingQuitConfirmation = notification.object as? Bool ?? false
@@ -244,6 +260,9 @@ struct WorkspaceView: View {
         }
         .onAppear {
             if !relaydOnboardingSeen { showingRelaydOnboarding = true }
+            workspace.applicationPresentationChanged(
+                visible: RelayApplicationActivityState.allowsContinuousUpdates
+            )
         }
     }
 }
@@ -510,7 +529,7 @@ private struct AgentIntelligencePanel: View {
     }
 
     private func refreshSearch() {
-        search.search(items: store.items, query: query, scope: scope)
+        search.scheduleSearch(items: store.items, query: query, scope: scope)
     }
 }
 
@@ -839,6 +858,7 @@ private struct AgentInspectorPanel: View {
 
 private struct WorkspaceBar: View {
     @ObservedObject var workspace: WorkspaceModel
+    @State private var draggedTabID: UUID?
 
     private var sessionTabs: [TabModel] {
         guard let sessionID = workspace.selectedTab?.sessionID else { return [] }
@@ -891,7 +911,11 @@ private struct WorkspaceBar: View {
                             select: { workspace.selectTab(tab.id) },
                             togglePin: { workspace.toggleTabPin(tab.id) },
                             rename: { workspace.beginRenameTab(tab.id) },
-                            close: { workspace.closeTab(tab.id) }
+                            close: { workspace.closeTab(tab.id) },
+                            draggedTabID: $draggedTabID,
+                            move: { sourceID, placement in
+                                workspace.moveTab(sourceID, relativeTo: tab.id, placement: placement)
+                            }
                         )
                     }
                     ChromeButton(symbol: "plus", help: "New tab in this session · ⌘T") {
@@ -903,6 +927,9 @@ private struct WorkspaceBar: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 6) {
+                ChromeButton(symbol: "waveform.path.ecg.rectangle", help: "Performance") {
+                    workspace.togglePerformancePanel()
+                }
                 if workspace.activePane?.profile.kind == .ssh,
                    workspace.activePane?.profile.backend == .relay {
                     ChromeButton(symbol: "curlybraces", help: "Open remote editor · ⇧⌘E") {
@@ -959,7 +986,11 @@ private struct WorkspaceBar: View {
         .padding(.leading, workspace.sidebarVisible ? 10 : 76)
         .padding(.trailing, 10)
         .frame(height: workspace.isFullScreen ? 38 : 44)
-        .background(RelayTheme.canvas)
+        .background {
+            RelayWindowDragRegion()
+                .background(RelayTheme.canvas)
+                .accessibilityHidden(true)
+        }
     }
 }
 
@@ -972,7 +1003,11 @@ private struct WorkspaceTab: View {
     let togglePin: () -> Void
     let rename: () -> Void
     let close: () -> Void
+    @Binding var draggedTabID: UUID?
+    let move: (UUID, TabMovePlacement) -> Void
     @State private var hovering = false
+    @State private var dropPlacement: TabMovePlacement?
+    @State private var tabWidth: CGFloat = 1
 
     var body: some View {
         HStack(spacing: 1) {
@@ -1020,6 +1055,43 @@ private struct WorkspaceTab: View {
                     .padding(.horizontal, 7)
                 }
         }
+        .overlay {
+            HStack(spacing: 0) {
+                if dropPlacement == .before {
+                    Capsule().fill(RelayTheme.accent).frame(width: 2, height: 21)
+                }
+                Spacer(minLength: 0)
+                if dropPlacement == .after {
+                    Capsule().fill(RelayTheme.accent).frame(width: 2, height: 21)
+                }
+            }
+            .padding(.horizontal, -2)
+            .allowsHitTesting(false)
+        }
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .preference(key: WorkspaceTabWidthPreferenceKey.self, value: proxy.size.width)
+            }
+        }
+        .onPreferenceChange(WorkspaceTabWidthPreferenceKey.self) { tabWidth = max($0, 1) }
+        .onDrag {
+            draggedTabID = tab.id
+            return NSItemProvider(
+                item: Data(tab.id.uuidString.lowercased().utf8) as NSData,
+                typeIdentifier: UTType.relayWorkspaceTab.identifier
+            )
+        }
+        .onDrop(
+            of: [UTType.relayWorkspaceTab.identifier],
+            delegate: WorkspaceTabDropDelegate(
+                targetID: tab.id,
+                targetWidth: tabWidth,
+                draggedTabID: $draggedTabID,
+                placement: $dropPlacement,
+                move: move
+            )
+        )
         .onHover { hovering = $0 }
         .contextMenu {
             Button(pinned ? "Unpin tab" : "Pin tab", action: togglePin)
@@ -1027,6 +1099,51 @@ private struct WorkspaceTab: View {
             Divider()
             Button("Close tab", action: close)
         }
+    }
+}
+
+private struct WorkspaceTabWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 1
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct WorkspaceTabDropDelegate: DropDelegate {
+    let targetID: UUID
+    let targetWidth: CGFloat
+    @Binding var draggedTabID: UUID?
+    @Binding var placement: TabMovePlacement?
+    let move: (UUID, TabMovePlacement) -> Void
+
+    func validateDrop(info _: DropInfo) -> Bool {
+        guard let draggedTabID else { return false }
+        return draggedTabID != targetID
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard draggedTabID != nil, draggedTabID != targetID else {
+            placement = nil
+            return DropProposal(operation: .forbidden)
+        }
+        placement = info.location.x < targetWidth / 2 ? .before : .after
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info _: DropInfo) {
+        placement = nil
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let draggedTabID, draggedTabID != targetID else {
+            placement = nil
+            return false
+        }
+        let resolvedPlacement = placement ?? (info.location.x < targetWidth / 2 ? .before : .after)
+        move(draggedTabID, resolvedPlacement)
+        self.draggedTabID = nil
+        placement = nil
+        return true
     }
 }
 
@@ -1274,10 +1391,16 @@ private struct AttachedSessionRow: View {
     private var panes: [PaneModel] {
         session.tabs.flatMap(\.allPaneIDs).compactMap { workspace.panes[$0] }
     }
-    private var agentThreads: Int {
-        panes.reduce(into: 0) { count, pane in
-            guard pane.contentKind == .terminal, pane.kind != .shell else { return }
-            count += 1 + pane.subagents.count
+    /// Keep a background session expanded only while its root agent is
+    /// actively working or needs attention. Subagent history is intentionally
+    /// shown at the owning pane instead of as a host-level "thread" total.
+    private var hasActiveAgentWork: Bool {
+        panes.contains { pane in
+            guard pane.contentKind == .terminal, pane.kind != .shell else { return false }
+            return switch pane.phase {
+            case .connecting, .active, .needsInput: true
+            case .quiet, .exited: false
+            }
         }
     }
     var body: some View {
@@ -1306,11 +1429,6 @@ private struct AttachedSessionRow: View {
                     Text("\(session.tabs.count) tab\(session.tabs.count == 1 ? "" : "s")")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
-                    if agentThreads > 0 {
-                        Text("\(agentThreads) thread\(agentThreads == 1 ? "" : "s")")
-                            .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(RelayTheme.mint)
-                    }
                 }
                 .padding(.horizontal, 6)
                 .frame(height: 34)
@@ -1338,7 +1456,7 @@ private struct AttachedSessionRow: View {
                 .help("New tab in session")
             }
 
-            if selected || agentThreads > 0 {
+            if selected || hasActiveAgentWork {
                 ForEach(session.tabs) { tab in
                     let tabIndex = session.tabs.firstIndex(where: { $0.id == tab.id }) ?? 0
                     SessionTabSection(
@@ -1350,7 +1468,7 @@ private struct AttachedSessionRow: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(label), \(session.tabs.count) tabs, \(panes.count) panes, \(agentThreads) agent threads")
+        .accessibilityLabel("\(label), \(session.tabs.count) tabs, \(panes.count) panes")
     }
 }
 
@@ -1720,7 +1838,7 @@ private struct SessionPaneRow: View {
             }
         }
         .onAppear {
-            attention.refresh(agents: pane.subagents, paneID: pane.id)
+            attention.scheduleRefresh(agents: pane.subagents, paneID: pane.id)
             agentThreadsExpanded = active && !pane.subagents.isEmpty
         }
         .onChange(of: active) { _, isActive in
@@ -1731,7 +1849,7 @@ private struct SessionPaneRow: View {
             }
         }
         .onChange(of: pane.subagents) { _, agents in
-            attention.refresh(agents: agents, paneID: pane.id)
+            attention.scheduleRefresh(agents: agents, paneID: pane.id)
             if active && !agents.isEmpty { agentThreadsExpanded = true }
         }
     }
@@ -2190,7 +2308,7 @@ private struct RemotePaneRecoveryRow: View {
 
     private var location: String {
         guard let directory = pane.directory, !directory.isEmpty else { return "Remote pane" }
-        let name = URL(fileURLWithPath: directory).lastPathComponent
+        let name = TerminalPathSyntax.lastComponent(directory)
         return name.isEmpty ? directory : name
     }
 
@@ -2289,6 +2407,7 @@ private struct WorkspaceCanvas: View {
                     toggleZoom: { workspace.togglePaneZoom(zoomedID) },
                     toggleFloating: { workspace.toggleActivePaneFloating() },
                     rename: { workspace.beginRenamePane(zoomedID) },
+                    terminate: { workspace.requestTerminatePane(zoomedID) },
                     close: {
                         workspace.selectPane(zoomedID)
                         workspace.closeActivePane()
@@ -2322,6 +2441,7 @@ private struct WorkspaceCanvas: View {
                             zoom: { workspace.togglePaneZoom(pane.id) },
                             dock: { workspace.dockFloatingPane(pane.id) },
                             rename: { workspace.beginRenamePane(pane.id) },
+                            terminate: { workspace.requestTerminatePane(pane.id) },
                             close: {
                                 workspace.selectPane(pane.id)
                                 workspace.closeActivePane()
@@ -2348,6 +2468,7 @@ private struct FloatingPaneWindow: View {
     let zoom: () -> Void
     let dock: () -> Void
     let rename: () -> Void
+    let terminate: () -> Void
     let close: () -> Void
 
     @GestureState private var dragOffset: CGSize = .zero
@@ -2404,6 +2525,7 @@ private struct FloatingPaneWindow: View {
                 toggleZoom: zoom,
                 toggleFloating: dock,
                 rename: rename,
+                terminate: terminate,
                 isFloating: true
             )
         }
@@ -2498,27 +2620,32 @@ private struct FloatingPaneWindow: View {
                 move(Double(baseOriginX), Double(min(bounds.height - baseHeight - edgeInset, baseOriginY + 20))); return .handled
             }
 
-            Button(action: dock) {
+            HStack(spacing: 0) {
+                Button(action: dock) {
                     Image(systemName: "rectangle.portrait.and.arrow.right")
                         .font(.system(size: 9, weight: .bold))
                         .frame(width: 24, height: 24)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .help("Dock pane")
-            .accessibilityLabel("Dock floating pane")
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .focusEffectDisabled()
+                .help("Dock pane")
+                .accessibilityLabel("Dock floating pane")
 
-            Button(action: close) {
+                Button(action: close) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
                         .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .focusEffectDisabled()
+                .help(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
+                .accessibilityLabel(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .help(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
-            .accessibilityLabel(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
+            .frame(height: 24)
         }
         .padding(.horizontal, 10)
         .frame(height: 36)
@@ -2584,6 +2711,7 @@ private struct SplitPaneTree: View {
                     toggleZoom: { workspace.togglePaneZoom(id) },
                     toggleFloating: { workspace.floatTiledPane(id) },
                     rename: { workspace.beginRenamePane(id) },
+                    terminate: { workspace.requestTerminatePane(id) },
                     close: {
                         workspace.selectPane(id)
                         workspace.closeActivePane()
@@ -2619,6 +2747,7 @@ private struct PaneView: View {
     var toggleZoom: (() -> Void)? = nil
     var toggleFloating: (() -> Void)? = nil
     var rename: (() -> Void)? = nil
+    var terminate: (() -> Void)? = nil
     var close: (() -> Void)? = nil
     var isFloating = false
     var isZoomed = false
@@ -2740,6 +2869,7 @@ private struct PaneView: View {
                 toggleZoom: toggleZoom,
                 toggleFloating: toggleFloating,
                 rename: rename,
+                terminate: terminate,
                 close: close
             )
                 .onDrag {
@@ -2757,6 +2887,7 @@ private struct PaneView: View {
                 toggleZoom: toggleZoom,
                 toggleFloating: toggleFloating,
                 rename: rename,
+                terminate: terminate,
                 close: close
             )
         }
@@ -2961,7 +3092,7 @@ private struct QuickEditorContent: View {
             .help(runtime.navigatorVisible ? "Hide files" : "Show files")
 
             if let path = runtime.currentPath {
-                Text(URL(fileURLWithPath: path).lastPathComponent)
+                Text(TerminalPathSyntax.lastComponent(path))
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                     .lineLimit(1)
@@ -3037,7 +3168,7 @@ private struct EditorNavigator: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(runtime.directoryPath == runtime.workspacePath ? RelayTheme.textFaint : RelayTheme.textMuted)
                 .disabled(runtime.directoryPath == runtime.workspacePath)
-                Text(runtime.directoryPath.isEmpty ? "Files" : URL(fileURLWithPath: runtime.directoryPath).lastPathComponent)
+                Text(runtime.directoryPath.isEmpty ? "Files" : TerminalPathSyntax.lastComponent(runtime.directoryPath))
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(RelayTheme.text)
                     .lineLimit(1)
@@ -3092,10 +3223,18 @@ private struct EditorNavigator: View {
     }
 
     private func fileSymbol(_ name: String) -> String {
-        let suffix = URL(fileURLWithPath: name).pathExtension.lowercased()
+        let suffix = TerminalPathSyntax.pathExtension(name)
         return ["swift", "go", "rs", "py", "r", "js", "ts", "c", "cpp"].contains(suffix)
             ? "chevron.left.forwardslash.chevron.right" : "doc"
     }
+}
+
+enum FloatingArtifactChromeMetrics {
+    static let titleBarHeight: CGFloat = 34
+    static let controlLength: CGFloat = 24
+    static let resizeHandleLength: CGFloat = 28
+    // Keep toolbar controls out from under the invisible corner resize targets.
+    static let titleBarEdgeInset: CGFloat = resizeHandleLength + 2
 }
 
 private struct ArtifactPreview: View {
@@ -3170,81 +3309,105 @@ private struct ArtifactPreview: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 7) {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(RelayTheme.textFaint)
-                Image(systemName: "photo")
-                    .foregroundStyle(RelayTheme.blue)
-                Text(artifact.filename)
-                    .font(.system(size: 10.5, weight: .medium))
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                Button {
-                    setZoom(imageZoom - 0.25)
-                } label: {
-                    Text("−")
-                        .font(.system(size: 13, weight: .medium))
-                        .frame(width: 18, height: 22)
+            HStack(spacing: 8) {
+                HStack(spacing: 7) {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(RelayTheme.textFaint)
+                    Image(systemName: "photo")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(RelayTheme.blue)
+                    Text(artifact.filename)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .lineLimit(1)
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .focusEffectDisabled()
-                .disabled(imageZoom <= 1)
-                .accessibilityLabel("Zoom out")
-                Button {
-                    resetImageView()
-                } label: {
-                    Text("\(Int((imageZoom * 100).rounded()))%")
-                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                        .frame(minWidth: 34, minHeight: 22)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .focusEffectDisabled()
-                .accessibilityLabel("Reset image zoom")
-                Button {
-                    setZoom(imageZoom + 0.25)
-                } label: {
-                    Text("+")
-                        .font(.system(size: 13, weight: .medium))
-                        .frame(width: 18, height: 22)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .focusEffectDisabled()
-                .disabled(imageZoom >= 6)
-                .accessibilityLabel("Zoom in")
-                Button(action: dismiss) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .focusEffectDisabled()
-                .accessibilityLabel("Close image preview")
-            }
-            .padding(.horizontal, 10)
-            .frame(height: 34)
-            .background(RelayTheme.elevated)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 2, coordinateSpace: .global)
-                    .updating($dragTranslation) { value, state, _ in state = value.translation }
-                    .onEnded { value in
-                        offset.width += value.translation.width
-                        offset.height += value.translation.height
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                        .updating($dragTranslation) { value, state, _ in state = value.translation }
+                        .onEnded { value in
+                            offset.width += value.translation.width
+                            offset.height += value.translation.height
+                        }
+                )
+                .onTapGesture(count: 2) {
+                    if reduceMotion {
+                        offset = .zero
+                    } else {
+                        withAnimation(.easeOut(duration: 0.16)) { offset = .zero }
                     }
-            )
-            .onTapGesture(count: 2) {
-                if reduceMotion {
-                    offset = .zero
-                } else {
-                    withAnimation(.easeOut(duration: 0.16)) { offset = .zero }
                 }
+                .help("Drag to move · double-click to reset")
+
+                HStack(spacing: 0) {
+                    Button {
+                        setZoom(imageZoom - 0.25)
+                    } label: {
+                        Image(systemName: "minus")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .frame(
+                                width: FloatingArtifactChromeMetrics.controlLength,
+                                height: FloatingArtifactChromeMetrics.controlLength
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(RelayTheme.textMuted)
+                    .focusEffectDisabled()
+                    .disabled(imageZoom <= 1)
+                    .accessibilityLabel("Zoom out")
+
+                    Button {
+                        resetImageView()
+                    } label: {
+                        Text("\(Int((imageZoom * 100).rounded()))%")
+                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .frame(width: 38, height: FloatingArtifactChromeMetrics.controlLength)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(RelayTheme.textMuted)
+                    .focusEffectDisabled()
+                    .accessibilityLabel("Reset image zoom")
+
+                    Button {
+                        setZoom(imageZoom + 0.25)
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .frame(
+                                width: FloatingArtifactChromeMetrics.controlLength,
+                                height: FloatingArtifactChromeMetrics.controlLength
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(RelayTheme.textMuted)
+                    .focusEffectDisabled()
+                    .disabled(imageZoom >= 6)
+                    .accessibilityLabel("Zoom in")
+
+                    Button(action: dismiss) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .frame(
+                                width: FloatingArtifactChromeMetrics.controlLength,
+                                height: FloatingArtifactChromeMetrics.controlLength
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(RelayTheme.textMuted)
+                    .focusEffectDisabled()
+                    .accessibilityLabel("Close image preview")
+                }
+                .frame(height: FloatingArtifactChromeMetrics.controlLength)
             }
-            .help("Drag to move · double-click to reset")
+            .padding(.leading, FloatingArtifactChromeMetrics.titleBarEdgeInset)
+            .padding(.trailing, FloatingArtifactChromeMetrics.titleBarEdgeInset)
+            .frame(height: FloatingArtifactChromeMetrics.titleBarHeight)
+            .background(RelayTheme.elevated)
 
             if let image = artifact.image {
                 GeometryReader { proxy in
@@ -3320,7 +3483,10 @@ private struct ArtifactPreview: View {
 
     private func resizeHandle(_ corner: ResizeCorner) -> some View {
         Color.clear
-            .frame(width: 28, height: 28)
+            .frame(
+                width: FloatingArtifactChromeMetrics.resizeHandleLength,
+                height: FloatingArtifactChromeMetrics.resizeHandleLength
+            )
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 1, coordinateSpace: .global)
@@ -3478,6 +3644,7 @@ private struct ConnectionPath: View {
     let toggleZoom: (() -> Void)?
     let toggleFloating: (() -> Void)?
     let rename: (() -> Void)?
+    let terminate: (() -> Void)?
     let close: (() -> Void)?
     @ObservedObject private var preferences = RelayPreferences.shared
 
@@ -3502,7 +3669,8 @@ private struct ConnectionPath: View {
                     .foregroundStyle(RelayTheme.textMuted)
             }
             if let directory = pane.directory, !directory.isEmpty {
-                Text(URL(fileURLWithPath: directory).lastPathComponent.isEmpty ? "/" : URL(fileURLWithPath: directory).lastPathComponent)
+                let component = TerminalPathSyntax.lastComponent(directory)
+                Text(component.isEmpty ? "/" : component)
                     .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                     .foregroundStyle(RelayTheme.textFaint)
                     .lineLimit(1)
@@ -3563,36 +3731,49 @@ private struct ConnectionPath: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(pane.connectionState.color)
             }
-            if let toggleFloating {
-                Button(action: toggleFloating) {
-                    Image(systemName: isFloating ? "rectangle.portrait.and.arrow.right" : "macwindow.on.rectangle")
-                        .frame(width: 22, height: 22)
+            if toggleFloating != nil || toggleZoom != nil || close != nil {
+                HStack(spacing: 0) {
+                    if let toggleFloating {
+                        Button(action: toggleFloating) {
+                            Image(systemName: isFloating ? "rectangle.portrait.and.arrow.right" : "macwindow.on.rectangle")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .frame(width: 24, height: 24)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .focusEffectDisabled()
+                        .help(isFloating ? "Dock pane" : "Float pane")
+                        .accessibilityLabel(isFloating ? "Dock pane" : "Float pane")
+                    }
+                    if let toggleZoom {
+                        Button(action: toggleZoom) {
+                            Image(systemName: zoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .frame(width: 24, height: 24)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .focusEffectDisabled()
+                        .help(zoomed ? "Restore pane layout" : "Zoom pane")
+                        .accessibilityLabel(zoomed ? "Restore pane layout" : "Zoom pane")
+                    }
+                    if let close {
+                        Button(action: close) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .bold))
+                                .frame(width: 24, height: 24)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .focusEffectDisabled()
+                        .help(pane.profile.kind == .ssh ? "Detach pane · ⌘W" : "Close pane · ⌘W")
+                        .accessibilityLabel(pane.profile.kind == .ssh ? "Detach pane" : "Close pane")
+                    }
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .help(isFloating ? "Dock pane" : "Float pane")
-                .accessibilityLabel(isFloating ? "Dock pane" : "Float pane")
-            }
-            if let toggleZoom {
-                Button(action: toggleZoom) {
-                    Image(systemName: zoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .help(zoomed ? "Restore pane layout" : "Zoom pane")
-                .accessibilityLabel(zoomed ? "Restore pane layout" : "Zoom pane")
-            }
-            if let close {
-                Button(action: close) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .semibold))
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .help(pane.profile.kind == .ssh ? "Detach pane · ⌘W" : "Close pane · ⌘W")
-                .accessibilityLabel(pane.profile.kind == .ssh ? "Detach pane" : "Close pane")
+                .frame(height: 24)
             }
         }
         .padding(.horizontal, compact ? 9 : 12)
@@ -3618,6 +3799,9 @@ private struct ConnectionPath: View {
             if let toggleZoom { Button(zoomed ? "Restore pane layout" : "Zoom pane", action: toggleZoom) }
             if let toggleFloating { Button(isFloating ? "Dock pane" : "Float pane", action: toggleFloating) }
             if let close { Button(pane.profile.kind == .ssh ? "Detach pane" : "Close pane", action: close) }
+            if pane.profile.kind == .ssh, pane.profile.backend == .relay, let terminate {
+                Button("Terminate remote pane…", role: .destructive, action: terminate)
+            }
         }
     }
 

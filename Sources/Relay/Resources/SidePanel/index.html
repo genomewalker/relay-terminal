@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:47471; img-src 'self' data:">
+  <link rel="stylesheet" href="/xterm/xterm.css">
+  <title>Relay</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #161616; --terminal: #101010; --raised: #202020; --hover: #292929;
+      --line: #303030; --line-strong: #424242; --text: #ededed; --muted: #999;
+      --faint: #6f6f6f; --relay: #73c7a5; --attention: #eaa88f;
+      --navigator-height: 220px;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      overflow: hidden; background: var(--bg); color: var(--text);
+      font: 12px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    button:focus { outline: none; }
+    button:focus-visible, input:focus-visible, summary:focus-visible {
+      outline: 1px solid var(--relay); outline-offset: -1px;
+    }
+    .app {
+      height: 100%; min-width: 220px; display: grid;
+      grid-template-rows: 40px minmax(96px, var(--navigator-height)) 5px minmax(0, 1fr);
+    }
+    .app.nav-collapsed { grid-template-rows: 40px 34px 0 minmax(0, 1fr); }
+    .topbar {
+      min-width: 0; display: flex; align-items: center; gap: 8px; padding: 0 9px 0 11px;
+      border-bottom: 1px solid var(--line); background: #191919;
+    }
+    .mark { width: 3px; height: 17px; flex: 0 0 auto; border-radius: 2px; background: var(--relay); }
+    .brand { font-weight: 650; letter-spacing: -.015em; }
+    .spacer { flex: 1; }
+    .connection { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10px; }
+    .connection::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--faint); }
+    .connection.live::before { background: var(--relay); }
+    .connection.offline::before { background: var(--attention); }
+    .icon-button, .quiet-button {
+      border: 0; background: transparent; min-width: 25px; height: 25px; padding: 0 6px;
+      border-radius: 6px; color: var(--muted); cursor: default;
+    }
+    .icon-button:hover, .quiet-button:hover { color: var(--text); background: var(--hover); }
+    .navigator { min-height: 0; display: grid; grid-template-rows: 34px minmax(0, 1fr); overflow: hidden; }
+    .navigator-head {
+      min-width: 0; display: flex; align-items: center; gap: 6px; padding: 4px 7px;
+      border-bottom: 1px solid var(--line);
+    }
+    .search-wrap { position: relative; flex: 1; min-width: 0; }
+    .search {
+      width: 100%; height: 25px; padding: 0 8px 0 25px; border: 1px solid transparent;
+      border-radius: 6px; background: var(--raised); color: var(--text);
+    }
+    .search::placeholder { color: var(--faint); }
+    .search:focus { border-color: var(--line-strong); }
+    .search-glyph { position: absolute; left: 8px; top: 5px; color: var(--faint); pointer-events: none; }
+    .tree { min-height: 0; overflow: auto; padding: 4px 6px 7px; scrollbar-color: #424242 transparent; }
+    .empty, .error { padding: 18px 9px; color: var(--muted); }
+    .error { color: var(--attention); }
+    details { margin: 0; }
+    summary {
+      display: flex; align-items: center; min-width: 0; gap: 6px; height: 25px; padding: 0 5px;
+      border-radius: 5px; list-style: none; color: #b8b8b8; font-size: 10px; font-weight: 650;
+      letter-spacing: .025em; text-transform: uppercase; cursor: default;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::before { content: "›"; width: 8px; color: var(--faint); font-size: 14px; transform: translateY(-1px); }
+    details[open] > summary::before { content: "⌄"; font-size: 11px; }
+    .session-name, .tab-name, .pane-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pin { color: var(--relay); font-size: 8px; }
+    .tab-group { margin: 0 0 2px 10px; padding-left: 7px; border-left: 1px solid var(--line); }
+    .tab-group > .tab-label {
+      min-width: 0; height: 23px; display: flex; align-items: center; gap: 5px; padding: 0 5px;
+      color: var(--muted); font-size: 10px; font-weight: 500; letter-spacing: 0; text-transform: none;
+    }
+    .tab-group > .tab-label::before { width: 7px; font-size: 12px; }
+    .tab-panes { min-width: 0; }
+    .pane {
+      width: 100%; min-width: 0; height: 31px; display: grid; grid-template-columns: 7px minmax(0, 1fr) auto;
+      align-items: center; gap: 7px; margin: 1px 0; padding: 0 6px; border: 0; border-radius: 6px;
+      background: transparent; text-align: left; cursor: default;
+    }
+    .pane:hover { background: var(--hover); }
+    .pane.selected { background: var(--raised); box-shadow: inset 2px 0 var(--relay); }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+    .dot.active, .dot.running, .dot.connected { background: var(--relay); }
+    .dot.needsInput, .dot.waitingApproval, .dot.failed { background: var(--attention); }
+    .pane-copy { min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+    .pane-name { color: #dedede; font-size: 11px; }
+    .pane-sub { overflow: hidden; color: var(--faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+    .agent { max-width: 54px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+    .resize-handle {
+      position: relative; z-index: 2; cursor: row-resize; background: transparent;
+    }
+    .resize-handle::after {
+      content: ""; position: absolute; left: calc(50% - 15px); top: 2px; width: 30px; height: 1px;
+      border-radius: 1px; background: var(--line-strong);
+    }
+    .resize-handle:focus { outline: none; }
+    .nav-collapsed .tree, .nav-collapsed .resize-handle { display: none; }
+    .terminal-panel {
+      min-height: 0; min-width: 0; display: grid; grid-template-rows: 34px minmax(0, 1fr) auto;
+      background: var(--terminal); border-top: 1px solid var(--line);
+    }
+    .terminal-head {
+      min-width: 0; display: flex; align-items: center; gap: 7px; padding: 0 7px 0 10px;
+      border-bottom: 1px solid #282828; background: #181818;
+    }
+    .terminal-title {
+      min-width: 0; flex: 1; overflow: hidden; font-size: 10px; font-weight: 620;
+      text-overflow: ellipsis; white-space: nowrap;
+    }
+    .terminal-state { flex: 0 0 auto; color: var(--muted); font-size: 9px; }
+    #terminal {
+      position: relative; min-width: 0; min-height: 0; overflow: auto; padding: 5px 4px 2px;
+      scrollbar-color: #3e3e3e transparent; scrollbar-width: thin;
+    }
+    #terminal .xterm { height: 100%; }
+    #terminal .xterm-viewport { scrollbar-color: #3e3e3e transparent; scrollbar-width: thin; }
+    .agent-drawer {
+      display: none; max-height: 116px; overflow: auto; padding: 7px 10px 9px;
+      border-top: 1px solid var(--line); background: #171717; color: var(--muted); font-size: 10px;
+    }
+    .agent-drawer.visible { display: block; }
+    .agent-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 3px 0; }
+    .agent-label, .agent-update { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-update { color: var(--faint); }
+    @media (max-width: 300px) {
+      .brand, .terminal-state, .agent { display: none; }
+      .topbar { padding-left: 7px; }
+    }
+    @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+  </style>
+</head>
+<body>
+<div id="app" class="app">
+  <header class="topbar">
+    <span class="mark" aria-hidden="true"></span><span class="brand">Relay</span><span class="spacer"></span>
+    <span id="status" class="connection">Connecting</span>
+    <button id="collapse-nav" class="icon-button" type="button" aria-label="Collapse session navigator" aria-expanded="true">⌃</button>
+  </header>
+  <section class="navigator" aria-label="Relay sessions">
+    <div class="navigator-head">
+      <div class="search-wrap"><span class="search-glyph" aria-hidden="true">⌕</span><input id="search" class="search" type="search" placeholder="Find session, tab, or pane" autocomplete="off" spellcheck="false" aria-label="Find session, tab, or pane"></div>
+    </div>
+    <main id="tree" class="tree"><div class="empty">Waiting for Relay…</div></main>
+  </section>
+  <div id="resize-handle" class="resize-handle" role="separator" tabindex="0" aria-label="Resize session navigator" aria-orientation="horizontal"></div>
+  <section class="terminal-panel" aria-label="Selected Relay terminal">
+    <div class="terminal-head">
+      <span id="terminal-title" class="terminal-title">Select a remote pane</span>
+      <span id="terminal-state" class="terminal-state">Idle</span>
+      <button id="agents" class="quiet-button" type="button" aria-expanded="false">Agents</button>
+      <button id="open-relay" class="quiet-button" type="button">Open</button>
+    </div>
+    <div id="terminal" aria-label="Remote terminal"></div>
+    <div id="agent-drawer" class="agent-drawer" aria-live="polite"></div>
+  </section>
+</div>
+<script src="/xterm/xterm.js"></script>
+<script src="/xterm/addon-fit.js"></script>
+<script src="/xterm/addon-image.js"></script>
+<script>
+(() => {
+  const fragment = location.hash.slice(1);
+  if (fragment) { sessionStorage.setItem('relay-token', fragment); history.replaceState(null, '', '/'); }
+  const token = fragment || sessionStorage.getItem('relay-token') || '';
+  const byID = id => document.getElementById(id);
+  const app = byID('app'), tree = byID('tree'), status = byID('status'), search = byID('search');
+  const collapseNav = byID('collapse-nav'), resizeHandle = byID('resize-handle');
+  const terminalElement = byID('terminal'), terminalTitle = byID('terminal-title');
+  const terminalState = byID('terminal-state'), openRelay = byID('open-relay');
+  const agentsButton = byID('agents'), agentDrawer = byID('agent-drawer');
+  const encoder = new TextEncoder();
+  let selected = null, selectedPane = null, panelSelected = null, lastJSON = '', lastState = null;
+  let refreshInFlight = false;
+  let detail = null, detailPaneID = null, detailRequest = 0, lastDetailJSON = '';
+  let socket = null, socketPaneID = null, reconnectTimer = null, terminalFocused = false;
+  let canonicalSize = null, ownsInput = false, fitFrame = null, lastSize = '', pendingInput = '';
+  let remoteWheelFrame = null, remoteWheelDelta = 0, remoteWheelColumn = 1, remoteWheelRow = 1;
+  let filter = '', agentsOpen = false, resizing = false, resizeFrame = null, resizeY = 0;
+  let collapsedTabs = new Set();
+  try { collapsedTabs = new Set(JSON.parse(localStorage.getItem('relay-side-panel-collapsed-tabs') || '[]')); } catch (_) {}
+
+  const term = new Terminal({
+    cursorBlink: true, cursorStyle: 'bar', scrollback: 5000, convertEol: false,
+    minimumContrastRatio: 4.5, fontSize: 12, fontFamily: 'Menlo, monospace',
+    theme: {
+      background: '#101010', foreground: '#e7e7e7', cursor: '#73c7a5',
+      selectionBackground: '#416f5f99', black: '#151515', brightBlack: '#686868'
+    }
+  });
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  if (globalThis.ImageAddon?.ImageAddon) term.loadAddon(new ImageAddon.ImageAddon({enableSizeReports:false}));
+  term.open(terminalElement);
+
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[character]));
+  const api = async (path, options = {}) => {
+    const response = await fetch(path, {
+      ...options, cache: 'no-store',
+      headers: {'X-Relay-Token':token, 'Content-Type':'application/json', ...(options.headers || {})}
+    });
+    if (!response.ok) {
+      throw new Error(response.status === 401
+        ? 'In Relay, choose Remote → Copy Codex panel link and open that link here.'
+        : `Relay returned ${response.status}.`);
+    }
+    return response.json();
+  };
+
+  function allPanes(state) {
+    return state.sessions.flatMap(session => session.tabs.flatMap(tab => tab.panes));
+  }
+  function matchesFilter(session, tab, pane) {
+    if (!filter) return true;
+    return [session.name, tab.name, pane.name, pane.host, pane.directory, pane.agent, pane.summary]
+      .some(value => String(value || '').toLowerCase().includes(filter));
+  }
+  function renderTree(state, active) {
+    let html = '';
+    for (const session of state.sessions) {
+      const tabHTML = [];
+      for (const tab of session.tabs) {
+        const panes = tab.panes.filter(pane => matchesFilter(session, tab, pane));
+        if (!panes.length) continue;
+        const paneHTML = panes.map(pane => `
+          <button class="pane ${pane.id === active?.id ? 'selected' : ''}" data-pane="${pane.id}" type="button"
+            aria-current="${pane.id === active?.id ? 'true' : 'false'}">
+            <span class="dot ${esc(pane.phase)}" aria-hidden="true"></span>
+            <span class="pane-copy"><span class="pane-name">${esc(pane.name)}</span>
+              <span class="pane-sub">${esc(pane.host)} · ${esc(pane.connection)}</span></span>
+            <span class="agent">${esc(pane.agent === 'shell' ? '' : pane.agent)}</span>
+          </button>`).join('');
+        tabHTML.push(`<details class="tab-group" data-tab="${tab.id}" ${collapsedTabs.has(tab.id) ? '' : 'open'}>
+          <summary class="tab-label">${tab.pinned ? '<span class="pin">●</span>' : ''}
+          <span class="tab-name">${esc(tab.name)}</span></summary><div class="tab-panes">${paneHTML}</div></details>`);
+      }
+      if (!tabHTML.length) continue;
+      html += `<details open><summary>${session.pinned ? '<span class="pin">●</span>' : ''}
+        <span class="session-name">${esc(session.name)}</span></summary>${tabHTML.join('')}</details>`;
+    }
+    tree.innerHTML = html || `<div class="empty">${filter ? 'No matching panes.' : 'No Relay sessions.'}</div>`;
+  }
+  function render(state) {
+    lastState = state;
+    const panes = allPanes(state);
+    if (!panes.some(pane => pane.id === panelSelected)) panelSelected = state.selectedPaneID;
+    const active = panes.find(pane => pane.id === panelSelected)
+      || panes.find(pane => pane.id === state.selectedPaneID) || panes[0] || null;
+    selected = active?.id || null; selectedPane = active;
+    if (state.terminalFontFamily) {
+      term.options.fontFamily = `"${state.terminalFontFamily.replaceAll('"', '')}", Menlo, monospace`;
+    }
+    if (state.terminalFontSize) term.options.fontSize = Math.max(9, Math.min(24, state.terminalFontSize));
+    renderTree(state, active);
+    terminalTitle.textContent = active ? `${active.name} · ${active.host}` : 'Select a remote pane';
+    openRelay.disabled = !active; agentsButton.disabled = !active;
+    if (active?.terminalAvailable) {
+      if (socketPaneID !== active.id) connectTerminal(active.id);
+    } else {
+      disconnectTerminal();
+      term.reset();
+      terminalState.textContent = active ? 'Open in Relay' : 'Idle';
+    }
+    renderAgentDrawer();
+  }
+
+  async function loadDetail(paneID) {
+    if (!paneID) return;
+    const request = ++detailRequest;
+    try {
+      const next = await api(`/api/panes/${paneID}`);
+      if (request !== detailRequest || paneID !== selected) return;
+      const json = JSON.stringify(next);
+      if (detailPaneID === paneID && json === lastDetailJSON) return;
+      detail = next; detailPaneID = paneID; lastDetailJSON = json; renderAgentDrawer();
+    } catch (_) {}
+  }
+  function renderAgentDrawer() {
+    if (!agentsOpen) {
+      agentDrawer.className = 'agent-drawer'; agentDrawer.replaceChildren();
+      agentsButton.setAttribute('aria-expanded', 'false'); return;
+    }
+    agentsButton.setAttribute('aria-expanded', 'true');
+    agentDrawer.className = 'agent-drawer visible';
+    const subagents = detailPaneID === selected ? (detail?.subagents || []) : [];
+    if (!subagents.length) { agentDrawer.textContent = 'No subagent activity for this pane.'; return; }
+    agentDrawer.innerHTML = subagents.slice(-20).reverse().map(agent => {
+      const update = agent.updates.length ? agent.updates[agent.updates.length - 1] : agent.provider;
+      return `<div class="agent-row"><span class="agent-label">${esc(agent.label)} · ${esc(agent.phase)}</span>
+        <span class="agent-update">${esc(update)}</span></div>`;
+    }).join('');
+  }
+  async function refresh(force = false) {
+    if (document.hidden || refreshInFlight) return;
+    refreshInFlight = true;
+    try {
+      const state = await api('/api/state');
+      const json = JSON.stringify(state);
+      if (force || json !== lastJSON) { lastJSON = json; render(state); }
+      // The terminal stream already carries live output. Agent detail can be
+      // comparatively large, so only poll it while its drawer is visible.
+      if (agentsOpen && selected) loadDetail(selected);
+      status.textContent = 'Live'; status.className = 'connection live';
+    } catch (error) {
+      status.textContent = 'Offline'; status.className = 'connection offline';
+      tree.innerHTML = `<div class="error">${esc(error.message)}</div>`;
+    } finally {
+      refreshInFlight = false;
+    }
+  }
+
+  function packet(kind, payload = new Uint8Array()) {
+    const result = new Uint8Array(payload.length + 1); result[0] = kind; result.set(payload, 1); return result;
+  }
+  function sendControl(kind) {
+    if (socket?.readyState === WebSocket.OPEN) socket.send(packet(kind));
+  }
+  function fitForOwnership() {
+    if (fitFrame !== null) return;
+    fitFrame = requestAnimationFrame(() => {
+      fitFrame = null;
+      try {
+        if (terminalFocused && ownsInput) {
+          fitAddon.fit();
+        } else if (canonicalSize &&
+                   (term.cols !== canonicalSize.columns || term.rows !== canonicalSize.rows)) {
+          // A viewer keeps the owner's exact grid. Its own narrower panel clips
+          // and scrolls locally instead of resizing the shared remote PTY.
+          term.resize(canonicalSize.columns, canonicalSize.rows);
+        }
+      } catch (_) {}
+    });
+  }
+  function applyViewport(message) {
+    const columns = Math.max(20, Math.min(1000, Number(message.columns) || 0));
+    const rows = Math.max(5, Math.min(1000, Number(message.rows) || 0));
+    canonicalSize = {columns, rows}; ownsInput = Boolean(message.ownsInput);
+    terminalState.textContent = ownsInput
+      ? `Input · ${columns}×${rows}`
+      : `View · ${columns}×${rows}`;
+    if (ownsInput && pendingInput && socket?.readyState === WebSocket.OPEN) {
+      socket.send(packet(1, encoder.encode(pendingInput))); pendingInput = '';
+    }
+    fitForOwnership();
+  }
+  function sendResize() {
+    if (!terminalFocused || !ownsInput || socket?.readyState !== WebSocket.OPEN) return;
+    const key = `${term.cols}x${term.rows}`;
+    if (key === lastSize) return;
+    lastSize = key;
+    socket.send(packet(2, new Uint8Array([term.cols >> 8, term.cols & 255, term.rows >> 8, term.rows & 255])));
+  }
+  function disconnectTerminal() {
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    if (remoteWheelFrame !== null) cancelAnimationFrame(remoteWheelFrame);
+    remoteWheelFrame = null; remoteWheelDelta = 0;
+    if (socket) { sendControl(4); socket.close(); socket = null; }
+    socketPaneID = null; canonicalSize = null; ownsInput = false; pendingInput = ''; lastSize = '';
+  }
+  function connectTerminal(paneID) {
+    disconnectTerminal();
+    socketPaneID = paneID; term.reset(); terminalState.textContent = 'Connecting';
+    const next = new WebSocket(`ws://127.0.0.1:47471/api/panes/${paneID}/terminal`, ['relay-v1', token]);
+    next.binaryType = 'arraybuffer'; socket = next;
+    next.onopen = () => {
+      if (socket !== next) return;
+      terminalState.textContent = 'View only';
+      if (terminalFocused) sendControl(3);
+    };
+    next.onmessage = event => {
+      if (socket !== next) return;
+      if (typeof event.data === 'string') {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === 'viewport') applyViewport(message);
+        } catch (_) {}
+      } else {
+        term.write(new Uint8Array(event.data));
+      }
+    };
+    next.onerror = () => { if (socket === next) terminalState.textContent = 'Unavailable'; };
+    next.onclose = () => {
+      if (socket !== next) return;
+      socket = null; ownsInput = false; terminalState.textContent = 'Reconnecting';
+      if (!document.hidden && selectedPane?.terminalAvailable) {
+        reconnectTimer = setTimeout(() => connectTerminal(paneID), 1200);
+      }
+    };
+  }
+
+  tree.addEventListener('click', event => {
+    const pane = event.target.closest('[data-pane]');
+    if (!pane) return;
+    panelSelected = pane.dataset.pane; detailPaneID = null; lastDetailJSON = '';
+    render(lastState); loadDetail(panelSelected);
+    // Selecting a pane is an intent to use it. Move focus directly into the
+    // terminal so the first keystroke is not lost on the sidebar button. If
+    // its socket is still opening, `onopen` will claim input ownership.
+    requestAnimationFrame(() => term.focus());
+  });
+  tree.addEventListener('toggle', event => {
+    const tab = event.target.closest?.('details[data-tab]');
+    if (!tab || event.target !== tab) return;
+    if (tab.open) collapsedTabs.delete(tab.dataset.tab); else collapsedTabs.add(tab.dataset.tab);
+    localStorage.setItem('relay-side-panel-collapsed-tabs', JSON.stringify([...collapsedTabs]));
+  }, true);
+  search.addEventListener('input', () => {
+    filter = search.value.trim().toLowerCase();
+    if (lastState) renderTree(lastState, allPanes(lastState).find(pane => pane.id === selected));
+  });
+  collapseNav.addEventListener('click', () => {
+    const collapsed = app.classList.toggle('nav-collapsed');
+    collapseNav.textContent = collapsed ? '⌄' : '⌃';
+    collapseNav.setAttribute('aria-expanded', String(!collapsed));
+    collapseNav.setAttribute('aria-label', collapsed ? 'Expand session navigator' : 'Collapse session navigator');
+    localStorage.setItem('relay-side-panel-nav-collapsed', collapsed ? '1' : '0');
+    fitForOwnership();
+  });
+  function applyNavigatorHeight() {
+    resizeFrame = null;
+    const height = Math.max(96, Math.min(innerHeight - 150, resizeY));
+    document.documentElement.style.setProperty('--navigator-height', `${height}px`);
+    localStorage.setItem('relay-side-panel-nav-height', String(Math.round(height)));
+    fitForOwnership();
+  }
+  resizeHandle.addEventListener('pointerdown', event => {
+    resizing = true; resizeHandle.setPointerCapture(event.pointerId); event.preventDefault();
+  });
+  resizeHandle.addEventListener('pointermove', event => {
+    if (!resizing) return;
+    resizeY = event.clientY - 40;
+    if (resizeFrame === null) resizeFrame = requestAnimationFrame(applyNavigatorHeight);
+  });
+  resizeHandle.addEventListener('pointerup', event => {
+    resizing = false; resizeHandle.releasePointerCapture(event.pointerId);
+  });
+  resizeHandle.addEventListener('keydown', event => {
+    if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    const current = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--navigator-height')) || 220;
+    resizeY = current + (event.key === 'ArrowDown' ? 16 : -16);
+    applyNavigatorHeight(); event.preventDefault();
+  });
+  agentsButton.addEventListener('click', () => {
+    agentsOpen = !agentsOpen;
+    if (agentsOpen && selected) loadDetail(selected);
+    renderAgentDrawer(); fitForOwnership();
+  });
+  openRelay.addEventListener('click', () => {
+    if (selected) api(`/api/panes/${selected}/reveal`, {method:'POST', body:'{}'});
+  });
+  function forwardTerminalInput(data) {
+    if (!terminalFocused || socket?.readyState !== WebSocket.OPEN) return;
+    if (ownsInput) {
+      socket.send(packet(1, encoder.encode(data)));
+    } else {
+      if (pendingInput.length + data.length <= 65536) pendingInput += data;
+      sendControl(3);
+    }
+  }
+  // xterm.js cannot observe the Kitty keyboard mode negotiated between a
+  // remote TUI and the PTY. Its browser defaults collapse Shift-Enter to a
+  // plain Enter and encode Backspace differently from Codex's Relay mode.
+  // Preserve these two editing keys explicitly instead of letting a newline
+  // become a queued/submitted prompt or making Backspace appear inert.
+  terminalElement.addEventListener('keydown', event => {
+    const agent = String(selectedPane?.agent || '').toLowerCase();
+    const isAgent = agent === 'codex' || agent === 'claude';
+    const isEnter = event.key === 'Enter' || event.code === 'Enter' || event.keyCode === 13;
+    const isShiftEnter = isAgent && isEnter && event.shiftKey &&
+      !event.metaKey && !event.ctrlKey && !event.altKey;
+    const isBackspace = event.key === 'Backspace' || event.code === 'Backspace' ||
+      event.keyCode === 8;
+    const isCodexBackspace = agent === 'codex' && isBackspace &&
+      !event.metaKey && !event.ctrlKey && !event.altKey;
+    if (!isShiftEnter && !isCodexBackspace) return;
+    if (isShiftEnter) {
+      // Codex exposes Ctrl-J as its compatibility newline binding even when
+      // an older running process did not decode Kitty CSI-u modifiers.
+      // Claude accepts the native Kitty Shift-Enter sequence.
+      forwardTerminalInput(agent === 'codex' ? '\x0a' : '\x1b[13;2u');
+    } else {
+      forwardTerminalInput('\x08');
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, {capture:true});
+  term.onData(forwardTerminalInput);
+  function flushRemoteWheel() {
+    remoteWheelFrame = null;
+    if (!remoteWheelDelta) return;
+    const button = remoteWheelDelta < 0 ? 64 : 65;
+    remoteWheelDelta = 0;
+    forwardTerminalInput(`\x1b[<${button};${remoteWheelColumn};${remoteWheelRow}M`);
+  }
+  // A browser terminal has no PTY-side knowledge of Codex/Claude mouse mode.
+  // Without an explicit wheel route xterm.js scrolls its own alternate buffer,
+  // which can blank the conversation while leaving the remote TUI untouched.
+  // Send standard SGR wheel events to the owning agent pane instead, so the
+  // remote application scrolls its transcript and keeps the composer pinned.
+  terminalElement.addEventListener('wheel', event => {
+    const agent = String(selectedPane?.agent || '').toLowerCase();
+    const mouseTrackingMode = term.modes?.mouseTrackingMode || 'none';
+    const remoteOwnsWheel = mouseTrackingMode !== 'none' ||
+      agent === 'codex' || agent === 'claude';
+    if (!remoteOwnsWheel || socket?.readyState !== WebSocket.OPEN) return;
+    const rect = terminalElement.getBoundingClientRect();
+    if (!rect.width || !rect.height || !event.deltaY) return;
+    // A wheel gesture is an explicit interaction with this pane.  It must
+    // claim control just like a click/key press; otherwise a read-only mirror
+    // lets xterm scroll its private alternate buffer and the live conversation
+    // appears to vanish. forwardTerminalInput queues the report until the
+    // ownership acknowledgement arrives, so no wheel delta is lost.
+    term.focus();
+    const column = Math.max(1, Math.min(term.cols,
+      Math.floor((event.clientX - rect.left) / rect.width * term.cols) + 1));
+    const row = Math.max(1, Math.min(term.rows,
+      Math.floor((event.clientY - rect.top) / rect.height * term.rows) + 1));
+    // Trackpads can emit dozens of pixel deltas per frame. Coalesce them into
+    // one terminal wheel report per display frame; mapping the pixel magnitude
+    // to repeated SGR reports makes a small gesture jump hundreds of history
+    // rows and can land on Codex's sparse partial-history boundary.
+    const direction = Math.sign(event.deltaY);
+    if (remoteWheelDelta && Math.sign(remoteWheelDelta) !== direction) remoteWheelDelta = 0;
+    remoteWheelDelta += direction;
+    remoteWheelColumn = column; remoteWheelRow = row;
+    if (remoteWheelFrame === null) remoteWheelFrame = requestAnimationFrame(flushRemoteWheel);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, {capture:true, passive:false});
+  term.onResize(sendResize);
+  term.element.addEventListener('focusin', () => { terminalFocused = true; sendControl(3); });
+  term.element.addEventListener('focusout', () => {
+    terminalFocused = false; ownsInput = false; pendingInput = ''; sendControl(4); fitForOwnership();
+  });
+  new ResizeObserver(fitForOwnership).observe(terminalElement);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      sendControl(4);
+      if (socket) { socket.close(); socket = null; }
+    } else {
+      refresh(true);
+      if (selectedPane?.terminalAvailable) connectTerminal(selectedPane.id);
+    }
+  });
+
+  const savedHeight = Number(localStorage.getItem('relay-side-panel-nav-height'));
+  if (Number.isFinite(savedHeight) && savedHeight >= 96) {
+    document.documentElement.style.setProperty('--navigator-height', `${savedHeight}px`);
+  }
+  if (localStorage.getItem('relay-side-panel-nav-collapsed') === '1') collapseNav.click();
+  refresh(true);
+  setInterval(refresh, 2000);
+})();
+</script>
+</body>
+</html>

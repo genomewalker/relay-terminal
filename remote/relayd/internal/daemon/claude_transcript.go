@@ -12,51 +12,6 @@ import (
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
-func observeClaudeTranscript(rootPID int) (<-chan protocol.Frame, func()) {
-	frames := make(chan protocol.Frame, 64)
-	stopped := make(chan struct{})
-	go func() {
-		defer close(frames)
-		timer := time.NewTimer(0)
-		defer timer.Stop()
-		readers := make(map[int]*claudeTranscriptReader)
-		poll := func() bool {
-			processes := descendantAgentProcesses(rootPID)
-			for pid, agent := range processes {
-				if agent != "claude" {
-					continue
-				}
-				reader := readers[pid]
-				if reader == nil {
-					reader = &claudeTranscriptReader{rootPID: pid, known: make(map[string]bool), active: make(map[string]bool)}
-					readers[pid] = reader
-				}
-				if !reader.poll(frames, stopped) {
-					return false
-				}
-			}
-			for pid := range readers {
-				if processes[pid] != "claude" {
-					delete(readers, pid)
-				}
-			}
-			return true
-		}
-		for {
-			select {
-			case <-timer.C:
-				if !poll() {
-					return
-				}
-				timer.Reset(transcriptPollInterval(len(readers)))
-			case <-stopped:
-				return
-			}
-		}
-	}()
-	return frames, func() { close(stopped) }
-}
-
 type claudeTranscriptReader struct {
 	rootPID             int
 	path                string

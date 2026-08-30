@@ -31,6 +31,12 @@ func TestNodeMultiplexRoutesVirtualProtocolConnection(t *testing.T) {
 	if !containsCapability(nodeStatus.Capabilities, "node_mux_v2") {
 		t.Fatalf("node multiplexer did not advertise independent routes: %#v", nodeStatus.Capabilities)
 	}
+	if !containsCapability(nodeStatus.Capabilities, "viewport_commit_compat_v1") {
+		t.Fatalf("node multiplexer did not advertise legacy viewport recovery: %#v", nodeStatus.Capabilities)
+	}
+	if !containsCapability(nodeStatus.Capabilities, "viewport_commit_compat_v2") {
+		t.Fatalf("node multiplexer did not advertise exactly-once viewport recovery: %#v", nodeStatus.Capabilities)
+	}
 
 	heartbeat := []byte("heartbeat-1")
 	if err := writer.Write(protocol.Frame{Type: protocol.Ping, Payload: heartbeat}); err != nil {
@@ -60,6 +66,22 @@ func TestNodeMultiplexRoutesVirtualProtocolConnection(t *testing.T) {
 		t.Fatalf("virtual probe was not routed: %#v", response)
 	}
 
+	// A virtual pane can close while the shared SSH/node stream remains alive
+	// (for example when a fast TUI overflows its bounded viewer queue). The
+	// client needs an explicit route-level signal so it can replay that pane.
+	closedEnvelope, err := protocol.ReadFrame(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedSessionID, closedResponse, err := protocol.ParseHostEvent(closedEnvelope)
+	if err != nil || closedSessionID != "pane-probe" || closedResponse.Type != protocol.Status {
+		t.Fatalf("unexpected route-close response: session=%q frame=%#v err=%v", closedSessionID, closedResponse, err)
+	}
+	var closedStatus protocol.StatusPayload
+	if protocol.DecodeJSON(closedResponse, &closedStatus) != nil || closedStatus.State != "route_closed" {
+		t.Fatalf("virtual route closure was silent: %#v", closedResponse)
+	}
+
 	observerHello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
 		Version: 1, SessionID: "pane-probe", Probe: true,
 	})
@@ -83,4 +105,21 @@ func containsCapability(values []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func TestMultiplexedSessionCachesWorkerViewportCapability(t *testing.T) {
+	virtual := &multiplexedSession{}
+	if known, supported := virtual.supportsExactViewportCommit(); known || supported {
+		t.Fatalf("new route unexpectedly had cached capabilities")
+	}
+	status, err := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+		State: "attached", Capabilities: []string{"viewport_commit_v2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	virtual.observeWorkerFrame(status)
+	if known, supported := virtual.supportsExactViewportCommit(); !known || !supported {
+		t.Fatalf("attached worker capability was not cached: known=%v supported=%v", known, supported)
+	}
 }

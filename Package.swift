@@ -12,7 +12,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/genomewalker/libghostty-spm.git",
-            revision: "c056eecfe327616a42f46ef29e706c604285cf6a"
+            revision: "859807b2d92ec8e2e57806b311fad23afe5f16c4"
         )
     ],
     targets: [
@@ -23,10 +23,13 @@ let package = Package(
             ],
             path: "Sources/Relay",
             resources: [
-                .copy("Resources/Editor")
+                .copy("Resources/Editor"),
+                .copy("Resources/SidePanel"),
+                .copy("Resources/Terminfo")
             ],
             linkerSettings: [
-                .linkedFramework("WebKit")
+                .linkedFramework("WebKit"),
+                .linkedFramework("Network")
             ]
         ),
         .executableTarget(

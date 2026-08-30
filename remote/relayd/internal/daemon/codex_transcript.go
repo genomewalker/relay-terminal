@@ -15,55 +15,6 @@ import (
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
-// observeCodexTranscript recovers structured collaboration events from Codex's
-// append-only session log. This also works for Codex processes started before
-// Relay's hooks were installed because the supervisor observes the process from
-// outside the durable pane worker.
-func observeCodexTranscript(rootPID int) (<-chan protocol.Frame, func()) {
-	frames := make(chan protocol.Frame, 64)
-	stopped := make(chan struct{})
-	go func() {
-		defer close(frames)
-		timer := time.NewTimer(0)
-		defer timer.Stop()
-		readers := make(map[int]*codexTranscriptReader)
-		poll := func() bool {
-			processes := descendantAgentProcesses(rootPID)
-			for pid, agent := range processes {
-				if agent != "codex" {
-					continue
-				}
-				reader := readers[pid]
-				if reader == nil {
-					reader = &codexTranscriptReader{rootPID: pid, known: make(map[string]bool), active: make(map[string]bool)}
-					readers[pid] = reader
-				}
-				if !reader.poll(frames, stopped) {
-					return false
-				}
-			}
-			for pid := range readers {
-				if processes[pid] != "codex" {
-					delete(readers, pid)
-				}
-			}
-			return true
-		}
-		for {
-			select {
-			case <-timer.C:
-				if !poll() {
-					return
-				}
-				timer.Reset(transcriptPollInterval(len(readers)))
-			case <-stopped:
-				return
-			}
-		}
-	}()
-	return frames, func() { close(stopped) }
-}
-
 type codexTranscriptReader struct {
 	rootPID             int
 	path                string

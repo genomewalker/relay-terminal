@@ -40,9 +40,11 @@ payload_dir="$relay_root/bin"
 shim_dir="$relay_root/shims"
 lock_dir="$relay_root/install.lock"
 temporary_launcher=
+temporary_claude_shim=
+temporary_codex_shim=
 lock_owned=0
 cleanup() {
-    rm -f "$upload" "$temporary_launcher"
+    rm -f "$upload" "$temporary_launcher" "$temporary_claude_shim" "$temporary_codex_shim"
     if [ "$lock_owned" = 1 ]; then rmdir "$lock_dir" 2>/dev/null || true; fi
 }
 trap cleanup EXIT HUP INT TERM
@@ -84,6 +86,25 @@ exec "$relay_payload" "$@"
 RELAY_LAUNCHER
 chmod 700 "$temporary_launcher"
 mv -f "$temporary_launcher" "$bin_dir/relayd"
+temporary_claude_shim="$(mktemp "$shim_dir/.claude-shim.XXXXXX")"
+temporary_codex_shim="$(mktemp "$shim_dir/.codex-shim.XXXXXX")"
+cat > "$temporary_claude_shim" <<'RELAY_CLAUDE_SHIM'
+#!/bin/sh
+set -eu
+RELAY_INVOKED_AS=claude
+export RELAY_INVOKED_AS
+exec "$HOME/.local/bin/relayd" "$@"
+RELAY_CLAUDE_SHIM
+cat > "$temporary_codex_shim" <<'RELAY_CODEX_SHIM'
+#!/bin/sh
+set -eu
+RELAY_INVOKED_AS=codex
+export RELAY_INVOKED_AS
+exec "$HOME/.local/bin/relayd" "$@"
+RELAY_CODEX_SHIM
+chmod 700 "$temporary_claude_shim" "$temporary_codex_shim"
+mv -f "$temporary_claude_shim" "$shim_dir/claude"
+mv -f "$temporary_codex_shim" "$shim_dir/codex"
 printf 'relay-managed-v1\n' > "$relay_root/managed-v1"
 if [ ! -e "$bin_dir/rcode" ] && [ ! -L "$bin_dir/rcode" ]; then
     ln -s "$bin_dir/relayd" "$bin_dir/rcode"
@@ -97,8 +118,9 @@ elif [ -L "$bin_dir/rcode" ]; then
 else
     echo "left existing rcode command unchanged" >&2
 fi
-ln -sfn "$bin_dir/relayd" "$shim_dir/claude"
-ln -sfn "$bin_dir/relayd" "$shim_dir/codex"
 "$bin_dir/relayd" --version
-"$bin_dir/relayd" upgrade-supervisor --force
+if ! "$bin_dir/relayd" upgrade-supervisor --force; then
+    sleep 1
+    "$bin_dir/relayd" upgrade-supervisor
+fi
 REMOTE_INSTALL

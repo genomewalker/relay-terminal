@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/relay-terminal/relayd/internal/daemon"
 	"github.com/relay-terminal/relayd/internal/protocol"
+	relayterminfo "github.com/relay-terminal/relayd/internal/terminfo"
 )
 
 var relaydVersion = "0.5.2"
@@ -27,6 +29,7 @@ var relaydVersion = "0.5.2"
 const supervisorProtocolVersion = 2
 
 func main() {
+	configureRuntime()
 	invocation := os.Getenv("RELAY_INVOKED_AS")
 	if invocation == "" {
 		invocation = filepath.Base(os.Args[0])
@@ -40,7 +43,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|artifact|files|live-status|upgrade-supervisor>")
+		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|artifact|files|terminfo|live-status|upgrade-supervisor>")
 	}
 	switch os.Args[1] {
 	case "daemon":
@@ -71,6 +74,8 @@ func main() {
 		runArtifact(os.Args[2:])
 	case "files":
 		runFiles(os.Args[2:])
+	case "terminfo":
+		runTerminfo(os.Args[2:])
 	case "live-status":
 		runLiveStatus(os.Args[2:])
 	case "upgrade-supervisor":
@@ -80,6 +85,41 @@ func main() {
 	default:
 		fatal("unknown command: " + os.Args[1])
 	}
+}
+
+func runTerminfo(arguments []string) {
+	if len(arguments) > 1 || len(arguments) == 1 && arguments[0] != "status" && arguments[0] != "install" {
+		fatal("usage: relayd terminfo [status|install]")
+	}
+	status, err := relayterminfo.EnsureCurrentUser()
+	if encodeErr := daemon.EncodeJSON(os.Stdout, status); encodeErr != nil {
+		fatal(encodeErr.Error())
+	}
+	if err != nil {
+		os.Exit(1)
+	}
+}
+
+func configureRuntime() {
+	if maximum := desiredMaxProcs(os.Getenv); maximum > 0 {
+		runtime.GOMAXPROCS(maximum)
+	}
+}
+
+func desiredMaxProcs(getenv func(string) string) int {
+	// Respect administrators who already tune Go globally. Relay's override is
+	// intentionally separate so one small I/O worker does not inherit all 96+
+	// host cores merely because it runs on an HPC node.
+	if strings.TrimSpace(getenv("GOMAXPROCS")) != "" {
+		return 0
+	}
+	if value := strings.TrimSpace(getenv("RELAYD_MAX_PROCS")); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err == nil && parsed >= 1 && parsed <= 32 {
+			return parsed
+		}
+	}
+	return 2
 }
 
 func runRCode(arguments []string) {
@@ -319,11 +359,11 @@ func runClaude(arguments []string) {
 	}
 	executable, err := findRealAgentExecutable("claude")
 	if err != nil {
-		fatal("claude is not available on PATH")
+		fatal(err.Error())
 	}
 	claudeArguments := []string{"claude", "--settings", settingsPath}
 	claudeArguments = append(claudeArguments, arguments...)
-	if err := syscall.Exec(executable, claudeArguments, os.Environ()); err != nil {
+	if err := syscall.Exec(executable, claudeArguments, agentExecEnvironment(os.Environ())); err != nil {
 		fatal(err.Error())
 	}
 }
@@ -343,13 +383,27 @@ func runCodex(arguments []string) {
 	}
 	executable, err := findRealAgentExecutable("codex")
 	if err != nil {
-		fatal("codex is not available on PATH")
+		fatal(err.Error())
 	}
 	codexArguments := []string{"codex", "--profile", "relay-terminal"}
 	codexArguments = append(codexArguments, arguments...)
-	if err := syscall.Exec(executable, codexArguments, os.Environ()); err != nil {
+	if err := syscall.Exec(executable, codexArguments, agentExecEnvironment(os.Environ())); err != nil {
 		fatal(err.Error())
 	}
+}
+
+// The shim marker only selects relayd's dispatch path. It must not leak into the agent process:
+// hooks spawned by that process call relayd by its real name and need the normal daemon commands.
+func agentExecEnvironment(environment []string) []string {
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		name, _, found := strings.Cut(entry, "=")
+		if found && name == "RELAY_INVOKED_AS" {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 func findRealAgentExecutable(name string) (string, error) {
@@ -358,9 +412,31 @@ func findRealAgentExecutable(name string) (string, error) {
 	if selfErr == nil {
 		selfInfo, _ = os.Stat(selfPath)
 	}
+	if configured := strings.TrimSpace(os.Getenv("RELAY_" + strings.ToUpper(name) + "_BIN")); configured != "" {
+		info, err := os.Stat(configured)
+		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			return "", fmt.Errorf("configured %s executable is not runnable: %s", name, configured)
+		}
+		if selfInfo != nil && os.SameFile(selfInfo, info) {
+			return "", fmt.Errorf("configured %s executable points back to relayd", name)
+		}
+		absolute, err := filepath.Abs(configured)
+		if err != nil {
+			return "", err
+		}
+		return absolute, nil
+	}
+	relayShimDirectory := ""
+	if home, err := os.UserHomeDir(); err == nil {
+		relayShimDirectory = filepath.Clean(filepath.Join(home, ".local", "share", "relay", "shims"))
+	}
 	for _, directory := range filepath.SplitList(os.Getenv("PATH")) {
 		if directory == "" {
 			directory = "."
+		}
+		absoluteDirectory, err := filepath.Abs(directory)
+		if err == nil && relayShimDirectory != "" && filepath.Clean(absoluteDirectory) == relayShimDirectory {
+			continue
 		}
 		candidate := filepath.Join(directory, name)
 		info, err := os.Stat(candidate)
@@ -405,6 +481,7 @@ var codexHookSpecs = []codexHookSpec{
 func codexHookProfile(profilePath string) string {
 	var state strings.Builder
 	state.WriteString("# Managed by Relay Terminal. Remove this file to uninstall the profile.\n")
+	state.WriteString("[tui]\nterminal_resize_reflow_max_rows = 256\n\n")
 	for _, spec := range codexHookSpecs {
 		key := profilePath + ":" + spec.event + ":0:0"
 		state.WriteString("[hooks.state.")

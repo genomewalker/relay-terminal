@@ -52,8 +52,71 @@ func TestFindRealAgentExecutableSkipsRelayShim(t *testing.T) {
 	}
 }
 
+func TestFindRealAgentExecutableSkipsRelayOwnedWrapper(t *testing.T) {
+	home := t.TempDir()
+	shimDirectory := filepath.Join(home, ".local", "share", "relay", "shims")
+	realDirectory := filepath.Join(home, "real")
+	if err := os.MkdirAll(shimDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(realDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(shimDirectory, "claude")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nexec relayd \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(realDirectory, "claude")
+	if err := os.WriteFile(real, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", shimDirectory+string(os.PathListSeparator)+realDirectory)
+
+	found, err := findRealAgentExecutable("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found != real {
+		t.Fatalf("found %q, want non-Relay executable %q", found, real)
+	}
+}
+
+func TestFindRealAgentExecutableHonorsExplicitRelayBinary(t *testing.T) {
+	root := t.TempDir()
+	configured := filepath.Join(root, "codex-local")
+	if err := os.WriteFile(configured, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_CODEX_BIN", configured)
+	t.Setenv("PATH", "")
+
+	found, err := findRealAgentExecutable("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found != configured {
+		t.Fatalf("found %q, want configured binary %q", found, configured)
+	}
+}
+
+func TestAgentExecEnvironmentRemovesShimMarker(t *testing.T) {
+	got := agentExecEnvironment([]string{
+		"PATH=/usr/bin",
+		"RELAY_INVOKED_AS=claude",
+		"RELAY_SESSION=pane-1",
+	})
+	want := []string{"PATH=/usr/bin", "RELAY_SESSION=pane-1"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("agent environment = %#v, want %#v", got, want)
+	}
+}
+
 func TestCodexHookProfile(t *testing.T) {
 	profile := codexHookProfile("/home/test/.codex/relay-terminal.config.toml")
+	if !strings.Contains(profile, "[tui]\nterminal_resize_reflow_max_rows = 256") {
+		t.Fatal("Codex hook profile does not bound resize transcript reflow for Relay")
+	}
 	for _, event := range []string{"SessionStart", "PermissionRequest", "SubagentStart", "SubagentStop", "SessionEnd"} {
 		if !strings.Contains(profile, "[[hooks."+event+"]]") {
 			t.Fatalf("Codex hook profile is missing %s", event)
@@ -89,5 +152,21 @@ func TestDefaultSocketNeverUsesSharedHome(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "/run/user/123")
 	if got := defaultSocket(); got != "/run/user/123/relayd.sock" {
 		t.Fatalf("runtime socket = %q", got)
+	}
+}
+
+func TestDesiredMaxProcsKeepsPerPaneRuntimeSmall(t *testing.T) {
+	values := map[string]string{}
+	lookup := func(key string) string { return values[key] }
+	if got := desiredMaxProcs(lookup); got != 2 {
+		t.Fatalf("default GOMAXPROCS = %d, want 2", got)
+	}
+	values["RELAYD_MAX_PROCS"] = "4"
+	if got := desiredMaxProcs(lookup); got != 4 {
+		t.Fatalf("Relay override = %d, want 4", got)
+	}
+	values["GOMAXPROCS"] = "8"
+	if got := desiredMaxProcs(lookup); got != 0 {
+		t.Fatalf("explicit Go setting was overridden: %d", got)
 	}
 }

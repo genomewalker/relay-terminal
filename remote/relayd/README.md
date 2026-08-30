@@ -12,6 +12,8 @@ When a native Relay pane is split, the new session can name its parent session. 
 
 Agent lifecycle JSON is carried as a separate `AgentEvent` frame, never printed into the terminal byte stream. Events receive monotonic cursors and are retained in bounded mode-0600 journals under the Relay state directory. The installer places `claude` and `codex` shims in a directory prepended only to Relay worker shells. Those shims execute the real agent binaries with generated hook settings that forward tool, permission, notification, subagent, stop, and session events to the owning Relay pane. Process-tree and provider-transcript detection remain compatibility fallbacks and are indexed by the supervisor for older workers.
 
+By default a shim resolves the first real agent executable after Relay's shim directory. A maintained fork can use an explicit, stable path instead: `RELAY_CODEX_BIN=$HOME/.local/bin/codex-local` or `RELAY_CLAUDE_BIN=…`. This keeps Relay independent of package-manager symlinks that may be replaced during automatic updates; already-running panes remain pinned to the executable they started.
+
 New workers advertise acknowledged input. Each client supplies a stable connection identity and monotonic input sequence; a reconnect can retry an unacknowledged write and the worker applies it at most once. Older workers continue to accept the original raw input frame.
 
 The only non-standard-library dependency is `creack/pty`, which supplies the OS pseudo-terminal calls. Tabs and layout belong to the Mac app; PTYs, replay, and agent-event fan-out belong to pane workers. If a pane worker itself dies, its open PTY cannot be reconstructed from disk.

@@ -204,6 +204,9 @@ final class TerminalSnapshotStore: @unchecked Sendable {
     }
 
     static func bounded(_ data: Data) -> Data {
+        // Small snapshots are already bounded and replay quickly. Scanning the
+        // same ANSI stream on every periodic save was pure background work.
+        guard data.count > maximumBytes else { return data }
         let compacted = TerminalReplayCompactor.compact(data)
         guard compacted.count > maximumBytes else { return compacted }
         var result = Data("\u{001B}c".utf8)
