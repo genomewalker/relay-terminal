@@ -493,6 +493,7 @@ final class TerminalRuntime: NSObject {
     private var pendingFocusOnPresentation = false
     private var keyboardFocusEligible = false
     private var inputDiagnosticCount = 0
+    private var initialAuthoritativeRepaintPending = false
 
     private var session: InMemoryTerminalSession { io.session }
     private(set) lazy var view: RelayGhosttyView = makeView()
@@ -595,8 +596,10 @@ final class TerminalRuntime: NSObject {
         io.installTransport(remote)
         beginMeasuredRestore(reason: "launch")
         io.beginReplay()
-        let restoredSequence = io.restoreSnapshot(paneID: pane.id)
-        if restoredSequence != nil {
+        let restoration = io.restoreSnapshot(paneID: pane.id)
+        let restoredSequence = restoration?.remoteSequence
+        initialAuthoritativeRepaintPending = restoration?.rendered == false
+        if restoration?.rendered == true {
             // A snapshot may contain a partially composed command entered
             // before this Relay process existed. The rendered state is valid;
             // the local prompt mirror is not.
@@ -700,6 +703,13 @@ final class TerminalRuntime: NSObject {
                     if status.state == "attached" {
                         self.pane?.beginTerminalRestore()
                         self.pane?.connected()
+                        if self.initialAuthoritativeRepaintPending {
+                            self.initialAuthoritativeRepaintPending = false
+                            self.io.requestCurrentViewportRepaint(
+                                compatibilityRepaintPulse: self.pane?.kind != .shell ||
+                                    self.io.isAlternateScreenActive
+                            )
+                        }
                     } else if status.state == "caught_up" {
                         self.terminalReplayCaughtUp = true
                         self.applyLegacyTerminalModeCompatibilityIfNeeded()
@@ -1802,6 +1812,11 @@ private final class TerminalActivityCoalescer: @unchecked Sendable {
 }
 
 private final class TerminalIOBridge: @unchecked Sendable {
+    struct SnapshotRestoration {
+        let remoteSequence: UInt64
+        let rendered: Bool
+    }
+
     private var transport: RelayRemoteTransport?
     var onReplayFinished: (@Sendable () -> Void)?
     var onPresentationResumed: (@Sendable () -> Void)?
@@ -2077,6 +2092,17 @@ private final class TerminalIOBridge: @unchecked Sendable {
         setPresentationPaused(false, reconstruct: true)
     }
 
+    /// A viewport-mismatched snapshot contributes only its durable resume
+    /// cursor. Once input ownership is attached, request one fresh screen at
+    /// the already measured native grid so an up-to-date cursor cannot result
+    /// in a valid zero-byte replay and a blank renderer.
+    func requestCurrentViewportRepaint(compatibilityRepaintPulse: Bool) {
+        _ = flushPendingResize(
+            forceRepaint: true,
+            compatibilityRepaintPulse: compatibilityRepaintPulse
+        )
+    }
+
     func beginViewportTransition(authoritativePrimaryScreen: Bool = false) {
         resizeLock.lock()
         resizeTransitionActive = true
@@ -2299,13 +2325,31 @@ private final class TerminalIOBridge: @unchecked Sendable {
         return true
     }
 
-    func restoreSnapshot(paneID: UUID) -> UInt64? {
+    func restoreSnapshot(paneID: UUID) -> SnapshotRestoration? {
         receiveLock.lock()
         snapshotPaneID = paneID
         receiveLock.unlock()
-        guard let cached = TerminalSnapshotStore.shared.loadSnapshot(
-            paneID: paneID, viewport: currentViewport
-        ), !cached.payload.isEmpty else {
+        let store = TerminalSnapshotStore.shared
+        guard let cached = store.loadSnapshot(paneID: paneID, viewport: currentViewport),
+              !cached.payload.isEmpty else {
+            if let resumeCursor = store.loadResumeCursor(paneID: paneID), resumeCursor > 0 {
+                receiveLock.lock()
+                TerminalBufferRetentionPolicy.clear(&snapshotBuffer)
+                snapshotRemoteSequence = resumeCursor
+                receiveLock.unlock()
+                RelayDiagnostics.shared.record(
+                    category: "snapshot",
+                    name: "viewport-mismatch-cursor-restored",
+                    details: [
+                        "pane_id": paneID.uuidString.lowercased(),
+                        "remote_sequence": String(resumeCursor),
+                    ]
+                )
+                return SnapshotRestoration(
+                    remoteSequence: resumeCursor,
+                    rendered: false
+                )
+            }
             if ProcessInfo.processInfo.environment["RELAY_TERMINAL_DEBUG"] == "1" {
                 let viewport = currentViewport
                 FileHandle.standardError.write(Data(
@@ -2335,7 +2379,10 @@ private final class TerminalIOBridge: @unchecked Sendable {
             "bytes": String(cached.payload.count),
             "remote_sequence": String(cached.remoteSequence),
         ])
-        return cached.remoteSequence
+        return SnapshotRestoration(
+            remoteSequence: cached.remoteSequence,
+            rendered: true
+        )
     }
 
     func resetRemoteSequence() {
@@ -3564,10 +3611,24 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         let movementOffset: Int
     }
 
+    /// AppKit keeps delivering a drag to the view that received mouse-down,
+    /// but SwiftUI is allowed to move that durable terminal view when the pane
+    /// becomes active. Retaining the original NSEvent therefore retains a
+    /// window coordinate that may no longer address the same terminal cell.
+    /// Keep the semantic terminal point and only recreate the event after the
+    /// final view placement is known.
+    private struct PendingLocalSelectionMouseDown {
+        let terminalPoint: CGPoint
+        let modifierFlags: NSEvent.ModifierFlags
+        let timestamp: TimeInterval
+        let eventNumber: Int
+        let clickCount: Int
+        let pressure: Float
+    }
+
     weak var owner: TerminalRuntime?
     private var pointerDownPoint: CGPoint?
     private var selectionStart: CGPoint?
-    private var selectionStartInWindow: CGPoint?
     private var selectionCanEditPrompt = false
     private var promptSelection: PromptSelection?
     private var keyboardSelectionOffset: Int?
@@ -3577,7 +3638,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     /// even when a remote TUI (or a stale terminal mode) has mouse reporting
     /// enabled. Clicks are replayed to the terminal after mouse-up.
     private var forcingLocalSelectionGesture = false
-    private var pendingLocalSelectionMouseDown: NSEvent?
+    private var pendingLocalSelectionMouseDown: PendingLocalSelectionMouseDown?
     private var localSelectionDidDrag = false
     private var geometryRevealTask: Task<Void, Never>?
     private var promptBuffer = TerminalPromptBuffer()
@@ -3743,6 +3804,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     override func mouseDown(with event: NSEvent) {
+        // Resolve the cell before selecting the pane. Pane selection can
+        // synchronously reorder a floating pane or rebuild a tiled host, which
+        // changes the meaning of event.locationInWindow while this method is
+        // still running.
+        let point = terminalPoint(for: event)
         owner?.prepareForUserInteraction()
         // Own the keyboard before publishing the SwiftUI selection change.
         // A floating-pane reorder or tab/zoom transition can reparent this
@@ -3759,7 +3825,6 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         promptSelection = nil
         keyboardSelectionOffset = nil
         keyboardSelectionIsVisual = false
-        let point = terminalPoint(for: event)
         pointerDownPoint = point
         let agentPrompt = owner?.forcesLocalPromptSelection == true
         let canBeginPromptSelection = owner?.allowsPromptSelectionEditing == true &&
@@ -3774,7 +3839,6 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         // remains gated by `selectionCanEditPrompt`, so selecting old output
         // can never edit the live composer.
         selectionStart = (canBeginPromptSelection || agentPrompt) ? point : nil
-        selectionStartInWindow = selectionStart == nil ? nil : event.locationInWindow
         selectionCanEditPrompt = canBeginPromptSelection
         forcingLocalSelectionGesture = true
         localSelectionDidDrag = false
@@ -3784,7 +3848,14 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             // subsequent drag as a double/triple click, expanding a precise
             // character selection to word or line boundaries. A genuine click
             // is replayed to the TUI from mouseUp instead.
-            pendingLocalSelectionMouseDown = event
+            pendingLocalSelectionMouseDown = PendingLocalSelectionMouseDown(
+                terminalPoint: point,
+                modifierFlags: event.modifierFlags,
+                timestamp: event.timestamp,
+                eventNumber: event.eventNumber,
+                clickCount: event.clickCount,
+                pressure: event.pressure
+            )
         } else {
             pendingLocalSelectionMouseDown = nil
             super.mouseDown(with: event)
@@ -3798,7 +3869,9 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         }
         if let pending = pendingLocalSelectionMouseDown {
             pendingLocalSelectionMouseDown = nil
-            super.mouseDown(with: localSelectionEvent(from: pending, clickCount: 1) ?? pending)
+            if let down = localSelectionEvent(from: pending, clickCount: 1) {
+                super.mouseDown(with: down)
+            }
         }
         localSelectionDidDrag = true
         super.mouseDragged(with: localSelectionEvent(from: event, clickCount: 1) ?? event)
@@ -3807,7 +3880,6 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     override func mouseUp(with event: NSEvent) {
         let start = selectionStart
         let pointerStart = pointerDownPoint
-        let caretLocation = selectionStartInWindow
         let canEditPrompt = selectionCanEditPrompt
         let end = terminalPoint(for: event)
         let forcedLocalSelection = forcingLocalSelectionGesture
@@ -3823,16 +3895,17 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                             .intersection([.command, .option, .control, .shift]).isEmpty {
                 // Preserve deliberate word/line selection and modified-click
                 // selection. Ordinary single clicks belong to the agent TUI.
-                super.mouseDown(with: localSelectionEvent(from: pendingLocalDown) ?? pendingLocalDown)
-                super.mouseUp(with: localSelectionEvent(from: event) ?? event)
-                handledLocalSelectionClick = true
+                if let down = localSelectionEvent(from: pendingLocalDown) {
+                    super.mouseDown(with: down)
+                    super.mouseUp(with: localSelectionEvent(from: event) ?? event)
+                    handledLocalSelectionClick = true
+                }
             }
         } else {
             super.mouseUp(with: event)
         }
         selectionStart = nil
         pointerDownPoint = nil
-        selectionStartInWindow = nil
         selectionCanEditPrompt = false
         forcingLocalSelectionGesture = false
         pendingLocalSelectionMouseDown = nil
@@ -3856,7 +3929,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                 return
             }
         }
-        guard canEditPrompt, let start, let caretLocation,
+        guard canEditPrompt, let start,
               hypot(end.x - start.x, end.y - start.y) >= 2,
               selectionIsNearActivePrompt(start: start, end: end),
               copySelectedTextToPasteboard(),
@@ -3864,8 +3937,8 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
               TerminalPromptSelectionEdit.deletionSequence(for: text, backwards: true) != nil
         else { return }
         let backwards = end.y < start.y - 4 || (abs(end.y - start.y) <= 4 && end.x < start.x)
-        let deletionAnchor = backwards ? caretLocation : event.locationInWindow
-        guard let movementOffset = cursorMovementOffset(to: deletionAnchor) else { return }
+        let deletionAnchor = backwards ? start : end
+        guard let movementOffset = cursorMovementOffset(toTerminalPoint: deletionAnchor) else { return }
         promptSelection = PromptSelection(
             characterCount: text.count,
             movementOffset: movementOffset
@@ -4471,9 +4544,13 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     private func cursorMovementOffset(to locationInWindow: CGPoint) -> Int? {
+        cursorMovementOffset(
+            toTerminalPoint: terminalPointForWindowLocation(locationInWindow)
+        )
+    }
+
+    private func cursorMovementOffset(toTerminalPoint target: CGPoint) -> Int? {
         guard let geometry = activeCursorGeometry() else { return nil }
-        let local = convert(selectionAdjustedWindowLocation(locationInWindow), from: nil)
-        let target = CGPoint(x: local.x, y: bounds.height - local.y)
         guard let visualOffset = TerminalPromptSelectionEdit.cursorMovementOffset(
             cursorOrigin: geometry.origin,
             target: target,
@@ -4645,6 +4722,31 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             eventNumber: event.eventNumber,
             clickCount: clickCount ?? event.clickCount,
             pressure: event.pressure
+        )
+    }
+
+    private func localSelectionEvent(
+        from pending: PendingLocalSelectionMouseDown,
+        clickCount: Int? = nil
+    ) -> NSEvent? {
+        guard let window else { return nil }
+        return NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: windowLocation(forTerminalPoint: pending.terminalPoint),
+            modifierFlags: pending.modifierFlags.union(.shift),
+            timestamp: pending.timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: pending.eventNumber,
+            clickCount: clickCount ?? pending.clickCount,
+            pressure: pending.pressure
+        )
+    }
+
+    private func windowLocation(forTerminalPoint point: CGPoint) -> CGPoint {
+        convert(
+            CGPoint(x: point.x, y: bounds.height - point.y),
+            to: nil
         )
     }
 

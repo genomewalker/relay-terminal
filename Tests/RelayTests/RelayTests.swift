@@ -1573,6 +1573,11 @@ func terminalSnapshotSynchronousSave() throws {
 
     #expect(store.load(paneID: paneID, viewport: viewport) != nil)
     #expect(store.loadSnapshot(paneID: paneID, viewport: viewport)?.remoteSequence == 417)
+    #expect(store.loadSnapshot(
+        paneID: paneID,
+        viewport: RelayViewport(columns: 81, rows: 24)
+    ) == nil)
+    #expect(store.loadResumeCursor(paneID: paneID) == 417)
 }
 
 @Test("Terminal screen caches require an exact viewport match")
@@ -1587,10 +1592,12 @@ func terminalSnapshotViewportRecord() {
     #expect(TerminalSnapshotRecordCodec.decodeSnapshot(
         record, expectedViewport: viewport
     )?.remoteSequence == 99)
+    #expect(TerminalSnapshotRecordCodec.resumeCursor(record) == 99)
     #expect(TerminalSnapshotRecordCodec.decode(
         record, expectedViewport: RelayViewport(columns: 92, rows: 27)
     ) == nil)
     #expect(TerminalSnapshotRecordCodec.decode(payload, expectedViewport: viewport) == nil)
+    #expect(TerminalSnapshotRecordCodec.resumeCursor(payload) == nil)
 }
 
 @Test("Persisted agent state retains its resume cursor and thread summaries")

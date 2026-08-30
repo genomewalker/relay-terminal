@@ -899,6 +899,66 @@ func relayRemoteShellTranscriptSelectionCopiesLocally() async throws {
     // drag by Relay's native-selection override.
     #expect(recorder.data.isEmpty)
 
+    // Activating a tiled or floating pane can move its durable AppKit terminal
+    // view between mouse-down and the first drag event. The selection anchor
+    // must remain the cell under the initial pointer, not the obsolete window
+    // coordinate stored in the original NSEvent.
+    let container = NSView(frame: view.frame)
+    window.contentView = container
+    view.frame = container.bounds
+    container.addSubview(view)
+    let movingStartWindow = view.convert(secondStartLocal, to: nil)
+    guard let movingDown = NSEvent.mouseEvent(
+        with: .leftMouseDown,
+        location: movingStartWindow,
+        modifierFlags: [],
+        timestamp: now + 0.10,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 5,
+        clickCount: 1,
+        pressure: 1
+    ) else {
+        Issue.record("AppKit could not construct moving-pane selection start")
+        return
+    }
+    view.mouseDown(with: movingDown)
+    view.setFrameOrigin(NSPoint(x: 90, y: 0))
+    let movingEndWindow = view.convert(endLocal, to: nil)
+    guard let movingDrag = NSEvent.mouseEvent(
+        with: .leftMouseDragged,
+        location: movingEndWindow,
+        modifierFlags: [],
+        timestamp: now + 0.11,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 5,
+        clickCount: 1,
+        pressure: 1
+    ), let movingUp = NSEvent.mouseEvent(
+        with: .leftMouseUp,
+        location: movingEndWindow,
+        modifierFlags: [],
+        timestamp: now + 0.12,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 5,
+        clickCount: 1,
+        pressure: 0
+    ) else {
+        Issue.record("AppKit could not construct moving-pane selection events")
+        return
+    }
+    view.mouseDragged(with: movingDrag)
+    view.mouseUp(with: movingUp)
+    try await Task.sleep(for: .milliseconds(30))
+    pasteboard.clearContents()
+    #expect(view.performKeyEquivalent(with: copy))
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(pasteboard.string(forType: .string) == "KL")
+    #expect(recorder.data.isEmpty)
+    view.setFrameOrigin(.zero)
+
     // Relay keeps the previous IOSurface visible while a remote resize waits
     // for its destination-sized PTY frame. Reproduce that retained-grid
     // interval: the visible text is scaled to half size, while Ghostty still
@@ -926,30 +986,30 @@ func relayRemoteShellTranscriptSelectionCopiesLocally() async throws {
         with: .leftMouseDown,
         location: scaledStartWindow,
         modifierFlags: [],
-        timestamp: now + 0.10,
+        timestamp: now + 0.14,
         windowNumber: window.windowNumber,
         context: nil,
-        eventNumber: 5,
+        eventNumber: 6,
         clickCount: 1,
         pressure: 1
     ), let scaledDrag = NSEvent.mouseEvent(
         with: .leftMouseDragged,
         location: scaledEndWindow,
         modifierFlags: [],
-        timestamp: now + 0.11,
+        timestamp: now + 0.15,
         windowNumber: window.windowNumber,
         context: nil,
-        eventNumber: 5,
+        eventNumber: 6,
         clickCount: 1,
         pressure: 1
     ), let scaledUp = NSEvent.mouseEvent(
         with: .leftMouseUp,
         location: scaledEndWindow,
         modifierFlags: [],
-        timestamp: now + 0.12,
+        timestamp: now + 0.16,
         windowNumber: window.windowNumber,
         context: nil,
-        eventNumber: 5,
+        eventNumber: 6,
         clickCount: 1,
         pressure: 0
     ) else {

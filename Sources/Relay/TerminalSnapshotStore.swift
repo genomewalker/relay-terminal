@@ -68,6 +68,18 @@ enum TerminalSnapshotRecordCodec {
             remoteSequence: 0
         )
     }
+
+    /// The ANSI payload is only safe to draw at its recorded viewport, but
+    /// its durable relayd sequence remains a valid resume cursor at every
+    /// viewport. Keeping those concerns separate prevents a window-size
+    /// change from replaying a multi-megabyte agent transcript from byte zero.
+    static func resumeCursor(_ record: Data) -> UInt64? {
+        guard record.starts(with: magic), record.count >= headerBytes else { return nil }
+        let offset = magic.count + 4
+        return record[offset..<(offset + 8)].reduce(UInt64(0)) {
+            ($0 << 8) | UInt64($1)
+        }
+    }
 }
 
 /// A small, local reconstruction stream for instant visual restore. The
@@ -100,13 +112,13 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         paneID: UUID,
         viewport: RelayViewport
     ) -> TerminalSnapshotRecordCodec.Snapshot? {
-        let url = snapshotURL(paneID)
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
-              let size = values.fileSize,
-              size > TerminalSnapshotRecordCodec.minimumHeaderBytes,
-              size <= Self.maximumBytes + TerminalSnapshotRecordCodec.headerBytes,
-              let record = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        guard let record = loadRecord(paneID: paneID) else { return nil }
         return TerminalSnapshotRecordCodec.decodeSnapshot(record, expectedViewport: viewport)
+    }
+
+    func loadResumeCursor(paneID: UUID) -> UInt64? {
+        guard let record = loadRecord(paneID: paneID) else { return nil }
+        return TerminalSnapshotRecordCodec.resumeCursor(record)
     }
 
     func save(
@@ -158,6 +170,16 @@ final class TerminalSnapshotStore: @unchecked Sendable {
 
     private func snapshotURL(_ paneID: UUID) -> URL {
         directory.appendingPathComponent(paneID.uuidString.lowercased() + ".ansi")
+    }
+
+    private func loadRecord(paneID: UUID) -> Data? {
+        let url = snapshotURL(paneID)
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize,
+              size > TerminalSnapshotRecordCodec.minimumHeaderBytes,
+              size <= Self.maximumBytes + TerminalSnapshotRecordCodec.headerBytes
+        else { return nil }
+        return try? Data(contentsOf: url, options: .mappedIfSafe)
     }
 
     private func reserve(
