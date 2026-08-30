@@ -660,8 +660,8 @@ func relayKeyboardWordSelectionDeletesAndUndoes() async throws {
 }
 
 @MainActor
-@Test("Agent transcript drag selection stays local while mouse reporting is active")
-func relayAgentTranscriptSelectionCopiesLocally() async throws {
+@Test("SSH-style terminal drag selection stays local while mouse reporting is active")
+func relayRemoteShellTranscriptSelectionCopiesLocally() async throws {
     _ = NSApplication.shared
     let recorder = TerminalInputRecorder()
     let session = InMemoryTerminalSession(
@@ -669,7 +669,6 @@ func relayAgentTranscriptSelectionCopiesLocally() async throws {
         resize: { _ in }
     )
     let pane = PaneModel(profile: .local)
-    pane.setAgentKind(.codex)
     let view = pane.runtime.view
     view.frame = NSRect(x: 0, y: 0, width: 800, height: 400)
     view.configuration = TerminalSurfaceOptions(backend: .inMemory(session))

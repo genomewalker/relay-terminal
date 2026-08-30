@@ -3512,7 +3512,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     private var promptSelection: PromptSelection?
     private var keyboardSelectionOffset: Int?
     private var keyboardSelectionIsVisual = false
-    private var forcingLocalPromptSelection = false
+    /// A primary-button gesture is held locally until AppKit distinguishes a
+    /// click from a drag. Drags always use Ghostty's local selection path,
+    /// even when a remote TUI (or a stale terminal mode) has mouse reporting
+    /// enabled. Clicks are replayed to the terminal after mouse-up.
+    private var forcingLocalSelectionGesture = false
     private var pendingLocalSelectionMouseDown: NSEvent?
     private var localSelectionDidDrag = false
     private var geometryRevealTask: Task<Void, Never>?
@@ -3702,18 +3706,19 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             owner?.promptEditingViewportIsLive == true &&
             promptEditingIsSemanticallyActive &&
             (agentPrompt || pointIsNearActivePrompt(point))
-        // Codex and Claude commonly keep terminal mouse reporting enabled.
-        // Give an ordinary drag native macOS text-selection semantics across
-        // the whole transcript, then replay a genuine click to the TUI when
-        // the gesture never became a drag. Prompt deletion remains gated by
-        // `selectionCanEditPrompt`, so selecting old output can never edit the
-        // live composer.
+        // Remote TUIs can keep mouse reporting enabled after they exit, and a
+        // reconnect can restore that mode before its reset sequence arrives.
+        // Hold every primary-button gesture locally until it proves to be a
+        // drag. A drag gets native macOS selection semantics; a genuine click
+        // is replayed to the remote application from mouseUp. Prompt deletion
+        // remains gated by `selectionCanEditPrompt`, so selecting old output
+        // can never edit the live composer.
         selectionStart = (canBeginPromptSelection || agentPrompt) ? point : nil
         selectionStartInWindow = selectionStart == nil ? nil : event.locationInWindow
         selectionCanEditPrompt = canBeginPromptSelection
-        forcingLocalPromptSelection = selectionStart != nil && agentPrompt
+        forcingLocalSelectionGesture = true
         localSelectionDidDrag = false
-        if forcingLocalPromptSelection {
+        if forcingLocalSelectionGesture {
             // Do not commit the terminal selection mode until AppKit proves
             // this is a drag. A focus click can otherwise be coalesced with a
             // subsequent drag as a double/triple click, expanding a precise
@@ -3727,7 +3732,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard forcingLocalPromptSelection else {
+        guard forcingLocalSelectionGesture else {
             super.mouseDragged(with: event)
             return
         }
@@ -3745,7 +3750,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         let caretLocation = selectionStartInWindow
         let canEditPrompt = selectionCanEditPrompt
         let end = terminalPoint(for: event)
-        let forcedLocalSelection = forcingLocalPromptSelection
+        let forcedLocalSelection = forcingLocalSelectionGesture
         let pendingLocalDown = pendingLocalSelectionMouseDown
         let completedLocalDrag = localSelectionDidDrag
         var handledLocalSelectionClick = false
@@ -3769,7 +3774,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         pointerDownPoint = nil
         selectionStartInWindow = nil
         selectionCanEditPrompt = false
-        forcingLocalPromptSelection = false
+        forcingLocalSelectionGesture = false
         pendingLocalSelectionMouseDown = nil
         localSelectionDidDrag = false
         if handledLocalSelectionClick { return }
@@ -3781,12 +3786,13 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             // mouse-down made paths and URLs impossible to drag-select and
             // therefore impossible to copy from Codex/Claude transcripts.
             if owner?.openHoveredLink() == true { return }
-            if forcedLocalSelection {
-                // Alternate-screen applications own their pointer protocol.
-                replayAgentClick(at: event.locationInWindow)
+            if placePromptCursor(at: event.locationInWindow) {
                 return
             }
-            if placePromptCursor(at: event.locationInWindow) {
+            if forcedLocalSelection {
+                // Alternate-screen applications and ordinary shells still
+                // receive real clicks; only drag gestures stay local.
+                replayTerminalClick(at: event.locationInWindow)
                 return
             }
         }
@@ -4565,7 +4571,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         )
     }
 
-    private func replayAgentClick(at locationInWindow: CGPoint) {
+    private func replayTerminalClick(at locationInWindow: CGPoint) {
         guard let window else { return }
         let timestamp = ProcessInfo.processInfo.systemUptime
         guard let down = NSEvent.mouseEvent(
