@@ -2040,6 +2040,26 @@ func remoteViewportPredictionUsesBackingPixels() {
     ) == nil)
 }
 
+@Test("Pointer geometry follows a retained terminal surface during resize")
+func terminalPointerGeometryRemapsScaledSurface() {
+    let point = TerminalPointerGeometry.remappedPoint(
+        CGPoint(x: 300, y: 100),
+        visibleSize: CGSize(width: 600, height: 400),
+        surfaceSizePixels: CGSize(width: 800, height: 600),
+        backingScaleFactor: 2
+    )
+    #expect(abs(point.x - 200) < 0.001)
+    #expect(abs(point.y - 175) < 0.001)
+
+    let unchanged = TerminalPointerGeometry.remappedPoint(
+        CGPoint(x: 300, y: 100),
+        visibleSize: CGSize(width: 600, height: 400),
+        surfaceSizePixels: CGSize(width: 1_200, height: 800),
+        backingScaleFactor: 2
+    )
+    #expect(unchanged == CGPoint(x: 300, y: 100))
+}
+
 @Test("Split geometry never forwards invalid transition sizes to AppKit")
 func splitGeometrySanitizesInvalidTransitionSizes() {
     let negative = RelaySplitGeometry(

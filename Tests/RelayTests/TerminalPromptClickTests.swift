@@ -898,6 +898,73 @@ func relayRemoteShellTranscriptSelectionCopiesLocally() async throws {
     // the host-managed session. Mouse reports are likewise suppressed for the
     // drag by Relay's native-selection override.
     #expect(recorder.data.isEmpty)
+
+    // Relay keeps the previous IOSurface visible while a remote resize waits
+    // for its destination-sized PTY frame. Reproduce that retained-grid
+    // interval: the visible text is scaled to half size, while Ghostty still
+    // hit-tests the original grid. A drag over the scaled probe must select
+    // the same text rather than cells at the unscaled pointer coordinates.
+    let retainedSize = view.bounds.size
+    view.setResizeSynchronizationSuspended(true)
+    defer { view.setResizeSynchronizationSuspended(false) }
+    window.setContentSize(NSSize(
+        width: retainedSize.width / 2,
+        height: retainedSize.height / 2
+    ))
+    view.layoutSubtreeIfNeeded()
+    let xScale = view.bounds.width / retainedSize.width
+    let yScale = view.bounds.height / retainedSize.height
+    let scaledStartWindow = view.convert(
+        NSPoint(x: startLocal.x * xScale, y: startLocal.y * yScale),
+        to: nil
+    )
+    let scaledEndWindow = view.convert(
+        NSPoint(x: endLocal.x * xScale, y: endLocal.y * yScale),
+        to: nil
+    )
+    guard let scaledDown = NSEvent.mouseEvent(
+        with: .leftMouseDown,
+        location: scaledStartWindow,
+        modifierFlags: [],
+        timestamp: now + 0.10,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 5,
+        clickCount: 1,
+        pressure: 1
+    ), let scaledDrag = NSEvent.mouseEvent(
+        with: .leftMouseDragged,
+        location: scaledEndWindow,
+        modifierFlags: [],
+        timestamp: now + 0.11,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 5,
+        clickCount: 1,
+        pressure: 1
+    ), let scaledUp = NSEvent.mouseEvent(
+        with: .leftMouseUp,
+        location: scaledEndWindow,
+        modifierFlags: [],
+        timestamp: now + 0.12,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 5,
+        clickCount: 1,
+        pressure: 0
+    ) else {
+        Issue.record("AppKit could not construct retained-grid selection events")
+        return
+    }
+    view.mouseDown(with: scaledDown)
+    view.mouseDragged(with: scaledDrag)
+    view.mouseUp(with: scaledUp)
+    try await Task.sleep(for: .milliseconds(30))
+    pasteboard.clearContents()
+    #expect(view.performKeyEquivalent(with: copy))
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(pasteboard.string(forType: .string) == probe)
+    #expect(recorder.data.isEmpty)
 }
 
 @MainActor

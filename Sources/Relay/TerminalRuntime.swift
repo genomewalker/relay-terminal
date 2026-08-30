@@ -287,6 +287,56 @@ enum TerminalViewportGeometry {
     }
 }
 
+enum TerminalPointerGeometry {
+    /// While Relay atomically resizes an SSH pane, Ghostty deliberately keeps
+    /// the previous IOSurface visible until the destination PTY frame is
+    /// complete. Core Animation scales that retained surface to the new view
+    /// bounds, but Ghostty's selection grid still has the retained surface's
+    /// pixel dimensions. Translate the visible pointer back into that grid so
+    /// the selected cells remain under the pointer throughout the handoff.
+    static func remappedPoint(
+        _ point: CGPoint,
+        visibleSize: CGSize,
+        surfaceSizePixels: CGSize,
+        backingScaleFactor: CGFloat
+    ) -> CGPoint {
+        guard point.x.isFinite, point.y.isFinite,
+              visibleSize.width.isFinite, visibleSize.height.isFinite,
+              visibleSize.width > 0, visibleSize.height > 0,
+              surfaceSizePixels.width.isFinite, surfaceSizePixels.height.isFinite,
+              surfaceSizePixels.width > 0, surfaceSizePixels.height > 0,
+              backingScaleFactor.isFinite, backingScaleFactor > 0
+        else { return point }
+
+        let surfaceSize = CGSize(
+            width: surfaceSizePixels.width / backingScaleFactor,
+            height: surfaceSizePixels.height / backingScaleFactor
+        )
+        guard abs(surfaceSize.width - visibleSize.width) >= 0.5 ||
+                abs(surfaceSize.height - visibleSize.height) >= 0.5
+        else { return point }
+
+        let surfaceX = min(
+            max(point.x * surfaceSize.width / visibleSize.width, 0),
+            surfaceSize.width
+        )
+        // AppKit locations are bottom-origin while Ghostty flips them against
+        // the *current* view height. Preserve that final flip by mapping the
+        // top-origin distance and expressing it back in the current view's
+        // coordinate system; a retained surface taller than the view can
+        // therefore legitimately produce a negative AppKit y coordinate.
+        let visibleTop = visibleSize.height - point.y
+        let surfaceTop = min(
+            max(visibleTop * surfaceSize.height / visibleSize.height, 0),
+            surfaceSize.height
+        )
+        return CGPoint(
+            x: surfaceX,
+            y: visibleSize.height - surfaceTop
+        )
+    }
+}
+
 enum TerminalGeometry {
     /// SwiftUI can briefly propose invalid NSView dimensions while replacing
     /// one tab tree with another. Reject those values rather than clamping to
@@ -1333,6 +1383,16 @@ final class TerminalRuntime: NSObject {
               cellSize.width > 0, cellSize.height > 0
         else { return nil }
         return (cellSize, Int(metrics.columns))
+    }
+
+    fileprivate func terminalRenderedSurfaceSizePixels() -> CGSize? {
+        guard let metrics = latestSurfaceGridMetrics,
+              metrics.widthPixels > 0, metrics.heightPixels > 0
+        else { return nil }
+        return CGSize(
+            width: CGFloat(metrics.widthPixels),
+            height: CGFloat(metrics.heightPixels)
+        )
     }
 
     fileprivate var promptCursorPlacementAllowed: Bool {
@@ -4216,8 +4276,25 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     private func terminalPoint(for event: NSEvent) -> CGPoint {
-        let point = convert(event.locationInWindow, from: nil)
+        let point = convert(
+            selectionAdjustedWindowLocation(event.locationInWindow),
+            from: nil
+        )
         return CGPoint(x: point.x, y: bounds.height - point.y)
+    }
+
+    private func selectionAdjustedWindowLocation(_ locationInWindow: CGPoint) -> CGPoint {
+        guard let window,
+              let surfaceSizePixels = owner?.terminalRenderedSurfaceSizePixels()
+        else { return locationInWindow }
+        let local = convert(locationInWindow, from: nil)
+        let remapped = TerminalPointerGeometry.remappedPoint(
+            local,
+            visibleSize: bounds.size,
+            surfaceSizePixels: surfaceSizePixels,
+            backingScaleFactor: window.backingScaleFactor
+        )
+        return convert(remapped, to: nil)
     }
 
     private func selectionIsNearActivePrompt(start: CGPoint, end: CGPoint) -> Bool {
@@ -4395,7 +4472,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
 
     private func cursorMovementOffset(to locationInWindow: CGPoint) -> Int? {
         guard let geometry = activeCursorGeometry() else { return nil }
-        let local = convert(locationInWindow, from: nil)
+        let local = convert(selectionAdjustedWindowLocation(locationInWindow), from: nil)
         let target = CGPoint(x: local.x, y: bounds.height - local.y)
         guard let visualOffset = TerminalPromptSelectionEdit.cursorMovementOffset(
             cursorOrigin: geometry.origin,
@@ -4470,7 +4547,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     private func terminalPointForWindowLocation(_ locationInWindow: CGPoint) -> CGPoint {
-        let local = convert(locationInWindow, from: nil)
+        let local = convert(selectionAdjustedWindowLocation(locationInWindow), from: nil)
         return CGPoint(x: local.x, y: bounds.height - local.y)
     }
 
@@ -4560,7 +4637,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     ) -> NSEvent? {
         NSEvent.mouseEvent(
             with: event.type,
-            location: event.locationInWindow,
+            location: selectionAdjustedWindowLocation(event.locationInWindow),
             modifierFlags: event.modifierFlags.union(.shift),
             timestamp: event.timestamp,
             windowNumber: event.windowNumber,
