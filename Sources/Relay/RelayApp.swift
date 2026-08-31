@@ -42,6 +42,12 @@ enum RelayApplicationActivityState {
     private static var applicationIsVisible = true
     private static var userSessionIsActive = true
 
+    // Nonisolated mirror for background monitors (e.g. the responsiveness
+    // ping on a utility queue) that cannot touch the main-actor state. Only
+    // update() writes it; a one-tick-stale read is harmless.
+    nonisolated(unsafe) private static var continuousUpdatesMirror = true
+    nonisolated static var continuousUpdatesSnapshot: Bool { continuousUpdatesMirror }
+
     static func setApplicationVisible(_ visible: Bool) {
         applicationIsVisible = visible
         update()
@@ -56,6 +62,7 @@ enum RelayApplicationActivityState {
         let allowed = applicationIsVisible && userSessionIsActive
         guard allowsContinuousUpdates != allowed else { return }
         allowsContinuousUpdates = allowed
+        continuousUpdatesMirror = allowed
         NotificationCenter.default.post(name: .relayApplicationActivityChanged, object: allowed)
     }
 }
@@ -75,6 +82,11 @@ enum RelayQuitConfirmationPolicy {
 
 @MainActor
 final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
+    // Closing the workspace window tears down the WorkspaceView subscription
+    // that would otherwise run shutdown() on willTerminate, so the delegate
+    // holds a reference and runs it here as a reliable backstop. shutdown()
+    // is idempotent, so the surviving onReceive path is harmless.
+    weak var workspace: WorkspaceModel?
     private var keyboardMonitor: Any?
     private var quitArmedAt: UInt64?
     private var quitConfirmationTimer: Timer?
@@ -240,6 +252,9 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Persist layout and tear down transports/children even when the last
+        // window closed first (the SwiftUI subscription is already gone).
+        workspace?.shutdown()
         responsivenessMonitor.stop()
         presentationSuspensionTask?.cancel()
         presentationSuspensionTask = nil
@@ -465,6 +480,7 @@ struct RelayApp: App {
                 )) { _ in
                     workspace.shutdown()
                 }
+                .onAppear { applicationDelegate.workspace = workspace }
         }
         .defaultSize(width: 1320, height: 820)
         .windowStyle(.hiddenTitleBar)

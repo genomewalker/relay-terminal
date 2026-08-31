@@ -202,6 +202,22 @@ enum RelayKeyBindingStorage {
         overrides[command.rawValue] ?? command.defaultBinding
     }
 
+    /// System chords Relay itself intercepts before its remappable commands:
+    /// the app-delegate quit monitor and the pasteboard/undo CommandGroups.
+    /// Recording one of these silently shadows the user's command, so the
+    /// recorder must warn instead of saving a binding that never fires.
+    static func reservedConflictName(for candidate: RelayKeyBinding) -> String? {
+        let reserved: [(RelayKeyBinding, String)] = [
+            (RelayKeyBinding("q", command: true), "Quit Relay"),
+            (RelayKeyBinding("c", command: true), "Copy"),
+            (RelayKeyBinding("v", command: true), "Paste"),
+            (RelayKeyBinding("a", command: true), "Select All"),
+            (RelayKeyBinding("z", command: true), "Undo"),
+            (RelayKeyBinding("z", command: true, shift: true), "Redo"),
+        ]
+        return reserved.first { $0.0 == candidate }?.1
+    }
+
     static func conflict(
         for candidate: RelayKeyBinding,
         command: RelayCommand,

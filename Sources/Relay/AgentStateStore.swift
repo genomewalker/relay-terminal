@@ -41,7 +41,19 @@ final class AgentStateStore: @unchecked Sendable {
         guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
               size > 0, size <= 4 << 20,
               let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
-        return try? JSONDecoder.relayState.decode(PersistedAgentPaneState.self, from: data)
+        do {
+            return try JSONDecoder.relayState.decode(PersistedAgentPaneState.self, from: data)
+        } catch {
+            // A schema drift / downgrade silently discarded the durable event
+            // cursor, so the pane replayed the whole agent stream from zero
+            // with no way to tell it from a genuinely fresh pane. Leave a
+            // breadcrumb; the caller still falls back to a fresh cursor.
+            RelayDiagnostics.shared.record(category: "agent-state", name: "decode-failed", details: [
+                "pane_id": paneID.uuidString.lowercased(),
+                "bytes": String(size),
+            ])
+            return nil
+        }
     }
 
     func save(_ state: PersistedAgentPaneState, paneID: UUID) {

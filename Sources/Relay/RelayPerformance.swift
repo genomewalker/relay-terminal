@@ -175,6 +175,11 @@ final class RelayResponsivenessMonitor: @unchecked Sendable {
     }
 
     private func ping() {
+        // Skip while Relay is hidden/occluded: the main queue is legitimately
+        // idle, and macOS App Nap throttles timers so the round-trip inflates
+        // past the stall threshold, logging main-thread stalls that never
+        // affected any visible UI.
+        guard RelayApplicationActivityState.continuousUpdatesSnapshot else { return }
         let startedAt = DispatchTime.now().uptimeNanoseconds
         lock.lock()
         guard running, pendingStartedAt == nil else { lock.unlock(); return }

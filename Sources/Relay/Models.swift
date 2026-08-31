@@ -431,9 +431,15 @@ struct AgentSignalDetector: Sendable {
         let lower = (scanBoundary + text).lowercased()
 
         if detectAgentKind {
-            if lower.contains("claude code") || lower.contains("claude.ai/code") || lower.contains("anthropic") {
+            // Require a real agent banner. The bare word "anthropic" matched
+            // ordinary shell output (grep anthropic, package.json, a path
+            // under node_modules), flipping a plain shell to .claude — after
+            // which forcesLocalSelection stayed true and click-to-place
+            // synthesized arrow keys into bash. There is no raw-output path
+            // back to .shell, so the match must be specific.
+            if lower.contains("claude code") || lower.contains("claude.ai/code") {
                 kind = .claude
-            } else if lower.contains("openai codex") || lower.contains("codex cli") || lower.contains("codex>") {
+            } else if lower.contains("openai codex") || lower.contains("codex cli") {
                 kind = .codex
             }
         }

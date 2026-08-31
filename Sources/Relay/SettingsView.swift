@@ -344,7 +344,10 @@ private struct RelayKeyBindingsView: View {
                 .help("Restore default")
             }
             RelayShortcutRecorderButton(binding: preferences.keyBinding(for: command)) { candidate in
-                if let conflict = preferences.setKeyBinding(candidate, for: command) {
+                if let reserved = RelayKeyBindingStorage.reservedConflictName(for: candidate) {
+                    conflictMessage = "\(candidate.displayName) is reserved by macOS/Relay for \(reserved)."
+                    NSSound.beep()
+                } else if let conflict = preferences.setKeyBinding(candidate, for: command) {
                     conflictMessage = "\(candidate.displayName) is already assigned to \(conflict.label)."
                     NSSound.beep()
                 } else {

@@ -2890,3 +2890,27 @@ func utf8TailTruncationAlignment() {
     // A budget smaller than one scalar yields an empty tail, not garbage.
     #expect(UTF8TailTruncation.tail("汉", maximumUTF8Bytes: 2) == "")
 }
+
+@Test("Agent kind detection requires a real banner, not the bare word anthropic")
+func agentKindDetectionSpecificity() {
+    var shellNoise = AgentSignalDetector()
+    shellNoise.ingest("$ grep -r anthropic package.json\nnode_modules/@anthropic-ai/sdk")
+    #expect(shellNoise.kind == .shell)
+
+    var claude = AgentSignalDetector()
+    claude.ingest("Welcome to Claude Code! Type your request.")
+    #expect(claude.kind == .claude)
+
+    var codex = AgentSignalDetector()
+    codex.ingest("OpenAI Codex CLI v1.2\n")
+    #expect(codex.kind == .codex)
+}
+
+@Test("Reserved system chords are rejected by the shortcut recorder")
+func reservedShortcutRejection() {
+    #expect(RelayKeyBindingStorage.reservedConflictName(for: RelayKeyBinding("q", command: true)) == "Quit Relay")
+    #expect(RelayKeyBindingStorage.reservedConflictName(for: RelayKeyBinding("c", command: true)) == "Copy")
+    #expect(RelayKeyBindingStorage.reservedConflictName(for: RelayKeyBinding("z", command: true, shift: true)) == "Redo")
+    // A non-reserved chord returns nil so ordinary bindings still record.
+    #expect(RelayKeyBindingStorage.reservedConflictName(for: RelayKeyBinding("k", command: true, shift: true)) == nil)
+}
