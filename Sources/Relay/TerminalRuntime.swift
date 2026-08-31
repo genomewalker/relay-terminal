@@ -57,6 +57,27 @@ enum TerminalPromptSelectionEdit {
         return String(repeating: "\u{007F}", count: count)
     }
 
+    /// Whether a drag selection ran right-to-left / bottom-to-top, i.e. the
+    /// logical end of the selected range is the drag's START point. Compared
+    /// in cell rows, not raw pixels: a same-row trackpad drag routinely
+    /// drifts more vertically than the old 4-point band allowed, and a
+    /// misclassification anchors the synthesized backspaces at the wrong end
+    /// of the selection, deleting text outside it.
+    static func selectionIsBackwards(
+        start: CGPoint,
+        end: CGPoint,
+        rowHeight: CGFloat
+    ) -> Bool {
+        guard rowHeight.isFinite, rowHeight > 0,
+              start.y.isFinite, end.y.isFinite else {
+            return end.y < start.y - 4 || (abs(end.y - start.y) <= 4 && end.x < start.x)
+        }
+        let startRow = floor(start.y / rowHeight)
+        let endRow = floor(end.y / rowHeight)
+        if endRow != startRow { return endRow < startRow }
+        return end.x < start.x
+    }
+
     static func selectionIsNearCursor(
         startY: CGFloat,
         endY: CGFloat,
@@ -2024,18 +2045,7 @@ private final class TerminalActivityCoalescer: @unchecked Sendable {
         pendingText.append(text)
         pendingBytes += text.utf8.count
         if pendingBytes > Self.maximumCharacters {
-            // Align the byte-budget cut to a character boundary: a raw UTF-8
-            // suffix can start mid-scalar and decode the head of the retained
-            // sample as U+FFFD garbage (CJK text, emoji).
-            var cut = pendingText.utf8.index(pendingText.utf8.endIndex, offsetBy: -Self.maximumCharacters)
-            while cut != pendingText.utf8.endIndex, String.Index(cut, within: pendingText) == nil {
-                cut = pendingText.utf8.index(after: cut)
-            }
-            if let aligned = String.Index(cut, within: pendingText) {
-                pendingText = String(pendingText[aligned...])
-            } else {
-                pendingText.removeAll(keepingCapacity: true)
-            }
+            pendingText = UTF8TailTruncation.tail(pendingText, maximumUTF8Bytes: Self.maximumCharacters)
             pendingBytes = pendingText.utf8.count
         }
         guard !deliveryScheduled else {
@@ -4278,7 +4288,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
               let text = NSPasteboard.general.string(forType: .string),
               TerminalPromptSelectionEdit.deletionSequence(for: text, backwards: true) != nil
         else { return }
-        let backwards = end.y < start.y - 4 || (abs(end.y - start.y) <= 4 && end.x < start.x)
+        let backwards = TerminalPromptSelectionEdit.selectionIsBackwards(
+            start: start,
+            end: end,
+            rowHeight: activeCursorGeometry()?.cellSize.height ?? 0
+        )
         let deletionAnchor = backwards ? start : end
         guard let movementOffset = cursorMovementOffset(toTerminalPoint: deletionAnchor) else { return }
         promptSelection = PromptSelection(

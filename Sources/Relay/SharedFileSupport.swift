@@ -21,3 +21,18 @@ enum SecureFiles {
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 }
+
+/// Byte-budgeted suffix of a string, aligned to a character boundary so the
+/// retained tail never starts mid-scalar and decodes as U+FFFD garbage.
+enum UTF8TailTruncation {
+    static func tail(_ text: String, maximumUTF8Bytes: Int) -> String {
+        guard maximumUTF8Bytes > 0 else { return "" }
+        guard text.utf8.count > maximumUTF8Bytes else { return text }
+        var cut = text.utf8.index(text.utf8.endIndex, offsetBy: -maximumUTF8Bytes)
+        while cut != text.utf8.endIndex, String.Index(cut, within: text) == nil {
+            cut = text.utf8.index(after: cut)
+        }
+        guard let aligned = String.Index(cut, within: text) else { return "" }
+        return String(text[aligned...])
+    }
+}

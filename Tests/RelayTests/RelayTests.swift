@@ -2839,3 +2839,54 @@ func relayTerminfoInstallation() throws {
     )
     #expect(fallback.activeTerm == "xterm-256color")
 }
+
+@Test("Backwards selection detection uses cell rows, not a 4-point pixel band")
+func selectionBackwardsClassification() {
+    let rowHeight: CGFloat = 17
+    // Forward same-row drag drifting 6pt upward stays forward.
+    #expect(!TerminalPromptSelectionEdit.selectionIsBackwards(
+        start: CGPoint(x: 40, y: 100), end: CGPoint(x: 180, y: 94), rowHeight: rowHeight
+    ))
+    // Right-to-left same-row drag drifting 6pt downward is backwards.
+    #expect(TerminalPromptSelectionEdit.selectionIsBackwards(
+        start: CGPoint(x: 180, y: 94), end: CGPoint(x: 40, y: 100), rowHeight: rowHeight
+    ))
+    // A drag ending on an earlier row is backwards regardless of x.
+    #expect(TerminalPromptSelectionEdit.selectionIsBackwards(
+        start: CGPoint(x: 40, y: 100), end: CGPoint(x: 180, y: 60), rowHeight: rowHeight
+    ))
+    // A drag ending on a later row is forward regardless of x.
+    #expect(!TerminalPromptSelectionEdit.selectionIsBackwards(
+        start: CGPoint(x: 180, y: 60), end: CGPoint(x: 40, y: 100), rowHeight: rowHeight
+    ))
+    // Without a usable row height the legacy pixel heuristic still applies.
+    #expect(TerminalPromptSelectionEdit.selectionIsBackwards(
+        start: CGPoint(x: 180, y: 100), end: CGPoint(x: 40, y: 100), rowHeight: 0
+    ))
+}
+
+@Test("ssh_config Key=Value syntax is tokenized like whitespace-separated options")
+func sshConfigEqualsSyntax() {
+    let hosts = SSHConfigDiscovery.literalHosts(in: """
+    Host=alias
+    Host = beta
+    Host gamma
+    Host wild-*
+    """)
+    #expect(hosts == ["alias", "beta", "gamma"])
+}
+
+@Test("UTF-8 tail truncation never splits a scalar")
+func utf8TailTruncationAlignment() {
+    let text = String(repeating: "汉", count: 10) // 3 bytes each
+    // A 7-byte budget lands mid-scalar; the tail must round down to 2 chars.
+    let tail = UTF8TailTruncation.tail(text, maximumUTF8Bytes: 7)
+    #expect(tail == "汉汉")
+    #expect(!tail.unicodeScalars.contains("\u{FFFD}"))
+    // Exact boundary keeps 3 characters.
+    #expect(UTF8TailTruncation.tail(text, maximumUTF8Bytes: 9) == "汉汉汉")
+    // Under-budget input is returned unchanged.
+    #expect(UTF8TailTruncation.tail("abc", maximumUTF8Bytes: 16) == "abc")
+    // A budget smaller than one scalar yields an empty tail, not garbage.
+    #expect(UTF8TailTruncation.tail("汉", maximumUTF8Bytes: 2) == "")
+}

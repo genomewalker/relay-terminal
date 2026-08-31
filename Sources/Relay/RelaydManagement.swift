@@ -317,7 +317,7 @@ launcher_temporary=
 claude_shim_temporary=
 codex_shim_temporary=
 trap 'rm -f "$temporary" "$launcher_temporary" "$claude_shim_temporary" "$codex_shim_temporary"; rmdir "$lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
-temporary="$(mktemp "$payload_dir/.relayd-install-#(architecture).XXXXXX")"
+temporary="$(mktemp "$payload_dir/.relayd-install-\#(architecture).XXXXXX")"
 launcher_temporary="$(mktemp "$bin_dir/.relayd-launcher.XXXXXX")"
 cat > "$temporary"
 if command -v sha256sum >/dev/null 2>&1; then
@@ -328,12 +328,12 @@ else
     printf 'No SHA-256 utility is available on this host.\n' >&2
     exit 1
 fi
-if [ "$actual" != "#(expectedHash)" ]; then
+if [ "$actual" != "\#(expectedHash)" ]; then
     printf 'Uploaded relayd checksum did not match the signed application resource.\n' >&2
     exit 1
 fi
 chmod 700 "$temporary"
-mv -f "$temporary" "$payload_dir/relayd-linux-#(architecture)"
+mv -f "$temporary" "$payload_dir/relayd-linux-\#(architecture)"
 cat > "$launcher_temporary" <<'RELAY_LAUNCHER'
 #!/bin/sh
 set -eu
