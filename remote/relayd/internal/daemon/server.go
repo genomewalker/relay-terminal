@@ -105,11 +105,27 @@ func (server *Server) Serve(socketPath string) error {
 	// Startup-only retention avoids a polling goroutine and bounds cleanup
 	// work. Running panes are never eligible.
 	_, _ = server.CollectGarbage(30*24*time.Hour, false)
+	var acceptBackoff time.Duration
 	for {
 		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {
+			// A transient error (e.g. EMFILE under fd pressure) must not kill
+			// the whole supervisor and drop every attached client; back off
+			// and keep serving. Only a permanent error (closed listener) ends
+			// the loop.
+			var netErr net.Error
+			if errors.As(acceptErr, &netErr) && netErr.Temporary() {
+				if acceptBackoff == 0 {
+					acceptBackoff = 5 * time.Millisecond
+				} else if acceptBackoff < time.Second {
+					acceptBackoff *= 2
+				}
+				time.Sleep(acceptBackoff)
+				continue
+			}
 			return acceptErr
 		}
+		acceptBackoff = 0
 		if peerErr := RequirePeerUID(connection, os.Getuid()); peerErr != nil {
 			_ = connection.Close()
 			continue
@@ -644,7 +660,10 @@ func (server *Server) startWorker(hello protocol.HelloPayload, manifestPath stri
 	if err := child.Start(); err != nil {
 		return workerManifest{}, err
 	}
-	_ = child.Process.Release()
+	// Reap the worker when it exits so it does not linger as a zombie for the
+	// supervisor's (long) lifetime. Setsid already detached it into its own
+	// session, so waiting here does not affect its independence.
+	go func() { _ = child.Wait() }()
 	for attempt := 0; attempt < 120; attempt++ {
 		time.Sleep(25 * time.Millisecond)
 		manifest, loadErr := loadManifest(manifestPath)
