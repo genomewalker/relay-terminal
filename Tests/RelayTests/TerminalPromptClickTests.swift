@@ -550,6 +550,8 @@ func relayKeyboardSelectionDoesNotWaitForAgentLabel() async throws {
     view.fitToSize()
     #expect(window.makeFirstResponder(view))
     view.insertText("copy-me", replacementRange: NSRange(location: NSNotFound, length: 0))
+    session.receive("copy-me")
+    try await Task.sleep(for: .milliseconds(30))
 
     guard let selectLeft = NSEvent.keyEvent(
         with: .keyDown,
@@ -578,7 +580,79 @@ func relayKeyboardSelectionDoesNotWaitForAgentLabel() async throws {
         return
     }
 
-    for _ in 0..<7 { #expect(view.performKeyEquivalent(with: selectLeft)) }
+    let pasteboard = NSPasteboard.general
+    let previous = pasteboard.string(forType: .string)
+    defer {
+        pasteboard.clearContents()
+        if let previous { pasteboard.setString(previous, forType: .string) }
+    }
+    for _ in 0..<4 { #expect(view.performKeyEquivalent(with: selectLeft)) }
+    pasteboard.clearContents()
+    #expect(view.copySelectedTextToPasteboard())
+    #expect(pasteboard.string(forType: .string) == "y-me")
+    for _ in 0..<3 { #expect(view.performKeyEquivalent(with: selectLeft)) }
+    pasteboard.clearContents()
+    #expect(view.copySelectedTextToPasteboard())
+    #expect(pasteboard.string(forType: .string) == "copy-me")
+    pasteboard.clearContents()
+    #expect(view.performKeyEquivalent(with: copy))
+    #expect(pasteboard.string(forType: .string) == "copy-me")
+}
+
+@MainActor
+@Test("Keyboard prompt selection follows wrapped terminal rows")
+func relayKeyboardSelectionFollowsWrappedRows() async throws {
+    _ = NSApplication.shared
+    let recorder = TerminalInputRecorder()
+    let session = InMemoryTerminalSession(
+        write: { recorder.append($0) },
+        resize: { _ in }
+    )
+    let pane = PaneModel(profile: .local)
+    let view = pane.runtime.view
+    view.frame = NSRect(x: 0, y: 0, width: 160, height: 400)
+    view.configuration = TerminalSurfaceOptions(backend: .inMemory(session))
+
+    let window = NSWindow(
+        contentRect: view.frame,
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.contentView = view
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.orderOut(nil)
+        window.contentView = nil
+    }
+    view.fitToSize()
+    #expect(window.makeFirstResponder(view))
+    try await Task.sleep(for: .milliseconds(50))
+
+    let text = "0123456789abcdefghijklmnopqrstuvwxyzABCD"
+    view.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+    session.receive(text)
+    await Task.detached { session.waitForPendingOutput() }.value
+    view.synchronizeAndRedraw()
+    try await Task.sleep(for: .milliseconds(30))
+
+    guard let selectLeft = NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: .shift,
+        timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: window.windowNumber,
+        context: nil,
+        characters: String(UnicodeScalar(NSLeftArrowFunctionKey)!),
+        charactersIgnoringModifiers: String(UnicodeScalar(NSLeftArrowFunctionKey)!),
+        isARepeat: false,
+        keyCode: 123
+    ) else {
+        Issue.record("AppKit could not construct wrapped keyboard-selection events")
+        return
+    }
+
+    for _ in text { #expect(view.performKeyEquivalent(with: selectLeft)) }
     let pasteboard = NSPasteboard.general
     let previous = pasteboard.string(forType: .string)
     defer {
@@ -586,8 +660,8 @@ func relayKeyboardSelectionDoesNotWaitForAgentLabel() async throws {
         if let previous { pasteboard.setString(previous, forType: .string) }
     }
     pasteboard.clearContents()
-    #expect(view.performKeyEquivalent(with: copy))
-    #expect(pasteboard.string(forType: .string) == "copy-me")
+    #expect(view.copySelectedTextToPasteboard())
+    #expect(pasteboard.string(forType: .string) == text)
 }
 
 @MainActor

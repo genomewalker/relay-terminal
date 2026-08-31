@@ -155,6 +155,17 @@ enum RelayPaneAttachPolicy {
     }
 }
 
+enum TerminalViewportRepaintProbe {
+    static func dimensions(
+        columns: UInt16,
+        rows: UInt16
+    ) -> (columns: UInt16, rows: UInt16)? {
+        guard columns > 0, rows > 0 else { return nil }
+        if rows > 1 { return (columns, rows - 1) }
+        return (columns, rows + 1)
+    }
+}
+
 final class RelayRemoteTransport: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
@@ -171,6 +182,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var pendingInputs: [UInt64: Data] = [:]
     private var pendingInputBytes = 0
     private var inputOverflowed = false
+    private var attachRepaintPending = false
     private var attached = false
     private var supportsInputAcknowledgements = false
     private var supportsViewportCommits = false
@@ -185,10 +197,11 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var attachRetryScheduled = false
     private var diagnosticSessionID = "unknown"
     private var inputDiagnosticCount = 0
+    private var connectionContext: RelayConnectionContext?
 
     deinit {
         nodeChannel?.close()
-        process?.terminate()
+        if let process, process.processIdentifier != 0 { process.terminate() }
     }
 
     func setInitialViewport(_ viewport: RelayViewport) {
@@ -212,6 +225,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         paneTitle: String,
         contentKind: String,
         initialLastSequence: UInt64 = 0,
+        forceAttachRepaint: Bool = false,
         onOutput: @escaping @Sendable (Data, UInt64) -> Void,
         onStatus: @escaping @Sendable (RelayStatus) -> Void,
         onAgentEvent: @escaping @Sendable (Data) -> Void,
@@ -235,6 +249,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             observeAgentsOnly: observeAgentsOnly
         )
         lock.lock()
+        connectionContext = context
         diagnosticSessionID = sessionID
         inputDiagnosticCount = 0
         detached = false
@@ -245,6 +260,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         pendingInputs.removeAll(keepingCapacity: true)
         pendingInputBytes = 0
         inputOverflowed = false
+        attachRepaintPending = forceAttachRepaint
         attached = false
         supportsInputAcknowledgements = false
         supportsViewportCommits = false
@@ -309,6 +325,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
             "last_event_seq": resumeEventSequence,
             "client_id": inputClientID.uuidString.lowercased(),
         ]
+        lock.lock()
+        let repaintPending = attachRepaintPending
+        lock.unlock()
+        if repaintPending { hello["repaint_pulse"] = true }
         if context.observeAgentsOnly {
             hello["observe_events"] = true
         } else {
@@ -534,6 +554,15 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 "--last-event-seq", String(resumeEventSequence),
             ]
         } else {
+            lock.lock()
+            let repaintPending = attachRepaintPending
+            lock.unlock()
+            if repaintPending {
+                // Environment negotiation is backward compatible: older
+                // relayd binaries ignore it, while current supervisors turn it
+                // into a one-time pre-attach viewport pulse.
+                arguments += ["env", "RELAY_ATTACH_REPAINT=1"]
+            }
             arguments += [
                 "~/.local/bin/relayd", "attach",
                 "--session", context.sessionID,
@@ -576,11 +605,16 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
 
         lock.lock()
+        // Only start() may clear `detached`. Resetting it here would let a
+        // reconnect that races detach() resurrect a closed pane's transport.
+        guard !detached else {
+            lock.unlock()
+            return
+        }
         process = ssh
         writer = RelayWireWriter(input.fileHandleForWriting)
         supportsSupervisorViewportCommits = false
         supportsExactSupervisorViewportCommits = false
-        detached = false
         attached = false
         lock.unlock()
 
@@ -588,6 +622,17 @@ final class RelayRemoteTransport: @unchecked Sendable {
             try ssh.run()
         } catch {
             scheduleReconnect(context, failure: .diagnose(error.localizedDescription))
+            return
+        }
+
+        // detach() can land between the store above and run(); it skips
+        // terminating a not-yet-launched process, so finish that job here now
+        // that the process is running.
+        lock.lock()
+        let cancelled = detached || process !== ssh
+        lock.unlock()
+        if cancelled {
+            ssh.terminate()
             return
         }
 
@@ -614,11 +659,15 @@ final class RelayRemoteTransport: @unchecked Sendable {
                             self?.receiveOutput(frame.payload, context: context)
                         case .status:
                             if let decoded = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload) {
-                                if decoded.outputReset == true || decoded.eventReset == true {
-                                    self?.lock.lock()
-                                    if decoded.outputReset == true { self?.lastSequence = 0 }
-                                    if decoded.eventReset == true { self?.lastEventSequence = 0 }
-                                    self?.lock.unlock()
+                                // Hold self strongly across each lock/unlock
+                                // pair: optional-chained statements re-load
+                                // the weak reference independently, so the
+                                // lock could be deallocated while held.
+                                if decoded.outputReset == true || decoded.eventReset == true, let self {
+                                    self.lock.lock()
+                                    if decoded.outputReset == true { self.lastSequence = 0 }
+                                    if decoded.eventReset == true { self.lastEventSequence = 0 }
+                                    self.lock.unlock()
                                 }
                                 if decoded.state == "attached" { self?.didAttach(context: context, capabilities: decoded.capabilities ?? []) }
                                 if decoded.state == "exited" || decoded.state == "error" { self?.markSessionEnded() }
@@ -636,20 +685,21 @@ final class RelayRemoteTransport: @unchecked Sendable {
                             try self?.writer?.write(type: .pong)
                         case .agentEvent:
                             if let decoded = try? JSONDecoder().decode(EventWireEnvelope.self, from: frame.payload),
-                               let sequence = decoded.sequence {
-                                self?.lock.lock()
-                                self?.lastEventSequence = max(self?.lastEventSequence ?? 0, sequence)
-                                self?.lock.unlock()
+                               let sequence = decoded.sequence, let self {
+                                self.lock.lock()
+                                self.lastEventSequence = max(self.lastEventSequence, sequence)
+                                self.lock.unlock()
                             }
                             context.onAgentEvent(frame.payload)
                         case .inputAck:
-                            if let acknowledgement = RelayWireFrame.parseInputAck(frame.payload),
-                               acknowledgement.clientID == self?.inputClientID {
-                                self?.lock.lock()
-                                if let removed = self?.pendingInputs.removeValue(forKey: acknowledgement.sequence) {
-                                    self?.pendingInputBytes = max(0, (self?.pendingInputBytes ?? 0) - removed.count)
+                            if let self,
+                               let acknowledgement = RelayWireFrame.parseInputAck(frame.payload),
+                               acknowledgement.clientID == self.inputClientID {
+                                self.lock.lock()
+                                if let removed = self.pendingInputs.removeValue(forKey: acknowledgement.sequence) {
+                                    self.pendingInputBytes = max(0, self.pendingInputBytes - removed.count)
                                 }
-                                self?.lock.unlock()
+                                self.lock.unlock()
                             }
                         case .viewportAck:
                             self?.receiveViewportAck(frame.payload)
@@ -707,6 +757,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         reconnectAttempt = 0
         reconnectScheduled = false
         attached = true
+        attachRepaintPending = false
         attachRetryCount = 0
         attachRetryScheduled = false
         supportsInputAcknowledgements = capabilities.contains("input_ack_v1")
@@ -800,6 +851,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let diagnosticSessionID = self.diagnosticSessionID
         var inputSequence: UInt64?
         var processToRestart: Process?
+        var multiplexedRetryContext: RelayConnectionContext?
         if canSend && acknowledged && pendingInputBytes + data.count <= 64 << 10 {
             let sequence = RelayInputSequenceAllocator.shared.next()
             inputSequence = sequence
@@ -813,6 +865,11 @@ final class RelayRemoteTransport: @unchecked Sendable {
             }
             attached = false
             processToRestart = process
+            // On the multiplexed node channel there is no dedicated process
+            // to restart; reattach the pane instead, or the backlogged bytes
+            // would also be sent immediately below (duplicated input) and the
+            // pane's input would stall until an unrelated disconnect.
+            if processToRestart == nil { multiplexedRetryContext = connectionContext }
         } else if !canSend {
             if inputBacklog.count + data.count <= 64 << 10 {
                 inputBacklog.append(data)
@@ -836,6 +893,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
         processToRestart?.terminate()
         if processToRestart != nil { return }
+        if let multiplexedRetryContext {
+            scheduleMultiplexedRetry(multiplexedRetryContext, waitingForInputLease: false)
+            return
+        }
         guard canSend, let writer else { return }
         if let inputSequence {
             writer.writeAsync(
@@ -879,17 +940,21 @@ final class RelayRemoteTransport: @unchecked Sendable {
             generation = nil
         }
         lock.unlock()
+        if compatibilityRepaintPulse,
+           let probe = TerminalViewportRepaintProbe.dimensions(
+               columns: columns,
+               rows: rows
+           ) {
+            // Codex and Claude retain a virtual diff grid. A direct large →
+            // small SIGWINCH can therefore contain only their prompt/status
+            // delta, which is not enough to replace the outgoing surface.
+            // Briefly request an adjacent grid before the acknowledged final
+            // commit. This invalidates the TUI's whole diff grid without
+            // restarting it and is the protocol equivalent of the resize that
+            // previously repaired the pane only after a manual zoom cycle.
+            writeResize(columns: probe.columns, rows: probe.rows, using: writer)
+        }
         if let generation {
-            if viewportChanged && compatibilityRepaintPulse &&
-                !supportsExactViewportCommits &&
-                !supportsExactSupervisorViewportCommits {
-                // v1 peers signalled twice when a commit itself changed the
-                // grid. Apply the new size once with the ordinary frame, then
-                // request an acknowledged repaint at that now-unchanged size.
-                // Agent primary-screen TUIs need this complete repaint to
-                // replace background cells from the outgoing grid.
-                writeResize(columns: columns, rows: rows, using: writer)
-            }
             writer?.writeAsync(
                 type: .viewportCommit,
                 payload: RelayWireFrame.viewportCommitPayload(
@@ -901,8 +966,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             return generation
         }
         // A pre-viewport_commit worker understands only the original resize
-        // frame. Send the final grid once; rapid probe/final pairs can make a
-        // TUI clear for the probe and coalesce away its useful final repaint.
+        // frame. The ordinary frame completes the adjacent probe above.
         writeResize(columns: columns, rows: rows, using: writer)
         return nil
     }
@@ -955,13 +1019,19 @@ final class RelayRemoteTransport: @unchecked Sendable {
         lock.lock()
         detached = true
         attached = false
+        let writer = self.writer
+        let channel = nodeChannel
+        let ssh = process
+        nodeChannel = nil
+        process = nil
+        self.writer = nil
         lock.unlock()
         try? writer?.write(type: .detach)
-        nodeChannel?.close()
-        nodeChannel = nil
-        process?.terminate()
-        process = nil
-        writer = nil
+        channel?.close()
+        // terminate() on a stored-but-never-launched Process raises an
+        // uncatchable NSInvalidArgumentException; connect() re-checks
+        // `detached` after run() and finishes the termination for us.
+        if let ssh, ssh.processIdentifier != 0 { ssh.terminate() }
     }
 }
 
@@ -1054,7 +1124,7 @@ struct StatusWirePayload: Decodable {
     }
 }
 
-private struct EventWireEnvelope: Decodable {
+struct EventWireEnvelope: Decodable {
     let sequence: UInt64?
 
     enum CodingKeys: String, CodingKey {

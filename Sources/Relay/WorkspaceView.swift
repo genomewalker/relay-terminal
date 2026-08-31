@@ -56,6 +56,10 @@ struct WorkspaceView: View {
                     showTerminal: { workspace.revealPane(selection.paneID) },
                     close: workspace.closeAgentInspector
                 )
+                // Recreate the panel when the inspected agent changes: its
+                // snapshot lives in @State, so without a new identity the
+                // previous agent's content lingers until the pane publishes.
+                .id(selection)
                 .padding(.top, workspace.isFullScreen ? 50 : 58)
                 .padding(.trailing, 18)
                 .zIndex(500)
@@ -241,11 +245,15 @@ struct WorkspaceView: View {
             showingRelaydManager = true
         }
         .onChange(of: workspace.recentlyClosedPaneCount) { _, count in
+            // Only dismissal lives here; showing is driven by paneCloseEvent
+            // so that Undo (count decreasing) never re-shows the notice and
+            // the 21st close (count saturated at 20) still shows it.
+            guard count == 0 else { return }
             paneCloseNoticeTask?.cancel()
-            guard count > 0 else {
-                showingPaneCloseNotice = false
-                return
-            }
+            showingPaneCloseNotice = false
+        }
+        .onChange(of: workspace.paneCloseEvent) { _, _ in
+            paneCloseNoticeTask?.cancel()
             let show = { showingPaneCloseNotice = true }
             if reduceMotion { show() } else { withAnimation(.easeOut(duration: 0.16), show) }
             paneCloseNoticeTask = Task { @MainActor in
@@ -347,7 +355,7 @@ private struct AgentIntelligencePanel: View {
     @State private var isDragging = false
 
     private var visibleItems: [AgentInboxItem] {
-        let byID = Dictionary(uniqueKeysWithValues: store.items.map { ($0.id, $0) })
+        let byID = Dictionary(store.items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         return search.visibleIDs.compactMap { byID[$0] }
     }
 
@@ -2974,8 +2982,21 @@ private struct PaneRearrangementDropDelegate: DropDelegate {
         guard let rearrange, let draggedID = PaneDragCoordinator.shared.paneID else {
             return false
         }
-        PaneDragCoordinator.shared.paneID = nil
-        rearrange(draggedID, placement)
+        // A cancelled pane drag leaves a stale paneID behind (onDrag has no
+        // cancellation callback), so an unrelated plain-text drag would
+        // otherwise rearrange the layout. Only rearrange when the dropped
+        // payload is the UUID token the pane-header drag provided.
+        guard let provider = info.itemProviders(for: [UTType.utf8PlainText]).first else {
+            return false
+        }
+        _ = provider.loadObject(ofClass: NSString.self) { object, _ in
+            let string = (object as? NSString).map(String.init)
+            Task { @MainActor in
+                PaneDragCoordinator.shared.paneID = nil
+                guard let string, UUID(uuidString: string) == draggedID else { return }
+                rearrange(draggedID, placement)
+            }
+        }
         return true
     }
 

@@ -337,7 +337,11 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
                         input: Data(content.utf8)
                     )
                 }.value
-                guard let self, self.generation == currentGeneration else { return }
+                // The generation only changes in startIfNeeded/stop, so also
+                // require the path to still match: a save of file A racing an
+                // open of file B must not stamp B with A's mtime and content.
+                guard let self, self.generation == currentGeneration,
+                      self.currentPath == path else { return }
                 self.currentModificationNS = document.modificationNS
                 self.savedContent = content
                 self.isDirty = false
@@ -345,7 +349,8 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
                 self.status = "Saved"
                 _ = try? await self.webView.evaluateJavaScript("window.relayMarkSaved && window.relayMarkSaved()")
             } catch {
-                guard let self, self.generation == currentGeneration else { return }
+                guard let self, self.generation == currentGeneration,
+                      self.currentPath == path else { return }
                 self.isBusy = false
                 self.operationError = error.localizedDescription
                 self.status = "Save failed"
@@ -450,7 +455,12 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
     ) throws -> T {
         let ssh = Process()
         ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        var arguments = ["-T", "-o", "ControlMaster=no", "-o", "ControlPath=~/.ssh/relay-%C"]
+        // BatchMode keeps a fresh connection (expired control master) from
+        // stalling on an interactive auth prompt until the capture timeout.
+        var arguments = [
+            "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "ControlMaster=no", "-o", "ControlPath=~/.ssh/relay-%C",
+        ]
         arguments += profile.sshConnectionArguments
         arguments += ["~/.local/bin/relayd"] + commandArguments
         ssh.arguments = arguments

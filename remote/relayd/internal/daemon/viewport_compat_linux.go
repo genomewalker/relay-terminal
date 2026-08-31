@@ -8,9 +8,45 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
+
+// pulseLegacyWorkerViewport forces a full primary-screen TUI repaint for a
+// worker created before attach_repaint_v1. A same-size SIGWINCH is often
+// optimized into cursor-only output by Codex/Claude; a brief one-row probe and
+// return invalidates their complete diff grid while leaving the process alive.
+func pulseLegacyWorkerViewport(manifest workerManifest, cols, rows uint16) error {
+	if cols == 0 || rows == 0 {
+		return fmt.Errorf("invalid repaint viewport %dx%d", cols, rows)
+	}
+	if err := validateWorkerIdentity(manifest); err != nil {
+		return err
+	}
+	terminal, err := os.OpenFile(
+		fmt.Sprintf("/proc/%d/fd/0", manifest.ShellPID),
+		os.O_RDWR|syscall.O_NOCTTY,
+		0,
+	)
+	if err != nil {
+		return err
+	}
+	defer terminal.Close()
+	steps := attachResizeSteps(cols, rows, cols, rows, true)
+	for index, step := range steps {
+		if err := pty.Setsize(terminal, &pty.Winsize{Cols: step.cols, Rows: step.rows}); err != nil {
+			return err
+		}
+		if index+1 < len(steps) {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	// Let the worker's PTY reader append the final redraw before attach takes
+	// its cursor snapshot. This runs once only for a non-renderable checkpoint.
+	time.Sleep(40 * time.Millisecond)
+	return nil
+}
 
 // commitLegacyWorkerViewport applies an atomic final grid to a durable worker
 // that predates viewport_commit_v1. The supervisor validates the recorded

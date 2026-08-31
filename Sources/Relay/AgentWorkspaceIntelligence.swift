@@ -161,8 +161,7 @@ final class AgentIntelligenceStore: ObservableObject {
         self.persistenceEnabled = persistenceEnabled ?? !Self.isRunningTests
         if self.persistenceEnabled {
             let directory = self.fileURL.deletingLastPathComponent()
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            SecureFiles.createPrivateDirectory(at: directory)
             load()
         }
     }
@@ -231,16 +230,16 @@ final class AgentIntelligenceStore: ObservableObject {
               summaryTasks.count < maximumPendingSummaries else { return }
         summaryTasks[item.id]?.cancel()
         summaryTasks[item.id] = Task { [weak self] in
+            // A cancelled task must never clear the slot: the replacement
+            // task that cancelled it owns summaryTasks[item.id] now, and
+            // removing it would let untracked summaries run concurrently
+            // and undercount the maximumPendingSummaries throttle.
             do {
                 try await Task.sleep(for: .milliseconds(900))
             } catch {
-                self?.summaryTasks[item.id] = nil
                 return
             }
-            guard !Task.isCancelled else {
-                self?.summaryTasks[item.id] = nil
-                return
-            }
+            guard !Task.isCancelled else { return }
             guard RelayPreferences.shared.intelligenceEnabled,
                   RelayPreferences.shared.automaticAgentSummaries else {
                 self?.summaryTasks[item.id] = nil
@@ -248,8 +247,9 @@ final class AgentIntelligenceStore: ObservableObject {
             }
             let summary = await AgentWorkspaceIntelligenceService.shared.summarize(item)
             guard let self else { return }
+            guard !Task.isCancelled else { return }
             self.summaryTasks[item.id] = nil
-            guard !Task.isCancelled, let summary,
+            guard let summary,
                   let index = self.items.firstIndex(where: { $0.id == item.id }) else { return }
             self.items[index].title = summary.title
             self.items[index].detail = summary.detail
@@ -280,6 +280,11 @@ final class AgentIntelligenceStore: ObservableObject {
               let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
               let decoded = try? JSONDecoder.agentIntelligence.decode([AgentInboxItem].self, from: data) else { return }
         items = decoded.sorted { $0.occurredAt > $1.occurredAt }
+        // Rebuild the dedup set unconditionally: prune() only rebuilds it
+        // when it removed something, and a stale-empty set lets replayed
+        // events re-insert duplicate ids, which traps the Agent panel's
+        // Dictionary(uniqueKeysWithValues:).
+        itemIDs = Set(items.map(\.id))
         prune()
     }
 
@@ -324,7 +329,7 @@ final class AgentIntelligenceStore: ObservableObject {
                   data.count <= 8 << 20 else { return }
             do {
                 try data.write(to: url, options: .atomic)
-                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                SecureFiles.restrictToOwner(url)
             } catch {
                 RelayDiagnostics.shared.record(category: "intelligence", name: "inbox-write-failed", details: [
                     "reason": error.localizedDescription,

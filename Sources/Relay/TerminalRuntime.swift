@@ -138,6 +138,57 @@ enum TerminalPromptSelectionEdit {
     }
 }
 
+enum TerminalKeyboardSelectionGeometry {
+    static func anchor(
+        for cursor: CGPoint,
+        cellSize: CGSize,
+        columns: Int,
+        gridOriginX: CGFloat = 0
+    ) -> CGPoint? {
+        guard cursor.x.isFinite, cursor.y.isFinite,
+              cellSize.width.isFinite, cellSize.height.isFinite,
+              gridOriginX.isFinite,
+              cellSize.width > 0, cellSize.height > 0,
+              columns > 0
+        else { return nil }
+        let cursorColumn = Int(floor((cursor.x - gridOriginX) / cellSize.width))
+        guard cursorColumn >= 0, cursorColumn < columns else { return nil }
+        // Preserve Ghostty's exact caret x. The unused horizontal pixels are
+        // not guaranteed to be distributed symmetrically, so snapping the
+        // caret to a guessed centered grid shifts partial selections.
+        return cursor
+    }
+
+    /// Moves a terminal-cell center by a signed number of visual cells.
+    /// Unlike a raw x offset, this preserves the renderer's row/column grid
+    /// when a keyboard selection crosses either edge of a wrapped line.
+    static func endpoint(
+        from cursor: CGPoint,
+        visualCellDelta: Int,
+        cellSize: CGSize,
+        columns: Int,
+        gridOriginX: CGFloat = 0
+    ) -> CGPoint? {
+        guard cursor.x.isFinite, cursor.y.isFinite,
+              cellSize.width.isFinite, cellSize.height.isFinite,
+              gridOriginX.isFinite,
+              cellSize.width > 0, cellSize.height > 0,
+              columns > 0, abs(visualCellDelta) <= 4_096
+        else { return nil }
+
+        let cursorColumn = Int(floor((cursor.x - gridOriginX) / cellSize.width))
+        guard cursorColumn >= 0, cursorColumn < columns else { return nil }
+        let unwrappedColumn = cursorColumn + visualCellDelta
+        let rowDelta = Int(floor(Double(unwrappedColumn) / Double(columns)))
+        let endpointColumn = unwrappedColumn - rowDelta * columns
+        guard endpointColumn >= 0, endpointColumn < columns else { return nil }
+        return CGPoint(
+            x: cursor.x + CGFloat(endpointColumn - cursorColumn) * cellSize.width,
+            y: cursor.y + CGFloat(rowDelta) * cellSize.height
+        )
+    }
+}
+
 enum TerminalViewportRepaintPolicy {
     private struct Evidence {
         var addressedRows: [UInt16] = []
@@ -349,6 +400,28 @@ enum TerminalGeometry {
     }
 }
 
+struct TerminalStableGeometrySampler {
+    private(set) var candidate: CGSize?
+    private(set) var consecutiveSamples = 0
+
+    mutating func observe(_ size: CGSize) -> Bool {
+        guard TerminalGeometry.accepts(size) else {
+            candidate = nil
+            consecutiveSamples = 0
+            return false
+        }
+        if let candidate,
+           abs(candidate.width - size.width) < 0.5,
+           abs(candidate.height - size.height) < 0.5 {
+            consecutiveSamples += 1
+        } else {
+            candidate = size
+            consecutiveSamples = 1
+        }
+        return consecutiveSamples >= 2
+    }
+}
+
 enum TerminalBufferRetentionPolicy {
     static let retainedCapacityLimit = 512 << 10
 
@@ -358,6 +431,103 @@ enum TerminalBufferRetentionPolicy {
         } else {
             data.removeAll(keepingCapacity: true)
         }
+    }
+}
+
+enum TerminalReconnectReplayPolicy {
+    private static let presentationClear = Data("\u{001B}[2J\u{001B}[H".utf8)
+    private static let terminalReset = Data("\u{001B}c".utf8)
+    private static let eraseScrollback = Data("\u{001B}[3J".utf8)
+
+    static func isPresentationClear(_ data: Data, remoteSequence: UInt64) -> Bool {
+        remoteSequence == 0 && data == presentationClear
+    }
+
+    /// A replay gap invalidates the remote sequence cursor, not an
+    /// exact-viewport local screen. The bounded worker suffix is still useful
+    /// as a current-screen delta over that checkpoint. Dropping the checkpoint
+    /// here collapses a long Codex/Claude conversation to the latest prompt.
+    static func extendsCachedScreenAfterOutputReset(hasExactSnapshot: Bool) -> Bool {
+        hasExactSnapshot
+    }
+
+    /// relayd prefixes a replay that starts inside its bounded ring with RIS.
+    /// RIS and CSI 3J are correct for a renderer starting from nothing, but
+    /// when Relay has just reconstructed an exact checkpoint they also erase
+    /// its scrollback. Remove only a destructive *leading* replay prefix; later
+    /// application resets remain authoritative terminal output.
+    static func preservingCheckpointScrollback(_ replay: Data) -> Data {
+        var remainder = replay[...]
+        var removedPrefix = false
+        while true {
+            if remainder.starts(with: terminalReset) {
+                remainder = remainder.dropFirst(terminalReset.count)
+                removedPrefix = true
+                continue
+            }
+            if remainder.starts(with: eraseScrollback) {
+                remainder = remainder.dropFirst(eraseScrollback.count)
+                removedPrefix = true
+                continue
+            }
+            break
+        }
+        return removedPrefix ? Data(remainder) : replay
+    }
+}
+
+enum TerminalSnapshotDisplayPolicy {
+    /// A checkpoint made only of input-mode negotiation is useful for its
+    /// durable output cursor but cannot reconstruct a visible pane. Treat it
+    /// as a cache miss so Relay requests one authoritative same-size repaint
+    /// from Codex/Claude instead of presenting a blank terminal indefinitely.
+    static func hasVisibleContent(_ data: Data) -> Bool {
+        let bytes = Array(data)
+        var index = 0
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte == 0x1B, index + 1 < bytes.count {
+                switch bytes[index + 1] {
+                case 0x5B: // CSI
+                    index += 2
+                    while index < bytes.count, !(0x40...0x7E).contains(bytes[index]) {
+                        index += 1
+                    }
+                    index = min(index + 1, bytes.count)
+                    continue
+                case 0x5D, 0x50: // OSC / DCS
+                    // BEL terminates OSC only; a DCS payload is 8-bit clean
+                    // and may legitimately contain 0x07, so DCS ends on ST.
+                    let isOperatingSystemCommand = bytes[index + 1] == 0x5D
+                    index += 2
+                    while index < bytes.count {
+                        if isOperatingSystemCommand, bytes[index] == 0x07 {
+                            index += 1
+                            break
+                        }
+                        if bytes[index] == 0x1B,
+                           index + 1 < bytes.count,
+                           bytes[index + 1] == 0x5C {
+                            index += 2
+                            break
+                        }
+                        index += 1
+                    }
+                    continue
+                case 0x28, 0x29, 0x2A, 0x2B: // character-set designation
+                    index = min(index + 3, bytes.count)
+                    continue
+                default:
+                    index += 2
+                    continue
+                }
+            }
+            // Space, line breaks, tabs, and C0 controls do not make a blank
+            // checkpoint renderable. Any other ASCII glyph or UTF-8 byte does.
+            if byte >= 0x21, byte != 0x7F { return true }
+            index += 1
+        }
+        return false
     }
 }
 
@@ -483,6 +653,7 @@ final class TerminalRuntime: NSObject {
     private var presentationRecoveryTask: Task<Void, Never>?
     private var focusRecoveryTask: Task<Void, Never>?
     private var interactionPresentationTask: Task<Void, Never>?
+    private var nativeViewportRecoveryTask: Task<Void, Never>?
     private var viewportCommitFallbackTask: Task<Void, Never>?
     private var pendingViewportCommitGeneration: UInt64?
     private var pendingViewportCommitEpoch: UInt64?
@@ -523,10 +694,32 @@ final class TerminalRuntime: NSObject {
                 // render before removing Relay's restore cover. Window resizes
                 // and tab switches did this incidentally, which is why they
                 // appeared to "fix" a garbled reconnect.
-                self.view.layoutSubtreeIfNeeded()
-                self.view.fitToSize()
-                self.view.synchronizeAndRedraw()
-                self.commitStableViewport()
+                var sampler = TerminalStableGeometrySampler()
+                var settled = false
+                for delay in [0, 16, 32, 64, 120, 240] {
+                    if delay == 0 {
+                        await Task.yield()
+                    } else {
+                        try? await Task.sleep(for: .milliseconds(delay))
+                    }
+                    guard !Task.isCancelled else { return }
+                    self.view.superview?.layoutSubtreeIfNeeded()
+                    guard self.view.window != nil,
+                          sampler.observe(self.view.bounds.size),
+                          !self.explicitGeometryTransitionPending,
+                          self.pendingViewportCommitEpoch == nil else { continue }
+                    self.view.fitToSize()
+                    self.view.synchronizeAndRedraw()
+                    self.commitStableViewport()
+                    settled = true
+                    break
+                }
+                // A minimized/off-Space window can remain unmeasurable for the
+                // whole bounded wait. Do not fit transient geometry; the normal
+                // application-presentation recovery will fit it when visible.
+                if !settled {
+                    self.view.synchronizeAndRedraw()
+                }
                 // Ghostty applies a large replay over several render passes. Keep
                 // the overlay up until the viewport settles on the live screen.
                 for delay in [0, 32, 96] {
@@ -535,6 +728,7 @@ final class TerminalRuntime: NSObject {
                     }
                     _ = self.view.performBindingAction("scroll_to_bottom")
                     _ = self.view.scrollToRow(UInt.max)
+                    self.view.synchronizeAndRedraw()
                 }
                 self.pane?.finishTerminalRestore()
                 self.finishMeasuredRestore()
@@ -576,6 +770,7 @@ final class TerminalRuntime: NSObject {
         presentationRecoveryTask?.cancel()
         focusRecoveryTask?.cancel()
         interactionPresentationTask?.cancel()
+        nativeViewportRecoveryTask?.cancel()
         viewportCommitFallbackTask?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
@@ -598,6 +793,7 @@ final class TerminalRuntime: NSObject {
         io.beginReplay()
         let restoration = io.restoreSnapshot(paneID: pane.id)
         let restoredSequence = restoration?.remoteSequence
+        let forceAttachRepaint = restoration?.rendered == false
         initialAuthoritativeRepaintPending = restoration?.rendered == false
         if restoration?.rendered == true {
             // A snapshot may contain a partially composed command entered
@@ -619,6 +815,7 @@ final class TerminalRuntime: NSObject {
             paneTitle: pane.displayName,
             contentKind: pane.contentKind.rawValue,
             initialLastSequence: restoredSequence ?? 0,
+            forceAttachRepaint: forceAttachRepaint,
             onOutput: { [weak self] data, sequence in
                 autoreleasepool {
                     // Linkify the 4 ms display batch in TerminalIOBridge, not
@@ -996,6 +1193,16 @@ final class TerminalRuntime: NSObject {
         )
         view.setSurfaceVisible(surfaceVisible)
         guard surfaceVisible, view.window != nil else { return }
+
+        // AppKit can report a transient negative frame while a full-screen
+        // Space is becoming active. Remote panes must not fit their Ghostty
+        // surface in that interval: doing so leaves the current grid blank or
+        // offset until an unrelated tab switch. The bounded recovery below
+        // samples stable geometry, reclaims the remote viewport, and redraws.
+        if pane?.profile.kind == .ssh, pane?.profile.backend == .relay {
+            reclaimNativeViewportOwnership()
+            return
+        }
         view.layoutSubtreeIfNeeded()
         prepareFinalSurfaceMeasurement()
         fitForStableViewportCommit()
@@ -1513,19 +1720,57 @@ final class TerminalRuntime: NSObject {
     /// resize callback because its own frame never changed while backgrounded,
     /// so explicitly compare and commit its last measured grid.
     func reclaimNativeViewportOwnership() {
-        guard started,
-              pane?.profile.kind == .ssh,
-              pane?.profile.backend == .relay,
-              presentationAttachment.isPresented,
-              view.window != nil else { return }
-        view.layoutSubtreeIfNeeded()
-        view.fitToSize()
-        guard let viewport = latestSurfaceViewport else { return }
-        if io.reclaimNativeViewport(
-            viewport,
-            compatibilityRepaintPulse: pane?.kind != .shell
-        ) {
-            view.synchronizeAndRedraw()
+        nativeViewportRecoveryTask?.cancel()
+        nativeViewportRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var sampler = TerminalStableGeometrySampler()
+            for delay in [0, 16, 32, 64, 120, 240] {
+                if delay == 0 {
+                    await Task.yield()
+                } else {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                }
+                guard !Task.isCancelled,
+                      self.started,
+                      self.allowsRendering,
+                      self.pane?.profile.kind == .ssh,
+                      self.pane?.profile.backend == .relay,
+                      self.presentationAttachment.isPresented,
+                      let window = self.view.window,
+                      window.isVisible,
+                      !window.isMiniaturized else { continue }
+
+                self.view.superview?.layoutSubtreeIfNeeded()
+                guard sampler.observe(self.view.bounds.size),
+                      !self.explicitGeometryTransitionPending,
+                      self.pendingViewportCommitEpoch == nil else { continue }
+
+                // Returning from another Space can make the IOSurface stale
+                // without changing the PTY grid. Fit only after AppKit has
+                // published stable geometry, then redraw unconditionally;
+                // viewport ownership and surface presentation are separate.
+                self.view.fitToSize()
+                if let viewport = self.latestSurfaceViewport {
+                    _ = self.io.reclaimNativeViewport(
+                        viewport,
+                        compatibilityRepaintPulse: self.pane?.kind != .shell
+                    )
+                }
+                self.view.setSurfaceVisible(true)
+                self.view.synchronizeAndRedraw()
+                if self.pane?.kind != .shell {
+                    // Primary-screen agents can retain an obsolete internal
+                    // viewport across a Space transition even though their
+                    // PTY grid is current. Keep the composer visible after the
+                    // same stable barrier used for resize and restore.
+                    _ = self.view.performBindingAction("scroll_to_bottom")
+                    _ = self.view.scrollToRow(UInt.max)
+                }
+                self.view.alphaValue = 1
+                self.nativeViewportRecoveryTask = nil
+                return
+            }
+            self.nativeViewportRecoveryTask = nil
         }
     }
 
@@ -1558,16 +1803,13 @@ final class TerminalRuntime: NSObject {
         guard let pane, pane.profile.kind == .ssh else { return nil }
         let profile = pane.profile
         var parts = ["/usr/bin/ssh", "-tt"]
-        parts.append(contentsOf: profile.sshConnectionArguments.map(Self.shellQuote))
+        parts.append(contentsOf: profile.sshConnectionArguments.map(ShellQuoting.quote))
         if let command = profile.remoteCommand(forPane: pane.id) {
-            parts.append(Self.shellQuote(command))
+            parts.append(ShellQuoting.quote(command))
         }
         return parts.joined(separator: " ")
     }
 
-    private static func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
 
     nonisolated private static func stableImageID(for path: String) -> UInt32 {
         var hash: UInt32 = 2_166_136_261
@@ -1782,10 +2024,18 @@ private final class TerminalActivityCoalescer: @unchecked Sendable {
         pendingText.append(text)
         pendingBytes += text.utf8.count
         if pendingBytes > Self.maximumCharacters {
-            pendingText = String(
-                decoding: pendingText.utf8.suffix(Self.maximumCharacters),
-                as: UTF8.self
-            )
+            // Align the byte-budget cut to a character boundary: a raw UTF-8
+            // suffix can start mid-scalar and decode the head of the retained
+            // sample as U+FFFD garbage (CJK text, emoji).
+            var cut = pendingText.utf8.index(pendingText.utf8.endIndex, offsetBy: -Self.maximumCharacters)
+            while cut != pendingText.utf8.endIndex, String.Index(cut, within: pendingText) == nil {
+                cut = pendingText.utf8.index(after: cut)
+            }
+            if let aligned = String.Index(cut, within: pendingText) {
+                pendingText = String(pendingText[aligned...])
+            } else {
+                pendingText.removeAll(keepingCapacity: true)
+            }
             pendingBytes = pendingText.utf8.count
         }
         guard !deliveryScheduled else {
@@ -1852,6 +2102,8 @@ private final class TerminalIOBridge: @unchecked Sendable {
     private var viewportTransitionFrameRows: UInt16?
     private let replayLock = NSLock()
     private var replaying = false
+    private var preservesRestoredScreenOnReconnect = false
+    private var reconnectReplayExtendsRestoredScreen = false
     private var expectsExplicitReplayBoundary = false
     private var suppressingTerminalWrites = false
     private var replayBuffer = Data()
@@ -2243,6 +2495,11 @@ private final class TerminalIOBridge: @unchecked Sendable {
                             self.deferredDisplayBuffer = TerminalSnapshotStore.bounded(
                                 self.deferredDisplayBuffer
                             )
+                            // Match drainDisplay: a bounded (truncated) deferred
+                            // delta can start mid-stream, so the next resume must
+                            // rebuild from the snapshot instead of applying the
+                            // fragment over the retained grid.
+                            self.deferredDisplayRequiresReconstruction = true
                         }
                         self.presentationLock.unlock()
                     } else {
@@ -2283,8 +2540,28 @@ private final class TerminalIOBridge: @unchecked Sendable {
         guard !displayData.isEmpty else { return true }
         replayLock.lock()
         if replaying {
+            // Older workers add a sequence-zero clear before an unchanged-size
+            // attach repaint. When Relay already restored an exact-viewport
+            // checkpoint, that presentation-only clear erases the visible
+            // Codex/Claude transcript and leaves only the prompt. Preserve the
+            // retained screen and apply the following cursor-addressed repaint
+            // over it. A real output reset clears this flag before replay.
+            if preservesRestoredScreenOnReconnect,
+               TerminalReconnectReplayPolicy.isPresentationClear(
+                   displayData,
+                   remoteSequence: remoteSequence
+               ) {
+                reconnectReplayExtendsRestoredScreen = true
+                replayLock.unlock()
+                return false
+            }
             replayBuffer.append(displayData)
-            if replayBuffer.count > TerminalSnapshotStore.maximumBytes * 2 {
+            // Never rebound while endReplay()'s commit is in flight: it
+            // snapshotted bufferedCount and will slice the live tail with
+            // dropFirst(bufferedCount), so rewriting the buffer here would
+            // shift those offsets and drop or garble the tail.
+            if replayBuffer.count > TerminalSnapshotStore.maximumBytes * 2,
+               replayCommitGeneration == nil {
                 replayBuffer = TerminalSnapshotStore.bounded(replayBuffer)
             }
             replayLock.unlock()
@@ -2332,6 +2609,9 @@ private final class TerminalIOBridge: @unchecked Sendable {
         let store = TerminalSnapshotStore.shared
         guard let cached = store.loadSnapshot(paneID: paneID, viewport: currentViewport),
               !cached.payload.isEmpty else {
+            replayLock.lock()
+            preservesRestoredScreenOnReconnect = false
+            replayLock.unlock()
             if let resumeCursor = store.loadResumeCursor(paneID: paneID), resumeCursor > 0 {
                 receiveLock.lock()
                 TerminalBufferRetentionPolicy.clear(&snapshotBuffer)
@@ -2358,6 +2638,31 @@ private final class TerminalIOBridge: @unchecked Sendable {
             }
             return nil
         }
+        guard TerminalSnapshotDisplayPolicy.hasVisibleContent(cached.payload) else {
+            replayLock.lock()
+            preservesRestoredScreenOnReconnect = false
+            reconnectReplayExtendsRestoredScreen = false
+            replayLock.unlock()
+            receiveLock.lock()
+            TerminalBufferRetentionPolicy.clear(&snapshotBuffer)
+            snapshotRemoteSequence = cached.remoteSequence
+            receiveLock.unlock()
+            alternateScreenCleanup.observe(cached.payload)
+            bracketedPasteTracker.observe(cached.payload)
+            RelayDiagnostics.shared.record(
+                category: "snapshot",
+                name: "mode-only-cursor-restored",
+                details: [
+                    "pane_id": paneID.uuidString.lowercased(),
+                    "bytes": String(cached.payload.count),
+                    "remote_sequence": String(cached.remoteSequence),
+                ]
+            )
+            return SnapshotRestoration(
+                remoteSequence: cached.remoteSequence,
+                rendered: false
+            )
+        }
         if ProcessInfo.processInfo.environment["RELAY_TERMINAL_DEBUG"] == "1" {
             let viewport = currentViewport
             FileHandle.standardError.write(Data(
@@ -2368,6 +2673,9 @@ private final class TerminalIOBridge: @unchecked Sendable {
         snapshotBuffer = cached.payload
         snapshotRemoteSequence = cached.remoteSequence
         receiveLock.unlock()
+        replayLock.lock()
+        preservesRestoredScreenOnReconnect = true
+        replayLock.unlock()
         alternateScreenCleanup.observe(cached.payload)
         bracketedPasteTracker.observe(cached.payload)
         if let active = semanticPromptTracker.observe(cached.payload) {
@@ -2386,6 +2694,12 @@ private final class TerminalIOBridge: @unchecked Sendable {
     }
 
     func resetRemoteSequence() {
+        replayLock.lock()
+        reconnectReplayExtendsRestoredScreen =
+            TerminalReconnectReplayPolicy.extendsCachedScreenAfterOutputReset(
+                hasExactSnapshot: preservesRestoredScreenOnReconnect
+            )
+        replayLock.unlock()
         receiveLock.lock()
         snapshotRemoteSequence = 0
         receiveLock.unlock()
@@ -2412,6 +2726,7 @@ private final class TerminalIOBridge: @unchecked Sendable {
         replayLock.lock()
         if !replaying { TerminalBufferRetentionPolicy.clear(&replayBuffer) }
         replaying = true
+        reconnectReplayExtendsRestoredScreen = false
         replayCommitGeneration = nil
         suppressingTerminalWrites = true
         filterDeviceResponsesUntil = Date().addingTimeInterval(5)
@@ -2481,6 +2796,7 @@ private final class TerminalIOBridge: @unchecked Sendable {
         replayCommitGeneration = generation
         let buffered = replayBuffer
         let bufferedCount = buffered.count
+        let preservesCachedBase = reconnectReplayExtendsRestoredScreen
         legacyReplayHardDeadline = .distantFuture
         legacyReplayTimer.schedule(deadline: .distantFuture)
         replayLock.unlock()
@@ -2492,7 +2808,8 @@ private final class TerminalIOBridge: @unchecked Sendable {
             self.receiveLock.unlock()
             let replacement = TerminalReplayCommit.prepare(
                 cached: cached,
-                incoming: buffered
+                incoming: buffered,
+                preserveCachedBase: preservesCachedBase
             )
 
             // Keep the replay gate closed while the expensive compaction runs.
@@ -2525,6 +2842,8 @@ private final class TerminalIOBridge: @unchecked Sendable {
             }
             TerminalBufferRetentionPolicy.clear(&self.replayBuffer)
             self.replaying = false
+            self.preservesRestoredScreenOnReconnect = false
+            self.reconnectReplayExtendsRestoredScreen = false
             self.replayCommitGeneration = nil
             self.replayLock.unlock()
 
@@ -3049,8 +3368,10 @@ final class TerminalAlternateScreenCleanupFilter: @unchecked Sendable {
         }
     }
 
+    private static let candidateSequences = entries + exits
+
     private static func isCandidatePrefix(_ bytes: [UInt8]) -> Bool {
-        (entries + exits).contains { sequence in
+        candidateSequences.contains { sequence in
             bytes.count < sequence.count && sequence.prefix(bytes.count).elementsEqual(bytes)
         }
     }
@@ -3069,7 +3390,24 @@ final class TerminalAlternateScreenCleanupFilter: @unchecked Sendable {
 enum TerminalReplayCommit {
     private static let reset = Data("\u{001B}c".utf8)
 
-    static func prepare(cached: Data, incoming: Data) -> Data {
+    static func prepare(
+        cached: Data,
+        incoming: Data,
+        preserveCachedBase: Bool = false
+    ) -> Data {
+        if preserveCachedBase, !cached.isEmpty {
+            // An exact-viewport checkpoint is already a compact, renderable
+            // base. An older worker's unchanged-size SIGWINCH replay contains
+            // cursor-addressed agent updates whose internal clear markers are
+            // not standalone transcript boundaries. Apply them over the base
+            // without running boundary selection a second time.
+            var replacement = reset
+            replacement.append(cached)
+            replacement.append(
+                TerminalReconnectReplayPolicy.preservingCheckpointScrollback(incoming)
+            )
+            return replacement
+        }
         let replayHistory = TerminalReplayCompactor.preservingAlternateScreenOwner(
             cached: cached,
             incoming: incoming
@@ -3157,6 +3495,10 @@ enum TerminalReplayCompactor {
     /// redraw ever emitted by a TUI. Reconstruct from its latest full clear.
     static func compact(_ data: Data) -> Data {
         guard !data.isEmpty else { return data }
+        // scan() produces zero-based offsets; rebase a nonzero-startIndex
+        // slice (Data.SubSequence keeps its parent's index base) so the
+        // collection indexing below stays aligned.
+        let data = data.startIndex == 0 ? data : Data(data)
         let scanned = scan(data)
         let latest = [
             scanned.replayStart,
@@ -4272,13 +4614,45 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
               let geometry = activeCursorGeometry()
         else { return false }
 
-        let startLocal = CGPoint(
+        // `ghostty_surface_ime_point` identifies the insertion boundary below
+        // the row that Ghostty's pointer hit-testing uses for the live text.
+        // AppTerminalView's NSTextInputClient rectangle preserves that IME
+        // convention, so keyboard selection must move the visual anchor up by
+        // one cell before synthesizing the native renderer drag.
+        let reportedSelectionCursor = CGPoint(
             x: geometry.point.x,
-            y: bounds.height - geometry.point.y
+            y: geometry.point.y - geometry.cellSize.height
+        )
+        let gridOriginX = max(
+            0,
+            (bounds.width - CGFloat(geometry.columns) * geometry.cellSize.width) / 2
+        )
+        guard let selectionCursor = TerminalKeyboardSelectionGeometry.anchor(
+            for: reportedSelectionCursor,
+            cellSize: geometry.cellSize,
+            columns: geometry.columns,
+            gridOriginX: gridOriginX
+        ) else { return false }
+        guard let selectionEnd = TerminalKeyboardSelectionGeometry.endpoint(
+            from: selectionCursor,
+            visualCellDelta: delta,
+            cellSize: geometry.cellSize,
+            columns: geometry.columns,
+            gridOriginX: gridOriginX
+        ) else { return false }
+        guard selectionCursor.y >= 0, selectionCursor.y <= bounds.height,
+              selectionEnd.y >= 0, selectionEnd.y <= bounds.height
+        else { return false }
+        let insertionBoundaryOffset = geometry.cellSize.width / 2
+        let startLocal = CGPoint(
+            // Ghostty's selection endpoints are text insertion boundaries,
+            // while `selectionCursor` is the center used for cell lookup.
+            x: selectionCursor.x - insertionBoundaryOffset,
+            y: bounds.height - selectionCursor.y
         )
         let endLocal = CGPoint(
-            x: startLocal.x + CGFloat(delta) * geometry.cellSize.width,
-            y: startLocal.y
+            x: selectionEnd.x - insertionBoundaryOffset,
+            y: bounds.height - selectionEnd.y
         )
         let start = convert(startLocal, to: nil)
         let end = convert(endLocal, to: nil)
@@ -4286,7 +4660,10 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         guard let down = NSEvent.mouseEvent(
             with: .leftMouseDown,
             location: start,
-            modifierFlags: .shift,
+            // Rebuild the complete visual range from the fixed keyboard
+            // anchor on every arrow event. Shift would ask Ghostty to extend
+            // its previous pointer selection a second time.
+            modifierFlags: [],
             timestamp: timestamp,
             windowNumber: window.windowNumber,
             context: nil,
@@ -4296,7 +4673,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         ), let drag = NSEvent.mouseEvent(
             with: .leftMouseDragged,
             location: end,
-            modifierFlags: .shift,
+            modifierFlags: [],
             timestamp: timestamp,
             windowNumber: window.windowNumber,
             context: nil,
@@ -4306,7 +4683,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         ), let up = NSEvent.mouseEvent(
             with: .leftMouseUp,
             location: end,
-            modifierFlags: .shift,
+            modifierFlags: [],
             timestamp: timestamp,
             windowNumber: window.windowNumber,
             context: nil,

@@ -86,7 +86,7 @@ final class RelayDiagnostics: @unchecked Sendable {
         ]
         let data = try JSONSerialization.data(withJSONObject: bundle, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        SecureFiles.restrictToOwner(url)
     }
 
     @MainActor
@@ -163,8 +163,7 @@ final class RelayCrashRecovery: @unchecked Sendable {
     private init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Relay/Diagnostics", isDirectory: true)
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
+        SecureFiles.createPrivateDirectory(at: base)
         markerURL = base.appendingPathComponent("running.json")
     }
 
@@ -181,7 +180,7 @@ final class RelayCrashRecovery: @unchecked Sendable {
         ]
         if let data = try? JSONSerialization.data(withJSONObject: marker, options: [.sortedKeys]) {
             try? data.write(to: markerURL, options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: markerURL.path)
+            SecureFiles.restrictToOwner(markerURL)
         }
     }
 

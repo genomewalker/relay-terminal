@@ -102,7 +102,9 @@ enum RelayBridge {
             try? writer.write(type: .detach)
         }
 
+        let stderrFinished = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {
+            defer { stderrFinished.signal() }
             let errors = errorPipe.fileHandleForReading
             while let data = try? errors.read(upToCount: 8 << 10), !data.isEmpty {
                 if let text = String(data: data, encoding: .utf8) {
@@ -144,6 +146,10 @@ enum RelayBridge {
             if exitCode == 0 { exitCode = ssh.terminationStatus }
         }
         resizeSource.cancel()
+        // Let the stderr forwarder flush SSH's diagnostic ("Permission
+        // denied", "Connection refused", …) before the process exits, or a
+        // fast failure dies with a bare nonzero status and no error text.
+        _ = stderrFinished.wait(timeout: .now() + .seconds(2))
         exit(exitCode)
     }
 

@@ -407,7 +407,7 @@ fi
         process.arguments = [
             "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
             "-o", "ConnectionAttempts=1", "-o", "ControlMaster=no", "-o", "ControlPath=none",
-        ] + profile.sshConnectionArguments + ["sh", "-c", shellQuote(script)]
+        ] + profile.sshConnectionArguments + ["sh", "-c", ShellQuoting.quote(script)]
         process.standardOutput = output
         process.standardError = errors
         let captured = try ProcessCapture.run(
@@ -421,9 +421,6 @@ fi
         )
     }
 
-    private static func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
 }
 
 @MainActor

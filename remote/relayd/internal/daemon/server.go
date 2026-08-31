@@ -165,6 +165,16 @@ func (server *Server) serveConnection(connection net.Conn) {
 		}
 		return
 	}
+	if hello.RepaintPulse && !manifest.supports("attach_repaint_v1") {
+		// Durable workers keep running across relayd upgrades. Give an older
+		// worker the same pre-attach full-repaint contract through its existing
+		// PTY, then clear the flag so it is not pulsed a second time.
+		if pulseErr := pulseLegacyWorkerViewport(
+			manifest, hello.Cols, hello.Rows,
+		); pulseErr == nil {
+			hello.RepaintPulse = false
+		}
+	}
 	_ = server.recordCatalogEntry(hello, manifest)
 	worker, err := net.DialTimeout("unix", manifest.SocketPath, time.Second)
 	if err != nil {

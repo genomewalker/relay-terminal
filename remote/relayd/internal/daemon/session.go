@@ -961,7 +961,10 @@ func attachResizeSteps(
 // to append its new-grid redraw to replay. Shells that emit nothing take the
 // short quiet path; continuously updating programs never delay attach beyond
 // the hard deadline.
-func (session *Session) resizeForAttach(cols, rows uint16) (uint64, bool) {
+func (session *Session) resizeForAttach(
+	cols, rows uint16,
+	pulseUnchanged bool,
+) (uint64, bool) {
 	if cols == 0 || rows == 0 {
 		return 0, false
 	}
@@ -975,7 +978,7 @@ func (session *Session) resizeForAttach(cols, rows uint16) (uint64, bool) {
 	}
 	steps := attachResizeSteps(
 		currentCols, currentRows, cols, rows,
-		session.requiresAttachRepaint(),
+		pulseUnchanged && session.requiresAttachRepaint(),
 	)
 	if len(steps) == 0 {
 		return before, false

@@ -738,6 +738,7 @@ func runAttach(arguments []string) {
 		WorkspaceID: *workspace, TabID: *tab, PaneTitle: *paneTitle, ContentKind: *contentKind,
 		Cols: uint16(*cols), Rows: uint16(*rows), LastSeq: *lastSequence, LastEventSeq: *lastEventSequence,
 		TerminalOnly: *terminalOnly, ClientID: *clientID,
+		RepaintPulse: os.Getenv("RELAY_ATTACH_REPAINT") == "1",
 	})
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
 		fatal(err.Error())

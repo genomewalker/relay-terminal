@@ -53,8 +53,11 @@ enum RemoteFileTransfer {
 
         let ssh = Process()
         ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        // BatchMode keeps a fresh connection (expired control master) from
+        // stalling on an interactive auth prompt for the full 120 s timeout.
         var arguments = [
-            "-T", "-o", "ControlMaster=no", "-o", "ControlPath=~/.ssh/relay-%C",
+            "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "ControlMaster=no", "-o", "ControlPath=~/.ssh/relay-%C",
         ]
         arguments += profile.sshConnectionArguments
         arguments += [

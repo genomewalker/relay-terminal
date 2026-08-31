@@ -287,7 +287,10 @@ private final class RelayLegacyHostAgentTransport: @unchecked Sendable {
         let process = self.process
         self.process = nil
         lock.unlock()
-        process?.terminate()
+        // terminate() on a stored-but-never-launched Process raises an
+        // uncatchable NSInvalidArgumentException; connect() re-checks
+        // `stopped` after run() and finishes the termination for us.
+        if let process, process.processIdentifier != 0 { process.terminate() }
     }
 
     private func connect() {
@@ -318,11 +321,18 @@ private final class RelayLegacyHostAgentTransport: @unchecked Sendable {
         lock.unlock()
         do {
             try ssh.run()
-            onAttached?()
         } catch {
             didEnd(ssh)
             return
         }
+        lock.lock()
+        let cancelled = stopped || process !== ssh
+        lock.unlock()
+        if cancelled {
+            ssh.terminate()
+            return
+        }
+        onAttached?()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.readFrames(output.fileHandleForReading)
         }
@@ -334,6 +344,15 @@ private final class RelayLegacyHostAgentTransport: @unchecked Sendable {
                 guard let frame = try? RelayWireFrame.read(from: handle) else { return false }
                 guard let envelope = RelayWireFrame.parseHostEvent(frame),
                       envelope.inner.type == .agentEvent else { return true }
+                // Advance the per-session cursor so the 1-second reconnect
+                // resumes from the last delivered event instead of replaying
+                // the whole backlog since start() after every network blip.
+                if let decoded = try? JSONDecoder().decode(EventWireEnvelope.self, from: envelope.inner.payload),
+                   let sequence = decoded.sequence {
+                    lock.lock()
+                    sessions[envelope.sessionID] = max(sessions[envelope.sessionID] ?? 0, sequence)
+                    lock.unlock()
+                }
                 onEvent?(envelope.sessionID, envelope.inner.payload)
                 return true
             }

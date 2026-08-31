@@ -128,7 +128,13 @@ struct RelayKeyBinding: Codable, Equatable, Hashable, Sendable {
         case 125: key = "down"
         case 126: key = "up"
         default:
-            guard let characters = event.charactersIgnoringModifiers?.lowercased(),
+            // charactersIgnoringModifiers still applies Shift, so recording
+            // ⌘⇧] would store "}"+shift while the defaults are written with
+            // the unshifted key ("]"+shift) — conflict detection would miss
+            // duplicates and the stored shortcut would never match. Resolve
+            // the physical key with no modifiers applied instead.
+            let base = event.characters(byApplyingModifiers: []) ?? event.charactersIgnoringModifiers
+            guard let characters = base?.lowercased(),
                   characters.count == 1,
                   let character = characters.first,
                   !character.isWhitespace else { return nil }

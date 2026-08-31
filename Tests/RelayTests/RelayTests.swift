@@ -1292,6 +1292,20 @@ func orderedTerminalReplayCommit() {
     #expect(rendered.range(of: "replayed screen")!.lowerBound < rendered.range(of: "fresh agent output")!.lowerBound)
 }
 
+@Test("Checkpoint reconnect repaint extends rather than replaces the retained transcript")
+func checkpointReconnectCommitKeepsCachedBase() {
+    let cached = Data("retained Claude transcript\u{001B}[31;1Hprompt".utf8)
+    let repaint = Data("\u{001B}[2J\u{001B}[H\u{001B}[31;1Hupdated prompt".utf8)
+    let replacement = TerminalReplayCommit.prepare(
+        cached: cached,
+        incoming: repaint,
+        preserveCachedBase: true
+    )
+    let rendered = String(decoding: replacement, as: UTF8.self)
+    #expect(rendered.contains("retained Claude transcript"))
+    #expect(rendered.contains("updated prompt"))
+}
+
 @Test("Terminal replay preserves alternate-screen ownership")
 func compactTerminalReplayPreservesAlternateScreenLifecycle() {
     let completed = Data(
@@ -1819,6 +1833,45 @@ func promptSelectionDeletionSequence() {
         cellSize: CGSize(width: 6, height: 14),
         columns: 150
     ) == 0)
+
+    let cell = CGSize(width: 10, height: 20)
+    #expect(TerminalKeyboardSelectionGeometry.endpoint(
+        from: CGPoint(x: 75, y: 100),
+        visualCellDelta: -1,
+        cellSize: cell,
+        columns: 8
+    ) == CGPoint(x: 65, y: 100))
+    #expect(TerminalKeyboardSelectionGeometry.endpoint(
+        from: CGPoint(x: 75, y: 100),
+        visualCellDelta: 1,
+        cellSize: cell,
+        columns: 8
+    ) == CGPoint(x: 5, y: 120))
+    #expect(TerminalKeyboardSelectionGeometry.endpoint(
+        from: CGPoint(x: 5, y: 100),
+        visualCellDelta: -1,
+        cellSize: cell,
+        columns: 8
+    ) == CGPoint(x: 75, y: 80))
+    #expect(TerminalKeyboardSelectionGeometry.endpoint(
+        from: CGPoint(x: 75, y: 100),
+        visualCellDelta: -8,
+        cellSize: cell,
+        columns: 8
+    ) == CGPoint(x: 75, y: 80))
+    #expect(TerminalKeyboardSelectionGeometry.anchor(
+        for: CGPoint(x: 65, y: 100),
+        cellSize: CGSize(width: 8, height: 20),
+        columns: 17,
+        gridOriginX: 12
+    ) == CGPoint(x: 65, y: 100))
+    #expect(TerminalKeyboardSelectionGeometry.endpoint(
+        from: CGPoint(x: 65, y: 100),
+        visualCellDelta: -7,
+        cellSize: CGSize(width: 8, height: 20),
+        columns: 17,
+        gridOriginX: 12
+    ) == CGPoint(x: 145, y: 80))
 }
 
 @Test("Remote prompt editing survives agent phase changes and restored lines")
@@ -2045,6 +2098,71 @@ func remoteViewportPredictionUsesBackingPixels() {
         cellWidthPixels: 10,
         cellHeightPixels: 20
     ) == nil)
+}
+
+@Test("Terminal presentation resumes only after valid stable geometry")
+func terminalPresentationGeometryRequiresTwoStableSamples() {
+    var sampler = TerminalStableGeometrySampler()
+    let invalid = sampler.observe(CGSize(width: -50, height: 300))
+    #expect(!invalid)
+    #expect(sampler.consecutiveSamples == 0)
+    let first = sampler.observe(CGSize(width: 700, height: 420))
+    let moving = sampler.observe(CGSize(width: 680, height: 420))
+    let stable = sampler.observe(CGSize(width: 680, height: 420))
+    #expect(!first)
+    #expect(!moving)
+    #expect(stable)
+    #expect(sampler.consecutiveSamples == 2)
+}
+
+@Test("Agent viewport repaint probes an adjacent valid grid")
+func terminalViewportRepaintProbeUsesAdjacentGrid() {
+    let ordinary = TerminalViewportRepaintProbe.dimensions(columns: 135, rows: 24)
+    #expect(ordinary?.columns == 135)
+    #expect(ordinary?.rows == 23)
+
+    let singleRow = TerminalViewportRepaintProbe.dimensions(columns: 135, rows: 1)
+    #expect(singleRow?.columns == 135)
+    #expect(singleRow?.rows == 2)
+
+    let maximum = TerminalViewportRepaintProbe.dimensions(columns: 2, rows: .max)
+    #expect(maximum?.columns == 2)
+    #expect(maximum?.rows == UInt16.max - 1)
+
+    #expect(TerminalViewportRepaintProbe.dimensions(columns: 0, rows: 24) == nil)
+    #expect(TerminalViewportRepaintProbe.dimensions(columns: 80, rows: 0) == nil)
+}
+
+@Test("Checkpoint reconnect keeps presentation-only clears out of agent history")
+func checkpointReconnectPreservesRetainedAgentScreen() {
+    let clear = Data("\u{001B}[2J\u{001B}[H".utf8)
+    #expect(TerminalReconnectReplayPolicy.isPresentationClear(clear, remoteSequence: 0))
+    #expect(!TerminalReconnectReplayPolicy.isPresentationClear(clear, remoteSequence: 42))
+    #expect(!TerminalReconnectReplayPolicy.isPresentationClear(Data("\u{001B}[H".utf8), remoteSequence: 0))
+    #expect(TerminalReconnectReplayPolicy.extendsCachedScreenAfterOutputReset(
+        hasExactSnapshot: true
+    ))
+    #expect(!TerminalReconnectReplayPolicy.extendsCachedScreenAfterOutputReset(
+        hasExactSnapshot: false
+    ))
+    let boundedReplay = Data("\u{001B}c\u{001B}[3J\u{001B}[2J\u{001B}[Hcurrent prompt".utf8)
+    #expect(String(
+        decoding: TerminalReconnectReplayPolicy.preservingCheckpointScrollback(boundedReplay),
+        as: UTF8.self
+    ) == "\u{001B}[2J\u{001B}[Hcurrent prompt")
+    let laterReset = Data("current\u{001B}cnew session".utf8)
+    #expect(TerminalReconnectReplayPolicy.preservingCheckpointScrollback(laterReset) == laterReset)
+}
+
+@Test("Mode-only terminal checkpoints request an authoritative repaint")
+func modeOnlyCheckpointIsNotRenderable() {
+    let modes = Data("\u{001B}(B\u{000F}\u{001B}[?1000h\u{001B}[?1002h\u{001B}[?1003h\u{001B}[?1006h".utf8)
+    #expect(!TerminalSnapshotDisplayPolicy.hasVisibleContent(modes))
+    #expect(!TerminalSnapshotDisplayPolicy.hasVisibleContent(Data("\r\n  \t".utf8)))
+    #expect(TerminalSnapshotDisplayPolicy.hasVisibleContent(
+        Data("\u{001B}[38;2;153;153;153mAsk Claude anything".utf8)
+    ))
+    #expect(TerminalSnapshotDisplayPolicy.hasVisibleContent(Data("λ".utf8)))
 }
 
 @Test("Pointer geometry follows a retained terminal surface during resize")

@@ -80,6 +80,7 @@ type HelloPayload struct {
 	WorkerToken     string `json:"worker_token,omitempty"`
 	NodeMux         bool   `json:"node_mux,omitempty"`
 	ClientID        string `json:"client_id,omitempty"`
+	RepaintPulse    bool   `json:"repaint_pulse,omitempty"`
 }
 
 type StatusPayload struct {

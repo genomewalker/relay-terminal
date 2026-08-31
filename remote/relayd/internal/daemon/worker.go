@@ -74,7 +74,7 @@ func ServeWorker(config WorkerConfig) error {
 		ShellPID: session.processID(), NodeBootID: bootID,
 		SocketPath: config.SocketPath, Token: config.Token,
 		Command: config.Command, WorkingDirectory: config.WorkingDirectory,
-		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "client_count_v1", "terminal_mode_state_v1"}, CreatedAt: time.Now().UTC(),
+		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "client_count_v1", "terminal_mode_state_v1"}, CreatedAt: time.Now().UTC(),
 	}
 	if err := storeManifest(config.ManifestPath, manifest); err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -250,7 +250,11 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		// A replay is cursor-addressed for the PTY grid that produced it. Apply
 		// the native pane geometry and capture its SIGWINCH redraw before taking
 		// the attachment snapshot.
-		repaintAfterSequence, attachRedrew = session.resizeForAttach(hello.Cols, hello.Rows)
+		repaintAfterSequence, attachRedrew = session.resizeForAttach(
+			hello.Cols,
+			hello.Rows,
+			hello.LastSeq == 0 || hello.RepaintPulse,
+		)
 	}
 
 	viewer, replay, outputReset, eventReset, clientCount := session.attach(
@@ -258,7 +262,7 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "client_count_v1", "terminal_mode_state_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "client_count_v1", "terminal_mode_state_v1"},
 		OutputReset: outputReset, EventReset: eventReset,
 		ControlGranted: &controlGranted, ClientCount: clientCount,
 	})

@@ -512,7 +512,7 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var terminalProgressState: String?
     private(set) var detector = AgentSignalDetector()
     private(set) var lastActivity = Date()
-    private(set) var activeSubagents = 0
+    var activeSubagents: Int { subagents.count { $0.phase == .active } }
     private(set) var subagents: [SubagentActivity] = []
     private(set) var agentActivities: [AgentActivityItem] = []
     private(set) var agentResourceUsage: AgentResourceUsage?
@@ -570,7 +570,6 @@ final class PaneModel: ObservableObject, Identifiable {
            let saved = AgentStateStore.shared.load(paneID: id) {
             agentEventCursor = saved.cursor
             subagents = saved.subagents
-            activeSubagents = saved.subagents.count { $0.phase == .active }
             agentActivities = saved.activities
             agentResourceUsage = saved.resourceUsage
             agentProgressPercent = saved.progressPercent
@@ -779,7 +778,6 @@ final class PaneModel: ObservableObject, Identifiable {
         let incomingEventName = (event["hook_event_name"] as? String) ?? (event["type"] as? String)
         if incomingEventName == "RelayStateSnapshot" {
             subagents.removeAll(keepingCapacity: true)
-            activeSubagents = 0
             activeAgentRoots.removeAll(keepingCapacity: true)
             seenAgentEventHashes.removeAll(keepingCapacity: true)
             seenAgentEventOrder.removeAll(keepingCapacity: true)
@@ -790,7 +788,6 @@ final class PaneModel: ObservableObject, Identifiable {
                 receivedAgentEvent(encoded)
             }
             agentSnapshotReplayDepth -= 1
-            activeSubagents = subagents.count { $0.phase == .active }
             scheduleAgentUIRefresh()
             return
         }
@@ -882,7 +879,6 @@ final class PaneModel: ObservableObject, Identifiable {
                 phase: .active
             ))
             pruneCompletedSubagents()
-            activeSubagents = subagents.count { $0.phase == .active }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent: \(agentType ?? "working")")
             recordActivity("Started \(agentType ?? "subagent")", phase: .active)
         case "SubagentStop":
@@ -913,7 +909,6 @@ final class PaneModel: ObservableObject, Identifiable {
                 }
             }
             pruneCompletedSubagents()
-            activeSubagents = subagents.count { $0.phase == .active }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Subagent finished")
             recordActivity("Subagent finished", phase: .quiet)
             let completedLabel = agentType ?? subagentID ?? "Subagent"
@@ -1035,7 +1030,6 @@ final class PaneModel: ObservableObject, Identifiable {
             if !providerStillRunning {
                 subagents.removeAll { $0.provider == kind }
             }
-            activeSubagents = subagents.count { $0.phase == .active }
             if providerStillRunning {
                 detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Working")
                 structuredAgentRunning = true

@@ -88,7 +88,7 @@ enum RelayTerminfo {
         else { return nil }
         let directory = targetRoot.appendingPathComponent("78", isDirectory: true)
         let target = directory.appendingPathComponent(name)
-        return "sudo mkdir -p \(shellQuote(directory.path)) && sudo install -m 0644 \(shellQuote(bundled.path)) \(shellQuote(target.path))"
+        return "sudo mkdir -p \(ShellQuoting.quote(directory.path)) && sudo install -m 0644 \(ShellQuoting.quote(bundled.path)) \(ShellQuoting.quote(target.path))"
     }
 
     static func install(
@@ -258,7 +258,4 @@ enum RelayTerminfo {
         )
     }
 
-    private static func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
 }

@@ -100,8 +100,7 @@ final class TerminalSnapshotStore: @unchecked Sendable {
             for: .applicationSupportDirectory, in: .userDomainMask
         )[0].appendingPathComponent("Relay/TerminalSnapshots", isDirectory: true)
         self.directory = base
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
+        SecureFiles.createPrivateDirectory(at: base)
     }
 
     func load(paneID: UUID, viewport: RelayViewport) -> Data? {
@@ -211,7 +210,7 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         let url = snapshotURL(paneID)
         do {
             try record.write(to: url, options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            SecureFiles.restrictToOwner(url)
         } catch {
             lock.lock()
             if generations[paneID] == generation {

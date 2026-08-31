@@ -98,29 +98,39 @@ enum ProcessCapture {
             )
             readers.leave()
         }
-        if let input, let pipe = process.standardInput as? Pipe {
-            pipe.fileHandleForWriting.write(input)
-            try pipe.fileHandleForWriting.close()
-        }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [weak process] in
             guard let process, process.isRunning else { return }
             failure.record(.timedOut(seconds: timeout))
+            // Terminating the child closes its pipe ends, which unblocks a
+            // writer stuck feeding stdin and lets the readers reach EOF.
             process.terminate()
-            // The launched process may be a shell whose child inherited both
-            // descriptors. Closing our read ends prevents readers.wait() from
-            // hanging forever when that child survives the shell briefly.
-            try? output.fileHandleForReading.close()
-            try? errors.fileHandleForReading.close()
+        }
+        if let input, let pipe = process.standardInput as? Pipe {
+            let writer = pipe.fileHandleForWriting
+            // The child may exit before draining stdin (auth failure, reset).
+            // Ask for an error instead of SIGPIPE, and use the throwing write
+            // so a broken pipe surfaces as a failure rather than an
+            // uncatchable NSFileHandleOperationException.
+            _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+            do {
+                try writer.write(contentsOf: input)
+                try writer.close()
+            } catch {
+                failure.record(.readFailed("Could not send input to the command: \(error.localizedDescription)"))
+                try? writer.close()
+            }
         }
         process.waitUntilExit()
         // A successfully exited launcher can leave a descendant holding one
         // of its pipes open. Never let diagnostics or catalog refreshes pin a
-        // thread forever waiting for that unrelated process. The locked
-        // buffers remain safe if a reader finishes after this call returns.
+        // thread forever waiting for that unrelated process; give the readers
+        // a moment, then give up. The blocked reader threads unwind on their
+        // own once the descendant exits — closing the handles here would race
+        // their in-flight reads (FileHandle is not safe for concurrent
+        // read/close, and a freed descriptor number could be reused). The
+        // locked buffers remain safe if a reader finishes after this returns.
         if readers.wait(timeout: .now() + .seconds(1)) == .timedOut {
-            failure.record(.readFailed("Timed out while closing subprocess output streams."))
-            try? output.fileHandleForReading.close()
-            try? errors.fileHandleForReading.close()
+            failure.record(.readFailed("Timed out while draining subprocess output streams."))
         }
         if let failure = failure.value { throw failure }
         return CapturedProcessOutput(

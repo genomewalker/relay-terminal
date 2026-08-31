@@ -78,6 +78,7 @@ enum SSHConfigDiscovery {
         var word = ""
         var quote: Character?
         var escaped = false
+        var usedEquals = false
 
         func finishWord() {
             if !word.isEmpty {
@@ -99,6 +100,13 @@ enum SSHConfigDiscovery {
             } else if character == "#" {
                 break
             } else if character.isWhitespace {
+                finishWord()
+            } else if character == "=" && !usedEquals {
+                // ssh_config allows "Key=Value" (or "Key = Value"): the first
+                // unquoted '=' separates keyword and arguments, so entries
+                // like "Host=alias" and "Include=conf.d/*" must not be
+                // swallowed as a single token.
+                usedEquals = true
                 finishWord()
             } else {
                 word.append(character)

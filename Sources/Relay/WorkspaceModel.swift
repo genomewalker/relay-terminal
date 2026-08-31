@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-struct AgentInspectorSelection: Equatable, Sendable {
+struct AgentInspectorSelection: Hashable, Sendable {
     let paneID: UUID
     let subagentID: String
 }
@@ -45,6 +45,7 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var pinnedSessionIDs = WorkspacePinStore.load(.session)
     @Published private(set) var pinnedTabIDs = WorkspacePinStore.load(.tab)
     @Published private(set) var recentlyClosedPaneCount = 0
+    @Published private(set) var paneCloseEvent = 0
     @Published private(set) var lastClosedPaneWasRemote = false
 
     let profileStore = ProfileStore()
@@ -967,6 +968,11 @@ final class WorkspaceModel: ObservableObject {
         }
         lastClosedPaneWasRemote = pane.profile.kind == .ssh && pane.profile.backend == .relay
         recentlyClosedPaneCount = recentlyClosedPanes.count
+        // Monotonic close signal for the undo toast: the buffer count
+        // saturates at 20 (21st close computes 20 -> 20, no change) and
+        // decreases on undo, so it cannot distinguish "pane closed" from
+        // "pane reopened".
+        paneCloseEvent &+= 1
     }
 
     func closeTab(_ id: UUID) {
@@ -984,7 +990,10 @@ final class WorkspaceModel: ObservableObject {
         WorkspacePinStore.save(pinnedTabIDs, kind: .tab)
         if tabs.isEmpty {
             newTab(profile: .local)
-        } else {
+        } else if selectedTabID == id {
+            // Only move selection when the closed tab was the selected one;
+            // closing a background tab from its context menu must not yank
+            // the user away from the tab they are working in.
             let nextIndex = min(index, tabs.count - 1)
             selectedTabID = tabs[nextIndex].id
             activePaneID = tabs[nextIndex].layout.paneIDs.first
@@ -1013,10 +1022,12 @@ final class WorkspaceModel: ObservableObject {
             newTab(profile: .local)
             return
         }
-        let next = tabs[0]
-        selectedTabID = next.id
-        activePaneID = next.layout.paneIDs.first
-        zoomedPaneID = nil
+        if let selected = selectedTabID, closingTabIDs.contains(selected) {
+            let next = tabs[0]
+            selectedTabID = next.id
+            activePaneID = next.layout.paneIDs.first
+            zoomedPaneID = nil
+        }
         persistWorkspace()
     }
 

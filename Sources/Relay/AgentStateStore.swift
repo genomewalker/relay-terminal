@@ -32,8 +32,7 @@ final class AgentStateStore: @unchecked Sendable {
         self.directory = directory ?? FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         )[0].appendingPathComponent("Relay/AgentState", isDirectory: true)
-        try? FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: self.directory.path)
+        SecureFiles.createPrivateDirectory(at: self.directory)
     }
 
     func load(paneID: UUID) -> PersistedAgentPaneState? {
@@ -68,7 +67,7 @@ final class AgentStateStore: @unchecked Sendable {
             let url = self.stateURL(paneID)
             do {
                 try data.write(to: url, options: .atomic)
-                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                SecureFiles.restrictToOwner(url)
             } catch {
                 RelayDiagnostics.shared.record(category: "agent-state", name: "write-failed", details: [
                     "pane_id": paneID.uuidString.lowercased(),

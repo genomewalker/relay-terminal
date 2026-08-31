@@ -364,7 +364,11 @@ final class RelayNodeConnection: @unchecked Sendable {
         }
         DispatchQueue.global(qos: .userInteractive).async { [weak self, weak ssh] in
             do {
-                while let self, let ssh, ssh.isRunning {
+                // Read until EOF (readExactly throws .endOfStream) rather
+                // than gating on ssh.isRunning: frames still buffered in the
+                // pipe when the process exits — the final output burst, the
+                // terminal "exited" status — must be drained, not dropped.
+                while let self {
                     try autoreleasepool {
                         let frame = try RelayWireFrame.read(from: output.fileHandleForReading)
                         self.receive(frame, generation: currentGeneration)

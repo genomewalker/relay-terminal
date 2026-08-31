@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 )
 
@@ -71,5 +72,26 @@ func TestHostEventRoundTrip(t *testing.T) {
 	session, decoded, err := ParseHostEvent(outer)
 	if err != nil || session != "pane-123" || decoded.Type != AgentEvent || !bytes.Equal(decoded.Payload, inner.Payload) {
 		t.Fatalf("invalid host event: session=%q frame=%#v err=%v", session, decoded, err)
+	}
+}
+
+func TestHelloRepaintPulseRoundTrip(t *testing.T) {
+	want := HelloPayload{
+		Version:      1,
+		SessionID:    "pane-123",
+		Cols:         135,
+		Rows:         24,
+		RepaintPulse: true,
+	}
+	payload, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got HelloPayload
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.RepaintPulse || got.Cols != want.Cols || got.Rows != want.Rows {
+		t.Fatalf("repaint hello did not round trip: %#v", got)
 	}
 }
