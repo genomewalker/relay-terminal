@@ -2006,10 +2006,18 @@ final class TerminalRuntime: NSObject {
     }
 
     private static func promptPath(_ path: String) -> String {
-        guard path.contains(where: { $0.isWhitespace || "'\"\\$`!()[]{};&|<>".contains($0) }) else {
-            return path
+        // This path comes from the remote relayd's JSON and is typed into the
+        // user's shell as synthetic keystrokes. Control bytes (newline, CR,
+        // ESC, 0x03) cannot be neutralized by shell quoting — the PTY line
+        // discipline acts on them before any shell does — so a compromised
+        // remote could inject an interrupt plus a command. Strip control
+        // characters first, then quote shell metacharacters.
+        let sanitized = String(path.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F })
+        guard sanitized.contains(where: { $0.isWhitespace || "'\"\\$`!()[]{};&|<>".contains($0) })
+                || sanitized.count != path.count else {
+            return sanitized
         }
-        return "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        return "'" + sanitized.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 

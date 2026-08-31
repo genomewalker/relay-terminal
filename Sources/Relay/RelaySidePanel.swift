@@ -3,6 +3,22 @@ import AppKit
 import CryptoKit
 import Foundation
 
+enum RelaySidePanelAuth {
+    /// Length-independent, byte-wise comparison so an attacker on loopback
+    /// cannot recover the bearer token one character at a time from timing.
+    static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
+        let a = Array(lhs.utf8)
+        let b = Array(rhs.utf8)
+        var difference = a.count ^ b.count
+        for index in 0..<max(a.count, b.count) {
+            let x = index < a.count ? a[index] : 0
+            let y = index < b.count ? b[index] : 0
+            difference |= Int(x ^ y)
+        }
+        return difference == 0
+    }
+}
+
 struct RelaySidePanelState: Encodable, Sendable {
     let version = 3
     let selectedPaneID: String?
@@ -106,7 +122,8 @@ struct RelaySidePanelHTTPRequest: Equatable, Sendable {
     }
 
     func isAuthorized(token: String) -> Bool {
-        headers["x-relay-token"] == token
+        guard let presented = headers["x-relay-token"] else { return false }
+        return RelaySidePanelAuth.constantTimeEquals(presented, token)
     }
 
     func isAuthorizedWebSocket(token: String) -> Bool {
@@ -116,7 +133,9 @@ struct RelaySidePanelHTTPRequest: Equatable, Sendable {
         let protocols = headers["sec-websocket-protocol"]?
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) } ?? []
-        return protocols.contains("relay-v1") && protocols.contains(token)
+        guard protocols.contains("relay-v1") else { return false }
+        // Constant-time to avoid leaking the token through comparison timing.
+        return protocols.contains { RelaySidePanelAuth.constantTimeEquals($0, token) }
     }
 }
 

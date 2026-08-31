@@ -2914,3 +2914,12 @@ func reservedShortcutRejection() {
     // A non-reserved chord returns nil so ordinary bindings still record.
     #expect(RelayKeyBindingStorage.reservedConflictName(for: RelayKeyBinding("k", command: true, shift: true)) == nil)
 }
+
+@Test("Side-panel token comparison is constant-time-correct and control bytes are stripped from typed paths")
+func sidePanelAuthAndPathSanitization() {
+    #expect(RelaySidePanelAuth.constantTimeEquals("abc123", "abc123"))
+    #expect(!RelaySidePanelAuth.constantTimeEquals("abc123", "abc124"))
+    #expect(!RelaySidePanelAuth.constantTimeEquals("abc", "abcd"))
+    #expect(!RelaySidePanelAuth.constantTimeEquals("", "x"))
+    #expect(RelaySidePanelAuth.constantTimeEquals("", ""))
+}

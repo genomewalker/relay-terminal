@@ -567,13 +567,23 @@ final class TerminalArtifactCoordinator: @unchecked Sendable {
     private let lock = NSLock()
     private var detector = ImagePathDetector()
     private var states: [String: State] = [:]
+    // Each discovered path spawns a delayed SSH fetch buffering up to 25 MiB.
+    // A chatty or malicious remote printing thousands of distinct image-like
+    // paths would otherwise open thousands of concurrent connections. Bound
+    // the number of in-flight (non-presented) loads; a handful of real images
+    // is well under this, and a flood is throttled instead of exhausting the
+    // machine.
+    private static let maximumOutstandingLoads = 8
 
     func discover(in text: String) -> [String] {
         lock.lock()
         defer { lock.unlock() }
+        var outstanding = states.values.reduce(0) { $0 + ($1 == .presented ? 0 : 1) }
         return detector.ingest(text).filter { path in
             guard states[path] == nil else { return false }
+            guard outstanding < Self.maximumOutstandingLoads else { return false }
             states[path] = .scheduled
+            outstanding += 1
             return true
         }
     }
@@ -619,7 +629,15 @@ enum RemoteArtifactLoader {
     static func load(path: String, profile: ConnectionProfile) async throws -> Data {
         try await Task.detached(priority: .utility) {
             if profile.kind == .local {
-                let data = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
+                let url = URL(fileURLWithPath: path)
+                // Auto-loading is triggered purely by text printed to the
+                // terminal, so refuse a symlink: a program could print a path
+                // that points at an unrelated user-readable file.
+                let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+                guard values.isSymbolicLink != true, values.isRegularFile == true else {
+                    throw ArtifactLoadError.failed("Refusing to auto-open a non-regular or symlinked file")
+                }
+                let data = try Data(contentsOf: url, options: .mappedIfSafe)
                 guard data.count <= 25 << 20 else { throw ArtifactLoadError.tooLarge }
                 return data
             }
