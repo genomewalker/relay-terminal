@@ -2287,6 +2287,30 @@ func viewportTransactionsRetainGenerationAndGeometry() {
     #expect(parsed?.repaintSequence == 9_001)
 }
 
+@Test("Unknown wire frames preserve the following frame boundary")
+func unknownWireFramesAreConsumedBeforeClassification() throws {
+    func encodedFrame(type: UInt8, payload: Data) -> Data {
+        var data = Data([type])
+        var length = UInt32(payload.count).bigEndian
+        withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }
+        data.append(payload)
+        return data
+    }
+
+    let pipe = Pipe()
+    var stream = encodedFrame(type: 250, payload: Data("future".utf8))
+    stream.append(encodedFrame(type: RelayWireType.output.rawValue, payload: Data("next".utf8)))
+    try pipe.fileHandleForWriting.write(contentsOf: stream)
+    try pipe.fileHandleForWriting.close()
+
+    let unknown = try RelayWireFrame.read(from: pipe.fileHandleForReading)
+    let following = try RelayWireFrame.read(from: pipe.fileHandleForReading)
+    #expect(unknown.type == .unsupported)
+    #expect(String(decoding: unknown.payload, as: UTF8.self) == "future")
+    #expect(following.type == .output)
+    #expect(String(decoding: following.payload, as: UTF8.self) == "next")
+}
+
 @MainActor
 @Test("Missing terminal fonts use a metrically valid installed fallback")
 func missingTerminalFontsUseInstalledFallback() {

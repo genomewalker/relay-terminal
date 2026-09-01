@@ -1,7 +1,10 @@
 package daemon
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,27 +102,70 @@ func ReadEditorFile(path string) (FileDocument, error) {
 	if err != nil {
 		return FileDocument{}, err
 	}
-	info, err := os.Stat(resolved)
+	state, err := readEditorFileState(resolved)
 	if err != nil {
 		return FileDocument{}, err
-	}
-	if !info.Mode().IsRegular() {
-		return FileDocument{}, errors.New("editor path is not a regular file")
-	}
-	if info.Size() > maxEditorFileBytes {
-		return FileDocument{}, errors.New("editor file exceeds 16 MiB")
-	}
-	data, err := os.ReadFile(resolved)
-	if err != nil {
-		return FileDocument{}, err
-	}
-	if strings.IndexByte(string(data), 0) >= 0 {
-		return FileDocument{}, errors.New("binary files cannot be opened in the text editor")
 	}
 	return FileDocument{
-		Path: resolved, ContentBase64: base64.StdEncoding.EncodeToString(data),
-		ModificationNS: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()),
+		Path: resolved, ContentBase64: base64.StdEncoding.EncodeToString(state.data),
+		ModificationNS: state.revision, Mode: uint32(state.info.Mode().Perm()),
 	}, nil
+}
+
+type editorFileState struct {
+	info     os.FileInfo
+	data     []byte
+	revision int64
+}
+
+func readEditorFileState(path string) (editorFileState, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return editorFileState{}, err
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return editorFileState{}, err
+	}
+	if !before.Mode().IsRegular() {
+		return editorFileState{}, errors.New("editor path is not a regular file")
+	}
+	if before.Size() > maxEditorFileBytes {
+		return editorFileState{}, errors.New("editor file exceeds 16 MiB")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxEditorFileBytes+1))
+	if err != nil {
+		return editorFileState{}, err
+	}
+	if len(data) > maxEditorFileBytes {
+		return editorFileState{}, errors.New("editor file exceeds 16 MiB")
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return editorFileState{}, err
+	}
+	if before.Size() != after.Size() || before.ModTime() != after.ModTime() {
+		return editorFileState{}, errors.New("file changed while reading; retry")
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return editorFileState{}, errors.New("binary files cannot be opened in the text editor")
+	}
+	return editorFileState{info: after, data: data, revision: editorFileRevision(after, data)}, nil
+}
+
+func editorFileRevision(info os.FileInfo, data []byte) int64 {
+	var metadata [24]byte
+	binary.BigEndian.PutUint64(metadata[0:8], uint64(info.ModTime().UnixNano()))
+	binary.BigEndian.PutUint64(metadata[8:16], uint64(info.Size()))
+	binary.BigEndian.PutUint64(metadata[16:24], uint64(info.Mode()))
+	hash := sha256.New()
+	_, _ = hash.Write(metadata[:])
+	_, _ = hash.Write(data)
+	sum := hash.Sum(nil)
+	// Keep the token positive and mark it so a legacy raw-mtime client can be
+	// recognized during a rolling app/relayd upgrade.
+	return int64(binary.BigEndian.Uint64(sum[:8])&((uint64(1)<<62)-1) | (uint64(1) << 62))
 }
 
 func WriteEditorFile(path string, expectedModificationNS int64, reader io.Reader) (FileDocument, error) {
@@ -127,14 +173,13 @@ func WriteEditorFile(path string, expectedModificationNS int64, reader io.Reader
 	if err != nil {
 		return FileDocument{}, err
 	}
-	info, err := os.Stat(resolved)
+	state, err := readEditorFileState(resolved)
 	if err != nil {
 		return FileDocument{}, err
 	}
-	if !info.Mode().IsRegular() {
-		return FileDocument{}, errors.New("editor path is not a regular file")
-	}
-	if expectedModificationNS != 0 && info.ModTime().UnixNano() != expectedModificationNS {
+	if expectedModificationNS != 0 &&
+		expectedModificationNS != state.revision &&
+		expectedModificationNS != state.info.ModTime().UnixNano() {
 		return FileDocument{}, errors.New("file changed on the remote node; reload before saving")
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, maxEditorFileBytes+1))
@@ -150,7 +195,7 @@ func WriteEditorFile(path string, expectedModificationNS int64, reader io.Reader
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(info.Mode().Perm()); err != nil {
+	if err := temporary.Chmod(state.info.Mode().Perm()); err != nil {
 		temporary.Close()
 		return FileDocument{}, err
 	}
@@ -164,6 +209,15 @@ func WriteEditorFile(path string, expectedModificationNS int64, reader io.Reader
 	}
 	if err := temporary.Close(); err != nil {
 		return FileDocument{}, err
+	}
+	// Recheck after writing and syncing the temporary file. This narrows the
+	// overwrite race with another editor to the atomic rename itself.
+	current, err := readEditorFileState(resolved)
+	if err != nil {
+		return FileDocument{}, err
+	}
+	if current.revision != state.revision {
+		return FileDocument{}, errors.New("file changed on the remote node; reload before saving")
 	}
 	if err := os.Rename(temporaryPath, resolved); err != nil {
 		return FileDocument{}, err

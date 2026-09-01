@@ -612,7 +612,14 @@ final class RelayRemoteTransport: @unchecked Sendable {
             return
         }
         process = ssh
-        writer = RelayWireWriter(input.fileHandleForWriting)
+        writer = RelayWireWriter(input.fileHandleForWriting) { [weak ssh] message in
+            RelayDiagnostics.shared.record(category: "connection", name: "wire-write-failed", details: [
+                "connection_id": context.sessionID,
+                "transport": "legacy-pane",
+                "reason": message,
+            ])
+            if ssh?.isRunning == true { ssh?.terminate() }
+        }
         supportsSupervisorViewportCommits = false
         supportsExactSupervisorViewportCommits = false
         attached = false
@@ -1133,19 +1140,27 @@ struct EventWireEnvelope: Decodable {
 }
 
 enum RelayWireType: UInt8 {
+    case unsupported = 0
     case hello = 1, input, resize, output, status, detach, ping, pong, agentEvent, artifact, inputAck, inputV2, hostEvent, workspaceState, viewportCommit, viewportAck
 }
 
 struct RelayWireFrame {
+    static let maximumPayloadBytes = 16 << 20
+
     let type: RelayWireType
     let payload: Data
 
     static func read(from handle: FileHandle) throws -> RelayWireFrame {
         let header = try readExactly(5, from: handle)
-        guard let type = RelayWireType(rawValue: header[0]) else { throw RelayWireError.invalidFrame }
         let length = header.dropFirst().reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-        guard length <= 16 << 20 else { throw RelayWireError.invalidFrame }
-        return RelayWireFrame(type: type, payload: try readExactly(Int(length), from: handle))
+        guard Int(length) <= maximumPayloadBytes else { throw RelayWireError.invalidFrame }
+        // Consume the declared payload before classifying the frame. A newer
+        // relayd may introduce a type this app does not know yet; dropping
+        // that one complete frame preserves the boundary of every frame after
+        // it instead of tearing down an otherwise healthy SSH connection.
+        let payload = try readExactly(Int(length), from: handle)
+        let type = RelayWireType(rawValue: header[0]) ?? .unsupported
+        return RelayWireFrame(type: type, payload: payload)
     }
 
     private static func readExactly(_ count: Int, from handle: FileHandle) throws -> Data {
@@ -1237,10 +1252,10 @@ struct RelayWireFrame {
         guard frame.type == .hostEvent, frame.payload.count >= 3 else { return nil }
         let length = frame.payload.prefix(2).reduce(UInt16(0)) { ($0 << 8) | UInt16($1) }
         guard length > 0, 3 + Int(length) <= frame.payload.count,
-              let type = RelayWireType(rawValue: frame.payload[2]),
               let sessionID = String(data: frame.payload.subdata(in: 3..<(3 + Int(length))), encoding: .utf8) else {
             return nil
         }
+        let type = RelayWireType(rawValue: frame.payload[2]) ?? .unsupported
         return (sessionID, RelayWireFrame(type: type, payload: frame.payload.subdata(in: (3 + Int(length))..<frame.payload.count)))
     }
 }
@@ -1261,22 +1276,55 @@ final class RelayWireWriter: RelayFrameWriting, @unchecked Sendable {
     private let handle: FileHandle
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "dev.relay.terminal-wire", qos: .userInteractive)
+    private let onError: @Sendable (String) -> Void
+    private var reportedFailure = false
 
-    init(_ handle: FileHandle) { self.handle = handle }
+    init(
+        _ handle: FileHandle,
+        onError: @escaping @Sendable (String) -> Void = { _ in }
+    ) {
+        self.handle = handle
+        self.onError = onError
+    }
 
     func write(type: RelayWireType, payload: Data = Data()) throws {
+        guard payload.count <= RelayWireFrame.maximumPayloadBytes else {
+            let error = RelayWireError.invalidFrame
+            report(error)
+            throw error
+        }
         var header = Data([type.rawValue])
         var length = UInt32(payload.count).bigEndian
         withUnsafeBytes(of: &length) { header.append(contentsOf: $0) }
         lock.lock()
-        defer { lock.unlock() }
-        try handle.write(contentsOf: header)
-        if !payload.isEmpty { try handle.write(contentsOf: payload) }
+        do {
+            try handle.write(contentsOf: header)
+            if !payload.isEmpty { try handle.write(contentsOf: payload) }
+            lock.unlock()
+        } catch {
+            lock.unlock()
+            report(error)
+            throw error
+        }
     }
 
     func writeAsync(type: RelayWireType, payload: Data = Data()) {
-        queue.async { [weak self] in
-            try? self?.write(type: type, payload: payload)
+        queue.async {
+            // write() reports the first failure to the connection owner. The
+            // owner then closes SSH, whose normal termination path reconnects
+            // and replays acknowledged input rather than silently losing it.
+            try? self.write(type: type, payload: payload)
         }
+    }
+
+    private func report(_ error: Error) {
+        lock.lock()
+        guard !reportedFailure else {
+            lock.unlock()
+            return
+        }
+        reportedFailure = true
+        lock.unlock()
+        onError(error.localizedDescription)
     }
 }

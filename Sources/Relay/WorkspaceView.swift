@@ -1858,7 +1858,12 @@ private struct SessionPaneRow: View {
         }
         .onChange(of: pane.subagents) { _, agents in
             attention.scheduleRefresh(agents: agents, paneID: pane.id)
-            if active && !agents.isEmpty { agentThreadsExpanded = true }
+            // A restored or busy agent can publish several structured events
+            // in one display frame. Avoid repeatedly assigning the same view
+            // state from onChange, which causes SwiftUI re-entrant frame work.
+            if active && !agents.isEmpty && !agentThreadsExpanded {
+                agentThreadsExpanded = true
+            }
         }
     }
 }

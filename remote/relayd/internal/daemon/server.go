@@ -23,6 +23,7 @@ var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,96}$`)
 
 type Server struct {
 	mu              sync.Mutex
+	workerLocks     sync.Map
 	executable      string
 	buildVersion    string
 	protocolVersion int
@@ -185,9 +186,11 @@ func (server *Server) serveConnection(connection net.Conn) {
 		// Durable workers keep running across relayd upgrades. Give an older
 		// worker the same pre-attach full-repaint contract through its existing
 		// PTY, then clear the flag so it is not pulsed a second time.
-		if pulseErr := pulseLegacyWorkerViewport(
-			manifest, hello.Cols, hello.Rows,
-		); pulseErr == nil {
+		workerLock := server.workerLock(manifest.SessionID)
+		workerLock.Lock()
+		pulseErr := pulseLegacyWorkerViewport(manifest, hello.Cols, hello.Rows)
+		workerLock.Unlock()
+		if pulseErr == nil {
 			hello.RepaintPulse = false
 		}
 	}
@@ -243,11 +246,68 @@ type multiplexedSession struct {
 	connection       net.Conn
 	terminalOnly     bool
 	durableSessionID string
+	outbound         chan protocol.Frame
+	closed           chan struct{}
+	closeOnce        sync.Once
 	capabilitiesMu   sync.RWMutex
 	capabilitiesSeen bool
 	viewportCommitV2 bool
 	manifestCached   bool
 	manifest         workerManifest
+}
+
+func newMultiplexedSession(
+	connection net.Conn,
+	terminalOnly bool,
+	durableSessionID string,
+) *multiplexedSession {
+	return &multiplexedSession{
+		connection: connection, terminalOnly: terminalOnly,
+		durableSessionID: durableSessionID,
+		outbound:         make(chan protocol.Frame, 128),
+		closed:           make(chan struct{}),
+	}
+}
+
+func (session *multiplexedSession) close() {
+	session.closeOnce.Do(func() {
+		close(session.closed)
+		_ = session.connection.Close()
+	})
+}
+
+// The node reader must never wait for one pane's worker. A stopped foreground
+// process can fill its PTY input queue and block the worker's protocol reader;
+// queue that pane independently so heartbeats and sibling panes keep moving.
+func (session *multiplexedSession) enqueue(frame protocol.Frame) bool {
+	select {
+	case <-session.closed:
+		return false
+	default:
+	}
+	select {
+	case session.outbound <- frame:
+		return true
+	case <-session.closed:
+		return false
+	default:
+		return false
+	}
+}
+
+func (session *multiplexedSession) forwardToWorker() {
+	writer := protocol.NewWriter(session.connection)
+	for {
+		select {
+		case frame := <-session.outbound:
+			if writer.Write(frame) != nil {
+				session.close()
+				return
+			}
+		case <-session.closed:
+			return
+		}
+	}
 }
 
 func (session *multiplexedSession) observeWorkerFrame(frame protocol.Frame) {
@@ -330,7 +390,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 			closedCurrentRoute = true
 		}
 		sessionsMu.Unlock()
-		_ = expected.connection.Close()
+		expected.close()
 		return closedCurrentRoute
 	}
 	defer func() {
@@ -342,7 +402,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 		sessions = make(map[string]*multiplexedSession)
 		sessionsMu.Unlock()
 		for _, session := range remaining {
-			_ = session.connection.Close()
+			session.close()
 		}
 	}()
 
@@ -362,7 +422,9 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 		}
 		sessionID, inner, err := protocol.ParseHostEvent(envelope)
 		if err != nil || !validSessionID.MatchString(sessionID) {
-			return
+			// ReadFrame already consumed the complete invalid envelope, so one
+			// malformed virtual route cannot desynchronize or tear down the node.
+			continue
 		}
 		if inner.Type == protocol.WorkspaceState {
 			response := server.handleWorkspaceState(sessionID, inner.Payload)
@@ -378,20 +440,18 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 			// observer for the same pane coexist on one SSH stream.
 			if protocol.DecodeJSON(inner, &hello) != nil ||
 				!validSessionID.MatchString(hello.SessionID) || hello.NodeMux {
-				return
+				continue
 			}
 			clientSide, serverSide := net.Pipe()
-			virtual := &multiplexedSession{
-				connection: clientSide, terminalOnly: hello.TerminalOnly,
-				durableSessionID: hello.SessionID,
-			}
+			virtual := newMultiplexedSession(clientSide, hello.TerminalOnly, hello.SessionID)
 			sessionsMu.Lock()
 			previous := sessions[sessionID]
 			sessions[sessionID] = virtual
 			sessionsMu.Unlock()
 			if previous != nil {
-				_ = previous.connection.Close()
+				previous.close()
 			}
+			go virtual.forwardToWorker()
 			go server.serveConnection(serverSide)
 			go func(id string, session *multiplexedSession) {
 				defer func() {
@@ -428,8 +488,8 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 					}
 				}
 			}(sessionID, virtual)
-			if protocol.NewWriter(clientSide).Write(inner) != nil {
-				closeSession(sessionID, virtual)
+			if !virtual.enqueue(inner) {
+				virtual.close()
 			}
 			continue
 		}
@@ -449,14 +509,14 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 				if loadErr == nil && manifest.supports("viewport_commit_v2") {
 					// The status and manifest normally agree. Prefer the durable
 					// capability if a commit raced the routed attached status.
-					if protocol.NewWriter(virtual.connection).Write(inner) != nil {
-						closeSession(sessionID, virtual)
+					if !virtual.enqueue(inner) {
+						virtual.close()
 					}
 					continue
 				}
 				if loadErr != nil {
-					if protocol.NewWriter(virtual.connection).Write(inner) != nil {
-						closeSession(sessionID, virtual)
+					if !virtual.enqueue(inner) {
+						virtual.close()
 					}
 					continue
 				}
@@ -467,22 +527,23 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 					// the node read loop so one slow TUI repaint never stalls the
 					// other multiplexed panes or their heartbeat.
 					go func(routeID string, worker workerManifest) {
-						if commitLegacyWorkerViewport(worker, cols, rows) != nil {
+						workerLock := server.workerLock(worker.SessionID)
+						workerLock.Lock()
+						repaintSequence, commitErr := commitLegacyWorkerViewport(worker, cols, rows)
+						workerLock.Unlock()
+						if commitErr != nil {
 							return
 						}
-						// Give the old worker's ordinary output route time to publish
-						// the SIGWINCH repaint before the client uncovers its surface.
-						time.Sleep(150 * time.Millisecond)
 						_ = writer.Write(protocol.HostEventFrame(
-							routeID, protocol.ViewportAckFrame(generation, 0),
+							routeID, protocol.ViewportAckFrame(generation, repaintSequence),
 						))
 					}(sessionID, manifest)
 					continue
 				}
 			}
 		}
-		if protocol.NewWriter(virtual.connection).Write(inner) != nil {
-			closeSession(sessionID, virtual)
+		if !virtual.enqueue(inner) {
+			virtual.close()
 		}
 	}
 }
@@ -573,8 +634,9 @@ func (server *Server) eventJournalPath(sessionID string) string {
 }
 
 func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest, error) {
-	server.mu.Lock()
-	defer server.mu.Unlock()
+	workerLock := server.workerLock(hello.SessionID)
+	workerLock.Lock()
+	defer workerLock.Unlock()
 	manifestPath := server.manifestPath(hello.SessionID)
 	if manifest, err := loadManifest(manifestPath); err == nil {
 		if state, liveErr := server.workerState(manifest); liveErr == nil && state == "ready" {
@@ -590,6 +652,11 @@ func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest,
 		return workerManifest{}, errors.New("Relay pane worker is not running")
 	}
 	return server.startWorker(hello, manifestPath)
+}
+
+func (server *Server) workerLock(sessionID string) *sync.Mutex {
+	lock, _ := server.workerLocks.LoadOrStore(sessionID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 func (server *Server) workerState(manifest workerManifest) (string, error) {
@@ -711,8 +778,9 @@ func (server *Server) TerminatePane(sessionID string) error {
 	if !validSessionID.MatchString(sessionID) {
 		return errors.New("invalid pane session ID")
 	}
-	server.mu.Lock()
-	defer server.mu.Unlock()
+	workerLock := server.workerLock(sessionID)
+	workerLock.Lock()
+	defer workerLock.Unlock()
 	manifest, err := loadManifest(server.manifestPath(sessionID))
 	if err != nil {
 		return errors.New("pane is not present on this node")
@@ -741,6 +809,9 @@ func (server *Server) ForgetPane(sessionID string) error {
 	if !validSessionID.MatchString(sessionID) {
 		return errors.New("invalid pane session ID")
 	}
+	workerLock := server.workerLock(sessionID)
+	workerLock.Lock()
+	defer workerLock.Unlock()
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	catalog, err := loadStoredCatalog(server.catalogPath())

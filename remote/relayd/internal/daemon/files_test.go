@@ -29,6 +29,9 @@ func TestEditorFileRoundTripAndConflict(t *testing.T) {
 	if written.ModificationNS == 0 {
 		t.Fatal("saved document is missing its timestamp")
 	}
+	if written.ModificationNS == document.ModificationNS {
+		t.Fatal("changed content retained the stale editor revision")
+	}
 	if _, err := WriteEditorFile(path, document.ModificationNS, bytes.NewBufferString("stale")); err == nil {
 		t.Fatal("stale editor write was accepted")
 	}

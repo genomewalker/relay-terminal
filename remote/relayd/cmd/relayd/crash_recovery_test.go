@@ -28,10 +28,13 @@ func TestSupervisorCrashPreservesPaneWorkerAndShell(t *testing.T) {
 		t.Skip("relayd requires Unix sockets and PTYs")
 	}
 	temporary := t.TempDir()
-	binary := filepath.Join(temporary, "relayd-test")
-	build := exec.Command("go", "build", "-o", binary, ".")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build relayd: %v\n%s", err, output)
+	binary := strings.TrimSpace(os.Getenv("RELAYD_TEST_BINARY"))
+	if binary == "" {
+		binary = filepath.Join(temporary, "relayd-test")
+		build := exec.Command("go", "build", "-o", binary, ".")
+		if output, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build relayd: %v\n%s", err, output)
+		}
 	}
 	runtimeDir, err := os.MkdirTemp("/tmp", "relay-crash-")
 	if err != nil {
@@ -92,10 +95,14 @@ func TestSupervisorUpgradePreservesPaneWorkerAndShell(t *testing.T) {
 		t.Skip("relayd requires Unix sockets and PTYs")
 	}
 	temporary := t.TempDir()
-	oldBinary := filepath.Join(temporary, "relayd-old")
-	newBinary := filepath.Join(temporary, "relayd-new")
-	buildTestRelayd(t, oldBinary, "0.5.1")
-	buildTestRelayd(t, newBinary, "0.5.2")
+	oldBinary := strings.TrimSpace(os.Getenv("RELAYD_TEST_OLD_BINARY"))
+	newBinary := strings.TrimSpace(os.Getenv("RELAYD_TEST_NEW_BINARY"))
+	if oldBinary == "" || newBinary == "" {
+		oldBinary = filepath.Join(temporary, "relayd-old")
+		newBinary = filepath.Join(temporary, "relayd-new")
+		buildTestRelayd(t, oldBinary, "0.5.1")
+		buildTestRelayd(t, newBinary, "0.5.2")
+	}
 	runtimeDir, err := os.MkdirTemp("/tmp", "relay-upgrade-")
 	if err != nil {
 		t.Fatal(err)

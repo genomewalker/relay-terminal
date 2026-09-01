@@ -87,6 +87,91 @@ func TestAcknowledgedInputAcceptsFreshProcessIdentity(t *testing.T) {
 	}
 }
 
+func TestBlockedAcknowledgedInputDoesNotHoldSessionStateLock(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	session := &Session{pty: writer, inputSequences: make(map[[16]byte]uint64)}
+	started := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		close(started)
+		finished <- session.acknowledgedInput([16]byte{1}, 1, bytes.Repeat([]byte("x"), 8<<20))
+	}()
+	<-started
+	// Give the pipe enough time to fill so the PTY writer is definitely blocked.
+	time.Sleep(25 * time.Millisecond)
+	snapshot := make(chan struct{})
+	go func() {
+		session.snapshot()
+		close(snapshot)
+	}()
+	select {
+	case <-snapshot:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("a blocked PTY write held the session state lock")
+	}
+	_ = reader.Close()
+	_ = writer.Close()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("blocked input writer did not stop after its pipe closed")
+	}
+}
+
+func TestAcknowledgedInputDoesNotForgetOlderClientHighWater(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{pty: writer, inputSequences: make(map[[16]byte]uint64)}
+	const clients = 128
+	for index := 0; index < clients; index++ {
+		clientID := [16]byte{byte(index), byte(index >> 8), 0xA5}
+		if err := session.acknowledgedInput(clientID, 1, []byte{'x'}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index := 0; index < clients; index++ {
+		clientID := [16]byte{byte(index), byte(index >> 8), 0xA5}
+		if err := session.acknowledgedInput(clientID, 1, []byte{'x'}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != clients {
+		t.Fatalf("old client dedupe state was evicted: got %d writes, want %d", len(data), clients)
+	}
+}
+
+func TestWorkerOutputSequenceSpacesDoNotStartFromZero(t *testing.T) {
+	first := outputSequenceFromEntropy(100)
+	second := outputSequenceFromEntropy(10_000)
+	if first < 1<<62 || second < 1<<62 || first == second {
+		t.Fatalf("worker sequence epochs are not distinct high-water values: %d %d", first, second)
+	}
+	replay := []record{{sequence: second + 1, data: []byte("new shell")}}
+	if !outputCursorNeedsReset(replay, first, second+1) {
+		t.Fatal("cursor from an older worker aliased into the replacement worker")
+	}
+}
+
+func TestEventCursorAheadOfRestartedWorkerRequestsReset(t *testing.T) {
+	session := &Session{eventSequence: 10}
+	if !session.eventCursorHasGap(500) {
+		t.Fatal("event cursor from an older worker did not request a reset")
+	}
+}
+
 func TestInputControlLeaseAllowsOneClientAndReconnectGrace(t *testing.T) {
 	session := &Session{}
 	if !session.acquireControl("client-a") {
@@ -129,7 +214,7 @@ func TestAgentJournalSurvivesReopenAndRestoresCursor(t *testing.T) {
 	}
 	first.agentEvent([]byte(`{"agent":"codex","event":{"type":"thread.started"}}`))
 	first.agentEvent([]byte(`{"agent":"codex","event":{"type":"item.completed"}}`))
-	if err := first.eventJournal.file.Close(); err != nil {
+	if err := first.eventJournal.close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -140,11 +225,59 @@ func TestAgentJournalSurvivesReopenAndRestoresCursor(t *testing.T) {
 	if err := restored.enableEventJournal(path); err != nil {
 		t.Fatal(err)
 	}
-	defer restored.eventJournal.file.Close()
+	defer restored.eventJournal.close()
 	observer, frames, _ := restored.observeAgents(1)
 	defer restored.detachAgentObserver(observer)
 	if restored.eventSequence != 2 || len(frames) != 1 || indexedAgentSequence(frames[0].Payload) != 2 {
 		t.Fatalf("journal cursor was not restored: sequence=%d frames=%#v", restored.eventSequence, frames)
+	}
+}
+
+type blockingAgentEventWriter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (journal *blockingAgentEventWriter) append(uint64, []byte) error {
+	journal.started <- struct{}{}
+	<-journal.release
+	return nil
+}
+
+func (*blockingAgentEventWriter) close() error { return nil }
+
+func TestBlockedAgentJournalDoesNotHoldTerminalStateLock(t *testing.T) {
+	journal := &blockingAgentEventWriter{started: make(chan struct{}, 1), release: make(chan struct{})}
+	session := &Session{
+		eventJournal: journal,
+		clients:      make(map[*client]struct{}),
+		agentClients: make(map[*client]struct{}),
+	}
+	finished := make(chan struct{})
+	go func() {
+		session.agentEvent([]byte(`{"agent":"codex","event":{"type":"item.completed"}}`))
+		close(finished)
+	}()
+	select {
+	case <-journal.started:
+	case <-time.After(time.Second):
+		t.Fatal("agent event did not enter journal append")
+	}
+	snapshotDone := make(chan struct{})
+	go func() {
+		session.snapshot()
+		close(snapshotDone)
+	}()
+	select {
+	case <-snapshotDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("blocked journal append held terminal session state")
+	}
+	close(journal.release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("agent event did not resume after journal became writable")
 	}
 }
 

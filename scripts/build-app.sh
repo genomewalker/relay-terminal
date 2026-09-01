@@ -130,6 +130,12 @@ fi
 /usr/libexec/PlistBuddy -c "Add :RelaydProtocolVersion integer $relayd_protocol_version" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 14.0" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations array" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0 dict" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeIdentifier string dev.relay.workspace-tab" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeDescription string Relay Workspace Tab" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeConformsTo array" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeConformsTo:0 string public.data" "$app_path/Contents/Info.plist"
 
 # Some dependency bundles intentionally ship read-only terminfo and shader
 # files. The staged copy must be owner-writable while xattrs and signatures are

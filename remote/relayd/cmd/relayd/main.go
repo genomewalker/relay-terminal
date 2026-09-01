@@ -190,7 +190,7 @@ func runFiles(arguments []string) {
 	pathBase64 := flags.String("path-b64", "", "base64-encoded absolute path")
 	parentSession := flags.String("parent-session", "", "terminal session whose working directory should be used")
 	nameBase64 := flags.String("name-b64", "", "base64-encoded import filename")
-	expectedModificationNS := flags.Int64("expected-modification-ns", 0, "mtime used for conflict detection")
+	expectedModificationNS := flags.Int64("expected-modification-ns", 0, "opaque revision used for conflict detection")
 	_ = flags.Parse(arguments[1:])
 	path := ""
 	if *pathBase64 != "" {

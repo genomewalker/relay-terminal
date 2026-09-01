@@ -2,22 +2,56 @@
 
 package daemon
 
-import "testing"
+import (
+	"net"
+	"testing"
+	"time"
 
-func TestParseForegroundProcessGroupHandlesCommandSpaces(t *testing.T) {
-	group, err := parseForegroundProcessGroup(
-		"123 (shell with spaces) S 1 123 123 34816 456 0 0 0 0",
-	)
+	"github.com/relay-terminal/relayd/internal/protocol"
+)
+
+func TestLegacyRepaintObserverWaitsForNewOutputAndQuiet(t *testing.T) {
+	observerConnection, workerConnection := net.Pipe()
+	defer observerConnection.Close()
+	defer workerConnection.Close()
+	observer := &legacyRepaintObserver{connection: observerConnection, sequence: 40}
+	writeErr := make(chan error, 1)
+	go func() {
+		writer := protocol.NewWriter(workerConnection)
+		if err := writer.Write(protocol.OutputFrame(40, []byte("old"))); err != nil {
+			writeErr <- err
+			return
+		}
+		if err := writer.Write(protocol.OutputFrame(41, []byte("repaint"))); err != nil {
+			writeErr <- err
+			return
+		}
+		writeErr <- nil
+	}()
+
+	sequence, err := observer.waitForOutputUntil(40, 250*time.Millisecond, 5*time.Millisecond)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("wait for repaint output: %v", err)
 	}
-	if group != 456 {
-		t.Fatalf("foreground process group = %d, want 456", group)
+	if sequence != 41 || observer.sequence != 41 {
+		t.Fatalf("repaint sequence = %d, observer = %d; want 41", sequence, observer.sequence)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write repaint output: %v", err)
 	}
 }
 
-func TestParseForegroundProcessGroupRejectsMalformedStat(t *testing.T) {
-	if _, err := parseForegroundProcessGroup("malformed"); err == nil {
-		t.Fatal("malformed proc stat was accepted")
+func TestLegacyRepaintObserverRejectsDeadlineWithoutOutput(t *testing.T) {
+	observerConnection, workerConnection := net.Pipe()
+	defer observerConnection.Close()
+	defer workerConnection.Close()
+	observer := &legacyRepaintObserver{connection: observerConnection, sequence: 7}
+
+	sequence, err := observer.waitForOutputUntil(7, 10*time.Millisecond, time.Millisecond)
+	if err == nil {
+		t.Fatal("wait without repaint output unexpectedly succeeded")
+	}
+	if sequence != 7 || observer.sequence != 7 {
+		t.Fatalf("deadline changed sequence to %d/%d", sequence, observer.sequence)
 	}
 }

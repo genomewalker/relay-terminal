@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,6 +54,8 @@ type Session struct {
 	pty      *os.File
 	process  *exec.Cmd
 	resizeMu sync.Mutex
+	inputMu  sync.Mutex
+	eventMu  sync.Mutex
 
 	mu                    sync.Mutex
 	sequence              uint64
@@ -70,7 +74,7 @@ type Session struct {
 	eventSequence         uint64
 	eventHistory          []protocol.Frame
 	eventHistoryBytes     int
-	eventJournal          *agentEventJournal
+	eventJournal          agentEventWriter
 	eventHashes           map[[32]byte]struct{}
 	eventHashOrder        [][32]byte
 	eventJournalError     string
@@ -158,7 +162,8 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	}
 	session := &Session{
 		id: id, command: command, pty: terminal, process: child,
-		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		sequence: initialOutputSequence(),
+		clients:  make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
 		activeSubagents: make(map[string][]byte), activeAgentRoots: make(map[string][]byte), done: make(chan struct{}),
 		agentProcesses: make(map[int]string), agentProcessesChanged: make(chan struct{}),
 		inputSequences: make(map[[16]byte]uint64),
@@ -174,6 +179,25 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	go session.wait()
 	go session.monitorAgentProcesses()
 	return session, nil
+}
+
+// Every worker owns a distinct output sequence space. Starting from a random
+// high-water value makes a cursor retained from a dead worker unambiguously
+// outside a replacement worker's replay range: it is either ahead of the new
+// tail or behind the new ring head, and attach therefore requests a reset.
+// A zero-based counter could alias after a restart and silently skip the new
+// shell's first N output records.
+func initialOutputSequence() uint64 {
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err == nil {
+		return outputSequenceFromEntropy(binary.BigEndian.Uint64(raw[:]))
+	}
+	return outputSequenceFromEntropy(uint64(time.Now().UnixNano()))
+}
+
+func outputSequenceFromEntropy(value uint64) uint64 {
+	const marker = uint64(1) << 62
+	return marker | (value & (marker - 1))
 }
 
 func sessionCommand(shell, command, home, shimPath string) (*exec.Cmd, error) {
@@ -682,10 +706,7 @@ func (session *Session) attach(
 	viewer.includeAgentEvents = includeAgentEvents
 	session.clients[viewer] = struct{}{}
 	session.broadcastClientCountLocked()
-	outputReset := replayCursorHasGap(session.replay, lastSequence)
-	if lastSequence > session.sequence {
-		outputReset = true
-	}
+	outputReset := outputCursorNeedsReset(session.replay, lastSequence, session.sequence)
 	if outputReset {
 		lastSequence = 0
 	}
@@ -734,6 +755,10 @@ func replayCursorHasGap(replay []record, sequence uint64) bool {
 		return false
 	}
 	return sequence+1 < replay[0].sequence
+}
+
+func outputCursorNeedsReset(replay []record, sequence, current uint64) bool {
+	return sequence > current || replayCursorHasGap(replay, sequence)
 }
 
 // A new local renderer only needs the latest complete terminal redraw. Sending
@@ -854,6 +879,8 @@ func (session *Session) detachAgentObserver(observer *client) {
 }
 
 func (session *Session) input(data []byte) error {
+	session.inputMu.Lock()
+	defer session.inputMu.Unlock()
 	session.mu.Lock()
 	exited := session.exited
 	session.mu.Unlock()
@@ -865,14 +892,21 @@ func (session *Session) input(data []byte) error {
 }
 
 func (session *Session) acknowledgedInput(clientID [16]byte, sequence uint64, data []byte) error {
+	// PTY writes may block when the foreground process stops draining its input.
+	// Serialize those writes independently so output publication, snapshots,
+	// reconnects, status and agent events never wait behind terminal input.
+	session.inputMu.Lock()
+	defer session.inputMu.Unlock()
 	session.mu.Lock()
-	defer session.mu.Unlock()
 	if session.exited {
+		session.mu.Unlock()
 		return io.ErrClosedPipe
 	}
 	if sequence <= session.inputSequences[clientID] {
+		session.mu.Unlock()
 		return nil
 	}
+	session.mu.Unlock()
 	remaining := data
 	for len(remaining) > 0 {
 		written, err := session.pty.Write(remaining)
@@ -881,15 +915,9 @@ func (session *Session) acknowledgedInput(clientID [16]byte, sequence uint64, da
 		}
 		remaining = remaining[written:]
 	}
+	session.mu.Lock()
 	session.inputSequences[clientID] = sequence
-	if len(session.inputSequences) > 64 {
-		for key := range session.inputSequences {
-			if key != clientID {
-				delete(session.inputSequences, key)
-				break
-			}
-		}
-	}
+	session.mu.Unlock()
 	return nil
 }
 
@@ -1098,15 +1126,32 @@ func (session *Session) outputSequenceWaitState() (uint64, bool, <-chan struct{}
 }
 
 func (session *Session) agentEvent(payload []byte) {
+	// Preserve event/journal order while allowing terminal output, input lease
+	// changes, and attachment snapshots to proceed during disk I/O.
+	session.eventMu.Lock()
+	defer session.eventMu.Unlock()
+	hash := semanticAgentEventHash(payload)
 	session.mu.Lock()
-	defer session.mu.Unlock()
 	if session.eventHashes == nil {
 		session.eventHashes = make(map[[32]byte]struct{})
 	}
-	hash := semanticAgentEventHash(payload)
 	if _, duplicate := session.eventHashes[hash]; duplicate {
+		session.mu.Unlock()
 		return
 	}
+	sequence := session.eventSequence + 1
+	journal := session.eventJournal
+	session.mu.Unlock()
+
+	payload = indexedAgentPayload(payload, sequence)
+	var journalErr error
+	if journal != nil {
+		journalErr = journal.append(sequence, payload)
+	}
+
+	frame := protocol.Frame{Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...)}
+	session.mu.Lock()
+	defer session.mu.Unlock()
 	session.eventHashes[hash] = struct{}{}
 	session.eventHashOrder = append(session.eventHashOrder, hash)
 	if len(session.eventHashOrder) > 4_096 {
@@ -1114,14 +1159,10 @@ func (session *Session) agentEvent(payload []byte) {
 		session.eventHashOrder = session.eventHashOrder[1:]
 		delete(session.eventHashes, oldest)
 	}
-	session.eventSequence++
-	payload = indexedAgentPayload(payload, session.eventSequence)
-	frame := protocol.Frame{Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...)}
-	if session.eventJournal != nil {
-		if err := session.eventJournal.append(session.eventSequence, payload); err != nil {
-			session.eventJournalError = err.Error()
-			fmt.Fprintf(os.Stderr, "relay: agent journal append failed: %v\n", err)
-		}
+	session.eventSequence = sequence
+	if journalErr != nil {
+		session.eventJournalError = journalErr.Error()
+		fmt.Fprintf(os.Stderr, "relay: agent journal append failed: %v\n", journalErr)
 	}
 	session.appendEventHistory(frame)
 	session.latestAgentEvent = append(session.latestAgentEvent[:0], payload...)
@@ -1149,9 +1190,10 @@ func (session *Session) agentEvent(payload []byte) {
 
 func (session *Session) eventCursorHasGap(sequence uint64) bool {
 	if sequence == 0 || len(session.eventHistory) == 0 {
-		return false
+		return sequence > session.eventSequence
 	}
-	return sequence+1 < indexedAgentSequence(session.eventHistory[0].Payload)
+	return sequence > session.eventSequence ||
+		sequence+1 < indexedAgentSequence(session.eventHistory[0].Payload)
 }
 
 func (session *Session) agentStateSnapshot() protocol.Frame {
@@ -1194,6 +1236,8 @@ func (session *Session) appendEventHistory(frame protocol.Frame) {
 }
 
 func (session *Session) enableEventJournal(path string) error {
+	session.eventMu.Lock()
+	defer session.eventMu.Unlock()
 	journal, records, err := openAgentEventJournal(path)
 	if err != nil {
 		return err

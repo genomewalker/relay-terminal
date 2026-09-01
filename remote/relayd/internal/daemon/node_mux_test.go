@@ -47,6 +47,20 @@ func TestNodeMultiplexRoutesVirtualProtocolConnection(t *testing.T) {
 		t.Fatalf("node heartbeat was not echoed: frame=%#v err=%v", pong, err)
 	}
 
+	// An invalid top-level frame is already fully framed and consumed. It must
+	// not collapse every pane or stop the node-level heartbeat.
+	if err := writer.Write(protocol.Frame{Type: protocol.Status, Payload: []byte("ignored")}); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat = []byte("heartbeat-after-invalid-route")
+	if err := writer.Write(protocol.Frame{Type: protocol.Ping, Payload: heartbeat}); err != nil {
+		t.Fatal(err)
+	}
+	pong, err = protocol.ReadFrame(client)
+	if err != nil || pong.Type != protocol.Pong || string(pong.Payload) != string(heartbeat) {
+		t.Fatalf("invalid route killed node heartbeat: frame=%#v err=%v", pong, err)
+	}
+
 	probeHello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
 		Version: 1, SessionID: "pane-probe", Probe: true,
 	})
@@ -95,6 +109,35 @@ func TestNodeMultiplexRoutesVirtualProtocolConnection(t *testing.T) {
 	routeID, observerResponse, err := protocol.ParseHostEvent(observerEnvelope)
 	if err != nil || routeID != "observer-pane-probe" || observerResponse.Type != protocol.Status {
 		t.Fatalf("independent observer route failed: route=%q frame=%#v err=%v", routeID, observerResponse, err)
+	}
+}
+
+func TestMultiplexedSessionBackpressureIsRouteLocal(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	route := newMultiplexedSession(client, true, "pane-blocked")
+	defer route.close()
+	for index := 0; index < cap(route.outbound); index++ {
+		if !route.enqueue(protocol.Frame{Type: protocol.Input, Payload: []byte{byte(index)}}) {
+			t.Fatalf("route queue rejected frame %d before reaching capacity", index)
+		}
+	}
+	started := time.Now()
+	if route.enqueue(protocol.Frame{Type: protocol.Input, Payload: []byte("overflow")}) {
+		t.Fatal("full route queue accepted an unbounded frame")
+	}
+	if elapsed := time.Since(started); elapsed > 50*time.Millisecond {
+		t.Fatalf("full route queue blocked the node reader for %s", elapsed)
+	}
+}
+
+func TestWorkerStartupLocksArePerSession(t *testing.T) {
+	server := NewServer()
+	if server.workerLock("pane-a") != server.workerLock("pane-a") {
+		t.Fatal("one pane did not retain a stable startup lock")
+	}
+	if server.workerLock("pane-a") == server.workerLock("pane-b") {
+		t.Fatal("unrelated panes still share a worker startup lock")
 	}
 }
 

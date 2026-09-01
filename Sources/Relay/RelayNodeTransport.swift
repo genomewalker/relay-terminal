@@ -331,7 +331,14 @@ final class RelayNodeConnection: @unchecked Sendable {
         ssh.standardError = errors
         let diagnostics = SSHDiagnosticBuffer()
         process = ssh
-        writer = RelayWireWriter(input.fileHandleForWriting)
+        writer = RelayWireWriter(input.fileHandleForWriting) { [weak self, weak ssh] message in
+            RelayDiagnostics.shared.record(category: "connection", name: "wire-write-failed", details: [
+                "connection_id": self?.diagnosticConnectionID ?? "node",
+                "transport": "node-mux",
+                "reason": message,
+            ])
+            if ssh?.isRunning == true { ssh?.terminate() }
+        }
         ready = false
         RelayDiagnostics.shared.record(category: "connection", name: "ssh-started", details: [
             "connection_id": diagnosticConnectionID,

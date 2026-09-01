@@ -17,6 +17,11 @@ type indexedAgentRecord struct {
 	Payload  json.RawMessage `json:"payload"`
 }
 
+type agentEventWriter interface {
+	append(sequence uint64, payload []byte) error
+	close() error
+}
+
 type agentEventJournal struct {
 	path string
 	file *os.File
@@ -89,6 +94,13 @@ func (journal *agentEventJournal) append(sequence uint64, payload []byte) error 
 		return journal.compact(records)
 	}
 	return nil
+}
+
+func (journal *agentEventJournal) close() error {
+	if journal.file == nil {
+		return nil
+	}
+	return journal.file.Close()
 }
 
 func (journal *agentEventJournal) compact(records []indexedAgentRecord) error {
