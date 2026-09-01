@@ -1165,3 +1165,42 @@ func restoredTerminalRedrawsAfterReattachment() async throws {
 
 }
 #endif
+
+@Test("Prompt mirror deleteRange removes an exact cursor-relative range without assuming caret adjacency")
+func promptBufferDeleteRangeExactness() {
+    // A mouse selection need not touch the caret. deleteRange must mirror the
+    // remote edit exactly: caret to the range's upper end, erase back to lower.
+    var buffer = TerminalPromptBuffer()
+    buffer.insert("hello world") // caret at 11
+    let removedMiddle = buffer.deleteRange(relativeToCursor: -8, -4) // "lo w", indices 3..<7
+    #expect(removedMiddle)
+    #expect(buffer.text == "helorld")
+    #expect(buffer.cursor == 3)
+
+    // Offset order is irrelevant.
+    var other = TerminalPromptBuffer()
+    other.insert("abcdef")
+    other.move(by: -6) // caret at 0
+    let removedReversed = other.deleteRange(relativeToCursor: 4, 2) // removes "cd"
+    #expect(removedReversed)
+    #expect(other.text == "abef")
+    #expect(other.cursor == 2)
+
+    // Rejections leave the mirror untouched: empty range, out of bounds, unreliable.
+    var guarded = TerminalPromptBuffer()
+    guarded.insert("abc")
+    let rejectedEmpty = guarded.deleteRange(relativeToCursor: 0, 0)
+    #expect(!rejectedEmpty)
+    let rejectedOutOfBounds = guarded.deleteRange(relativeToCursor: -5, -1)
+    #expect(!rejectedOutOfBounds)
+    #expect(guarded.text == "abc")
+    guarded.invalidate()
+    let rejectedUnreliable = guarded.deleteRange(relativeToCursor: -1, 0)
+    #expect(!rejectedUnreliable)
+}
+
+@Test("Cut is a first-class clipboard action")
+func clipboardActionIncludesCut() {
+    #expect(RelayClipboardAction(rawValue: "cut") == .cut)
+    #expect(RelayClipboardAction.allCases.contains(.cut))
+}

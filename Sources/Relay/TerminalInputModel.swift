@@ -232,6 +232,22 @@ struct TerminalPromptBuffer: Equatable, Sendable {
         return true
     }
 
+    /// Removes the characters between two cursor-relative offsets and leaves
+    /// the caret at the lower end — the exact effect of moving the remote caret
+    /// to `upperOffset` and erasing backwards to `lowerOffset`. Unlike
+    /// deleteSelection this does not assume the range touches the caret.
+    @discardableResult
+    mutating func deleteRange(relativeToCursor lowerOffset: Int, _ upperOffset: Int) -> Bool {
+        guard isReliable else { return false }
+        let lower = cursor + min(lowerOffset, upperOffset)
+        let upper = cursor + max(lowerOffset, upperOffset)
+        guard lower >= 0, upper <= characters.count, lower < upper,
+              upper - lower <= 4_096 else { return false }
+        characters.removeSubrange(lower..<upper)
+        cursor = lower
+        return true
+    }
+
     mutating func submit() -> String? {
         let value = isReliable ? text.trimmingCharacters(in: .whitespacesAndNewlines) : ""
         clear()

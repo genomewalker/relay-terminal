@@ -267,9 +267,32 @@ func (writer *Writer) Write(frame Frame) error {
 	var header [5]byte
 	header[0] = byte(frame.Type)
 	binary.BigEndian.PutUint32(header[1:], uint32(len(frame.Payload)))
-	if _, err := writer.writer.Write(header[:]); err != nil {
+	if err := writeAll(writer.writer, header[:]); err != nil {
 		return err
 	}
-	_, err := writer.writer.Write(frame.Payload)
-	return err
+	return writeAll(writer.writer, frame.Payload)
+}
+
+// io.Writer is allowed to accept only a prefix without returning an error.
+// Unix sockets and pipes normally consume a complete small write, but Relay's
+// frames can contain large terminal replays and artifacts. Treating a short
+// write as success drops bytes and permanently desynchronizes every later
+// frame on the shared node connection.
+func writeAll(destination io.Writer, data []byte) error {
+	for len(data) > 0 {
+		written, err := destination.Write(data)
+		if written < 0 || written > len(data) {
+			return io.ErrShortWrite
+		}
+		if written > 0 {
+			data = data[written:]
+		}
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }

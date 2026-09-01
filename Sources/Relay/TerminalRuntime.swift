@@ -4,8 +4,9 @@ import Foundation
 import GhosttyTerminal
 import SwiftUI
 
-enum RelayClipboardAction: String, Sendable {
+enum RelayClipboardAction: String, Sendable, CaseIterable {
     case copy
+    case cut
     case paste
     case selectAll
 }
@@ -3599,6 +3600,7 @@ enum TerminalReplayCompactor {
             var promptRedrawCount = 0
             var promptStormStart: Int?
             var synchronizedFrameCandidate: Int?
+            var synchronizedFrameRepaintsFromTop = false
             var latestCompletedSynchronizedFrame: Int?
 
             while index < bytes.count {
@@ -3636,17 +3638,28 @@ enum TerminalReplayCompactor {
                     // as a new reconstruction base because the current frame
                     // may still be arriving on another SSH packet.
                     synchronizedFrameCandidate = index
+                    synchronizedFrameRepaintsFromTop = false
                     index += synchronizedOutputBegin.count
                     continue
                 }
                 if !inAlternateScreen,
                    sequence(synchronizedOutputEnd, matches: bytes, at: index, before: bytes.count) {
+                    // Size alone is not proof of a full repaint: ratatui (Codex)
+                    // and Ink (Claude Code) emit incremental frames that only
+                    // cursor-address the rows that changed, and those routinely
+                    // exceed the byte floor. Replaying such a frame after RIS
+                    // paints only that fragment and blanks the transcript above
+                    // it. Only a frame that clears the screen is independently
+                    // replayable, so require a clear or a home-to-origin in addition
+                    // to the size.
                     if let candidate = synchronizedFrameCandidate,
+                       synchronizedFrameRepaintsFromTop,
                        index + synchronizedOutputEnd.count - candidate >=
                        minimumReplayableSynchronizedFrameBytes {
                         latestCompletedSynchronizedFrame = candidate
                     }
                     synchronizedFrameCandidate = nil
+                    synchronizedFrameRepaintsFromTop = false
                     index += synchronizedOutputEnd.count
                     continue
                 }
@@ -3667,7 +3680,14 @@ enum TerminalReplayCompactor {
                         break
                     }
                 }
+                if !inAlternateScreen, synchronizedFrameCandidate != nil,
+                   let count = homeSequenceLength(in: bytes, at: index) {
+                    synchronizedFrameRepaintsFromTop = true
+                    index += count
+                    continue
+                }
                 if !inAlternateScreen, let count = clearSequenceLength(in: bytes, at: index) {
+                    if synchronizedFrameCandidate != nil { synchronizedFrameRepaintsFromTop = true }
                     latestPrimaryClear = index
                     promptRedrawCount = 0
                     promptStormStart = nil
@@ -3696,6 +3716,40 @@ enum TerminalReplayCompactor {
               (bytes[index + 2] == 0x32 || bytes[index + 2] == 0x33),
               bytes[index + 3] == 0x4A else { return nil } // ESC [ 2J / 3J
         return 4
+    }
+
+    /// CSI H (CUP) to the top-left corner: `ESC[H`, `ESC[1H`, `ESC[1;1H` and the
+    /// empty-parameter forms. A TUI frame that homes the cursor is repainting
+    /// from the top, which distinguishes a full redraw from an incremental
+    /// frame that only cursor-addresses the rows that changed.
+    private static func homeSequenceLength(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        at index: Int
+    ) -> Int? {
+        guard index + 3 <= bytes.count, bytes[index + 1] == 0x5B else { return nil } // ESC [
+        var cursor = index + 2
+        var row = 0, column = 0, rowDigits = 0, columnDigits = 0
+        var sawSemicolon = false
+        while cursor < bytes.count, cursor - index < 12 {
+            let byte = bytes[cursor]
+            if byte >= 0x30, byte <= 0x39 {
+                if sawSemicolon {
+                    column = column * 10 + Int(byte - 0x30); columnDigits += 1
+                } else {
+                    row = row * 10 + Int(byte - 0x30); rowDigits += 1
+                }
+            } else if byte == 0x3B, !sawSemicolon {
+                sawSemicolon = true
+            } else if byte == 0x48 { // H
+                let rowIsHome = rowDigits == 0 || row == 1
+                let columnIsHome = columnDigits == 0 || column == 1
+                return rowIsHome && columnIsHome ? cursor - index + 1 : nil
+            } else {
+                return nil
+            }
+            cursor += 1
+        }
+        return nil
     }
 
     private static func privateModePrelude(in data: Data, before boundary: Int) -> Data {
@@ -4301,10 +4355,30 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             end: end,
             rowHeight: activeCursorGeometry()?.cellSize.height ?? 0
         )
+        // Prefer an exact logical range when the prompt mirror is reliable and
+        // both endpoints resolve: the count then comes from the mirror, not from
+        // the rendered text, which on wrapped/bordered agent composers includes
+        // chrome glyphs and hard-wrap newlines that are not in the prompt.
+        if promptBuffer.isReliable,
+           let startOffset = cursorMovementOffset(toTerminalPoint: start),
+           let endOffset = cursorMovementOffset(toTerminalPoint: end),
+           startOffset != endOffset {
+            promptSelection = PromptSelection(
+                characterCount: abs(endOffset - startOffset),
+                movementOffset: max(startOffset, endOffset)
+            )
+            return
+        }
         let deletionAnchor = backwards ? start : end
         guard let movementOffset = cursorMovementOffset(toTerminalPoint: deletionAnchor) else { return }
+        // Rendered text can exceed the logical prompt; never delete more than
+        // the mirror holds when it is trustworthy.
+        var characterCount = text.count
+        if promptBuffer.isReliable {
+            characterCount = min(characterCount, promptBuffer.characters.count)
+        }
         promptSelection = PromptSelection(
-            characterCount: text.count,
+            characterCount: characterCount,
             movementOffset: movementOffset
         )
     }
@@ -4392,6 +4466,8 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             switch key {
             case "c":
                 return handleApplicationClipboardAction(.copy)
+            case "x":
+                return handleApplicationClipboardAction(.cut)
             case "v":
                 return handleApplicationClipboardAction(.paste)
             case "a":
@@ -4408,6 +4484,8 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         switch action {
         case .copy:
             return copyRelaySelectionToPasteboard()
+        case .cut:
+            return cutRelayPromptSelection()
         case .paste:
             return pasteFromClipboard()
         case .selectAll:
@@ -5048,11 +5126,15 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             movementOffset: selection.movementOffset,
             deletionCount: selection.characterCount
         )
-        let relativeOffset = selection.movementOffset > 0
-            ? selection.characterCount
-            : -selection.characterCount
         if recordHistory { recordPromptEdit(.deleting) }
-        if !promptBuffer.deleteSelection(relativeToCursor: relativeOffset) {
+        // Mirror exactly what the remote receives: the caret moves by
+        // movementOffset to the logical end of the range, then characterCount
+        // backspaces erase back to its start. (deleteSelection assumed the
+        // range touched the caret, which a mouse selection need not.)
+        if !promptBuffer.deleteRange(
+            relativeToCursor: selection.movementOffset - selection.characterCount,
+            selection.movementOffset
+        ) {
             invalidatePromptMirror()
         }
     }
@@ -5289,6 +5371,16 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         promptBuffer.insert(text)
         if !promptBuffer.isReliable { promptHistory.reset() }
         owner?.userEnteredInput()
+        return true
+    }
+
+    /// Cut = copy the selection, then delete it from the live prompt. Only an
+    /// armed prompt selection is deletable, so cutting old transcript output
+    /// degrades to a plain copy rather than doing nothing.
+    @discardableResult
+    private func cutRelayPromptSelection() -> Bool {
+        guard copyRelaySelectionToPasteboard() else { return false }
+        deleteCurrentPromptSelection()
         return true
     }
 

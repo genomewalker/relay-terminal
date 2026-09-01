@@ -3,8 +3,25 @@ package protocol
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"testing"
 )
+
+type shortWriter struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (writer *shortWriter) Write(data []byte) (int, error) {
+	if len(data) > writer.limit {
+		data = data[:writer.limit]
+	}
+	return writer.buffer.Write(data)
+}
+
+type stalledWriter struct{}
+
+func (stalledWriter) Write([]byte) (int, error) { return 0, nil }
 
 func TestFrameRoundTrip(t *testing.T) {
 	var wire bytes.Buffer
@@ -23,6 +40,35 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 	if sequence != 42 || !bytes.Equal(payload, []byte("hello\x00terminal")) {
 		t.Fatalf("unexpected output: seq=%d payload=%q", sequence, payload)
+	}
+}
+
+func TestWriterCompletesShortWritesWithoutDesynchronizingFrames(t *testing.T) {
+	wire := &shortWriter{limit: 3}
+	w := NewWriter(wire)
+	want := []Frame{
+		OutputFrame(41, bytes.Repeat([]byte("a"), 257)),
+		OutputFrame(42, []byte("next frame")),
+	}
+	for _, frame := range want {
+		if err := w.Write(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index, expected := range want {
+		got, err := ReadFrame(&wire.buffer)
+		if err != nil {
+			t.Fatalf("read frame %d: %v", index, err)
+		}
+		if got.Type != expected.Type || !bytes.Equal(got.Payload, expected.Payload) {
+			t.Fatalf("frame %d was corrupted by short writes", index)
+		}
+	}
+}
+
+func TestWriterRejectsZeroProgress(t *testing.T) {
+	if err := NewWriter(stalledWriter{}).Write(Frame{Type: Ping}); err != io.ErrShortWrite {
+		t.Fatalf("zero-progress write error = %v, want %v", err, io.ErrShortWrite)
 	}
 }
 

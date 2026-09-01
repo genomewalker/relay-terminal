@@ -1193,9 +1193,9 @@ func compactTerminalReplay() {
 
 @Test("Terminal replay keeps the latest complete synchronized TUI frame")
 func compactSynchronizedTerminalFrames() {
-    let first = "\u{001B}[?2026h\u{001B}[10;1Hfirst frame" +
+    let first = "\u{001B}[?2026h\u{001B}[Hfirst frame" +
         String(repeating: "a", count: 600) + "\u{001B}[?2026l"
-    let latest = "\u{001B}[?2026h\u{001B}[10;1Hlatest frame" +
+    let latest = "\u{001B}[?2026h\u{001B}[Hlatest frame" +
         String(repeating: "b", count: 600) + "\u{001B}[?2026l"
     let incomplete = "\u{001B}[?2026h\u{001B}[11;1Hlive tail"
     let history = Data(("old redraws" + first + latest + incomplete).utf8)
@@ -1221,6 +1221,32 @@ func compactSynchronizedTerminalDeltas() {
     #expect(compacted.contains("full frame"))
     #expect(compacted.components(separatedBy: "Working").count == 3)
     #expect(!compacted.contains("old redraws"))
+}
+
+@Test("Terminal replay does not use a partial synchronized frame as a base")
+func compactSynchronizedPartialFramesKeepTranscript() {
+    // ratatui (Codex) and Ink (Claude Code) frames are incremental: a large
+    // frame that only cursor-addresses rows 10+ must not become the post-RIS
+    // base, or the transcript above it is blank after a restore.
+    let transcript = "transcript line one\r\ntranscript line two\r\n"
+    let partial = "\u{001B}[?2026h\u{001B}[10;1Hstreaming response" +
+        String(repeating: "r", count: 700) + "\u{001B}[?2026l"
+    let history = Data((transcript + partial + partial).utf8)
+
+    let compacted = String(decoding: TerminalReplayCompactor.compact(history), as: UTF8.self)
+    #expect(compacted.contains("transcript line one"))
+    #expect(compacted.contains("streaming response"))
+    #expect(!TerminalReplayCompactor.hasCompletedSynchronizedFrame(history))
+
+    // A frame that repaints from the top-left is a legitimate base.
+    let full = "\u{001B}[?2026h\u{001B}[Hredrawn screen" +
+        String(repeating: "f", count: 700) + "\u{001B}[?2026l"
+    let replaced = String(
+        decoding: TerminalReplayCompactor.compact(Data((transcript + full).utf8)),
+        as: UTF8.self
+    )
+    #expect(!replaced.contains("transcript line one"))
+    #expect(replaced.contains("redrawn screen"))
 }
 
 @Test("Synchronized frames inside the alternate screen retain their owner")

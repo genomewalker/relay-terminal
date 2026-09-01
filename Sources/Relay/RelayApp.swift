@@ -130,6 +130,7 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
                !(NSApp.keyWindow?.firstResponder is NSTextView) {
                 let action: RelayClipboardAction? = switch key {
                 case "c": .copy
+                case "x": .cut
                 case "v": .paste
                 case "a": .selectAll
                 default: nil
@@ -419,6 +420,7 @@ struct RelayApp: App {
         // Ghostty's asynchronous clipboard lookup after a focus transition.
         let selectorName = switch action {
         case .copy: "copy:"
+        case .cut: "cut:"
         case .paste: "paste:"
         case .selectAll: "selectAll:"
         }
@@ -494,6 +496,8 @@ struct RelayApp: App {
             CommandGroup(replacing: .pasteboard) {
                 Button("Copy") { performClipboardCommand(.copy) }
                     .keyboardShortcut("c", modifiers: .command)
+                Button("Cut") { performClipboardCommand(.cut) }
+                    .keyboardShortcut("x", modifiers: .command)
                 Button("Paste") { performClipboardCommand(.paste) }
                     .keyboardShortcut("v", modifiers: .command)
                 Button("Select All") { performClipboardCommand(.selectAll) }
