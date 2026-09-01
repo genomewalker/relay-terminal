@@ -134,10 +134,15 @@ struct SSHConnectionFailure: Equatable, Sendable {
 enum RelayPaneAttachPolicy {
     // The node stream itself has already completed SSH authentication before a
     // pane hello is sent. At normal HPC latencies this response is measured in
-    // milliseconds, so a 1.5 second silence is a wedged virtual channel rather
-    // than a slow login. Fall back once instead of displaying an empty pane for
-    // two full watchdog cycles.
-    static let handshakeTimeoutMilliseconds = 1_500
+    // milliseconds. Compatibility recovery for durable workers is slower but
+    // still bounded; only fall back after that complete window instead of
+    // displaying an empty pane through repeated watchdog cycles.
+    // A current worker normally attaches in a few milliseconds. A durable
+    // worker from an older relayd can require a bounded compatibility repaint:
+    // opening its observer may take up to two seconds and the observed resize
+    // barrier up to another 1.5 seconds. Do not mistake that deliberate work
+    // for a dead multiplex route and fan the pane out onto another SSH process.
+    static let handshakeTimeoutMilliseconds = 4_000
     static let dedicatedTransportAfterAttempt = 1
 
     static func retryDelayMilliseconds(attempt: Int, waitingForInputLease: Bool) -> Int {

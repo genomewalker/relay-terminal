@@ -17,6 +17,7 @@ struct RelaydHostReport: Equatable, Sendable {
     var state: RelaydHostState = .unknown
     var architecture = "—"
     var version: String?
+    var payloadHash: String?
     var liveVersion: String?
     var protocolVersion: Int?
     var supervisorPID: Int?
@@ -62,7 +63,11 @@ enum RelaydStatusParser {
     static let logBegin = "RELAYD_LOG_BEGIN"
     static let logEnd = "RELAYD_LOG_END"
 
-    static func parse(_ data: Data, expectedVersion: String) throws -> RelaydHostReport {
+    static func parse(
+        _ data: Data,
+        expectedVersion: String,
+        expectedPayloadHashes: [String: String] = [:]
+    ) throws -> RelaydHostReport {
         guard let text = String(data: data, encoding: .utf8) else {
             throw RelaydManagementError.invalidResponse
         }
@@ -88,6 +93,7 @@ enum RelaydStatusParser {
         let nonce: String?
         let architecture: String
         let version: String
+        let payloadHash: String?
         let liveVersion: String?
         let protocolVersion: Int?
         let supervisorPID: Int?
@@ -100,6 +106,8 @@ enum RelaydStatusParser {
             protocolVersion = Int(fields[5]).flatMap { $0 > 0 ? $0 : nil }
             supervisorPID = supervisorPIDValue(fields[6])
             catalogHealthy = fields.count < 9 || fields[8] == "1"
+            payloadHash = fields.count >= 10 && fields[9] != "unknown"
+                ? fields[9].lowercased() : nil
         } else if fields.count >= 5 {
             nonce = nil
             architecture = fields[1]
@@ -108,6 +116,7 @@ enum RelaydStatusParser {
             liveVersion = supervisorPID == nil ? nil : version
             protocolVersion = nil
             catalogHealthy = true
+            payloadHash = nil
         } else {
             throw RelaydManagementError.invalidResponse
         }
@@ -130,7 +139,17 @@ enum RelaydStatusParser {
         let recoverable = catalog.panes.count(where: \.recoverable)
         let installedOrder = compareVersions(version, expectedVersion)
         let liveIsCurrent = liveVersion == nil || compareVersions(liveVersion!, expectedVersion) != .orderedAscending
-        let state: RelaydHostState = installedOrder != .orderedAscending && liveIsCurrent && catalogHealthy
+        let expectedPayloadHash = expectedPayloadHashes[normalizedArchitecture(architecture)]?.lowercased()
+        // A semantic version identifies the wire contract, not the exact
+        // daemon build. Development and patched release builds may retain the
+        // same version, so compare the signed app payload before declaring a
+        // trusted host current. Never use a hash mismatch to downgrade a
+        // genuinely newer remote version.
+        let payloadIsCurrent = expectedPayloadHash == nil ||
+            installedOrder == .orderedDescending ||
+            payloadHash == expectedPayloadHash
+        let state: RelaydHostState = installedOrder != .orderedAscending &&
+            liveIsCurrent && catalogHealthy && payloadIsCurrent
             ? .ready : .outdated
         let message: String?
         if !catalogHealthy {
@@ -139,6 +158,8 @@ enum RelaydStatusParser {
             message = "Installed version \(version); Relay includes \(expectedVersion)."
         } else if installedOrder == .orderedDescending {
             message = "The host has newer relayd \(version). This app will not downgrade it."
+        } else if !payloadIsCurrent {
+            message = "Installed relayd \(version) is a different build from the helper included with this app."
         } else if let liveVersion, liveVersion != expectedVersion {
             message = "The running supervisor is \(liveVersion); Relay includes \(expectedVersion)."
         } else if supervisorPID == nil {
@@ -150,6 +171,7 @@ enum RelaydStatusParser {
             state: state,
             architecture: architecture,
             version: version,
+            payloadHash: payloadHash,
             liveVersion: liveVersion,
             protocolVersion: protocolVersion,
             supervisorPID: supervisorPID,
@@ -165,6 +187,14 @@ enum RelaydStatusParser {
 
     private static func normalizedVersion(_ value: String) -> String {
         value.replacingOccurrences(of: "relayd ", with: "")
+    }
+
+    private static func normalizedArchitecture(_ value: String) -> String {
+        switch value.lowercased() {
+        case "x86_64", "amd64": "amd64"
+        case "aarch64", "arm64": "arm64"
+        default: value.lowercased()
+        }
     }
 
     private static func supervisorPIDValue(_ value: String) -> Int? {
@@ -209,6 +239,7 @@ enum RelaydRemoteClient {
 
     static func check(profile: ConnectionProfile) async throws -> RelaydHostReport {
         try await Task.detached(priority: .userInitiated) {
+            let expectedPayloadHashes = bundledPayloadHashes()
             let result = try runSSH(profile: profile, script: statusScript, timeout: 15)
             guard result.status == 0 else {
                 let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -216,8 +247,23 @@ enum RelaydRemoteClient {
                     message.isEmpty ? "Could not check relayd on \(profile.name)." : message
                 )
             }
-            return try RelaydStatusParser.parse(result.output, expectedVersion: expectedVersion)
+            return try RelaydStatusParser.parse(
+                result.output,
+                expectedVersion: expectedVersion,
+                expectedPayloadHashes: expectedPayloadHashes
+            )
         }.value
+    }
+
+    private static func bundledPayloadHashes() -> [String: String] {
+        ["amd64", "arm64"].reduce(into: [String: String]()) { hashes, architecture in
+            let name = "relayd-linux-\(architecture)"
+            guard let url = Bundle.main.resourceURL?.appendingPathComponent(name),
+                  let binary = try? Data(contentsOf: url), !binary.isEmpty else { return }
+            hashes[architecture] = SHA256.hash(data: binary)
+                .map { String(format: "%02x", $0) }
+                .joined()
+        }
     }
 
     static func install(profile: ConnectionProfile, architecture: String) async throws {
@@ -236,7 +282,12 @@ enum RelaydRemoteClient {
             }
             let hash = SHA256.hash(data: binary).map { String(format: "%02x", $0) }.joined()
             let script = installScript(expectedHash: hash, architecture: goArchitecture)
-            let result = try runSSH(profile: profile, script: script, input: binary, timeout: 30)
+            // Replacing a supervisor is normally immediate, but a loaded HPC
+            // login node can take tens of seconds to schedule the new daemon
+            // and answer its authenticated probe. Keep the UI operation
+            // bounded without turning a successful handoff into a false
+            // installation failure.
+            let result = try runSSH(profile: profile, script: script, input: binary, timeout: 60)
             guard result.status == 0 else {
                 let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
                 throw RelaydManagementError.commandFailed(
@@ -256,6 +307,20 @@ if [ ! -x "$relay_bin" ]; then
     exit 0
 fi
 version="$($relay_bin --version 2>/dev/null || printf unknown)"
+case "$arch" in
+    x86_64|amd64) payload_arch=amd64 ;;
+    aarch64|arm64) payload_arch=arm64 ;;
+    *) payload_arch=unknown ;;
+esac
+payload="$HOME/.local/share/relay/bin/relayd-linux-$payload_arch"
+payload_hash=unknown
+if [ -r "$payload" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+        payload_hash="$(sha256sum "$payload" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        payload_hash="$(shasum -a 256 "$payload" | awk '{print $1}')"
+    fi
+fi
 if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     relay_socket="$XDG_RUNTIME_DIR/relayd.sock"
 else
@@ -284,8 +349,8 @@ case "$live_line" in
         fi
         ;;
 esac
-printf 'RELAYD_STATUS\t%s\t%s\t%s\t%s\t%s\t%s\t2\t%s\n' \
-    "$nonce" "$arch" "$version" "$live_version" "$live_protocol" "$relay_pid" "$catalog_ok"
+printf 'RELAYD_STATUS\t%s\t%s\t%s\t%s\t%s\t%s\t3\t%s\t%s\n' \
+    "$nonce" "$arch" "$version" "$live_version" "$live_protocol" "$relay_pid" "$catalog_ok" "$payload_hash"
 printf 'RELAYD_CATALOG_BEGIN\t%s\n' "$nonce"
 printf '%s\n' "$catalog_output"
 printf 'RELAYD_CATALOG_END\t%s\nRELAYD_LOG_BEGIN\t%s\n' "$nonce" "$nonce"

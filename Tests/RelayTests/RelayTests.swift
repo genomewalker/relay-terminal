@@ -941,7 +941,7 @@ private final class RelayNodeFrameRecorder: @unchecked Sendable {
 
 @Test("A stalled pane handshake retries forever with bounded backoff")
 func paneAttachRetryPolicy() {
-    #expect(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds == 1_500)
+    #expect(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds == 4_000)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: false) == 250)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: false) == 4_000)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: true) == 5_500)
@@ -1550,6 +1550,36 @@ func relaydCatalogFailureIsRepairable() throws {
     let report = try RelaydStatusParser.parse(Data(response.utf8), expectedVersion: "0.5.2")
     #expect(report.state == .outdated)
     #expect(report.message?.contains("repair") == true)
+}
+
+@Test("relayd status detects a different payload at the same version")
+func relaydStatusDetectsSameVersionBuildMismatch() throws {
+    let nonce = "relay-status-9-300"
+    let catalog = #"{"schema":1,"revision":0,"panes":[],"workspace_states":{}}"#
+    let response = """
+    RELAYD_STATUS\t\(nonce)\tx86_64\trelayd 0.5.2\t0.5.2\t2\t100\t3\t1\told-hash
+    RELAYD_CATALOG_BEGIN\t\(nonce)
+    \(catalog)
+    RELAYD_CATALOG_END\t\(nonce)
+    RELAYD_LOG_BEGIN\t\(nonce)
+    RELAYD_LOG_END\t\(nonce)
+    """
+
+    let outdated = try RelaydStatusParser.parse(
+        Data(response.utf8),
+        expectedVersion: "0.5.2",
+        expectedPayloadHashes: ["amd64": "new-hash"]
+    )
+    #expect(outdated.state == .outdated)
+    #expect(outdated.payloadHash == "old-hash")
+    #expect(outdated.message?.contains("different build") == true)
+
+    let current = try RelaydStatusParser.parse(
+        Data(response.utf8),
+        expectedVersion: "0.5.2",
+        expectedPayloadHashes: ["amd64": "old-hash"]
+    )
+    #expect(current.state == .ready)
 }
 
 @Test("Terminal snapshots use a battery-friendly write debounce")

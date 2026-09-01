@@ -72,7 +72,7 @@ func runUpgradeSupervisor(arguments []string) {
 
 	// A shared HPC login node may have dozens of panes reconnecting while the socket changes
 	// owners. Give the validated replacement time to win that bounded startup race.
-	verificationDeadline := time.Now().Add(15 * time.Second)
+	verificationDeadline := time.Now().Add(30 * time.Second)
 	var live liveSupervisor
 	for {
 		live, err = inspectSupervisor(*socket)
