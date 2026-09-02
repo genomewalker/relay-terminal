@@ -58,27 +58,6 @@ enum TerminalPromptSelectionEdit {
         return String(repeating: "\u{007F}", count: count)
     }
 
-    /// Whether a drag selection ran right-to-left / bottom-to-top, i.e. the
-    /// logical end of the selected range is the drag's START point. Compared
-    /// in cell rows, not raw pixels: a same-row trackpad drag routinely
-    /// drifts more vertically than the old 4-point band allowed, and a
-    /// misclassification anchors the synthesized backspaces at the wrong end
-    /// of the selection, deleting text outside it.
-    static func selectionIsBackwards(
-        start: CGPoint,
-        end: CGPoint,
-        rowHeight: CGFloat
-    ) -> Bool {
-        guard rowHeight.isFinite, rowHeight > 0,
-              start.y.isFinite, end.y.isFinite else {
-            return end.y < start.y - 4 || (abs(end.y - start.y) <= 4 && end.x < start.x)
-        }
-        let startRow = floor(start.y / rowHeight)
-        let endRow = floor(end.y / rowHeight)
-        if endRow != startRow { return endRow < startRow }
-        return end.x < start.x
-    }
-
     static func selectionIsNearCursor(
         startY: CGFloat,
         endY: CGFloat,
@@ -4345,41 +4324,22 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         }
         guard canEditPrompt, let start,
               hypot(end.x - start.x, end.y - start.y) >= 2,
-              selectionIsNearActivePrompt(start: start, end: end),
-              copySelectedTextToPasteboard(),
-              let text = NSPasteboard.general.string(forType: .string),
-              TerminalPromptSelectionEdit.deletionSequence(for: text, backwards: true) != nil
+              selectionIsNearActivePrompt(start: start, end: end)
         else { return }
-        let backwards = TerminalPromptSelectionEdit.selectionIsBackwards(
-            start: start,
-            end: end,
-            rowHeight: activeCursorGeometry()?.cellSize.height ?? 0
-        )
-        // Prefer an exact logical range when the prompt mirror is reliable and
-        // both endpoints resolve: the count then comes from the mirror, not from
-        // the rendered text, which on wrapped/bordered agent composers includes
-        // chrome glyphs and hard-wrap newlines that are not in the prompt.
-        if promptBuffer.isReliable,
-           let startOffset = cursorMovementOffset(toTerminalPoint: start),
-           let endOffset = cursorMovementOffset(toTerminalPoint: end),
-           startOffset != endOffset {
-            promptSelection = PromptSelection(
-                characterCount: abs(endOffset - startOffset),
-                movementOffset: max(startOffset, endOffset)
-            )
-            return
-        }
-        let deletionAnchor = backwards ? start : end
-        guard let movementOffset = cursorMovementOffset(toTerminalPoint: deletionAnchor) else { return }
-        // Rendered text can exceed the logical prompt; never delete more than
-        // the mirror holds when it is trustworthy.
-        var characterCount = text.count
-        if promptBuffer.isReliable {
-            characterCount = min(characterCount, promptBuffer.characters.count)
-        }
+        // Arm a prompt deletion only from the logical prompt mirror. The
+        // previous fallback copied Ghostty's rendered selection to obtain a
+        // character count, which wrote the system clipboard on every prompt
+        // drag — and a jittery click past the drag threshold clobbered
+        // whatever the user was about to paste. When the mirror cannot
+        // resolve both endpoints no deletion is armed; Cmd+C still copies.
+        guard promptBuffer.isReliable,
+              let startOffset = cursorMovementOffset(toTerminalPoint: start),
+              let endOffset = cursorMovementOffset(toTerminalPoint: end),
+              startOffset != endOffset
+        else { return }
         promptSelection = PromptSelection(
-            characterCount: characterCount,
-            movementOffset: movementOffset
+            characterCount: abs(endOffset - startOffset),
+            movementOffset: max(startOffset, endOffset)
         )
     }
 

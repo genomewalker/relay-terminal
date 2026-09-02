@@ -857,10 +857,11 @@ func relayRemoteShellTranscriptSelectionCopiesLocally() async throws {
     try await Task.sleep(for: .milliseconds(30))
     #expect(pasteboard.string(forType: .string) == probe)
 
-    // Starting a second drag must replace the retained renderer selection,
-    // not extend the old anchor. Relay deliberately keeps the highlight after
-    // copying, which used to make a later selection intermittently include
-    // more transcript text than the pointer covered.
+    // Starting a second drag must replace any renderer selection that still
+    // remains, not extend the old anchor. Relay replays local drags with
+    // Shift held, and Ghostty's Shift+press extends an existing selection —
+    // which used to make a later selection intermittently include more
+    // transcript text than the pointer covered.
     let cellWidth = max(
         1,
         (endLocal.x - startLocal.x) / CGFloat(probe.count)

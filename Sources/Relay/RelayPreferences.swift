@@ -200,9 +200,13 @@ final class RelayPreferences: ObservableObject {
             builder.withSelectionBackground(palette.selectionBackground)
             builder.withSelectionForeground(palette.selectionForeground)
             // Relay reads the local selection to implement prompt editing.
-            // Keep it painted after that internal copy; normal typing still
-            // clears it through Ghostty's default selection-clear-on-typing.
-            builder.withCustom("selection-clear-on-copy", "false")
+            // Clear the renderer selection after an explicit copy. Relay
+            // replays local drags with Shift held so Ghostty selects under TUI
+            // mouse reporting; with a retained selection, Ghostty's
+            // Shift+press EXTENDS from the old anchor, so a later drag (or a
+            // jittery click) silently spanned a previous selection. Until the
+            // fork exposes a selection reset, drop the anchor on copy.
+            builder.withCustom("selection-clear-on-copy", "true")
             builder.withCustom("minimum-contrast", "2.2")
             builder.withBackgroundOpacity(1)
             builder.withCursorColor(palette.cursor)
@@ -214,7 +218,11 @@ final class RelayPreferences: ObservableObject {
             let padding = Int(min(max(terminalPadding.rounded(), 0), 32))
             builder.withWindowPaddingX(padding)
             builder.withWindowPaddingY(padding)
-            builder.withCustom("copy-on-select", "clipboard")
+            // Never let pointer gestures write the system clipboard: Ghostty
+            // re-copies a retained selection on every left-button release, so
+            // a misclassified click clobbered whatever the user was about to
+            // paste. Copy is explicit (Cmd+C / Edit menu) in Relay.
+            builder.withCustom("copy-on-select", "false")
             builder.withCustom("mouse-hide-while-typing", "true")
             // libghostty's macOS exec backend starts login shells through
             // /usr/bin/login. Auto-detection therefore sees `login` instead of

@@ -2575,7 +2575,8 @@ func terminalSelectionColorsAreExplicit() {
         )
         #expect(rendered.contains("font-size = \(expectedSize)"))
         #expect(rendered.contains("minimum-contrast = 2.2"))
-        #expect(rendered.contains("selection-clear-on-copy = false"))
+        #expect(rendered.contains("selection-clear-on-copy = true"))
+        #expect(rendered.contains("copy-on-select = false"))
         #expect(rendered.contains("shell-integration = "))
         #expect(rendered.contains("cursor-click-to-move = false"))
         #expect(!rendered.contains("13,5"))
@@ -2918,31 +2919,6 @@ func relayTerminfoInstallation() throws {
         fileManager: .default
     )
     #expect(fallback.activeTerm == "xterm-256color")
-}
-
-@Test("Backwards selection detection uses cell rows, not a 4-point pixel band")
-func selectionBackwardsClassification() {
-    let rowHeight: CGFloat = 17
-    // Forward same-row drag drifting 6pt upward stays forward.
-    #expect(!TerminalPromptSelectionEdit.selectionIsBackwards(
-        start: CGPoint(x: 40, y: 100), end: CGPoint(x: 180, y: 94), rowHeight: rowHeight
-    ))
-    // Right-to-left same-row drag drifting 6pt downward is backwards.
-    #expect(TerminalPromptSelectionEdit.selectionIsBackwards(
-        start: CGPoint(x: 180, y: 94), end: CGPoint(x: 40, y: 100), rowHeight: rowHeight
-    ))
-    // A drag ending on an earlier row is backwards regardless of x.
-    #expect(TerminalPromptSelectionEdit.selectionIsBackwards(
-        start: CGPoint(x: 40, y: 100), end: CGPoint(x: 180, y: 60), rowHeight: rowHeight
-    ))
-    // A drag ending on a later row is forward regardless of x.
-    #expect(!TerminalPromptSelectionEdit.selectionIsBackwards(
-        start: CGPoint(x: 180, y: 60), end: CGPoint(x: 40, y: 100), rowHeight: rowHeight
-    ))
-    // Without a usable row height the legacy pixel heuristic still applies.
-    #expect(TerminalPromptSelectionEdit.selectionIsBackwards(
-        start: CGPoint(x: 180, y: 100), end: CGPoint(x: 40, y: 100), rowHeight: 0
-    ))
 }
 
 @Test("ssh_config Key=Value syntax is tokenized like whitespace-separated options")
