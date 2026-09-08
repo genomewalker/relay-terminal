@@ -151,6 +151,14 @@ fi
 /usr/bin/codesign --verify --deep --strict "$app_path"
 
 mkdir -p "$(dirname "$output_path")"
+# Replacing a live bundle leaves the process executing the old image while
+# loading resources from the new installation (or the removed staging path).
+# Require a clean quit before replacing it so an install cannot look successful
+# while the user's windows still run the previous build.
+if /bin/ps -axo comm= | /usr/bin/grep -Fx "$output_path/Contents/MacOS/Relay" >/dev/null; then
+    echo "Relay is still running from $output_path. Quit Relay and rerun this script to install the build." >&2
+    exit 1
+fi
 previous_path="$stage_root/Relay.previous.app"
 if [[ -e "$output_path" || -L "$output_path" ]]; then
     /bin/mv "$output_path" "$previous_path"

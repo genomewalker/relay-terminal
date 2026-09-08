@@ -643,10 +643,18 @@ func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest,
 			return manifest, nil
 		} else if liveErr == nil && state == "exited" {
 			server.stopValidatedWorker(manifest)
+		} else if identityErr := validateWorkerIdentity(manifest); identityErr == nil {
+			// A slow handshake is not evidence that the PTY owner died. In
+			// particular, a loaded HPC node can miss the probe deadline while
+			// Claude/Codex and its worker are still alive. Replacing its manifest
+			// would orphan that terminal and create another shell with the same ID.
+			return workerManifest{}, fmt.Errorf("pane worker %d is still alive but unavailable; retry attachment: %v", manifest.WorkerPID, liveErr)
 		}
 		server.cleanStaleWorker(manifestPath, manifest)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		removeManifest(manifestPath)
+		// Preserve recovery metadata on unreadable/corrupt files. Starting a
+		// replacement without knowing the old owner's identity can fork a pane.
+		return workerManifest{}, fmt.Errorf("cannot read pane worker metadata: %w", err)
 	}
 	if hello.EventOnly || hello.ObserveEvents {
 		return workerManifest{}, errors.New("Relay pane worker is not running")
