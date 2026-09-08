@@ -50,7 +50,7 @@ type FileDiff struct {
 func ResolveWorkspace(parentSessionID, requested string) (WorkspaceInfo, error) {
 	path := strings.TrimSpace(requested)
 	if path == "" && validSessionID.MatchString(parentSessionID) {
-		manifestPath := filepath.Join(defaultWorkerStateDir(), parentSessionID+".json")
+		manifestPath := NewServer().manifestPath(parentSessionID)
 		if parent, err := loadManifest(manifestPath); err == nil && validateWorkerIdentity(parent) == nil {
 			if directory, cwdErr := processWorkingDirectory(parent.ShellPID); cwdErr == nil {
 				path = directory

@@ -110,9 +110,18 @@ func (server *Server) CatalogSnapshot() (CatalogSnapshot, error) {
 	if err != nil {
 		return CatalogSnapshot{}, err
 	}
+	recoveredPaths, err := filepath.Glob(filepath.Join(filepath.Dir(server.recoveredManifestPath("unused")), "*.json"))
+	if err != nil {
+		return CatalogSnapshot{}, err
+	}
+	manifestPaths = append(manifestPaths, recoveredPaths...)
 	seen := make(map[string]bool, len(manifestPaths))
 	for _, path := range manifestPaths {
-		manifest, loadErr := loadManifest(path)
+		id := strings.TrimSuffix(filepath.Base(path), ".json")
+		if seen[id] || !validSessionID.MatchString(id) {
+			continue
+		}
+		manifest, loadErr := loadManifest(server.manifestPath(id))
 		if loadErr != nil {
 			continue
 		}

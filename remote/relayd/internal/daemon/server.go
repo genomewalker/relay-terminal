@@ -641,6 +641,8 @@ func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest,
 	if manifest, err := loadManifest(manifestPath); err == nil {
 		if state, liveErr := server.workerState(manifest); liveErr == nil && state == "ready" {
 			return manifest, nil
+		} else if manifestPath == server.recoveredManifestPath(hello.SessionID) {
+			return workerManifest{}, fmt.Errorf("recovered pane worker %d is unavailable; retry or explicitly recover another worker", manifest.WorkerPID)
 		} else if liveErr == nil && state == "exited" {
 			server.stopValidatedWorker(manifest)
 		} else if identityErr := validateWorkerIdentity(manifest); identityErr == nil {
@@ -851,7 +853,18 @@ func (server *Server) cleanStaleWorker(manifestPath string, manifest workerManif
 }
 
 func (server *Server) manifestPath(sessionID string) string {
+	// A deliberately recovered owner takes precedence over the old shared
+	// manifest, which duplicate legacy workers can still overwrite.
+	recovered := server.recoveredManifestPath(sessionID)
+	if _, err := os.Lstat(recovered); !errors.Is(err, os.ErrNotExist) {
+		return recovered
+	}
 	return filepath.Join(server.stateDir, sessionID+".json")
+}
+
+func (server *Server) recoveredManifestPath(sessionID string) string {
+	nodeID, _ := currentNodeIdentity()
+	return filepath.Join(server.stateDir, "recovered-"+nodeID, sessionID+".json")
 }
 
 func (server *Server) workerSocketPath(sessionID, token string) string {

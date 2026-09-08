@@ -109,6 +109,25 @@ The development installer remains available:
 
 The first Relay connection starts the per-user daemon automatically.
 
+An attachment probe timing out no longer replaces a worker whose process is
+still alive. Relay retries the attachment and preserves the existing PTY.
+For sessions affected by older versions creating duplicate workers, recover
+the intended worker on its Linux host:
+
+```bash
+relayd recover --session <pane-session-id> --worker-pid <existing-relayd-worker-pid>
+```
+
+Use the worker PID, not the Claude/Codex PID. Recovery checks process ownership,
+session identity, and socket authentication, then records the selected worker
+separately so other legacy workers cannot overwrite the choice. Reconnect the
+pane afterward. Recovery does not kill, restart, or merge any processes; if the
+selected worker becomes unavailable, attachment fails instead of opening a
+different shell.
+If an older supervisor already deleted that worker's socket, this command
+cannot reconnect it. The saved agent conversation must be resumed separately
+after deciding how to handle the original process.
+
 Relay also installs its bundled `xterm-relay` entry into the current user's terminfo database. Remote hosts receive the compiled entry from `relayd`; they do not need `tic`. Settings reports the active entry and its content hash. Programs run through `sudo` may not see a user-private entry, so Relay keeps `xterm-256color` as the safe fallback and shows an optional one-time system-install command. Relay never requests administrator access silently.
 
 The installer adds Relay-only `claude` and `codex` shims to remote shells created by Relay. It creates an `rcode` symlink only when that name is unused or already belongs to Relay; an unrelated command is never replaced. The agent shims launch the real commands with structured hooks, while normal SSH shells keep their existing `PATH`. An explicit launch also works:

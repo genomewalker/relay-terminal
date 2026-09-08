@@ -141,3 +141,45 @@ func TestEnsureWorkerPreservesOwnerAfterProbeTimeout(t *testing.T) {
 		t.Fatalf("worker socket removed: %v", err)
 	}
 }
+
+func TestRecoveredOwnerWinsOverLegacyManifestUpdates(t *testing.T) {
+	server := &Server{stateDir: t.TempDir(), executable: "/must-not-start-a-replacement"}
+	start, err := processStartTime(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := nodeBootID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := workerManifest{Version: workerProtocolVersion, SessionID: "recovered-pane",
+		WorkerPID: os.Getpid(), WorkerStartTime: start, NodeBootID: boot,
+		State: "running", Token: "selected", SocketPath: "/no-such-recovery-socket"}
+	legacyPath := filepath.Join(server.stateDir, selected.SessionID+".json")
+	if err := storeManifest(server.recoveredManifestPath(selected.SessionID), selected); err != nil {
+		t.Fatal(err)
+	}
+	legacy := selected
+	legacy.Token = "legacy"
+	legacy.WorkerPID = 1
+	if err := storeManifest(legacyPath, legacy); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadManifest(server.manifestPath(selected.SessionID))
+	if err != nil || got.Token != "selected" {
+		t.Fatalf("legacy worker displaced recovered owner: %v", err)
+	}
+	snapshot, err := server.CatalogSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Panes) != 1 || snapshot.Panes[0].WorkerPID != selected.WorkerPID {
+		t.Fatalf("catalog disagrees with attachment owner: %#v", snapshot.Panes)
+	}
+	if _, err := server.ensureWorker(protocol.HelloPayload{SessionID: selected.SessionID}); err == nil {
+		t.Fatal("unavailable recovered owner must not silently switch to another shell")
+	}
+	if _, err := os.Stat(server.recoveredManifestPath(selected.SessionID)); err != nil {
+		t.Fatal(err)
+	}
+}

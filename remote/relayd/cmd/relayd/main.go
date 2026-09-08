@@ -60,6 +60,8 @@ func main() {
 		runObserveMany(os.Args[2:])
 	case "sessions":
 		runSessions(os.Args[2:])
+	case "recover":
+		runRecover(os.Args[2:])
 	case "terminate":
 		runTerminate(os.Args[2:])
 	case "forget":
@@ -803,6 +805,20 @@ func runSessions(arguments []string) {
 	if err := daemon.EncodeJSON(os.Stdout, snapshot); err != nil {
 		fatal(err.Error())
 	}
+}
+
+func runRecover(arguments []string) {
+	flags := flag.NewFlagSet("recover", flag.ExitOnError)
+	session := flags.String("session", "", "pane session ID")
+	pid := flags.Int("worker-pid", 0, "existing PTY worker to recover")
+	_ = flags.Parse(arguments)
+	if *session == "" || *pid <= 1 || flags.NArg() != 0 {
+		fatal("usage: relayd recover --session <pane-id> --worker-pid <pid>")
+	}
+	if err := daemon.NewServer().RecoverWorker(*session, *pid); err != nil {
+		fatal(err.Error())
+	}
+	fmt.Printf("Recovered pane %s using existing worker %d. Reconnect the pane to attach.\n", *session, *pid)
 }
 
 func runTerminate(arguments []string) {
