@@ -5,25 +5,22 @@
 <meta name="description" content="Relay is a macOS terminal for SSH sessions, remote files and Codex or Claude.">
 <meta name="robots" content="noindex, nofollow"><meta name="color-scheme" content="light">
 <title>Relay — macOS terminal</title>
-<link rel="icon" href="assets/relay.svg" type="image/svg+xml"><link rel="stylesheet" href="layout-20260919.css">
+<link rel="icon" href="assets/relay.svg" type="image/svg+xml"><link rel="stylesheet" href="product-20260919.css">
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<div class="site-shell">
-<aside class="site-nav">
-<a class="wordmark" href="#" aria-label="Relay home"><img src="assets/relay.svg" width="36" height="36" alt="">Relay</a>
-<nav aria-label="Main navigation"><a href="#main">Overview</a><a href="#plugins">Plugins <span>6</span></a><a href="#getting-started">Setup</a><a href="#releases">Releases</a></nav>
-<div class="nav-footer"><a href="https://github.com/genomewalker/relay-terminal">GitHub repository</a><a href="https://github.com/genomewalker/relay-terminal/issues">Report an issue</a><p>macOS application<br>Local and SSH terminals</p></div>
-</aside>
-<main id="main">
+<header class="topbar">
+<a class="wordmark" href="#" aria-label="Relay home"><img src="assets/relay-app.png" width="32" height="32" alt="">Relay</a>
+<nav aria-label="Main navigation"><a href="#plugins">Plugins</a><a href="#getting-started">Setup</a><a href="https://github.com/genomewalker/relay-terminal">GitHub</a></nav>
+</header><main id="main">
 <header class="intro">
-<div><h1>Relay</h1><p class="lead">A macOS terminal for <br>remote development.</p></div>
-<div class="intro-info"><p>SSH sessions, split panes, remote files, and Codex or Claude in the same application.</p><a class="button" href="https://github.com/genomewalker/relay-terminal">View source</a><p class="release-note">Under development. <a href="#releases">Release notes</a></p></div>
+<img class="app-icon" src="assets/relay-app.png" width="112" height="112" alt="Relay app icon">
+<h1>Relay for macOS</h1>
+<p class="lead">Local terminals, SSH sessions,<br>and the files you’re working on.</p>
+<div class="actions"><a class="button" href="https://github.com/genomewalker/relay-terminal/releases">View releases</a><a class="source-link" href="https://github.com/genomewalker/relay-terminal">Source code</a></div>
+<p class="release-note">In development. Builds and known issues are listed on GitHub.</p>
 </header>
-<section class="interface" aria-labelledby="interface-title">
-<div class="section-bar"><h2 id="interface-title">Inside Relay</h2><span>HPC jobs plugin</span></div>
-<figure class="main-capture"><img src="assets/hpc-jobs.jpg" alt="Relay HPC plugin showing three test jobs with state and name filters" width="900" height="512"><figcaption>Development build with test data.</figcaption></figure>
-</section>
+
 <section class="feature-list" aria-label="Terminal features">
 <article><h2>Sessions &amp; panes</h2><p>Local shells and SSH connections, grouped into tabs. Split panes or use floating panels. Remote processes run under <code>relayd</code> on the host.</p></article>
 <article><h2>Files &amp; editor</h2><p>Edit remote files, inspect diffs and preview images. Files stay on the remote host unless you download a copy.</p></article>
@@ -31,7 +28,7 @@
 </section>
 <section class="plugins-section" id="plugins" aria-labelledby="plugins-title">
 <div class="section-bar"><h2 id="plugins-title">Plugins</h2><a href="#getting-started">How to install</a></div>
-<p class="section-intro">Optional tools for the selected pane’s host and project. Expand a row for screenshots and current limitations.</p>
+<p class="section-intro">Tools for the current host and project. Open one to see what it supports.</p>
 <div class="plugin-list">
         <details><summary><span>HPC jobs</span><span class="summary-description">Inspect and filter Slurm jobs</span><span class="package-status">Experimental prerelease</span></summary><div class="plugin-detail"><img src="assets/hpc-jobs.jpg" alt="Synthetic HPC job-list preview" width="900" height="512" loading="lazy"><div><h3>Job list</h3><p>The published v0.1.0 lists owned jobs. Search and filter up to 500 loaded rows, with an explicit queue count.</p><p>Details, log tails, submission and cancellation remain development work outside that release.</p><a href="https://github.com/genomewalker/relay-plugin-hpc-jobs">HPC features and installation</a></div></div></details>
         <details><summary><span>Artifacts</span><span class="summary-description">Browse and preview project results</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/artifacts.jpg" alt="Native Markdown artifact preview with a source toggle" width="900" height="652" loading="lazy"><div><h3>File previews</h3><p>Browse folders and preview images, Markdown, text or CSV/TSV tables. Save a verified copy with the native dialog.</p><p>Files are limited to 8 MiB; previews are bounded. HTML is not executed and external images are not loaded.</p><a href="https://github.com/genomewalker/relay-plugin-artifacts">Artifact features and limits</a></div></div></details>
@@ -40,7 +37,7 @@
         <details><summary><span>Transfers</span><span class="summary-description">Save a verified copy to the Mac</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/transfers.jpg" alt="CSV transfer preview with native Save copy control" width="900" height="652" loading="lazy"><div><h3>File downloads</h3><p>Browse files, verify received bytes with SHA-256 and save atomically through the native macOS dialog.</p><p>Regular files up to 8 MiB. Large-file streaming, resume, directory transfers and Finder drag-out remain unfinished.</p><a href="https://github.com/genomewalker/relay-plugin-transfers">Transfer features and limits</a></div></div></details>
         <details><summary><span>Project actions</span><span class="summary-description">Identify the build setup</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/project-actions.jpg" alt="Project inspector identifying a synthetic pnpm project without running commands" width="900" height="652" loading="lazy"><div><h3>Project detection</h3><p>Detect project types and JavaScript package managers from manifests and lockfiles.</p><p>Suggestions only. The plugin does not install dependencies or run repository scripts.</p><a href="https://github.com/genomewalker/relay-plugin-project-actions">Project action features and limits</a></div></div></details>
       </div>
-<p class="catalog-note">Only HPC jobs v0.1.0 has an installable release. The other five packages are still in development.</p>
+<p class="capture-note">Screenshots use test data from the development build.</p><p class="catalog-note">Only HPC jobs v0.1.0 has an installable release. The other five packages are still in development.</p>
 </section>
 <section class="setup-section" id="getting-started" aria-labelledby="setup-title">
 <div class="section-bar"><h2 id="setup-title">Setup</h2></div>
@@ -51,4 +48,4 @@
 </section>
 <section class="releases-section" id="releases" aria-labelledby="release-title"><div><h2 id="release-title">Development releases</h2><p>Builds and known limitations are listed on GitHub. Relay is not yet a production release.</p></div><a class="button" href="https://github.com/genomewalker/relay-terminal/releases">View releases</a></section>
 <footer><span>Relay</span><p>No analytics or cookies.</p><a href="https://github.com/genomewalker/relay-terminal">Source code</a></footer>
-</main></div></body></html>
+</main></body></html>
