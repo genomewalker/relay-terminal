@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Relay is a macOS workspace for remote terminals, files, and coding agents. Explore the development preview and its current capabilities.">
+  <meta name="description" content="Relay is a macOS terminal for local shells and SSH sessions, with tabs, split panes, a file editor and Codex/Claude activity views.">
   <meta name="robots" content="noindex, nofollow">
   <meta name="color-scheme" content="light">
-  <title>Relay — a macOS workspace for remote terminals</title>
+  <title>Relay — macOS terminal</title>
   <link rel="icon" href="assets/relay.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -14,16 +14,16 @@
   <a class="skip" href="#main">Skip to content</a>
   <header class="masthead wrap">
     <a class="wordmark" href="#" aria-label="Relay home"><img src="assets/relay.svg" width="32" height="32" alt="">Relay</a>
-    <nav aria-label="Main navigation"><a href="#workspace">Workspace</a><a href="#plugins">Plugins</a><a href="#getting-started">Getting started</a><a href="https://github.com/genomewalker/relay-terminal">GitHub</a></nav>
+    <nav aria-label="Main navigation"><a href="#workspace">Terminal</a><a href="#plugins">Plugins</a><a href="#getting-started">Getting started</a><a href="https://github.com/genomewalker/relay-terminal">GitHub</a></nav>
   </header>
   <main id="main">
     <section class="hero wrap" aria-labelledby="hero-title">
       <div class="hero-copy">
         <p class="preview"><span aria-hidden="true"></span>Development preview</p>
-        <h1 id="hero-title">Remote terminals.<br>A Mac workspace.</h1>
-        <p class="lead">Keep your shells on the server. Arrange terminals, files and agent activity together on your Mac.</p>
-        <div class="actions"><a class="button primary" href="https://github.com/genomewalker/relay-terminal">Explore the project</a><a class="text-link" href="#release-status">Check release status</a></div>
-        <p class="availability">Development preview. Production release testing is in progress.</p>
+        <h1 id="hero-title">A macOS terminal<br>for SSH work.</h1>
+        <p class="lead">Connect to remote hosts over SSH. Use tabs and split panes, edit remote files, and run Codex or Claude alongside your shells.</p>
+        <div class="actions"><a class="button primary" href="https://github.com/genomewalker/relay-terminal">View source</a><a class="text-link" href="#release-status">Release status</a></div>
+        <p class="availability">Under development. See release notes for known limitations.</p>
       </div>
       <figure class="workspace-demo">
         <div class="demo-title"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span>Example workspace</span><span>Relay</span></div>
@@ -42,46 +42,46 @@
             <div class="demo-bottom"><div><div class="pane-label">Agent activity</div><p><span class="status-dot" aria-hidden="true"></span>Review parser changes</p><small>Waiting for your input</small></div><div><div class="pane-label">Project files</div><p>src / parser.rs</p><p>tests / parser.rs</p></div></div>
           </div>
         </div>
-        <figcaption>Workflow illustration with fictional data, not a screenshot. Interface examples below are captured from the development build.</figcaption>
+        <figcaption>Illustration, not an app screenshot.</figcaption>
       </figure>
     </section>
     <section class="workspace-section wrap" id="workspace" aria-labelledby="workspace-title">
-      <div class="section-heading"><h2 id="workspace-title">One place to work.<br>Clear boundaries underneath.</h2><p>A native Mac interface around remote processes. The connection, project and originating pane stay explicit.</p></div>
+      <div class="section-heading"><h2 id="workspace-title">Terminal, files<br>and agents</h2><p>Relay runs on your Mac. Remote shells run under relayd on the SSH host.</p></div>
       <div class="workflow-list">
-        <article><h3>Connect and arrange</h3><p>SSH connections, sessions, tabs, splits and floating panes. Work locally or on a remote host without moving your project to the Mac.</p></article>
-        <article><h3>Inspect beside the terminal</h3><p>Open files with the built-in editor, inspect a diff or preview an artifact. Keep the terminal attached to its process.</p></article>
-        <article><h3>Follow the agents</h3><p>Inspect the Codex and Claude activity Relay has captured. Expand subagents and read retained updates. Approvals stay with the agent.</p></article>
+        <article><h3>Sessions and panes</h3><p>Group local and remote shells into tabs. Split panes or detach them into floating panels.</p></article>
+        <article><h3>File editor</h3><p>Edit files, view diffs and preview images without leaving Relay. Remote files stay on the host.</p></article>
+        <article><h3>Codex and Claude</h3><p>Run the CLIs in terminal panes. The activity panel shows captured agent and subagent updates; coverage depends on the integration.</p></article>
       </div>
     </section>
     <section class="interface-section" aria-labelledby="interface-title">
-      <div class="wrap"><div class="section-heading"><h2 id="interface-title">A closer look</h2><p>Real native components. Synthetic data. These examples show the development build, not a completed production release.</p></div>
+      <div class="wrap"><div class="section-heading"><h2 id="interface-title">Screenshots</h2><p>Plugin views from the development build, using test data.</p></div>
         <div class="gallery">
-          <figure><img src="assets/hpc-jobs.jpg" alt="Relay’s native HPC view with three synthetic Slurm jobs and text and state filters" width="900" height="512" loading="lazy"><figcaption><strong>Know what is running.</strong> Filter your Slurm jobs without sending a new scheduler query for each keystroke.</figcaption></figure>
-          <figure><img src="assets/agent-activity.jpg" alt="An expanded synthetic Claude subagent and a captured example peer message in Relay" width="900" height="592" loading="lazy"><figcaption><strong>Read the activity that matters.</strong> Expand retained updates by agent. Missing provider events are not invented.</figcaption></figure>
+          <figure><img src="assets/hpc-jobs.jpg" alt="Relay’s native HPC view with three synthetic Slurm jobs and text and state filters" width="900" height="512" loading="lazy"><figcaption><strong>Slurm jobs</strong> Search and filter the loaded job list. Refresh to query the scheduler again.</figcaption></figure>
+          <figure><img src="assets/agent-activity.jpg" alt="An expanded synthetic Claude subagent and a captured example peer message in Relay" width="900" height="592" loading="lazy"><figcaption><strong>Agent activity</strong> Expand an agent to read its recorded updates.</figcaption></figure>
         </div>
       </div>
     </section>
     <section class="wrap plugins-section" id="plugins" aria-labelledby="plugins-title">
-      <div class="section-heading"><h2 id="plugins-title">Tools for the work<br>around your terminal.</h2><p>Plugins select native Relay operations. Review the source and permissions, then explicitly enable the tools you want.</p></div>
-      <p class="catalog-note">Experimental packages. Only HPC jobs currently has a tagged prerelease; the other packages are not yet installable releases. Open a tool below for its actual interface and limits.</p>
+      <div class="section-heading"><h2 id="plugins-title">Plugins</h2><p>Install plugins in Settings → Plugins → Manage plugins. Enable a plugin, then open it with the puzzle-piece button in a terminal pane.</p></div>
+      <p class="catalog-note">HPC jobs v0.1.0 is available as an experimental release. The other five plugins are in development and do not have installable releases yet.</p>
       <div class="plugin-list">
-        <details><summary><span>HPC jobs</span><span class="summary-description">Inspect and filter Slurm jobs</span><span class="package-status">Experimental prerelease</span></summary><div class="plugin-detail"><img src="assets/hpc-jobs.jpg" alt="Synthetic HPC job-list preview" width="900" height="512" loading="lazy"><div><h3>Your queue, on demand</h3><p>The published v0.1.0 lists owned jobs. Search and filter up to 500 loaded rows, with an explicit queue count.</p><p>Details, log tails, submission and cancellation remain development work outside that release.</p><a href="https://github.com/genomewalker/relay-plugin-hpc-jobs">HPC features and installation</a></div></div></details>
-        <details><summary><span>Artifacts</span><span class="summary-description">Browse and preview project results</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/artifacts.jpg" alt="Native Markdown artifact preview with a source toggle" width="900" height="652" loading="lazy"><div><h3>Look before you download</h3><p>Browse folders and preview images, Markdown, text or CSV/TSV tables. Save a verified copy with the native dialog.</p><p>Files are limited to 8 MiB; previews are bounded. HTML is not executed and external images are not loaded.</p><a href="https://github.com/genomewalker/relay-plugin-artifacts">Artifact features and limits</a></div></div></details>
-        <details><summary><span>Agent activity</span><span class="summary-description">Read captured subagent updates</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/agent-activity.jpg" alt="Native agent activity with expanded synthetic updates" width="900" height="592" loading="lazy"><div><h3>Keep the context, not a wall of text</h3><p>Search a snapshot of up to 100 agents. Expand identities, timestamped updates and recent pane activity.</p><p>This displays already-captured events. It does not send peer messages, answer approvals or guarantee complete provider history.</p><a href="https://github.com/genomewalker/relay-plugin-agent-activity">Agent activity features and limits</a></div></div></details>
-        <details><summary><span>Git review</span><span class="summary-description">Inspect changed files and diffs</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/git-review.jpg" alt="Read-only Git diff for a synthetic CSV fixture" width="900" height="652" loading="lazy"><div><h3>Load the diff you need</h3><p>List and filter changed tracked files, then inspect staged and unstaged changes for the selected file.</p><p>Read-only, with bounded output. No commits, staging, untracked-file contents or agent handoff.</p><a href="https://github.com/genomewalker/relay-plugin-git-review">Git review features and limits</a></div></div></details>
-        <details><summary><span>Transfers</span><span class="summary-description">Save a verified copy to the Mac</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/transfers.jpg" alt="CSV transfer preview with native Save copy control" width="900" height="652" loading="lazy"><div><h3>Choose the destination</h3><p>Browse files, verify received bytes with SHA-256 and save atomically through the native macOS dialog.</p><p>Regular files up to 8 MiB. Large-file streaming, resume, directory transfers and Finder drag-out remain unfinished.</p><a href="https://github.com/genomewalker/relay-plugin-transfers">Transfer features and limits</a></div></div></details>
-        <details><summary><span>Project actions</span><span class="summary-description">Identify the build setup</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/project-actions.jpg" alt="Project inspector identifying a synthetic pnpm project without running commands" width="900" height="652" loading="lazy"><div><h3>Inspect before running</h3><p>Recognize common project manifests and JavaScript lockfiles. Get inspection guidance without guessing a package manager.</p><p>Suggestions only. The plugin does not install dependencies or run repository scripts.</p><a href="https://github.com/genomewalker/relay-plugin-project-actions">Project action features and limits</a></div></div></details>
+        <details><summary><span>HPC jobs</span><span class="summary-description">Inspect and filter Slurm jobs</span><span class="package-status">Experimental prerelease</span></summary><div class="plugin-detail"><img src="assets/hpc-jobs.jpg" alt="Synthetic HPC job-list preview" width="900" height="512" loading="lazy"><div><h3>Job list</h3><p>The published v0.1.0 lists owned jobs. Search and filter up to 500 loaded rows, with an explicit queue count.</p><p>Details, log tails, submission and cancellation remain development work outside that release.</p><a href="https://github.com/genomewalker/relay-plugin-hpc-jobs">HPC features and installation</a></div></div></details>
+        <details><summary><span>Artifacts</span><span class="summary-description">Browse and preview project results</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/artifacts.jpg" alt="Native Markdown artifact preview with a source toggle" width="900" height="652" loading="lazy"><div><h3>File previews</h3><p>Browse folders and preview images, Markdown, text or CSV/TSV tables. Save a verified copy with the native dialog.</p><p>Files are limited to 8 MiB; previews are bounded. HTML is not executed and external images are not loaded.</p><a href="https://github.com/genomewalker/relay-plugin-artifacts">Artifact features and limits</a></div></div></details>
+        <details><summary><span>Agent activity</span><span class="summary-description">Read captured subagent updates</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/agent-activity.jpg" alt="Native agent activity with expanded synthetic updates" width="900" height="592" loading="lazy"><div><h3>Agent history</h3><p>Search a snapshot of up to 100 agents. Expand identities, timestamped updates and recent pane activity.</p><p>This displays already-captured events. It does not send peer messages, answer approvals or guarantee complete provider history.</p><a href="https://github.com/genomewalker/relay-plugin-agent-activity">Agent activity features and limits</a></div></div></details>
+        <details><summary><span>Git review</span><span class="summary-description">Inspect changed files and diffs</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/git-review.jpg" alt="Read-only Git diff for a synthetic CSV fixture" width="900" height="652" loading="lazy"><div><h3>File diffs</h3><p>List and filter changed tracked files, then inspect staged and unstaged changes for the selected file.</p><p>Read-only, with bounded output. No commits, staging, untracked-file contents or agent handoff.</p><a href="https://github.com/genomewalker/relay-plugin-git-review">Git review features and limits</a></div></div></details>
+        <details><summary><span>Transfers</span><span class="summary-description">Save a verified copy to the Mac</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/transfers.jpg" alt="CSV transfer preview with native Save copy control" width="900" height="652" loading="lazy"><div><h3>File downloads</h3><p>Browse files, verify received bytes with SHA-256 and save atomically through the native macOS dialog.</p><p>Regular files up to 8 MiB. Large-file streaming, resume, directory transfers and Finder drag-out remain unfinished.</p><a href="https://github.com/genomewalker/relay-plugin-transfers">Transfer features and limits</a></div></div></details>
+        <details><summary><span>Project actions</span><span class="summary-description">Identify the build setup</span><span class="package-status">Development</span></summary><div class="plugin-detail"><img src="assets/project-actions.jpg" alt="Project inspector identifying a synthetic pnpm project without running commands" width="900" height="652" loading="lazy"><div><h3>Project detection</h3><p>Detect project types and JavaScript package managers from manifests and lockfiles.</p><p>Suggestions only. The plugin does not install dependencies or run repository scripts.</p><a href="https://github.com/genomewalker/relay-plugin-project-actions">Project action features and limits</a></div></div></details>
       </div>
     </section>
     <section class="wrap getting-started" id="getting-started" aria-labelledby="start-title">
-      <h2 id="start-title">Before you connect</h2>
-      <div class="start-columns"><div><h3>A matching app and helper</h3><p>Remote features use <code>relayd</code> on the host. Check the app and helper versions together. A new binary on disk does not mean an existing worker has upgraded.</p></div><div><h3>Explicit access</h3><p>Review the host and project before opening a plugin. Plugin reads are on demand. Switching tabs must not silently retarget a request.</p></div><div><h3>Test with a disposable session</h3><p>Development builds still need installed-app and remote acceptance. Do not make an unverified build your only way to reach important work.</p></div></div>
+      <h2 id="start-title">Setup</h2>
+      <div class="start-columns"><div><h3>Remote helper</h3><p>Remote features use <code>relayd</code> on the host. Check the app and helper versions together. A new binary on disk does not mean an existing worker has upgraded.</p></div><div><h3>Plugin permissions</h3><p>Plugins use the host and directory of the selected pane. Review the permissions before enabling them.</p></div><div><h3>Development builds</h3><p>Keep another SSH client available when testing Relay with important sessions.</p></div></div>
     </section>
     <section class="release-section wrap" id="release-status" aria-labelledby="release-title">
-      <div><p class="preview"><span aria-hidden="true"></span>Development preview</p><h2 id="release-title">Release in testing.</h2><p>Terminal input, redraw, reconnect, session recovery and plugin permissions are undergoing testing. A verified production download will be added here when ready.</p></div>
-      <div class="release-links"><a href="https://github.com/genomewalker/relay-terminal/releases">Existing releases and their notes</a><a href="https://github.com/genomewalker/relay-terminal/issues">Known issues and reports</a><a href="https://github.com/genomewalker/relay-terminal">Source and development instructions</a></div>
+      <div><p class="preview"><span aria-hidden="true"></span>Development preview</p><h2 id="release-title">Releases</h2><p>Relay is still under development. Existing builds and their release notes are on GitHub.</p></div>
+      <div class="release-links"><a href="https://github.com/genomewalker/relay-terminal/releases">View releases</a><a href="https://github.com/genomewalker/relay-terminal/issues">Report a bug</a><a href="https://github.com/genomewalker/relay-terminal">Build from source</a></div>
     </section>
   </main>
-  <footer class="wrap"><a class="wordmark" href="#">Relay</a><p>Made for remote work on macOS.<br>No analytics, cookies or external fonts on this page.</p><a href="https://github.com/genomewalker/relay-terminal">GitHub</a></footer>
+  <footer class="wrap"><a class="wordmark" href="#">Relay</a><p>No analytics or cookies.</p><a href="https://github.com/genomewalker/relay-terminal">GitHub</a></footer>
 </body>
 </html>
