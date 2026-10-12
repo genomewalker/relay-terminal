@@ -665,6 +665,18 @@ enum TerminalViewportOwnershipPolicy {
 /// and resize barriers continue to bypass this delay.
 enum TerminalDisplayBatchPolicy {
     static let liveMilliseconds = 16
+    /// An echo or other small update after a quiet period is drawn at once.
+    /// Only sustained output waits, so a packet burst stays one Ghostty write.
+    static let interactiveBytes = 1024
+
+    static func drainDelayMilliseconds(
+        immediate: Bool, pendingBytes: Int, millisecondsSinceLastDrain: Double?
+    ) -> Int {
+        if immediate { return 0 }
+        guard pendingBytes <= interactiveBytes else { return liveMilliseconds }
+        guard let elapsed = millisecondsSinceLastDrain else { return 0 }
+        return elapsed >= Double(liveMilliseconds) ? 0 : liveMilliseconds
+    }
 }
 
 enum TerminalViewportPosition {
@@ -3323,6 +3335,8 @@ final class TerminalIOBridge: @unchecked Sendable {
     private let displayQueue = DispatchQueue(label: "relay.terminal-display", qos: .userInteractive)
     private var displayBuffer = Data()
     private var displayDrainScheduled = false
+    /// Uptime of the last display drain; guarded by displayLock.
+    private var lastDisplayDrainUptime: UInt64?
     /// Live browser companions observe the exact byte stream delivered to
     /// Ghostty. This dictionary is confined to displayQueue so a viewer cannot
     /// contend with terminal input or the PTY reader.
@@ -4622,11 +4636,14 @@ final class TerminalIOBridge: @unchecked Sendable {
             return
         }
         displayDrainScheduled = true
+        let elapsed = lastDisplayDrainUptime.map {
+            Double(DispatchTime.now().uptimeNanoseconds &- $0) / 1_000_000
+        }
+        let delay = TerminalDisplayBatchPolicy.drainDelayMilliseconds(
+            immediate: immediate, pendingBytes: displayBuffer.count, millisecondsSinceLastDrain: elapsed
+        )
         displayLock.unlock()
-        let delay: DispatchTimeInterval = immediate
-            ? .nanoseconds(0)
-            : .milliseconds(TerminalDisplayBatchPolicy.liveMilliseconds)
-        displayQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+        displayQueue.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
             self?.drainDisplay()
         }
     }
@@ -4639,6 +4656,7 @@ final class TerminalIOBridge: @unchecked Sendable {
         pendingObservedRepaintFrame = nil
         displayBuffer = Data()
         displayDrainScheduled = false
+        lastDisplayDrainUptime = DispatchTime.now().uptimeNanoseconds
         displayLock.unlock()
         // Hide rendering, not terminal emulation. A bounded byte suffix cannot
         // reconstruct an arbitrary terminal, especially after an alternate-
