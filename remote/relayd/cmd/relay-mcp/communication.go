@@ -44,6 +44,12 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	if !ok {
 		return nil, false
 	}
+	// With a desktop transport configured, the node daemon serves only pairs
+	// it owns; cross-host pairs and the full link list stay on the desktop path.
+	desktopFallback := s.token != ""
+	if desktopFallback && operation == "list" {
+		return nil, false
+	}
 	packet := map[string]any{"operation": operation}
 	if s.callerToken != "" {
 		packet["client_token"] = s.callerToken
@@ -53,6 +59,9 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 		var err error
 		actor, err = s.communicationActor()
 		if err != nil {
+			if desktopFallback {
+				return nil, false
+			}
 			return map[string]any{"content": []map[string]any{{"type": "text", "text": err.Error()}}, "isError": true}, true
 		}
 		packet["actor_pane_id"] = actor
@@ -92,10 +101,35 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if desktopFallback && daemonDeclinedBeforeWrite(operation, stderr.String()) {
+			return nil, false
+		}
 		return result(fmt.Sprintf("Daemon communication unavailable: %s", strings.TrimSpace(stderr.String())), true), true
 	}
 	if out.Len() > 128<<10 || !json.Valid(out.Bytes()) {
 		return result("Invalid daemon communication response", true), true
 	}
+	if desktopFallback && (operation == "receipt" || operation == "unlink") {
+		// Desktop-path messages and links have no record on this node.
+		var reply struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(out.Bytes(), &reply) == nil &&
+			((operation == "receipt" && reply.Status == "unknown") || (operation == "unlink" && reply.Status == "not_found")) {
+			return nil, false
+		}
+	}
 	return result(out.String(), false), true
+}
+
+// daemonDeclinedBeforeWrite matches only refusals relayd returns before it
+// claims a receipt or saves a link, so the desktop path cannot duplicate a send.
+func daemonDeclinedBeforeWrite(operation, stderr string) bool {
+	switch operation {
+	case "link":
+		return strings.Contains(stderr, "both panes must belong to this daemon")
+	case "send":
+		return strings.Contains(stderr, "save the communication pair on this daemon before sending")
+	}
+	return false
 }

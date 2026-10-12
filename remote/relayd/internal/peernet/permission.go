@@ -13,6 +13,20 @@ import (
 	"syscall"
 )
 
+// SenderPermissionClass reports "bypass", "prompting" or "" (unknown) for a
+// live harness process and its native session. Callers must have bound the
+// PID to its pane already; the start is captured here and rechecked below.
+func SenderPermissionClass(home string, pid int, session string) string {
+	if pid <= 1 || session == "" || strings.ContainsAny(session, "/*?[\\") {
+		return ""
+	}
+	start, err := processStart(pid)
+	if err != nil || start == "" {
+		return ""
+	}
+	return runtimePermissionClass(home, Record{PID: pid, Start: start, Session: session})
+}
+
 // Runtime permission changes supersede initial launch flags. Unknown stays
 // unasserted; neither the destination nor message content determines this mode.
 func runtimePermissionClass(home string, target Record) string {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type CommunicationActor struct {
@@ -160,6 +161,7 @@ func reconcileCommunicationActor(r CommunicationRequest, actor CommunicationActo
 }
 
 func ReconcileCommunicationActor(r CommunicationRequest, clientPID int) (CommunicationRequest, error) {
+	r.actorVerified = false
 	if r.ActorPaneID == "" {
 		return r, nil
 	}
@@ -178,5 +180,14 @@ func ReconcileCommunicationActor(r CommunicationRequest, clientPID int) (Communi
 			return r, err
 		}
 	}
-	return reconcileCommunicationActor(r, actor, bootstrap)
+	r, err = reconcileCommunicationActor(r, actor, bootstrap)
+	// The actor pane now names the kernel-observed owner of the calling process.
+	r.actorVerified = err == nil && r.ActorPaneID == actor.PaneID
+	return r, err
+}
+
+// communicationSourceVerified reports whether the sender pane was proven by
+// the calling process's kernel ancestry rather than claimed in the request.
+func communicationSourceVerified(r CommunicationRequest) bool {
+	return r.actorVerified && r.ActorPaneID != "" && strings.EqualFold(r.ActorPaneID, r.SourcePaneID)
 }

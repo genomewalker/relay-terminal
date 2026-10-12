@@ -20,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/relay-terminal/relayd/internal/peernet"
 )
 
 // These are build copies of the canonical native provider adapters. Both
@@ -58,6 +60,9 @@ type CommunicationRequest struct {
 	Policy                     *communicationPolicy       `json:"policy,omitempty"`
 	Cursor                     int64                      `json:"cursor,omitempty"`
 	LinkID                     string                     `json:"link_id,omitempty"`
+	// Set only by ReconcileCommunicationActor after a kernel ancestry check of
+	// the calling process. Unexported, so no JSON packet or host RPC can set it.
+	actorVerified bool
 }
 
 type communicationMember struct {
@@ -216,6 +221,39 @@ func communicationObserve(pane string) communicationMember {
 		member.Unavailable = "provider has no verified messaging endpoint"
 	}
 	return member
+}
+
+// senderPermissionClass is replaceable in tests; it reads the sender's
+// native transcript or launch flags on this node.
+var senderPermissionClass = func(pid int, session string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return peernet.SenderPermissionClass(home, pid, session)
+}
+
+// communicationSourcePacket describes the sender for native delivery. Only a
+// kernel-verified sender carries its provider, permission class and native
+// inbox; a claimed pane label stays routing metadata.
+func communicationSourcePacket(r CommunicationRequest, nodeID string, source communicationMember) map[string]any {
+	packet := map[string]any{"hostID": nodeID, "paneID": r.SourcePaneID, "sessionID": source.SessionID,
+		"authentication": "claimed_pane_label"}
+	if !communicationSourceVerified(r) {
+		return packet
+	}
+	packet["authentication"] = "kernel_verified"
+	packet["provider"] = source.Provider
+	if mode := senderPermissionClass(source.PID, source.SessionID); mode == "bypass" || mode == "prompting" {
+		packet["permissionClass"] = mode
+	}
+	// A Claude sender's own inbox lets the recipient reply natively.
+	if source.Endpoint["transport"] == "native_peer_socket" {
+		if socket, ok := source.Endpoint["socketPath"].(string); ok && filepath.IsAbs(socket) {
+			packet["socketPath"] = socket
+		}
+	}
+	return packet
 }
 
 func communicationPair(source, target string) (string, []string, error) {
@@ -473,9 +511,10 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 				return nil, errors.New("linked conversation changed; review the pair before sending")
 			}
 		}
+		sourcePacket := communicationSourcePacket(r, nodeID, source)
 		receipt = communicationReceipt{Version: 1, Fingerprint: fingerprint, CreatedAt: time.Now().UTC(), Result: map[string]any{
 			"message_id": r.MessageID, "source_pane_id": r.SourcePaneID, "pane_id": r.PaneID, "status": "outcome_unknown", "replay_permitted": false,
-			"source_authentication": "claimed_pane_label", "submitting_client_id": identity,
+			"source_authentication": sourcePacket["authentication"], "submitting_client_id": identity,
 			"authority": "relayd", "desktop_required": false}}
 		// Persist the claim before the only native delivery. A lost client or
 		// daemon crash can never cause this message ID to be submitted again.
@@ -487,7 +526,7 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		}
 		packet := map[string]any{"operation": "send", "expected": target.Endpoint, "messageID": r.MessageID,
 			"targetPaneID": r.PaneID, "text": r.Text, "submittingClientID": r.ClientID,
-			"source": map[string]any{"hostID": nodeID, "paneID": r.SourcePaneID, "sessionID": source.SessionID}}
+			"source": sourcePacket}
 		result, err := communicationNative(r.PaneID, packet)
 		for key, value := range communicationNativeOutcome(result, err) {
 			receipt.Result[key] = value
