@@ -1,0 +1,602 @@
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -718,6 +718,18 @@
+         params: v2::ThreadUnarchiveParams,
+         serialization: thread_id(params.thread_id),
+         response: v2::ThreadUnarchiveResponse,
++    },
++    #[experimental("thread/contextRotation/prepare")]
++    ThreadContextRotationPrepare => "thread/contextRotation/prepare" {
++        params: v2::ThreadContextRotationPrepareParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::ThreadContextRotationPrepareResponse,
++    },
++    #[experimental("thread/contextRotation/release")]
++    ThreadContextRotationRelease => "thread/contextRotation/release" {
++        params: v2::ThreadContextRotationReleaseParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::ThreadContextRotationReleaseResponse,
+     },
+     ThreadCompactStart => "thread/compact/start" {
+         params: v2::ThreadCompactStartParams,
+--- /dev/null
++++ b/codex-rs/app-server-protocol/src/protocol/v2/context_rotation.rs
+@@ -0,0 +1,45 @@
++//! Bounded native preparation receipts. These methods never clear or restore a thread.
++use crate::JsonSchema;
++use crate::TS;
++use serde::Deserialize;
++use serde::Serialize;
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadContextRotationPrepareParams {
++    pub thread_id: String,
++    pub turn_id: String,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadContextRotationPrepareResponse {
++    /// Opaque, connection-bound reservation; a copied receipt cannot authorize clear.
++    pub reservation_id: String,
++    pub runtime_id: String,
++    pub thread_id: String,
++    pub turn_id: String,
++    pub rollout_path: String,
++    /// Decimal string preserves the native counter without JSON number rounding.
++    pub admission_generation: String,
++    /// Remaining lifetime at response creation; transport latency consumes this time.
++    pub expires_in_ms: u32,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadContextRotationReleaseParams {
++    pub thread_id: String,
++    pub reservation_id: String,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadContextRotationReleaseResponse {
++    /// The matching owner's reservation was revoked. No session was cleared.
++    pub released: bool,
++}
+--- a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+@@ -10,6 +10,7 @@
+ mod command_exec;
+ mod computer_use_config;
+ mod config;
++mod context_rotation;
+ mod current_time;
+ mod diagnostics;
+ mod environment;
+@@ -49,6 +50,7 @@
+ pub use command_exec::*;
+ pub use computer_use_config::*;
+ pub use config::*;
++pub use context_rotation::*;
+ pub use current_time::*;
+ pub use diagnostics::*;
+ pub use environment::*;
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1434,6 +1434,16 @@
+                     .thread_unarchive(request_id.clone(), params)
+                     .await
+             }
++            ClientRequest::ThreadContextRotationPrepare { params, .. } => {
++                self.thread_processor
++                    .thread_context_rotation_prepare(&request_id, params)
++                    .await
++            }
++            ClientRequest::ThreadContextRotationRelease { params, .. } => {
++                self.thread_processor
++                    .thread_context_rotation_release(&request_id, params)
++                    .await
++            }
+             ClientRequest::ThreadCompactStart { params, .. } => {
+                 self.thread_processor
+                     .thread_compact_start(&request_id, params)
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -542,6 +542,7 @@
+ mod catalog_processor;
+ mod command_exec_processor;
+ mod config_processor;
++mod context_rotation;
+ mod diagnostics;
+ mod environment_processor;
+ mod feedback_doctor_report;
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/context_rotation.rs
+@@ -0,0 +1,192 @@
++//! Native leases stay in the server and are bound to one subscribed connection.
++//! The sole slot covers both pending preparation and an accepted lease.
++use super::*;
++use codex_app_server_protocol::ThreadContextRotationPrepareParams;
++use codex_app_server_protocol::ThreadContextRotationPrepareResponse;
++use codex_app_server_protocol::ThreadContextRotationReleaseParams;
++use codex_app_server_protocol::ThreadContextRotationReleaseResponse;
++use tokio_util::sync::CancellationToken;
++
++#[derive(Clone)]
++struct ReservationKey {
++    owner: ConnectionId,
++    thread: ThreadId,
++    id: uuid::Uuid,
++    cancelled: CancellationToken,
++}
++
++#[derive(Default)]
++pub(super) struct RotationReservations {
++    active: Mutex<Option<ReservationKey>>,
++}
++
++fn rotation_error(message: impl Into<String>) -> JSONRPCErrorError {
++    JSONRPCErrorError {
++        code: -32000,
++        message: message.into(),
++        data: None,
++    }
++}
++
++impl RotationReservations {
++    async fn claim(
++        &self,
++        owner: ConnectionId,
++        thread: ThreadId,
++    ) -> Result<ReservationKey, JSONRPCErrorError> {
++        let mut active = self.active.lock().await;
++        if active
++            .as_ref()
++            .is_some_and(|entry| !entry.cancelled.is_cancelled())
++        {
++            return Err(rotation_error(
++                "a context rotation reservation is already pending",
++            ));
++        }
++        let key = ReservationKey {
++            owner,
++            thread,
++            id: uuid::Uuid::new_v4(),
++            cancelled: CancellationToken::new(),
++        };
++        *active = Some(key.clone());
++        Ok(key)
++    }
++
++    async fn release(&self, owner: ConnectionId, thread: ThreadId, id: uuid::Uuid) -> bool {
++        let mut active = self.active.lock().await;
++        if active
++            .as_ref()
++            .is_some_and(|entry| entry.owner == owner && entry.thread == thread && entry.id == id)
++        {
++            if let Some(entry) = active.take() {
++                entry.cancelled.cancel();
++            }
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(super) async fn disconnect(&self, owner: ConnectionId) {
++        let mut active = self.active.lock().await;
++        if active.as_ref().is_some_and(|entry| entry.owner == owner)
++            && let Some(entry) = active.take()
++        {
++            entry.cancelled.cancel();
++        }
++    }
++}
++
++impl Drop for RotationReservations {
++    fn drop(&mut self) {
++        if let Some(entry) = self.active.get_mut().take() {
++            entry.cancelled.cancel();
++        }
++    }
++}
++
++impl ThreadRequestProcessor {
++    pub(crate) async fn thread_context_rotation_prepare(
++        &self,
++        request: &ConnectionRequestId,
++        params: ThreadContextRotationPrepareParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
++        let thread_id = ThreadId::from_string(&params.thread_id)
++            .map_err(|_| rotation_error("invalid native thread identity"))?;
++        if params.turn_id.is_empty() || params.turn_id.len() > 256 {
++            return Err(rotation_error("invalid native turn identity"));
++        }
++        let owners = self
++            .thread_state_manager
++            .subscribed_connection_ids(thread_id)
++            .await;
++        if owners.len() != 1 || !owners.contains(&request.connection_id) {
++            return Err(rotation_error(
++                "context rotation requires the sole subscribed connection",
++            ));
++        }
++        let key = self
++            .rotation_reservations
++            .claim(request.connection_id, thread_id)
++            .await?;
++        let failure_guard = key.cancelled.clone().drop_guard();
++        // Never implicitly load or resume a cold thread for maintenance.
++        let thread = self
++            .thread_manager
++            .get_thread(thread_id)
++            .await
++            .map_err(|_| rotation_error("native thread is no longer loaded"))?;
++        let lease = tokio::select! {
++            biased;
++            _ = key.cancelled.cancelled() => return Err(rotation_error("native preparation was cancelled")),
++            result = tokio::time::timeout_at(deadline, thread.prepare_context_rotation(params.turn_id)) =>
++                result.map_err(|_| rotation_error("native preparation expired"))?
++                    .map_err(|error| rotation_error(format!("native preparation refused: {error}")))?,
++        };
++        let owners = self
++            .thread_state_manager
++            .subscribed_connection_ids(thread_id)
++            .await;
++        let expires_in_ms = deadline
++            .saturating_duration_since(tokio::time::Instant::now())
++            .as_millis() as u32;
++        if key.cancelled.is_cancelled()
++            || expires_in_ms == 0
++            || owners.len() != 1
++            || !owners.contains(&request.connection_id)
++        {
++            return Err(rotation_error(
++                "native preparation ownership changed or expired",
++            ));
++        }
++        let receipt = lease.receipt();
++        let response = ThreadContextRotationPrepareResponse {
++            reservation_id: key.id.to_string(),
++            runtime_id: receipt.runtime_id.to_string(),
++            thread_id: receipt.thread_id.to_string(),
++            turn_id: receipt.turn_id.clone(),
++            rollout_path: receipt
++                .rollout_path
++                .to_str()
++                .ok_or_else(|| rotation_error("native rollout path is not representable"))?
++                .to_owned(),
++            admission_generation: receipt.admission_generation.to_string(),
++            expires_in_ms,
++        };
++        self.background_tasks.spawn(async move {
++            let _finished = key.cancelled.clone().drop_guard();
++            tokio::select! {
++                biased;
++                _ = key.cancelled.cancelled() => {},
++                _ = lease.revoked() => {},
++            }
++            drop(lease);
++        });
++        failure_guard.disarm();
++        Ok(Some(response.into()))
++    }
++
++    pub(crate) async fn thread_context_rotation_release(
++        &self,
++        request: &ConnectionRequestId,
++        params: ThreadContextRotationReleaseParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let thread = ThreadId::from_string(&params.thread_id)
++            .map_err(|_| rotation_error("invalid native thread identity"))?;
++        let id = uuid::Uuid::parse_str(&params.reservation_id)
++            .map_err(|_| rotation_error("invalid native reservation identity"))?;
++        let released = self
++            .rotation_reservations
++            .release(request.connection_id, thread, id)
++            .await;
++        Ok(Some(
++            ThreadContextRotationReleaseResponse { released }.into(),
++        ))
++    }
++}
++
++#[cfg(test)]
++#[path = "context_rotation_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/context_rotation_tests.rs
+@@ -0,0 +1,71 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[tokio::test]
++async fn context_rotation_reservation_binds_connection_thread_and_token() {
++    let registry = RotationReservations::default();
++    let thread = ThreadId::new();
++    let key = registry.claim(ConnectionId(1), thread).await.unwrap();
++    assert!(registry.claim(ConnectionId(2), thread).await.is_err());
++    assert!(!registry.release(ConnectionId(2), thread, key.id).await);
++    assert!(
++        !registry
++            .release(ConnectionId(1), ThreadId::new(), key.id)
++            .await
++    );
++    assert!(
++        !registry
++            .release(ConnectionId(1), thread, uuid::Uuid::new_v4())
++            .await
++    );
++    assert!(!key.cancelled.is_cancelled());
++    assert!(registry.release(ConnectionId(1), thread, key.id).await);
++    assert!(key.cancelled.is_cancelled());
++    assert!(!registry.release(ConnectionId(1), thread, key.id).await);
++}
++
++#[tokio::test]
++async fn context_rotation_disconnect_cancels_pending_owner_only() {
++    let registry = RotationReservations::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new())
++        .await
++        .unwrap();
++    registry.disconnect(ConnectionId(2)).await;
++    assert!(!key.cancelled.is_cancelled());
++    registry.disconnect(ConnectionId(1)).await;
++    key.cancelled.cancelled().await;
++    let next = registry
++        .claim(ConnectionId(2), ThreadId::new())
++        .await
++        .unwrap();
++    assert_ne!(next.id, key.id);
++    assert_eq!(next.owner, ConnectionId(2));
++}
++
++#[tokio::test]
++async fn context_rotation_failed_or_revoked_preparation_releases_capacity() {
++    let registry = RotationReservations::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new())
++        .await
++        .unwrap();
++    let guard = key.cancelled.clone().drop_guard();
++    drop(guard);
++    let next = registry.claim(ConnectionId(1), key.thread).await.unwrap();
++    assert_ne!(next.id, key.id);
++    assert!(!next.cancelled.is_cancelled());
++    assert!(!registry.release(key.owner, key.thread, key.id).await);
++    assert!(!next.cancelled.is_cancelled());
++}
++
++#[tokio::test]
++async fn context_rotation_registry_drop_revokes_its_retained_lease() {
++    let registry = RotationReservations::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new())
++        .await
++        .unwrap();
++    drop(registry);
++    key.cancelled.cancelled().await;
++}
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -445,6 +445,7 @@
+ pub(crate) struct ThreadRequestProcessor {
+     pub(super) auth_manager: Arc<AuthManager>,
+     pub(super) thread_manager: Arc<ThreadManager>,
++    pub(super) rotation_reservations: Arc<super::context_rotation::RotationReservations>,
+     pub(super) outgoing: Arc<OutgoingMessageSender>,
+     pub(super) arg0_paths: Arg0DispatchPaths,
+     pub(super) config: Arc<Config>,
+@@ -504,6 +505,7 @@
+         Self {
+             auth_manager,
+             thread_manager,
++            rotation_reservations: Arc::default(),
+             outgoing,
+             arg0_paths,
+             config,
+@@ -3586,6 +3588,7 @@
+     }
+ 
+     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
++        self.rotation_reservations.disconnect(connection_id).await;
+         let thread_ids = self
+             .thread_state_manager
+             .remove_connection(connection_id)
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -3,6 +3,7 @@
+ //! This module owns the typed JSON-RPC calls needed by the TUI and keeps
+ //! request/response plumbing out of `App` and `ChatWidget`.
+ 
++pub(crate) mod context_rotation;
+ mod external_agent_config;
+ pub(crate) mod fs;
+ mod history;
+--- /dev/null
++++ b/codex-rs/tui/src/app_server_session/context_rotation.rs
+@@ -0,0 +1,100 @@
++//! Combines the native receipt with the revocable foreground-editor reservation.
++//! Drop requests native release; a lost response still expires on the server.
++use super::*;
++use crate::tui::rotation::FrontendRotationReservation;
++use codex_app_server_protocol::ThreadContextRotationPrepareParams;
++use codex_app_server_protocol::ThreadContextRotationPrepareResponse;
++use codex_app_server_protocol::ThreadContextRotationReleaseParams;
++use codex_app_server_protocol::ThreadContextRotationReleaseResponse;
++
++pub(crate) struct PreparedContextRotation {
++    pub(crate) frontend: FrontendRotationReservation,
++    pub(crate) native: ThreadContextRotationPrepareResponse,
++    handle: AppServerRequestHandle,
++    deadline: tokio::time::Instant,
++}
++
++impl PreparedContextRotation {
++    pub(crate) async fn revoked(&self) {
++        tokio::select! {
++            _ = self.frontend.revoked() => {},
++            _ = tokio::time::sleep_until(self.deadline) => {},
++        }
++    }
++}
++
++impl Drop for PreparedContextRotation {
++    fn drop(&mut self) {
++        let handle = self.handle.clone();
++        let params = ThreadContextRotationReleaseParams {
++            thread_id: self.native.thread_id.clone(),
++            reservation_id: self.native.reservation_id.clone(),
++        };
++        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
++            runtime.spawn(async move {
++                let _ = tokio::time::timeout(
++                    Duration::from_secs(5),
++                    handle.request_typed::<ThreadContextRotationReleaseResponse>(
++                        ClientRequest::ThreadContextRotationRelease {
++                            request_id: RequestId::String(format!(
++                                "relay-rotation-release-{}",
++                                Uuid::new_v4()
++                            )),
++                            params,
++                        },
++                    ),
++                )
++                .await;
++            });
++        }
++    }
++}
++
++impl AppServerSession {
++    pub(crate) fn prepare_context_rotation(
++        &self,
++        frontend: FrontendRotationReservation,
++    ) -> impl std::future::Future<Output = Result<PreparedContextRotation>> + Send + 'static + use<>
++    {
++        let handle = self.request_handle();
++        async move {
++            let started = tokio::time::Instant::now();
++            let request = ClientRequest::ThreadContextRotationPrepare {
++                request_id: RequestId::String(format!("relay-rotation-prepare-{}", Uuid::new_v4())),
++                params: ThreadContextRotationPrepareParams {
++                    thread_id: frontend.thread_id.to_string(),
++                    turn_id: frontend.turn_id.clone(),
++                },
++            };
++            let native: ThreadContextRotationPrepareResponse = tokio::select! {
++                biased;
++                _ = frontend.revoked() => return Err(color_eyre::eyre::eyre!("frontend reservation was revoked")),
++                result = tokio::time::timeout(Duration::from_secs(5), handle.request_typed(request)) =>
++                    result.map_err(|_| color_eyre::eyre::eyre!("native preparation response timed out"))??,
++            };
++            // Subtract the complete round trip conservatively from the advertised remaining life.
++            let deadline =
++                started + Duration::from_millis(u64::from(native.expires_in_ms.min(5000)));
++            let prepared = PreparedContextRotation {
++                frontend,
++                native,
++                handle,
++                deadline,
++            };
++            if prepared.frontend.is_revoked()
++                || tokio::time::Instant::now() >= deadline
++                || prepared.native.thread_id != prepared.frontend.thread_id.to_string()
++                || prepared.native.turn_id != prepared.frontend.turn_id
++                || Uuid::parse_str(&prepared.native.reservation_id).is_err()
++                || Uuid::parse_str(&prepared.native.runtime_id).is_err()
++                || prepared.native.admission_generation.parse::<u64>().is_err()
++                || prepared.native.rollout_path.is_empty()
++            {
++                return Err(color_eyre::eyre::eyre!(
++                    "native preparation response is stale or mismatched"
++                ));
++            }
++            Ok(prepared)
++        }
++    }
++}
+--- a/codex-rs/app-server/tests/suite/v2/mod.rs
++++ b/codex-rs/app-server/tests/suite/v2/mod.rs
+@@ -33,6 +33,7 @@
+ mod connection_handling_websocket;
+ #[cfg(unix)]
+ mod connection_handling_websocket_unix;
++mod context_rotation;
+ #[cfg(unix)]
+ mod curated_mcp_sync;
+ mod current_time;
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/context_rotation.rs
+@@ -0,0 +1,65 @@
++use anyhow::Result;
++use app_test_support::MockResponsesConfig;
++use app_test_support::TestAppServer;
++use app_test_support::create_mock_responses_server_repeating_assistant;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::ThreadContextRotationPrepareParams;
++use codex_app_server_protocol::ThreadContextRotationReleaseParams;
++use codex_app_server_protocol::ThreadContextRotationReleaseResponse;
++use codex_app_server_protocol::ThreadStartParams;
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++
++#[tokio::test]
++async fn context_rotation_wire_api_refuses_a_thread_without_successful_completion() -> Result<()> {
++    let provider = create_mock_responses_server_repeating_assistant("unused").await;
++    let home = TempDir::new()?;
++    MockResponsesConfig::new(&provider.uri()).write(home.path())?;
++    let mut server = TestAppServer::builder()
++        .with_codex_home(home.path())
++        .build_initialized()
++        .await?;
++    let started = server
++        .start_thread(ThreadStartParams {
++            model: Some("mock-model".to_string()),
++            ..Default::default()
++        })
++        .await?;
++    // No turn is submitted. The real core preparation path must refuse this idle thread.
++    let request_id = server
++        .send_request(
++            "thread/contextRotation/prepare",
++            Some(serde_json::to_value(ThreadContextRotationPrepareParams {
++                thread_id: started.thread.id.clone(),
++                turn_id: "never-completed".into(),
++            })?),
++        )
++        .await?;
++    let error = tokio::time::timeout(
++        std::time::Duration::from_secs(10),
++        server.read_stream_until_error_message(codex_app_server_protocol::RequestId::Integer(
++            request_id,
++        )),
++    )
++    .await??;
++    assert_eq!(error.error.code, -32000);
++    assert!(
++        error.error.message.contains("native preparation refused"),
++        "{}",
++        error.error.message
++    );
++    let released: ThreadContextRotationReleaseResponse = server
++        .request(|request_id| ClientRequest::ThreadContextRotationRelease {
++            request_id,
++            params: ThreadContextRotationReleaseParams {
++                thread_id: started.thread.id.clone(),
++                reservation_id: uuid::Uuid::new_v4().to_string(),
++            },
++        })
++        .await?;
++    assert_eq!(
++        released,
++        ThreadContextRotationReleaseResponse { released: false }
++    );
++    Ok(())
++}

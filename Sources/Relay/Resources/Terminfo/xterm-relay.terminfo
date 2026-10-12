@@ -2,4 +2,5 @@
 # Ghostty capability set at build time so the installed entry is standalone on
 # remote hosts and keeps Relay's terminal identity independent of Ghostty.
 xterm-relay|Relay terminal using Ghostty core,
+	Pst=\E]7501;%p1%s\E\\,
 	use=xterm-ghostty,

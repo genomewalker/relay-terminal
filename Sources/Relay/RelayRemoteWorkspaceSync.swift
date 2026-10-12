@@ -3,52 +3,50 @@ import Foundation
 enum RelayClientIdentity {
     static let id: UUID = {
         let key = "relay.workspace-controller-id.v1"
-        if let existing = UserDefaults.standard.string(forKey: key),
+        if let existing = RelayStateProfile.defaults.string(forKey: key),
            let parsed = UUID(uuidString: existing) {
             return parsed
         }
         let created = UUID()
-        UserDefaults.standard.set(created.uuidString.lowercased(), forKey: key)
+        RelayStateProfile.defaults.set(created.uuidString.lowercased(), forKey: key)
         return created
     }()
 }
 
 enum RelayInputClientIdentity {
-    static let id: UUID = {
-        let key = "relay.input-client-id.v2"
-        if let existing = UserDefaults.standard.string(forKey: key),
-           let parsed = UUID(uuidString: existing) {
-            return parsed
-        }
-        let created = UUID()
-        UserDefaults.standard.set(created.uuidString.lowercased(), forKey: key)
-        return created
-    }()
+    // A profile identifies shared workspace state; an input client identifies
+    // one live process. Persisting this UUID lets simultaneous app copies both
+    // claim the worker's same controller lease and reuse input sequence blocks.
+    static let id = UUID()
 }
 
 /// Reserves input sequence numbers in large durable blocks. A crash may leave
 /// a harmless gap, but a new process can never reuse a sequence that a remote
-/// worker has already applied. This lets a restart reclaim its five-second
-/// input lease immediately without risking duplicate keystrokes.
+/// worker has already applied. Production uses a fresh process identity and
+/// in-memory reservations; reconnect within that process retains the allocator.
+/// Durable reservations remain available for explicitly stable client identities.
 final class RelayInputSequenceAllocator: @unchecked Sendable {
-    static let shared = RelayInputSequenceAllocator()
+    static let shared = RelayInputSequenceAllocator(persistReservations: false)
 
     private let lock = NSLock()
     private let defaults: UserDefaults
     private let key: String
     private let blockSize: UInt64
+    private let persistReservations: Bool
     private var nextValue: UInt64
     private var reservedUpperBound: UInt64
 
     init(
         defaults: UserDefaults = .standard,
         key: String = "relay.input-sequence-high-water.v2",
-        blockSize: UInt64 = 1 << 20
+        blockSize: UInt64 = 1 << 20,
+        persistReservations: Bool = true
     ) {
         self.defaults = defaults
         self.key = key
         self.blockSize = max(1, blockSize)
-        let previous = (defaults.object(forKey: key) as? NSNumber)?.uint64Value ?? 0
+        self.persistReservations = persistReservations
+        let previous = persistReservations ? (defaults.object(forKey: key) as? NSNumber)?.uint64Value ?? 0 : 0
         nextValue = previous
         reservedUpperBound = previous
         reserveBlock()
@@ -68,7 +66,7 @@ final class RelayInputSequenceAllocator: @unchecked Sendable {
             : reservedUpperBound + blockSize
         precondition(upper > reservedUpperBound, "Relay input sequence space exhausted")
         reservedUpperBound = upper
-        defaults.set(NSNumber(value: upper), forKey: key)
+        if persistReservations { defaults.set(NSNumber(value: upper), forKey: key) }
     }
 }
 

@@ -1,0 +1,60 @@
+//
+//  UITerminalView+PublicInput.swift
+//  libghostty-spm
+//
+//  Public wrappers around TerminalSurface input and navigation actions.
+//
+
+#if canImport(UIKit)
+    import UIKit
+
+    extension UITerminalView {
+        /// Make this view the first responder, reporting whether keyboard
+        /// focus was actually acquired. Fails (returns false) while the view
+        /// is not in a window; ``TerminalViewState/requestFocus()`` retries
+        /// then on window attach.
+        @discardableResult
+        public func acquireProgrammaticFocus() -> Bool {
+            guard window != nil else { return false }
+            if isFirstResponder { return true }
+            return becomeFirstResponder()
+        }
+
+        /// Clear the renderer selection and reset click-gesture state, so a
+        /// following Shift+press starts a fresh selection rather than extending
+        /// a retained one. Hosts that replay pointer gestures locally call this
+        /// before re-sending a deferred mouse-down.
+        @discardableResult
+        public func resetSelection() -> Bool {
+            surface?.resetSelection() ?? false
+        }
+
+        /// The current selection's text without touching the pasteboard, or nil
+        /// when nothing is selected.
+        public func selectedText() -> String? {
+            surface?.readSelection()
+        }
+
+        /// Invoke a named Ghostty binding action (e.g. "copy_to_clipboard",
+        /// "clear_screen"). Returns true when the action dispatched.
+        @discardableResult
+        public func performBindingAction(_ action: String) -> Bool {
+            surface?.performBindingAction(action) ?? false
+        }
+
+        /// Jump the viewport by a number of shell prompts.
+        ///
+        /// Negative offsets move toward older prompts and positive offsets move
+        /// toward newer prompts. Prompt navigation requires shell integration.
+        @discardableResult
+        public func jumpToPrompt(by offset: Int16) -> Bool {
+            surface?.jumpToPrompt(by: offset) ?? false
+        }
+
+        /// Reveal an absolute scrollback row, where zero is the first row.
+        @discardableResult
+        public func scrollToRow(_ row: UInt) -> Bool {
+            surface?.scrollToRow(row) ?? false
+        }
+    }
+#endif

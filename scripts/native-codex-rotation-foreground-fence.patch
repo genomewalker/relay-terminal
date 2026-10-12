@@ -1,0 +1,485 @@
+--- a/codex-rs/tui/src/tui/event_stream.rs
++++ b/codex-rs/tui/src/tui/event_stream.rs
+@@ -98,27 +98,33 @@
+ 
+     /// Drop the underlying event source
+     pub fn pause_events(&self) {
+-        self.rotation.invalidate();
+-        if let Some(monitor) = &self.size_monitor {
+-            monitor.set_active(/*active*/ false);
+-        }
+         let mut state = self
+             .state
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if self.rotation.is_committing() {
++            return;
++        }
++        self.rotation.invalidate();
++        if let Some(monitor) = &self.size_monitor {
++            monitor.set_active(/*active*/ false);
++        }
+         *state = EventBrokerState::Paused;
+     }
+ 
+     /// Create a new instance of the underlying event source
+     pub fn resume_events(&self) {
+-        self.rotation.invalidate();
+-        if let Some(monitor) = &self.size_monitor {
+-            monitor.set_active(/*active*/ true);
+-        }
+         let mut state = self
+             .state
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if self.rotation.is_committing() {
++            return;
++        }
++        self.rotation.invalidate();
++        if let Some(monitor) = &self.size_monitor {
++            monitor.set_active(/*active*/ true);
++        }
+         *state = EventBrokerState::Start;
+         let _ = self.resume_events_tx.send(());
+     }
+@@ -220,6 +226,15 @@
+                     .state
+                     .lock()
+                     .unwrap_or_else(std::sync::PoisonError::into_inner);
++                if self.broker.rotation.is_committing() {
++                    drop(state);
++                    // Completing the exact owner wakes this stream without recreating stdin.
++                    match Pin::new(&mut self.resume_stream).poll_next(cx) {
++                        Poll::Ready(Some(())) => continue,
++                        Poll::Ready(None) => return Poll::Ready(None),
++                        Poll::Pending => return Poll::Pending,
++                    }
++                }
+                 let events = match state.active_event_source_mut() {
+                     Some(events) => events,
+                     None => {
+@@ -671,13 +686,52 @@
+     ) -> Result<super::rotation::FrontendRotationReservation, super::rotation::FrontendRotationError>
+     {
+         use super::rotation::FrontendRotationError;
+-        if self.input_closed.load(Ordering::Acquire) {
+-            return Err(FrontendRotationError::Unavailable);
+-        }
+         let mut state = self
+             .state
+             .lock()
+             .map_err(|_| FrontendRotationError::Unavailable)?;
++        self.rotation_input_ready(&mut state)?;
++        self.rotation.reserve(thread_id, turn_id, deadline)
++    }
++
++    pub(super) fn seal_rotation(
++        &self,
++        reservation: super::rotation::FrontendRotationReservation,
++    ) -> Result<super::rotation::FrontendRotationCommit, super::rotation::FrontendRotationError>
++    {
++        use super::rotation::FrontendRotationError;
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| FrontendRotationError::Unavailable)?;
++        self.rotation_input_ready(&mut state)?;
++        self.rotation.seal(reservation)
++    }
++
++    pub(super) fn complete_rotation(
++        &self,
++        commit: &super::rotation::FrontendRotationCommit,
++    ) -> Result<(), super::rotation::FrontendRotationError> {
++        let _state = self
++            .state
++            .lock()
++            .map_err(|_| super::rotation::FrontendRotationError::Unavailable)?;
++        self.rotation.complete(commit)?;
++        let _ = self.resume_events_tx.send(());
++        Ok(())
++    }
++
++    fn rotation_input_ready(
++        &self,
++        state: &mut EventBrokerState<S>,
++    ) -> Result<(), super::rotation::FrontendRotationError> {
++        use super::rotation::FrontendRotationError;
++        if self.rotation.is_committing() {
++            return Err(FrontendRotationError::Busy);
++        }
++        if self.input_closed.load(Ordering::Acquire) {
++            return Err(FrontendRotationError::Unavailable);
++        }
+         let mut buffered = self
+             .buffered_input
+             .lock()
+@@ -700,7 +754,7 @@
+                 self.rotation.invalidate();
+                 Err(FrontendRotationError::Unavailable)
+             }
+-            Poll::Pending => self.rotation.reserve(thread_id, turn_id, deadline),
++            Poll::Pending => Ok(()),
+         }
+     }
+ }
+--- a/codex-rs/tui/src/tui/rotation.rs
++++ b/codex-rs/tui/src/tui/rotation.rs
+@@ -44,6 +44,7 @@
+     pub(crate) generation: u64,
+     deadline: Instant,
+     cancelled: CancellationToken,
++    reservation_id: uuid::Uuid,
+ }
+ 
+ impl FrontendRotationReservation {
+@@ -73,6 +74,14 @@
+     }
+ }
+ 
++/// The foreground owner retains this until target attachment or a verified source refusal.
++/// Dropping it deliberately leaves admission fenced for reconciliation.
++#[derive(Debug)]
++#[must_use = "a sealed rotation must be completed explicitly by its foreground owner"]
++pub(crate) struct FrontendRotationCommit {
++    reservation: FrontendRotationReservation,
++}
++
+ pub(super) struct FrontendRotationAdmission {
+     runtime_id: uuid::Uuid,
+     state: Mutex<AdmissionState>,
+@@ -81,7 +90,20 @@
+ #[derive(Default)]
+ struct AdmissionState {
+     generation: u64,
+-    active: Option<(CancellationToken, Instant)>,
++    active: Option<ActiveAdmission>,
++}
++
++enum ActiveAdmission {
++    Preparing {
++        reservation_id: uuid::Uuid,
++        thread_id: ThreadId,
++        turn_id: String,
++        cancelled: CancellationToken,
++        deadline: Instant,
++    },
++    Committing {
++        reservation_id: uuid::Uuid,
++    },
+ }
+ 
+ impl Default for FrontendRotationAdmission {
+@@ -99,8 +121,11 @@
+             .state
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if matches!(state.active, Some(ActiveAdmission::Committing { .. })) {
++            return;
++        }
+         state.generation = state.generation.saturating_add(1);
+-        if let Some((cancelled, _)) = state.active.take() {
++        if let Some(ActiveAdmission::Preparing { cancelled, .. }) = state.active.take() {
+             cancelled.cancel();
+         }
+     }
+@@ -121,15 +146,27 @@
+         if state.generation == u64::MAX {
+             return Err(FrontendRotationError::Unavailable);
+         }
+-        if state.active.as_ref().is_some_and(|(cancelled, expires)| {
+-            !cancelled.is_cancelled() && Instant::now() < *expires
++        if state.active.as_ref().is_some_and(|active| match active {
++            ActiveAdmission::Preparing {
++                cancelled,
++                deadline,
++                ..
++            } => !cancelled.is_cancelled() && Instant::now() < *deadline,
++            ActiveAdmission::Committing { .. } => true,
+         }) {
+             return Err(FrontendRotationError::Busy);
+         }
+         state.generation += 1;
+         let deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(5));
+         let cancelled = CancellationToken::new();
+-        state.active = Some((cancelled.clone(), deadline));
++        let reservation_id = uuid::Uuid::new_v4();
++        state.active = Some(ActiveAdmission::Preparing {
++            reservation_id,
++            thread_id,
++            turn_id: turn_id.clone(),
++            cancelled: cancelled.clone(),
++            deadline,
++        });
+         Ok(FrontendRotationReservation {
+             runtime_id: self.runtime_id,
+             thread_id,
+@@ -137,7 +174,72 @@
+             generation: state.generation,
+             deadline,
+             cancelled,
++            reservation_id,
+         })
++    }
++
++    pub(super) fn is_committing(&self) -> bool {
++        self.state.lock().map_or(true, |state| {
++            matches!(state.active, Some(ActiveAdmission::Committing { .. }))
++        })
++    }
++
++    /// Called only while the broker holds its source lock after probing pending input.
++    pub(super) fn seal(
++        &self,
++        reservation: FrontendRotationReservation,
++    ) -> Result<FrontendRotationCommit, FrontendRotationError> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| FrontendRotationError::Unavailable)?;
++        if Instant::now() >= reservation.deadline {
++            return Err(FrontendRotationError::Expired);
++        }
++        let exact = reservation.runtime_id == self.runtime_id
++            && reservation.generation == state.generation
++            && !reservation.cancelled.is_cancelled()
++            && matches!(
++                state.active.as_ref(),
++                Some(ActiveAdmission::Preparing {
++                    reservation_id, thread_id, turn_id, cancelled, deadline,
++                }) if *reservation_id == reservation.reservation_id
++                    && *thread_id == reservation.thread_id
++                    && *turn_id == reservation.turn_id
++                    && *deadline == reservation.deadline
++                    && !cancelled.is_cancelled()
++            );
++        if !exact {
++            return Err(FrontendRotationError::Unavailable);
++        }
++        state.active = Some(ActiveAdmission::Committing {
++            reservation_id: reservation.reservation_id,
++        });
++        Ok(FrontendRotationCommit { reservation })
++    }
++
++    /// Only the foreground owner may call this after it verifies the native outcome
++    /// and attaches the destination, or proves the source was retained.
++    pub(super) fn complete(
++        &self,
++        commit: &FrontendRotationCommit,
++    ) -> Result<(), FrontendRotationError> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| FrontendRotationError::Unavailable)?;
++        if commit.reservation.runtime_id != self.runtime_id
++            || commit.reservation.generation != state.generation
++            || !matches!(
++                state.active,
++                Some(ActiveAdmission::Committing { reservation_id })
++                    if reservation_id == commit.reservation.reservation_id
++            )
++        {
++            return Err(FrontendRotationError::Unavailable);
++        }
++        state.active = None;
++        Ok(())
+     }
+ }
+ 
+--- a/codex-rs/tui/src/tui/rotation_input_tests.rs
++++ b/codex-rs/tui/src/tui/rotation_input_tests.rs
+@@ -138,3 +138,193 @@
+     );
+     assert!(stream.next().await.is_none());
+ }
++
++#[tokio::test(start_paused = true)]
++async fn frontend_rotation_seal_keeps_input_through_expiry_and_pause() {
++    let (broker, tx, mut stream, _draw) = setup();
++    let commit = broker.seal_rotation(reserve(&broker).unwrap()).unwrap();
++    let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
++    tx.send(Ok(Event::Paste("new target draft".into())))
++        .unwrap();
++    tx.send(Ok(Event::Key(key))).unwrap();
++    let mut cx = Context::from_waker(std::task::Waker::noop());
++    assert!(stream.poll_crossterm_event(&mut cx).is_pending());
++    tokio::time::advance(std::time::Duration::from_secs(6)).await;
++    broker.rotation.invalidate();
++    broker.pause_events();
++    broker.resume_events();
++    assert_eq!(reserve(&broker).unwrap_err(), FrontendRotationError::Busy);
++    assert!(stream.poll_crossterm_event(&mut cx).is_pending());
++    broker.complete_rotation(&commit).unwrap();
++    assert!(
++        matches!(stream.next().await, Some(TuiEvent::Paste(text)) if text == "new target draft")
++    );
++    assert!(matches!(stream.next().await, Some(TuiEvent::Key(actual)) if actual == key));
++    assert!(!reserve(&broker).unwrap().is_revoked());
++}
++
++#[tokio::test]
++async fn frontend_rotation_seal_refuses_late_input_without_consuming_it() {
++    let (broker, tx, mut stream, _draw) = setup();
++    let reservation = reserve(&broker).unwrap();
++    tx.send(Ok(Event::Paste("arrived after prepare".into())))
++        .unwrap();
++    assert_eq!(
++        broker.seal_rotation(reservation).unwrap_err(),
++        FrontendRotationError::Busy
++    );
++    assert!(!broker.rotation.is_committing());
++    assert!(
++        matches!(stream.next().await, Some(TuiEvent::Paste(text)) if text == "arrived after prepare")
++    );
++    assert!(!reserve(&broker).unwrap().is_revoked());
++}
++
++#[tokio::test(start_paused = true)]
++async fn frontend_rotation_dropped_commit_stays_fenced() {
++    let (broker, tx, mut stream, _draw) = setup();
++    let commit = broker.seal_rotation(reserve(&broker).unwrap()).unwrap();
++    drop(commit);
++    tx.send(Ok(Event::Paste("retained for reconciliation".into())))
++        .unwrap();
++    tokio::time::advance(std::time::Duration::from_secs(30)).await;
++    broker.rotation.invalidate();
++    broker.pause_events();
++    broker.resume_events();
++    assert_eq!(reserve(&broker).unwrap_err(), FrontendRotationError::Busy);
++    let mut cx = Context::from_waker(std::task::Waker::noop());
++    assert!(stream.poll_crossterm_event(&mut cx).is_pending());
++    match &*broker.state.lock().unwrap() {
++        EventBrokerState::Running(source) => assert_eq!(source.rx.len(), 1),
++        EventBrokerState::Paused | EventBrokerState::Start => panic!("sealed source was replaced"),
++    }
++}
++
++#[tokio::test(start_paused = true)]
++async fn frontend_rotation_expired_and_foreign_seals_leave_current_owner_intact() {
++    let (broker, _tx, _stream, _draw) = setup();
++    let expired = reserve(&broker).unwrap();
++    tokio::time::advance(std::time::Duration::from_secs(5)).await;
++    let current = reserve(&broker).unwrap();
++    assert_eq!(
++        broker.seal_rotation(expired).unwrap_err(),
++        FrontendRotationError::Expired
++    );
++    assert!(!current.is_revoked());
++    let (foreign, _other_tx, _other_stream, _other_draw) = setup();
++    let foreign_lease = reserve(&foreign).unwrap();
++    assert_eq!(
++        broker.seal_rotation(foreign_lease).unwrap_err(),
++        FrontendRotationError::Unavailable
++    );
++    assert!(!current.is_revoked());
++    let _commit = broker.seal_rotation(current).unwrap();
++}
++
++#[tokio::test]
++async fn frontend_rotation_mutated_public_identity_cannot_seal() {
++    for change in 0..4 {
++        let (broker, _tx, _stream, _draw) = setup();
++        let mut lease = reserve(&broker).unwrap();
++        match change {
++            0 => lease.runtime_id = uuid::Uuid::new_v4(),
++            1 => lease.generation += 1,
++            2 => lease.thread_id = ThreadId::new(),
++            3 => lease.turn_id = "another turn".into(),
++            _ => unreachable!(),
++        }
++        assert_eq!(
++            broker.seal_rotation(lease).unwrap_err(),
++            FrontendRotationError::Unavailable
++        );
++        assert!(!broker.rotation.is_committing());
++        assert!(!reserve(&broker).unwrap().is_revoked());
++    }
++}
++
++#[tokio::test]
++async fn frontend_rotation_stale_completion_does_not_unlock_a_new_commit() {
++    let (broker, _tx, _stream, _draw) = setup();
++    let first = broker.seal_rotation(reserve(&broker).unwrap()).unwrap();
++    broker.complete_rotation(&first).unwrap();
++    let second = broker.seal_rotation(reserve(&broker).unwrap()).unwrap();
++    assert_eq!(
++        broker.complete_rotation(&first),
++        Err(FrontendRotationError::Unavailable)
++    );
++    let (foreign, _other_tx, _other_stream, _other_draw) = setup();
++    let other_commit = foreign.seal_rotation(reserve(&foreign).unwrap()).unwrap();
++    assert_eq!(
++        broker.complete_rotation(&other_commit),
++        Err(FrontendRotationError::Unavailable)
++    );
++    assert_eq!(reserve(&broker).unwrap_err(), FrontendRotationError::Busy);
++    broker.complete_rotation(&second).unwrap();
++    assert!(!reserve(&broker).unwrap().is_revoked());
++}
++
++#[tokio::test]
++async fn frontend_rotation_sealed_error_and_eof_wait_for_completion() {
++    for error in [false, true] {
++        let (broker, tx, mut stream, _draw) = setup();
++        let commit = broker.seal_rotation(reserve(&broker).unwrap()).unwrap();
++        if error {
++            tx.send(Err(std::io::Error::other("queued terminal failure")))
++                .unwrap();
++        }
++        drop(tx);
++        let mut cx = Context::from_waker(std::task::Waker::noop());
++        assert!(stream.poll_crossterm_event(&mut cx).is_pending());
++        broker.complete_rotation(&commit).unwrap();
++        assert!(stream.next().await.is_none());
++    }
++}
++
++#[tokio::test]
++async fn frontend_rotation_preseal_error_and_eof_refuse_and_remain_observable() {
++    for error in [false, true] {
++        let (broker, tx, mut stream, _draw) = setup();
++        let reservation = reserve(&broker).unwrap();
++        if error {
++            tx.send(Err(std::io::Error::other("late terminal failure")))
++                .unwrap();
++        }
++        drop(tx);
++        assert_eq!(
++            broker.seal_rotation(reservation).unwrap_err(),
++            if error {
++                FrontendRotationError::Busy
++            } else {
++                FrontendRotationError::Unavailable
++            }
++        );
++        assert!(!broker.rotation.is_committing());
++        assert!(stream.next().await.is_none());
++    }
++}
++
++struct WakeFlag(AtomicBool);
++
++impl std::task::Wake for WakeFlag {
++    fn wake(self: Arc<Self>) {
++        self.0.store(true, Ordering::Release);
++    }
++}
++
++#[tokio::test]
++async fn frontend_rotation_completion_wakes_waiting_input() {
++    let (broker, tx, mut stream, _draw) = setup();
++    let commit = broker.seal_rotation(reserve(&broker).unwrap()).unwrap();
++    let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
++    let waker = std::task::Waker::from(flag.clone());
++    let mut cx = Context::from_waker(&waker);
++    assert!(stream.poll_crossterm_event(&mut cx).is_pending());
++    tx.send(Ok(Event::Paste("wake me".into()))).unwrap();
++    flag.0.store(false, Ordering::Release);
++    broker.complete_rotation(&commit).unwrap();
++    assert!(flag.0.load(Ordering::Acquire));
++    assert!(matches!(
++        stream.poll_crossterm_event(&mut cx),
++        Poll::Ready(Some(TuiEvent::Paste(text))) if text == "wake me"
++    ));
++}

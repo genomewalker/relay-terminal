@@ -6,31 +6,120 @@ struct AgentInspectorSelection: Hashable, Sendable {
     let subagentID: String
 }
 
-enum TabMovePlacement: Equatable, Sendable {
+enum TabMovePlacement: String, Codable, Equatable, Sendable {
     case before
     case after
 }
 
-private struct ClosedPaneRecovery {
+struct ClosedPaneRecovery: Codable, Identifiable, Sendable {
+    var id = UUID()
+    var closedAt = Date()
     let pane: PaneSnapshot
     let tab: TabSnapshot
     let tabIndex: Int
     let floatingPlacement: FloatingPanePlacement?
 }
 
+private struct TabPresentationState {
+    let focusedPaneID: UUID?
+    let zoomedPaneID: UUID?
+}
+
+private struct SupervisorAdvisoryRequestKey: Equatable {
+    let identity: RelaySupervisedSessionID
+    let stage: RelaySupervisorStage
+}
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var tabs: [TabModel] = []
-    @Published var selectedTabID: UUID?
+    @Published private(set) var navigationState = WorkspaceNavigationState.load()
+    @Published var selectedTabID: UUID? {
+        willSet {
+            guard newValue != selectedTabID, let tab = selectedTab else { return }
+            if let paneID = tab.chrome.anchor?.paneID {
+                pluginPresentations[paneID]?.suspendForWorkspaceCover()
+            }
+            tab.chrome.suspendPresentation()
+            tabPresentationStates[tab.id] = TabPresentationState(
+                focusedPaneID: activePaneID,
+                zoomedPaneID: zoomedPaneID
+            )
+        }
+        didSet {
+            guard selectedTabID != oldValue else { return }
+            if let tab = selectedTab {
+                navigationState = WorkspaceNavigationState.updating { $0.remember(tabID: tab.id, sessionID: tab.sessionID) }
+            }
+            // Keep a tab's presentation separate from the remote session. A
+            // switch must not unzoom it or select its first shell on return.
+            let paneIDs = Set(selectedTab?.allPaneIDs ?? [])
+            let state = selectedTabID.flatMap { tabPresentationStates[$0] }
+            zoomedPaneID = state?.zoomedPaneID.flatMap { paneIDs.contains($0) ? $0 : nil }
+            activePaneID = zoomedPaneID
+                ?? state?.focusedPaneID.flatMap { paneIDs.contains($0) ? $0 : nil }
+                ?? selectedTab?.layout.paneIDs.first
+            tabPresentationStates = tabPresentationStates.filter { id, _ in
+                tabs.contains { $0.id == id }
+            }
+            if !networkVisible, selectedTab?.chrome.visible == true {
+                selectedTab?.chrome.resumePresentation()
+                if let paneID = selectedTab?.chrome.anchor?.paneID {
+                    pluginPresentations[paneID]?.resumeAfterWorkspaceCover()
+                }
+            }
+        }
+    }
     @Published var activePaneID: UUID? {
         didSet {
             guard activePaneID != oldValue else { return }
             updateTerminalFocusOwnership()
+            if let pane = activePane {
+                selectedTab?.chrome.activeContextChanged(WorkspaceContextAnchor(
+                    paneID: pane.id, profile: pane.profile, directory: pane.directory))
+            }
         }
     }
     @Published var isConnectionSheetPresented = false
     @Published var isHostLauncherPresented = false
-    @Published var sidebarVisible = true
+    @Published var isPaneLinkPresented = false
+    @Published var sidebarVisible = false
+    @Published var networkVisible = false {
+        didSet {
+            guard networkVisible != oldValue else { return }
+            if networkVisible {
+                if let paneID = selectedTab?.chrome.anchor?.paneID {
+                    pluginPresentations[paneID]?.suspendForWorkspaceCover()
+                }
+                selectedTab?.chrome.suspendPresentation()
+            } else {
+                selectedTab?.chrome.resumePresentation()
+                if let paneID = selectedTab?.chrome.anchor?.paneID {
+                    pluginPresentations[paneID]?.resumeAfterWorkspaceCover()
+                }
+            }
+            updateTerminalFocusOwnership()
+        }
+    }
+    let paneLinkSelection = PaneLinkSelection()
+
+    func showNetwork() {
+        networkVisible = true
+        // Navigation is deliberate; hidden terminals must not retain input.
+        NSApp?.keyWindow?.makeFirstResponder(nil)
+    }
+
+    func hideNetwork() {
+        guard networkVisible else { return }
+        networkVisible = false
+        guard let paneID = activePaneID, let pane = panes[paneID] else { return }
+        Task { @MainActor in
+            await Task.yield()
+            guard !self.networkVisible, !self.paneLinkSelection.active,
+                  self.activePaneID == paneID, self.panes[paneID] === pane else { return }
+            pane.focus()
+        }
+    }
     @Published var isFullScreen = false
     @Published var zoomedPaneID: UUID?
     @Published var draftProfile = ConnectionProfile()
@@ -38,6 +127,15 @@ final class WorkspaceModel: ObservableObject {
     @Published var renameDraft = ""
     @Published var agentInspector: AgentInspectorSelection?
     @Published var intelligencePanelVisible = false
+    @Published var assistantVisible = false
+    private var assistantStorage: RelayAssistantController?
+    var assistantController: RelayAssistantController {
+        if let assistantStorage { return assistantStorage }
+        let controller = RelayAssistantController(workspace: self)
+        assistantStorage = controller
+        return controller
+    }
+    @Published var energyMonitorMode = false
     @Published var performancePanelVisible = false
     @Published var terminationTargetID: UUID?
     @Published var operationError: String?
@@ -45,25 +143,309 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var pinnedSessionIDs = WorkspacePinStore.load(.session)
     @Published private(set) var pinnedTabIDs = WorkspacePinStore.load(.tab)
     @Published private(set) var recentlyClosedPaneCount = 0
+    @Published var isRecoveryPresented = false
+    @Published private(set) var recoveringTabIDs: Set<UUID> = []
+    @Published private(set) var recoveringConversationPaneIDs: Set<UUID> = []
     @Published private(set) var paneCloseEvent = 0
     @Published private(set) var lastClosedPaneWasRemote = false
+    @Published private(set) var supervisorRecommendations: [UUID: RelaySupervisorRecommendation] = [:]
+    @Published private(set) var supervisorAdvisories: [UUID: RelaySupervisorAdvisory] = [:]
+    @Published private(set) var supervisorReceipts: [UUID: RelaySupervisorActionReceipt] = [:]
 
     let profileStore = ProfileStore()
     let activityIndex = WorkspaceActivityIndex()
     private(set) var panes: [UUID: PaneModel] = [:]
+    private var floatingRPaneTabs: [UUID: UUID] = [:]
+    private var floatingRPrimaryEditors: [UUID: UUID] = [:]
+    var savedRPresentations: [RWorkspacePresentation] = []
+    var captureRPresentations: (() -> [RWorkspacePresentation])?
+
+    func persistRPresentation() { persistWorkspace() }
+
+    func rPresentationTabID(consoleID: UUID) -> UUID? {
+        tabs.first(where: { $0.allPaneIDs.contains(consoleID) })?.id ?? floatingRPaneTabs[consoleID]
+    }
+    private let editorInputRequests = AgentInputRequests()
     private let workspaceKey = "relay.workspace.v1"
+    private lazy var sharedWorkspaceStore = RelaySharedWorkspaceStore(directory:
+        RelayStateProfile.applicationSupportRoot.appendingPathComponent("Relay/Workspace", isDirectory: true))
+    private var workspaceBaseline: WorkspaceSnapshot?
+    private var workspaceSaveCanClose = true
+    @Published private(set) var workspacePersistenceIssue: String?
+    @Published private(set) var workspacePendingChanges = 0
     private var sidebarBeforeFullScreen = true
     private var persistenceTask: Task<Void, Never>?
+    private var supervisorTask: Task<Void, Never>?
+    private var supervisorAdvisoryTask: Task<Void, Never>?
+    private var supervisorAdvisoryRequestKey: SupervisorAdvisoryRequestKey?
+    private var sessionSupervisor = RelaySessionSupervisor()
+    private var supervisorActionBroker = RelaySupervisorActionBroker()
+    private var supervisorActionExecutor = RelaySupervisorActionExecutor()
+    private let supervisorAuditStore = RelaySupervisorAuditStore.shared
     private var presentationFocusTask: Task<Void, Never>?
     private var didShutdown = false
     private var recentlyClosedPanes: [ClosedPaneRecovery] = []
+    private var tabPresentationStates: [UUID: TabPresentationState] = [:]
+    // Retained above transient sheets/tabs so dispatched outcomes remain
+    // reachable even when their presenter or originating tab disappears.
+    private var pluginPresentations: [UUID: PluginToolPresentation] = [:]
+    private var retiredPluginPresentations: [UUID: [PluginToolPresentation]] = [:]
 
     init(restoreSavedWorkspace: Bool = true) {
+        paneLinkSelection.connectPair = { [weak self] ids, generation in
+            guard let self else { return }
+            Task { @MainActor in
+                do {
+                    guard ids.allSatisfy({ self.panes[$0]?.contentKind == .terminal }) else {
+                        throw RemoteCatalogError.failed("A selected pane is no longer available.")
+                    }
+                    let link = try await RelayPaneMessaging.shared.connect(panes: ids, workspace: self)
+                    self.paneLinkSelection.recordMembership(PaneLinkMembership(id: link.id,
+                        paneIDs: link.members.map(\.paneID), unavailable: link.transport == "unavailable"))
+                    guard link.transport != "unavailable" else {
+                        let failures = link.members.compactMap { member -> String? in
+                            guard let reason = link.resolutionErrors?[member.paneID.uuidString.lowercased()]
+                                ?? link.resolutionErrors?[member.paneID.uuidString] ?? member.unavailable else { return nil }
+                            return self.paneLinkSelection.label(for: member.paneID) + ": " + reason
+                        }
+                        throw RemoteCatalogError.failed(failures.isEmpty
+                            ? "The link was saved, but a pane is unavailable. Retry when both panes are ready."
+                            : failures.joined(separator: "\n"))
+                    }
+                    self.paneLinkSelection.finishPair(ids, generation: generation, failure: nil)
+                } catch {
+                    self.paneLinkSelection.finishPair(ids, generation: generation, failure: error.localizedDescription)
+                }
+                self.updateTerminalFocusOwnership()
+                if !self.paneLinkSelection.active, let id = self.activePaneID {
+                    self.panes[id]?.runtime.focus()
+                }
+            }
+        }
+        paneLinkSelection.describePane = { [weak self] id in
+            self?.paneLinkLabel(for: id) ?? "Unavailable pane"
+        }
+        paneLinkSelection.refreshLinks = { [weak self] in self?.refreshPaneLinkMemberships() }
+        paneLinkSelection.removeLink = { [weak self] id in self?.removePaneLink(id) }
+        recentlyClosedPanes = RelayRecoveryStore.shared.loadClosedPanes()
+        recentlyClosedPaneCount = recentlyClosedPanes.count
         let shouldRestore = restoreSavedWorkspace && !RelayLaunchMode.isSafeMode
         if shouldRestore && restoreWorkspace() {
             panes.values.forEach { $0.startAgentMonitoring() }
-        } else {
+        } else if workspacePersistenceIssue == nil {
             newTab(profile: .local)
+        }
+#if DEBUG
+        if RelaySupervisorAcceptanceFixture.isEnabled {
+            sessionSupervisor = RelaySessionSupervisor(
+                configuration: RelaySupervisorAcceptanceFixture.configuration
+            )
+            panes.values
+                .filter { $0.contentKind == .terminal && $0.profile.backend == .relay }
+                .forEach { $0.installSupervisorAcceptanceFixture() }
+        }
+#endif
+        panes.values.forEach { RelaySurfacePublication.shared.restore($0) }
+        startSupervisorMonitoring()
+    }
+
+    private func startSupervisorMonitoring() {
+        guard !RelayLaunchMode.isRunningTests, supervisorTask == nil else { return }
+        refreshSupervisorRecommendations()
+        supervisorTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled, let self else { return }
+                self.refreshSupervisorRecommendations()
+            }
+        }
+    }
+
+    func refreshSupervisorRecommendations(now: Date = Date()) {
+        var current: [UUID: RelaySupervisorRecommendation] = [:]
+        var telemetryByPane: [UUID: RelaySupervisorTelemetry] = [:]
+        for pane in panes.values where pane.contentKind == .terminal && pane.kind != .shell {
+            let telemetry = pane.supervisorTelemetry(now: now)
+            telemetryByPane[pane.id] = telemetry
+            current[pane.id] = sessionSupervisor.evaluate(telemetry)
+        }
+        supervisorRecommendations = current
+        supervisorAdvisories = supervisorAdvisories.filter { paneID, advisory in
+            current[paneID]?.identity == advisory.identity &&
+                (current[paneID]?.stage ?? .observe) > .observe
+        }
+        refreshSupervisorAdvisory(recommendations: current, telemetryByPane: telemetryByPane)
+    }
+
+    private func refreshSupervisorAdvisory(
+        recommendations: [UUID: RelaySupervisorRecommendation],
+        telemetryByPane: [UUID: RelaySupervisorTelemetry]
+    ) {
+        guard RelayPreferences.shared.intelligenceEnabled,
+              let recommendation = recommendations.values
+                .filter({ $0.stage > .observe })
+                .max(by: { $0.stage < $1.stage }),
+              let telemetry = telemetryByPane[recommendation.identity.paneID] else {
+            supervisorAdvisoryTask?.cancel()
+            supervisorAdvisoryTask = nil
+            supervisorAdvisoryRequestKey = nil
+            return
+        }
+        let requestKey = SupervisorAdvisoryRequestKey(
+            identity: recommendation.identity, stage: recommendation.stage
+        )
+        if supervisorAdvisoryTask != nil, supervisorAdvisoryRequestKey == requestKey { return }
+        supervisorAdvisoryTask?.cancel()
+        supervisorAdvisoryRequestKey = requestKey
+        supervisorAdvisoryTask = Task { @MainActor [weak self] in
+            let advisory = await RelaySupervisorIntelligenceService.shared.advise(
+                recommendation: recommendation,
+                telemetry: telemetry
+            )
+            guard let self else { return }
+            if self.supervisorAdvisoryRequestKey == requestKey {
+                self.supervisorAdvisoryTask = nil
+                self.supervisorAdvisoryRequestKey = nil
+            }
+            guard !Task.isCancelled, let advisory,
+                  let current = self.supervisorRecommendations[advisory.identity.paneID],
+                  current.identity == advisory.identity,
+                  current.observedAt == advisory.deterministicObservedAt,
+                  Date().timeIntervalSince(advisory.deterministicObservedAt) >= 0,
+                  Date().timeIntervalSince(advisory.deterministicObservedAt) <= 30,
+                  advisory.suggestedStage <= current.stage else { return }
+            self.supervisorAdvisories[advisory.identity.paneID] = advisory
+        }
+    }
+
+    @discardableResult
+    func proposeSupervisorAction(paneID: UUID, now: Date = Date()) -> RelaySupervisorActionReceipt? {
+        guard let recommendation = supervisorRecommendations[paneID],
+              let receipt = supervisorActionBroker.propose(recommendation, now: now) else { return nil }
+        guard recordSupervisorAudit(.proposed, receipt: receipt, reason: .userReview, now: now) else {
+            operationError = "Relay could not persist the supervisor proposal audit record."
+            return nil
+        }
+        supervisorReceipts[receipt.id] = receipt
+        return receipt
+    }
+
+    @discardableResult
+    func resolveSupervisorAction(
+        receiptID: UUID, approve: Bool, now: Date = Date()
+    ) -> RelaySupervisorActionReceipt? {
+        guard let pending = supervisorReceipts[receiptID],
+              let pane = panes[pending.identity.paneID] else { return nil }
+        let currentIdentity = pane.supervisorTelemetry(now: now).identity
+        guard let resolved = supervisorActionBroker.resolve(
+            receiptID, approve: approve, currentIdentity: currentIdentity, now: now
+        ) else { return nil }
+        let audit: (RelaySupervisorAuditKind, RelaySupervisorAuditReason) = switch resolved.state {
+        case .approved: (.approved, .userReview)
+        case .rejected: (.rejected, .userReview)
+        case .expired: (.expired, .expired)
+        case .staleIdentity: (.staleIdentity, .staleIdentity)
+        case .proposed: (.executionRejected, .notApproved)
+        }
+        guard recordSupervisorAudit(audit.0, receipt: resolved, reason: audit.1, now: now) else {
+            operationError = "Relay could not persist the supervisor decision audit record."
+            return nil
+        }
+        supervisorReceipts[receiptID] = resolved
+        return resolved
+    }
+
+    @discardableResult
+    func approveAndExecuteSupervisorAction(
+        receiptID: UUID, now: Date = Date()
+    ) -> RelaySupervisorExecutionClaim? {
+        guard let receipt = resolveSupervisorAction(receiptID: receiptID, approve: true, now: now),
+              let pane = panes[receipt.identity.paneID] else { return nil }
+        let telemetry = pane.supervisorTelemetry(now: now)
+        var capabilities = Set<RelaySupervisorExecutionCapability>()
+        if pane.profile.backend == .relay,
+           pane.contentKind == .terminal,
+           pane.kind != .shell,
+           telemetry.isReachable,
+           pane.runtime.canSendSupervisorInterrupt {
+            capabilities.insert(.gracefulInterrupt)
+        }
+        let result = supervisorActionExecutor.claim(
+            receipt,
+            currentIdentity: telemetry.identity,
+            isReachable: telemetry.isReachable,
+            capabilities: capabilities,
+            now: now
+        )
+        switch result {
+        case .success(let claim):
+            guard recordSupervisorAudit(
+                .executionDispatched, receipt: receipt, reason: .userReview, now: now
+            ) else {
+                operationError = "Relay could not persist the supervisor dispatch audit record. The action was not executed."
+                return nil
+            }
+            guard claim.command == .gracefulInterrupt,
+                  pane.runtime.sendSupervisorInterrupt() else {
+                _ = recordSupervisorAudit(
+                    .executionFailed, receipt: receipt, reason: .transportUnavailable, now: now
+                )
+                operationError = "The approved interrupt was not sent because the pane transport is no longer available."
+                return nil
+            }
+            _ = recordSupervisorAudit(
+                .executionSucceeded, receipt: receipt, reason: .userReview, now: now
+            )
+            return claim
+        case .failure(let rejection):
+            _ = recordSupervisorAudit(
+                .executionRejected,
+                receipt: receipt,
+                reason: Self.supervisorAuditReason(rejection),
+                now: now
+            )
+            operationError = Self.supervisorExecutionMessage(rejection)
+            return nil
+        }
+    }
+
+    private func recordSupervisorAudit(
+        _ kind: RelaySupervisorAuditKind,
+        receipt: RelaySupervisorActionReceipt,
+        reason: RelaySupervisorAuditReason,
+        now: Date
+    ) -> Bool {
+        supervisorAuditStore.record(RelaySupervisorAuditEvent(
+            id: UUID(), receiptID: receipt.id, identity: receipt.identity,
+            stage: receipt.stage, kind: kind, reason: reason, occurredAt: now
+        ))
+    }
+
+    private static func supervisorAuditReason(
+        _ rejection: RelaySupervisorExecutionRejection
+    ) -> RelaySupervisorAuditReason {
+        switch rejection {
+        case .alreadyConsumed: .alreadyConsumed
+        case .notApproved: .notApproved
+        case .expired: .expired
+        case .staleIdentity: .staleIdentity
+        case .unreachable: .unreachable
+        case .unsupportedStage: .unsupportedStage
+        case .missingCapability: .missingCapability
+        }
+    }
+
+    private static func supervisorExecutionMessage(
+        _ rejection: RelaySupervisorExecutionRejection
+    ) -> String {
+        switch rejection {
+        case .alreadyConsumed: "This supervisor approval was already used."
+        case .notApproved: "The supervisor action is not approved."
+        case .expired: "The supervisor approval expired before execution."
+        case .staleIdentity: "The supervised session changed; the approval was not executed."
+        case .unreachable: "The supervised session is offline; the approval was not queued."
+        case .unsupportedStage: "This Relay build cannot safely execute that supervisor stage."
+        case .missingCapability: "The live pane does not expose the required supervisor capability."
         }
     }
 
@@ -77,6 +459,59 @@ final class WorkspaceModel: ObservableObject {
 
     var selectedPanes: [PaneModel] {
         selectedTab?.allPaneIDs.compactMap { panes[$0] } ?? []
+    }
+
+    func pluginPresentation(paneID: UUID, profile: ConnectionProfile,
+                            directory: String?) -> PluginToolPresentation {
+        pruneRetiredPluginPresentations()
+        if let existing = pluginPresentations[paneID] { return existing }
+        let presentation = PluginToolPresentation()
+        let tab = tabs.first { $0.allPaneIDs.contains(paneID) }
+        let context = tab.flatMap { executionContext(tabID: $0.id) }
+        presentation.captureOnce(id: paneID, profile: context?.profile ?? profile, directory: context?.directory ?? directory)
+        pluginPresentations[paneID] = presentation
+        return presentation
+    }
+
+    /// Closing a pane retires its exact captured presentation. Undo may reuse
+    /// the pane UUID, but it must receive a fresh capture and authorization
+    /// lease. Dispatched mutations and their outcomes stay reachable here.
+    private func retirePluginPresentation(for paneID: UUID) {
+        guard let presentation = pluginPresentations.removeValue(forKey: paneID) else { return }
+        presentation.suspendForWorkspaceCover()
+        guard presentation.operationLifetime.running || presentation.resultStamp != nil ||
+                presentation.result != nil || presentation.error != nil else { return }
+        retiredPluginPresentations[paneID, default: []].append(presentation)
+        pruneRetiredPluginPresentations()
+    }
+
+    func retiredPluginPresentation(for paneID: UUID) -> PluginToolPresentation? {
+        pruneRetiredPluginPresentations()
+        return retiredPluginPresentations[paneID]?.last
+    }
+
+    private func pruneRetiredPluginPresentations() {
+        for paneID in Array(retiredPluginPresentations.keys) {
+            guard var values = retiredPluginPresentations[paneID] else { continue }
+            let running = values.filter { $0.operationLifetime.running }
+            let completed = values.filter { !$0.operationLifetime.running }.suffix(4)
+            values = running + completed
+            if values.isEmpty { retiredPluginPresentations.removeValue(forKey: paneID) }
+            else { retiredPluginPresentations[paneID] = values }
+        }
+        let completed = retiredPluginPresentations.values.flatMap { $0 }
+            .filter { !$0.operationLifetime.running }
+        guard completed.count > 32 else { return }
+        var excess = completed.count - 32
+        for paneID in Array(retiredPluginPresentations.keys) where excess > 0 {
+            guard var values = retiredPluginPresentations[paneID] else { continue }
+            while excess > 0,
+                  let index = values.firstIndex(where: { !$0.operationLifetime.running }) {
+                values.remove(at: index); excess -= 1
+            }
+            if values.isEmpty { retiredPluginPresentations.removeValue(forKey: paneID) }
+            else { retiredPluginPresentations[paneID] = values }
+        }
     }
 
     /// AppKit resigns the terminal first responder when Relay is hidden,
@@ -100,9 +535,20 @@ final class WorkspaceModel: ObservableObject {
             // focusing only the active pane leaves sibling TUIs rendering at
             // the browser width until an unrelated divider move.
             self.selectedPanes.forEach { $0.runtime.reclaimNativeViewportOwnership() }
+            guard self.selectedTab?.chrome.presentationActive != true else {
+                self.presentationFocusTask = nil
+                return
+            }
             pane.focus()
             self.presentationFocusTask = nil
         }
+    }
+
+    func dockWillTakeFocus() {
+        presentationFocusTask?.cancel()
+        presentationFocusTask = nil
+        selectedPanes.forEach { $0.runtime.cancelFocusRecoveryForExternalFocus() }
+        NSApp?.keyWindow?.makeFirstResponder(nil)
     }
 
     func inspectAgent(paneID: UUID, subagentID: String) {
@@ -112,6 +558,18 @@ final class WorkspaceModel: ObservableObject {
 
     func closeAgentInspector() {
         agentInspector = nil
+    }
+
+    func closeAssistant() {
+        assistantVisible = false
+        let target = activePaneID
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !self.assistantVisible, !self.networkVisible,
+                  !self.paneLinkSelection.active, self.activePaneID == target,
+                  let target else { return }
+            self.panes[target]?.focus()
+        }
     }
 
     func toggleIntelligencePanel() {
@@ -149,7 +607,7 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func requestTerminatePane(_ paneID: UUID) {
-        guard let pane = panes[paneID], pane.profile.kind == .ssh, pane.profile.backend == .relay else { return }
+        guard let pane = panes[paneID], pane.profile.backend == .relay else { return }
         terminationTargetID = paneID
     }
 
@@ -174,8 +632,9 @@ final class WorkspaceModel: ObservableObject {
 
     func revealPane(_ paneID: UUID) {
         guard let tab = tabs.first(where: { $0.allPaneIDs.contains(paneID) }) else { return }
-        if selectedTabID != tab.id { selectTab(tab.id) }
+        if networkVisible || selectedTabID != tab.id { selectTab(tab.id) }
         selectPane(paneID)
+        networkVisible = false
         panes[paneID]?.focus()
     }
 
@@ -202,7 +661,9 @@ final class WorkspaceModel: ObservableObject {
                             name: tab.name,
                             pinned: isTabPinned(tab.id),
                             selected: tab.id == selectedTabID,
-                            panes: tab.allPaneIDs.compactMap { paneID in
+                            panes: (tab.allPaneIDs + floatingRPaneTabs.filter {
+                                $0.value == tab.id && !tab.allPaneIDs.contains($0.key)
+                            }.map(\.key).sorted { $0.uuidString < $1.uuidString }).compactMap { paneID in
                                 guard let pane = panes[paneID] else { return nil }
                                 return RelaySidePanelState.Pane(
                                     id: pane.id.uuidString.lowercased(),
@@ -211,12 +672,15 @@ final class WorkspaceModel: ObservableObject {
                                     directory: pane.directory,
                                     contentKind: pane.contentKind.rawValue,
                                     terminalAvailable: pane.contentKind == .terminal &&
-                                        pane.profile.kind == .ssh && pane.profile.backend == .relay,
+                                        pane.profile.backend == .relay,
                                     agent: pane.kind.rawValue,
                                     phase: pane.phase.rawValue,
-                                    connection: pane.connectionState.label,
+                                    connection: pane.connectionStatusLabel,
                                     selected: pane.id == activePaneID,
-                                    summary: pane.activitySummary
+                                    summary: pane.activitySummary,
+                                    backend: pane.profile.backend.rawValue,
+                                    closeBehavior: pane.contentKind == .editor ? "not_supported_via_mcp" :
+                                        (pane.profile.backend == .relay ? "detach_persistent_session" : "stop_nonpersistent_process")
                                 )
                             }
                         )
@@ -224,6 +688,18 @@ final class WorkspaceModel: ObservableObject {
                 )
             }
         )
+    }
+
+    func paneIDs(inTab tabID: UUID) -> [UUID] {
+        guard let tab = tabs.first(where: { $0.id == tabID }) else { return [] }
+        return tab.allPaneIDs + floatingRPaneTabs
+            .filter { $0.value == tabID && !tab.allPaneIDs.contains($0.key) }
+            .map(\.key)
+            .sorted { $0.uuidString < $1.uuidString }
+    }
+
+    func tabID(containingPane paneID: UUID) -> UUID? {
+        tabs.first { $0.allPaneIDs.contains(paneID) }?.id ?? floatingRPaneTabs[paneID]
     }
 
     func sidePanelDetail(for paneID: UUID) -> RelaySidePanelPaneDetail? {
@@ -243,22 +719,21 @@ final class WorkspaceModel: ObservableObject {
                     provider: $0.provider.rawValue, phase: $0.phase.rawValue,
                     updates: $0.updates.suffix(5).map(\.message)
                 )
-            }
+            },
+            plans: pane.taskPlans
         )
     }
 
     @discardableResult
     func sidePanelReveal(_ paneID: UUID) -> Bool {
-        guard panes[paneID] != nil else { return false }
+        guard let pane = panes[paneID] else { return false }
         revealPane(paneID)
-        NSApp.activate(ignoringOtherApps: true)
+        activateSelectedWorkspacePane(pane)
         return true
     }
 
-    @discardableResult
-    func sidePanelSendPrompt(_ text: String, to paneID: UUID) -> Bool {
-        guard let pane = panes[paneID], pane.contentKind == .terminal else { return false }
-        return pane.runtime.sendSidePanelPrompt(text)
+    func sidePanelViewport(_ paneID: UUID) -> String? {
+        panes[paneID]?.runtime.sidePanelViewportText()
     }
 
     func sessionDisplayName(_ sessionID: UUID, fallback: String) -> String {
@@ -329,6 +804,16 @@ final class WorkspaceModel: ObservableObject {
             visualIndex += 1
         }
         tabs = reordered
+        persistWorkspace()
+    }
+
+    func renameTab(_ id: UUID, to name: String) throws {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 80,
+              let index = tabs.firstIndex(where: { $0.id == id }) else {
+            throw PluginError.invalid("Tab name must contain 1–80 characters and target an existing tab")
+        }
+        tabs[index].name = trimmed
         persistWorkspace()
     }
 
@@ -425,13 +910,27 @@ final class WorkspaceModel: ObservableObject {
         if profile.kind == .ssh { profileStore.markUsed(profile) }
         isHostLauncherPresented = false
         persistWorkspace()
-        Task { @MainActor in
+        Task { @MainActor [weak self, weak pane] in
             await Task.yield()
+            guard let self, let pane, self.selectedTabID == tab.id,
+                  self.activePaneID == pane.id, self.panes[pane.id] === pane,
+                  !self.networkVisible, !self.paneLinkSelection.active else { return }
             pane.focus()
         }
     }
 
-    func attachRemoteSession(profile: ConnectionProfile, remote: RemoteSessionRecord) {
+    func attachRemoteSession(profile: ConnectionProfile, remote: RemoteSessionRecord, inNewWindow: Bool = false) {
+        let attached = remote.panes.compactMap { UUID(uuidString: $0.paneID) }.contains { panes[$0] != nil }
+        if let sessionID = remote.workspaceID.flatMap(UUID.init(uuidString:)), attached,
+           RecoveryWindowRegistry.shared.focus(sessionID: sessionID) {
+            isHostLauncherPresented = false
+            if let pane = remote.panes.compactMap({ UUID(uuidString: $0.paneID) }).first(where: { panes[$0] != nil }) { revealPane(pane) }
+            return
+        }
+        let destination = inNewWindow ? RecoveryWindowRegistry.shared.openWindow(workspace: self) : NSApp?.keyWindow
+        if let sessionID = remote.workspaceID.flatMap(UUID.init(uuidString:)) {
+            RecoveryWindowRegistry.shared.record(sessionID: sessionID, replacing: true, window: destination)
+        }
         if let existingPane = remote.panes.compactMap({ UUID(uuidString: $0.paneID) })
             .first(where: { panes[$0] != nil }) {
             for remotePane in remote.panes {
@@ -462,6 +961,7 @@ final class WorkspaceModel: ObservableObject {
                 let pane = PaneModel(
                     id: paneID,
                     profile: profile,
+                    requiresExistingWorker: true,
                     remoteParentSessionID: remotePane.parentPaneID,
                     customName: remotePane.title,
                     directory: remotePane.directory
@@ -488,7 +988,7 @@ final class WorkspaceModel: ObservableObject {
         sessionNames[sessionID] = remote.label
         selectedTabID = attachedTabs[0].id
         activePaneID = attachedTabs[0].layout.paneIDs.first
-        profileStore.markUsed(profile)
+        if profile.kind == .ssh { profileStore.markUsed(profile) }
         isHostLauncherPresented = false
         persistWorkspace()
     }
@@ -496,26 +996,36 @@ final class WorkspaceModel: ObservableObject {
     /// Recreates one catalogued relay pane that is still alive remotely but no
     /// longer appears in the local layout. It is attached directly; no nested
     /// terminal command is launched and the remote process keeps one PTY writer.
+    @discardableResult
     func attachRemotePane(
         profile: ConnectionProfile,
         remotePane: RemoteCatalogPane,
         workspaceID: String?,
-        sessionLabel: String
-    ) {
+        sessionLabel: String,
+        intoSessionID: UUID? = nil
+    ) -> Bool {
         guard remotePane.recoverable,
-              let paneID = UUID(uuidString: remotePane.paneID) else { return }
-        if panes[paneID] != nil {
+              let paneID = UUID(uuidString: remotePane.paneID) else { return false }
+        if let pane = panes[paneID] {
+            guard pane.profile.id == profile.id, pane.profile.backend == .relay else { return false }
             isHostLauncherPresented = false
             revealPane(paneID)
-            return
+            // Catalog recovery is an explicit viewer reconnect. Renderer
+            // status may still say connected after a failed native surface
+            // attachment; it must not suppress the requested recovery.
+            pane.runtime.reconnectRetainedPane()
+            RelayRecoveryStore.shared.record(kind: "viewer_reconnect_requested", paneID: paneID,
+                profile: pane.profile, directory: pane.directory)
+            return true
         }
 
-        let sessionID = workspaceID.flatMap(UUID.init(uuidString:)) ?? UUID()
+        let sessionID = intoSessionID ?? workspaceID.flatMap(UUID.init(uuidString:)) ?? UUID()
         let tabID = remotePane.tabID.flatMap(UUID.init(uuidString:)) ?? UUID()
         let pane = PaneModel(
             id: paneID,
             profile: profile,
             contentKind: PaneContentKind(rawValue: remotePane.contentKind) ?? .terminal,
+            requiresExistingWorker: true,
             remoteParentSessionID: remotePane.parentPaneID,
             customName: remotePane.title,
             directory: remotePane.directory
@@ -542,12 +1052,160 @@ final class WorkspaceModel: ObservableObject {
         sessionNames[sessionID] = sessionNames[sessionID] ?? sessionLabel
         selectedTabID = tabID
         activePaneID = paneID
-        profileStore.markUsed(profile)
+        if profile.kind == .ssh { profileStore.markUsed(profile) }
         isHostLauncherPresented = false
         persistWorkspace()
         Task { @MainActor in
             await Task.yield()
             pane.focus()
+        }
+        return true
+    }
+
+    /// Recover a single tab from retained host records, including a partially
+    /// attached tab. Existing pane objects retain their drafts and runtimes.
+    @discardableResult
+    func recoverRemoteTab(profile: ConnectionProfile, remote: RemoteSessionRecord, tabID: UUID) -> [UUID] {
+        guard let sessionID = remote.workspaceID.flatMap(UUID.init(uuidString:)) else { return [] }
+        let records = remote.panes.filter {
+            $0.recoverable && $0.tabID.flatMap(UUID.init(uuidString:)) == tabID
+                && $0.workspaceID.flatMap(UUID.init(uuidString:)) == sessionID
+        }
+        let savedTab = remote.workspaceSnapshot?.tabs.first { $0.id == tabID && ($0.sessionID ?? $0.id) == sessionID }
+        var target = tabs.first { $0.id == tabID }
+        guard target == nil || target?.sessionID == sessionID else {
+            operationError = "This tab belongs to a different saved session."
+            return []
+        }
+        let recordIDs = records.compactMap { UUID(uuidString: $0.paneID) }
+        guard Set(recordIDs).count == records.count else {
+            operationError = "The host returned inconsistent pane identities."
+            return []
+        }
+        for id in recordIDs where panes[id] != nil {
+            guard panes[id]?.profile.connectionKey == profile.connectionKey,
+                  tabs.first(where: { $0.allPaneIDs.contains(id) })?.id == tabID else {
+                operationError = "A saved pane is already attached to a different tab or host."
+                return []
+            }
+        }
+        var added: [UUID] = []
+        for record in records {
+            guard let id = UUID(uuidString: record.paneID), panes[id] == nil else { continue }
+            let pane = PaneModel(id: id, profile: profile,
+                                 contentKind: PaneContentKind(rawValue: record.contentKind) ?? .terminal,
+                                 requiresExistingWorker: true, remoteParentSessionID: record.parentPaneID,
+                                 customName: record.title, directory: record.directory)
+            pane.assignRemoteHierarchy(workspaceSessionID: sessionID, tabID: tabID)
+            storePane(pane)
+            if let target {
+                target.floatingPanes.append(.initial(paneID: id, index: target.floatingPanes.count))
+            } else {
+                let tab = TabModel(id: tabID, sessionID: sessionID, name: savedTab?.name ?? record.title ?? "Recovered", firstPane: id)
+                tabs.append(tab)
+                target = tab
+            }
+            added.append(id)
+        }
+        guard let target else {
+            operationError = "No retained panes are available for this tab."
+            return []
+        }
+        if let savedTab, let snapshot = remote.workspaceSnapshot {
+            let desired = savedTab.layout.paneIDs + (savedTab.floatingPanes ?? []).map(\.paneID)
+            for saved in snapshot.panes where desired.contains(saved.id) && panes[saved.id] == nil && saved.contentKind == .editor {
+                // Restore editors only when their original console is retained
+                // on this host and belongs to this tab.
+                guard let parent = saved.remoteParentSessionID.flatMap(UUID.init(uuidString:)),
+                      target.allPaneIDs.contains(parent), panes[parent]?.profile.connectionKey == profile.connectionKey else { continue }
+                let pane = PaneModel(id: saved.id, profile: profile, contentKind: .editor,
+                                     remoteParentSessionID: saved.remoteParentSessionID,
+                                     editorRequest: saved.editorRequest, customName: saved.customName, directory: saved.directory)
+                pane.assignRemoteHierarchy(workspaceSessionID: sessionID, tabID: tabID)
+                storePane(pane)
+                target.floatingPanes.append(.initial(paneID: saved.id, index: target.floatingPanes.count))
+                added.append(saved.id)
+            }
+            if Set(desired).count == desired.count,
+               Set(target.allPaneIDs) == Set(desired),
+               desired.allSatisfy({ panes[$0] != nil }) {
+                rememberArrangement(target)
+                target.layout = savedTab.layout
+                target.floatingPanes = savedTab.floatingPanes ?? []
+                target.splitRatios = savedTab.splitRatios ?? [:]
+                restoreRLayout(savedTab, in: target)
+            }
+            let unavailable = desired.filter { panes[$0] == nil }.count
+            if unavailable > 0 { operationError = "Recovered retained panes. \(unavailable) saved panels have no available session record." }
+        }
+        for index in target.floatingPanes.indices { target.floatingPanes[index].minimized = false }
+        selectedTabID = tabID
+        zoomedPaneID = nil
+        if !target.allPaneIDs.contains(activePaneID ?? UUID()) { activePaneID = target.layout.paneIDs.first }
+        sessionNames[sessionID] = sessionNames[sessionID] ?? remote.label
+        isHostLauncherPresented = false
+        persistWorkspace()
+        return added
+    }
+
+    /// Reconnect only the current layout. Restoring closed panes remains a
+    /// separate explicit action, so refresh cannot resurrect old shell panels.
+    func reconnectPanels(in tabID: UUID) {
+        guard let tab = tabs.first(where: { $0.id == tabID }), !recoveringTabIDs.contains(tabID) else { return }
+        let ids = tab.allPaneIDs
+        recoveringTabIDs.insert(tabID)
+        operationError = nil
+        Task { @MainActor in
+            defer { self.recoveringTabIDs.remove(tabID) }
+            for id in ids {
+                guard self.tabs.contains(where: { $0 === tab }),
+                      tab.allPaneIDs.contains(id), let pane = self.panes[id],
+                      pane.contentKind == .terminal else { continue }
+                if pane.connectionState == .connecting { continue }
+                if !(await pane.runtime.reconnectExistingPaneRoute()) {
+                    self.operationError = "Some panels could not reconnect. Use Restore to reopen a saved conversation."
+                }
+            }
+        }
+    }
+
+    func recoverPanels(in tabID: UUID) {
+        guard let tab = tabs.first(where: { $0.id == tabID }), !recoveringTabIDs.contains(tabID) else { return }
+        let sessionID = tab.sessionID
+        var profiles: [ConnectionProfile] = []
+        for id in tab.allPaneIDs {
+            if let profile = panes[id]?.profile, !profiles.contains(where: { $0.connectionKey == profile.connectionKey }) { profiles.append(profile) }
+        }
+        recoveringTabIDs.insert(tabID)
+        operationError = nil
+        Task { @MainActor in
+            defer { self.recoveringTabIDs.remove(tabID) }
+            for profile in profiles {
+                do {
+                    let catalog = try await RemoteCatalogService.load(profile: profile)
+                    guard self.tabs.contains(where: { $0 === tab && $0.sessionID == sessionID }) else { return }
+                    if let remote = catalog.sessions.first(where: { $0.workspaceID.flatMap(UUID.init(uuidString:)) == sessionID }) {
+                        self.recoverRemoteTab(profile: profile, remote: remote, tabID: tabID)
+                    } else {
+                        self.operationError = "No saved session record was found on \(profile.name). Existing panels are still available."
+                    }
+                } catch { self.operationError = "Could not read saved panels on \(profile.name): \(error.localizedDescription)" }
+            }
+            guard self.tabs.contains(where: { $0 === tab }) else { return }
+            for index in tab.floatingPanes.indices { tab.floatingPanes[index].minimized = false }
+            self.zoomedPaneID = nil
+            self.selectedTabID = tabID
+            self.persistWorkspace()
+            for id in tab.allPaneIDs {
+                guard let pane = self.panes[id], pane.contentKind == .terminal else { continue }
+                switch pane.connectionState {
+                case .connected, .connecting: continue
+                default:
+                    if !(await pane.runtime.reconnectExistingPaneRoute()) {
+                        self.operationError = "Some panels could not reconnect to their retained session. Open the panel's connection details to recover them."
+                    }
+                }
+            }
         }
     }
 
@@ -579,6 +1237,7 @@ final class WorkspaceModel: ObservableObject {
                 id: paneID,
                 profile: profile,
                 contentKind: saved.contentKind ?? .terminal,
+                requiresExistingWorker: (saved.contentKind ?? .terminal) == .terminal,
                 remoteParentSessionID: remotePane?.parentPaneID ?? saved.remoteParentSessionID,
                 editorRequest: saved.editorRequest,
                 customName: remotePane?.title ?? saved.customName,
@@ -598,6 +1257,7 @@ final class WorkspaceModel: ObservableObject {
             )
             tab.layout = saved.layout
             tab.splitRatios = saved.splitRatios ?? [:]
+            restoreRLayout(saved, in: tab)
             if tab.splitRatios.isEmpty { tab.balanceSplits() }
             for paneID in tab.allPaneIDs {
                 panes[paneID]?.assignRemoteHierarchy(workspaceSessionID: sessionID, tabID: tab.id)
@@ -607,6 +1267,8 @@ final class WorkspaceModel: ObservableObject {
         guard !restoredTabs.isEmpty else {
             for paneID in requiredIDs {
                 panes.removeValue(forKey: paneID)
+            floatingRPaneTabs.removeValue(forKey: paneID)
+            floatingRPrimaryEditors = floatingRPrimaryEditors.filter { $0.key != paneID && $0.value != paneID }
                 activityIndex.remove(paneID)
             }
             return false
@@ -618,15 +1280,15 @@ final class WorkspaceModel: ObservableObject {
         } ?? restoredTabs[0].id
         activePaneID = snapshot.activePaneID.flatMap { requiredIDs.contains($0) ? $0 : nil }
             ?? restoredTabs.first(where: { $0.id == selectedTabID })?.layout.paneIDs.first
-        profileStore.markUsed(profile)
+        if profile.kind == .ssh { profileStore.markUsed(profile) }
         isHostLauncherPresented = false
         persistWorkspace()
         return true
     }
 
-    func newTabInActiveSession() {
+    func newTabInActiveSession(profile: ConnectionProfile? = nil) {
         guard let selectedTab else { return }
-        newTab(inSession: selectedTab.sessionID)
+        newTab(inSession: selectedTab.sessionID, profile: profile)
     }
 
     func newTab(inSession sessionID: UUID) {
@@ -634,24 +1296,38 @@ final class WorkspaceModel: ObservableObject {
         guard let sourceTab = sessionTabs.first,
               let sourcePaneID = (selectedTab?.sessionID == sessionID ? activePaneID : sourceTab.allPaneIDs.first),
               let sourcePane = panes[sourcePaneID] else { return }
-        let parentSessionID = sourcePane.profile.kind == .ssh && sourcePane.profile.backend == .relay
+        newTab(inSession: sessionID, profile: sourcePane.profile)
+    }
+
+    func newTab(inSession sessionID: UUID, profile: ConnectionProfile?) {
+        let sessionTabs = tabs.filter { $0.sessionID == sessionID }
+        guard let sourceTab = sessionTabs.first,
+              let sourcePaneID = (selectedTab?.sessionID == sessionID ? activePaneID : sourceTab.allPaneIDs.first),
+              let sourcePane = panes[sourcePaneID] else { return }
+        let targetProfile = profile ?? sourcePane.profile
+        let parentSessionID = targetProfile.kind == .ssh && targetProfile.backend == .relay &&
+            sourcePane.profile.kind == .ssh && sourcePane.profile.connectionKey == targetProfile.connectionKey
             ? (sourcePane.contentKind == .terminal ? sourcePane.id.uuidString.lowercased() : sourcePane.remoteParentSessionID)
             : nil
-        let pane = PaneModel(profile: sourcePane.profile, remoteParentSessionID: parentSessionID)
+        let pane = PaneModel(profile: targetProfile, remoteParentSessionID: parentSessionID)
         storePane(pane)
         let ordinal = sessionTabs.count + 1
         let tab = TabModel(
             sessionID: sessionID,
-            name: ordinal == 1 ? sourcePane.profile.name : "\(sourcePane.profile.name) \(ordinal)",
+            name: ordinal == 1 ? targetProfile.name : "\(targetProfile.name) \(ordinal)",
             firstPane: pane.id
         )
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         tabs.append(tab)
         selectedTabID = tab.id
         activePaneID = pane.id
+        if targetProfile.kind == .ssh { profileStore.markUsed(targetProfile) }
         persistWorkspace()
-        Task { @MainActor in
+        Task { @MainActor [weak self, weak pane] in
             await Task.yield()
+            guard let self, let pane, self.selectedTabID == tab.id,
+                  self.activePaneID == pane.id, self.panes[pane.id] === pane,
+                  !self.networkVisible, !self.paneLinkSelection.active else { return }
             pane.focus()
         }
     }
@@ -664,17 +1340,131 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func splitActive(axis: SplitAxis, profile: ConnectionProfile? = nil) {
-        guard let tab = selectedTab, let active = activePane else { return }
+        guard let tab = selectedTab, let active = activePane,
+              tab.allPaneIDs.contains(active.id) else { return }
+        // Floating panes are not leaves of the tiled layout. Dock the source
+        // before splitting it, otherwise splitting() silently leaves the tree
+        // unchanged and the newly focused pane has no visible host.
+        if tab.floatingPanes.contains(where: { $0.paneID == active.id }) {
+            dockFloatingPane(active.id)
+        }
+        guard tab.layout.paneIDs.contains(active.id) else { return }
         let splitProfile = profile ?? active.profile
-        let parentSessionID = splitProfile.kind == .ssh && splitProfile.backend == .relay
+        let parentSessionID = splitProfile.kind == .ssh && splitProfile.backend == .relay &&
+            active.profile.kind == .ssh && active.profile.connectionKey == splitProfile.connectionKey
             ? active.id.uuidString.lowercased()
             : nil
         let pane = PaneModel(profile: splitProfile, remoteParentSessionID: parentSessionID)
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         storePane(pane)
         tab.layout = tab.layout.splitting(active.id, axis: axis, with: pane.id)
-        tab.balanceSplits()
+        tab.reconcileSplitRatios()
+        zoomedPaneID = nil
         activePaneID = pane.id
+        persistWorkspace()
+    }
+
+    /// Plugin activation is scoped to the captured console, never another tab.
+    /// Reuses its editor and preserves every other terminal in the layout.
+    /// Native R workspaces own their editor without adding a leaf to the tab.
+    func prepareFloatingRWorkspace(consoleID: UUID) throws -> PaneModel {
+        guard let tab = selectedTab, selectedTabOwnsRPane(consoleID),
+              let console = panes[consoleID], console.contentKind == .terminal,
+              console.profile.kind == .local || console.profile.backend == .relay else {
+            throw PluginError.invalid("Select a local or Relay SSH R console.")
+        }
+        if console.profile.kind == .local && console.directory == nil {
+            throw PluginError.invalid("Return to the shell prompt first so Relay can identify the local project directory")
+        }
+        let parent = consoleID.uuidString.lowercased()
+        if let id = floatingRPrimaryEditors[consoleID], let editor = panes[id] { return editor }
+        if let editor = panes.values.first(where: {
+            $0.contentKind == .editor && $0.remoteParentSessionID == parent
+                && tab.allPaneIDs.contains($0.id)
+        }) {
+            floatingRPrimaryEditors[consoleID] = editor.id
+            return editor
+        }
+        let editor = PaneModel(profile: console.profile, contentKind: .editor, remoteParentSessionID: parent)
+        editor.directory = console.directory
+        editor.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
+        floatingRPaneTabs[editor.id] = tab.id
+        floatingRPrimaryEditors[consoleID] = editor.id
+        storePane(editor)
+        persistWorkspace()
+        return editor
+    }
+
+    func addFloatingRPanel(consoleID: UUID, contentKind: PaneContentKind) throws -> PaneModel {
+        guard let tab = selectedTab, selectedTabOwnsRPane(consoleID),
+              let console = panes[consoleID], console.contentKind == .terminal else {
+            throw PluginError.invalid("The original R console is unavailable in this tab")
+        }
+        let pane = PaneModel(profile: console.profile, contentKind: contentKind,
+                             remoteParentSessionID: consoleID.uuidString.lowercased())
+        pane.directory = console.directory
+        pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
+        floatingRPaneTabs[pane.id] = tab.id
+        storePane(pane)
+        persistWorkspace()
+        return pane
+    }
+
+    func closeFloatingRPanel(_ paneID: UUID, consoleID: UUID) -> Bool {
+        guard paneID != consoleID, floatingRPaneTabs[paneID] != nil,
+              !floatingRPrimaryEditors.values.contains(paneID), let pane = panes[paneID] else { return false }
+        if pane.contentKind == .editor, !pane.editorRuntime.confirmDiscardChanges() { return false }
+        retirePluginPresentation(for: paneID)
+        pane.stopRuntime()
+        panes.removeValue(forKey: paneID)
+        floatingRPaneTabs.removeValue(forKey: paneID)
+        activityIndex.remove(paneID)
+        if activePaneID == paneID { activePaneID = consoleID }
+        return true
+    }
+
+    func rWorkspaceTerminalCandidates(consoleID: UUID) -> [PaneModel] {
+        guard let tab = tabs.first(where: {
+            $0.allPaneIDs.contains(consoleID) || floatingRPaneTabs[consoleID] == $0.id
+        }) else { return [] }
+        return tab.allPaneIDs.compactMap { panes[$0] }.filter {
+            $0.contentKind == .terminal && $0.id != consoleID
+        }
+    }
+
+    private func selectedTabOwnsRPane(_ id: UUID) -> Bool {
+        guard let tab = selectedTab else { return false }
+        return tab.allPaneIDs.contains(id) || floatingRPaneTabs[id] == tab.id
+    }
+
+    func activateRWorkspace(consoleID: UUID) throws {
+        guard let tab = selectedTab, tab.allPaneIDs.contains(consoleID),
+              let console = panes[consoleID], console.contentKind == .terminal,
+              (console.profile.kind == .local || console.profile.backend == .relay),
+              tab.layout.paneIDs.contains(consoleID) else {
+            throw PluginError.invalid("Select a docked local or Relay SSH R console.")
+        }
+        if console.profile.kind == .local && console.directory == nil {
+            throw PluginError.invalid("Return to the shell prompt first so Relay can identify the local project directory")
+        }
+        let parent = consoleID.uuidString.lowercased()
+        let existing = tab.allPaneIDs.compactMap { panes[$0] }.first {
+            $0.contentKind == .editor && $0.remoteParentSessionID == parent
+        }
+        let editor: PaneModel
+        if let existing {
+            editor = existing
+            // A linked editor keeps its chosen tiled or floating placement.
+            activePaneID = editor.id
+            return
+        } else {
+            editor = PaneModel(profile: console.profile, contentKind: .editor, remoteParentSessionID: parent)
+            editor.directory = console.directory
+            editor.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
+            storePane(editor)
+        }
+        tab.layout = tab.layout.splitting(consoleID, axis: .vertical, with: editor.id, newPaneFirst: true)
+        activePaneID = editor.id
         persistWorkspace()
     }
 
@@ -699,13 +1489,17 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func openRemoteFile(_ open: RemoteFileOpenRequest) {
-        guard let tab = selectedTab else { return }
+        // Route asynchronous opens to their originating tab, even if the user
+        // switched tabs while the remote event was in flight.
+        guard let parentID = UUID(uuidString: open.parentSessionID),
+              let tab = tabs.first(where: { $0.allPaneIDs.contains(parentID) }) else { return }
+        selectedTabID = tab.id
         if let existingID = tab.allPaneIDs.first(where: { id in
             guard let pane = panes[id] else { return false }
             return pane.contentKind == .editor && pane.profile.connectionKey == open.profile.connectionKey
+                && pane.remoteParentSessionID == open.parentSessionID
         }), let editor = panes[existingID] {
             activePaneID = existingID
-            editor.editorRequest = open.request
             editor.editorRuntime.open(open.request)
             editor.focus()
             persistWorkspace()
@@ -718,6 +1512,7 @@ final class WorkspaceModel: ObservableObject {
             remoteParentSessionID: open.parentSessionID,
             editorRequest: open.request
         )
+        pane.directory = panes[parentID]?.directory
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         storePane(pane)
         tab.floatingPanes.append(.initial(paneID: pane.id, index: tab.floatingPanes.count))
@@ -760,7 +1555,7 @@ final class WorkspaceModel: ObservableObject {
         let axis: SplitAxis = effectivePlacement == .top || effectivePlacement == .bottom ? .vertical : .horizontal
         let first = effectivePlacement == .leading || effectivePlacement == .top
         tab.layout = baseLayout.splitting(targetID, axis: axis, with: paneID, newPaneFirst: first)
-        tab.balanceSplits()
+        tab.reconcileSplitRatios()
         activePaneID = paneID
         zoomedPaneID = nil
         persistWorkspace()
@@ -801,6 +1596,101 @@ final class WorkspaceModel: ObservableObject {
         persistWorkspace()
     }
 
+    private func rememberArrangement(_ tab: TabModel) {
+        guard tab.savedArrangement == nil else { return }
+        tab.savedArrangement = PaneArrangementSnapshot(
+            layout: tab.layout, floating: tab.floatingPanes, ratios: tab.splitRatios,
+            active: activePaneID,
+            results: Dictionary(uniqueKeysWithValues: tab.allPaneIDs.compactMap { id in
+                guard let pane = panes[id], pane.contentKind == .editor else { return nil }
+                return (id, pane.editorRuntime.showsRResults)
+            }))
+    }
+
+    func minimizeFloatingPane(_ id: UUID) {
+        guard let tab = selectedTab,
+              let index = tab.floatingPanes.firstIndex(where: { $0.paneID == id }) else { return }
+        tab.floatingPanes[index].minimized = true
+        if zoomedPaneID == id { zoomedPaneID = nil }
+        if activePaneID == id, let next = tab.layout.paneIDs.first { selectPane(next) }
+        persistWorkspace()
+    }
+
+    func arrangeFloatingPanes(cascade: Bool) {
+        guard let tab = selectedTab else { return }
+        let visible = tab.floatingPanes.indices.filter { !tab.floatingPanes[$0].isMinimized }
+        guard !visible.isEmpty, tab.canvasSize.width > 0, tab.canvasSize.height > 0 else { return }
+        let columns = Int(ceil(sqrt(Double(visible.count))))
+        let rows = Int(ceil(Double(visible.count) / Double(columns)))
+        let width = (tab.canvasSize.width - 24 - Double(columns - 1) * 12) / Double(columns)
+        let height = (tab.canvasSize.height - 24 - Double(rows - 1) * 12) / Double(rows)
+        guard cascade || (width >= 380 && height >= 260) else {
+            operationError = "Not enough room to tile these panes without overlap. Minimize some panes, enlarge the window, or use Cascade."
+            return
+        }
+        rememberArrangement(tab)
+        zoomedPaneID = nil
+        for (position, index) in visible.enumerated() {
+            let offset = Double(position) * min(28, max(0, (tab.canvasSize.height - 284) / Double(max(1, visible.count - 1))))
+            tab.floatingPanes[index].originX = cascade ? 12 + offset : 12 + Double(position % columns) * (width + 12)
+            tab.floatingPanes[index].originY = cascade ? 12 + offset : 12 + Double(position / columns) * (height + 12)
+            tab.floatingPanes[index].width = cascade ? min(620, max(380, tab.canvasSize.width - 24 - offset)) : width
+            tab.floatingPanes[index].height = cascade ? min(410, max(260, tab.canvasSize.height - 24 - offset)) : height
+        }
+        persistWorkspace()
+    }
+
+    func restorePaneArrangement() {
+        guard let tab = selectedTab, let saved = tab.savedArrangement else { return }
+        guard Set(tab.allPaneIDs) == Set(saved.layout.paneIDs + saved.floating.map(\.paneID)) else {
+            operationError = "The panes in this tab have changed. The saved layout cannot be restored safely."
+            return
+        }
+        tab.layout = saved.layout
+        if let id = tab.rLayoutEditorID { panes[id]?.editorRuntime.externalRResults = false }
+        tab.rLayoutEditorID = nil
+        tab.floatingPanes = saved.floating
+        tab.splitRatios = saved.ratios
+        for (id, visible) in saved.results { panes[id]?.editorRuntime.showsRResults = visible }
+        tab.savedArrangement = nil
+        zoomedPaneID = nil
+        activePaneID = saved.active ?? tab.layout.paneIDs.first
+        persistWorkspace()
+    }
+
+    @discardableResult
+    func arrangeRWorkspace(consoleID requestedConsoleID: UUID? = nil) -> Bool {
+        guard let tab = selectedTab, let active = activePane else {
+            operationError = "Select an R console before opening the R workspace."
+            return false
+        }
+        operationError = nil
+        guard !tab.chrome.hasDraft else {
+            operationError = "Finish or close the current context draft before opening R results."
+            return false
+        }
+        let consoleID = requestedConsoleID ?? (active.contentKind == .editor
+            ? active.remoteParentSessionID.flatMap(UUID.init(uuidString:)) : active.id)
+        guard let consoleID, tab.layout.paneIDs.contains(consoleID) else {
+            operationError = "Select a docked R console or its linked editor first."
+            return false
+        }
+        do { try activateRWorkspace(consoleID: consoleID) }
+        catch { operationError = error.localizedDescription; return false }
+        guard let editor = activePane, editor.contentKind == .editor,
+              let console = panes[consoleID] else { return false }
+        // R is an additive companion to the selected console. Existing splits,
+        // floating panes, zoom state and their geometry belong to the user.
+        editor.editorRuntime.showsRResults = true
+        editor.editorRuntime.externalRResults = true
+        tab.rLayoutEditorID = editor.id
+        tab.chrome.reveal(.rWorkspace, initial: WorkspaceContextAnchor(
+            paneID: consoleID, profile: console.profile, directory: console.directory))
+        editor.editorRuntime.connectRWorkspaceWhenReady()
+        persistWorkspace()
+        return true
+    }
+
     func toggleActivePaneZoom() {
         guard let activePaneID else { return }
         panes[activePaneID]?.runtime.beginExplicitGeometryTransition()
@@ -829,7 +1719,7 @@ final class WorkspaceModel: ObservableObject {
               let remaining = tab.layout.removing(paneID) else { return }
         tab.layout = remaining
         tab.floatingPanes.append(.initial(paneID: paneID, index: tab.floatingPanes.count))
-        tab.balanceSplits()
+        tab.reconcileSplitRatios()
         activePaneID = paneID
         zoomedPaneID = nil
         persistWorkspace()
@@ -841,20 +1731,97 @@ final class WorkspaceModel: ObservableObject {
               let targetID = tab.layout.paneIDs.first else { return }
         tab.floatingPanes.remove(at: floatingIndex)
         tab.layout = tab.layout.splitting(targetID, axis: .horizontal, with: paneID)
-        tab.balanceSplits()
+        tab.reconcileSplitRatios()
         activePaneID = paneID
         zoomedPaneID = nil
         persistWorkspace()
         panes[paneID]?.focus()
     }
 
+    /// An ended terminal needs a new worker identity, rather than another
+    /// attach to its immutable recovery binding. Keep the layout position and
+    /// retain the ended pane in recovery history without restarting its worker.
+    func requestResumeSavedConversation(_ paneID: UUID) {
+        Task { @MainActor in
+            do { _ = try await self.resumeSavedConversation(paneID) }
+            catch { self.operationError = "Could not resume saved conversation: \(error.localizedDescription)" }
+        }
+    }
+
+    func resumeSavedConversation(_ paneID: UUID) async throws -> UUID {
+        guard let old = panes[paneID], old.contentKind == .terminal,
+              old.profile.backend == .relay, (old.remoteExitCode != nil || old.phase == .exited),
+              !recoveringConversationPaneIDs.contains(paneID) else {
+            throw RemoteCatalogError.failed("Select an ended pane with a saved provider conversation")
+        }
+        recoveringConversationPaneIDs.insert(paneID)
+        defer { recoveringConversationPaneIDs.remove(paneID) }
+        operationError = nil
+        let plan = try await RelaySavedConversationRecovery.plan(profile: old.profile, paneID: paneID)
+        guard panes[paneID] === old, old.remoteExitCode != nil || old.phase == .exited else {
+            throw RemoteCatalogError.failed("The pane changed during recovery")
+        }
+        var profile = old.profile
+        profile.command = try plan.command(profile: profile)
+        guard let replacement = restartExitedPane(paneID, profile: profile, directory: plan.directory) else {
+            throw RemoteCatalogError.failed("The pane changed during recovery")
+        }
+        RelayRecoveryStore.shared.recordRestore(source: paneID, destination: replacement, plan: plan, profile: profile)
+        return replacement
+    }
+
+    func reconnectPane(_ paneID: UUID) {
+        guard let pane = panes[paneID], pane.contentKind == .terminal else { return }
+        selectPane(paneID)
+        pane.runtime.restart()
+    }
+
+    @discardableResult
+    func restartExitedPane(_ paneID: UUID, profile: ConnectionProfile? = nil, directory: String? = nil) -> UUID? {
+        guard let old = panes[paneID], old.contentKind == .terminal,
+              old.profile.backend == .relay, (old.remoteExitCode != nil || old.phase == .exited),
+              let tab = tabs.first(where: { $0.allPaneIDs.contains(paneID) }) else { return nil }
+        let replacement = PaneModel(
+            profile: profile ?? old.profile,
+            customName: old.customName,
+            directory: directory ?? old.directory
+        )
+        replacement.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
+        rememberClosedPane(paneID, in: tab)
+        storePane(replacement)
+        if let index = tab.floatingPanes.firstIndex(where: { $0.paneID == paneID }) {
+            let placement = tab.floatingPanes[index]
+            tab.floatingPanes[index] = FloatingPanePlacement(
+                paneID: replacement.id,
+                originX: placement.originX, originY: placement.originY,
+                width: placement.width, height: placement.height,
+                minimized: placement.minimized
+            )
+        } else {
+            tab.layout = tab.layout.swapping(paneID, replacement.id)
+        }
+        if zoomedPaneID == paneID { zoomedPaneID = replacement.id }
+        if agentInspector?.paneID == paneID { agentInspector = nil }
+        retirePluginPresentation(for: paneID)
+        old.stopRuntime()
+        panes.removeValue(forKey: paneID)
+        activityIndex.remove(paneID)
+        selectedTabID = tab.id
+        activePaneID = replacement.id
+        persistWorkspace()
+        return replacement.id
+    }
+
     func closeActivePane() {
         guard let tab = selectedTab, let activePaneID else { return }
+        if tab.allPaneIDs.count > 1, let pane = panes[activePaneID], pane.contentKind == .editor,
+           !pane.editorRuntime.confirmDiscardChanges() { return }
         rememberClosedPane(activePaneID, in: tab)
         if agentInspector?.paneID == activePaneID { agentInspector = nil }
         if zoomedPaneID == activePaneID { zoomedPaneID = nil }
         if let floatingIndex = tab.floatingPanes.firstIndex(where: { $0.paneID == activePaneID }) {
             tab.floatingPanes.remove(at: floatingIndex)
+            retirePluginPresentation(for: activePaneID)
             panes[activePaneID]?.stopRuntime()
             panes.removeValue(forKey: activePaneID)
             activityIndex.remove(activePaneID)
@@ -867,7 +1834,8 @@ final class WorkspaceModel: ObservableObject {
             return
         }
         tab.layout = tab.layout.removing(activePaneID) ?? tab.layout
-        tab.balanceSplits()
+        tab.reconcileSplitRatios()
+        retirePluginPresentation(for: activePaneID)
         panes[activePaneID]?.stopRuntime()
         panes.removeValue(forKey: activePaneID)
         activityIndex.remove(activePaneID)
@@ -877,8 +1845,52 @@ final class WorkspaceModel: ObservableObject {
 
     var canReopenClosedPane: Bool { recentlyClosedPaneCount > 0 }
 
-    func reopenLastClosedPane() {
-        while let recovery = recentlyClosedPanes.popLast() {
+    var recoveryEntries: [ClosedPaneRecovery] {
+        RelayRecoveryStore.shared.loadClosedPanes().filter { panes[$0.pane.id] == nil }
+    }
+
+    var exitedRecoveryPanes: [PaneModel] {
+        panes.values.filter { $0.contentKind == .terminal && ($0.phase == .exited || $0.remoteExitCode != nil) }
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+    }
+
+    func reopenRecoveryEntry(_ entry: ClosedPaneRecovery) {
+        recentlyClosedPanes.removeAll { $0.id == entry.id }
+        recentlyClosedPanes.append(entry)
+        reopenLastClosedPane()
+    }
+
+    func resumeRecoveryEntry(_ entry: ClosedPaneRecovery) async throws {
+        let source = entry.pane
+        let plan = try await RelaySavedConversationRecovery.plan(profile: source.profile, paneID: source.id)
+        var profile = source.profile
+        profile.command = try plan.command(profile: profile)
+        let pane = PaneModel(profile: profile, directory: plan.directory)
+        let tab: TabModel
+        if let existing = tabs.first(where: { $0.id == entry.tab.id }) {
+            tab = existing
+            if let target = tab.layout.paneIDs.first {
+                tab.layout = tab.layout.splitting(target, axis: .horizontal, with: pane.id)
+                tab.reconcileSplitRatios()
+            } else { tab.layout = .pane(pane.id) }
+        } else {
+            tab = TabModel(id: entry.tab.id, sessionID: entry.tab.sessionID ?? entry.tab.id,
+                name: entry.tab.name, firstPane: pane.id)
+            tabs.insert(tab, at: min(entry.tabIndex, tabs.count))
+        }
+        pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
+        storePane(pane)
+        selectedTabID = tab.id
+        activePaneID = pane.id
+        // Keep the archive until the user sees a successful restore. Launch
+        // submission alone cannot prove the provider opened its conversation.
+        RelayRecoveryStore.shared.recordRestore(source: source.id, destination: pane.id, plan: plan, profile: profile)
+        persistWorkspace()
+    }
+
+    func reopenLastClosedPane(in tabID: UUID? = nil) {
+        while let index = recentlyClosedPanes.lastIndex(where: { tabID == nil || $0.tab.id == tabID }) {
+            let recovery = recentlyClosedPanes.remove(at: index)
             recentlyClosedPaneCount = recentlyClosedPanes.count
             guard panes[recovery.pane.id] == nil else { continue }
 
@@ -909,7 +1921,7 @@ final class WorkspaceModel: ObservableObject {
                     existing.layout = existing.layout.splitting(
                         target, axis: .horizontal, with: saved.id
                     )
-                    existing.balanceSplits()
+                    existing.reconcileSplitRatios()
                 } else {
                     existing.layout = .pane(saved.id)
                 }
@@ -928,6 +1940,9 @@ final class WorkspaceModel: ObservableObject {
             selectedTabID = restoredTab.id
             activePaneID = saved.id
             zoomedPaneID = nil
+            RelayRecoveryStore.shared.removeClosedPane(recovery.id)
+            RelayRecoveryStore.shared.record(kind: "pane_reopened", paneID: saved.id, profile: saved.profile,
+                links: [.init(from: "pane:\(saved.id)", to: "tab:\(restoredTab.id)", kind: "belongs_to")])
             persistWorkspace()
             Task { @MainActor in
                 await Task.yield()
@@ -955,18 +1970,23 @@ final class WorkspaceModel: ObservableObject {
             name: tab.name,
             layout: tab.layout,
             floatingPanes: tab.floatingPanes,
-            splitRatios: tab.splitRatios
+            splitRatios: tab.splitRatios,
+            executionContext: tab.executionContext,
+            rLayoutEditorID: tab.rLayoutEditorID,
+            rResultsVisible: tab.rLayoutEditorID.flatMap { panes[$0]?.editorRuntime.showsRResults }
         )
-        recentlyClosedPanes.append(ClosedPaneRecovery(
+        let recovery = ClosedPaneRecovery(
             pane: paneSnapshot,
             tab: tabSnapshot,
             tabIndex: tabIndex,
             floatingPlacement: tab.floatingPanes.first(where: { $0.paneID == paneID })
-        ))
+        )
+        RelayRecoveryStore.shared.saveClosedPane(recovery)
+        recentlyClosedPanes.append(recovery)
         if recentlyClosedPanes.count > 20 {
             recentlyClosedPanes.removeFirst(recentlyClosedPanes.count - 20)
         }
-        lastClosedPaneWasRemote = pane.profile.kind == .ssh && pane.profile.backend == .relay
+        lastClosedPaneWasRemote = pane.contentKind == .terminal && pane.profile.backend == .relay
         recentlyClosedPaneCount = recentlyClosedPanes.count
         // Monotonic close signal for the undo toast: the buffer count
         // saturates at 20 (21st close computes 20 -> 20, no change) and
@@ -977,12 +1997,20 @@ final class WorkspaceModel: ObservableObject {
 
     func closeTab(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        let ids = tabs[index].allPaneIDs
+        let ids = tabs[index].allPaneIDs + floatingRPaneTabs.filter { $0.value == id }.map(\.key)
+        guard ids.allSatisfy({ id in
+            guard let pane = panes[id], pane.contentKind == .editor else { return true }
+            return pane.editorRuntime.confirmDiscardChanges()
+        }) else { return }
         if let zoomedPaneID, ids.contains(zoomedPaneID) { self.zoomedPaneID = nil }
         for paneID in ids {
+            rememberClosedPane(paneID, in: tabs[index])
             if agentInspector?.paneID == paneID { agentInspector = nil }
+            retirePluginPresentation(for: paneID)
             panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
+            floatingRPaneTabs.removeValue(forKey: paneID)
+            floatingRPrimaryEditors = floatingRPrimaryEditors.filter { $0.key != paneID && $0.value != paneID }
             activityIndex.remove(paneID)
         }
         tabs.remove(at: index)
@@ -996,7 +2024,6 @@ final class WorkspaceModel: ObservableObject {
             // the user away from the tab they are working in.
             let nextIndex = min(index, tabs.count - 1)
             selectedTabID = tabs[nextIndex].id
-            activePaneID = tabs[nextIndex].layout.paneIDs.first
         }
         persistWorkspace()
     }
@@ -1005,11 +2032,21 @@ final class WorkspaceModel: ObservableObject {
         let closingTabs = tabs.filter { $0.sessionID == sessionID }
         guard !closingTabs.isEmpty else { return }
         let closingTabIDs = Set(closingTabs.map(\.id))
-        let closingPaneIDs = closingTabs.flatMap(\.allPaneIDs)
+        let closingPaneIDs = closingTabs.flatMap(\.allPaneIDs) + floatingRPaneTabs.filter { closingTabIDs.contains($0.value) }.map(\.key)
+        guard closingPaneIDs.allSatisfy({ id in
+            guard let pane = panes[id], pane.contentKind == .editor else { return true }
+            return pane.editorRuntime.confirmDiscardChanges()
+        }) else { return }
         for paneID in closingPaneIDs {
+            if let tab = closingTabs.first(where: { $0.allPaneIDs.contains(paneID) }) {
+                rememberClosedPane(paneID, in: tab)
+            }
             if agentInspector?.paneID == paneID { agentInspector = nil }
+            retirePluginPresentation(for: paneID)
             panes[paneID]?.stopRuntime()
             panes.removeValue(forKey: paneID)
+            floatingRPaneTabs.removeValue(forKey: paneID)
+            floatingRPrimaryEditors = floatingRPrimaryEditors.filter { $0.key != paneID && $0.value != paneID }
             activityIndex.remove(paneID)
         }
         tabs.removeAll { closingTabIDs.contains($0.id) }
@@ -1032,10 +2069,8 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func selectTab(_ id: UUID) {
-        guard let tab = tabs.first(where: { $0.id == id }) else { return }
-        zoomedPaneID = nil
+        guard tabs.contains(where: { $0.id == id }) else { return }
         selectedTabID = id
-        activePaneID = tab.layout.paneIDs.first
         persistWorkspace()
         // The previous tab's Ghostty surface can remain the AppKit first
         // responder briefly after SwiftUI hides it. Wait for the selected
@@ -1043,13 +2078,22 @@ final class WorkspaceModel: ObservableObject {
         if let paneID = activePaneID, let pane = panes[paneID] {
             Task { @MainActor in
                 await Task.yield()
-                guard self.selectedTabID == id, self.activePaneID == paneID else { return }
+                guard !self.networkVisible, !self.paneLinkSelection.active, self.selectedTabID == id, self.activePaneID == paneID else { return }
                 pane.focus()
             }
         }
     }
 
     func selectPane(_ id: UUID) {
+        // Late callbacks from durable views in another tab must not corrupt
+        // selection. Explicit cross-tab navigation reveals its owner first.
+        guard panes[id] != nil, let selectedTabID, let tab = selectedTab,
+              tab.allPaneIDs.contains(id) || floatingRPaneTabs[id] == selectedTabID else { return }
+        if let tab = selectedTab,
+           let index = tab.floatingPanes.firstIndex(where: { $0.paneID == id }),
+           tab.floatingPanes[index].isMinimized {
+            tab.floatingPanes[index].minimized = false
+        }
         var reorderedFloatingPane = false
         if let tab = selectedTab,
            let index = tab.floatingPanes.firstIndex(where: { $0.paneID == id }),
@@ -1068,9 +2112,15 @@ final class WorkspaceModel: ObservableObject {
             persistWorkspace()
         }
         guard let pane = panes[id] else { return }
+        // An explicit click must repair eligibility even if this pane was
+        // already selected, and claim a mounted view before the next key.
+        updateTerminalFocusOwnership()
+        if !networkVisible && !paneLinkSelection.active { pane.focus() }
         Task { @MainActor [weak self, weak pane] in
             await Task.yield()
             guard let self, let pane,
+                  !self.networkVisible,
+                  !self.paneLinkSelection.active,
                   self.activePaneID == id,
                   self.panes[id] === pane else { return }
             pane.focus()
@@ -1088,9 +2138,37 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func selectTab(offset: Int) {
-        guard !tabs.isEmpty else { return }
-        let current = tabs.firstIndex(where: { $0.id == selectedTabID }) ?? 0
-        selectTab(tabs[(current + offset + tabs.count) % tabs.count].id)
+        guard let sessionID = selectedTab?.sessionID,
+              let next = WorkspaceNavigationState.adjacentTab(current: selectedTabID,
+                ordered: orderedTabs(in: sessionID).map(\.id), offset: offset) else { return }
+        selectTab(next)
+    }
+
+    var navigationSessionIDs: [UUID] {
+        var seen: Set<UUID> = []
+        return tabs.map(\.sessionID).filter { seen.insert($0).inserted }
+    }
+
+    func navigationSessionName(_ id: UUID) -> String {
+        let pane = tabs.first(where: { $0.sessionID == id })?.allPaneIDs.first.flatMap { panes[$0] }
+        let host = pane?.profile.kind == .ssh ? (pane?.profile.host ?? "Remote") : "This Mac"
+        return sessionDisplayName(id, fallback: host)
+    }
+
+    func selectSession(_ id: UUID) {
+        let candidates = orderedTabs(in: id).map(\.id)
+        guard let tabID = navigationState.preferredTab(in: id, available: candidates) else { return }
+        selectTab(tabID)
+    }
+
+    func selectSession(offset: Int) {
+        guard let next = WorkspaceNavigationState.adjacentTab(current: selectedTab?.sessionID,
+            ordered: navigationSessionIDs, offset: offset) else { return }
+        selectSession(next)
+    }
+
+    func toggleNavigationGroup(_ group: WorkspaceNavigationState.Group, id: UUID) {
+        navigationState = WorkspaceNavigationState.updating { $0.toggle(group, id: id) }
     }
 
     func updateSplitRatio(_ splitID: UUID, ratio: Double, persist: Bool) {
@@ -1104,28 +2182,61 @@ final class WorkspaceModel: ObservableObject {
         persistWorkspace()
     }
 
+    func confirmEditorClose() -> Bool {
+        persistWorkspaceNow()
+        guard workspaceSaveCanClose else {
+            let alert = NSAlert()
+            alert.messageText = "Workspace changes are not safely saved"
+            alert.informativeText = workspacePersistenceIssue ?? "Keep this window open until saving can complete."
+            alert.addButton(withTitle: "Keep Window Open")
+            alert.runModal()
+            return false
+        }
+        for pane in panes.values where pane.contentKind == .editor {
+            if !pane.editorRuntime.confirmDiscardChanges() { return false }
+        }
+        return true
+    }
+
     func shutdown() {
         guard !didShutdown else { return }
         didShutdown = true
+        assistantStorage?.cancel()
         presentationFocusTask?.cancel()
         presentationFocusTask = nil
         persistenceTask?.cancel()
         persistenceTask = nil
+        supervisorTask?.cancel()
+        supervisorTask = nil
+        supervisorAdvisoryTask?.cancel()
+        supervisorAdvisoryTask = nil
+        supervisorAdvisoryRequestKey = nil
         persistWorkspaceNow()
         panes.values.forEach { $0.stopRuntime() }
     }
 
     @discardableResult
     private func restoreWorkspace() -> Bool {
-        guard let data = UserDefaults.standard.data(forKey: workspaceKey),
-              let snapshot = try? JSONDecoder().decode(WorkspaceSnapshot.self, from: data),
-              !snapshot.tabs.isEmpty else { return false }
+        let snapshot: WorkspaceSnapshot
+        do {
+            guard let saved = try sharedWorkspaceStore.restore(legacy:
+                RelayStateProfile.defaults.data(forKey: workspaceKey)) else { return false }
+            snapshot = saved
+            workspaceBaseline = saved
+            workspacePendingChanges = try sharedWorkspaceStore.pendingCount()
+            guard !saved.tabs.isEmpty else { return false }
+        } catch {
+            workspacePersistenceIssue = "Saved workspace could not be read safely. Existing sessions have been left intact."
+            workspaceSaveCanClose = false
+            return false
+        }
 
         for savedPane in snapshot.panes {
             let pane = PaneModel(
                 id: savedPane.id,
                 profile: savedPane.profile,
                 contentKind: savedPane.contentKind ?? .terminal,
+                requiresExistingWorker: (savedPane.contentKind ?? .terminal) == .terminal,
                 remoteParentSessionID: savedPane.remoteParentSessionID,
                 editorRequest: savedPane.editorRequest,
                 customName: savedPane.customName,
@@ -1146,6 +2257,7 @@ final class WorkspaceModel: ObservableObject {
             )
             tab.layout = saved.layout
             tab.splitRatios = saved.splitRatios ?? [:]
+            restoreRLayout(saved, in: tab)
             if tab.splitRatios.isEmpty { tab.balanceSplits() }
             return tab
         }
@@ -1155,6 +2267,8 @@ final class WorkspaceModel: ObservableObject {
             return false
         }
         tabs = restoredTabs
+        restoreRPresentationOwnership(snapshot.rPresentations ?? [])
+        sidebarVisible = snapshot.sidebarVisible ?? false
         for tab in restoredTabs {
             for paneID in tab.allPaneIDs {
                 panes[paneID]?.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
@@ -1169,6 +2283,23 @@ final class WorkspaceModel: ObservableObject {
         return true
     }
 
+    func restoreRPresentationOwnership(_ saved: [RWorkspacePresentation]) {
+        savedRPresentations = saved.filter { item in
+            guard tabs.contains(where: { $0.id == item.tabID }),
+                  let console = panes[item.consoleID], console.contentKind == .terminal,
+                  let editor = panes[item.editorID], editor.contentKind == .editor,
+                  editor.remoteParentSessionID.flatMap(UUID.init(uuidString:)) == item.consoleID else { return false }
+            floatingRPrimaryEditors[item.consoleID] = item.editorID
+            if !tabs.contains(where: { $0.allPaneIDs.contains(item.editorID) }) { floatingRPaneTabs[item.editorID] = item.tabID }
+            for extra in item.extras {
+                if let id = extra.paneID, panes[id] != nil, !tabs.contains(where: { $0.allPaneIDs.contains(id) }) {
+                    floatingRPaneTabs[id] = item.tabID
+                }
+            }
+            return true
+        }
+    }
+
     private func persistWorkspace() {
         persistenceTask?.cancel()
         persistenceTask = Task { @MainActor [weak self] in
@@ -1179,9 +2310,119 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    /// Restore presentation only. Never attach a saved R identity or execute setup.
+    func restoreRLayout(_ saved: TabSnapshot, in tab: TabModel) {
+        tab.executionContext = saved.executionContext
+        guard let id = saved.rLayoutEditorID, tab.allPaneIDs.contains(id),
+              let editor = panes[id], editor.contentKind == .editor,
+              let parent = editor.remoteParentSessionID.flatMap(UUID.init(uuidString:)),
+              tab.layout.paneIDs.contains(parent), let console = panes[parent],
+              console.contentKind == .terminal,
+              console.profile.connectionKey == editor.profile.connectionKey else { return }
+        tab.rLayoutEditorID = id
+        editor.editorRuntime.externalRResults = true
+        editor.editorRuntime.showsRResults = saved.rResultsVisible ?? true
+        // The saved layout also owns its visible results surface. Restoring
+        // flags alone leaves chrome hidden after a native restart.
+        if editor.editorRuntime.showsRResults {
+            tab.chrome.reveal(.rWorkspace, initial: WorkspaceContextAnchor(
+                paneID: parent, profile: console.profile, directory: console.directory))
+        } else if tab.chrome.destination == .rWorkspace {
+            tab.chrome.hide()
+        }
+    }
+
     private func storePane(_ pane: PaneModel) {
         panes[pane.id] = pane
-        pane.runtime.setKeyboardFocusEligible(pane.id == activePaneID)
+        RelaySurfacePublication.shared.restore(pane)
+        if pane.contentKind == .editor {
+            pane.editorRuntime.canAutomaticallyConnectR = { [weak self, weak pane] in
+                guard let self, let pane,
+                      let parent = pane.remoteParentSessionID.flatMap(UUID.init(uuidString:)),
+                      let console = self.panes[parent],
+                      console.profile.connectionKey == pane.profile.connectionKey,
+                      console.connectionState == .connected,
+                      self.selectedTabOwnsRPane(pane.id),
+                      self.selectedTabOwnsRPane(parent) else { return false }
+                return RWorkspaceIdlePrompt.accepts(console.runtime.sidePanelViewportText())
+            }
+            pane.editorRuntime.prepareRSetup = { [weak self, weak pane] in
+                guard let self, let pane,
+                      let parent = pane.remoteParentSessionID.flatMap(UUID.init(uuidString:)),
+                      let console = self.panes[parent], console.contentKind == .terminal,
+                      console.profile.connectionKey == pane.profile.connectionKey,
+                      console.connectionState == .connected,
+                      self.selectedTabOwnsRPane(pane.id),
+                      self.selectedTabOwnsRPane(parent) else {
+                    throw PluginError.invalid("The linked R console is unavailable")
+                }
+                guard RWorkspaceIdlePrompt.accepts(console.runtime.sidePanelViewportText()) else {
+                    throw PluginError.invalid("Start radian in the linked console and wait for an empty r$> prompt before connecting R")
+                }
+                let revision = console.agentInputRevision
+                return { [weak self, weak pane, weak console] code in
+                    guard let self, let pane, let console,
+                          self.panes[parent] === console, self.panes[pane.id] === pane,
+                          console.agentInputRevision == revision, console.connectionState == .connected,
+                          self.selectedTabOwnsRPane(pane.id),
+                          self.selectedTabOwnsRPane(parent) else {
+                        throw PluginError.invalid("Console changed during R setup; retry from the idle R prompt")
+                    }
+                    guard RWorkspaceIdlePrompt.accepts(console.runtime.sidePanelViewportText()) else {
+                        throw PluginError.invalid("The linked console is no longer at an empty radian prompt; R setup was not sent")
+                    }
+                    guard console.runtime.sendSidePanelPrompt(code) else { throw PluginError.invalid("R console could not accept setup") }
+                }
+            }
+            pane.editorRuntime.requestRunCode = { [weak self, weak pane] code in
+                guard let self, let pane,
+                      let parent = pane.remoteParentSessionID.flatMap(UUID.init(uuidString:)),
+                      let console = self.panes[parent], console.contentKind == .terminal,
+                      console.profile.connectionKey == pane.profile.connectionKey,
+                      self.selectedTabOwnsRPane(pane.id),
+                      self.selectedTabOwnsRPane(parent) else {
+                    throw PluginError.invalid("The editor's original console is unavailable in this tab")
+                }
+                let proposal = AgentInputProposal(instance: self.editorInputRequests.instance, requestID: UUID(), text: code)
+                _ = try self.editorInputRequests.propose(proposal, pane: console) { [weak self, weak pane, weak console] in
+                    guard let self, let pane, let console else { return false }
+                    return self.panes[parent] === console && self.panes[pane.id] === pane
+                        && self.selectedTabOwnsRPane(pane.id)
+                        && self.selectedTabOwnsRPane(parent)
+                }
+            }
+            pane.editorRuntime.requestInterruptR = { [weak self, weak pane] in
+                guard let self, let pane, let parent = pane.remoteParentSessionID.flatMap(UUID.init(uuidString:)),
+                      let console = self.panes[parent], self.selectedTabOwnsRPane(parent) else { return false }
+                _ = RAutomationController.shared.pause(parent)
+                return console.runtime.sendSupervisorInterrupt()
+            }
+            pane.editorRuntime.requestUserRCode = { [weak self, weak pane] code in
+                guard let self, let pane,
+                      let parent = pane.remoteParentSessionID.flatMap(UUID.init(uuidString:)),
+                      let session = pane.editorRuntime.rSession?.session_id,
+                      self.selectedTabOwnsRPane(parent) else {
+                    throw PluginError.invalid("The linked R console is unavailable")
+                }
+                let id = UUID()
+                Task { @MainActor [weak self, weak pane] in
+                    guard let self, let pane else { return }
+                    do {
+                        _ = try await RAutomationController.shared.execute(paneID: parent,
+                            expected: session, id: id, code: code, workspace: self, direct: true,
+                            source: RExecutionSource(kind: pane.editorRuntime.isDirty ? "unsaved_editor" : "editor",
+                                path: pane.editorRuntime.currentPath, codeSHA256: RExecutionSource.digest(code)), human: true)
+                    } catch { pane.editorRuntime.noteRExecutionError(error) }
+                }
+            }
+        }
+        pane.runtime.onPaneSelection = { [weak self, weak pane] in
+            guard let self, let pane, self.panes[pane.id] === pane else { return }
+            self.updateTerminalFocusOwnership()
+            if self.paneLinkSelection.active { self.paneLinkSelection.toggle(pane.id) }
+            else { self.selectPane(pane.id) }
+        }
+        pane.runtime.setKeyboardFocusEligible(pane.id == activePaneID && !paneLinkSelection.active && !networkVisible)
         activityIndex.observe(pane)
     }
 
@@ -1191,14 +2432,16 @@ final class WorkspaceModel: ObservableObject {
     /// bounded recovery task can steal first responder after the user clicks a
     /// different pane, making typing and Command-C/V appear intermittently
     /// broken in Codex and Claude.
-    private func updateTerminalFocusOwnership() {
+    func updateTerminalFocusOwnership() {
         for (id, pane) in panes {
-            pane.runtime.setKeyboardFocusEligible(id == activePaneID)
+            pane.runtime.setKeyboardFocusEligible(id == activePaneID && !paneLinkSelection.active && !networkVisible)
         }
+        if paneLinkSelection.active { NSApp?.keyWindow?.makeFirstResponder(nil) }
     }
 
     private func persistWorkspaceNow() {
-        let usedPaneIDs = Set(tabs.flatMap(\.allPaneIDs))
+        let rPresentations = captureRPresentations?() ?? savedRPresentations
+        let usedPaneIDs = Set(tabs.flatMap(\.allPaneIDs) + rPresentations.flatMap(\.paneIDs))
         let snapshot = WorkspaceSnapshot(
             tabs: tabs.map {
                 TabSnapshot(
@@ -1207,7 +2450,10 @@ final class WorkspaceModel: ObservableObject {
                     name: $0.name,
                     layout: $0.layout,
                     floatingPanes: $0.floatingPanes,
-                    splitRatios: $0.splitRatios
+                    splitRatios: $0.splitRatios,
+                    executionContext: $0.executionContext,
+                    rLayoutEditorID: $0.rLayoutEditorID,
+                    rResultsVisible: $0.rLayoutEditorID.flatMap { panes[$0]?.editorRuntime.showsRResults }
                 )
             },
             panes: usedPaneIDs.compactMap { id in
@@ -1225,26 +2471,62 @@ final class WorkspaceModel: ObservableObject {
             },
             sessionNames: sessionNames,
             selectedTabID: selectedTabID,
-            activePaneID: activePaneID
+            activePaneID: activePaneID,
+            rPresentations: rPresentations,
+            sidebarVisible: sidebarVisible
         )
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        UserDefaults.standard.set(data, forKey: workspaceKey)
-        persistRemoteWorkspaceStates(snapshot)
+        do {
+            let merged = try sharedWorkspaceStore.commit(snapshot, baseline: workspaceBaseline)
+            RelayRecoveryStore.shared.observeWorkspace(snapshot)
+            // Baseline is what this renderer last submitted, not the union.
+            // Otherwise an unchanged renderer could delete another's additions.
+            workspaceBaseline = snapshot
+            workspacePersistenceIssue = nil
+            workspaceSaveCanClose = true
+            workspacePendingChanges = (try? sharedWorkspaceStore.pendingCount()) ?? workspacePendingChanges
+            let data = try JSONEncoder().encode(merged)
+            RelayStateProfile.defaults.set(data, forKey: workspaceKey)
+            persistRemoteWorkspaceStates(merged)
+        } catch RelaySharedWorkspaceError.busy {
+            workspaceSaveCanClose = false
+            workspacePersistenceIssue = "Another Relay instance is saving this workspace. Changes are waiting to be saved."
+            if !didShutdown { persistWorkspace() }
+        } catch RelaySharedWorkspaceError.conflictingEdit {
+            do {
+                try sharedWorkspaceStore.preservePending(snapshot)
+                workspacePendingChanges = try sharedWorkspaceStore.pendingCount()
+                workspacePersistenceIssue = "Another Relay instance changed the same workspace item. Your changes were saved separately for recovery."
+                workspaceSaveCanClose = true
+            } catch {
+                workspaceSaveCanClose = false
+                workspacePersistenceIssue = "Conflicting workspace changes could not be saved. Keep this window open to preserve your changes."
+            }
+        } catch {
+            workspaceSaveCanClose = false
+            workspacePersistenceIssue = "Workspace changes could not be saved safely. Existing sessions have been left intact."
+        }
     }
 
     private func persistRemoteWorkspaceStates(_ snapshot: WorkspaceSnapshot) {
-        for sessionID in Set(tabs.map(\.sessionID)) {
-            let sessionTabs = tabs.filter { $0.sessionID == sessionID }
-            let paneIDs = Set(sessionTabs.flatMap(\.allPaneIDs))
-            guard let remotePane = paneIDs.compactMap({ panes[$0] }).first(where: {
+        for sessionID in Set(snapshot.tabs.map { $0.sessionID ?? $0.id }) {
+            let sessionTabs = snapshot.tabs.filter { ($0.sessionID ?? $0.id) == sessionID }
+            let sessionTabIDs = Set(sessionTabs.map(\.id))
+            let presentations = (snapshot.rPresentations ?? []).filter { sessionTabIDs.contains($0.tabID) }
+            let paneIDs = Set(sessionTabs.flatMap { $0.layout.paneIDs + ($0.floatingPanes ?? []).map(\.paneID) } + presentations.flatMap(\.paneIDs))
+            guard let remotePane = snapshot.panes.first(where: {
+                paneIDs.contains($0.id) &&
                 $0.profile.kind == .ssh && $0.profile.backend == .relay
             }) else { continue }
+            RecoveryWindowRegistry.shared.record(sessionID: sessionID)
             let remoteSnapshot = WorkspaceSnapshot(
                 tabs: snapshot.tabs.filter { ($0.sessionID ?? $0.id) == sessionID },
                 panes: snapshot.panes.filter { paneIDs.contains($0.id) },
-                sessionNames: sessionNames[sessionID].map { [sessionID: $0] },
+                sessionNames: snapshot.sessionNames?[sessionID].map { [sessionID: $0] },
                 selectedTabID: sessionTabs.contains(where: { $0.id == selectedTabID }) ? selectedTabID : sessionTabs.first?.id,
-                activePaneID: activePaneID.flatMap { paneIDs.contains($0) ? $0 : nil }
+                activePaneID: activePaneID.flatMap { paneIDs.contains($0) ? $0 : nil },
+                recoveryWindow: RecoveryWindowRegistry.shared.origin(for: sessionID),
+                rPresentations: presentations,
+                sidebarVisible: snapshot.sidebarVisible
             )
             guard let state = try? JSONEncoder().encode(remoteSnapshot) else { continue }
             RelayRemoteWorkspaceSync.shared.put(profile: remotePane.profile, workspaceID: sessionID, state: state)
@@ -1272,6 +2554,9 @@ struct WorkspaceSnapshot: Codable, Sendable {
     let sessionNames: [UUID: String]?
     let selectedTabID: UUID?
     let activePaneID: UUID?
+    var recoveryWindow: RecoveryWindowOrigin? = nil
+    var rPresentations: [RWorkspacePresentation]? = nil
+    var sidebarVisible: Bool? = nil
 }
 
 struct TabSnapshot: Codable, Sendable {
@@ -1281,6 +2566,9 @@ struct TabSnapshot: Codable, Sendable {
     let layout: PaneLayout
     let floatingPanes: [FloatingPanePlacement]?
     let splitRatios: [UUID: Double]?
+    var executionContext: RelayExecutionContext? = nil
+    var rLayoutEditorID: UUID? = nil
+    var rResultsVisible: Bool? = nil
 }
 
 struct PaneSnapshot: Codable, Sendable {

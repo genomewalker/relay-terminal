@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/relay-terminal/relayd/internal/programstatus"
 	"io"
 	"sync"
 )
@@ -28,6 +29,11 @@ const (
 	WorkspaceState Type = 14
 	ViewportCommit Type = 15
 	ViewportAck    Type = 16
+	HostRequest    Type = 17
+	HostResponse   Type = 18
+	Fragment       Type = 19
+	Capabilities   Type = 20
+	AgentBinding   Type = 21
 )
 
 const MaxPayload = 16 << 20
@@ -61,41 +67,59 @@ func ParseHostEvent(frame Frame) (string, Frame, error) {
 }
 
 type HelloPayload struct {
-	Version         int    `json:"version"`
-	SessionID       string `json:"session_id"`
-	ParentSessionID string `json:"parent_session_id,omitempty"`
-	WorkspaceID     string `json:"workspace_id,omitempty"`
-	TabID           string `json:"tab_id,omitempty"`
-	PaneTitle       string `json:"pane_title,omitempty"`
-	ContentKind     string `json:"content_kind,omitempty"`
-	Command         string `json:"command,omitempty"`
-	Cols            uint16 `json:"cols"`
-	Rows            uint16 `json:"rows"`
-	LastSeq         uint64 `json:"last_seq"`
-	LastEventSeq    uint64 `json:"last_event_seq,omitempty"`
-	EventOnly       bool   `json:"event_only,omitempty"`
-	ObserveEvents   bool   `json:"observe_events,omitempty"`
-	TerminalOnly    bool   `json:"terminal_only,omitempty"`
-	Probe           bool   `json:"probe,omitempty"`
-	WorkerToken     string `json:"worker_token,omitempty"`
-	NodeMux         bool   `json:"node_mux,omitempty"`
-	ClientID        string `json:"client_id,omitempty"`
-	RepaintPulse    bool   `json:"repaint_pulse,omitempty"`
+	NativeRotationBridge  bool            `json:"native_rotation_bridge,omitempty"`
+	HostRotation          json.RawMessage `json:"host_rotation,omitempty"`
+	PromptEditor          json.RawMessage `json:"prompt_editor,omitempty"`
+	BindAgent             bool            `json:"bind_agent,omitempty"`
+	PrepareUpgrade        bool            `json:"prepare_upgrade,omitempty"`
+	Version               int             `json:"version"`
+	SessionID             string          `json:"session_id"`
+	ParentSessionID       string          `json:"parent_session_id,omitempty"`
+	WorkspaceID           string          `json:"workspace_id,omitempty"`
+	TabID                 string          `json:"tab_id,omitempty"`
+	PaneTitle             string          `json:"pane_title,omitempty"`
+	ContentKind           string          `json:"content_kind,omitempty"`
+	Command               string          `json:"command,omitempty"`
+	WorkingDirectory      string          `json:"working_directory,omitempty"`
+	RotationControlled    bool            `json:"rotation_controlled,omitempty"`
+	GuardedInput          bool            `json:"guarded_input,omitempty"`
+	GuardedOperationID    string          `json:"guarded_operation_id,omitempty"`
+	GuardedAgentPID       int             `json:"guarded_agent_pid,omitempty"`
+	GuardedProcessStart   uint64          `json:"guarded_process_start,omitempty"`
+	GuardedText           string          `json:"guarded_text,omitempty"`
+	Cols                  uint16          `json:"cols"`
+	Rows                  uint16          `json:"rows"`
+	LastSeq               uint64          `json:"last_seq"`
+	LastEventSeq          uint64          `json:"last_event_seq,omitempty"`
+	EventOnly             bool            `json:"event_only,omitempty"`
+	ObserveProgramStatus  bool            `json:"observe_program_status,omitempty"`
+	ObserveEvents         bool            `json:"observe_events,omitempty"`
+	TerminalOnly          bool            `json:"terminal_only,omitempty"`
+	RequireExistingWorker bool            `json:"require_existing_worker,omitempty"`
+	Probe                 bool            `json:"probe,omitempty"`
+	WorkerToken           string          `json:"worker_token,omitempty"`
+	NodeMux               bool            `json:"node_mux,omitempty"`
+	ClientID              string          `json:"client_id,omitempty"`
+	RepaintPulse          bool            `json:"repaint_pulse,omitempty"`
 }
 
 type StatusPayload struct {
-	State           string   `json:"state"`
-	Version         string   `json:"version,omitempty"`
-	ProtocolVersion int      `json:"protocol_version,omitempty"`
-	SupervisorPID   int      `json:"supervisor_pid,omitempty"`
-	ExitCode        int      `json:"exit_code,omitempty"`
-	Message         string   `json:"message,omitempty"`
-	WorkerPID       int      `json:"worker_pid,omitempty"`
-	Capabilities    []string `json:"capabilities,omitempty"`
-	OutputReset     bool     `json:"output_reset,omitempty"`
-	EventReset      bool     `json:"event_reset,omitempty"`
-	ControlGranted  *bool    `json:"control_granted,omitempty"`
-	ClientCount     int      `json:"client_count,omitempty"`
+	ProgramStatus         *[]programstatus.Record `json:"program_status,omitempty"`
+	ProgramStatusRevision uint64                  `json:"program_status_revision,omitempty"`
+	ProgramStatusReplay   bool                    `json:"program_status_replay,omitempty"`
+	UpgradePrepared       bool                    `json:"upgrade_prepared,omitempty"`
+	State                 string                  `json:"state"`
+	Version               string                  `json:"version,omitempty"`
+	ProtocolVersion       int                     `json:"protocol_version,omitempty"`
+	SupervisorPID         int                     `json:"supervisor_pid,omitempty"`
+	ExitCode              int                     `json:"exit_code,omitempty"`
+	Message               string                  `json:"message,omitempty"`
+	WorkerPID             int                     `json:"worker_pid,omitempty"`
+	Capabilities          []string                `json:"capabilities,omitempty"`
+	OutputReset           bool                    `json:"output_reset,omitempty"`
+	EventReset            bool                    `json:"event_reset,omitempty"`
+	ControlGranted        *bool                   `json:"control_granted,omitempty"`
+	ClientCount           int                     `json:"client_count,omitempty"`
 }
 
 const inputIdentityBytes = 16
@@ -250,8 +274,9 @@ func ReadFrame(reader io.Reader) (Frame, error) {
 }
 
 type Writer struct {
-	writer io.Writer
-	mu     sync.Mutex
+	scheduler *frameScheduler
+	writer    io.Writer
+	mu        sync.Mutex
 }
 
 func NewWriter(writer io.Writer) *Writer {
@@ -259,6 +284,9 @@ func NewWriter(writer io.Writer) *Writer {
 }
 
 func (writer *Writer) Write(frame Frame) error {
+	if writer.scheduler != nil {
+		return writer.scheduler.write(frame)
+	}
 	if len(frame.Payload) > MaxPayload {
 		return fmt.Errorf("payload too large: %d", len(frame.Payload))
 	}

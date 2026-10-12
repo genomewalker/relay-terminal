@@ -66,10 +66,12 @@ struct AgentInboxItem: Identifiable, Codable, Equatable, Sendable {
     var summarySource: AgentInboxSummarySource
     let fromPeerID: String?
     let toPeerID: String?
+    var isProgramReported: Bool? = nil
 }
 
 struct AgentInboxEvent: Sendable {
     let sourceID: String?
+    let isProgramReported: Bool
     let paneID: UUID
     let host: String
     let provider: AgentKind
@@ -92,9 +94,11 @@ struct AgentInboxEvent: Sendable {
         occurredAt: Date = Date(),
         fromPeerID: String? = nil,
         toPeerID: String? = nil,
-        sourceID: String? = nil
+        sourceID: String? = nil,
+        isProgramReported: Bool = false
     ) {
         self.sourceID = sourceID
+        self.isProgramReported = isProgramReported
         self.paneID = paneID
         self.host = host
         self.provider = provider
@@ -138,7 +142,19 @@ enum AgentInboxScope: String, CaseIterable, Identifiable {
 final class AgentIntelligenceStore: ObservableObject {
     static let shared = AgentIntelligenceStore()
 
-    private(set) var items: [AgentInboxItem] = []
+    private(set) var items: [AgentInboxItem] = [] {
+        didSet { cachedCounts = nil }
+    }
+    private struct AttentionIdentity: Hashable {
+        let paneID: UUID
+        let agentID: String
+    }
+    private struct InboxCounts {
+        var unread = 0
+        var attention = 0
+        var coordination = 0
+    }
+    private var cachedCounts: InboxCounts?
     @Published private var publicationRevision: UInt64 = 0
     private let fileURL: URL
     private let persistenceEnabled: Bool
@@ -150,12 +166,33 @@ final class AgentIntelligenceStore: ObservableObject {
     private let maximumItems = 1_000
     private let maximumPendingSummaries = 4
 
-    var unreadCount: Int { items.count { !$0.isRead } }
-    var attentionCount: Int { items.count { !$0.isRead && ($0.kind == .attention || $0.kind == .failure) } }
-    var coordinationCount: Int { items.count { $0.kind == .peer } }
+    var unreadCount: Int { inboxCounts.unread }
+    /// Count unresolved agent conversations, not accumulated event rows.
+    var attentionCount: Int { inboxCounts.attention }
+    var coordinationCount: Int { inboxCounts.coordination }
+
+    // Workspace badges read these getters several times per view update.
+    // Scan once after an item mutation, then reuse the counts until the next
+    // mutation. Array element edits also invalidate through items.didSet.
+    private var inboxCounts: InboxCounts {
+        if let cachedCounts { return cachedCounts }
+        var counts = InboxCounts()
+        var attention = Set<AttentionIdentity>()
+        for item in items {
+            if item.kind == .peer { counts.coordination += 1 }
+            guard !item.isRead else { continue }
+            counts.unread += 1
+            if item.kind == .attention || item.kind == .failure {
+                attention.insert(AttentionIdentity(paneID: item.paneID, agentID: item.agentID ?? "pane"))
+            }
+        }
+        counts.attention = attention.count
+        cachedCounts = counts
+        return counts
+    }
 
     init(fileURL: URL? = nil, persistenceEnabled: Bool? = nil) {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let base = RelayStateProfile.applicationSupportRoot
             .appendingPathComponent("Relay/Intelligence", isDirectory: true)
         self.fileURL = fileURL ?? base.appendingPathComponent("inbox.json")
         self.persistenceEnabled = persistenceEnabled ?? !Self.isRunningTests
@@ -189,7 +226,8 @@ final class AgentIntelligenceStore: ObservableObject {
             isRead: false,
             summarySource: .exact,
             fromPeerID: event.fromPeerID.map { Self.clean($0, limit: 240) },
-            toPeerID: event.toPeerID.map { Self.clean($0, limit: 240) }
+            toPeerID: event.toPeerID.map { Self.clean($0, limit: 240) },
+            isProgramReported: event.isProgramReported ? true : nil
         )
         items.insert(item, at: 0)
         prune()
@@ -375,7 +413,8 @@ enum AgentSummaryPolicy {
     static let maximumReplayAge: TimeInterval = 120
 
     static func shouldSummarize(_ item: AgentInboxItem, now: Date = Date()) -> Bool {
-        guard item.summarySource == .exact,
+        guard item.isProgramReported != true,
+              item.summarySource == .exact,
               item.detail.count >= 80,
               [.attention, .failure, .completion, .peer].contains(item.kind) else { return false }
         let age = now.timeIntervalSince(item.occurredAt)

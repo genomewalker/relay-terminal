@@ -20,7 +20,17 @@ struct PaneArtifact: Identifiable {
     }
 
     var filename: String { TerminalPathSyntax.lastComponent(remotePath) }
-    var image: NSImage? { NSImage(data: data) }
+    var isPDF: Bool { data.starts(with: Data("%PDF-".utf8)) }
+    var image: NSImage? {
+        if TerminalPathSyntax.pathExtension(remotePath) == "svg" {
+            let source = String(decoding: data, as: UTF8.self).lowercased()
+            guard data.count <= 2 << 20, !source.contains("<!entity"), !source.contains("<!doctype"),
+                  !source.contains("<script"), !source.contains("<foreignobject"),
+                  !source.contains("href="), !source.contains("url("),
+                  !source.contains(" onload=") else { return nil }
+        }
+        return NSImage(data: data)
+    }
 }
 
 enum TerminalImageNormalizer {
@@ -223,7 +233,7 @@ enum TerminalPathSyntax {
 }
 
 enum TerminalLinkResolver {
-    static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp", "svg"])
+    static let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "pdf"])
     private static let artifactPrefix = "file:///__relay_artifact__/"
     private static let legacyArtifactPrefix = "relay-artifact://open/"
     private static let filePrefix = "file:///__relay_remote_file__/"
@@ -246,7 +256,9 @@ enum TerminalLinkResolver {
 
         let path: String
         if let url = URL(string: link), url.isFileURL {
-            path = url.path
+            // An explicit file URL is a filename, even when its basename
+            // happens to resemble a provider slash-command description.
+            return target(forRemotePath: url.path)
         } else {
             path = link.removingPercentEncoding ?? link
         }
@@ -270,6 +282,14 @@ enum TerminalLinkResolver {
 
     private static func isRemotePath(_ path: String) -> Bool {
         let cleaned = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Provider welcome/help rows are commands followed by descriptions.
+        // Treating an entire "/review - review changes" row as a filename
+        // opens a broken editor when the user merely focuses the terminal.
+        // Explicit file URLs and encoded file links remain unambiguous above.
+        if cleaned.range(
+            of: #"^/[A-Za-z][A-Za-z0-9_-]*\s+[-–—]\s+\S"#,
+            options: .regularExpression
+        ) != nil { return false }
         return cleaned.hasPrefix("/") || cleaned.hasPrefix("./")
             || cleaned.hasPrefix("../") || cleaned.hasPrefix("~/")
             || cleaned.hasPrefix(".codex/")
@@ -433,7 +453,7 @@ private struct TerminalDetectedLink {
 /// repaint packet.
 private enum TerminalLinkScanner {
     private static let fileExtensions: Set<String> = Set([
-        "png", "jpg", "jpeg", "gif", "webp", "svg", "txt", "md", "markdown", "rst", "log",
+        "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "txt", "md", "markdown", "rst", "log",
         "csv", "tsv", "json", "jsonl", "yaml", "yml", "toml", "ini", "conf", "cfg",
         "swift", "go", "rs", "py", "pyw", "r", "rmd", "sh", "bash", "zsh", "fish",
         "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "html", "htm", "css",
@@ -468,6 +488,10 @@ private enum TerminalLinkScanner {
 
     private static func link(in text: String, tokenRange: Range<String.Index>) -> TerminalDetectedLink? {
         let token = text[tokenRange]
+        // ASCII tokens without a slash cannot match any supported path or URL.
+        // Avoid three Foundation case-folding searches for every ordinary word
+        // in a TUI repaint. Non-ASCII tokens keep the existing matching rules.
+        guard token.utf8.contains(0x2F) || token.utf8.contains(where: { $0 >= 0x80 }) else { return nil }
         guard !token.contains("\u{001B}") else { return nil }
         let start: String.Index
         if let web = firstRange(of: ["https://", "http://", "file:///"], in: token) {
@@ -642,35 +666,10 @@ enum RemoteArtifactLoader {
                 return data
             }
 
-            let process = Process()
-            let output = Pipe()
-            let errors = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            var arguments = [
-                "-T",
-                "-o", "ControlMaster=auto",
-                "-o", "ControlPersist=10m",
-                "-o", "ControlPath=~/.ssh/relay-%C"
-            ]
-            arguments += profile.sshConnectionArguments
-            arguments += [
-                "~/.local/bin/relayd", "artifact",
-                "--path-b64", Data(path.utf8).base64EncodedString()
-            ]
-            process.arguments = arguments
-            process.standardOutput = output
-            process.standardError = errors
-            let captured = try ProcessCapture.run(process, output: output, errors: errors)
-            let data = captured.standardOutput
-            let errorData = captured.standardError
-            guard process.terminationStatus == 0 else {
-                let message = String(data: errorData, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                throw ArtifactLoadError.failed(message?.isEmpty == false ? message! : "Could not fetch remote image")
-            }
-            guard data.count <= 25 << 20 else { throw ArtifactLoadError.tooLarge }
-            guard NSImage(data: data) != nil else { throw ArtifactLoadError.failed("Remote file is not a readable image") }
-            return data
+            return try await RelayHostFiles.image(
+                context: RelayExecutionContext(profile: profile, directory: "/"), path: path,
+                preserveFormat: ["pdf", "svg"].contains(TerminalPathSyntax.pathExtension(path)))
+
         }.value
     }
 }

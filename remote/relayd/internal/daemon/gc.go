@@ -30,6 +30,9 @@ func (server *Server) CollectGarbage(olderThan time.Duration, dryRun bool) ([]st
 	}
 	candidates := make([]candidate, 0)
 	for id, pane := range catalog.Panes {
+		if pane.Retained {
+			continue
+		}
 		state := pane.State
 		updated := pane.UpdatedAt
 		if manifest, loadErr := loadManifest(server.manifestPath(id)); loadErr == nil {
@@ -85,6 +88,10 @@ func (server *Server) CollectGarbage(olderThan time.Duration, dryRun bool) ([]st
 		latest, loadErr := loadStoredCatalog(server.catalogPath())
 		if loadErr == nil {
 			pane, exists := latest.Panes[candidate.id]
+			if exists && pane.Retained {
+				server.mu.Unlock()
+				continue
+			}
 			eligible := exists && !pane.UpdatedAt.After(cutoff) && pane.State != "running"
 			if manifest, manifestErr := loadManifest(server.manifestPath(candidate.id)); manifestErr == nil {
 				if validateWorkerIdentity(manifest) == nil {

@@ -9,6 +9,15 @@ permissions:
   contents: read
 
 jobs:
+  editor-lifecycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node scripts/test-editor-lifecycle.cjs
+
   swift-tests:
     runs-on: macos-15
     strategy:
@@ -44,6 +53,11 @@ jobs:
           RELAY_APP_OUTPUT: ${{ runner.temp }}/Relay.app
           RELAY_SKIP_WORKSPACE_LINK: "1"
         run: ./scripts/build-app.sh release
+      - name: Test optimized plugin validation and lifecycle
+        env:
+          RELAY_TESTING: "1"
+          RELAY_HEADLESS_TESTING: "1"
+        run: swift test -c release --filter 'plugin'
       - name: Build and inspect installer image
         run: |
           ./scripts/create-dmg.sh "${{ runner.temp }}/Relay.app" "${{ runner.temp }}/Relay.dmg"

@@ -2,15 +2,19 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -19,12 +23,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/relay-terminal/relayd/internal/agentlaunch"
 	"github.com/relay-terminal/relayd/internal/daemon"
+	"github.com/relay-terminal/relayd/internal/loopbackproxy"
 	"github.com/relay-terminal/relayd/internal/protocol"
 	relayterminfo "github.com/relay-terminal/relayd/internal/terminfo"
 )
 
-var relaydVersion = "0.5.2"
+var relaydVersion = "0.5.3"
 
 const supervisorProtocolVersion = 2
 
@@ -43,9 +49,15 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|artifact|files|terminfo|live-status|upgrade-supervisor>")
+		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|artifact|files|terminfo|live-status|upgrade-supervisor|communication|peer-serve>")
 	}
 	switch os.Args[1] {
+	case "codex-proxy":
+		runStockCodexProxy(os.Args[2:])
+	case "loopback-proxy":
+		runLoopbackProxy(os.Args[2:])
+	case "plugin":
+		runPlugin()
 	case "daemon":
 		runDaemon(os.Args[2:])
 	case "node":
@@ -60,6 +72,129 @@ func main() {
 		runObserveMany(os.Args[2:])
 	case "sessions":
 		runSessions(os.Args[2:])
+	case "preserve-catalog":
+		runPreserveCatalog(os.Args[2:])
+	case "prompt-owner-binding":
+		if len(os.Args) != 3 {
+			fatal("usage: relayd prompt-owner-binding PANE")
+		}
+		record, err := daemon.ReadVerifiedPromptOwnerBinding(os.Args[2])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, record); err != nil {
+			fatal(err.Error())
+		}
+	case "rotation-native-bridge":
+		if len(os.Args) != 3 {
+			fatal("usage: relayd rotation-native-bridge PANE")
+		}
+		if err := daemon.RunNativeRotationBridge(os.Args[2], os.Stdin, os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "rotation-supervisor-rpc":
+		if len(os.Args) != 4 {
+			fatal("usage: relayd rotation-supervisor-rpc PANE CLIENT_ID")
+		}
+		request, err := io.ReadAll(io.LimitReader(os.Stdin, 8193))
+		if err != nil || len(request) > 8192 {
+			fatal("invalid host rotation request")
+		}
+		response, err := daemon.CallHostRotation(os.Args[2], os.Args[3], request)
+		if err != nil {
+			fatal(err.Error())
+		}
+		if _, err := os.Stdout.Write(append(response, '\n')); err != nil {
+			fatal(err.Error())
+		}
+	case "prompt-editor-rpc":
+		if len(os.Args) != 4 {
+			fatal("usage: relayd prompt-editor-rpc PANE CLIENT_ID")
+		}
+		request, err := io.ReadAll(io.LimitReader(os.Stdin, (2<<20)+1))
+		if err != nil || len(request) > 2<<20 {
+			fatal("invalid prompt editor request")
+		}
+		response, err := daemon.CallPromptEditor(os.Args[2], os.Args[3], request)
+		if err != nil {
+			fatal(err.Error())
+		}
+		if _, err := os.Stdout.Write(append(response, '\n')); err != nil {
+			fatal(err.Error())
+		}
+	case "prompt-editor":
+		if len(os.Args) != 3 {
+			fatal("usage: relayd prompt-editor FILE")
+		}
+		fallback, err := daemon.RunPromptEditorFile(os.Getenv("RELAY_SESSION"), os.Args[2])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if fallback {
+			editor := os.Getenv("RELAY_PROMPT_ORIGINAL_VISUAL")
+			if editor == "" {
+				editor = os.Getenv("RELAY_PROMPT_ORIGINAL_EDITOR")
+			}
+			if editor == "" {
+				editor = "vi"
+			}
+			if err := syscall.Exec("/bin/sh", []string{"sh", "-c", "exec " + editor + " \"$@\"", "relay-prompt-editor", os.Args[2]}, daemon.OriginalPromptEditorEnvironment(agentExecEnvironment(os.Environ()))); err != nil {
+				fatal(err.Error())
+			}
+		}
+	case "agent-binding":
+		record, err := readAgentBindingArgs(os.Args[2:], daemon.ReadVerifiedAgentBinding, daemon.ReadNativeAgentBinding)
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, record); err != nil {
+			fatal(err.Error())
+		}
+	case "agent-harnesses":
+		report, err := daemon.ReadPaneHarnesses(os.Args[2:])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, report); err != nil {
+			fatal(err.Error())
+		}
+	case "agent-process-identity":
+		if len(os.Args) != 5 {
+			fatal("usage: relayd agent-process-identity PANE PID PROVIDER")
+		}
+		pid, err := strconv.Atoi(os.Args[3])
+		if err != nil {
+			fatal("invalid native agent PID")
+		}
+		start, err := daemon.NativeAgentIncarnation(os.Args[2], pid, os.Args[4])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, map[string]any{"process_start": start}); err != nil {
+			fatal(err.Error())
+		}
+	case "worker-identities":
+		if len(os.Args) != 2 {
+			fatal("usage: relayd worker-identities")
+		}
+		report, err := daemon.AuditWorkerIdentities()
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, report); err != nil {
+			fatal(err.Error())
+		}
+	case "network":
+		if len(os.Args) != 2 {
+			fatal("usage: relayd network")
+		}
+		snapshot, err := daemon.NewServer().NetworkSnapshot()
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, snapshot); err != nil {
+			fatal(err.Error())
+		}
 	case "recover":
 		runRecover(os.Args[2:])
 	case "terminate":
@@ -70,8 +205,88 @@ func main() {
 		runGC(os.Args[2:])
 	case "event":
 		runEvent(os.Args[2:])
+	case "agent-launch":
+		runAgentLaunch(os.Args[2:])
+	case "rotation-launch":
+		runRotationLaunch(os.Args[2:])
+	case "rotation-exec":
+		runRotationExec(os.Args[2:])
+	case "rotation-send":
+		runRotationSend(os.Args[2:])
+	case "rotation-status":
+		runRotationStatus(os.Args[2:])
+	case "codex-runtime":
+		runCodexRuntime(os.Args[2:])
+	case "codex-start-parameters":
+		runCodexStartParameters(os.Args[2:])
+	case "claude-status-capture":
+		runClaudeStatusCapture(os.Args[2:])
+	case "claude-start-parameters":
+		runClaudeStartParameters(os.Args[2:])
+	case "rotation-codex-launch":
+		runCodexRotationLaunch(os.Args[2:])
+	case "rotation-codex-exec":
+		runCodexRotationExec(os.Args[2:])
 	case "agent":
 		runAgent(os.Args[2:])
+	case "resume-plan":
+		if len(os.Args) != 3 {
+			fatal("usage: relayd resume-plan PANE")
+		}
+		plan, err := daemon.ReadSavedConversationPlan(os.Args[2])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, plan); err != nil {
+			fatal(err.Error())
+		}
+	case "communication-actor":
+		pid := os.Getppid()
+		if len(os.Args) == 3 {
+			var err error
+			pid, err = strconv.Atoi(os.Args[2])
+			if err != nil {
+				fatal("invalid communication client PID")
+			}
+		} else if len(os.Args) != 2 {
+			fatal("usage: relayd communication-actor [CLIENT_PID]")
+		}
+		actor, err := daemon.ReadCommunicationActor(pid)
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, actor); err != nil {
+			fatal(err.Error())
+		}
+	case "communication":
+		var request daemon.CommunicationRequest
+		decoder := json.NewDecoder(io.LimitReader(os.Stdin, 65537))
+		if err := decoder.Decode(&request); err != nil {
+			fatal("invalid communication request")
+		}
+		request, actorErr := daemon.ReconcileCommunicationActor(request, os.Getppid())
+		if actorErr != nil {
+			fatal(actorErr.Error())
+		}
+		result, err := daemon.ExecuteCommunication(request)
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, result); err != nil {
+			fatal(err.Error())
+		}
+	case "peer-serve":
+		flags := flag.NewFlagSet("peer-serve", flag.ExitOnError)
+		listen := flags.String("listen", "", "explicit host:port to listen on")
+		_ = flags.Parse(os.Args[2:])
+		if *listen == "" || flags.NArg() != 0 {
+			fatal("usage: relayd peer-serve --listen HOST:PORT")
+		}
+		if err := daemon.ServeCommunicationPeers(*listen); err != nil {
+			fatal(err.Error())
+		}
+	case "resume-saved":
+		runResumeSaved(os.Args[2:])
 	case "artifact":
 		runArtifact(os.Args[2:])
 	case "files":
@@ -143,8 +358,8 @@ func runRCode(arguments []string) {
 			fatal(err.Error())
 		}
 		info, err := os.Stat(canonical)
-		if err != nil || !info.Mode().IsRegular() {
-			fatal("not a regular file: " + path)
+		if err != nil || (!info.Mode().IsRegular() && !(!*diff && info.IsDir())) {
+			fatal("expected a regular file, or a directory without --diff: " + path)
 		}
 		resolved = append(resolved, canonical)
 	}
@@ -152,11 +367,7 @@ func runRCode(arguments []string) {
 	if session == "" {
 		fatal("rcode must run inside a Relay-managed terminal pane")
 	}
-	event, err := json.Marshal(struct {
-		Type  string   `json:"type"`
-		Paths []string `json:"paths"`
-		Diff  bool     `json:"diff"`
-	}{Type: "open_file", Paths: resolved, Diff: *diff})
+	event, err := editorOpenEvent(resolved, *diff)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -184,6 +395,21 @@ func runRCode(arguments []string) {
 	}
 }
 
+func editorOpenEvent(paths []string, diff bool) ([]byte, error) {
+	var requestID [16]byte
+	if _, err := rand.Read(requestID[:]); err != nil {
+		return nil, err
+	}
+	// Identical user commands are separate actions, unlike replayed provider
+	// transcript records. Give each invocation an identity for event dedup.
+	return json.Marshal(struct {
+		Type      string   `json:"type"`
+		RequestID string   `json:"request_id"`
+		Paths     []string `json:"paths"`
+		Diff      bool     `json:"diff"`
+	}{Type: "open_file", RequestID: fmt.Sprintf("%x", requestID), Paths: paths, Diff: diff})
+}
+
 func runFiles(arguments []string) {
 	if len(arguments) == 0 {
 		fatal("usage: relayd files <workspace|list|read|write|import|git-diff>")
@@ -192,6 +418,8 @@ func runFiles(arguments []string) {
 	pathBase64 := flags.String("path-b64", "", "base64-encoded absolute path")
 	parentSession := flags.String("parent-session", "", "terminal session whose working directory should be used")
 	nameBase64 := flags.String("name-b64", "", "base64-encoded import filename")
+	queryBase64 := flags.String("query-b64", "", "base64-encoded file search")
+	includeUntracked := flags.Bool("include-untracked", false, "include bounded discovery of untracked files")
 	expectedModificationNS := flags.Int64("expected-modification-ns", 0, "opaque revision used for conflict detection")
 	_ = flags.Parse(arguments[1:])
 	path := ""
@@ -209,6 +437,18 @@ func runFiles(arguments []string) {
 		value, err = daemon.ResolveWorkspace(*parentSession, path)
 	case "list":
 		value, err = daemon.ListDirectory(path)
+	case "find":
+		query, decodeErr := base64.StdEncoding.DecodeString(*queryBase64)
+		if decodeErr != nil {
+			fatal("invalid search query")
+		}
+		value, err = daemon.FindEditorFiles(path, string(query))
+	case "find-v2":
+		query, decodeErr := base64.StdEncoding.DecodeString(*queryBase64)
+		if decodeErr != nil {
+			fatal("invalid search query")
+		}
+		value, err = daemon.SearchEditorFiles(path, string(query), *includeUntracked)
 	case "read":
 		value, err = daemon.ReadEditorFile(path)
 	case "write":
@@ -332,6 +572,35 @@ func startsWithParent(path string) bool {
 	return path == ".." || len(path) > 3 && path[:3] == ".."+string(filepath.Separator)
 }
 
+func runAgentLaunch(arguments []string) {
+	flags := flag.NewFlagSet("agent-launch", flag.ExitOnError)
+	client := flags.String("client", "", "exact agent client")
+	pid := flags.Int("pid", 0, "verified process PID")
+	start := flags.String("process-start", "", "verified process start ticks")
+	expectedExecutable := flags.String("executable", "", "verified real agent executable")
+	_ = flags.Parse(arguments)
+	if flags.NArg() != 0 {
+		fatal("unexpected capture arguments")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fatal("home unavailable")
+	}
+	if *expectedExecutable == "" {
+		resolved, resolveError := findRealAgentExecutable(*client)
+		if resolveError != nil {
+			fatal("verified agent executable unavailable")
+		}
+		*expectedExecutable = resolved
+	}
+	path, err := agentlaunch.CaptureExisting(filepath.Join(home, ".local", "share", "relay", "agent-launches"), *client, *pid, *start, *expectedExecutable)
+	if err != nil {
+		fatal("launch capture refused; process identity or configuration is unavailable")
+	}
+	// The snapshot path is returned; arguments and environment are never logged.
+	_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"snapshot_path": path})
+}
+
 func runAgent(arguments []string) {
 	if len(arguments) == 0 {
 		fatal("usage: relayd agent <claude|codex> [agent arguments...]")
@@ -346,6 +615,24 @@ func runAgent(arguments []string) {
 	}
 }
 
+func runResumeSaved(arguments []string) {
+	if len(arguments) != 3 || os.Getenv("RELAY_SESSION") == "" || os.Getenv("RELAY_SESSION") == arguments[0] {
+		fatal("saved conversation recovery requires a new dedicated pane")
+	}
+	plan, err := daemon.ReadSavedConversationPlan(arguments[0])
+	if err != nil || plan.SessionID != arguments[1] || plan.BindingSHA != arguments[2] {
+		fatal("saved conversation changed or is unavailable; no agent was started")
+	}
+	if err := os.Chdir(plan.Directory); err != nil {
+		fatal("saved working directory is unavailable")
+	}
+	if plan.Provider == "claude" {
+		runClaude([]string{"--resume", plan.SessionID})
+	} else {
+		runCodex([]string{"resume", plan.SessionID})
+	}
+}
+
 func runClaude(arguments []string) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -356,18 +643,116 @@ func runClaude(arguments []string) {
 		fatal(err.Error())
 	}
 	settingsPath := filepath.Join(settingsDir, "claude-hooks.json")
-	if err := os.WriteFile(settingsPath, []byte(claudeHookSettings), 0o600); err != nil {
+	helper, err := os.Executable()
+	if err != nil {
+		fatal("Relay helper path is unavailable")
+	}
+	quotedHelper := "'" + strings.ReplaceAll(helper, "'", "'\"'\"'") + "'"
+	encodedHelper, _ := json.Marshal(quotedHelper)
+	settings := strings.ReplaceAll(claudeHookSettings, "~/.local/bin/relayd", string(encodedHelper[1:len(encodedHelper)-1]))
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o600); err != nil {
 		fatal(err.Error())
 	}
 	executable, err := findRealAgentExecutable("claude")
 	if err != nil {
 		fatal(err.Error())
 	}
+	// Native rendering observes the official CLI session; it must not replace
+	// this invocation with a Relay-owned SDK worker.
+	// Continuing a detached background conversation exits in recent Claude CLIs.
+	// Use the provider's own chooser instead of guessing which session is latest
+	// or stopping a process. Only intercept a plain interactive continuation.
+	if target, background := claudeContinuationTarget(executable, arguments); background {
+		cwd, _ := os.Getwd()
+		if target != "" {
+			fmt.Fprintln(os.Stderr, "Relay: reattaching this pane's existing Claude conversation.")
+			if err := syscall.Exec(executable, []string{"claude", "attach", target}, agentExecEnvironment(os.Environ())); err != nil {
+				fatal(err.Error())
+			}
+		}
+		fmt.Fprintln(os.Stderr, "Relay: a Claude conversation is still running in the background here. Select it to reattach.")
+		chooserArguments := []string{"claude", "agents", "--cwd", cwd, "--settings", settingsPath}
+		for _, argument := range arguments {
+			if argument != "--continue" && argument != "-c" {
+				chooserArguments = append(chooserArguments, argument)
+			}
+		}
+		if err := syscall.Exec(executable, chooserArguments, agentExecEnvironment(os.Environ())); err != nil {
+			fatal(err.Error())
+		}
+	}
 	claudeArguments := []string{"claude", "--settings", settingsPath}
 	claudeArguments = append(claudeArguments, arguments...)
-	if err := syscall.Exec(executable, claudeArguments, agentExecEnvironment(os.Environ())); err != nil {
+	if err := syscall.Exec(executable, claudeArguments, captureAgentLaunch(home, "claude", executable, arguments, claudeArguments[1:])); err != nil {
 		fatal(err.Error())
 	}
+}
+
+func claudeContinuationTarget(executable string, arguments []string) (string, bool) {
+	continuations := 0
+	for _, argument := range arguments {
+		switch argument {
+		case "--continue", "-c":
+			continuations++
+		case "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions":
+		default:
+			return "", false
+		}
+	}
+	if continuations != 1 {
+		return "", false
+	}
+	input, inputErr := os.Stdin.Stat()
+	output, outputErr := os.Stdout.Stat()
+	if inputErr != nil || outputErr != nil || input.Mode()&os.ModeCharDevice == 0 || output.Mode()&os.ModeCharDevice == 0 {
+		return "", false
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, executable, "agents", "--json", "--cwd", cwd)
+	command.Env = agentExecEnvironment(os.Environ())
+	command.Stdin = nil
+	command.Stderr = io.Discard
+	var rows []struct {
+		Kind      string `json:"kind"`
+		CWD       string `json:"cwd"`
+		ID        string `json:"id"`
+		SessionID string `json:"sessionId"`
+		PID       int    `json:"pid"`
+	}
+	stdout, err := command.StdoutPipe()
+	if err != nil || command.Start() != nil {
+		return "", false
+	}
+	data, readErr := io.ReadAll(io.LimitReader(stdout, 131073))
+	if len(data) > 131072 {
+		cancel()
+	}
+	waitErr := command.Wait()
+	if readErr != nil || waitErr != nil || len(data) > 131072 || json.Unmarshal(data, &rows) != nil {
+		return "", false
+	}
+	retained, _ := daemon.RetainedClaudeSession(os.Getenv("RELAY_SESSION"))
+	background := false
+	target := ""
+	matching := 0
+	for _, row := range rows {
+		if row.Kind == "background" && row.CWD == cwd && row.ID != "" && row.SessionID != "" && row.PID > 0 {
+			background = true
+			if retained != "" && row.SessionID == retained {
+				matching++
+				target = row.ID
+			}
+		}
+	}
+	if matching != 1 {
+		target = ""
+	}
+	return target, background
 }
 
 func runCodex(arguments []string) {
@@ -375,23 +760,49 @@ func runCodex(arguments []string) {
 	if err != nil {
 		fatal(err.Error())
 	}
-	configDir := filepath.Join(home, ".codex")
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		fatal(err.Error())
-	}
-	profilePath := filepath.Join(configDir, "relay-terminal.config.toml")
-	if err := os.WriteFile(profilePath, []byte(codexHookProfile(profilePath)), 0o600); err != nil {
-		fatal(err.Error())
-	}
-	executable, err := findRealAgentExecutable("codex")
+	executable, err := resolveStockCodexExecutable()
 	if err != nil {
 		fatal(err.Error())
 	}
-	codexArguments := []string{"codex", "--profile", "relay-terminal"}
-	codexArguments = append(codexArguments, arguments...)
-	if err := syscall.Exec(executable, codexArguments, agentExecEnvironment(os.Environ())); err != nil {
+	codexArguments := append([]string{"codex"}, arguments...)
+	environment := captureAgentLaunch(home, "codex", executable, arguments, codexArguments[1:])
+	environment = stockCodexEnvironment(environment)
+	if err := syscall.Exec(executable, codexArguments, environment); err != nil {
 		fatal(err.Error())
 	}
+}
+
+// Capture before exec, while argv is available verbatim. Exec preserves the
+// PID/incarnation. Capture failure does not change the user's requested launch;
+// it only makes that process ineligible for automatic rotation.
+func captureAgentLaunch(home, client, executable string, requested, effective []string) []string {
+	environment := agentExecEnvironment(os.Environ())
+	if client == "claude" && os.Getenv("RELAY_PROMPT_EDITOR_ENABLE") == "1" && os.Getenv("RELAY_SESSION") != "" {
+		helper, err := os.Executable()
+		if err == nil {
+			prepared, bridgeErr := daemon.PreparePromptEditorEnvironment(home, helper, os.Getenv("RELAY_SESSION"), environment)
+			if bridgeErr == nil {
+				environment = prepared
+			}
+		}
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return environment
+	}
+	path, err := agentlaunch.Save(filepath.Join(home, ".local", "share", "relay", "agent-launches"),
+		client, executable, cwd, os.Getenv("RELAY_SESSION"), agentlaunch.ProcessStart(), requested, effective)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Relay could not retain launch parameters; automatic rotation is unavailable for this launch.")
+		return environment
+	}
+	filtered := make([]string, 0, len(environment)+1)
+	for _, entry := range environment {
+		if !strings.HasPrefix(entry, "RELAY_AGENT_LAUNCH_SNAPSHOT=") {
+			filtered = append(filtered, entry)
+		}
+	}
+	return append(filtered, "RELAY_AGENT_LAUNCH_SNAPSHOT="+path)
 }
 
 // The shim marker only selects relayd's dispatch path. It must not leak into the agent process:
@@ -585,17 +996,17 @@ timeout = 3
 
 const claudeHookSettings = `{
   "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "PreToolUse": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "PermissionRequest": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "PostToolUse": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "PostToolUseFailure": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "Notification": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "SubagentStart": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}],
-    "SessionEnd": [{"hooks": [{"type": "command", "command": "~/.local/bin/relayd event --session $RELAY_SESSION --agent claude"}]}]
+    "SessionStart": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "PostToolUseFailure": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "Notification": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}]
   }
 }`
 
@@ -606,6 +1017,7 @@ func runEvent(arguments []string) {
 	agent := flags.String("agent", "unknown", "agent kind")
 	source := flags.String("source", "hook", "hook, codex-app-server, claude-stream-json, or provider-native")
 	stream := flags.Bool("stream", false, "read newline-delimited provider events until EOF")
+	bind := flags.Bool("bind", false, "authenticated provider binding channel (requires supporting supervisor)")
 	_ = flags.Parse(arguments)
 	if *session == "" {
 		fatal("--session is required")
@@ -613,21 +1025,76 @@ func runEvent(arguments []string) {
 	if err := daemon.ValidateNativeAgentSource(*source); err != nil {
 		fatal(err.Error())
 	}
+	if *bind {
+		if *source != "hook" || *stream {
+			fatal("binding requires a one-shot provider hook")
+		}
+	}
+	// Claude's one-shot hooks may spend time producing their JSON on stdin.
+	// Read it before opening the event-only connection: the supervisor can
+	// close a connection whose pane worker is unavailable before the hook has
+	// finished writing, which otherwise surfaces as a broken-pipe hook error.
+	var raw []byte
+	if !*stream {
+		var err error
+		raw, err = io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
+		if err != nil {
+			fatal(err.Error())
+		}
+	}
+	if *bind {
+		// Local kernel/worker verification also works with a retained older
+		// supervisor. Failure remains optional telemetry and cannot block a turn.
+		if err := daemon.StoreNativeAgentHook(*session, *agent, raw); err != nil && os.Getenv("RELAY_NATIVE_BINDING_DIAGNOSTICS") == "1" {
+			message := err.Error()
+			if len(message) > 400 {
+				message = message[:400]
+			}
+			fmt.Fprintln(os.Stderr, "Relay native hook binding unavailable:", message)
+		}
+		if err := daemon.RequireAgentBindingCapability(*socket, *session); err != nil {
+			*bind = false
+		}
+	}
 	connection, err := net.Dial("unix", *socket)
 	if err != nil {
+		if *source == "hook" && !*stream && isEventTransportError(err) {
+			return
+		}
 		fatal(err.Error())
 	}
 	defer connection.Close()
 	writer := protocol.NewWriter(connection)
 	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
-		Version: 1, SessionID: *session, EventOnly: true,
+		Version: 1, SessionID: *session, EventOnly: true, BindAgent: *bind,
 	})
 	if err := writer.Write(hello); err != nil {
+		if *source == "hook" && !*stream && isEventTransportError(err) {
+			return
+		}
 		fatal(err.Error())
 	}
 	emit := func(raw []byte) error {
 		if len(raw) == 0 || !json.Valid(raw) {
 			return nil
+		}
+		if *bind && *source == "hook" && !*stream {
+			var hook map[string]any
+			if json.Unmarshal(raw, &hook) == nil {
+				sessionID, _ := hook["session_id"].(string)
+				path, _ := hook["transcript_path"].(string)
+				if sessionID != "" && len(sessionID) <= 128 && len(path) <= 4096 {
+					binding, bindingErr := protocol.JSONFrame(protocol.AgentBinding, map[string]any{
+						"provider": *agent, "session_id": sessionID, "transcript_path": path,
+					})
+					if bindingErr != nil {
+						return bindingErr
+					}
+					if writeErr := writer.Write(binding); writeErr != nil {
+						return writeErr
+					}
+				}
+			}
 		}
 		envelope, canonicalErr := daemon.CanonicalAgentEnvelope(*agent, raw, *source)
 		if canonicalErr != nil {
@@ -648,13 +1115,29 @@ func runEvent(arguments []string) {
 		}
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
-	if err != nil {
-		fatal(err.Error())
-	}
 	if err := emit(raw); err != nil {
+		// Hook events are best-effort status telemetry. Losing the Relay
+		// connection must not turn a completed Claude turn into a hook error.
+		if *source == "hook" && isEventTransportError(err) {
+			return
+		}
 		fatal(err.Error())
 	}
+	if *bind {
+		_ = connection.SetReadDeadline(time.Now().Add(3 * time.Second))
+		frame, err := protocol.ReadFrame(connection)
+		var status protocol.StatusPayload
+		if err != nil || frame.Type != protocol.Status || protocol.DecodeJSON(frame, &status) != nil || status.State != "agent_event_received" {
+			return
+		}
+	}
+
+}
+
+func isEventTransportError(err error) bool {
+	var netErr *net.OpError
+	return errors.As(err, &netErr) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
 }
 
 func runDaemon(arguments []string) {
@@ -693,9 +1176,10 @@ func runWorker(arguments []string) {
 	config := daemon.WorkerConfig{
 		SocketPath: *socket, ManifestPath: *manifest,
 		SessionID: *session, Token: token,
-		Command:          decode(commandBase64, "RELAY_WORKER_COMMAND_B64"),
-		WorkingDirectory: decode(workingDirectoryBase64, "RELAY_WORKER_CWD_B64"),
-		Cols:             uint16(*cols), Rows: uint16(*rows),
+		Command:            decode(commandBase64, "RELAY_WORKER_COMMAND_B64"),
+		WorkingDirectory:   decode(workingDirectoryBase64, "RELAY_WORKER_CWD_B64"),
+		RotationControlled: os.Getenv("RELAY_ROTATION_WORKER") == "1",
+		Cols:               uint16(*cols), Rows: uint16(*rows),
 	}
 	if err := daemon.ServeWorker(config); err != nil {
 		fatal(err.Error())
@@ -717,6 +1201,8 @@ func runAttach(arguments []string) {
 	lastSequence := flags.Uint64("last-seq", 0, "last received output sequence")
 	lastEventSequence := flags.Uint64("last-event-seq", 0, "last received agent event sequence")
 	terminalOnly := flags.Bool("terminal-only", false, "exclude agent events from the terminal stream")
+	observeProgramStatus := os.Getenv("RELAY_OBSERVE_PROGRAM_STATUS") == "1"
+	requireExistingWorker := flags.Bool("require-existing-worker", false, "attach only to an existing pane worker")
 	clientID := flags.String("client-id", "", "durable input client identity")
 	_ = flags.Parse(arguments)
 	if *session == "" {
@@ -739,7 +1225,7 @@ func runAttach(arguments []string) {
 		Version: 1, SessionID: *session, ParentSessionID: *parentSession, Command: command,
 		WorkspaceID: *workspace, TabID: *tab, PaneTitle: *paneTitle, ContentKind: *contentKind,
 		Cols: uint16(*cols), Rows: uint16(*rows), LastSeq: *lastSequence, LastEventSeq: *lastEventSequence,
-		TerminalOnly: *terminalOnly, ClientID: *clientID,
+		TerminalOnly: *terminalOnly, ObserveProgramStatus: observeProgramStatus, ClientID: *clientID, RequireExistingWorker: *requireExistingWorker,
 		RepaintPulse: os.Getenv("RELAY_ATTACH_REPAINT") == "1",
 	})
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
@@ -778,17 +1264,10 @@ func runNode(arguments []string) {
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
 		fatal(err.Error())
 	}
-	done := make(chan error, 2)
-	go func() {
-		_, copyErr := io.Copy(connection, os.Stdin)
-		done <- copyErr
-	}()
-	go func() {
-		_, copyErr := io.Copy(os.Stdout, connection)
-		done <- copyErr
-	}()
-	if copyErr := <-done; copyErr != nil {
-		fatal(copyErr.Error())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := loopbackproxy.RelayNodeWithHostRequestHandlers(ctx, os.Stdin, os.Stdout, connection, daemon.HandleNodeHostRotationRequest, daemon.HandleNodeHostAccountsRequest); err != nil && err != io.EOF && ctx.Err() == nil {
+		fatal("node transport ended: " + err.Error())
 	}
 }
 
@@ -1064,6 +1543,7 @@ func connectOrStart(socket string) (net.Conn, error) {
 	}
 	defer logFile.Close()
 	child := exec.Command(os.Args[0], "daemon", "--socket", socket)
+	child.Env = daemon.TerminalEnvironment(os.Environ())
 	child.Stdin = nil
 	child.Stdout = logFile
 	child.Stderr = logFile
@@ -1145,4 +1625,23 @@ func legacySocket() string {
 func fatal(message string) {
 	fmt.Fprintln(os.Stderr, "relayd:", message)
 	os.Exit(1)
+}
+
+func runStockCodexProxy(arguments []string) {
+	flags := flag.NewFlagSet("codex-proxy", flag.ExitOnError)
+	pane := flags.String("pane", "", "exact retained Relay pane")
+	session := flags.String("session", "", "explicit stock conversation to resume")
+	backend := flags.String("backend", "", "existing stock App Server Unix socket")
+	pid := flags.Int("backend-pid", 0, "kernel verified backend PID")
+	start := flags.Uint64("backend-start", 0, "kernel verified backend incarnation")
+	_ = flags.Parse(arguments)
+	if flags.NArg() != 0 {
+		fatal("unexpected stock proxy arguments")
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	err := daemon.ServeStockCodexProxy(ctx, daemon.CodexProxyOptions{Pane: *pane, Session: *session, BackendSocket: *backend, BackendPID: *pid, BackendStart: *start}, os.Stdout)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		fatal("stock Codex proxy unavailable: " + err.Error())
+	}
 }

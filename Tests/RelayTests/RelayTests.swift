@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import GhosttyTerminal
 import Testing
 @testable import Relay
 
@@ -18,17 +19,17 @@ func onDeviceIntelligenceIsOptIn() {
     ))
 }
 
-@Test("Energy policy buffers background terminals and occludes their surfaces")
+@Test("Energy policy occludes background surfaces without resetting terminals")
 func terminalEnergyPolicyBuffersBackgroundWork() {
-    #expect(!TerminalEnergyPolicy.pausesTerminalEmulation(
+    #expect(!TerminalEnergyPolicy.pausesPresentation(
         isPresented: true,
         applicationVisible: true
     ))
-    #expect(TerminalEnergyPolicy.pausesTerminalEmulation(
+    #expect(TerminalEnergyPolicy.pausesPresentation(
         isPresented: true,
         applicationVisible: false
     ))
-    #expect(TerminalEnergyPolicy.pausesTerminalEmulation(
+    #expect(TerminalEnergyPolicy.pausesPresentation(
         isPresented: false,
         applicationVisible: true
     ))
@@ -75,6 +76,14 @@ func sidePanelWebSocketAuthentication() {
         body: Data()
     )
     #expect(!hostileOrigin.isAuthorizedWebSocket(token: "secret"))
+    let candidateOrigin = "http://127.0.0.1:47472"
+    let candidate = RelaySidePanelHTTPRequest(
+        method: request.method, path: request.path,
+        headers: request.headers.merging(["origin": candidateOrigin]) { _, new in new },
+        body: Data()
+    )
+    #expect(candidate.isAuthorizedWebSocket(token: "secret", expectedOrigin: candidateOrigin))
+    #expect(!candidate.isAuthorizedWebSocket(token: "secret", expectedOrigin: "http://127.0.0.1:47471"))
 }
 
 @Test("Side panel WebSocket framing follows RFC 6455 and rejects unsafe control frames")
@@ -148,7 +157,8 @@ func sidePanelIndexAndDetailAreSeparated() throws {
     let panes = try #require(tabs.first?["panes"] as? [[String: Any]])
     #expect(panes.first?["context"] == nil)
     #expect(panes.first?["subagents"] == nil)
-    #expect(panes.first?["terminalAvailable"] as? Bool == false)
+    #expect(panes.first?["terminalAvailable"] as? Bool == true)
+    #expect(panes.first?["backend"] as? String == RemoteSessionBackend.relay.rawValue)
 }
 
 @Test("Side panel gives each pane one input and geometry owner")
@@ -454,6 +464,43 @@ func multipleTabsPerSession() {
     workspace.selectTab(UUID())
     #expect(workspace.selectedTabID == firstTab?.id)
     workspace.selectTab(secondTabID!)
+    workspace.shutdown()
+}
+
+@MainActor
+@Test("Tab switching preserves floating-pane focus and zoom without leaking into new tabs")
+func tabPresentationSurvivesSwitching() {
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    let firstTabID = workspace.selectedTabID!
+    workspace.newFloatingPane()
+    let floatingPaneID = workspace.activePaneID!
+    workspace.toggleActivePaneZoom()
+
+    workspace.newTabInActiveSession()
+    let secondTabID = workspace.selectedTabID!
+    let secondPaneID = workspace.activePaneID!
+    #expect(workspace.zoomedPaneID == nil)
+
+    workspace.selectTab(firstTabID)
+    #expect(workspace.activePaneID == floatingPaneID)
+    #expect(workspace.zoomedPaneID == floatingPaneID)
+    workspace.selectTab(firstTabID)
+    #expect(workspace.activePaneID == floatingPaneID)
+    #expect(workspace.zoomedPaneID == floatingPaneID)
+
+    workspace.toggleActivePaneZoom()
+    workspace.selectTab(secondTabID)
+    #expect(workspace.activePaneID == secondPaneID)
+    #expect(workspace.zoomedPaneID == nil)
+    workspace.selectTab(firstTabID)
+    #expect(workspace.activePaneID == floatingPaneID)
+    #expect(workspace.zoomedPaneID == nil)
+
+    workspace.closeActivePane()
+    workspace.selectTab(secondTabID)
+    workspace.selectTab(firstTabID)
+    #expect(workspace.activePaneID != floatingPaneID)
+    #expect(workspace.zoomedPaneID == nil)
     workspace.shutdown()
 }
 
@@ -941,7 +988,7 @@ private final class RelayNodeFrameRecorder: @unchecked Sendable {
 
 @Test("A stalled pane handshake retries forever with bounded backoff")
 func paneAttachRetryPolicy() {
-    #expect(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds == 4_000)
+    #expect(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds == 5_000)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: false) == 250)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: false) == 4_000)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: true) == 5_500)
@@ -1193,16 +1240,16 @@ func compactTerminalReplay() {
 
 @Test("Terminal replay keeps the latest complete synchronized TUI frame")
 func compactSynchronizedTerminalFrames() {
-    let first = "\u{001B}[?2026h\u{001B}[Hfirst frame" +
+    let first = "\u{001B}[?2026h\u{001B}[2J\u{001B}[Hfirst frame" +
         String(repeating: "a", count: 600) + "\u{001B}[?2026l"
-    let latest = "\u{001B}[?2026h\u{001B}[Hlatest frame" +
+    let latest = "\u{001B}[?2026h\u{001B}[2J\u{001B}[Hlatest frame" +
         String(repeating: "b", count: 600) + "\u{001B}[?2026l"
     let incomplete = "\u{001B}[?2026h\u{001B}[11;1Hlive tail"
     let history = Data(("old redraws" + first + latest + incomplete).utf8)
 
     let compacted = String(decoding: TerminalReplayCompactor.compact(history), as: UTF8.self)
 
-    #expect(compacted.hasPrefix("\u{001B}c\u{001B}[?2026h"))
+    #expect(compacted.hasPrefix("\u{001B}c"))
     #expect(compacted.contains("latest frame"))
     #expect(compacted.hasSuffix("live tail"))
     #expect(!compacted.contains("old redraws"))
@@ -1211,7 +1258,7 @@ func compactSynchronizedTerminalFrames() {
 
 @Test("Terminal replay retains a complete base before synchronized cursor deltas")
 func compactSynchronizedTerminalDeltas() {
-    let base = "\u{001B}[?2026h\u{001B}[Hfull frame" +
+    let base = "\u{001B}[?2026h\u{001B}[2J\u{001B}[Hfull frame" +
         String(repeating: "x", count: 600) + "\u{001B}[?2026l"
     let spinner = "\u{001B}[?2026h\u{001B}[30;3HWorking\u{001B}[?2026l"
     let history = Data(("old redraws" + base + spinner + spinner).utf8)
@@ -1238,14 +1285,14 @@ func compactSynchronizedPartialFramesKeepTranscript() {
     #expect(compacted.contains("streaming response"))
     #expect(!TerminalReplayCompactor.hasCompletedSynchronizedFrame(history))
 
-    // A frame that repaints from the top-left is a legitimate base.
+    // Cursor-home can precede a large incremental update. Retain its base.
     let full = "\u{001B}[?2026h\u{001B}[Hredrawn screen" +
         String(repeating: "f", count: 700) + "\u{001B}[?2026l"
     let replaced = String(
         decoding: TerminalReplayCompactor.compact(Data((transcript + full).utf8)),
         as: UTF8.self
     )
-    #expect(!replaced.contains("transcript line one"))
+    #expect(replaced.contains("transcript line one"))
     #expect(replaced.contains("redrawn screen"))
 }
 
@@ -1365,17 +1412,16 @@ func compactTerminalReplayPreservesAlternateScreenLifecycle() {
     #expect(!afterAlternateEntry.contains("\u{001B}c"))
 }
 
-@Test("Leaving a dynamic alternate-screen app clears the restored viewport")
-func alternateScreenExitClearsRestoredViewport() {
+@Test("Leaving an alternate-screen app preserves the restored screen and cursor")
+func alternateScreenExitPreservesRestoredViewport() {
     let filter = TerminalAlternateScreenCleanupFilter()
     let entry = Data("\u{001B}[?1049h\u{001B}[2Jwatch frame".utf8)
     let exitAndPrompt = Data("\u{001B}[?1049lrelay$ ".utf8)
 
     #expect(filter.transform(entry) == entry)
-    #expect(
-        filter.transform(exitAndPrompt)
-            == Data("\u{001B}[?1049l\u{001B}[0m\u{001B}[?25h\u{001B}[0 q\u{001B}[2J\u{001B}[Hrelay$ ".utf8)
-    )
+    #expect(filter.isActive)
+    #expect(filter.transform(exitAndPrompt) == exitAndPrompt)
+    #expect(!filter.isActive)
 }
 
 @Test("Alternate-screen cleanup survives packet boundaries and snapshot restore")
@@ -1386,7 +1432,7 @@ func alternateScreenCleanupHandlesSplitPacketsAndRestore() {
     #expect(filter.transform(Data("\u{001B}[?10".utf8)).isEmpty)
     #expect(
         filter.transform(Data("49lprompt".utf8))
-            == Data("\u{001B}[?1049l\u{001B}[0m\u{001B}[?25h\u{001B}[0 q\u{001B}[2J\u{001B}[Hprompt".utf8)
+            == Data("\u{001B}[?1049lprompt".utf8)
     )
 
     let orphan = TerminalAlternateScreenCleanupFilter()
@@ -1394,6 +1440,20 @@ func alternateScreenCleanupHandlesSplitPacketsAndRestore() {
         orphan.transform(Data("\u{001B}[?1049lunchanged".utf8))
             == Data("\u{001B}[?1049lunchanged".utf8)
     )
+}
+
+@Test("Alternate-screen tracking preserves every byte at every packet boundary")
+func alternateScreenTrackingIsBytePreserving() {
+    for mode in [47, 1047, 1049] {
+        let stream = Data("primary\u{001B}[8;9H\u{001B}[?\(mode)h\u{001B}[2Jfull screen\u{001B}[?\(mode)l\u{001B}[2Cpartial update".utf8)
+        for split in 0...stream.count {
+            let tracker = TerminalAlternateScreenCleanupFilter()
+            var result = tracker.transform(Data(stream.prefix(split)))
+            result.append(tracker.transform(Data(stream.dropFirst(split))))
+            #expect(result == stream)
+            #expect(!tracker.isActive)
+        }
+    }
 }
 
 @Test("Remote semantic prompt tracking survives SSH packet boundaries")
@@ -1413,6 +1473,21 @@ func semanticPromptTrackingIgnoresUnrelatedOSC() {
     #expect(tracker.observe(Data("\u{001B}]133;P;k=i\u{0007}".utf8)) == nil)
     #expect(tracker.observe(Data("\u{001B}]133;B\u{0007}".utf8)) == true)
     #expect(tracker.observe(Data("\u{001B}]133;B\u{0007}".utf8)) == nil)
+}
+
+@Test("Semantic prompt bulk scanning preserves OSC state at every byte boundary")
+func semanticPromptBulkScanPreservesContinuation() {
+    let stream = Data("ordinary Ω text\u{001B}]0;unrelated\u{0007}\u{001B}]133;B\u{001B}\\prompt\u{001B}]133;C\u{0007}\u{001B}]133;".utf8)
+    for split in 0...stream.count {
+        let tracker = TerminalSemanticPromptStateTracker()
+        let first = tracker.observe(Data(stream.prefix(split)))
+        let second = tracker.observe(Data(stream.dropFirst(split)))
+        #expect((second ?? first) == false)
+        #expect(tracker.observe(Data("B\u{0007}".utf8)) == true)
+    }
+    let tracker = TerminalSemanticPromptStateTracker()
+    #expect(tracker.observe(Data(repeating: 0x78, count: 4 << 20)) == nil)
+    #expect(tracker.observe(Data("\u{001B}]133;B\u{0007}".utf8)) == true)
 }
 
 @Test("Primary-screen reconnect deltas extend the cached TUI screen")
@@ -1451,6 +1526,41 @@ func terminalSnapshotBound() {
     let bounded = TerminalSnapshotStore.bounded(oversized)
     #expect(bounded.count <= TerminalSnapshotStore.maximumBytes)
     #expect(bounded.starts(with: Data("\u{001B}c".utf8)))
+}
+
+@Test("Bounded terminal replay begins after a complete control sequence")
+func terminalSnapshotSafeBoundary() {
+    let prefix = Data("old".utf8)
+    let color = Data("\u{001B}[38;2;160;160;160;49m".utf8)
+    let line = Data("current line\r\nnext line".utf8)
+    let stream = prefix + color + line
+    let suffix = TerminalReplayCompactor.safeSuffix(
+        stream, maximumBytes: color.count + line.count - 5
+    )
+    #expect(suffix == Data("next line".utf8))
+
+    let osc = Data("\u{001B}]2;title\nwith newline\u{0007}".utf8)
+    let after = Data("\u{001B}[31mvalid".utf8)
+    let controlStream = prefix + osc + after
+    let controlSuffix = TerminalReplayCompactor.safeSuffix(
+        controlStream, maximumBytes: osc.count + after.count - 4
+    )
+    #expect(controlSuffix == after)
+
+    let legacy = Data("\u{001B}c136;136;49mr\u{001B}[31med\r\nclean line".utf8)
+    #expect(TerminalSnapshotStore.repairLegacyCut(legacy) ==
+        Data("\u{001B}cclean line".utf8))
+    #expect(TerminalSnapshotStore.repairLegacyCut(Data("\u{001B}cvalid line".utf8)) ==
+        Data("\u{001B}cvalid line".utf8))
+
+    let cursorOnly = Data("\u{001B}c".utf8) + Data(repeating: 0x78, count: TerminalSnapshotStore.maximumBytes - 2)
+    #expect(TerminalSnapshotStore.isLegacyLossySnapshot(cursorOnly))
+    #expect(!TerminalSnapshotStore.isLegacyLossySnapshot(cursorOnly + Data("\n".utf8)))
+    let oldOverflow = Data("\u{001B}c".utf8) + Data(repeating: 0x78, count: (2 << 20) - 2)
+    #expect(TerminalSnapshotStore.isLegacyLossySnapshot(oldOverflow))
+    let largerHistory = Data("\u{001B}c".utf8) + Data(repeating: 0x78, count: 4 << 20)
+    #expect(TerminalSnapshotStore.bounded(largerHistory) == largerHistory)
+    #expect(!TerminalSnapshotStore.isLegacyLossySnapshot(largerHistory))
 }
 
 @Test("Live snapshot compaction uses a bounded high-water window")
@@ -1981,36 +2091,18 @@ func remotePromptEditingPolicy() {
     ) == nil)
 }
 
-@Test("Viewport repaint barriers distinguish replacement output from ordinary output")
+@Test("Viewport repaint detection recognizes completed frames")
 func viewportRepaintBarrierPolicy() {
-    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
-        Data("\u{001B}]133;A\u{0007}$ prompt".utf8), rows: 40
+    let differentialFrame = "\u{001B}[?2026h\u{001B}[H" +
+        String(repeating: "updated row\r\n", count: 50) + "\u{001B}[?2026l"
+    let differentialBytes = Data(differentialFrame.utf8)
+    #expect(TerminalViewportRepaintPolicy.hasCompleteReplacement(differentialBytes, rows: 40))
+    // Safe to present over the retained grid, never safe to discard its base.
+    #expect(!TerminalReplayCompactor.hasCompletedSynchronizedFrame(differentialBytes))
+    #expect(!TerminalViewportRepaintPolicy.hasCompleteReplacement(
+        Data(differentialFrame.dropLast("\u{001B}[?2026l".count).utf8), rows: 40
     ))
-    #expect(TerminalViewportRepaintPolicy.needsClearBarrier(
-        Data(("\u{001B}[1;1Hfirst" + String(repeating: "x", count: 80) +
-            "\u{001B}[2;1Hsecond\u{001B}[3;1Hthird").utf8), rows: 40
-    ))
-    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
-        Data("ordinary build output\r\nnext line\r\n".utf8), rows: 40
-    ))
-    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
-        Data("\r\u{001B}[2K[user@host project]$ pending input".utf8), rows: 40
-    ))
-    let coloredOutput = String(repeating: "\u{001B}[38;5;42mgreen\u{001B}[0m ", count: 12)
-    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
-        Data(coloredOutput.utf8), rows: 40
-    ))
-    let semanticPromptRepaint = "\r\u{001B}[K\u{001B}]133;P;k=i\u{0007}" +
-        String(repeating: "[user@host project] ", count: 5) +
-        "$ \u{001B}]133;B\u{0007}pending command"
-    #expect(TerminalViewportRepaintPolicy.needsClearBarrier(
-        Data(semanticPromptRepaint.utf8), rows: 40
-    ))
-    #expect(!TerminalViewportRepaintPolicy.needsClearBarrier(
-        Data("\u{001B}[2J\u{001B}[Halready clears".utf8), rows: 40
-    ))
-
-    let synchronizedFrame = "\u{001B}[?2026h\u{001B}[H" +
+    let synchronizedFrame = "\u{001B}[?2026h\u{001B}[2J\u{001B}[H" +
         String(repeating: "frame", count: 120) + "\u{001B}[?2026l"
     #expect(TerminalViewportRepaintPolicy.hasCompleteReplacement(
         Data(synchronizedFrame.utf8), rows: 40
@@ -2139,20 +2231,18 @@ func terminalGeometryRejectsInvalidTransitionalViewSizes() {
     #expect(TerminalGeometry.accepts(NSSize(width: 640, height: 360)))
 }
 
-@Test("Remote viewport prediction preserves the live surface until commit")
-func remoteViewportPredictionUsesBackingPixels() {
-    let viewport = TerminalViewportGeometry.predictedViewport(
-        bounds: CGSize(width: 610, height: 400),
-        backingScaleFactor: 2,
-        cellWidthPixels: 10,
-        cellHeightPixels: 20
+@Test("Remote viewport commit uses Ghostty's measured grid")
+func remoteViewportCommitUsesMeasuredGrid() {
+    let metrics = TerminalGridMetrics(
+        columns: 162, rows: 47,
+        widthPixels: 2640, heightPixels: 1494,
+        cellWidthPixels: 16, cellHeightPixels: 31
     )
-    #expect(viewport == RelayViewport(columns: 122, rows: 40))
-    #expect(TerminalViewportGeometry.predictedViewport(
-        bounds: .zero,
-        backingScaleFactor: 2,
-        cellWidthPixels: 10,
-        cellHeightPixels: 20
+    #expect(TerminalViewportGeometry.measuredViewport(
+        metrics, bounds: CGSize(width: 1320, height: 747), backingScaleFactor: 2
+    ) == RelayViewport(columns: 162, rows: 47))
+    #expect(TerminalViewportGeometry.measuredViewport(
+        metrics, bounds: CGSize(width: 1075, height: 747), backingScaleFactor: 2
     ) == nil)
 }
 
@@ -2171,22 +2261,12 @@ func terminalPresentationGeometryRequiresTwoStableSamples() {
     #expect(sampler.consecutiveSamples == 2)
 }
 
-@Test("Agent viewport repaint probes an adjacent valid grid")
-func terminalViewportRepaintProbeUsesAdjacentGrid() {
-    let ordinary = TerminalViewportRepaintProbe.dimensions(columns: 135, rows: 24)
-    #expect(ordinary?.columns == 135)
-    #expect(ordinary?.rows == 23)
-
-    let singleRow = TerminalViewportRepaintProbe.dimensions(columns: 135, rows: 1)
-    #expect(singleRow?.columns == 135)
-    #expect(singleRow?.rows == 2)
-
-    let maximum = TerminalViewportRepaintProbe.dimensions(columns: 2, rows: .max)
-    #expect(maximum?.columns == 2)
-    #expect(maximum?.rows == UInt16.max - 1)
-
-    #expect(TerminalViewportRepaintProbe.dimensions(columns: 0, rows: 24) == nil)
-    #expect(TerminalViewportRepaintProbe.dimensions(columns: 80, rows: 0) == nil)
+@Test("Changed grids use commits only when exactly-one resize signal is supported")
+func terminalViewportCommitAvoidsDuplicateSignals() {
+    #expect(!TerminalViewportCommitPolicy.isSignalSafe(viewportChanged: true, exactWorker: false, exactSupervisor: false))
+    #expect(TerminalViewportCommitPolicy.isSignalSafe(viewportChanged: false, exactWorker: false, exactSupervisor: false))
+    #expect(TerminalViewportCommitPolicy.isSignalSafe(viewportChanged: true, exactWorker: true, exactSupervisor: false))
+    #expect(TerminalViewportCommitPolicy.isSignalSafe(viewportChanged: true, exactWorker: false, exactSupervisor: true))
 }
 
 @Test("Checkpoint reconnect keeps presentation-only clears out of agent history")
@@ -2220,6 +2300,61 @@ func modeOnlyCheckpointIsNotRenderable() {
     ))
     #expect(TerminalSnapshotDisplayPolicy.hasVisibleContent(Data("λ".utf8)))
 }
+
+@Test("A checkpoint cursor cannot skip the worker replay without a visible screen")
+func unrenderableCheckpointStartsReplayFromBeginning() {
+    #expect(TerminalSnapshotDisplayPolicy.initialReplaySequence(
+        remoteSequence: 42, rendered: false
+    ) == 0)
+    #expect(TerminalSnapshotDisplayPolicy.initialReplaySequence(
+        remoteSequence: 42, rendered: true
+    ) == 42)
+    #expect(TerminalSnapshotDisplayPolicy.initialReplaySequence(
+        remoteSequence: nil, rendered: false
+    ) == 0)
+}
+
+@Test("An agent repaint cannot replace an unrendered checkpoint's history")
+func agentRepaintStillRequiresTheWorkerScreenBase() {
+    #expect(TerminalSnapshotDisplayPolicy.initialReplaySequence(
+        remoteSequence: 42, rendered: false
+    ) == 0)
+    #expect(TerminalSnapshotDisplayPolicy.initialReplaySequence(
+        remoteSequence: nil, rendered: false
+    ) == 0)
+}
+
+@Test("An agent cache hit still owes an authoritative initial repaint")
+func renderedAgentCheckpointRequestsAttachRepaint() {
+    #expect(TerminalSnapshotDisplayPolicy.requiresAttachRepaint(rendered: true, isAgent: true))
+    #expect(TerminalSnapshotDisplayPolicy.requiresAttachRepaint(rendered: false, isAgent: true))
+    #expect(TerminalSnapshotDisplayPolicy.requiresAttachRepaint(rendered: false, isAgent: false))
+    #expect(!TerminalSnapshotDisplayPolicy.requiresAttachRepaint(rendered: true, isAgent: false))
+    #expect(TerminalSnapshotDisplayPolicy.initialReplaySequence(
+        remoteSequence: 42, rendered: true
+    ) == 42)
+}
+
+@Test("Initial worker attach waits for the engine-confirmed surface viewport")
+func initialAttachWaitsForConfirmedViewport() {
+    let full = RelayViewport(columns: 132, rows: 47)
+    let stale = RelayViewport(columns: 47, rows: 18)
+    let viewPixels = CGSize(width: 2150, height: 1494)
+    let fullPixels = CGSize(width: 2150, height: 1494)
+    #expect(!TerminalInitialViewportPolicy.isReady(
+        surface: full, confirmed: stale,
+        surfacePixels: fullPixels, viewPixels: viewPixels
+    ))
+    #expect(!TerminalInitialViewportPolicy.isReady(
+        surface: stale, confirmed: stale,
+        surfacePixels: CGSize(width: 760, height: 576), viewPixels: viewPixels
+    ))
+    #expect(TerminalInitialViewportPolicy.isReady(
+        surface: full, confirmed: full,
+        surfacePixels: fullPixels, viewPixels: viewPixels
+    ))
+}
+
 
 @Test("Pointer geometry follows a retained terminal surface during resize")
 func terminalPointerGeometryRemapsScaledSurface() {
@@ -2575,7 +2710,7 @@ func terminalSelectionColorsAreExplicit() {
         )
         #expect(rendered.contains("font-size = \(expectedSize)"))
         #expect(rendered.contains("minimum-contrast = 2.2"))
-        #expect(rendered.contains("selection-clear-on-copy = true"))
+        #expect(rendered.contains("selection-clear-on-copy = false"))
         #expect(rendered.contains("copy-on-select = false"))
         #expect(rendered.contains("shell-integration = "))
         #expect(rendered.contains("cursor-click-to-move = false"))
@@ -2978,4 +3113,88 @@ func sidePanelAuthAndPathSanitization() {
     #expect(!RelaySidePanelAuth.constantTimeEquals("abc", "abcd"))
     #expect(!RelaySidePanelAuth.constantTimeEquals("", "x"))
     #expect(RelaySidePanelAuth.constantTimeEquals("", ""))
+}
+
+@Test("Alternate-screen observation matches transformation and partial continuation")
+func alternateObservationMatchesTransform() {
+    for mode in [47, 1047, 1049] {
+        let stream = Data("text\u{001B}[?\(mode)hbody\u{001B}[?\(mode)l\u{001B}[?104".utf8)
+        for split in 0...stream.count {
+            let observer = TerminalAlternateScreenCleanupFilter()
+            let transformer = TerminalAlternateScreenCleanupFilter()
+            for chunk in [Data(stream.prefix(split)), Data(stream.dropFirst(split)), Data("9h".utf8)] {
+                observer.observe(chunk)
+                _ = transformer.transform(chunk)
+                #expect(observer.isActive == transformer.isActive)
+            }
+            #expect(observer.transform(Data("after\u{001B}[?1049l".utf8)) == transformer.transform(Data("after\u{001B}[?1049l".utf8)))
+        }
+    }
+}
+
+@Test("Hydrated grid reuse requires a resumable cursor and explicit replay boundary")
+func hydratedGridReuseRequiresCursor() {
+    #expect(TerminalReconnectReplayPolicy.canRetainHydratedGrid(remoteSequence: 42, explicitBoundary: true))
+    #expect(!TerminalReconnectReplayPolicy.canRetainHydratedGrid(remoteSequence: 0, explicitBoundary: true))
+    #expect(!TerminalReconnectReplayPolicy.canRetainHydratedGrid(remoteSequence: 42, explicitBoundary: false))
+}
+
+@Test("SSH connection reuse is disabled on retries or unavailable private storage")
+func sshConnectionReuseRecovery() {
+    let first = RelaySSHConnectionReusePolicy.options(controlDirectory: "/tmp/private", reconnectAttempt: 0)
+    #expect(first.contains("ControlPersist=600"))
+    #expect(first.contains("ControlPath=/tmp/private/%C"))
+    for options in [RelaySSHConnectionReusePolicy.options(controlDirectory: "/tmp/private", reconnectAttempt: 1), RelaySSHConnectionReusePolicy.options(controlDirectory: nil, reconnectAttempt: 0)] {
+        #expect(options.contains("ControlMaster=no"))
+        #expect(options.contains("ControlPath=none"))
+        #expect(!options.contains("ControlPersist=600"))
+    }
+}
+
+@Test func terminalCommandDescriptionRowsAreNotFileLinks() {
+    for row in ["/review - review any changes and find issues",
+                "/init – create an AGENTS.md file",
+                "/status — show current session configuration"] {
+        #expect(TerminalLinkResolver.target(from: row) == nil)
+    }
+    for path in ["/tmp/report - draft.txt", "/maps/projects/Team Files/report.md"] {
+        #expect(TerminalLinkResolver.target(from: path) == .file(path))
+    }
+    let explicit = "/review - actual root filename"
+    #expect(TerminalLinkResolver.target(from: TerminalLinkResolver.link(forRemotePath: explicit)) == .file(explicit))
+    #expect(TerminalLinkResolver.target(from: "file:///review%20-%20actual%20root%20filename") == .file(explicit))
+}
+
+@Test func promptIncrementalUnicodeInsertionUsesActualGraphemeBoundaries() {
+    var combining = TerminalPromptBuffer()
+    combining.insert("e")
+    combining.insert("\u{301}")
+    #expect(combining.text.utf8.elementsEqual("e\u{301}".utf8))
+    #expect(combining.snapshot?.characters.count == 1)
+    #expect(combining.snapshot?.cursor == 1)
+    combining.insert("x")
+    #expect(combining.snapshot?.characters == Array("e\u{301}x"))
+    #expect(combining.snapshot?.cursor == 2)
+    var emoji = TerminalPromptBuffer()
+    for text in ["👩", "\u{200D}", "🔬"] { emoji.insert(text) }
+    #expect(emoji.snapshot?.characters == Array("👩‍🔬"))
+    #expect(emoji.snapshot?.cursor == 1)
+    var flag = TerminalPromptBuffer()
+    flag.insert("🇩")
+    flag.insert("🇰")
+    #expect(flag.snapshot?.characters == Array("🇩🇰"))
+    #expect(flag.snapshot?.cursor == 1)
+    var middle = TerminalPromptBuffer()
+    middle.insert("ex")
+    middle.move(by: -1)
+    middle.insert("\u{301}")
+    #expect(middle.text.utf8.elementsEqual("e\u{301}x".utf8))
+    #expect(middle.snapshot?.cursor == 1)
+    // Inserting a regional indicator before another would put the desired
+    // byte caret inside the new flag. The grapheme model must not invent it.
+    var interior = TerminalPromptBuffer()
+    interior.insert("🇰")
+    interior.moveToStart()
+    interior.insert("🇩")
+    #expect(interior.snapshot == nil)
 }

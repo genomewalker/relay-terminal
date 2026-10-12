@@ -4,9 +4,55 @@ import (
 	"bytes"
 	"encoding/base64"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+func TestEditorReadDirectory(t *testing.T) {
+	directory := t.TempDir()
+	document, err := ReadEditorFile(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _ := filepath.EvalSymlinks(directory)
+	if !document.Directory || document.Path != resolved || document.ContentBase64 != "" {
+		t.Fatalf("unexpected directory response: %+v", document)
+	}
+}
+
+func TestEditorSearchRespectsGitIgnoreAndLiteralPaths(t *testing.T) {
+	dir := t.TempDir()
+	if output, err := exec.Command("git", "init", "--quiet", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, output)
+	}
+	for name, content := range map[string]string{".gitignore": "ignored.txt\n", "ignored.txt": "hidden", "A # λ.txt": "visible"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	matches, err := FindEditorFiles(dir, ".TXT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].Name != "A # λ.txt" {
+		t.Fatalf("bad matches: %+v", matches)
+	}
+	if matches, err = FindEditorFiles(dir, ""); err != nil || len(matches) != 0 {
+		t.Fatal("empty query must not scan")
+	}
+	page, err := SearchEditorFiles(dir, ".TXT", false)
+	if err != nil || len(page.Entries) != 0 || page.Truncated {
+		t.Fatalf("tracked-only search discovered untracked files: %+v %v", page, err)
+	}
+	if output, err := exec.Command("git", "-C", dir, "add", "--", "A # λ.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v %s", err, output)
+	}
+	page, err = SearchEditorFiles(dir, ".TXT", false)
+	if err != nil || len(page.Entries) != 1 {
+		t.Fatalf("missing tracked file: %+v %v", page, err)
+	}
+}
 
 func TestEditorFileRoundTripAndConflict(t *testing.T) {
 	directory := t.TempDir()

@@ -87,7 +87,8 @@ enum TerminalSnapshotRecordCodec {
 /// as soon as relayd finishes replaying the current screen.
 final class TerminalSnapshotStore: @unchecked Sendable {
     static let shared = TerminalSnapshotStore()
-    static let maximumBytes = 2 << 20
+    static let maximumBytes = 16 << 20
+    private static let legacyMaximumBytes = 2 << 20
 
     private let directory: URL
     private let queue = DispatchQueue(label: "relay.terminal-snapshots", qos: .utility)
@@ -96,9 +97,8 @@ final class TerminalSnapshotStore: @unchecked Sendable {
     private var scheduledDigests: [UUID: Data] = [:]
 
     init(directory: URL? = nil) {
-        let base = directory ?? FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        )[0].appendingPathComponent("Relay/TerminalSnapshots", isDirectory: true)
+        let base = directory ?? RelayStateProfile.applicationSupportRoot
+            .appendingPathComponent("Relay/TerminalSnapshots", isDirectory: true)
         self.directory = base
         SecureFiles.createPrivateDirectory(at: base)
     }
@@ -112,7 +112,18 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         viewport: RelayViewport
     ) -> TerminalSnapshotRecordCodec.Snapshot? {
         guard let record = loadRecord(paneID: paneID) else { return nil }
-        return TerminalSnapshotRecordCodec.decodeSnapshot(record, expectedViewport: viewport)
+        guard let snapshot = TerminalSnapshotRecordCodec.decodeSnapshot(
+            record, expectedViewport: viewport
+        ) else { return nil }
+        // Legacy overflow records can contain a 2 MiB cursor-addressed suffix
+        // with no self-contained screen. Replaying that suffix on a reset grid
+        // produces stray cells even if its first escape is complete. Request
+        // an application repaint instead of treating it as a valid cache.
+        guard !Self.isLegacyLossySnapshot(snapshot.payload) else { return nil }
+        return TerminalSnapshotRecordCodec.Snapshot(
+            payload: Self.repairLegacyCut(snapshot.payload),
+            remoteSequence: snapshot.remoteSequence
+        )
     }
 
     func loadResumeCursor(paneID: UUID) -> UInt64? {
@@ -231,7 +242,41 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         let compacted = TerminalReplayCompactor.compact(data)
         guard compacted.count > maximumBytes else { return compacted }
         var result = Data("\u{001B}c".utf8)
-        result.append(compacted.suffix(maximumBytes - result.count))
+        result.append(TerminalReplayCompactor.safeSuffix(
+            compacted,
+            maximumBytes: maximumBytes - result.count
+        ))
         return result
+    }
+
+    /// Older overflow snapshots were cut at an arbitrary byte, including the
+    /// middle of SGR parameters. Repair that known on-disk shape on load so a
+    /// new build does not immediately redraw the same damaged cached screen.
+    static func repairLegacyCut(_ data: Data) -> Data {
+        let bytes = Array(data.prefix(32))
+        guard bytes.count >= 6, bytes[0] == 0x1B, bytes[1] == 0x63 else { return data }
+        var index = 2
+        var hasSeparator = false
+        while index < bytes.count, (bytes[index] >= 0x30 && bytes[index] <= 0x39) || bytes[index] == 0x3B {
+            if bytes[index] == 0x3B { hasSeparator = true }
+            index += 1
+        }
+        guard hasSeparator, index < bytes.count, bytes[index] == 0x6D else { return data }
+        var repaired = Data("\u{001B}c".utf8)
+        repaired.append(TerminalReplayCompactor.safeSuffix(
+            data, maximumBytes: data.count - 2
+        ))
+        return repaired
+    }
+
+    static func isLegacyLossySnapshot(_ data: Data) -> Bool {
+        // Keep rejecting records truncated by the previous 2 MiB limit.
+        // Raising the limit cannot repair a suffix already missing its base.
+        let atOverflowLimit = [legacyMaximumBytes, maximumBytes].contains {
+            data.count >= $0 - 4_096 && data.count <= $0
+        }
+        return atOverflowLimit &&
+            data.starts(with: Data("\u{001B}c".utf8)) &&
+            !data.contains(0x0A)
     }
 }

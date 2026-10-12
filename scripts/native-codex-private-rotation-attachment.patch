@@ -1,0 +1,805 @@
+--- a/codex-rs/app-server-client/src/lib.rs
++++ b/codex-rs/app-server-client/src/lib.rs
+@@ -33,10 +33,14 @@
+ pub use codex_app_server::in_process::InProcessServerEvent;
+ use codex_app_server::in_process::InProcessStartArgs;
+ use codex_app_server::in_process::LogDbLayer;
++pub use codex_app_server::in_process::NativeRotationAttachedTarget;
++pub use codex_app_server::in_process::NativeRotationAttachment;
++pub use codex_app_server::in_process::NativeRotationAttachmentResult;
+ pub use codex_app_server::in_process::NativeRotationCommitOutcome;
+ pub use codex_app_server::in_process::NativeRotationCommitRequest;
+ pub use codex_app_server::in_process::NativeRotationCommitResult;
+ pub use codex_app_server::in_process::NativeRotationReservationId;
++pub use codex_app_server::in_process::NativeRotationRetainedSource;
+ pub use codex_app_server::in_process::StateDbHandle;
+ use codex_app_server_protocol::ClientInfo;
+ use codex_app_server_protocol::ClientNotification;
+@@ -295,6 +299,11 @@
+ /// Each variant carries a oneshot sender so the caller can `await` the
+ /// result without holding a mutable reference to the client.
+ enum ClientCommand {
++    AttachContextRotation {
++        reservation_id: NativeRotationReservationId,
++        outcome: Arc<NativeRotationCommitOutcome>,
++        response_tx: oneshot::Sender<NativeRotationAttachmentResult>,
++    },
+     CommitContextRotation {
+         reservation_id: NativeRotationReservationId,
+         request: NativeRotationCommitRequest,
+@@ -399,6 +408,13 @@
+                                             let _ = response_tx.send(result);
+                                         }
+                                     }
++                                });
++                            }
++                            Some(ClientCommand::AttachContextRotation { reservation_id, outcome, response_tx }) => {
++                                let request_sender = request_sender.clone();
++                                tokio::spawn(async move {
++                                    let result = request_sender.attach_context_rotation(reservation_id, outcome).await;
++                                    let _ = response_tx.send(result);
+                                 });
+                             }
+                             Some(ClientCommand::CommitContextRotation { reservation_id, request, response_tx }) => {
+@@ -655,6 +671,31 @@
+ }
+ 
+ impl InProcessAppServerRequestHandle {
++    /// Preserve the sealed foreground owner until this actual attachment is installed.
++    pub async fn attach_context_rotation(
++        &self,
++        reservation_id: NativeRotationReservationId,
++        outcome: Arc<NativeRotationCommitOutcome>,
++    ) -> NativeRotationAttachmentResult {
++        let (response_tx, response_rx) = oneshot::channel();
++        self.command_tx
++            .send(ClientCommand::AttachContextRotation {
++                reservation_id,
++                outcome,
++                response_tx,
++            })
++            .await
++            .map_err(|_| {
++                IoError::new(ErrorKind::BrokenPipe, "native attachment worker is closed")
++            })?;
++        response_rx.await.map_err(|_| {
++            IoError::new(
++                ErrorKind::BrokenPipe,
++                "native attachment response lost; reconciliation required",
++            )
++        })?
++    }
++
+     /// Caller prerequisites: sealed foreground owner and verified durable host intent.
+     /// Errors and lost responses require reconciliation before any input release.
+     pub async fn commit_context_rotation(
+@@ -712,6 +753,25 @@
+ }
+ 
+ impl AppServerRequestHandle {
++    /// Private in-process attachment of an actual retained native owner.
++    pub async fn attach_context_rotation(
++        &self,
++        reservation_id: NativeRotationReservationId,
++        outcome: Arc<NativeRotationCommitOutcome>,
++    ) -> NativeRotationAttachmentResult {
++        match self {
++            Self::InProcess(handle) => {
++                handle
++                    .attach_context_rotation(reservation_id, outcome)
++                    .await
++            }
++            Self::Remote(_) => Err(IoError::new(
++                ErrorKind::Unsupported,
++                "native context rotation attachment requires an in-process owner",
++            )),
++        }
++    }
++
+     pub fn supports_native_context_rotation_commit(&self) -> bool {
+         matches!(self, Self::InProcess(_))
+     }
+@@ -971,6 +1031,31 @@
+ 
+     async fn start_test_client(session_source: SessionSource) -> TestClient {
+         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
++    }
++
++    #[tokio::test]
++    async fn in_process_context_rotation_attachment_rejects_unowned_completion_through_typed_route()
++    {
++        let client = start_test_client(SessionSource::Cli).await;
++        let handle = AppServerRequestHandle::InProcess(client.request_handle());
++        let outcome = Arc::new(NativeRotationCommitOutcome::Refused(
++            codex_core::NativeRotationError::Busy,
++        ));
++        let result = timeout(
++            Duration::from_secs(5),
++            handle.attach_context_rotation(NativeRotationReservationId::new_v4(), outcome),
++        )
++        .await
++        .expect("private attachment route must return");
++        let error = result
++            .err()
++            .expect("fabricated completion must not attach a runtime");
++        assert_eq!(error.kind(), ErrorKind::Other);
++        assert_eq!(error.to_string(), "native attachment owner mismatch");
++        client
++            .shutdown()
++            .await
++            .expect("in-process runtime should shutdown");
+     }
+ 
+     async fn start_test_remote_server<F, Fut>(handler: F) -> String
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -102,6 +102,12 @@
+ #[path = "in_process_bootstrap.rs"]
+ mod bootstrap;
+ 
++mod native_rotation_attachment;
++pub use native_rotation_attachment::NativeRotationAttachedTarget;
++pub use native_rotation_attachment::NativeRotationAttachment;
++pub use native_rotation_attachment::NativeRotationAttachmentResult;
++pub use native_rotation_attachment::NativeRotationRetainedSource;
++
+ const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(0);
+ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+ // Covers both bounded runtime drains plus the analytics client's 25-second best-effort flush.
+@@ -197,6 +203,11 @@
+ pub type NativeRotationCommitResult = IoResult<Arc<NativeRotationCommitOutcome>>;
+ 
+ enum InProcessClientMessage {
++    AttachContextRotation {
++        reservation_id: NativeRotationReservationId,
++        outcome: Arc<NativeRotationCommitOutcome>,
++        response_tx: oneshot::Sender<NativeRotationAttachmentResult>,
++    },
+     CommitContextRotation {
+         reservation_id: NativeRotationReservationId,
+         request: NativeRotationCommitRequest,
+@@ -224,6 +235,11 @@
+ }
+ 
+ enum ProcessorCommand {
++    AttachContextRotation {
++        reservation_id: NativeRotationReservationId,
++        outcome: Arc<NativeRotationCommitOutcome>,
++        response_tx: oneshot::Sender<NativeRotationAttachmentResult>,
++    },
+     CommitContextRotation {
+         reservation_id: NativeRotationReservationId,
+         request: NativeRotationCommitRequest,
+@@ -239,6 +255,26 @@
+ }
+ 
+ impl InProcessClientSender {
++    /// Revalidate and attach the exact retained completion without a wire fallback.
++    pub async fn attach_context_rotation(
++        &self,
++        reservation_id: NativeRotationReservationId,
++        outcome: Arc<NativeRotationCommitOutcome>,
++    ) -> NativeRotationAttachmentResult {
++        let (response_tx, response_rx) = oneshot::channel();
++        self.try_send_client_message(InProcessClientMessage::AttachContextRotation {
++            reservation_id,
++            outcome,
++            response_tx,
++        })?;
++        response_rx.await.map_err(|_| {
++            IoError::new(
++                ErrorKind::BrokenPipe,
++                "native attachment response lost; reconciliation required",
++            )
++        })?
++    }
++
+     /// The caller must own sealed input and a verified durable host intent.
+     /// A lost reply is uncertain; only the exact same request can observe it again.
+     pub async fn commit_context_rotation(
+@@ -595,6 +631,17 @@
+                                     processor.send_initialize_notifications().await;
+                                 }
+                             }
++                            Some(ProcessorCommand::AttachContextRotation { reservation_id, outcome, response_tx }) => {
++                                if session.initialized() {
++                                    processor.attach_context_rotation_in_process(
++                                        IN_PROCESS_CONNECTION_ID, reservation_id, outcome, response_tx,
++                                    );
++                                } else {
++                                    let _ = response_tx.send(Err(IoError::new(
++                                        ErrorKind::NotConnected, "native attachment requires initialized in-process owner",
++                                    )));
++                                }
++                            }
+                             Some(ProcessorCommand::CommitContextRotation { reservation_id, request, response_tx }) => {
+                                 if session.initialized() {
+                                     processor.commit_context_rotation_in_process(
+@@ -692,6 +739,23 @@
+                                         )));
+                                     }
+                                     break;
++                                }
++                            }
++                        }
++                        Some(InProcessClientMessage::AttachContextRotation { reservation_id, outcome, response_tx }) => {
++                            if let Err(error) = processor_tx.try_send(ProcessorCommand::AttachContextRotation {
++                                reservation_id, outcome, response_tx,
++                            }) {
++                                let (kind, message, command) = match error {
++                                    mpsc::error::TrySendError::Full(command) => (
++                                        ErrorKind::WouldBlock, "native attachment processor queue is full", command,
++                                    ),
++                                    mpsc::error::TrySendError::Closed(command) => (
++                                        ErrorKind::BrokenPipe, "native attachment processor is closed", command,
++                                    ),
++                                };
++                                if let ProcessorCommand::AttachContextRotation { response_tx, .. } = command {
++                                    let _ = response_tx.send(Err(IoError::new(kind, message)));
+                                 }
+                             }
+                         }
+@@ -960,6 +1024,31 @@
+ 
+     async fn start_test_client(session_source: SessionSource) -> InProcessClientHandle {
+         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
++    }
++
++    #[tokio::test]
++    async fn in_process_context_rotation_attachment_rejects_unowned_completion_through_typed_route()
++    {
++        let client = start_test_client(SessionSource::Cli).await;
++        let handle = client.client.clone();
++        let outcome = Arc::new(NativeRotationCommitOutcome::Refused(
++            codex_core::NativeRotationError::Busy,
++        ));
++        let result = timeout(
++            Duration::from_secs(5),
++            handle.attach_context_rotation(NativeRotationReservationId::new_v4(), outcome),
++        )
++        .await
++        .expect("private attachment route must return");
++        let error = result
++            .err()
++            .expect("fabricated completion must not attach a runtime");
++        assert_eq!(error.kind(), ErrorKind::Other);
++        assert_eq!(error.to_string(), "native attachment owner mismatch");
++        client
++            .shutdown()
++            .await
++            .expect("in-process runtime should shutdown");
+     }
+ 
+     #[tokio::test]
+--- /dev/null
++++ b/codex-rs/app-server/src/in_process/native_rotation_attachment.rs
+@@ -0,0 +1,81 @@
++//! Owned attachment results for the private embedding route.
++//! These retain actual runtime owners. Serialized receipts cannot construct them.
++use codex_core::CodexThread;
++use codex_core::NativeRotationCommitOutcome;
++use codex_core::NativeRotationReceipt;
++use codex_core::NewThread;
++use codex_core::ThreadConfigSnapshot;
++use codex_core::config::Config;
++use codex_utils_path_uri::PathUri;
++use std::sync::Arc;
++
++pub type NativeRotationAttachmentResult = std::io::Result<NativeRotationAttachment>;
++
++#[must_use = "keep the foreground owner sealed until this attachment is installed"]
++pub enum NativeRotationAttachment {
++    Restored(Box<NativeRotationAttachedTarget>),
++    SourceRetained(Box<NativeRotationRetainedSource>),
++}
++
++/// The actual committed target, with settings captured from that target.
++pub struct NativeRotationAttachedTarget {
++    pub(crate) outcome: Arc<NativeRotationCommitOutcome>,
++    pub(crate) config: Arc<Config>,
++    pub(crate) settings: ThreadConfigSnapshot,
++    pub(crate) instruction_sources: Vec<PathUri>,
++}
++
++impl NativeRotationAttachedTarget {
++    pub fn target(&self) -> &NewThread {
++        match &*self.outcome {
++            NativeRotationCommitOutcome::Restored(owned) => owned.target(),
++            _ => unreachable!("attached target constructed only from a restored owner"),
++        }
++    }
++
++    pub fn config(&self) -> &Arc<Config> {
++        &self.config
++    }
++
++    pub fn settings(&self) -> &ThreadConfigSnapshot {
++        &self.settings
++    }
++
++    pub fn instruction_sources(&self) -> &[PathUri] {
++        &self.instruction_sources
++    }
++
++    pub fn outcome(&self) -> &Arc<NativeRotationCommitOutcome> {
++        &self.outcome
++    }
++}
++
++/// A refused transaction whose original runtime was independently revalidated.
++pub struct NativeRotationRetainedSource {
++    pub(crate) outcome: Arc<NativeRotationCommitOutcome>,
++    pub(crate) thread: Arc<CodexThread>,
++    pub(crate) receipt: NativeRotationReceipt,
++}
++
++impl NativeRotationRetainedSource {
++    pub fn thread(&self) -> &Arc<CodexThread> {
++        &self.thread
++    }
++
++    pub fn receipt(&self) -> &NativeRotationReceipt {
++        &self.receipt
++    }
++
++    pub fn outcome(&self) -> &Arc<NativeRotationCommitOutcome> {
++        &self.outcome
++    }
++
++    /// A current observation; the foreground owner still controls input release.
++    pub fn matches_runtime(&self) -> bool {
++        self.thread.matches_native_rotation_runtime(
++            self.receipt.thread_id,
++            self.receipt.runtime_id,
++            &self.receipt.rollout_path,
++        )
++    }
++}
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -685,6 +685,23 @@
+     ///
+     /// This bypasses JSON request deserialization but keeps identical request
+     /// semantics by delegating to `handle_client_request`.
++    pub(crate) fn attach_context_rotation_in_process(
++        &self,
++        connection_id: ConnectionId,
++        reservation_id: uuid::Uuid,
++        outcome: Arc<codex_core::NativeRotationCommitOutcome>,
++        response_tx: tokio::sync::oneshot::Sender<
++            crate::in_process::NativeRotationAttachmentResult,
++        >,
++    ) {
++        self.thread_processor.attach_context_rotation_in_process(
++            connection_id,
++            reservation_id,
++            outcome,
++            response_tx,
++        );
++    }
++
+     pub(crate) fn commit_context_rotation_in_process(
+         &self,
+         connection_id: ConnectionId,
+--- a/codex-rs/app-server/src/request_processors/context_rotation.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation.rs
+@@ -18,6 +18,182 @@
+ }
+ 
+ impl ThreadRequestProcessor {
++    /// Attachment errors never discard the registry's retained native owner.
++    pub(crate) fn attach_context_rotation_in_process(
++        &self,
++        connection_id: ConnectionId,
++        reservation_id: uuid::Uuid,
++        outcome: Arc<codex_core::NativeRotationCommitOutcome>,
++        response_tx: tokio::sync::oneshot::Sender<
++            crate::in_process::NativeRotationAttachmentResult,
++        >,
++    ) {
++        let processor = self.clone();
++        self.background_tasks.spawn(async move {
++            let result = processor
++                .attach_retained_rotation(connection_id, reservation_id, outcome)
++                .await;
++            let _ = response_tx.send(result.map_err(|error| std::io::Error::other(error.message)));
++        });
++    }
++
++    async fn attach_retained_rotation(
++        &self,
++        connection_id: ConnectionId,
++        reservation_id: uuid::Uuid,
++        outcome: Arc<codex_core::NativeRotationCommitOutcome>,
++    ) -> Result<crate::in_process::NativeRotationAttachment, JSONRPCErrorError> {
++        use crate::in_process::NativeRotationAttachedTarget;
++        use crate::in_process::NativeRotationAttachment;
++        use crate::in_process::NativeRotationRetainedSource;
++        use codex_core::NativeRotationCommitOutcome;
++
++        let request = self.rotation_reservations.retained_request_for_attachment(
++            connection_id,
++            reservation_id,
++            &outcome,
++        )?;
++        match &*outcome {
++            NativeRotationCommitOutcome::Restored(owned) => {
++                let receipt = owned.receipt();
++                if &receipt.source != request.source()
++                    || owned.target().thread_id != receipt.target_thread_id
++                {
++                    return Err(rotation_error(
++                        "native target does not match the retained transaction",
++                    ));
++                }
++                let target = &owned.target().thread;
++                self.ensure_rotation_runtime_attached(
++                    connection_id,
++                    receipt.target_thread_id,
++                    receipt.target_runtime_id,
++                    &receipt.target_rollout_path,
++                    target,
++                )
++                .await?;
++                // SessionConfigured alone omits settings that the foreground must preserve.
++                let config = target.config().await;
++                let settings = target.config_snapshot().await;
++                let instruction_sources = target.instruction_sources().await;
++                self.verify_rotation_runtime_attached(
++                    connection_id,
++                    receipt.target_thread_id,
++                    receipt.target_runtime_id,
++                    &receipt.target_rollout_path,
++                    target,
++                )
++                .await?;
++                Ok(NativeRotationAttachment::Restored(Box::new(
++                    NativeRotationAttachedTarget {
++                        outcome,
++                        config,
++                        settings,
++                        instruction_sources,
++                    },
++                )))
++            }
++            NativeRotationCommitOutcome::Refused(_) => {
++                let receipt = request.source().clone();
++                let thread = self
++                    .thread_manager
++                    .get_thread(receipt.thread_id)
++                    .await
++                    .map_err(|_| rotation_error("native source is no longer registered"))?;
++                self.ensure_rotation_runtime_attached(
++                    connection_id,
++                    receipt.thread_id,
++                    receipt.runtime_id,
++                    &receipt.rollout_path,
++                    &thread,
++                )
++                .await?;
++                Ok(NativeRotationAttachment::SourceRetained(Box::new(
++                    NativeRotationRetainedSource {
++                        outcome,
++                        thread,
++                        receipt,
++                    },
++                )))
++            }
++            NativeRotationCommitOutcome::ReconciliationRequired(_) => {
++                Err(rotation_error("native completion requires reconciliation"))
++            }
++        }
++    }
++
++    async fn ensure_rotation_runtime_attached(
++        &self,
++        connection_id: ConnectionId,
++        thread_id: ThreadId,
++        runtime_id: uuid::Uuid,
++        rollout_path: &std::path::Path,
++        thread: &Arc<codex_core::CodexThread>,
++    ) -> Result<(), JSONRPCErrorError> {
++        let registered = self
++            .thread_manager
++            .get_thread(thread_id)
++            .await
++            .map_err(|_| rotation_error("native attachment runtime is no longer registered"))?;
++        if !Arc::ptr_eq(&registered, thread)
++            || !thread.matches_native_rotation_runtime(thread_id, runtime_id, rollout_path)
++        {
++            return Err(rotation_error("native attachment runtime changed"));
++        }
++        match self
++            .ensure_conversation_listener(thread_id, connection_id, false)
++            .await?
++        {
++            super::thread_lifecycle::EnsureConversationListenerResult::Attached => {}
++            super::thread_lifecycle::EnsureConversationListenerResult::ConnectionClosed => {
++                return Err(rotation_error("native attachment connection is closed"));
++            }
++        }
++        self.verify_rotation_runtime_attached(
++            connection_id,
++            thread_id,
++            runtime_id,
++            rollout_path,
++            thread,
++        )
++        .await
++    }
++
++    async fn verify_rotation_runtime_attached(
++        &self,
++        connection_id: ConnectionId,
++        thread_id: ThreadId,
++        runtime_id: uuid::Uuid,
++        rollout_path: &std::path::Path,
++        thread: &Arc<codex_core::CodexThread>,
++    ) -> Result<(), JSONRPCErrorError> {
++        let registered = self
++            .thread_manager
++            .get_thread(thread_id)
++            .await
++            .map_err(|_| rotation_error("native attachment runtime is no longer registered"))?;
++        let owners = self
++            .thread_state_manager
++            .subscribed_connection_ids(thread_id)
++            .await;
++        let state = self.thread_state_manager.thread_state(thread_id).await;
++        let state = state.lock().await;
++        if !Arc::ptr_eq(&registered, thread)
++            || !thread.matches_native_rotation_runtime(thread_id, runtime_id, rollout_path)
++            || owners.len() != 1
++            || !owners.contains(&connection_id)
++            || !state.listener_matches(thread)
++            || !state
++                .listener_command_tx()
++                .is_some_and(|sender| !sender.is_closed())
++        {
++            return Err(rotation_error(
++                "native attachment ownership or listener changed",
++            ));
++        }
++        Ok(())
++    }
++
+     // Rust embedding only: callers must retain their sealed frontend owner and
+     // verified durable host intent. Transport errors never authorize input release.
+     pub(crate) fn commit_context_rotation_in_process(
+--- a/codex-rs/app-server/src/request_processors/context_rotation_commit_tests.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation_commit_tests.rs
+@@ -250,3 +250,84 @@
+             .is_err()
+     );
+ }
++
++#[tokio::test]
++async fn context_rotation_attachment_requires_exact_retained_arc_and_owner() {
++    let registry = RotationReservations::<usize>::default();
++    let key = registry
++        .claim(
++            ConnectionId(1),
++            ThreadId::new(),
++            Instant::now() + Duration::from_secs(5),
++        )
++        .await
++        .unwrap();
++    let request = request(key.thread);
++    let fabricated = Arc::new(NativeRotationCommitOutcome::Refused(
++        NativeRotationError::Busy,
++    ));
++    assert!(
++        registry
++            .retained_request_for_attachment(key.owner, key.id, &fabricated)
++            .is_err()
++    );
++    registry.retain(&key, 7).await.unwrap();
++    let started = registry
++        .begin_commit_using(key.owner, key.id, request.clone(), |_| true)
++        .unwrap();
++    assert!(
++        registry
++            .retained_request_for_attachment(key.owner, key.id, &fabricated)
++            .is_err()
++    );
++    let (_, completion) = started.transaction.unwrap();
++    completion.finish(NativeRotationCommitOutcome::Refused(
++        NativeRotationError::Busy,
++    ));
++    let outcome = await_commit(started.observer).await;
++    assert!(
++        registry
++            .retained_request_for_attachment(key.owner, key.id, &outcome)
++            .unwrap()
++            == request
++    );
++    assert!(
++        registry
++            .retained_request_for_attachment(key.owner, key.id, &fabricated)
++            .is_err()
++    );
++    assert!(
++        registry
++            .retained_request_for_attachment(ConnectionId(2), key.id, &outcome)
++            .is_err()
++    );
++    assert!(
++        registry
++            .retained_request_for_attachment(key.owner, uuid::Uuid::new_v4(), &outcome)
++            .is_err()
++    );
++}
++
++#[tokio::test]
++async fn context_rotation_attachment_keeps_reconciliation_fenced() {
++    let registry = RotationReservations::<usize>::default();
++    let key = registry
++        .claim(
++            ConnectionId(1),
++            ThreadId::new(),
++            Instant::now() + Duration::from_secs(5),
++        )
++        .await
++        .unwrap();
++    registry.retain(&key, 7).await.unwrap();
++    let started = registry
++        .begin_commit_using(key.owner, key.id, request(key.thread), |_| true)
++        .unwrap();
++    drop(started.transaction);
++    let outcome = await_commit(started.observer).await;
++    assert!(
++        registry
++            .retained_request_for_attachment(key.owner, key.id, &outcome)
++            .is_err()
++    );
++}
+--- a/codex-rs/app-server/src/request_processors/context_rotation_owner.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation_owner.rs
+@@ -295,6 +295,40 @@
+ }
+ 
+ impl<L> RotationReservations<L> {
++    /// Bind attachment to the actual retained result, never to copied evidence.
++    pub(super) fn retained_request_for_attachment(
++        &self,
++        owner: ConnectionId,
++        id: uuid::Uuid,
++        outcome: &Arc<NativeRotationCommitOutcome>,
++    ) -> Result<NativeRotationCommitRequest, JSONRPCErrorError> {
++        let active = self
++            .active
++            .lock()
++            .map_err(|_| rotation_error("rotation owner unavailable"))?;
++        let state = active
++            .as_ref()
++            .filter(|entry| entry.key.owner == owner && entry.key.id == id)
++            .and_then(|entry| entry.commit.as_ref())
++            .ok_or_else(|| rotation_error("native attachment owner mismatch"))?;
++        let retained = state.result.borrow();
++        if !retained
++            .as_ref()
++            .is_some_and(|retained| Arc::ptr_eq(retained, outcome))
++        {
++            return Err(rotation_error(
++                "native attachment requires the retained completion",
++            ));
++        }
++        if matches!(
++            &**outcome,
++            NativeRotationCommitOutcome::ReconciliationRequired(_)
++        ) {
++            return Err(rotation_error("native completion requires reconciliation"));
++        }
++        Ok(state.request.clone())
++    }
++
+     pub(super) fn observe_commit(
+         &self,
+         owner: ConnectionId,
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -1096,7 +1096,7 @@
+         }
+     }
+ 
+-    async fn ensure_conversation_listener(
++    pub(super) async fn ensure_conversation_listener(
+         &self,
+         conversation_id: ThreadId,
+         connection_id: ConnectionId,
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -875,6 +875,20 @@
+         &self.startup_metadata
+     }
+ 
++    /// Observes the identity and liveness of this exact runtime.
++    /// Matching descriptive evidence does not grant rotation or input ownership.
++    pub fn matches_native_rotation_runtime(
++        &self,
++        thread_id: ThreadId,
++        runtime_id: uuid::Uuid,
++        rollout_path: &std::path::Path,
++    ) -> bool {
++        self.is_running()
++            && self.session.thread_id == thread_id
++            && self.session.native_rotation.runtime_id() == runtime_id
++            && self.rollout_path.as_deref() == Some(rollout_path)
++    }
++
+     pub(crate) fn is_running(&self) -> bool {
+         !self.io.tx_sub.is_closed()
+     }
+--- a/codex-rs/core/src/session/native_rotation.rs
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -107,6 +107,10 @@
+ }
+ 
+ impl NativeRotationState {
++    pub(crate) fn runtime_id(&self) -> uuid::Uuid {
++        self.runtime_id
++    }
++
+     pub(crate) fn started(&self) {
+         *self
+             .completed
+--- a/codex-rs/core/src/thread_manager/native_rotation_commit_tests.rs
++++ b/codex-rs/core/src/thread_manager/native_rotation_commit_tests.rs
+@@ -153,7 +153,57 @@
+     assert!(Arc::ptr_eq(&registered, &owned.target().thread));
+     assert!(receipt.target_rollout_path.is_file());
+     assert!(receipt.journal_directory.join("restored.json").is_file());
++    assert!(owned.target().thread.matches_native_rotation_runtime(
++        receipt.target_thread_id,
++        receipt.target_runtime_id,
++        &receipt.target_rollout_path,
++    ));
+     owned.target().thread.shutdown_and_wait().await.unwrap();
++    assert!(!owned.target().thread.matches_native_rotation_runtime(
++        receipt.target_thread_id,
++        receipt.target_runtime_id,
++        &receipt.target_rollout_path,
++    ));
+     drop(owned);
+     native_close_fixture_finished(fixture).await;
+ }
++
++#[tokio::test]
++async fn native_rotation_runtime_identity_observes_exact_live_owner() {
++    let fixture = Fixture::completed().await;
++    let lease = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let receipt = lease.receipt().clone();
++    let source = Arc::clone(&fixture.root.thread);
++    assert!(source.matches_native_rotation_runtime(
++        receipt.thread_id,
++        receipt.runtime_id,
++        &receipt.rollout_path,
++    ));
++    assert!(!source.matches_native_rotation_runtime(
++        ThreadId::new(),
++        receipt.runtime_id,
++        &receipt.rollout_path,
++    ));
++    assert!(!source.matches_native_rotation_runtime(
++        receipt.thread_id,
++        uuid::Uuid::new_v4(),
++        &receipt.rollout_path,
++    ));
++    assert!(!source.matches_native_rotation_runtime(
++        receipt.thread_id,
++        receipt.runtime_id,
++        &receipt.rollout_path.join("changed"),
++    ));
++    drop(lease);
++    fixture.close().await;
++    assert!(!source.matches_native_rotation_runtime(
++        receipt.thread_id,
++        receipt.runtime_id,
++        &receipt.rollout_path,
++    ));
++}

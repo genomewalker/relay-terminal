@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 2,
+  "id": "relay.transfers",
+  "name": "Transfers",
+  "version": "0.2.0",
+  "repository": "genomewalker/relay-plugin-transfers",
+  "permissions": [
+    {
+      "kind": "projectRead",
+      "reason": "Download a selected file from the pane’s host and save it using the native Mac save dialog."
+    }
+  ],
+  "contributions": [
+    {
+      "id": "main",
+      "kind": "tool",
+      "title": "Transfers",
+      "text": "Browse folders and download files up to 64 GiB in bounded chunks. Pause/resume while the panel is open, verify SHA-256, then save through the native Mac dialog.",
+      "operation": "transfers"
+    }
+  ]
+}

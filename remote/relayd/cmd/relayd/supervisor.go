@@ -51,16 +51,37 @@ func runUpgradeSupervisor(arguments []string) {
 		return
 	}
 
+	// Prepare every affected supervisor before stopping any of them. A legacy
+	// refusal must not leave the current supervisor needlessly disconnected.
+	var old *liveSupervisor
+	if *legacy != "" && *legacy != *socket {
+		if live, err := inspectSupervisor(*legacy); err == nil {
+			prepared, err := inspectSupervisorForUpgrade(*legacy)
+			if err != nil || !prepared.Status.UpgradePrepared {
+				fatal("legacy supervisor cannot guarantee host-job-safe upgrade; upgrade deferred")
+			}
+			live = prepared
+			old = &live
+		}
+	}
+	if currentErr == nil {
+		prepared, err := inspectSupervisorForUpgrade(*socket)
+		if err != nil {
+			fatal("cannot prepare supervisor upgrade: " + err.Error())
+		}
+		if !prepared.Status.UpgradePrepared {
+			fatal("existing supervisor does not support safe host-job upgrade handoff; upgrade deferred")
+		}
+		current = prepared
+	}
+	if old != nil {
+		if err := stopValidatedSupervisor(*legacy, *old); err != nil {
+			fatal("cannot retire legacy supervisor: " + err.Error())
+		}
+	}
 	if currentErr == nil {
 		if err := stopValidatedSupervisor(*socket, current); err != nil {
 			fatal("cannot replace existing supervisor: " + err.Error())
-		}
-	}
-	if *legacy != "" && *legacy != *socket {
-		if old, err := inspectSupervisor(*legacy); err == nil {
-			if err := stopValidatedSupervisor(*legacy, old); err != nil {
-				fatal("cannot retire legacy supervisor: " + err.Error())
-			}
 		}
 	}
 
@@ -93,6 +114,14 @@ func runUpgradeSupervisor(arguments []string) {
 }
 
 func inspectSupervisor(socket string) (liveSupervisor, error) {
+	return inspectSupervisorMode(socket, false)
+}
+
+func inspectSupervisorForUpgrade(socket string) (liveSupervisor, error) {
+	return inspectSupervisorMode(socket, true)
+}
+
+func inspectSupervisorMode(socket string, prepare bool) (liveSupervisor, error) {
 	var live liveSupervisor
 	connection, err := dialDaemon(socket, 250*time.Millisecond)
 	if err != nil {
@@ -105,7 +134,7 @@ func inspectSupervisor(socket string) (liveSupervisor, error) {
 		return live, err
 	}
 	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{
-		Version: 1, SessionID: "_probe", Probe: true,
+		Version: 1, SessionID: "_probe", Probe: true, PrepareUpgrade: prepare,
 	})
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
 		return live, err
@@ -114,8 +143,11 @@ func inspectSupervisor(socket string) (liveSupervisor, error) {
 	if err != nil || frame.Type != protocol.Status {
 		return live, fmt.Errorf("invalid relayd probe response")
 	}
-	if err := protocol.DecodeJSON(frame, &live.Status); err != nil || live.Status.State != "ready" {
-		return live, fmt.Errorf("relayd is not ready")
+	if err := protocol.DecodeJSON(frame, &live.Status); err != nil {
+		return live, fmt.Errorf("invalid relayd status")
+	}
+	if live.Status.State != "ready" {
+		return live, fmt.Errorf("relayd is not ready: %s", live.Status.Message)
 	}
 	live.PeerPID = peerPID
 	if live.PeerPID > 0 && live.Status.SupervisorPID > 0 && live.PeerPID != live.Status.SupervisorPID {

@@ -1,0 +1,1300 @@
+[
+  {
+    "agent": "claude",
+    "relay_event_seq": 1,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "source": "hook",
+      "occurred_at": "2026-10-05T18:19:24.664098838Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 2,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:1922727:944610697",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T18:19:26.876233723Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 159,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2099581:944804375",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T18:51:39.735282844Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 160,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2099581:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T18:51:40.736587772Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 161,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2100923:944804938",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T18:51:44.741302642Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 162,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2100923:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T18:51:45.742956253Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 224,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2311952:945026806",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:28:43.948480927Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 225,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2311952:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:28:44.949454665Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 226,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2312233:945026952",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:28:44.949617858Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 227,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2312233:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:28:45.950764203Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 228,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2312423:945027056",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:28:45.950911452Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 229,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2312423:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:28:46.952047746Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 230,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2312674:945027255",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:28:47.953509399Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 231,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2312674:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:28:48.954915719Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 248,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:2331987:945040371",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:30:59.072346714Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 250,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:2331987:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T19:31:00.073520618Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 291,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2499347:945251131",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:06:07.215559923Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 292,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2499347:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:06:08.216519614Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 293,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2499491:945251382",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:06:09.217822906Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 294,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2499491:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:06:10.219590798Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 295,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:2499660:945251480",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:06:10.21975329Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 296,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:2499660:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:06:11.221276845Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 297,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2499959:945251584",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:06:11.221399936Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 298,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2499959:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:06:12.222243424Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 303,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2512212:945259772",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:33.31701384Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 304,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2512212:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:34.318521804Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 305,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2512273:945259858",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:34.318645916Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 306,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2512273:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:35.319836785Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 307,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2512529:945260091",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:36.321344428Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 308,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2512529:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:37.323205661Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 309,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:2512643:945260195",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:37.323351002Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 310,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:2512643:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:38.324167503Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 311,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2512803:945260293",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:38.324343096Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 312,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2512803:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:07:39.326159329Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 358,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2550308:945300260",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:14:18.704270415Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 359,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2550308:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:14:19.705860923Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 364,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2560058:945308582",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:15:41.807826458Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 365,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2560058:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:15:42.80912325Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 366,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2560275:945308841",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:15:43.810612368Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 367,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2560275:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:15:44.811804353Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 368,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2560708:945309141",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:15:46.813912151Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 369,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2560708:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:15:47.814660787Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 411,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2638424:945426846",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:23.818046561Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 412,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2638424:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:24.819631296Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 413,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2638456:945426930",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:24.819785496Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 414,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2638456:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:25.821189284Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 415,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2638643:945427145",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:26.8227764Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 416,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2638643:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:27.824415784Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 417,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:2638801:945427243",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:27.824589059Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 418,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:2638801:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:28.826140509Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 419,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2639171:945427442",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:29.827294293Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 420,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2639171:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:35:30.828789105Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 465,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2815681:945500482",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:47:40.524283309Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 466,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2815681:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:47:41.525461957Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 467,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2815697:945500567",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:47:41.525573039Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 468,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2815697:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:47:42.526788083Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 469,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:2816129:945500811",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:47:43.527654208Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 470,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:2816129:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:47:44.529021771Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 471,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2816353:945500916",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:47:44.529159033Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 472,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2816353:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:47:45.530023256Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 523,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2865047:945554642",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:56:42.024396426Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 524,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2865047:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:56:43.02595904Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 525,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2865101:945554727",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:56:43.026138154Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 526,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2865101:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:56:44.027213621Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 527,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2865375:945554967",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:56:45.028338166Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 528,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2865375:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T20:56:46.029316621Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 568,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2894213:945579665",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:52.27398558Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 569,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2894213:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:53.275635077Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 570,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2894257:945579750",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:53.275777587Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 571,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2894257:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:54.277151473Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 572,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2894533:945579986",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:55.278388052Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 573,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2894533:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:56.280021837Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 574,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:2894633:945580066",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:56.280159668Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 575,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:2894633:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:57.281584801Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 576,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2894697:945580151",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:57.28172061Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 577,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2894697:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:58.283362788Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 578,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2894745:945580273",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:00:58.283504185Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 579,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2894745:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:01:01.286913728Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 580,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2894994:945580593",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:01:01.287053576Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 581,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2894994:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:01:02.288786234Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 631,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3050912:945791526",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:36:11.32851521Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 632,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3050912:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:36:12.329985994Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 633,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3051294:945791893",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:36:14.332223365Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 634,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3051294:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:36:15.333295776Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 645,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3069865:945805374",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:38:29.512900388Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 646,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3069865:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:38:30.514322986Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 647,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3070046:945805460",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:38:30.514467498Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 648,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3070046:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:38:31.516349384Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 649,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3070571:945805711",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:38:32.517752927Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 650,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3070571:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:38:33.519136747Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 651,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3070695:945805814",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:38:33.519298496Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 652,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3070695:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:38:34.520464342Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 663,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3099753:945839452",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:44:09.877567091Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 664,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3099753:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T21:44:10.879285418Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 745,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3211523:945997051",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T22:10:26.548014274Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 746,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3211523:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T22:10:27.549706801Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 747,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3212448:945997414",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T22:10:29.552033146Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 748,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3212448:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T22:10:30.553579319Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 769,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3240999:946028715",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T22:15:42.900255036Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 770,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3240999:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T22:15:43.902132997Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 771,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:3241034:946028799",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T22:15:43.902268604Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 772,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:3241034:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-05T22:15:44.903559951Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 987,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:1400922:950706465",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T11:15:20.623103553Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 988,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:1400922:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T11:15:21.63607241Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 1250,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2332595:952475174",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T16:10:07.201179871Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 1251,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2332595:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T16:10:08.204350802Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 1252,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "codex:2332632:952475259",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T16:10:08.204572449Z"
+    }
+  },
+  {
+    "agent": "codex",
+    "relay_event_seq": 1253,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "codex:2332632:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T16:10:09.206852392Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1522,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3061904:953695957",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T19:33:35.754460371Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1523,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3061904:953695957",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T19:33:36.756062813Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1524,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3166096:953874107",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T20:03:16.428479156Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1525,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3166096:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T20:03:17.429454325Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1526,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3481101:954456453",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T21:40:19.888620453Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1527,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3481101:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T21:40:20.890251471Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1528,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3606257:954778153",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T22:33:56.891200571Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1529,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3606257:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T22:33:57.893312696Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1530,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3719956:955091343",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T23:26:08.78847149Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1531,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3719956:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-06T23:26:09.789873884Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1532,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3826016:955384517",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T00:15:00.525597607Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1533,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3826016:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T00:15:01.527573885Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1534,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:3943974:955707716",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T01:08:52.518646098Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1535,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:3943974:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T01:08:53.520598816Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1536,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:4184291:956369132",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T02:59:06.674471066Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1537,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:4184291:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T02:59:07.676310255Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1538,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:120046:956693334",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T03:53:08.700449317Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1539,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:120046:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T03:53:09.70184592Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1541,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "source": "hook",
+      "occurred_at": "2026-10-07T04:17:02.094979291Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1542,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:1922727:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T04:17:03.05211844Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1543,
+    "event": {
+      "hook_event_name": "SessionStart",
+      "root_id": "claude:206865:956839242",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T04:17:28.055075033Z"
+    }
+  },
+  {
+    "agent": "claude",
+    "relay_event_seq": 1544,
+    "event": {
+      "hook_event_name": "SessionEnd",
+      "root_id": "claude:206865:unavailable",
+      "source": "process-tree",
+      "occurred_at": "2026-10-07T04:17:30.056547923Z"
+    }
+  }
+]

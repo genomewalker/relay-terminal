@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +18,7 @@ import (
 	"unsafe"
 
 	"github.com/creack/pty"
+	"github.com/relay-terminal/relayd/internal/programstatus"
 	"github.com/relay-terminal/relayd/internal/protocol"
 	relayterminfo "github.com/relay-terminal/relayd/internal/terminfo"
 )
@@ -32,10 +32,11 @@ type record struct {
 }
 
 type client struct {
-	frames             chan protocol.Frame
-	lagged             chan struct{}
-	once               sync.Once
-	includeAgentEvents bool
+	frames               chan protocol.Frame
+	lagged               chan struct{}
+	once                 sync.Once
+	includeProgramStatus bool
+	includeAgentEvents   bool
 }
 
 func newClient(capacity int) *client {
@@ -49,19 +50,30 @@ func (viewer *client) markLagged() {
 }
 
 type Session struct {
-	id       string
-	command  string
-	pty      *os.File
-	process  *exec.Cmd
-	resizeMu sync.Mutex
-	inputMu  sync.Mutex
-	eventMu  sync.Mutex
+	nativeRotationMu       sync.Mutex
+	nativeRotation         *hostNativeRotationBridge
+	hostRotation           *hostRotationSupervisor
+	promptEditorMu         sync.Mutex
+	promptEditor           *promptEditorPending
+	id                     string
+	command                string
+	pty                    *os.File
+	process                *exec.Cmd
+	resizeMu               sync.Mutex
+	inputMu                sync.Mutex
+	humanInputRevision     uint64 // inputMu; invalidates enrollment prepared outside this lock
+	rotationControlled     bool
+	rotationGuardDirectory string
+	rotationHumanInputSeen bool
+	rotationGuardInstalled bool
+	eventMu                sync.Mutex
 
 	mu                    sync.Mutex
 	sequence              uint64
 	outputChanged         chan struct{}
 	replay                []record
 	replayBytes           int
+	replayTrimmed         bool // set only when retained PTY records are evicted
 	clients               map[*client]struct{}
 	agentClients          map[*client]struct{}
 	exited                bool
@@ -80,6 +92,9 @@ type Session struct {
 	eventJournalError     string
 	inputSequences        map[[16]byte]uint64
 	artifactDetector      artifactDetector
+	programStatusReplies  chan int
+	programStatusRevision uint64
+	programStatus         programstatus.Tracker
 	terminalModes         terminalModeState
 	controlClientID       string
 	controlConnections    int
@@ -141,6 +156,7 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	if err != nil {
 		return nil, err
 	}
+	child.Dir = home
 	if workingDirectory != "" {
 		child.Dir = workingDirectory
 	}
@@ -148,8 +164,11 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	environmentOverrides["COLORTERM"] = "truecolor"
 	environmentOverrides["TERM_PROGRAM"] = "relay"
 	environmentOverrides["RELAY_SESSION"] = id
+	// Configure only newly launched shells. The official Claude shim can
+	// prepare its editor bridge before exec without rebinding live providers.
+	environmentOverrides["RELAY_PROMPT_EDITOR_ENABLE"] = promptEditorLaunchSetting(os.Environ())
 	environmentOverrides["PATH"] = shimPath + string(os.PathListSeparator) + os.Getenv("PATH")
-	child.Env = environmentWithOverrides(os.Environ(), environmentOverrides)
+	child.Env = TerminalEnvironment(environmentWithOverrides(os.Environ(), environmentOverrides))
 	if cols == 0 {
 		cols = 120
 	}
@@ -166,15 +185,17 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 		clients:  make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
 		activeSubagents: make(map[string][]byte), activeAgentRoots: make(map[string][]byte), done: make(chan struct{}),
 		agentProcesses: make(map[int]string), agentProcessesChanged: make(chan struct{}),
-		inputSequences: make(map[[16]byte]uint64),
-		eventHashes:    make(map[[32]byte]struct{}),
-		outputChanged:  make(chan struct{}),
-		terminalModes:  newTerminalModeState(),
+		inputSequences:       make(map[[16]byte]uint64),
+		eventHashes:          make(map[[32]byte]struct{}),
+		outputChanged:        make(chan struct{}),
+		terminalModes:        newTerminalModeState(),
+		programStatusReplies: make(chan int, 8),
 	}
 	// Seed the shared process snapshot once so transcript observers can attach
 	// immediately. Thereafter one monitor owns /proc traversal for the pane and
 	// broadcasts changes to both Codex and Claude readers.
 	session.agentProcesses = descendantAgentProcesses(child.Process.Pid)
+	go session.writeProgramStatusReplies()
 	go session.readOutput()
 	go session.wait()
 	go session.monitorAgentProcesses()
@@ -202,7 +223,21 @@ func outputSequenceFromEntropy(value uint64) uint64 {
 
 func sessionCommand(shell, command, home, shimPath string) (*exec.Cmd, error) {
 	if command != "" {
-		wrapped := "export PATH=" + shellQuote(shimPath) + ":$PATH; hash -r 2>/dev/null || true; " + command
+		// Startup commands are children of the pane bootstrap. Even an `exec`
+		// in a configured agent command must not consume the persistent shell.
+		interactive, err := sessionCommand(shell, "", home, shimPath)
+		if err != nil {
+			return nil, err
+		}
+		followup := "exec " + shellQuote(interactive.Path)
+		for _, arg := range interactive.Args[1:] {
+			followup += " " + shellQuote(arg)
+		}
+		launch := shellQuote(shell) + " -lc " + shellQuote(command)
+		wrapped := "export PATH=" + shellQuote(shimPath) + ":$PATH; hash -r 2>/dev/null || true; " + launch + "; " + followup
+		if filepath.Base(shell) == "fish" {
+			wrapped = "set -gx PATH " + shellQuote(shimPath) + " $PATH; " + launch + "; " + followup
+		}
 		return exec.Command(shell, "-lc", wrapped), nil
 	}
 
@@ -212,8 +247,9 @@ func sessionCommand(shell, command, home, shimPath string) (*exec.Cmd, error) {
 		if err != nil {
 			return nil, err
 		}
-		launch := "exec " + shellQuote(shell) + " --rcfile " + shellQuote(rcPath) + " -i"
-		return exec.Command(shell, "-l", "-c", launch), nil
+		// Load profile and interactive setup in the same process. A login
+		// bootstrap followed by exec loses non-exported prompt functions.
+		return exec.Command(shell, "--rcfile", rcPath, "-i"), nil
 	case "zsh":
 		zdotDirectory, err := writeZshIntegration(home, shimPath)
 		if err != nil {
@@ -252,7 +288,20 @@ func writeBashIntegration(home, shimPath string) (string, error) {
 	}
 	path := filepath.Join(directory, "bashrc")
 	contents := "# Managed by Relay Terminal.\n" +
-		"if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n" +
+		// This is an interactive non-login Bash using --rcfile. On RHEL-like
+		// hosts /etc/profile sources /etc/bashrc, which then sources every
+		// /etc/profile.d script again because login_shell is off. Mark the
+		// system bashrc as already handled while loading the login profile.
+		// Otherwise readonly declarations in profile.d fail on every split.
+		"if [ -r /etc/profile ]; then BASHRCSOURCED=Y; . /etc/profile; fi\n" +
+		"__relay_profile_loaded=0\n" +
+		"for __relay_profile in \"$HOME/.bash_profile\" \"$HOME/.bash_login\" \"$HOME/.profile\"; do\n" +
+		"  if [ -r \"$__relay_profile\" ]; then . \"$__relay_profile\"; __relay_profile_loaded=1; break; fi\n" +
+		"done\n" +
+		// Login profiles decide whether to load ~/.bashrc. Loading it here as
+		// well runs the user's interactive configuration twice on common hosts.
+		"if [ \"$__relay_profile_loaded\" -eq 0 ] && [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n" +
+		"unset __relay_profile __relay_profile_loaded\n" +
 		"export PATH=" + shellQuote(shimPath) + ":$PATH\n" +
 		"hash -r 2>/dev/null || true\n" +
 		bashSemanticPromptIntegration
@@ -368,6 +417,15 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
+func promptEditorLaunchSetting(environment []string) string {
+	for _, entry := range environment {
+		if value, found := strings.CutPrefix(entry, "RELAY_PROMPT_EDITOR_ENABLE="); found {
+			return value
+		}
+	}
+	return "1"
+}
+
 func environmentWithOverrides(environment []string, overrides map[string]string) []string {
 	result := make([]string, 0, len(environment)+len(overrides))
 	for _, entry := range environment {
@@ -388,7 +446,7 @@ func environmentWithOverrides(environment []string, overrides map[string]string)
 func (session *Session) monitorAgentProcesses() {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
-	known := make(map[int]string)
+	known := make(map[int]detectedAgentProcess)
 	for range timer.C {
 		session.mu.Lock()
 		exited := session.exited
@@ -398,17 +456,11 @@ func (session *Session) monitorAgentProcesses() {
 			return
 		}
 		current := descendantAgentProcesses(rootPID)
-		for pid, agent := range known {
-			if _, exists := current[pid]; !exists {
-				session.publishDetectedAgent(agent, "SessionEnd", pid)
-			}
+		observed := observedAgentProcesses(current, known, processStartIdentity)
+		for _, change := range agentProcessTransitions(known, observed) {
+			session.publishDetectedAgent(change.process.agent, change.event, change.pid, change.process.startIdentity)
 		}
-		for pid, agent := range current {
-			if known[pid] != agent {
-				session.publishDetectedAgent(agent, "SessionStart", pid)
-			}
-		}
-		known = current
+		known = observed
 		session.updateAgentProcesses(current)
 		timer.Reset(agentProcessPollInterval(len(current)))
 	}
@@ -480,14 +532,13 @@ func transcriptPollInterval(activeReaders, idlePolls int) time.Duration {
 	return 5 * time.Second
 }
 
-func (session *Session) publishDetectedAgent(agent, eventName string, pid int) {
-	startTime, _ := processStartTime(pid)
+func (session *Session) publishDetectedAgent(agent, eventName string, pid int, startIdentity string) {
 	payload, err := json.Marshal(map[string]any{
 		"agent": agent,
 		"event": map[string]any{
 			"hook_event_name": eventName,
 			"source":          "process-tree",
-			"root_id":         fmt.Sprintf("%s:%d:%d", agent, pid, startTime),
+			"root_id":         fmt.Sprintf("%s:%d:%s", agent, pid, startIdentity),
 			"occurred_at":     time.Now().UTC().Format(time.RFC3339Nano),
 		},
 	})
@@ -501,69 +552,8 @@ func descendantAgent(rootPID int) string {
 	return agent
 }
 
-func descendantAgentProcesses(rootPID int) map[int]string {
-	result := make(map[int]string)
-	stack := []int{rootPID}
-	seen := make(map[int]bool)
-	for len(stack) > 0 {
-		pid := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if seen[pid] {
-			continue
-		}
-		seen[pid] = true
-		command, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm"))
-		arguments, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
-		if agent := classifyAgentProcess(string(command), string(arguments)); agent != "" {
-			result[pid] = agent
-		}
-		children, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "task", strconv.Itoa(pid), "children"))
-		for _, value := range strings.Fields(string(children)) {
-			if child, err := strconv.Atoi(value); err == nil {
-				stack = append(stack, child)
-			}
-		}
-	}
-	return result
-}
-
-func descendantAgentProcess(rootPID int) (string, int) {
-	stack := []int{rootPID}
-	seen := make(map[int]bool)
-	for len(stack) > 0 {
-		pid := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if seen[pid] {
-			continue
-		}
-		seen[pid] = true
-		command, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm"))
-		arguments, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
-		if agent := classifyAgentProcess(string(command), string(arguments)); agent != "" {
-			return agent, pid
-		}
-		children, _ := os.ReadFile(filepath.Join(
-			"/proc", strconv.Itoa(pid), "task", strconv.Itoa(pid), "children",
-		))
-		for _, value := range strings.Fields(string(children)) {
-			if child, err := strconv.Atoi(value); err == nil {
-				stack = append(stack, child)
-			}
-		}
-	}
-	return "", 0
-}
-
 func classifyAgentProcess(command, arguments string) string {
-	command = strings.ToLower(strings.TrimSpace(command))
-	arguments = strings.ToLower(strings.ReplaceAll(arguments, "\x00", " "))
-	if command == "codex" || strings.Contains(arguments, "/codex ") || strings.HasSuffix(arguments, "/codex") {
-		return "codex"
-	}
-	if command == "claude" || strings.Contains(arguments, "/claude ") || strings.HasSuffix(arguments, "/claude") {
-		return "claude"
-	}
-	return ""
+	return classifyHarnessProcess(command, arguments)
 }
 
 func (session *Session) workingDirectory() string {
@@ -612,6 +602,14 @@ func (session *Session) publish(data []byte) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.terminalModes.ingest(copyOfData)
+	// Collect only fresh owned PTY output. Attach replay never updates metadata.
+	// Detection is deliberately not answered until client/server ownership is negotiated.
+	programEvents := session.programStatus.Feed(copyOfData)
+	session.queueProgramStatusReplies(programEvents.DetectionQueries)
+	if programEvents.Changed {
+		session.programStatusRevision++
+		session.broadcastProgramStatusLocked()
+	}
 	session.sequence++
 	if session.outputChanged != nil {
 		close(session.outputChanged)
@@ -628,6 +626,7 @@ func (session *Session) publish(data []byte) {
 			session.replayBytes -= len(artifact.Payload)
 		}
 		session.replay = session.replay[1:]
+		session.replayTrimmed = true
 	}
 	frame := protocol.OutputFrame(session.sequence, copyOfData)
 	for viewer := range session.clients {
@@ -660,6 +659,10 @@ func (session *Session) wait() {
 	}
 	status, _ := json.Marshal(protocol.StatusPayload{State: "exited", ExitCode: exitCode})
 	session.mu.Lock()
+	if session.programStatus.DropRunning() {
+		session.programStatusRevision++
+		session.broadcastProgramStatusLocked()
+	}
 	session.exited = true
 	session.exitCode = exitCode
 	for viewer := range session.clients {
@@ -700,10 +703,15 @@ func (session *Session) attach(
 	lastSequence, lastEventSequence uint64,
 	includeAgentEvents bool,
 ) (*client, []protocol.Frame, bool, bool, int) {
+	return session.attachWithProgramStatus(lastSequence, lastEventSequence, includeAgentEvents, false)
+}
+
+func (session *Session) attachWithProgramStatus(lastSequence, lastEventSequence uint64, includeAgentEvents, includeProgramStatus bool) (*client, []protocol.Frame, bool, bool, int) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	viewer := newClient(512)
 	viewer.includeAgentEvents = includeAgentEvents
+	viewer.includeProgramStatus = includeProgramStatus
 	session.clients[viewer] = struct{}{}
 	session.broadcastClientCountLocked()
 	outputReset := outputCursorNeedsReset(session.replay, lastSequence, session.sequence)
@@ -711,7 +719,19 @@ func (session *Session) attach(
 		lastSequence = 0
 	}
 	startRecord, startOffset := replayStart(session.replay, lastSequence)
+	// A trimmed ring without a complete repaint has no reconstructable base.
+	// Never hand a new parser an arbitrary mid-CSI/UTF-8 suffix. The attach
+	// geometry repaint supplies fresh output; presentation reset is seq zero.
+	unsafePrefix := lastSequence == 0 && len(session.replay) > 0 &&
+		session.replayTrimmed && !hasPrimaryReplayBoundary(session.replay)
 	frames := make([]protocol.Frame, 0, len(session.replay)-startRecord)
+	if includeProgramStatus {
+		frames = append(frames, session.programStatusFrameLocked(true))
+	}
+	if unsafePrefix {
+		startRecord = len(session.replay)
+		frames = append(frames, protocol.OutputFrame(0, []byte("\x1bc")))
+	}
 	for index, item := range session.replay {
 		if item.sequence > lastSequence {
 			if index < startRecord {
@@ -750,6 +770,22 @@ func (session *Session) attach(
 	return viewer, frames, outputReset, eventReset, len(session.clients)
 }
 
+func hasPrimaryReplayBoundary(replay []record) bool {
+	var stream []byte
+	for _, item := range replay {
+		stream = append(stream, item.data...)
+	}
+	return safePrimaryScreenReplayStart(stream) >= 0
+}
+
+func (session *Session) needsFreshAttachReplay(sequence uint64) bool {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return outputCursorNeedsReset(session.replay, sequence, session.sequence) ||
+		(sequence == 0 && len(session.replay) > 0 && session.replayTrimmed &&
+			!hasPrimaryReplayBoundary(session.replay))
+}
+
 func replayCursorHasGap(replay []record, sequence uint64) bool {
 	if sequence == 0 || len(replay) == 0 {
 		return false
@@ -785,7 +821,9 @@ func replayStart(replay []record, lastSequence uint64) (int, int) {
 }
 
 func safePrimaryScreenReplayStart(stream []byte) int {
-	clears := [][]byte{[]byte("\x1b[2J"), []byte("\x1b[3J"), []byte("\x1bc")}
+	// ED 3 erases saved scrollback, not the visible cells. It is not a
+	// reconstruction boundary and must retain the preceding screen state.
+	clears := [][]byte{[]byte("\x1b[2J"), []byte("\x1bc")}
 	alternateEntries := [][]byte{[]byte("\x1b[?1049h"), []byte("\x1b[?1047h"), []byte("\x1b[?47h")}
 	alternateExits := [][]byte{[]byte("\x1b[?1049l"), []byte("\x1b[?1047l"), []byte("\x1b[?47l")}
 	inAlternateScreen := false
@@ -881,11 +919,22 @@ func (session *Session) detachAgentObserver(observer *client) {
 func (session *Session) input(data []byte) error {
 	session.inputMu.Lock()
 	defer session.inputMu.Unlock()
+	if session.rotationControlled {
+		if session.rotationGuardInstalled {
+			return errors.New("rotation owns terminal input")
+		}
+		session.rotationHumanInputSeen = true
+	}
 	session.mu.Lock()
 	exited := session.exited
+	supervisor := session.hostRotation
 	session.mu.Unlock()
 	if exited {
 		return io.ErrClosedPipe
+	}
+	session.humanInputRevision++
+	if supervisor != nil {
+		supervisor.humanInput()
 	}
 	_, err := session.pty.Write(data)
 	return err
@@ -906,7 +955,19 @@ func (session *Session) acknowledgedInput(clientID [16]byte, sequence uint64, da
 		session.mu.Unlock()
 		return nil
 	}
+	if session.rotationControlled {
+		if session.rotationGuardInstalled {
+			session.mu.Unlock()
+			return errors.New("rotation owns terminal input")
+		}
+		session.rotationHumanInputSeen = true
+	}
+	supervisor := session.hostRotation
 	session.mu.Unlock()
+	session.humanInputRevision++
+	if supervisor != nil {
+		supervisor.humanInput()
+	}
 	remaining := data
 	for len(remaining) > 0 {
 		written, err := session.pty.Write(remaining)
@@ -956,10 +1017,9 @@ type terminalGridSize struct {
 	rows uint16
 }
 
-// An unchanged TIOCSWINSZ does not reliably deliver SIGWINCH on Linux. Active
-// agent TUIs need a one-row pulse so reconnect replay captures a full screen;
-// an ordinary shell already has authoritative replay and pulsing it only
-// appends duplicate prompts on every app launch.
+// Attach output is parsed on the requested grid. A temporary row change can
+// produce cursor-addressed bytes for a grid the renderer never had. Repaint
+// an unchanged agent grid with an explicit SIGWINCH instead.
 func attachResizeSteps(
 	currentCols, currentRows, cols, rows uint16,
 	pulseUnchanged bool,
@@ -971,18 +1031,7 @@ func attachResizeSteps(
 	if !pulseUnchanged {
 		return nil
 	}
-	probe := target
-	if rows > 1 {
-		probe.rows--
-	} else if rows < ^uint16(0) {
-		probe.rows++
-	} else if cols > 1 {
-		probe.cols--
-	}
-	if probe == target {
-		return []terminalGridSize{target}
-	}
-	return []terminalGridSize{probe, target}
+	return []terminalGridSize{target}
 }
 
 // resizeForAttach gives an interactive program a small, bounded opportunity
@@ -1004,15 +1053,21 @@ func (session *Session) resizeForAttach(
 	if current != nil {
 		currentCols, currentRows = current.Cols, current.Rows
 	}
+	repaintUnchanged := pulseUnchanged && session.requiresAttachRepaint()
 	steps := attachResizeSteps(
 		currentCols, currentRows, cols, rows,
-		pulseUnchanged && session.requiresAttachRepaint(),
+		repaintUnchanged,
 	)
 	if len(steps) == 0 {
 		return before, false
 	}
 	for _, step := range steps {
 		if session.resizeLocked(step.cols, step.rows) != nil {
+			return before, false
+		}
+	}
+	if repaintUnchanged && currentCols == cols && currentRows == rows {
+		if err := session.signalForegroundResize(); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return before, false
 		}
 	}
@@ -1151,7 +1206,13 @@ func (session *Session) agentEvent(payload []byte) {
 
 	frame := protocol.Frame{Type: protocol.AgentEvent, Payload: append([]byte(nil), payload...)}
 	session.mu.Lock()
-	defer session.mu.Unlock()
+	defer func() {
+		supervisor := session.hostRotation
+		session.mu.Unlock()
+		if supervisor != nil {
+			supervisor.event(payload, journal != nil && journalErr == nil)
+		}
+	}()
 	session.eventHashes[hash] = struct{}{}
 	session.eventHashOrder = append(session.eventHashOrder, hash)
 	if len(session.eventHashOrder) > 4_096 {
@@ -1308,7 +1369,12 @@ func (session *Session) updateActiveSubagents(payload []byte) {
 		if rootID == "" {
 			rootID = envelope.Agent
 		}
-		delete(session.activeAgentRoots, rootID)
+		if !processRootStartedAfterEvent(session.activeAgentRoots[rootID], payload) {
+			delete(session.activeAgentRoots, rootID)
+		}
+		for _, legacyRoot := range legacyEndedProcessRoots(session.activeAgentRoots, payload) {
+			delete(session.activeAgentRoots, legacyRoot)
+		}
 		providerStillRunning := false
 		for _, activePayload := range session.activeAgentRoots {
 			var activeEnvelope struct {
@@ -1366,4 +1432,98 @@ func (session *Session) terminate() {
 	// explicit Relay termination does not orphan agent descendants.
 	_ = syscall.Kill(-pid, syscall.SIGHUP)
 	_ = session.process.Process.Signal(syscall.SIGTERM)
+}
+
+// programStatusSnapshot is untrusted display metadata, independent of native
+// provider identity, permissions, input ownership and transport status frames.
+func (session *Session) programStatusSnapshot() []programstatus.Record {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.programStatus.Snapshot()
+}
+
+// programStatusFrameLocked provides complete replacement state, including an
+// explicit empty array on clear. Revision is a session-local freshness cursor.
+// Replay snapshots never imply a new attention event.
+func (session *Session) programStatusFrameLocked(replay bool) protocol.Frame {
+	records := session.programStatus.Snapshot()
+	if records == nil {
+		records = make([]programstatus.Record, 0)
+	}
+	frame, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+		State: "program_status", ProgramStatus: &records,
+		ProgramStatusRevision: session.programStatusRevision, ProgramStatusReplay: replay,
+	})
+	return frame
+}
+
+func (session *Session) broadcastProgramStatusLocked() {
+	frame := session.programStatusFrameLocked(false)
+	for viewer := range session.clients {
+		if !viewer.includeProgramStatus {
+			continue
+		}
+		select {
+		case viewer.frames <- frame:
+		default:
+			viewer.markLagged()
+			delete(session.clients, viewer)
+		}
+	}
+}
+
+// Only fresh owned PTY output reaches this queue. Replays, report text and
+// client input never generate device replies. Pending amplification is bounded.
+func (session *Session) queueProgramStatusReplies(count int) {
+	if session.programStatusReplies == nil || count <= 0 {
+		return
+	}
+	if count > 32 {
+		count = 32
+	}
+	select {
+	case session.programStatusReplies <- count:
+	default:
+	}
+}
+
+// Device responses do not acquire a client lease or count as human input.
+// They contain the fixed protocol literal only, serialized with existing PTY writes.
+func (session *Session) writeProgramStatusReplies() {
+	for {
+		select {
+		case <-session.done:
+			return
+		case count := <-session.programStatusReplies:
+			session.inputMu.Lock()
+			session.mu.Lock()
+			exited := session.exited
+			session.mu.Unlock()
+			if !exited && session.pty != nil {
+				_, _ = session.pty.Write(bytes.Repeat([]byte(programstatus.DetectionReply), count))
+			}
+			session.inputMu.Unlock()
+		}
+	}
+}
+
+// Negotiate on the authenticated connection after attach. Older supervisors
+// forward this frame unchanged even when they strip newer Hello fields.
+// Replay and subsequent fresh updates share the same lock and bounded queue.
+func (session *Session) setProgramStatusObservation(viewer *client, enabled bool) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if _, attached := session.clients[viewer]; !attached || viewer.includeProgramStatus == enabled {
+		return
+	}
+	viewer.includeProgramStatus = enabled
+	if !enabled {
+		return
+	}
+	select {
+	case viewer.frames <- session.programStatusFrameLocked(true):
+	default:
+		viewer.markLagged()
+		delete(session.clients, viewer)
+	}
 }

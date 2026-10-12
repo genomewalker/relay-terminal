@@ -1,0 +1,263 @@
+--- a/codex-rs/tui/src/app/rotation.rs
++++ b/codex-rs/tui/src/app/rotation.rs
+@@ -4,6 +4,37 @@
+ use crate::tui::rotation::FrontendRotationRequest;
+ 
+ impl App {
++    pub(super) fn prepare_context_rotation(
++        &self,
++        tui: &mut tui::Tui,
++        events: &mpsc::UnboundedReceiver<AppEvent>,
++        app_server: &AppServerSession,
++        request: crate::app_server_session::context_rotation::ContextRotationRequest,
++    ) {
++        if request.reply.is_closed() {
++            return;
++        }
++        if !self.frontend_rotation_ready(events, request.thread_id, &request.turn_id) {
++            tui.invalidate_context_rotation();
++            request.refuse("frontend is not ready for context rotation");
++            return;
++        }
++        let frontend = match tui.reserve_context_rotation(
++            request.thread_id,
++            request.turn_id.clone(),
++            request.deadline,
++        ) {
++            Ok(frontend) => frontend,
++            Err(_) => {
++                request.refuse("frontend context rotation reservation was refused");
++                return;
++            }
++        };
++        // The future owns the request handle. Continue reading input while core preparation waits.
++        let prepare = app_server.prepare_context_rotation(frontend);
++        tokio::spawn(request.complete(prepare));
++    }
++
+     pub(super) fn prepare_frontend_rotation(
+         &self,
+         tui: &mut tui::Tui,
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -122,6 +122,9 @@
+             event => (event, None),
+         };
+         match event {
++            AppEvent::PrepareContextRotation(request) => {
++                request.refuse("context rotation requires the foreground queue owner");
++            }
+             AppEvent::PrepareFrontendRotation(request) => {
+                 // Only the foreground loop can prove its input queues are drained.
+                 let _ = request.reply.send(Err(crate::tui::rotation::FrontendRotationError::Unavailable));
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -1149,6 +1149,10 @@
+                 let control = select! {
+                     Some(event) = app_event_rx.recv() => {
+                         let event = match event {
++                            AppEvent::PrepareContextRotation(request) => {
++                                app.prepare_context_rotation(tui, &app_event_rx, &app_server, request);
++                                continue;
++                            }
+                             AppEvent::PrepareFrontendRotation(request) => {
+                                 app.prepare_frontend_rotation(tui, &app_event_rx, request);
+                                 continue;
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -279,6 +279,7 @@
+ #[derive(Debug, IntoStaticStr)]
+ pub(crate) enum AppEvent {
+     PrepareFrontendRotation(crate::tui::rotation::FrontendRotationRequest),
++    PrepareContextRotation(crate::app_server_session::context_rotation::ContextRotationRequest),
+     SecuritySetupLoaded {
+         request_id: uuid::Uuid,
+         identity: crate::security_setup::Identity,
+--- a/codex-rs/tui/src/app_event_sender.rs
++++ b/codex-rs/tui/src/app_event_sender.rs
+@@ -30,6 +30,36 @@
+ }
+ 
+ impl AppEventSender {
++    pub(crate) fn prepare_context_rotation(
++        &self,
++        thread_id: ThreadId,
++        turn_id: String,
++    ) -> impl std::future::Future<
++        Output = color_eyre::Result<
++            crate::app_server_session::context_rotation::PreparedContextRotation,
++        >,
++    >
++    + Send
++    + 'static
++    + use<> {
++        let sender = self.clone();
++        async move {
++            let (reply, response) = tokio::sync::oneshot::channel();
++            let request = crate::app_server_session::context_rotation::ContextRotationRequest::new(
++                thread_id, turn_id, reply,
++            );
++            let deadline = request.deadline;
++            sender.send(AppEvent::PrepareContextRotation(request));
++            tokio::time::timeout_at(deadline, response)
++                .await
++                .map_err(|_| {
++                    color_eyre::eyre::eyre!("foreground context rotation request expired")
++                })?
++                .map_err(|_| color_eyre::eyre::eyre!("foreground context rotation owner closed"))?
++                .map_err(color_eyre::Report::msg)
++        }
++    }
++
+     pub(crate) fn new(app_event_tx: UnboundedSender<AppEvent>) -> Self {
+         Self {
+             app_event_tx,
+--- a/codex-rs/tui/src/app_server_session/context_rotation.rs
++++ b/codex-rs/tui/src/app_server_session/context_rotation.rs
+@@ -98,3 +98,62 @@
+         }
+     }
+ }
++
++/// A requester hands preparation to the queue owner and receives the owned pair of leases.
++pub(crate) struct ContextRotationRequest {
++    pub(crate) thread_id: ThreadId,
++    pub(crate) turn_id: String,
++    pub(crate) deadline: tokio::time::Instant,
++    pub(crate) reply:
++        tokio::sync::oneshot::Sender<std::result::Result<PreparedContextRotation, String>>,
++}
++
++impl std::fmt::Debug for ContextRotationRequest {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter
++            .debug_struct("ContextRotationRequest")
++            .field("thread_id", &self.thread_id)
++            .field("turn_id", &self.turn_id)
++            .field("deadline", &self.deadline)
++            .finish_non_exhaustive()
++    }
++}
++
++impl ContextRotationRequest {
++    pub(crate) fn new(
++        thread_id: ThreadId,
++        turn_id: String,
++        reply: tokio::sync::oneshot::Sender<std::result::Result<PreparedContextRotation, String>>,
++    ) -> Self {
++        Self {
++            thread_id,
++            turn_id,
++            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
++            reply,
++        }
++    }
++
++    pub(crate) fn refuse(self, reason: impl Into<String>) {
++        let _ = self.reply.send(Err(reason.into()));
++    }
++
++    pub(crate) async fn complete(
++        mut self,
++        prepare: impl std::future::Future<Output = Result<PreparedContextRotation>> + Send + 'static,
++    ) {
++        let result = tokio::select! {
++            biased;
++            _ = self.reply.closed() => return,
++            result = tokio::time::timeout_at(self.deadline, prepare) => match result {
++                Ok(result) => result.map_err(|error| error.to_string()),
++                Err(_) => Err("context rotation preparation expired".to_owned()),
++            },
++        };
++        // A dropped requester drops the returned pair here, releasing both reservations.
++        let _ = self.reply.send(result);
++    }
++}
++
++#[cfg(test)]
++#[path = "context_rotation_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/tui/src/app_server_session/context_rotation_tests.rs
+@@ -0,0 +1,81 @@
++use super::*;
++use std::pin::Pin;
++use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++use std::task::Context;
++use std::task::Poll;
++
++struct PendingPreparation(Arc<AtomicBool>);
++
++impl std::future::Future for PendingPreparation {
++    type Output = Result<PreparedContextRotation>;
++
++    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
++        Poll::Pending
++    }
++}
++
++impl Drop for PendingPreparation {
++    fn drop(&mut self) {
++        self.0.store(true, Ordering::SeqCst);
++    }
++}
++
++fn request(
++    reply: tokio::sync::oneshot::Sender<std::result::Result<PreparedContextRotation, String>>,
++) -> ContextRotationRequest {
++    ContextRotationRequest::new(
++        ThreadId::from_string("00000000-0000-0000-0000-000000000701").expect("thread"),
++        "completed-turn".to_owned(),
++        reply,
++    )
++}
++
++#[tokio::test]
++async fn context_rotation_requester_disconnect_drops_pending_native_preparation() {
++    let dropped = Arc::new(AtomicBool::new(false));
++    let (reply, response) = tokio::sync::oneshot::channel();
++    let request = request(reply);
++    drop(response);
++    request.complete(PendingPreparation(dropped.clone())).await;
++    assert!(dropped.load(Ordering::SeqCst));
++}
++
++#[tokio::test]
++async fn context_rotation_request_deadline_drops_pending_native_preparation() {
++    let dropped = Arc::new(AtomicBool::new(false));
++    let (reply, response) = tokio::sync::oneshot::channel();
++    let mut request = request(reply);
++    request.deadline = tokio::time::Instant::now();
++    request.complete(PendingPreparation(dropped.clone())).await;
++    assert!(dropped.load(Ordering::SeqCst));
++    assert!(
++        matches!(response.await, Ok(Err(error)) if error == "context rotation preparation expired")
++    );
++}
++
++#[tokio::test]
++async fn context_rotation_request_propagates_native_refusal() {
++    let (reply, response) = tokio::sync::oneshot::channel();
++    request(reply)
++        .complete(std::future::ready(Err(color_eyre::eyre::eyre!(
++            "native refusal"
++        ))))
++        .await;
++    assert!(matches!(response.await, Ok(Err(error)) if error == "native refusal"));
++}
++
++#[tokio::test]
++async fn context_rotation_request_with_closed_foreground_returns_an_error() {
++    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
++    drop(rx);
++    let sender = crate::app_event_sender::AppEventSender::new(tx);
++    let thread = ThreadId::from_string("00000000-0000-0000-0000-000000000702").expect("thread");
++    assert!(
++        sender
++            .prepare_context_rotation(thread, "completed-turn".to_owned())
++            .await
++            .is_err()
++    );
++}

@@ -1,0 +1,267 @@
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -1,4 +1,5 @@
+ mod managed;
++mod rotation_admission;
+ mod shared_instructions;
+ 
+ use crate::CodexAppsToolsCache;
+@@ -400,6 +401,7 @@
+ /// `Arc` reference that can be downgraded to by `LocalAgentControl` while preventing every single
+ /// function to require an `Arc<&Self>`.
+ pub(crate) struct ThreadManagerState {
++    pub(crate) rotation_admission: crate::session::ActivityAdmission,
+     // Eviction updates this registry and residency together, locking the registry first.
+     pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+     shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
+@@ -564,6 +566,7 @@
+             };
+         Self {
+             state: Arc::new(ThreadManagerState {
++                rotation_admission: crate::session::ActivityAdmission::default(),
+                 threads: Arc::new(RwLock::new(HashMap::new())),
+                 shared_thread_instructions: Default::default(),
+                 thread_created_tx,
+@@ -736,6 +739,7 @@
+         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
+         Self {
+             state: Arc::new(ThreadManagerState {
++                rotation_admission: crate::session::ActivityAdmission::default(),
+                 threads: Arc::new(RwLock::new(HashMap::new())),
+                 shared_thread_instructions: Default::default(),
+                 thread_created_tx,
+@@ -2038,6 +2042,10 @@
+ 
+     /// Spawn a new thread with optional history and register it with the manager.
+     async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
++        let admission =
++            self.rotation_admission.enter().await.ok_or_else(|| {
++                CodexErr::Fatal("thread creation admission is closed".to_string())
++            })?;
+         let ThreadSpawnRequest {
+             startup,
+             options,
+@@ -2074,6 +2082,21 @@
+         } = options;
+         let inherited_environments = captured_environments.or(inherited_environments);
+         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
++        // Retain child admission after registry removal and through asynchronous
++        // cleanup. A conservative manager-wide reservation requires all child
++        // runtimes to be gone, including internal reviewers and warm residents.
++        if session_source.is_non_root_agent()
++            || session_source.is_internal()
++            || parent_thread_id.is_some()
++            || matches!(
++                &thread_source,
++                Some(ThreadSource::Subagent | ThreadSource::GuardianReview)
++            )
++        {
++            thread_extension_init.insert(rotation_admission::ResidentChild {
++                _admission: Arc::clone(&admission),
++            });
++        }
+         // Older callers and saved reviewers identify isolation through their source.
+         // New internal callers supply an explicit runtime policy before startup.
+         let isolation = thread_extension_init
+--- a/codex-rs/core/src/agent/control/spawn.rs
++++ b/codex-rs/core/src/agent/control/spawn.rs
+@@ -316,6 +316,10 @@
+         parent: Option<Arc<CodexThread>>,
+     ) -> CodexResult<()> {
+         let state = self.runtime.upgrade()?;
++        let _admission =
++            state.rotation_admission.enter().await.ok_or_else(|| {
++                CodexErr::Fatal("thread creation admission is closed".to_string())
++            })?;
+         let owner_thread_id = parent.as_ref().map(|parent| parent.session.thread_id);
+         if let Some(parent) = &parent {
+             let parent_thread_id = parent.session.thread_id;
+@@ -636,6 +640,10 @@
+     ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
+         let spawn_started_at = Instant::now();
+         let state = self.runtime.upgrade()?;
++        let _admission =
++            state.rotation_admission.enter().await.ok_or_else(|| {
++                CodexErr::Fatal("thread creation admission is closed".to_string())
++            })?;
+         let multi_agent_version = state
+             .effective_multi_agent_version_for_spawn(
+                 &InitialHistory::New,
+@@ -1256,12 +1264,16 @@
+         thread_id: ThreadId,
+         session_source: SessionSource,
+     ) -> CodexResult<ThreadId> {
++        let state = self.runtime.upgrade()?;
++        let _admission =
++            state.rotation_admission.enter().await.ok_or_else(|| {
++                CodexErr::Fatal("thread creation admission is closed".to_string())
++            })?;
+         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
+         let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
+             self.resume_single_agent_from_rollout(config.clone(), thread_id, session_source),
+         )
+         .await?;
+-        let state = self.runtime.upgrade()?;
+         if config.multi_agent_version_from_features() == MultiAgentVersion::V2
+             || resumed_multi_agent_version == MultiAgentVersion::V2
+         {
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -241,6 +241,7 @@
+ pub(crate) use reasoning_effort::RequestEffortUsage;
+ pub(crate) use submission::Submission;
+ pub(crate) mod activity_admission;
++pub(crate) use activity_admission::ActivityAdmission;
+ mod input_queue;
+ mod mcp;
+ mod mcp_prewarm;
+--- /dev/null
++++ b/codex-rs/core/src/thread_manager/rotation_admission.rs
+@@ -0,0 +1,25 @@
++//! Manager-wide child creation and residency exclusion for native rotation.
++//! This is deliberately conservative: any resident child in this manager blocks
++//! reservation, even when it belongs to another root. The managed TUI normally
++//! owns one root per manager. External agent controllers require their own proof.
++use super::ThreadManagerState;
++use crate::session::ActivityAdmission;
++use std::sync::Arc;
++use tokio::sync::OwnedRwLockReadGuard;
++
++/// Kept in the child's extension data until its last runtime owner is dropped.
++pub(super) struct ResidentChild {
++    pub(super) _admission: Arc<OwnedRwLockReadGuard<()>>,
++}
++
++impl ThreadManagerState {
++    pub(crate) fn local_rotation_admission(&self) -> Option<ActivityAdmission> {
++        self.agent_control_factory
++            .is_none()
++            .then(|| self.rotation_admission.clone())
++    }
++}
++
++#[cfg(test)]
++#[path = "rotation_admission_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/core/src/thread_manager/rotation_admission_tests.rs
+@@ -0,0 +1,119 @@
++//! Offline manager entry-point and child-lifetime checks; no model turns.
++use crate::config::Config;
++use crate::config::test_config;
++use crate::thread_manager::StartThreadOptions;
++use crate::thread_manager::ThreadManager;
++use codex_login::CodexAuth;
++use codex_protocol::protocol::SessionSource;
++use codex_protocol::protocol::SubAgentSource;
++use futures::poll;
++use pretty_assertions::assert_eq;
++use std::sync::Arc;
++use std::task::Poll;
++use wiremock::MockServer;
++
++async fn fixture() -> (ThreadManager, Config, MockServer) {
++    let server = MockServer::start().await;
++    let mut config = test_config().await;
++    config.ephemeral = true;
++    config.model_provider.base_url = Some(server.uri());
++    config.model_provider.supports_websockets = false;
++    let manager = ThreadManager::with_models_provider_and_home_for_tests(
++        CodexAuth::from_api_key("dummy"),
++        config.model_provider.clone(),
++        config.codex_home.to_path_buf(),
++        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
++    );
++    (manager, config, server)
++}
++
++#[tokio::test]
++async fn reserved_manager_fences_creation_before_session_startup() {
++    let (manager, config, server) = fixture().await;
++    let admission = manager.state.local_rotation_admission().unwrap();
++    let reserved = admission.try_reserve(0).unwrap();
++    {
++        let start = manager.start_thread(StartThreadOptions {
++            environments: Some(Vec::new()),
++            ..StartThreadOptions::new(config)
++        });
++        tokio::pin!(start);
++        assert!(matches!(poll!(&mut start), Poll::Pending));
++        reserved.invalidated().await;
++        assert!(manager.list_thread_ids().await.is_empty());
++        assert!(server.received_requests().await.unwrap().is_empty());
++    }
++    assert!(!reserved.is_current());
++    drop(reserved);
++    let generation = admission.generation().unwrap();
++    assert!(admission.try_reserve(generation).is_some());
++}
++
++#[tokio::test]
++async fn removed_child_retains_admission_through_shutdown_and_last_owner() {
++    let (manager, config, server) = fixture().await;
++    let child = manager
++        .start_thread(StartThreadOptions {
++            environments: Some(Vec::new()),
++            session_source: Some(SessionSource::SubAgent(SubAgentSource::Other(
++                "rotation-admission-fixture".to_string(),
++            ))),
++            ..StartThreadOptions::new(config)
++        })
++        .await
++        .unwrap();
++    let admission = manager.state.local_rotation_admission().unwrap();
++    let generation = admission.generation().unwrap();
++    assert!(admission.try_reserve(generation).is_none());
++    let removed = manager.remove_thread(&child.thread_id).await.unwrap();
++    assert!(manager.list_thread_ids().await.is_empty());
++    assert!(admission.try_reserve(generation).is_none());
++    removed.shutdown_and_wait().await.unwrap();
++    assert!(admission.try_reserve(generation).is_none());
++    drop(removed);
++    drop(child);
++    assert!(admission.try_reserve(generation).is_some());
++    assert!(
++        server
++            .received_requests()
++            .await
++            .unwrap()
++            .iter()
++            .all(|request| request.url.path().ends_with("/models"))
++    );
++}
++
++#[tokio::test]
++async fn root_residency_does_not_hold_child_creation_admission() {
++    let (manager, config, server) = fixture().await;
++    let root = manager
++        .start_thread(StartThreadOptions {
++            environments: Some(Vec::new()),
++            ..StartThreadOptions::new(config)
++        })
++        .await
++        .unwrap();
++    let admission = manager.state.local_rotation_admission().unwrap();
++    let generation = admission.generation().unwrap();
++    assert!(admission.try_reserve(generation).is_some());
++    root.thread.shutdown_and_wait().await.unwrap();
++    assert!(
++        server
++            .received_requests()
++            .await
++            .unwrap()
++            .iter()
++            .all(|request| request.url.path().ends_with("/models"))
++    );
++}
++
++#[tokio::test]
++async fn external_controller_factory_cannot_claim_local_admission_proof() {
++    let (manager, _config, _server) = fixture().await;
++    let manager = manager.with_agent_control_factory(|_| async {
++        Err(codex_protocol::error::CodexErr::Fatal(
++            "factory must not be called".to_string(),
++        ))
++    });
++    assert_eq!(manager.state.local_rotation_admission().is_some(), false);
++}

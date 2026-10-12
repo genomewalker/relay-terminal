@@ -101,12 +101,14 @@ final class RelayPreferences: ObservableObject {
     @Published var showArtifactPreviews: Bool { didSet { save() } }
     @Published var artifactPresentation: RelayArtifactPresentation { didSet { save() } }
     @Published var intelligenceEnabled: Bool { didSet { save() } }
+    @Published var decisionModelPath: String { didSet { save() } }
+    @Published var decisionModelSHA256: String { didSet { save() } }
     @Published var automaticAgentSummaries: Bool { didSet { save() } }
     @Published var semanticAgentSearch: Bool { didSet { save() } }
     @Published var automaticallyUpdateRelayd: Bool { didSet { save() } }
     @Published private(set) var keyBindings: [String: RelayKeyBinding] { didSet { save() } }
 
-    private let defaults = UserDefaults.standard
+    private let defaults = RelayStateProfile.defaults
     private var isLoading = true
 
     private init() {
@@ -124,6 +126,8 @@ final class RelayPreferences: ObservableObject {
             rawValue: defaults.string(forKey: "relay.settings.artifact-presentation") ?? ""
         ) ?? .preview
         let intelligenceRevision = defaults.integer(forKey: "relay.settings.intelligence-opt-in-revision")
+        decisionModelPath = defaults.string(forKey: "relay.settings.decision-model-path") ?? ""
+        decisionModelSHA256 = defaults.string(forKey: "relay.settings.decision-model-sha256") ?? ""
         intelligenceEnabled = RelayIntelligencePreferencePolicy.enabled(
             storedValue: defaults.object(forKey: "relay.settings.intelligence-enabled") as? Bool,
             storedRevision: intelligenceRevision
@@ -175,13 +179,25 @@ final class RelayPreferences: ObservableObject {
         keyBindings.removeValue(forKey: command.rawValue)
     }
 
+    /// Called only after the complete map passed RelaySettingsPolicy validation.
+    func replaceValidatedKeyBindings(_ bindings: [String: RelayKeyBinding]) {
+        keyBindings = bindings
+    }
+
     func resetAllKeyBindings() {
         keyBindings.removeAll()
     }
 
     func terminalConfiguration() -> TerminalConfiguration {
         let resolvedFamily = resolvedFontFamily
-        return TerminalConfiguration(startingFrom: .default) { builder in
+        // Preserve the existing ANSI palette while applying Relay's explicit
+        // colors last, without a controller theme overriding them afterward.
+        return TerminalConfiguration(startingFrom: TerminalConfiguration(startingFrom: .default) { builder in
+            let colors = ["151515", "AC4142", "7E8E50", "E4B567", "6C99BB", "9F4E86", "7DD5CF", "D0D0D0", "505050", "AC4142", "7E8E50", "E4B567", "6C99BB", "9F4E86", "7DD5CF", "F5F5F5"]
+            for (index, color) in colors.enumerated() {
+                builder.withPalette(index, color: "#" + color)
+            }
+        }) { builder in
             builder.withFontFamily(resolvedFamily)
             let normalizedFontSize = String(
                 format: "%.1f",
@@ -200,13 +216,12 @@ final class RelayPreferences: ObservableObject {
             builder.withSelectionBackground(palette.selectionBackground)
             builder.withSelectionForeground(palette.selectionForeground)
             // Relay reads the local selection to implement prompt editing.
-            // Clear the renderer selection after an explicit copy. Relay
-            // replays local drags with Shift held so Ghostty selects under TUI
-            // mouse reporting; with a retained selection, Ghostty's
-            // Shift+press EXTENDS from the old anchor, so a later drag (or a
-            // jittery click) silently spanned a previous selection. Until the
-            // fork exposes a selection reset, drop the anchor on copy.
-            builder.withCustom("selection-clear-on-copy", "true")
+            // Keep the highlight after an explicit copy. Relay replays local
+            // drags with Shift held so Ghostty selects under TUI mouse
+            // reporting, and a retained selection would make that Shift+press
+            // extend from the old anchor — so the runtime resets the selection
+            // (libghostty resetSelection) right before replaying a new drag.
+            builder.withCustom("selection-clear-on-copy", "false")
             builder.withCustom("minimum-contrast", "2.2")
             builder.withBackgroundOpacity(1)
             builder.withCursorColor(palette.cursor)
@@ -218,6 +233,9 @@ final class RelayPreferences: ObservableObject {
             let padding = Int(min(max(terminalPadding.rounded(), 0), 32))
             builder.withWindowPaddingX(padding)
             builder.withWindowPaddingY(padding)
+            // Prompt editing converts IME positions back to grid cells using
+            // this explicit padding; surplus pixels stay at the trailing edge.
+            builder.withCustom("window-padding-balance", "false")
             // Never let pointer gestures write the system clipboard: Ghostty
             // re-copies a retained selection on every left-button release, so
             // a misclassified click clobbered whatever the user was about to
@@ -274,6 +292,8 @@ final class RelayPreferences: ObservableObject {
         defaults.set(showArtifactPreviews, forKey: "relay.settings.artifact-previews")
         defaults.set(artifactPresentation.rawValue, forKey: "relay.settings.artifact-presentation")
         defaults.set(intelligenceEnabled, forKey: "relay.settings.intelligence-enabled")
+        defaults.set(decisionModelPath, forKey: "relay.settings.decision-model-path")
+        defaults.set(decisionModelSHA256, forKey: "relay.settings.decision-model-sha256")
         defaults.set(automaticAgentSummaries, forKey: "relay.settings.intelligence-summaries")
         defaults.set(semanticAgentSearch, forKey: "relay.settings.intelligence-search")
         defaults.set(automaticallyUpdateRelayd, forKey: "relay.settings.relayd-auto-update")

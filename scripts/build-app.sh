@@ -3,31 +3,28 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 configuration="${1:-release}"
-app_version="${RELAY_APP_VERSION:-${RELAY_VERSION:-0.5.2}}"
+app_version="${RELAY_APP_VERSION:-${RELAY_VERSION:-0.5.3}}"
 relayd_version="${RELAYD_VERSION:-$app_version}"
 relayd_protocol_version="${RELAYD_PROTOCOL_VERSION:-2}"
 build_number="${RELAY_BUILD_NUMBER:-1}"
 signing_identity="${RELAY_CODESIGN_IDENTITY:--}"
+bundle_name="${RELAY_BUNDLE_NAME:-Relay}"
+bundle_identifier="${RELAY_BUNDLE_IDENTIFIER:-dev.relay.terminal}"
 build_jobs="${RELAY_BUILD_JOBS:-2}"
 cd "$project_root"
-swift build -c "$configuration" --jobs "$build_jobs"
-binary_path="$(cd "$project_root" && swift build -c "$configuration" --jobs "$build_jobs" --show-bin-path)"
+python3 "$project_root/scripts/check-rotation-resources.py"
+swift_build_args=(-c "$configuration" --jobs "$build_jobs")
+# Keep compiler caches outside File Provider and use SwiftPM's supported default.
+# Canonicalize /tmp to /private/tmp so Clang never sees two module-cache paths.
+build_scratch="${RELAY_BUILD_SCRATCH_PATH:-/private/tmp/relay-swiftpm-build}"
+mkdir -p "$build_scratch"
+build_scratch="$(cd "$build_scratch" && pwd -P)"
+swift_build_args+=(--scratch-path "$build_scratch")
+swift build "${swift_build_args[@]}"
+binary_path="$(swift build "${swift_build_args[@]}" --show-bin-path)"
 
-# SwiftPM generates command-line executable accessors that resolve resource
-# bundles beside Bundle.main.bundleURL. Once wrapped as a signed .app, bundles
-# must live in Contents/Resources. Rewrite only generated accessors and rebuild
-# when needed so the executable uses the standard macOS resource location.
-accessor_changed=0
-while IFS= read -r -d '' accessor; do
-    if /usr/bin/grep -q 'Bundle.main.bundleURL.appendingPathComponent' "$accessor"; then
-        /usr/bin/perl -pi -e 's/Bundle\.main\.bundleURL\.appendingPathComponent/Bundle.main.resourceURL!.appendingPathComponent/g' "$accessor"
-        accessor_changed=1
-    fi
-done < <(/usr/bin/find "$(dirname "$binary_path")/$configuration" -path '*/DerivedSources/resource_bundle_accessor.swift' -print0)
-if [[ "$accessor_changed" == "1" ]]; then
-    swift build -c "$configuration" --jobs "$build_jobs"
-    binary_path="$(cd "$project_root" && swift build -c "$configuration" --jobs "$build_jobs" --show-bin-path)"
-fi
+# Resource loaders must resolve Contents/Resources in an installed app. Do not
+# rewrite generated SwiftPM accessors: subsequent builds regenerate them.
 workspace_link="$project_root/Relay.app"
 # A bundle inside Documents may be managed by File Provider, which immediately
 # reapplies extended attributes and invalidates strict code-sign verification.
@@ -40,6 +37,18 @@ if [[ -d "/Applications/Relay.app" ]]; then
     default_output="/Applications/Relay.app"
 fi
 output_path="${RELAY_APP_OUTPUT:-$default_output}"
+
+is_executable_running() {
+    /bin/ps -axo comm= | /usr/bin/perl -MCwd=realpath -e '
+        my $target = realpath(shift) // "";
+        while (my $path = <STDIN>) {
+            chomp $path;
+            my $resolved = realpath($path) // $path;
+            exit 0 if length($target) && $resolved eq $target;
+        }
+        exit 1;
+    ' -- "$1"
+}
 stage_root="$(mktemp -d "${TMPDIR:-/tmp}/relay-app.XXXXXX")"
 trap '/bin/rm -rf "$stage_root"' EXIT
 app_path="$stage_root/Relay.app"
@@ -47,23 +56,88 @@ app_path="$stage_root/Relay.app"
 mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
 cp "$binary_path/Relay" "$app_path/Contents/MacOS/Relay"
 cp "$binary_path/relay-bridge" "$app_path/Contents/MacOS/relay-bridge"
+# One signed Keychain client. Secrets use stdin/stdout pipes, never argv or files.
+/usr/bin/swiftc -O "$project_root/native/credentials/relay-credentials.swift" \
+    -o "$app_path/Contents/MacOS/relay-credentials"
+
+# This bridge runs as the user, never as root. The privileged tunnel service is
+# separate; Homebrew libraries must not be loaded by a privileged service.
+if command -v pkg-config >/dev/null && pkg-config --exists openconnect; then
+    read -r -a vpn_cflags <<< "$(pkg-config --cflags openconnect)"
+    read -r -a vpn_libs <<< "$(pkg-config --libs openconnect)"
+    /usr/bin/clang -fobjc-arc -framework Foundation -framework Security "${vpn_cflags[@]}" \
+        "$project_root/native/vpn/relay-vpn-auth.m" "${vpn_libs[@]}" \
+        -o "$app_path/Contents/MacOS/relay-vpn-auth"
+    if [[ "$signing_identity" == "-" ]]; then
+        /usr/bin/codesign --force --sign - "$app_path/Contents/MacOS/relay-vpn-auth"
+    else
+        /usr/bin/codesign --force --options runtime --timestamp --sign "$signing_identity" "$app_path/Contents/MacOS/relay-vpn-auth"
+    fi
+    vpn_auth_hash="$(/usr/bin/codesign -d --verbose=4 "$app_path/Contents/MacOS/relay-vpn-auth" 2>&1 | /usr/bin/sed -n 's/^CDHash=//p')"
+    if [[ ! "$vpn_auth_hash" =~ ^[0-9a-fA-F]{40}$ ]]; then echo "VPN bridge signature hash missing" >&2; exit 1; fi
+    printf '#define RELAY_VPN_AUTH_REQUIREMENT "cdhash H\\"%s\\""\n' "$vpn_auth_hash" > "$stage_root/vpn-requirement.h"
+    /usr/bin/clang -fobjc-arc -framework Foundation -framework SystemConfiguration \
+        -include "$stage_root/vpn-requirement.h" "$project_root/native/vpn/relay-vpn-network.m" \
+        -o "$app_path/Contents/MacOS/relay-vpn-network"
+    mkdir -p "$app_path/Contents/Library/LaunchDaemons"
+    cp "$project_root/native/vpn/dev.relay.terminal.vpn-network.plist" "$app_path/Contents/Library/LaunchDaemons/"
+fi
 # SwiftPM emits one resource bundle for Relay and another for Ghostty's
 # terminfo/shell-integration assets. Copy all of them so a packaged app never
 # falls back to absolute development paths in .build (which may be offline or
 # File Provider-managed).
 for resource_bundle in "$binary_path"/*.bundle; do
     if [[ -d "$resource_bundle" ]]; then
-        ditto "$resource_bundle" "$app_path/Contents/Resources/$(basename "$resource_bundle")"
+        # SwiftPM resource caches can contain symlinks to source assets. Materialize
+        # them so the installed bundle never depends on that build cache or checkout.
+        python3 - "$resource_bundle" "$app_path/Contents/Resources/$(basename "$resource_bundle")" <<'PY'
+import shutil
+import sys
+shutil.copytree(sys.argv[1], sys.argv[2], symlinks=False)
+PY
     fi
 done
 
-ghostty_bundle="$app_path/Contents/Resources/GhosttyKit_GhosttyTerminal.bundle"
+resource_root() {
+    local bundle="$1"
+    if [[ -d "$bundle/Contents/Resources" ]]; then
+        printf '%s\n' "$bundle/Contents/Resources"
+    else
+        printf '%s\n' "$bundle"
+    fi
+}
+ghostty_bundle="$(resource_root "$app_path/Contents/Resources/GhosttyKit_GhosttyTerminal.bundle")"
+# Xcode's SwiftPM cache can emit an empty resource bundle with directory stubs.
+# Copy the pinned dependency's canonical resources as part of packaging.
+python3 - "$project_root/Vendor/libghostty-spm/Sources/GhosttyTerminal/Resources" "$ghostty_bundle" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+source, destination = map(Path, sys.argv[1:])
+for name in ("Ghostty", "terminfo"):
+    if not (source / name).is_dir():
+        raise SystemExit("canonical Ghostty resources are missing")
+    shutil.copytree(source / name, destination / name, symlinks=False, dirs_exist_ok=True)
+required = (
+    "Ghostty/shell-integration/bash/bash-preexec.sh",
+    "Ghostty/shell-integration/bash/ghostty.bash",
+    "Ghostty/shell-integration/elvish/lib/ghostty-integration.elv",
+    "Ghostty/shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish",
+    "Ghostty/shell-integration/nushell/vendor/autoload/ghostty.nu",
+    "Ghostty/shell-integration/zsh/ghostty-integration",
+    "terminfo/67/ghostty", "terminfo/78/xterm-ghostty",
+)
+for relative in required:
+    path = destination / relative
+    if not path.is_file() or path.stat().st_size == 0:
+        raise SystemExit("packaged Ghostty resource is missing: " + relative)
+PY
 if [[ ! -d "$ghostty_bundle/Ghostty" || ! -d "$ghostty_bundle/terminfo" ]]; then
     echo "packaged Ghostty resources are incomplete" >&2
     exit 1
 fi
 
-relay_bundle="$app_path/Contents/Resources/Relay_Relay.bundle"
+relay_bundle="$(resource_root "$app_path/Contents/Resources/Relay_Relay.bundle")"
 relay_terminfo="$relay_bundle/Terminfo/78/xterm-relay"
 if [[ ! -s "$relay_terminfo" ]]; then
     echo "packaged xterm-relay entry is missing" >&2
@@ -78,6 +152,7 @@ fi
 # Remote installation is explicit in the UI, but it must remain offline and
 # reproducible once authorized. Bundle the exact static Linux helpers inside
 # the signed app rather than downloading an executable at connection time.
+python3 "$project_root/scripts/sync-daemon-communication-assets.py"
 for relay_architecture in amd64 arm64; do
     (
         cd "$project_root/remote/relayd"
@@ -86,6 +161,13 @@ for relay_architecture in amd64 arm64; do
             -o "$app_path/Contents/Resources/relayd-linux-$relay_architecture" ./cmd/relayd
     )
     chmod 0555 "$app_path/Contents/Resources/relayd-linux-$relay_architecture"
+    (
+        cd "$project_root/remote/relayd"
+        CGO_ENABLED=0 GOOS=linux GOARCH="$relay_architecture" \
+            go build -trimpath -ldflags="-s -w" \
+            -o "$app_path/Contents/Resources/relay-peer-link-linux-$relay_architecture" ./cmd/relay-peer-link
+    )
+    chmod 0555 "$app_path/Contents/Resources/relay-peer-link-linux-$relay_architecture"
 done
 
 # The Linux payloads cannot run on the build Mac. Build the same source for the
@@ -100,6 +182,18 @@ if [[ "$($relayd_version_check --version)" != "relayd $relayd_version" ]]; then
     echo "relayd version stamping failed" >&2
     exit 1
 fi
+cp "$relayd_version_check" "$app_path/Contents/MacOS/relayd"
+(
+    cd "$project_root/remote/relayd"
+    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-mcp" ./cmd/relay-mcp
+    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-peer-link" ./cmd/relay-peer-link
+    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-connection" ./cmd/relay-connection
+    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-workspace" ./cmd/relay-workspace
+)
+mkdir -p "$app_path/Contents/Resources/R"
+cp "$project_root/scripts/relay-workspace.py" "$app_path/Contents/Resources/relay-workspace.py"
+cp "$project_root/remote/r/relay-r.R" "$app_path/Contents/Resources/R/relay-r.R"
+cp "$project_root/remote/r/editor-tools.R" "$app_path/Contents/Resources/R/editor-tools.R"
 
 icon_source="$project_root/Resources/RelayIcon.png"
 if [[ -f "$icon_source" ]]; then
@@ -118,18 +212,37 @@ if [[ -f "$icon_source" ]]; then
     /usr/bin/iconutil -c icns "$iconset" -o "$app_path/Contents/Resources/RelayIcon.icns"
 fi
 /usr/libexec/PlistBuddy -c "Clear dict" "$app_path/Contents/Info.plist" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c "Add :CFBundleName string Relay" "$app_path/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Relay" "$app_path/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string dev.relay.terminal" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleName string $bundle_name" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $bundle_name" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $bundle_identifier" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string Relay" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string RelayIcon" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $app_version" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $build_number" "$app_path/Contents/Info.plist"
+# Update builds preserve installation-scoped consent. A fresh installation/reset
+# explicitly rotates this identity; it never imports the old granted capabilities.
+installation_id="${RELAY_INSTALLATION_ID:-}"
+if [[ -z "$installation_id" && "${RELAY_FRESH_INSTALL:-0}" != "1" ]]; then
+    installation_source="$output_path"
+    if [[ "$bundle_identifier" == "dev.relay.terminal" && ! -f "$installation_source/Contents/Info.plist" ]]; then
+        installation_source="/Applications/Relay.app"
+    fi
+    installation_id="$(/usr/libexec/PlistBuddy -c 'Print :RelayInstallationID' "$installation_source/Contents/Info.plist" 2>/dev/null || true)"
+fi
+if [[ ! "$installation_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+    installation_id="$(/usr/bin/uuidgen)"
+fi
+/usr/libexec/PlistBuddy -c "Add :RelayInstallationID string $installation_id" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :RelaydVersion string $relayd_version" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :RelaydProtocolVersion integer $relayd_protocol_version" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 14.0" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$app_path/Contents/Info.plist"
+if [[ -n "${RELAY_BUNDLE_STATE_ROOT:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :RelayStateRoot string $RELAY_BUNDLE_STATE_ROOT" "$app_path/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :RelayDefaultsSuite string ${RELAY_BUNDLE_DEFAULTS_SUITE:-$bundle_identifier}" "$app_path/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :RelaySidePanelPort string ${RELAY_BUNDLE_SIDE_PANEL_PORT:-47471}" "$app_path/Contents/Info.plist"
+fi
 /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations array" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0 dict" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeIdentifier string dev.relay.workspace-tab" "$app_path/Contents/Info.plist"
@@ -149,13 +262,17 @@ else
 fi
 /usr/bin/xattr -cr "$app_path"
 /usr/bin/codesign --verify --deep --strict "$app_path"
+if [[ -n "${vpn_auth_hash:-}" ]]; then
+    vpn_final_hash="$(/usr/bin/codesign -d --verbose=4 "$app_path/Contents/MacOS/relay-vpn-auth" 2>&1 | /usr/bin/sed -n 's/^CDHash=//p')"
+    if [[ "$vpn_final_hash" != "$vpn_auth_hash" ]]; then echo "VPN client signature changed after helper pinning" >&2; exit 1; fi
+fi
 
 mkdir -p "$(dirname "$output_path")"
 # Replacing a live bundle leaves the process executing the old image while
 # loading resources from the new installation (or the removed staging path).
 # Require a clean quit before replacing it so an install cannot look successful
 # while the user's windows still run the previous build.
-if /bin/ps -axo comm= | /usr/bin/grep -Fx "$output_path/Contents/MacOS/Relay" >/dev/null; then
+if is_executable_running "$output_path/Contents/MacOS/Relay"; then
     echo "Relay is still running from $output_path. Quit Relay and rerun this script to install the build." >&2
     exit 1
 fi
@@ -175,5 +292,7 @@ if [[ "${RELAY_SKIP_WORKSPACE_LINK:-0}" != "1" && "$workspace_link" != "$output_
         /bin/mv "$workspace_link" "$stage_root/Relay.workspace.previous.app"
     fi
     /bin/ln -s "$output_path" "$workspace_link"
+    echo "$workspace_link -> $output_path"
+else
+    echo "Built $output_path (workspace link unchanged)"
 fi
-echo "$workspace_link -> $output_path"

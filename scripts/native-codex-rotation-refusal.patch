@@ -1,0 +1,1070 @@
+--- a/codex-rs/app-server/src/request_processors/context_rotation.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation.rs
+@@ -116,6 +116,18 @@
+                     .await
+                     .map_err(|_| rotation_error("native source is no longer registered"))?;
+                 self.ensure_rotation_runtime_attached(
++                    connection_id,
++                    receipt.thread_id,
++                    receipt.runtime_id,
++                    &receipt.rollout_path,
++                    &thread,
++                )
++                .await?;
++                let home = thread.config().await.codex_home.to_path_buf();
++                self.rotation_reservations
++                    .publish_refusal(connection_id, reservation_id, &outcome, home)
++                    .await?;
++                self.verify_rotation_runtime_attached(
+                     connection_id,
+                     receipt.thread_id,
+                     receipt.runtime_id,
+@@ -356,7 +368,9 @@
+         };
+         // The registry owns the real capability; the observer owns no lease.
+         let revoked = lease.revoked();
+-        self.rotation_reservations.retain(&key, lease).await?;
++        self.rotation_reservations
++            .retain_native(&key, lease)
++            .await?;
+         self.background_tasks
+             .spawn(self.rotation_reservations.monitor(key, revoked));
+         failure_guard.disarm();
+--- a/codex-rs/app-server/src/request_processors/context_rotation_commit_tests.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation_commit_tests.rs
+@@ -862,3 +862,177 @@
+     let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+     (CancelProbe(Arc::clone(&drops)), drops)
+ }
++
++#[tokio::test(start_paused = true)]
++async fn context_rotation_revoked_identity_can_refuse_but_never_transfer() {
++    for expiry in [false, true] {
++        let registry = RotationReservations::default();
++        let key = registry
++            .claim(
++                ConnectionId(1),
++                ThreadId::new(),
++                Instant::now() + Duration::from_secs(5),
++            )
++            .await
++            .unwrap();
++        let request = request(key.thread);
++        let (lease, drops) = cancel_probe();
++        registry
++            .retain_with_source(
++                &key,
++                lease,
++                super::ReservationSource::Native(request.source().clone()),
++            )
++            .unwrap();
++        let revoked = tokio_util::sync::CancellationToken::new();
++        let monitor = registry.monitor(key.clone(), revoked.clone().cancelled_owned());
++        if expiry {
++            tokio::time::advance(Duration::from_secs(6)).await;
++        } else {
++            revoked.cancel();
++        }
++        monitor.await;
++        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
++        assert!(
++            registry
++                .begin_commit_using(key.owner, key.id, request.clone(), |_| true)
++                .is_err()
++        );
++        let mut changed = request.source().clone();
++        changed.runtime_id = uuid::Uuid::new_v4();
++        let foreign = NativeRotationCommitRequest::new(
++            request.operation_id(),
++            request.host_claim_id(),
++            changed,
++            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".into(),
++            "a".into(),
++        )
++        .unwrap();
++        assert!(
++            registry
++                .cancel_commit_using(key.owner, key.id, foreign, |_| true)
++                .is_err()
++        );
++        let outcome = await_commit(
++            registry
++                .cancel_commit_using(key.owner, key.id, request.clone(), |_| {
++                    panic!("revoked lease cannot be examined")
++                })
++                .unwrap(),
++        )
++        .await;
++        assert!(matches!(
++            &*outcome,
++            NativeRotationCommitOutcome::Refused(NativeRotationError::Cancelled)
++        ));
++        let late = registry
++            .begin_commit_using(key.owner, key.id, request, |_| panic!("cannot reacquire"))
++            .unwrap();
++        assert!(late.transaction.is_none());
++        assert!(Arc::ptr_eq(&outcome, &await_commit(late.observer).await));
++    }
++}
++
++#[tokio::test]
++async fn context_rotation_replaced_revoked_identity_never_affects_a_new_owner() {
++    let registry = RotationReservations::<usize>::default();
++    let key = registry
++        .claim(
++            ConnectionId(1),
++            ThreadId::new(),
++            Instant::now() + Duration::from_secs(5),
++        )
++        .await
++        .unwrap();
++    let request = request(key.thread);
++    registry
++        .retain_with_source(
++            &key,
++            1,
++            super::ReservationSource::Native(request.source().clone()),
++        )
++        .unwrap();
++    drop(registry.monitor(key.clone(), std::future::pending()));
++    let next = registry
++        .claim(
++            key.owner,
++            key.thread,
++            Instant::now() + Duration::from_secs(5),
++        )
++        .await
++        .unwrap();
++    registry.retain(&next, 2).await.unwrap();
++    assert!(
++        registry
++            .cancel_commit_using(key.owner, key.id, request, |_| true)
++            .is_err()
++    );
++    assert_eq!(
++        registry
++            .take(next.owner, next.thread, next.id)
++            .await
++            .unwrap(),
++        2
++    );
++}
++
++#[tokio::test]
++async fn context_rotation_refusal_publication_requires_the_retained_outcome_and_owner() {
++    let registry = RotationReservations::<usize>::default();
++    let key = registry
++        .claim(
++            ConnectionId(1),
++            ThreadId::new(),
++            Instant::now() + Duration::from_secs(5),
++        )
++        .await
++        .unwrap();
++    let request = request(key.thread);
++    registry.retain(&key, 3).await.unwrap();
++    let outcome = await_commit(
++        registry
++            .cancel_commit_using(key.owner, key.id, request.clone(), |_| true)
++            .unwrap(),
++    )
++    .await;
++    let home = tempfile::tempdir().unwrap();
++    let forged = Arc::new(NativeRotationCommitOutcome::Refused(
++        NativeRotationError::Cancelled,
++    ));
++    assert!(
++        registry
++            .publish_refusal(key.owner, key.id, &forged, home.path().to_path_buf())
++            .await
++            .is_err()
++    );
++    assert!(
++        registry
++            .publish_refusal(ConnectionId(2), key.id, &outcome, home.path().to_path_buf())
++            .await
++            .is_err()
++    );
++    assert!(!home.path().join("relay-context-rotation").exists());
++    registry
++        .publish_refusal(key.owner, key.id, &outcome, home.path().to_path_buf())
++        .await
++        .unwrap();
++    registry
++        .publish_refusal(key.owner, key.id, &outcome, home.path().to_path_buf())
++        .await
++        .unwrap();
++    let path = home
++        .path()
++        .join("relay-context-rotation")
++        .join(request.operation_id().to_string())
++        .join("refused.json");
++    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
++    assert_eq!(record["reservation_id"], key.id.to_string());
++    assert_eq!(record["process_id"], std::process::id());
++    registry.retire_commit(key.owner, key.id, &outcome).unwrap();
++    assert!(
++        registry
++            .publish_refusal(key.owner, key.id, &outcome, home.path().to_path_buf())
++            .await
++            .is_err()
++    );
++}
+--- a/codex-rs/app-server/src/request_processors/context_rotation_owner.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation_owner.rs
+@@ -23,9 +23,16 @@
+     deadline: Instant,
+ }
+ 
++enum ReservationSource {
++    Unbound,
++    Native(codex_core::NativeRotationReceipt),
++}
++
+ enum ReservationPhase<L> {
+     Preparing,
+     Held(L),
++    // Descriptive source identity survives revocation; no native lease remains.
++    Revoked,
+     // A transferred capability may already be executing. Expiry/disconnect
+     // must not free this slot or authorize a second transaction.
+     Transferred,
+@@ -33,6 +40,7 @@
+ struct ReservationEntry<L> {
+     key: ReservationKey,
+     phase: ReservationPhase<L>,
++    native_source: Option<codex_core::NativeRotationReceipt>,
+     commit: Option<Arc<RotationCommitState>>,
+ }
+ impl<L> ReservationEntry<L> {
+@@ -93,6 +101,7 @@
+         *active = Some(ReservationEntry {
+             key: key.clone(),
+             phase: ReservationPhase::Preparing,
++            native_source: None,
+             commit: None,
+         });
+         Ok(key)
+@@ -102,6 +111,15 @@
+         &self,
+         key: &ReservationKey,
+         lease: L,
++    ) -> Result<(), JSONRPCErrorError> {
++        self.retain_with_source(key, lease, ReservationSource::Unbound)
++    }
++
++    fn retain_with_source(
++        &self,
++        key: &ReservationKey,
++        lease: L,
++        source: ReservationSource,
+     ) -> Result<(), JSONRPCErrorError> {
+         let mut active = self
+             .active
+@@ -117,6 +135,10 @@
+         {
+             return Err(rotation_error("native preparation is no longer eligible"));
+         }
++        entry.native_source = match source {
++            ReservationSource::Unbound => None,
++            ReservationSource::Native(receipt) => Some(receipt),
++        };
+         entry.phase = ReservationPhase::Held(lease);
+         Ok(())
+     }
+@@ -236,13 +258,19 @@
+             let mut active = active
+                 .lock()
+                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+-            if let Some(entry) = active.as_ref()
++            if let Some(entry) = active.as_mut()
+                 && entry.matches(self.key.owner, self.key.thread, self.key.id)
+             {
+                 if entry.transferred() {
+                     return;
+                 }
+-                active.take();
++                if entry.native_source.is_some() {
++                    // Keep only the authentic description. Cancellation may
++                    // bind a refusal here, but can never transfer a lease.
++                    entry.phase = ReservationPhase::Revoked;
++                } else {
++                    active.take();
++                }
+             }
+         }
+         self.key.cancelled.cancel();
+@@ -262,6 +290,7 @@
+ struct RotationCommitState {
+     request: NativeRotationCommitRequest,
+     result: watch::Sender<Option<Arc<NativeRotationCommitOutcome>>>,
++    refusal_publication: tokio::sync::Mutex<()>,
+ }
+ pub(super) struct RotationCommitStart<L> {
+     pub(super) observer: CommitObserver,
+@@ -396,6 +425,51 @@
+         Ok(state.request.clone())
+     }
+ 
++    /// Serialize durable refusal publication for the exact retained completion.
++    /// This lock never grants native lease or lifecycle authority.
++    pub(super) async fn publish_refusal(
++        &self,
++        owner: ConnectionId,
++        id: uuid::Uuid,
++        outcome: &Arc<NativeRotationCommitOutcome>,
++        home: std::path::PathBuf,
++    ) -> Result<(), JSONRPCErrorError> {
++        let state = {
++            let active = self
++                .active
++                .lock()
++                .map_err(|_| rotation_error("rotation owner unavailable"))?;
++            let state = active
++                .as_ref()
++                .filter(|entry| entry.key.owner == owner && entry.key.id == id)
++                .and_then(|entry| entry.commit.as_ref())
++                .ok_or_else(|| rotation_error("native refusal owner mismatch"))?;
++            if !state
++                .result
++                .borrow()
++                .as_ref()
++                .is_some_and(|saved| Arc::ptr_eq(saved, outcome))
++                || !matches!(&**outcome, NativeRotationCommitOutcome::Refused(_))
++            {
++                return Err(rotation_error(
++                    "native refusal requires the retained terminal result",
++                ));
++            }
++            Arc::clone(state)
++        };
++        let _publication = state.refusal_publication.lock().await;
++        state
++            .request
++            .persist_refusal(home, id, outcome)
++            .await
++            .map_err(|error| {
++                rotation_error(format!("native refusal publication failed: {error}"))
++            })?;
++        // Retirement or a changed owner during I/O cannot publish an attachment.
++        self.retained_request_for_attachment(owner, id, outcome)?;
++        Ok(())
++    }
++
+     pub(super) fn observe_commit(
+         &self,
+         owner: ConnectionId,
+@@ -449,14 +523,14 @@
+             // case permits replacing the retained result or acquiring a lease.
+             return Ok(state.result.subscribe());
+         }
+-        let ReservationPhase::Held(lease) = &entry.phase else {
++        let matches_source = match &entry.phase {
++            ReservationPhase::Held(lease) => matches_lease(lease),
++            ReservationPhase::Revoked => entry.native_source.as_ref() == Some(request.source()),
++            ReservationPhase::Preparing | ReservationPhase::Transferred => false,
++        };
++        if !matches_source {
+             return Err(rotation_error(
+-                "native cancellation has no held reservation",
+-            ));
+-        };
+-        if !matches_lease(lease) {
+-            return Err(rotation_error(
+-                "native cancellation source does not match the held lease",
++                "native cancellation has no matching held or revoked reservation",
+             ));
+         }
+         // Expiry/revocation may prevent a commit, but cannot prevent this owner
+@@ -465,7 +539,11 @@
+             NativeRotationError::Cancelled,
+         ));
+         let (result, observer) = watch::channel(Some(outcome));
+-        entry.commit = Some(Arc::new(RotationCommitState { request, result }));
++        entry.commit = Some(Arc::new(RotationCommitState {
++            request,
++            result,
++            refusal_publication: tokio::sync::Mutex::new(()),
++        }));
+         // The terminal slot uses the same retention rules as a transferred
+         // commit: monitor, release, disconnect and a new claim cannot erase it.
+         let held = std::mem::replace(&mut entry.phase, ReservationPhase::Transferred);
+@@ -512,7 +590,11 @@
+             ));
+         }
+         let (result, observer) = watch::channel(None);
+-        let state = Arc::new(RotationCommitState { request, result });
++        let state = Arc::new(RotationCommitState {
++            request,
++            result,
++            refusal_publication: tokio::sync::Mutex::new(()),
++        });
+         let completion = RotationCommitCompletion {
+             state: Some(Arc::clone(&state)),
+         };
+@@ -529,6 +611,15 @@
+     }
+ }
+ impl RotationReservations {
++    pub(super) async fn retain_native(
++        &self,
++        key: &ReservationKey,
++        lease: codex_core::NativeRotationReservation,
++    ) -> Result<(), JSONRPCErrorError> {
++        let source = ReservationSource::Native(lease.receipt().clone());
++        self.retain_with_source(key, lease, source)
++    }
++
+     pub(super) fn cancel_commit(
+         &self,
+         owner: ConnectionId,
+--- a/codex-rs/core/src/session/native_rotation.rs
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -256,6 +256,8 @@
+ pub(crate) mod commit;
+ #[path = "native_rotation_journal.rs"]
+ mod journal;
++#[path = "native_rotation_refusal.rs"]
++mod refusal;
+ #[path = "native_rotation_restore.rs"]
+ pub(crate) mod restore;
+ 
+--- a/codex-rs/core/src/session/native_rotation_commit.rs
++++ b/codex-rs/core/src/session/native_rotation_commit.rs
+@@ -24,6 +24,34 @@
+ }
+ 
+ impl NativeRotationCommitRequest {
++    /// Persist descriptive refusal evidence for an embedding broker's exact
++    /// retained terminal outcome. The caller must verify that owner/result
++    /// identity and serialize publication. This grants no native authority.
++    pub async fn persist_refusal(
++        &self,
++        home: PathBuf,
++        reservation_id: uuid::Uuid,
++        outcome: &NativeRotationCommitOutcome,
++    ) -> Result<(), NativeRotationError> {
++        if !matches!(outcome, NativeRotationCommitOutcome::Refused(_)) || reservation_id.is_nil() {
++            return Err(NativeRotationError::InvalidRequest);
++        }
++        let record = super::refusal::NativeRefusalRecord {
++            v: 1,
++            state: "refused".to_owned(),
++            operation_id: self.operation_id,
++            claim_id: self.host_claim_id,
++            reservation_id,
++            capsule_sha256: self.capsule_sha256.clone(),
++            source: self.source.clone(),
++            process_id: std::process::id(),
++        };
++        tokio::task::spawn_blocking(move || super::refusal::publish(&home, &record))
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))
++    }
++
+     pub fn operation_id(&self) -> uuid::Uuid {
+         self.operation_id
+     }
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation_refusal.rs
+@@ -0,0 +1,344 @@
++//! Durable evidence for a broker-owned terminal refusal.
++//! An existing operation directory also fences every later core journal begin.
++//! Only the embedding broker authenticates the retained request/result identity.
++use super::NativeRotationReceipt;
++use serde::Serialize;
++use std::path::Path;
++
++#[derive(Serialize)]
++pub(super) struct NativeRefusalRecord {
++    pub(super) v: u8,
++    pub(super) state: String,
++    pub(super) operation_id: uuid::Uuid,
++    pub(super) claim_id: uuid::Uuid,
++    pub(super) reservation_id: uuid::Uuid,
++    pub(super) capsule_sha256: String,
++    pub(super) source: NativeRotationReceipt,
++    pub(super) process_id: u32,
++}
++
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++pub(super) use unix::publish;
++
++#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++pub(super) fn publish(_home: &Path, _record: &NativeRefusalRecord) -> std::io::Result<()> {
++    Err(std::io::Error::new(
++        std::io::ErrorKind::Unsupported,
++        "durable native refusal is supported on Linux and macOS",
++    ))
++}
++
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++mod unix {
++    use super::*;
++    use serde_json::Value;
++    use std::collections::BTreeSet;
++    use std::ffi::CStr;
++    use std::ffi::CString;
++    use std::fs::File;
++    use std::fs::OpenOptions;
++    use std::io;
++    use std::io::Read;
++    use std::io::Write;
++    use std::os::fd::AsRawFd;
++    use std::os::fd::FromRawFd;
++    use std::os::unix::fs::MetadataExt;
++    use std::os::unix::fs::OpenOptionsExt;
++
++    #[derive(serde::Deserialize, Serialize)]
++    #[serde(deny_unknown_fields)]
++    struct BeforeSealRecord {
++        v: u8,
++        state: String,
++        operation_id: uuid::Uuid,
++        claim_id: uuid::Uuid,
++        capsule_sha256: String,
++        source: NativeRotationReceipt,
++        destination_thread_id: Option<uuid::Uuid>,
++        settings_sha256: Option<String>,
++        restored: Option<Value>,
++    }
++
++    const LIMIT: u64 = 64 * 1024;
++    const DIRECTORY_FLAGS: i32 =
++        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
++
++    fn invalid(message: &str) -> io::Error {
++        io::Error::new(io::ErrorKind::InvalidData, message)
++    }
++
++    fn open_at(parent: &File, name: &str, flags: i32) -> io::Result<File> {
++        let name = CString::new(name).map_err(|_| invalid("invalid journal name"))?;
++        // Returned fd is owned by this call and immediately transferred to File.
++        let fd = unsafe {
++            libc::openat(
++                parent.as_raw_fd(),
++                name.as_ptr(),
++                flags,
++                0o600 as libc::c_uint,
++            )
++        };
++        if fd < 0 {
++            return Err(io::Error::last_os_error());
++        }
++        Ok(unsafe { File::from_raw_fd(fd) })
++    }
++
++    fn private_directory(directory: &File) -> io::Result<()> {
++        let metadata = directory.metadata()?;
++        if !metadata.is_dir()
++            || metadata.uid() != unsafe { libc::geteuid() }
++            || metadata.mode() & 0o077 != 0
++        {
++            return Err(invalid("native journal directory is not private and owned"));
++        }
++        Ok(())
++    }
++
++    fn child_directory(parent: &File, name: &str) -> io::Result<File> {
++        let c_name = CString::new(name).map_err(|_| invalid("invalid journal directory"))?;
++        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) };
++        if result != 0 {
++            let error = io::Error::last_os_error();
++            if error.kind() != io::ErrorKind::AlreadyExists {
++                return Err(error);
++            }
++        }
++        let directory = open_at(parent, name, DIRECTORY_FLAGS)?;
++        private_directory(&directory)?;
++        parent.sync_all()?;
++        Ok(directory)
++    }
++
++    fn names(directory: &File) -> io::Result<BTreeSet<String>> {
++        struct Stream(*mut libc::DIR);
++        impl Drop for Stream {
++            fn drop(&mut self) {
++                unsafe {
++                    libc::closedir(self.0);
++                }
++            }
++        }
++        // openat(".") creates a fresh directory offset, unlike dup().
++        let enumeration = open_at(directory, ".", DIRECTORY_FLAGS)?;
++        use std::os::fd::IntoRawFd;
++        let fd = enumeration.into_raw_fd();
++        let pointer = unsafe { libc::fdopendir(fd) };
++        if pointer.is_null() {
++            let error = io::Error::last_os_error();
++            unsafe {
++                libc::close(fd);
++            }
++            return Err(error);
++        }
++        let stream = Stream(pointer);
++        let mut names = BTreeSet::new();
++        loop {
++            #[cfg(target_os = "linux")]
++            unsafe {
++                *libc::__errno_location() = 0;
++            }
++            #[cfg(target_os = "macos")]
++            unsafe {
++                *libc::__error() = 0;
++            }
++            let entry = unsafe { libc::readdir(stream.0) };
++            if entry.is_null() {
++                let error = io::Error::last_os_error();
++                if error.raw_os_error() != Some(0) {
++                    return Err(error);
++                }
++                break;
++            }
++            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
++                .to_str()
++                .map_err(|_| invalid("non-UTF8 native journal entry"))?;
++            if name != "." && name != ".." {
++                names.insert(name.to_owned());
++            }
++        }
++        Ok(names)
++    }
++
++    fn read_record(directory: &File, name: &str) -> io::Result<Vec<u8>> {
++        let mut file = open_at(
++            directory,
++            name,
++            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
++        )?;
++        let before = file.metadata()?;
++        if !before.is_file()
++            || before.uid() != unsafe { libc::geteuid() }
++            || before.mode() & 0o077 != 0
++            || before.nlink() != 1
++            || before.len() > LIMIT
++        {
++            return Err(invalid(
++                "native journal record is not a bounded private regular file",
++            ));
++        }
++        let mut bytes = Vec::new();
++        (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
++        let after = file.metadata()?;
++        if bytes.len() as u64 != before.len()
++            || before.len() != after.len()
++            || before.mtime() != after.mtime()
++            || before.mtime_nsec() != after.mtime_nsec()
++            || before.ctime() != after.ctime()
++            || before.ctime_nsec() != after.ctime_nsec()
++            || after.nlink() != 1
++            || after.mode() != before.mode()
++        {
++            return Err(invalid("native journal record changed while reading"));
++        }
++        // A retry confirms durability even if the original caller lost its reply.
++        file.sync_all()?;
++        Ok(bytes)
++    }
++
++    fn validate_existing(
++        directory: &File,
++        record: &NativeRefusalRecord,
++        expected: &[u8],
++    ) -> io::Result<bool> {
++        let names = names(directory)?;
++        if names.iter().any(|name| {
++            !matches!(
++                name.as_str(),
++                "intent.json" | "aborted.json" | "refused.json"
++            )
++        }) || (names.contains("aborted.json") && !names.contains("intent.json"))
++        {
++            return Err(invalid("native refusal conflicts with journal state"));
++        }
++        let mut intent: Option<Value> = None;
++        for (name, state) in [("intent.json", "intent"), ("aborted.json", "aborted")] {
++            if !names.contains(name) {
++                continue;
++            }
++            let bytes = read_record(directory, name)?;
++            // Struct decoding rejects duplicate known fields, including source
++            // fields. Exact roundtrip equality also rejects ignored source fields.
++            let typed: BeforeSealRecord =
++                serde_json::from_slice(&bytes).map_err(io::Error::other)?;
++            let value = serde_json::to_value(typed).map_err(io::Error::other)?;
++            if value != serde_json::from_slice::<Value>(&bytes).map_err(io::Error::other)? {
++                return Err(invalid("native journal record contains unsupported fields"));
++            }
++            let object = value
++                .as_object()
++                .ok_or_else(|| invalid("invalid native journal object"))?;
++            let keys = [
++                "v",
++                "state",
++                "operation_id",
++                "claim_id",
++                "capsule_sha256",
++                "source",
++                "destination_thread_id",
++                "settings_sha256",
++                "restored",
++            ];
++            if object.len() != keys.len()
++                || keys.iter().any(|key| !object.contains_key(*key))
++                || value["v"].as_u64() != Some(1)
++                || value["state"] != state
++                || value["operation_id"] != record.operation_id.to_string()
++                || value["claim_id"] != record.claim_id.to_string()
++                || value["capsule_sha256"] != record.capsule_sha256
++                || value["source"]
++                    != serde_json::to_value(&record.source).map_err(io::Error::other)?
++                || !value["restored"].is_null()
++            {
++                return Err(invalid("native refusal journal identity mismatch"));
++            }
++            let target = &value["destination_thread_id"];
++            let settings = &value["settings_sha256"];
++            if !(target.is_null() && settings.is_null()) {
++                let target = target
++                    .as_str()
++                    .and_then(|value| uuid::Uuid::parse_str(value).ok());
++                if target.is_none_or(|id| {
++                    id.is_nil() || id.to_string() == record.source.thread_id.to_string()
++                }) || settings.as_str().is_none_or(|value| {
++                    value.len() != 64
++                        || !value
++                            .bytes()
++                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++                }) {
++                    return Err(invalid("native refusal journal settings mismatch"));
++                }
++            }
++            let mut normalized = value.clone();
++            normalized["state"] = Value::String("intent".to_owned());
++            if let Some(intent) = &intent {
++                if intent != &normalized {
++                    return Err(invalid("native aborted record differs from intent"));
++                }
++            } else {
++                intent = Some(normalized);
++            }
++        }
++        if names.contains("refused.json") {
++            if read_record(directory, "refused.json")? != expected {
++                return Err(invalid("native refusal record conflicts or is incomplete"));
++            }
++            return Ok(true);
++        }
++        Ok(false)
++    }
++
++    fn same_child(parent: &File, name: &str, retained: &File) -> io::Result<()> {
++        let current = open_at(parent, name, DIRECTORY_FLAGS)?;
++        private_directory(&current)?;
++        let a = current.metadata()?;
++        let b = retained.metadata()?;
++        if a.dev() != b.dev() || a.ino() != b.ino() {
++            return Err(invalid("native journal directory changed"));
++        }
++        Ok(())
++    }
++
++    pub(in crate::session::native_rotation) fn publish(
++        home: &Path,
++        record: &NativeRefusalRecord,
++    ) -> io::Result<()> {
++        let home = std::fs::canonicalize(home)?;
++        let home = OpenOptions::new()
++            .read(true)
++            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            .open(home)?;
++        let metadata = home.metadata()?;
++        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
++            return Err(invalid("native home is not owned or is writable by others"));
++        }
++        let root = child_directory(&home, "relay-context-rotation")?;
++        let operation = record.operation_id.to_string();
++        let directory = child_directory(&root, &operation)?;
++        let mut expected = serde_json::to_vec(record).map_err(io::Error::other)?;
++        expected.push(b'\n');
++        if !validate_existing(&directory, record, &expected)? {
++            let mut file = open_at(
++                &directory,
++                "refused.json",
++                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
++            )?;
++            file.write_all(&expected)?;
++            file.sync_all()?;
++        }
++        directory.sync_all()?;
++        if !validate_existing(&directory, record, &expected)? {
++            return Err(invalid("native refusal disappeared"));
++        }
++        same_child(&root, &operation, &directory)?;
++        same_child(&home, "relay-context-rotation", &root)?;
++        directory.sync_all()?;
++        root.sync_all()?;
++        home.sync_all()?;
++        Ok(())
++    }
++}
++
++#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
++#[path = "native_rotation_refusal_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation_refusal_tests.rs
+@@ -0,0 +1,252 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use std::fs;
++use std::io::Write;
++use std::os::unix::fs::DirBuilderExt;
++use std::os::unix::fs::MetadataExt;
++use std::os::unix::fs::OpenOptionsExt;
++use std::os::unix::fs::PermissionsExt;
++
++fn record() -> NativeRefusalRecord {
++    NativeRefusalRecord {
++        v: 1,
++        state: "refused".into(),
++        operation_id: uuid::Uuid::new_v4(),
++        claim_id: uuid::Uuid::new_v4(),
++        reservation_id: uuid::Uuid::new_v4(),
++        capsule_sha256: "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".into(),
++        source: NativeRotationReceipt {
++            runtime_id: uuid::Uuid::new_v4(),
++            thread_id: codex_protocol::ThreadId::new(),
++            turn_id: "completed".into(),
++            rollout_path: "/offline/source.jsonl".into(),
++            admission_generation: u64::MAX,
++        },
++        process_id: std::process::id(),
++    }
++}
++fn directory(home: &Path, record: &NativeRefusalRecord) -> std::path::PathBuf {
++    home.join("relay-context-rotation")
++        .join(record.operation_id.to_string())
++}
++fn prepare(home: &Path, record: &NativeRefusalRecord) -> std::path::PathBuf {
++    let root = home.join("relay-context-rotation");
++    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
++    let path = directory(home, record);
++    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
++    path
++}
++fn write(path: &Path, bytes: &[u8]) {
++    let mut file = fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .mode(0o600)
++        .open(path)
++        .unwrap();
++    file.write_all(bytes).unwrap();
++}
++fn intent(record: &NativeRefusalRecord, state: &str) -> serde_json::Value {
++    serde_json::json!({"v":1,"state":state,"operation_id":record.operation_id,"claim_id":record.claim_id,
++        "capsule_sha256":record.capsule_sha256,"source":record.source,"destination_thread_id":null,
++        "settings_sha256":null,"restored":null})
++}
++
++#[tokio::test]
++async fn native_rotation_refusal_is_durable_idempotent_and_blocks_future_core_begin() {
++    let home = tempfile::tempdir().unwrap();
++    let record = record();
++    publish(home.path(), &record).unwrap();
++    let path = directory(home.path(), &record).join("refused.json");
++    let bytes = fs::read(&path).unwrap();
++    assert_eq!(
++        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
++        serde_json::to_value(&record).unwrap()
++    );
++    let metadata = fs::metadata(&path).unwrap();
++    assert_eq!(metadata.mode() & 0o777, 0o600);
++    publish(home.path(), &record).unwrap();
++    assert_eq!(fs::read(&path).unwrap(), bytes);
++    assert_eq!(fs::metadata(&path).unwrap().ino(), metadata.ino());
++    let request = super::super::close::NativeCloseRequest::new(
++        record.operation_id,
++        record.claim_id,
++        record.capsule_sha256.clone(),
++    );
++    assert!(
++        super::super::journal::NativeCloseJournal::begin(
++            home.path().to_path_buf(),
++            record.source,
++            &request,
++            /*restore*/ None,
++        )
++        .await
++        .is_err()
++    );
++}
++
++#[test]
++fn native_rotation_refusal_accepts_only_matching_preseal_journal_records() {
++    for aborted in [false, true] {
++        let home = tempfile::tempdir().unwrap();
++        let record = record();
++        let path = prepare(home.path(), &record);
++        write(
++            &path.join("intent.json"),
++            &serde_json::to_vec(&intent(&record, "intent")).unwrap(),
++        );
++        if aborted {
++            write(
++                &path.join("aborted.json"),
++                &serde_json::to_vec(&intent(&record, "aborted")).unwrap(),
++            );
++        }
++        publish(home.path(), &record).unwrap();
++        assert!(path.join("refused.json").is_file());
++    }
++    for name in [
++        "sealed.json",
++        "closed.json",
++        "restored.json",
++        "failed.json",
++        "restore_failed.json",
++        "unknown.json",
++        "aborted.json",
++    ] {
++        let home = tempfile::tempdir().unwrap();
++        let record = record();
++        let path = prepare(home.path(), &record);
++        write(&path.join(name), b"{}");
++        assert!(publish(home.path(), &record).is_err(), "accepted {name}");
++        assert!(!path.join("refused.json").exists());
++    }
++}
++
++#[test]
++fn native_rotation_refusal_rejects_partial_foreign_duplicate_and_unsafe_records() {
++    for change in 0..10 {
++        let home = tempfile::tempdir().unwrap();
++        let record = record();
++        let path = prepare(home.path(), &record);
++        let mut value = intent(&record, "intent");
++        match change {
++            0 => value["operation_id"] = serde_json::json!(uuid::Uuid::new_v4()),
++            1 => {
++                value["source"]["admission_generation"] = serde_json::json!("18446744073709551615")
++            }
++            2 => value["source"]["extra"] = serde_json::json!(true),
++            3 => value["destination_thread_id"] = serde_json::json!(record.source.thread_id),
++            4 => value["settings_sha256"] = serde_json::json!("bad"),
++            5 => value["restored"] = serde_json::json!({}),
++            6 => value["v"] = serde_json::json!(1.0),
++            7..=9 => {}
++            _ => unreachable!(),
++        }
++        let mut bytes = serde_json::to_vec(&value).unwrap();
++        if change == 7 {
++            bytes = b"{".to_vec();
++        }
++        if change == 8 {
++            let text = String::from_utf8(bytes)
++                .unwrap()
++                .replacen("\"v\":1", "\"v\":1,\"v\":1", 1);
++            bytes = text.into_bytes();
++        }
++        if change == 9 {
++            let text = String::from_utf8(bytes).unwrap().replacen(
++                "\"turn_id\":",
++                "\"turn_id\":\"completed\",\"turn_id\":",
++                1,
++            );
++            bytes = text.into_bytes();
++        }
++        write(&path.join("intent.json"), &bytes);
++        assert!(publish(home.path(), &record).is_err(), "accepted {change}");
++        assert!(!path.join("refused.json").exists());
++    }
++    for change in 0..5 {
++        let home = tempfile::tempdir().unwrap();
++        let record = record();
++        let path = prepare(home.path(), &record);
++        let refused = path.join("refused.json");
++        match change {
++            0 => write(&refused, b"{"),
++            1 => {
++                write(&refused, &vec![b'x'; 65537]);
++            }
++            2 => {
++                write(&refused, b"{}");
++                fs::set_permissions(&refused, fs::Permissions::from_mode(0o644)).unwrap();
++            }
++            3 => {
++                let other = home.path().join("other");
++                write(&other, b"{}");
++                fs::hard_link(&other, &refused).unwrap();
++            }
++            4 => {
++                let other = home.path().join("other");
++                write(&other, b"{}");
++                std::os::unix::fs::symlink(other, &refused).unwrap();
++            }
++            _ => unreachable!(),
++        }
++        let before = fs::read(&refused).unwrap();
++        assert!(publish(home.path(), &record).is_err());
++        assert_eq!(fs::read(&refused).unwrap(), before);
++    }
++}
++
++#[test]
++fn native_rotation_refusal_rejects_symlinked_or_public_journal_directories() {
++    for level in [0, 1] {
++        for symlink in [false, true] {
++            let home = tempfile::tempdir().unwrap();
++            let record = record();
++            let path = if level == 0 {
++                home.path().join("relay-context-rotation")
++            } else {
++                fs::DirBuilder::new()
++                    .mode(0o700)
++                    .create(home.path().join("relay-context-rotation"))
++                    .unwrap();
++                directory(home.path(), &record)
++            };
++            if symlink {
++                std::os::unix::fs::symlink(home.path(), path).unwrap();
++            } else {
++                fs::DirBuilder::new().mode(0o755).create(path).unwrap();
++            }
++            assert!(publish(home.path(), &record).is_err());
++        }
++    }
++}
++
++#[tokio::test]
++async fn native_rotation_refusal_api_rejects_uncertain_outcome_before_creating_records() {
++    let home = tempfile::tempdir().unwrap();
++    let record = record();
++    let request = super::super::commit::NativeRotationCommitRequest::new(
++        record.operation_id,
++        record.claim_id,
++        record.source,
++        record.capsule_sha256,
++        "a".into(),
++    )
++    .unwrap();
++    let uncertain = super::super::commit::NativeRotationCommitOutcome::ReconciliationRequired(
++        super::super::NativeRotationError::Closed,
++    );
++    assert!(
++        request
++            .persist_refusal(home.path().to_path_buf(), record.reservation_id, &uncertain)
++            .await
++            .is_err()
++    );
++    assert!(!home.path().join("relay-context-rotation").exists());
++    let refused = super::super::commit::NativeRotationCommitOutcome::Refused(
++        super::super::NativeRotationError::Busy,
++    );
++    request
++        .persist_refusal(home.path().to_path_buf(), record.reservation_id, &refused)
++        .await
++        .unwrap();
++}

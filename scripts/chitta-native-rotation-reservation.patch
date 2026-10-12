@@ -1,0 +1,3901 @@
+diff --git a/chitta/CMakeLists.txt b/chitta/CMakeLists.txt
+index 9ee3a62..f7f458b 100644
+--- a/chitta/CMakeLists.txt
++++ b/chitta/CMakeLists.txt
+@@ -862,6 +862,9 @@ if(CHITTA_BUILD_TESTS)
+     add_executable(task_ledger_test src/task_ledger_test.cpp)
+     target_link_libraries(task_ledger_test PRIVATE chitta)
+     add_test(NAME task_ledger_test COMMAND task_ledger_test)
++    add_executable(task_native_rotation_test src/task_native_rotation_test.cpp)
++    target_link_libraries(task_native_rotation_test PRIVATE chitta)
++    add_test(NAME task_native_rotation_test COMMAND task_native_rotation_test)
+     add_executable(rpc_publication_test src/rpc_publication_test.cpp src/code_navigation.cpp)
+     target_include_directories(rpc_publication_test PRIVATE "${CHITTA_FIELD_INCLUDE}")
+     target_link_libraries(rpc_publication_test PRIVATE chitta-code-intel chitta OpenSSL::Crypto)
+@@ -1077,6 +1080,7 @@ if(CHITTA_BUILD_TESTS)
+         prompt_policy_test
+         visibility_footer_test
+         task_ledger_test
++        task_native_rotation_test
+         thread_pool_test llm_probe_test callsite_extract_test
+         value_fact_extract_test prefilter_keep_test recall_pool_cap_test
+         hit_line_test tool_spec_test rpc_work_policy_test recall_lanes_test
+diff --git a/chitta/include/chitta/task_rotation.hpp b/chitta/include/chitta/task_rotation.hpp
+index e1b113d..dcc3433 100644
+--- a/chitta/include/chitta/task_rotation.hpp
++++ b/chitta/include/chitta/task_rotation.hpp
+@@ -1,6 +1,8 @@
+ #pragma once
+ #include <nlohmann/json.hpp>
+ #include <algorithm>
++#include <cstdint>
++#include <initializer_list>
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -90,13 +92,116 @@ inline void validate_usage(const json& u) {
+     }
+ 
+ }
++// Native reservation records bind evidence; a JSON record is never authority
++// to close a session. The host must retain and revalidate the actual native and
++// foreground reservations. Legacy post-signal-turn admission stays unchanged.
++inline bool native_keys(const json& value, std::initializer_list<const char*> keys) {
++    if (!value.is_object() || value.size() != keys.size()) return false;
++    for (auto key : keys) if (!value.contains(key)) return false;
++    return true;
++}
++inline bool native_text(const json& value, size_t maximum) {
++    if (!value.is_string()) return false;
++    const auto& s = value.get_ref<const std::string&>();
++    return !s.empty() && s.size() <= maximum && s.find('\0') == std::string::npos;
++}
++inline bool native_uint(const json& value, uint64_t maximum = UINT64_MAX) {
++    return (value.is_number_unsigned() || (value.is_number_integer() && value.get<int64_t>() > 0)) &&
++           value.get<uint64_t>() > 0 && value.get<uint64_t>() <= maximum;
++}
++inline bool native_hex(const json& value, size_t length) {
++    if (!native_text(value, length)) return false;
++    const auto& s = value.get_ref<const std::string&>();
++    return s.size() == length && s.find_first_not_of("0123456789abcdef") == std::string::npos;
++}
++inline bool native_uuid(const json& value) {
++    if (!native_text(value, 36)) return false;
++    const auto& s = value.get_ref<const std::string&>();
++    if (s.size() != 36 || s == "00000000-0000-0000-0000-000000000000") return false;
++    for (size_t i = 0; i != s.size(); ++i) {
++        if (i == 8 || i == 13 || i == 18 || i == 23) { if (s[i] != '-') return false; }
++        else if (std::string("0123456789abcdef").find(s[i]) == std::string::npos) return false;
++    }
++    return true;
++}
++inline bool native_generation(const json& value) {
++    if (!native_text(value, 20)) return false;
++    const auto& s = value.get_ref<const std::string&>();
++    return s.find_first_not_of("0123456789") == std::string::npos &&
++           (s.size() == 1 || s[0] != '0') &&
++           (s.size() < 20 || s <= "18446744073709551615");
++}
++inline bool native_absolute_path(const json& value) {
++    return native_text(value, 4096) && value.get_ref<const std::string&>()[0] == '/';
++}
++inline void validate_native_claim(const json& a, const json& state, const json& metadata,
++                                  const json& row, const std::string& sid) {
++    require(native_keys(a, {"v", "session_id", "epoch", "claimant", "host_claim_id",
++                            "lease_ms", "source", "capsule", "reservation"}), "invalid native claim fields");
++    require(native_uuid(a.at("epoch")) && native_uuid(a.at("host_claim_id")) &&
++            a.at("epoch") != a.at("host_claim_id") && native_text(a.at("claimant"), 110),
++            "invalid native operation identity");
++    require(metadata.value("owner", "desktop") == "relay" && row.value("client", "") == "codex",
++            "native reservation requires Relay-owned Codex", "native_owner_mismatch");
++    const auto& s = a.at("source");
++    require(native_keys(s, {"enrollment", "turn_id", "turn_seq", "transcript_mtime_ms",
++                           "transcript_bytes", "source_sha256", "evidence_sha256",
++                           "binding_revision", "source_chunks"}), "invalid native source fields");
++    const auto& e = s.at("enrollment");
++    require(native_keys(e, {"session_id", "client", "cwd", "pane_id", "agent_pid", "agent_start",
++                           "worker_pid", "worker_start", "node_boot_id"}), "invalid native owner fields");
++    require(native_uuid(e.at("session_id")) && e.at("session_id") == sid && e.at("client") == "codex" &&
++            e.at("cwd") == row.value("project_dir", "") && native_absolute_path(e.at("cwd")) &&
++            native_text(e.at("pane_id"), 256) && native_text(e.at("node_boot_id"), 256) &&
++            native_uint(e.at("agent_pid"), INT32_MAX) && native_uint(e.at("agent_start")) &&
++            native_uint(e.at("worker_pid"), INT32_MAX) && native_uint(e.at("worker_start")),
++            "native source owner mismatch", "native_owner_mismatch");
++    require(native_text(s.at("turn_id"), 256) && native_uint(s.at("turn_seq")) &&
++            s.at("turn_seq") == state.value("turn_seq", uint64_t(0)) &&
++            native_uint(s.at("transcript_mtime_ms"), INT64_MAX) &&
++            native_uint(s.at("transcript_bytes"), 64 * 1024 * 1024) &&
++            native_hex(s.at("source_sha256"), 64) && native_hex(s.at("evidence_sha256"), 64) &&
++            native_text(s.at("binding_revision"), 256) && native_uint(s.at("source_chunks"), 128),
++            "invalid native source boundary", "seq_mismatch");
++    const auto turns = state.value("turns", json::object());
++    const auto turn = turns.value(s.at("turn_id").get<std::string>(), json::object());
++    require(turn.value("seq", uint64_t(0)) == s.at("turn_seq") && turn.value("session_id", "") == sid,
++            "native turn is not the completed boundary", "seq_mismatch");
++    const auto usage = turn.value("usage", json::object());
++    require(usage.value("turn_id_fresh", json()) == json({{"value", true}, {"provenance", "transcript"}}) &&
++            usage.value("in_flight_tool", json()) == json({{"value", false}, {"provenance", "transcript"}}) &&
++            usage.value("transcript_mtime_ms_at_stop", json()) ==
++                json({{"value", s.at("transcript_mtime_ms")}, {"provenance", "hook"}}) &&
++            usage.value("transcript_bytes_at_stop", json()) ==
++                json({{"value", s.at("transcript_bytes")}, {"provenance", "hook"}}),
++            "native claim lacks exact completed-turn observations", "native_boundary_unavailable");
++    const auto& cap = a.at("capsule");
++    require(native_keys(cap, {"artifact_id", "sha256", "bytes"}) &&
++            native_hex(cap.at("artifact_id"), 64) && native_hex(cap.at("sha256"), 64) &&
++            native_uint(cap.at("bytes"), 16384), "invalid native capsule binding");
++    const auto& pair = a.at("reservation");
++    require(native_keys(pair, {"native", "frontend"}), "invalid native reservation fields");
++    const auto& n = pair.at("native");
++    require(native_keys(n, {"reservationId", "runtimeId", "threadId", "turnId", "rolloutPath",
++                           "admissionGeneration", "expiresInMs"}), "invalid core reservation fields");
++    require(native_uuid(n.at("reservationId")) && native_uuid(n.at("runtimeId")) &&
++            n.at("threadId") == sid && n.at("turnId") == s.at("turn_id") &&
++            native_absolute_path(n.at("rolloutPath")) && native_generation(n.at("admissionGeneration")) &&
++            native_uint(n.at("expiresInMs"), 5000) && native_uint(a.at("lease_ms"), 5000) &&
++            a.at("lease_ms").get<uint64_t>() <= n.at("expiresInMs").get<uint64_t>(),
++            "invalid core reservation binding");
++    const auto& f = pair.at("frontend");
++    require(native_keys(f, {"runtime_id", "generation"}) && native_uuid(f.at("runtime_id")) &&
++            native_generation(f.at("generation")), "invalid foreground reservation binding");
++}
++
+ // Called only inside TaskLedger's durable transaction. All edits are to a local copy.
+ inline json apply(const std::string& op, const json& a, json& metadata,
+                   const json& row, uint64_t seq, int64_t now) {
+     require(op == "rotation_status" || op == "turn_complete" || op == "rotation_signal" ||
+             op == "rotation_claim" || op == "rotation_release" || op == "rotation_intent" ||
+             op == "rotation_abandon_intent" || op == "rotation_bind" || op == "rotation_ack" ||
+-            op == "capsule_save", "unknown rotation operation", "unknown_operation");
++            op == "capsule_save" || op == "rotation_native_claim" || op == "rotation_native_release", "unknown rotation operation", "unknown_operation");
+     require(a.value("v", 1) == 1, "unsupported rotation version", "unsupported_version");
+     const auto sid = text(a, "session_id");
+     auto state = metadata.value("rotation", json::object());
+@@ -198,7 +303,42 @@ inline json apply(const std::string& op, const json& a, json& metadata,
+                     a.at("token") == claim.at("token"), "stale rotation fencing token", "stale_token");
+             require(live(claim, now), "rotation claim is not live", "claim_expired");
+         };
+-        if (op == "rotation_signal") {
++        // A legacy operation cannot consume, renew or release a native claim.
++        require(op == "rotation_native_claim" || op == "rotation_native_release" ||
++                !claim.is_object() || claim.value("mode", "") != "native_v1",
++                "native claim requires native operations", "native_operation_required");
++        if (op == "rotation_native_claim") {
++            validate_native_claim(a, state, metadata, row, sid);
++            require(epoch.empty(), "native operation ID already exists", "native_operation_exists");
++            for (const auto& previous : epochs)
++                require(!previous.contains("ack"), "rotation already acknowledged", "already_acknowledged");
++            require(!has_live_claim(metadata, now), "rotation claim already live", "claim_live");
++            const auto expected = a.at("source").at("turn_seq");
++            claim = {{"v", 1}, {"mode", "native_v1"}, {"session_id", sid}, {"epoch", epoch_id},
++                     {"operation_id", epoch_id}, {"host_claim_id", a.at("host_claim_id")},
++                     {"claim_id", sid + ":" + std::to_string(seq)}, {"claimant", a.at("claimant")},
++                     {"token", seq}, {"seq", seq}, {"expected_seq", expected},
++                     {"expires_at_ms", now + a.at("lease_ms").get<int64_t>()}, {"closed", false},
++                     {"native", {{"source", a.at("source")}, {"capsule", a.at("capsule")},
++                                 {"reservation", a.at("reservation")}}}};
++            epoch["claim"] = claim;
++            result = claim;
++        } else if (op == "rotation_native_release") {
++            require(native_keys(a, {"v", "session_id", "epoch", "claim_id", "token", "host_claim_id"}),
++                    "invalid native release fields");
++            require(claim.is_object() && claim.value("mode", "") == "native_v1" &&
++                    a.at("claim_id") == claim.at("claim_id") && a.at("token") == claim.at("token") &&
++                    a.at("host_claim_id") == claim.at("host_claim_id"),
++                    "stale native claim identity", "stale_token");
++            require(intent.is_null(), "native intent requires reconciliation", "native_intent_pending");
++            if (claim.value("closed", false)) return claim;
++            // Releasing an expired reservation is safe. It cannot authorize any
++            // lifecycle work, renew the claim, or clear another operation's fence.
++            claim["closed"] = true;
++            claim["release_seq"] = seq;
++            epoch["claim"] = claim;
++            result = claim;
++        } else if (op == "rotation_signal") {
+             const auto action = text(a, "action");
+             require(action == "prepare" || action == "rotate", "unknown rotation action", "unknown_action");
+             auto signals = epoch.value("signals", json::object());
+diff --git a/chitta/src/rotation_contract.schema.json b/chitta/src/rotation_contract.schema.json
+index f36ea25..1e17b8b 100644
+--- a/chitta/src/rotation_contract.schema.json
++++ b/chitta/src/rotation_contract.schema.json
+@@ -1,581 +1,696 @@
+ {
+-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+-  "$id": "urn:chitta:rotation:1",
+   "$defs": {
+-    "signal": {
+-      "type": "object",
++    "ack": {
+       "properties": {
+-        "v": {
+-          "const": 1
++        "capsule_revision": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "epoch": {
+-          "type": "string",
+-          "minLength": 1
+-        },
+-        "action": {
+-          "enum": [
+-            "prepare",
+-            "rotate"
+-          ]
++          "minLength": 1,
++          "type": "string"
+         },
+-        "reason": {
++        "intent_id": {
++          "minLength": 1,
+           "type": "string"
+         },
+-        "usage": {
+-          "type": "object"
++        "lifecycle_performed": {
++          "const": true
++        },
++        "new_session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "seq": {
+-          "type": "integer",
+-          "minimum": 1
++          "minimum": 1,
++          "type": "integer"
++        },
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "token": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+         "v",
+         "session_id",
+         "epoch",
+-        "action",
+-        "reason",
+-        "usage",
+-        "seq"
+-      ]
++        "claim_id",
++        "token",
++        "intent_id",
++        "capsule_revision",
++        "new_session_id",
++        "seq",
++        "lifecycle_performed"
++      ],
++      "type": "object"
+     },
+-    "turn": {
+-      "type": "object",
++    "capsule": {
+       "properties": {
+-        "v": {
+-          "const": 1
++        "code_head": {
++          "type": "string"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "ledger_seq": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "turn_id": {
+-          "type": "string",
+-          "minLength": 1
++        "revision": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "seq": {
+-          "type": "integer",
+-          "minimum": 1
++        "state": {
++          "enum": [
++            "in_progress",
++            "complete",
++            "missing",
++            "invalidated"
++          ]
+         },
+-        "usage": {
+-          "$ref": "#/$defs/usage"
++        "token": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+         "v",
+-        "session_id",
+-        "turn_id",
+-        "seq"
+-      ]
++        "revision",
++        "code_head",
++        "state",
++        "ledger_seq",
++        "token"
++      ],
++      "type": "object"
+     },
+-    "claim": {
+-      "type": "object",
++    "capsule_input": {
++      "description": "Capsule v2 normalized by daemon; omitted fields receive defaults and repository/code_head/stream_id may be inferred from project_dir. Repository must resolve nonempty. Text limits and total normalized size (4096) are UTF-8 bytes; maxLength expresses the necessary character bound. Unknown top-level fields ignored.",
+       "properties": {
+-        "v": {
+-          "const": 1
++        "blockers": {
++          "items": {
++            "maxLength": 160,
++            "type": "string"
++          },
++          "maxItems": 3,
++          "type": "array"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "branch": {
++          "maxLength": 128,
++          "type": "string"
+         },
+-        "epoch": {
+-          "type": "string",
+-          "minLength": 1
++        "code_head": {
++          "maxLength": 64,
++          "type": "string"
+         },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "constraints": {
++          "items": {
++            "maxLength": 128,
++            "type": "string"
++          },
++          "maxItems": 4,
++          "type": "array"
+         },
+-        "token": {
+-          "type": "integer",
+-          "minimum": 1
++        "dirty_paths": {
++          "items": {
++            "maxLength": 128,
++            "type": "string"
++          },
++          "maxItems": 20,
++          "type": "array"
+         },
+-        "claimant": {
+-          "type": "string",
+-          "minLength": 1
++        "gates": {
++          "additionalProperties": {
++            "additionalProperties": false,
++            "properties": {
++              "number": {
++                "type": "number"
++              },
++              "status": {
++                "enum": [
++                  "pass",
++                  "fail"
++                ]
++              }
++            },
++            "required": [
++              "status",
++              "number"
++            ],
++            "type": "object"
++          },
++          "maxProperties": 6,
++          "propertyNames": {
++            "maxLength": 48
++          },
++          "type": "object"
+         },
+-        "seq": {
+-          "type": "integer",
+-          "minimum": 1
++        "jobs": {
++          "items": {
++            "additionalProperties": false,
++            "properties": {
++              "id": {
++                "maxLength": 64,
++                "type": "string"
++              },
++              "result_path": {
++                "maxLength": 192,
++                "type": "string"
++              }
++            },
++            "required": [
++              "id",
++              "result_path"
++            ],
++            "type": "object"
++          },
++          "maxItems": 4,
++          "type": "array"
+         },
+-        "expected_seq": {
+-          "type": "integer",
+-          "minimum": 1
++        "ledger_seq": {
++          "minimum": 0,
++          "type": "integer"
+         },
+-        "expires_at_ms": {
+-          "type": "integer",
+-          "minimum": 1
++        "next_action": {
++          "maxLength": 400,
++          "type": "string"
+         },
+-        "closed": {
+-          "type": "boolean"
++        "objective": {
++          "maxLength": 384,
++          "type": "string"
+         },
+-        "release_seq": {
+-          "type": "integer",
+-          "minimum": 1
++        "project_dir": {
++          "maxLength": 384,
++          "type": "string"
++        },
++        "repository": {
++          "maxLength": 384,
++          "type": "string"
++        },
++        "session_id": {
++          "maxLength": 128,
++          "type": "string"
++        },
++        "state": {
++          "enum": [
++            "complete",
++            "in_progress",
++            "missing",
++            "invalidated"
++          ]
++        },
++        "stream_id": {
++          "maxLength": 96,
++          "type": "string"
++        },
++        "version": {
++          "const": 2
+         }
+       },
+       "required": [
+-        "v",
+         "session_id",
+-        "epoch",
+-        "claim_id",
+-        "token",
+-        "claimant",
+-        "seq",
+-        "expected_seq",
+-        "expires_at_ms",
+-        "closed"
+-      ]
++        "ledger_seq"
++      ],
++      "type": "object"
+     },
+-    "intent": {
+-      "type": "object",
++    "capsule_save.request": {
+       "properties": {
+-        "v": {
+-          "const": 1
++        "capsule": {
++          "$ref": "#/$defs/capsule_input"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "epoch": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "expected_revision": {
++          "minimum": 0,
++          "type": "integer"
+         },
+         "token": {
+-          "type": "integer",
+-          "minimum": 1
+-        },
+-        "intent_id": {
+-          "type": "string",
+-          "minLength": 1
+-        },
+-        "seq": {
+-          "type": "integer",
+-          "minimum": 1
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "state": {
+-          "enum": [
+-            "ambiguous",
+-            "bound",
+-            "abandoned"
+-          ]
+-        },
+-        "new_session_id": {
+-          "type": "string",
+-          "minLength": 1
+-        },
+-        "bind_seq": {
+-          "type": "integer",
+-          "minimum": 1
+-        },
+-        "abandon_seq": {
+-          "type": "integer",
+-          "minimum": 1
+-        },
+-        "abandon_token": {
+-          "type": "integer",
+-          "minimum": 1
+-        },
+-        "abandon_claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+-        "v",
+-        "session_id",
+         "epoch",
+         "claim_id",
+         "token",
+-        "intent_id",
+-        "seq",
+-        "state"
++        "expected_revision",
++        "capsule"
+       ],
+-      "allOf": [
+-        {
+-          "if": {
+-            "properties": {
+-              "state": {
+-                "const": "bound"
+-              }
+-            }
+-          },
+-          "then": {
+-            "required": [
+-              "new_session_id",
+-              "bind_seq"
+-            ]
+-          }
+-        }
+-      ]
++      "type": "object"
+     },
+-    "ack": {
+-      "type": "object",
++    "capsule_save.response": {
++      "$ref": "#/$defs/capsule_saved"
++    },
++    "capsule_saved": {
+       "properties": {
+-        "v": {
+-          "const": 1
++        "blockers": {
++          "items": {
++            "maxLength": 160,
++            "type": "string"
++          },
++          "maxItems": 3,
++          "type": "array"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "branch": {
++          "maxLength": 128,
++          "type": "string"
+         },
+-        "epoch": {
+-          "type": "string",
+-          "minLength": 1
++        "code_head": {
++          "maxLength": 64,
++          "type": "string"
+         },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "constraints": {
++          "items": {
++            "maxLength": 128,
++            "type": "string"
++          },
++          "maxItems": 4,
++          "type": "array"
+         },
+-        "token": {
+-          "type": "integer",
+-          "minimum": 1
++        "dirty_paths": {
++          "items": {
++            "maxLength": 128,
++            "type": "string"
++          },
++          "maxItems": 20,
++          "type": "array"
+         },
+-        "intent_id": {
+-          "type": "string",
+-          "minLength": 1
++        "gates": {
++          "additionalProperties": {
++            "additionalProperties": false,
++            "properties": {
++              "number": {
++                "type": "number"
++              },
++              "status": {
++                "enum": [
++                  "pass",
++                  "fail"
++                ]
++              }
++            },
++            "required": [
++              "status",
++              "number"
++            ],
++            "type": "object"
++          },
++          "maxProperties": 6,
++          "propertyNames": {
++            "maxLength": 48
++          },
++          "type": "object"
+         },
+-        "capsule_revision": {
+-          "type": "integer",
+-          "minimum": 1
++        "jobs": {
++          "items": {
++            "additionalProperties": false,
++            "properties": {
++              "id": {
++                "maxLength": 64,
++                "type": "string"
++              },
++              "result_path": {
++                "maxLength": 192,
++                "type": "string"
++              }
++            },
++            "required": [
++              "id",
++              "result_path"
++            ],
++            "type": "object"
++          },
++          "maxItems": 4,
++          "type": "array"
+         },
+-        "new_session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "ledger_seq": {
++          "minimum": 0,
++          "type": "integer"
+         },
+-        "seq": {
+-          "type": "integer",
+-          "minimum": 1
++        "next_action": {
++          "maxLength": 400,
++          "type": "string"
+         },
+-        "lifecycle_performed": {
+-          "const": true
+-        }
+-      },
+-      "required": [
+-        "v",
+-        "session_id",
+-        "epoch",
+-        "claim_id",
+-        "token",
+-        "intent_id",
+-        "capsule_revision",
+-        "new_session_id",
+-        "seq",
+-        "lifecycle_performed"
+-      ]
+-    },
+-    "capsule": {
+-      "type": "object",
+-      "properties": {
+-        "v": {
+-          "const": 1
++        "objective": {
++          "maxLength": 384,
++          "type": "string"
++        },
++        "project_dir": {
++          "maxLength": 384,
++          "type": "string"
++        },
++        "repository": {
++          "maxLength": 384,
++          "type": "string"
+         },
+         "revision": {
+-          "type": "integer",
+-          "minimum": 1
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "code_head": {
++        "saved_at": {
++          "type": "number"
++        },
++        "session_id": {
++          "maxLength": 128,
+           "type": "string"
+         },
+         "state": {
+           "enum": [
+-            "in_progress",
+             "complete",
++            "in_progress",
+             "missing",
+             "invalidated"
+           ]
+         },
+-        "ledger_seq": {
+-          "type": "integer",
+-          "minimum": 1
++        "stream_id": {
++          "maxLength": 96,
++          "type": "string"
+         },
+-        "token": {
+-          "type": "integer",
+-          "minimum": 1
++        "v": {
++          "const": 1
++        },
++        "version": {
++          "const": 2
+         }
+       },
+       "required": [
++        "version",
++        "ledger_seq",
++        "state",
++        "objective",
++        "repository",
++        "project_dir",
++        "session_id",
++        "stream_id",
++        "branch",
++        "code_head",
++        "next_action",
++        "constraints",
++        "dirty_paths",
++        "blockers",
++        "gates",
++        "jobs",
+         "v",
+         "revision",
+-        "code_head",
+-        "state",
+-        "ledger_seq",
+-        "token"
+-      ]
++        "saved_at"
++      ],
++      "type": "object"
+     },
+-    "status": {
+-      "type": "object",
++    "claim": {
+       "properties": {
+-        "v": {
+-          "const": 1
+-        },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "client": {
++        "claimant": {
++          "minLength": 1,
+           "type": "string"
+         },
+-        "cwd": {
++        "closed": {
++          "type": "boolean"
++        },
++        "epoch": {
++          "minLength": 1,
+           "type": "string"
+         },
+-        "owner": {
+-          "enum": [
+-            "relay",
+-            "desktop",
+-            "stream"
+-          ]
++        "expected_seq": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "signal": {
+-          "anyOf": [
+-            {
+-              "$ref": "#/$defs/signal"
+-            },
+-            {
+-              "type": "null"
+-            }
+-          ]
++        "expires_at_ms": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "turn_seq": {
+-          "type": "integer",
+-          "minimum": 0
++        "release_seq": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "claim": {
+-          "anyOf": [
+-            {
+-              "$ref": "#/$defs/claim"
+-            },
+-            {
+-              "type": "null"
+-            }
+-          ]
+-        },
+-        "capsule": {
+-          "anyOf": [
+-            {
+-              "$ref": "#/$defs/capsule"
+-            },
+-            {
+-              "type": "null"
+-            }
+-          ]
+-        },
+-        "intent": {
+-          "anyOf": [
+-            {
+-              "$ref": "#/$defs/intent"
+-            },
+-            {
+-              "type": "null"
+-            }
+-          ]
+-        },
+-        "ack": {
+-          "anyOf": [
+-            {
+-              "$ref": "#/$defs/ack"
+-            },
+-            {
+-              "type": "null"
+-            }
+-          ]
+-        },
+-        "lifecycle_performed": {
+-          "type": "boolean"
+-        },
+-        "new_session_id": {
+-          "type": [
+-            "string",
+-            "null"
+-          ]
++        "seq": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "epoch": {
++        "session_id": {
++          "minLength": 1,
+           "type": "string"
+         },
+-        "live": {
+-          "type": "boolean"
+-        },
+-        "usage": {
+-          "$ref": "#/$defs/usage"
++        "token": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "usage_history": {
+-          "type": "array",
+-          "maxItems": 16,
+-          "items": {
+-            "$ref": "#/$defs/turn"
+-          }
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+         "v",
+         "session_id",
+-        "client",
+-        "cwd",
+-        "owner",
+-        "signal",
+-        "turn_seq",
+-        "claim",
+-        "capsule",
+-        "intent",
+-        "ack",
+-        "lifecycle_performed",
+-        "new_session_id",
+         "epoch",
+-        "live"
++        "claim_id",
++        "token",
++        "claimant",
++        "seq",
++        "expected_seq",
++        "expires_at_ms",
++        "closed"
++      ],
++      "type": "object",
++      "allOf": [
++        {
++          "if": {
++            "required": [
++              "mode"
++            ],
++            "properties": {
++              "mode": {
++                "const": "native_v1"
++              }
++            }
++          },
++          "then": {
++            "$ref": "#/$defs/native_claim"
++          }
++        }
+       ]
+     },
+-    "rotation_signal.request": {
+-      "type": "object",
++    "intent": {
++      "allOf": [
++        {
++          "if": {
++            "properties": {
++              "state": {
++                "const": "bound"
++              }
++            }
++          },
++          "then": {
++            "required": [
++              "new_session_id",
++              "bind_seq"
++            ]
++          }
++        }
++      ],
+       "properties": {
+-        "v": {
+-          "const": 1
++        "abandon_claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "abandon_seq": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "abandon_token": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "bind_seq": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "epoch": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "action": {
++        "intent_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "new_session_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "seq": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "state": {
+           "enum": [
+-            "prepare",
+-            "rotate"
++            "ambiguous",
++            "bound",
++            "abandoned"
+           ]
+         },
+-        "reason": {
+-          "type": "string"
++        "token": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "usage": {
+-          "type": "object"
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
++        "v",
+         "session_id",
+         "epoch",
+-        "action",
+-        "reason",
+-        "usage"
+-      ]
+-    },
+-    "rotation_signal.response": {
+-      "$ref": "#/$defs/signal"
++        "claim_id",
++        "token",
++        "intent_id",
++        "seq",
++        "state"
++      ],
++      "type": "object"
+     },
+-    "turn_complete.request": {
+-      "type": "object",
++    "refusal": {
++      "description": "JSON-RPC tools/call result has isError=true and structured equal to this object; content carries the human-readable message. All contract failures use one of these codes.",
+       "properties": {
+-        "v": {
+-          "const": 1
+-        },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "code": {
++          "enum": [
++            "ack_conflict",
++            "already_acknowledged",
++            "binding_conflict",
++            "capsule_mismatch",
++            "claim_expired",
++            "claim_live",
++            "claimant_mismatch",
++            "intent_abandoned",
++            "intent_unresolved",
++            "invalid_request",
++            "mid_turn",
++            "new_claim_required",
++            "not_ambiguous",
++            "not_bound",
++            "revision_mismatch",
++            "seq_mismatch",
++            "session_mismatch",
++            "stale_token",
++            "unknown_action",
++            "unknown_intent",
++            "unknown_operation",
++            "unknown_session",
++            "unsupported_version"
++          ]
+         },
+-        "turn_id": {
+-          "type": "string",
+-          "minLength": 1
++        "message": {
++          "type": "string"
+         },
+-        "usage": {
+-          "$ref": "#/$defs/usage"
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+-        "session_id",
+-        "turn_id"
+-      ]
+-    },
+-    "turn_complete.response": {
+-      "$ref": "#/$defs/turn"
++        "v",
++        "code",
++        "message"
++      ],
++      "type": "object"
+     },
+-    "rotation_claim.request": {
+-      "type": "object",
++    "rotation_abandon_intent.request": {
+       "properties": {
+-        "v": {
+-          "const": 1
+-        },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "epoch": {
+-          "type": "string",
+-          "minLength": 1
+-        },
+-        "claimant": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "lease_ms": {
+-          "type": "integer",
+-          "minimum": 1,
+-          "maximum": 86400000
++        "intent_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "expected_seq": {
+-          "type": "integer",
+-          "minimum": 1
+-        },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "token": {
+-          "type": "integer",
+-          "minimum": 1
++          "minimum": 1,
++          "type": "integer"
++        },
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+         "session_id",
+         "epoch",
+-        "claimant",
+-        "lease_ms",
+-        "expected_seq"
++        "claim_id",
++        "token",
++        "intent_id"
+       ],
+-      "dependentRequired": {
+-        "claim_id": [
+-          "token"
+-        ],
+-        "token": [
+-          "claim_id"
+-        ]
+-      }
++      "type": "object"
+     },
+-    "rotation_claim.response": {
+-      "$ref": "#/$defs/claim"
++    "rotation_abandon_intent.response": {
++      "$ref": "#/$defs/intent"
+     },
+-    "rotation_intent.request": {
+-      "type": "object",
++    "rotation_ack.request": {
+       "properties": {
+-        "v": {
+-          "const": 1
++        "capsule_revision": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "epoch": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "intent_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "new_session_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "token": {
+-          "type": "integer",
+-          "minimum": 1
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "intent_id": {
+-          "type": "string",
+-          "minLength": 1
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+@@ -583,46 +698,43 @@
+         "epoch",
+         "claim_id",
+         "token",
+-        "intent_id"
++        "intent_id",
++        "capsule_revision",
++        "new_session_id"
+       ],
+-      "not": {
+-        "required": [
+-          "new_session_id"
+-        ]
+-      }
++      "type": "object"
+     },
+-    "rotation_intent.response": {
+-      "$ref": "#/$defs/intent"
++    "rotation_ack.response": {
++      "$ref": "#/$defs/ack"
+     },
+     "rotation_bind.request": {
+-      "type": "object",
+       "properties": {
+-        "v": {
+-          "const": 1
+-        },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
+-        },
+-        "epoch": {
+-          "type": "string",
+-          "minLength": 1
+-        },
+         "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "token": {
+-          "type": "integer",
+-          "minimum": 1
++        "epoch": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "intent_id": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+         "new_session_id": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
++        },
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "token": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+@@ -632,102 +744,130 @@
+         "token",
+         "intent_id",
+         "new_session_id"
+-      ]
++      ],
++      "type": "object"
+     },
+     "rotation_bind.response": {
+       "$ref": "#/$defs/intent"
+     },
+-    "rotation_ack.request": {
+-      "type": "object",
++    "rotation_claim.request": {
++      "dependentRequired": {
++        "claim_id": [
++          "token"
++        ],
++        "token": [
++          "claim_id"
++        ]
++      },
+       "properties": {
+-        "v": {
+-          "const": 1
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "claimant": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "epoch": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "expected_seq": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "token": {
+-          "type": "integer",
+-          "minimum": 1
++        "lease_ms": {
++          "maximum": 86400000,
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "intent_id": {
+-          "type": "string",
+-          "minLength": 1
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "capsule_revision": {
+-          "type": "integer",
+-          "minimum": 1
++        "token": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "new_session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+         "session_id",
+         "epoch",
+-        "claim_id",
+-        "token",
+-        "intent_id",
+-        "capsule_revision",
+-        "new_session_id"
+-      ]
++        "claimant",
++        "lease_ms",
++        "expected_seq"
++      ],
++      "type": "object"
+     },
+-    "rotation_ack.response": {
+-      "$ref": "#/$defs/ack"
++    "rotation_claim.response": {
++      "$ref": "#/$defs/claim"
+     },
+-    "rotation_status.request": {
+-      "type": "object",
++    "rotation_intent.request": {
++      "not": {
++        "required": [
++          "new_session_id"
++        ]
++      },
+       "properties": {
+-        "v": {
+-          "const": 1
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "epoch": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "intent_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "session_id": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "epoch": {
+-          "type": "string",
+-          "minLength": 1
++        "token": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+-        "session_id"
+-      ]
++        "session_id",
++        "epoch",
++        "claim_id",
++        "token",
++        "intent_id"
++      ],
++      "type": "object"
+     },
+-    "rotation_status.response": {
+-      "$ref": "#/$defs/status"
++    "rotation_intent.response": {
++      "$ref": "#/$defs/intent"
+     },
+     "rotation_release.request": {
+-      "type": "object",
+       "properties": {
+-        "v": {
+-          "const": 1
+-        },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "epoch": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+         "token": {
+-          "type": "integer",
+-          "minimum": 1
++          "minimum": 1,
++          "type": "integer"
++        },
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+@@ -735,1061 +875,870 @@
+         "epoch",
+         "claim_id",
+         "token"
+-      ]
++      ],
++      "type": "object"
+     },
+     "rotation_release.response": {
+       "$ref": "#/$defs/claim"
+     },
+-    "rotation_abandon_intent.request": {
+-      "type": "object",
++    "rotation_signal.request": {
+       "properties": {
+-        "v": {
+-          "const": 1
+-        },
+-        "session_id": {
+-          "type": "string",
+-          "minLength": 1
++        "action": {
++          "enum": [
++            "prepare",
++            "rotate"
++          ]
+         },
+         "epoch": {
+-          "type": "string",
+-          "minLength": 1
++          "minLength": 1,
++          "type": "string"
+         },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "reason": {
++          "type": "string"
+         },
+-        "token": {
+-          "type": "integer",
+-          "minimum": 1
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "intent_id": {
+-          "type": "string",
+-          "minLength": 1
++        "usage": {
++          "type": "object"
++        },
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+         "session_id",
+         "epoch",
+-        "claim_id",
+-        "token",
+-        "intent_id"
+-      ]
++        "action",
++        "reason",
++        "usage"
++      ],
++      "type": "object"
+     },
+-    "rotation_abandon_intent.response": {
+-      "$ref": "#/$defs/intent"
++    "rotation_signal.response": {
++      "$ref": "#/$defs/signal"
+     },
+-    "capsule_input": {
+-      "type": "object",
++    "rotation_status.request": {
+       "properties": {
+-        "version": {
+-          "const": 2
++        "epoch": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "ledger_seq": {
+-          "type": "integer",
+-          "minimum": 0
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "state": {
++        "v": {
++          "const": 1
++        }
++      },
++      "required": [
++        "session_id"
++      ],
++      "type": "object"
++    },
++    "rotation_status.response": {
++      "$ref": "#/$defs/status"
++    },
++    "signal": {
++      "properties": {
++        "action": {
+           "enum": [
+-            "complete",
+-            "in_progress",
+-            "missing",
+-            "invalidated"
++            "prepare",
++            "rotate"
+           ]
+         },
+-        "objective": {
+-          "type": "string",
+-          "maxLength": 384
++        "epoch": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "repository": {
+-          "type": "string",
+-          "maxLength": 384
++        "reason": {
++          "type": "string"
+         },
+-        "project_dir": {
+-          "type": "string",
+-          "maxLength": 384
++        "seq": {
++          "minimum": 1,
++          "type": "integer"
+         },
+         "session_id": {
+-          "type": "string",
+-          "maxLength": 128
+-        },
+-        "stream_id": {
+-          "type": "string",
+-          "maxLength": 96
+-        },
+-        "branch": {
+-          "type": "string",
+-          "maxLength": 128
+-        },
+-        "code_head": {
+-          "type": "string",
+-          "maxLength": 64
+-        },
+-        "next_action": {
+-          "type": "string",
+-          "maxLength": 400
+-        },
+-        "constraints": {
+-          "type": "array",
+-          "maxItems": 4,
+-          "items": {
+-            "type": "string",
+-            "maxLength": 128
+-          }
+-        },
+-        "dirty_paths": {
+-          "type": "array",
+-          "maxItems": 20,
+-          "items": {
+-            "type": "string",
+-            "maxLength": 128
+-          }
+-        },
+-        "blockers": {
+-          "type": "array",
+-          "maxItems": 3,
+-          "items": {
+-            "type": "string",
+-            "maxLength": 160
+-          }
++          "minLength": 1,
++          "type": "string"
+         },
+-        "gates": {
+-          "type": "object",
+-          "maxProperties": 6,
+-          "propertyNames": {
+-            "maxLength": 48
+-          },
+-          "additionalProperties": {
+-            "type": "object",
+-            "properties": {
+-              "status": {
+-                "enum": [
+-                  "pass",
+-                  "fail"
+-                ]
+-              },
+-              "number": {
+-                "type": "number"
+-              }
+-            },
+-            "required": [
+-              "status",
+-              "number"
+-            ],
+-            "additionalProperties": false
+-          }
++        "usage": {
++          "type": "object"
+         },
+-        "jobs": {
+-          "type": "array",
+-          "maxItems": 4,
+-          "items": {
+-            "type": "object",
+-            "properties": {
+-              "id": {
+-                "type": "string",
+-                "maxLength": 64
+-              },
+-              "result_path": {
+-                "type": "string",
+-                "maxLength": 192
+-              }
+-            },
+-            "required": [
+-              "id",
+-              "result_path"
+-            ],
+-            "additionalProperties": false
+-          }
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
++        "v",
+         "session_id",
+-        "ledger_seq"
++        "epoch",
++        "action",
++        "reason",
++        "usage",
++        "seq"
+       ],
+-      "description": "Capsule v2 normalized by daemon; omitted fields receive defaults and repository/code_head/stream_id may be inferred from project_dir. Repository must resolve nonempty. Text limits and total normalized size (4096) are UTF-8 bytes; maxLength expresses the necessary character bound. Unknown top-level fields ignored."
++      "type": "object"
+     },
+-    "capsule_saved": {
+-      "type": "object",
++    "status": {
+       "properties": {
+-        "version": {
+-          "const": 2
+-        },
+-        "ledger_seq": {
+-          "type": "integer",
+-          "minimum": 0
++        "ack": {
++          "anyOf": [
++            {
++              "$ref": "#/$defs/ack"
++            },
++            {
++              "type": "null"
++            }
++          ]
+         },
+-        "state": {
+-          "enum": [
+-            "complete",
+-            "in_progress",
+-            "missing",
+-            "invalidated"
++        "capsule": {
++          "anyOf": [
++            {
++              "$ref": "#/$defs/capsule"
++            },
++            {
++              "type": "null"
++            }
+           ]
+         },
+-        "objective": {
+-          "type": "string",
+-          "maxLength": 384
++        "claim": {
++          "anyOf": [
++            {
++              "$ref": "#/$defs/claim"
++            },
++            {
++              "type": "null"
++            }
++          ]
+         },
+-        "repository": {
+-          "type": "string",
+-          "maxLength": 384
++        "client": {
++          "type": "string"
+         },
+-        "project_dir": {
+-          "type": "string",
+-          "maxLength": 384
++        "cwd": {
++          "type": "string"
+         },
+-        "session_id": {
+-          "type": "string",
+-          "maxLength": 128
++        "epoch": {
++          "type": "string"
+         },
+-        "stream_id": {
+-          "type": "string",
+-          "maxLength": 96
++        "intent": {
++          "anyOf": [
++            {
++              "$ref": "#/$defs/intent"
++            },
++            {
++              "type": "null"
++            }
++          ]
+         },
+-        "branch": {
+-          "type": "string",
+-          "maxLength": 128
++        "lifecycle_performed": {
++          "type": "boolean"
+         },
+-        "code_head": {
+-          "type": "string",
+-          "maxLength": 64
++        "live": {
++          "type": "boolean"
+         },
+-        "next_action": {
+-          "type": "string",
+-          "maxLength": 400
++        "new_session_id": {
++          "type": [
++            "string",
++            "null"
++          ]
+         },
+-        "constraints": {
+-          "type": "array",
+-          "maxItems": 4,
+-          "items": {
+-            "type": "string",
+-            "maxLength": 128
+-          }
++        "owner": {
++          "enum": [
++            "relay",
++            "desktop",
++            "stream"
++          ]
+         },
+-        "dirty_paths": {
+-          "type": "array",
+-          "maxItems": 20,
+-          "items": {
+-            "type": "string",
+-            "maxLength": 128
+-          }
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "blockers": {
+-          "type": "array",
+-          "maxItems": 3,
+-          "items": {
+-            "type": "string",
+-            "maxLength": 160
+-          }
+-        },
+-        "gates": {
+-          "type": "object",
+-          "maxProperties": 6,
+-          "propertyNames": {
+-            "maxLength": 48
+-          },
+-          "additionalProperties": {
+-            "type": "object",
+-            "properties": {
+-              "status": {
+-                "enum": [
+-                  "pass",
+-                  "fail"
+-                ]
+-              },
+-              "number": {
+-                "type": "number"
+-              }
++        "signal": {
++          "anyOf": [
++            {
++              "$ref": "#/$defs/signal"
+             },
+-            "required": [
+-              "status",
+-              "number"
+-            ],
+-            "additionalProperties": false
+-          }
++            {
++              "type": "null"
++            }
++          ]
+         },
+-        "jobs": {
+-          "type": "array",
+-          "maxItems": 4,
++        "turn_seq": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "usage": {
++          "$ref": "#/$defs/usage"
++        },
++        "usage_history": {
+           "items": {
+-            "type": "object",
+-            "properties": {
+-              "id": {
+-                "type": "string",
+-                "maxLength": 64
+-              },
+-              "result_path": {
+-                "type": "string",
+-                "maxLength": 192
+-              }
+-            },
+-            "required": [
+-              "id",
+-              "result_path"
+-            ],
+-            "additionalProperties": false
+-          }
++            "$ref": "#/$defs/turn"
++          },
++          "maxItems": 16,
++          "type": "array"
+         },
+         "v": {
+           "const": 1
+-        },
+-        "revision": {
+-          "type": "integer",
+-          "minimum": 1
+-        },
+-        "saved_at": {
+-          "type": "number"
+         }
+       },
+       "required": [
+-        "version",
+-        "ledger_seq",
+-        "state",
+-        "objective",
+-        "repository",
+-        "project_dir",
+-        "session_id",
+-        "stream_id",
+-        "branch",
+-        "code_head",
+-        "next_action",
+-        "constraints",
+-        "dirty_paths",
+-        "blockers",
+-        "gates",
+-        "jobs",
+         "v",
+-        "revision",
+-        "saved_at"
+-      ]
++        "session_id",
++        "client",
++        "cwd",
++        "owner",
++        "signal",
++        "turn_seq",
++        "claim",
++        "capsule",
++        "intent",
++        "ack",
++        "lifecycle_performed",
++        "new_session_id",
++        "epoch",
++        "live"
++      ],
++      "type": "object"
+     },
+-    "capsule_save.request": {
+-      "type": "object",
++    "turn": {
+       "properties": {
+-        "v": {
+-          "const": 1
+-        },
+-        "epoch": {
+-          "type": "string",
+-          "minLength": 1
++        "seq": {
++          "minimum": 1,
++          "type": "integer"
+         },
+-        "claim_id": {
+-          "type": "string",
+-          "minLength": 1
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "token": {
+-          "type": "integer",
+-          "minimum": 1
++        "turn_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "expected_revision": {
+-          "type": "integer",
+-          "minimum": 0
++        "usage": {
++          "$ref": "#/$defs/usage"
+         },
+-        "capsule": {
+-          "$ref": "#/$defs/capsule_input"
+-        }
+-      },
+-      "required": [
+-        "epoch",
+-        "claim_id",
+-        "token",
+-        "expected_revision",
+-        "capsule"
+-      ]
+-    },
+-    "capsule_save.response": {
+-      "$ref": "#/$defs/capsule_saved"
+-    },
+-    "refusal": {
+-      "type": "object",
+-      "properties": {
+         "v": {
+           "const": 1
+-        },
+-        "code": {
+-          "enum": [
+-            "ack_conflict",
+-            "already_acknowledged",
+-            "binding_conflict",
+-            "capsule_mismatch",
+-            "claim_expired",
+-            "claim_live",
+-            "claimant_mismatch",
+-            "intent_abandoned",
+-            "intent_unresolved",
+-            "invalid_request",
+-            "mid_turn",
+-            "new_claim_required",
+-            "not_ambiguous",
+-            "not_bound",
+-            "revision_mismatch",
+-            "seq_mismatch",
+-            "session_mismatch",
+-            "stale_token",
+-            "unknown_action",
+-            "unknown_intent",
+-            "unknown_operation",
+-            "unknown_session",
+-            "unsupported_version"
+-          ]
+-        },
+-        "message": {
+-          "type": "string"
+         }
+       },
+       "required": [
+         "v",
+-        "code",
+-        "message"
++        "session_id",
++        "turn_id",
++        "seq"
+       ],
+-      "description": "JSON-RPC tools/call result has isError=true and structured equal to this object; content carries the human-readable message. All contract failures use one of these codes."
++      "type": "object"
+     },
+-    "usage_counters": {
+-      "type": "object",
++    "turn_complete.request": {
+       "properties": {
+-        "input": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "cached_input": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "uncached_input": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "output": {
+-          "type": "integer",
+-          "minimum": 0
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "reasoning": {
+-          "type": "integer",
+-          "minimum": 0
++        "turn_id": {
++          "minLength": 1,
++          "type": "string"
+         },
+-        "responses": {
+-          "type": "integer",
+-          "minimum": 0
++        "usage": {
++          "$ref": "#/$defs/usage"
+         },
+-        "tool_calls": {
+-          "type": "integer",
+-          "minimum": 0
++        "v": {
++          "const": 1
+         }
+       },
+       "required": [
+-        "input",
+-        "cached_input",
+-        "uncached_input",
+-        "output",
+-        "reasoning",
+-        "responses",
+-        "tool_calls"
++        "session_id",
++        "turn_id"
+       ],
+-      "additionalProperties": false
++      "type": "object"
+     },
+-    "usage_session": {
+-      "type": "object",
+-      "properties": {
+-        "input": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "cached_input": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "uncached_input": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "output": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "reasoning": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "responses": {
+-          "type": "integer",
+-          "minimum": 0
+-        },
+-        "tool_calls": {
+-          "type": "integer",
+-          "minimum": 0
++    "turn_complete.response": {
++      "$ref": "#/$defs/turn"
++    },
++    "usage": {
++      "additionalProperties": false,
++      "maxProperties": 19,
++      "minProperties": 5,
++      "oneOf": [
++        {
++          "maxProperties": 5
+         },
+-        "turns": {
+-          "type": "integer",
+-          "minimum": 0
+-        }
+-      },
+-      "required": [
+-        "input",
+-        "cached_input",
+-        "uncached_input",
+-        "output",
+-        "reasoning",
+-        "responses",
+-        "tool_calls",
+-        "turns"
++        {
++          "required": [
++            "wall_ms",
++            "idle_ms",
++            "tool_errors",
++            "consecutive_tool_errors",
++            "retries",
++            "in_flight_tool",
++            "turn_id_fresh",
++            "transcript_bytes_at_stop",
++            "transcript_mtime_ms_at_stop",
++            "flush_verified_next_turn",
++            "capsule",
++            "owner",
++            "client",
++            "progress_marker"
++          ]
++        }
+       ],
+-      "additionalProperties": false
+-    },
+-    "usage": {
+-      "type": "object",
+       "properties": {
+-        "turn": {
+-          "$ref": "#/$defs/usage_counters"
+-        },
+-        "context_tokens": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "context_window": {
+-          "type": [
+-            "integer",
+-            "null"
+-          ],
+-          "minimum": 0
+-        },
+-        "model": {
+-          "type": [
+-            "string",
+-            "null"
+-          ],
+-          "minLength": 1,
+-          "maxLength": 128,
+-          "pattern": "^[a-zA-Z0-9_.:/-]+$"
+-        },
+-        "session": {
+-          "$ref": "#/$defs/usage_session"
+-        },
+-        "wall_ms": {
++        "capsule": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "integer",
+-                  "minimum": 0
+-                },
+                 "provenance": {
+-                  "const": "hook"
++                  "const": "ledger"
++                },
++                "value": {
++                  "additionalProperties": false,
++                  "properties": {
++                    "revision": {
++                      "minimum": 0,
++                      "type": "integer"
++                    },
++                    "saved_at_ms": {
++                      "minimum": 0,
++                      "type": "integer"
++                    },
++                    "status": {
++                      "enum": [
++                        "in_progress",
++                        "missing",
++                        "invalidated",
++                        "complete"
++                      ]
++                    }
++                  },
++                  "required": [
++                    "revision",
++                    "status",
++                    "saved_at_ms"
++                  ],
++                  "type": "object"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "idle_ms": {
++        "client": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "integer",
+-                  "minimum": 0
+-                },
+                 "provenance": {
+                   "const": "hook"
++                },
++                "value": {
++                  "enum": [
++                    "claude",
++                    "codex"
++                  ],
++                  "type": "string"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "tool_errors": {
++        "consecutive_tool_errors": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "integer",
+-                  "minimum": 0
+-                },
+                 "provenance": {
+                   "const": "transcript"
++                },
++                "value": {
++                  "minimum": 0,
++                  "type": "integer"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "consecutive_tool_errors": {
++        "context_tokens": {
++          "minimum": 0,
++          "type": [
++            "integer",
++            "null"
++          ]
++        },
++        "context_window": {
++          "minimum": 0,
++          "type": [
++            "integer",
++            "null"
++          ]
++        },
++        "flush_verified_next_turn": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "integer",
+-                  "minimum": 0
+-                },
+                 "provenance": {
+                   "const": "transcript"
++                },
++                "value": {
++                  "type": "boolean"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "retries": {
++        "idle_ms": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "integer",
+-                  "minimum": 0
+-                },
+                 "provenance": {
+-                  "const": "transcript"
++                  "const": "hook"
++                },
++                "value": {
++                  "minimum": 0,
++                  "type": "integer"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+         "in_flight_tool": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "boolean"
+-                },
+                 "provenance": {
+                   "const": "transcript"
++                },
++                "value": {
++                  "type": "boolean"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "turn_id_fresh": {
++        "model": {
++          "maxLength": 128,
++          "minLength": 1,
++          "pattern": "^[a-zA-Z0-9_.:/-]+$",
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "owner": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "boolean"
+-                },
+                 "provenance": {
+-                  "const": "transcript"
++                  "const": "ledger"
++                },
++                "value": {
++                  "enum": [
++                    "relay",
++                    "desktop"
++                  ],
++                  "type": "string"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "transcript_bytes_at_stop": {
++        "progress_marker": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
+-                }
+-              },
+-              "required": [
+-                "value",
+-                "provenance"
+-              ],
+-              "additionalProperties": false
+-            },
+-            {
+-              "type": "object",
+-              "properties": {
+-                "value": {
+-                  "type": "integer",
+-                  "minimum": 0
+                 },
+-                "provenance": {
+-                  "const": "hook"
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "transcript_mtime_ms_at_stop": {
++        "retries": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "integer",
+-                  "minimum": 0
+-                },
+                 "provenance": {
+-                  "const": "hook"
++                  "const": "transcript"
++                },
++                "value": {
++                  "minimum": 0,
++                  "type": "integer"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "flush_verified_next_turn": {
++        "session": {
++          "$ref": "#/$defs/usage_session"
++        },
++        "tool_errors": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "boolean"
+-                },
+                 "provenance": {
+                   "const": "transcript"
++                },
++                "value": {
++                  "minimum": 0,
++                  "type": "integer"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "capsule": {
++        "transcript_bytes_at_stop": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
++                "provenance": {
++                  "const": "hook"
++                },
+                 "value": {
+-                  "type": "object",
+-                  "properties": {
+-                    "revision": {
+-                      "type": "integer",
+-                      "minimum": 0
+-                    },
+-                    "status": {
+-                      "enum": [
+-                        "in_progress",
+-                        "missing",
+-                        "invalidated",
+-                        "complete"
+-                      ]
+-                    },
+-                    "saved_at_ms": {
+-                      "type": "integer",
+-                      "minimum": 0
+-                    }
+-                  },
+-                  "required": [
+-                    "revision",
+-                    "status",
+-                    "saved_at_ms"
+-                  ],
+-                  "additionalProperties": false
+-                },
+-                "provenance": {
+-                  "const": "ledger"
++                  "minimum": 0,
++                  "type": "integer"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "owner": {
++        "transcript_mtime_ms_at_stop": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "string",
+-                  "enum": [
+-                    "relay",
+-                    "desktop"
+-                  ]
+-                },
+                 "provenance": {
+-                  "const": "ledger"
++                  "const": "hook"
++                },
++                "value": {
++                  "minimum": 0,
++                  "type": "integer"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "client": {
++        "turn": {
++          "$ref": "#/$defs/usage_counters"
++        },
++        "turn_id_fresh": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "null"
+-                },
+                 "provenance": {
+                   "const": "absent"
++                },
++                "value": {
++                  "type": "null"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             },
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
+-                "value": {
+-                  "type": "string",
+-                  "enum": [
+-                    "claude",
+-                    "codex"
+-                  ]
+-                },
+                 "provenance": {
+-                  "const": "hook"
++                  "const": "transcript"
++                },
++                "value": {
++                  "type": "boolean"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         },
+-        "progress_marker": {
++        "wall_ms": {
+           "oneOf": [
+             {
+-              "type": "object",
++              "additionalProperties": false,
+               "properties": {
++                "provenance": {
++                  "const": "absent"
++                },
+                 "value": {
+                   "type": "null"
+-                },
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            },
++            {
++              "additionalProperties": false,
++              "properties": {
+                 "provenance": {
+-                  "const": "absent"
++                  "const": "hook"
++                },
++                "value": {
++                  "minimum": 0,
++                  "type": "integer"
+                 }
+               },
+               "required": [
+                 "value",
+                 "provenance"
+               ],
+-              "additionalProperties": false
++              "type": "object"
+             }
+           ]
+         }
+@@ -1801,32 +1750,562 @@
+         "model",
+         "session"
+       ],
++      "type": "object"
++    },
++    "usage_counters": {
+       "additionalProperties": false,
+-      "minProperties": 5,
+-      "maxProperties": 19,
+-      "oneOf": [
++      "properties": {
++        "cached_input": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "input": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "output": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "reasoning": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "responses": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "tool_calls": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "uncached_input": {
++          "minimum": 0,
++          "type": "integer"
++        }
++      },
++      "required": [
++        "input",
++        "cached_input",
++        "uncached_input",
++        "output",
++        "reasoning",
++        "responses",
++        "tool_calls"
++      ],
++      "type": "object"
++    },
++    "usage_session": {
++      "additionalProperties": false,
++      "properties": {
++        "cached_input": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "input": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "output": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "reasoning": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "responses": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "tool_calls": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "turns": {
++          "minimum": 0,
++          "type": "integer"
++        },
++        "uncached_input": {
++          "minimum": 0,
++          "type": "integer"
++        }
++      },
++      "required": [
++        "input",
++        "cached_input",
++        "uncached_input",
++        "output",
++        "reasoning",
++        "responses",
++        "tool_calls",
++        "turns"
++      ],
++      "type": "object"
++    },
++    "native_capsule_storage_receipt": {
++      "type": "object",
++      "properties": {
++        "artifact_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "bytes": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 16384
++        }
++      },
++      "required": [
++        "artifact_id",
++        "sha256",
++        "bytes"
++      ],
++      "additionalProperties": false
++    },
++    "native_source_enrollment": {
++      "type": "object",
++      "properties": {
++        "session_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "client": {
++          "const": "codex"
++        },
++        "cwd": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 4096,
++          "pattern": "^/[^\\u0000]*$"
++        },
++        "pane_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 256,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "agent_pid": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 2147483647
++        },
++        "agent_start": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "worker_pid": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 2147483647
++        },
++        "worker_start": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "node_boot_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 256,
++          "pattern": "^[^\\u0000]+$"
++        }
++      },
++      "required": [
++        "session_id",
++        "client",
++        "cwd",
++        "pane_id",
++        "agent_pid",
++        "agent_start",
++        "worker_pid",
++        "worker_start",
++        "node_boot_id"
++      ],
++      "additionalProperties": false
++    },
++    "native_source_binding": {
++      "type": "object",
++      "properties": {
++        "enrollment": {
++          "$ref": "#/$defs/native_source_enrollment"
++        },
++        "turn_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 256,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "turn_seq": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "transcript_mtime_ms": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "transcript_bytes": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 67108864
++        },
++        "source_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "evidence_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "binding_revision": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 256,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "source_chunks": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 128
++        }
++      },
++      "required": [
++        "enrollment",
++        "turn_id",
++        "turn_seq",
++        "transcript_mtime_ms",
++        "transcript_bytes",
++        "source_sha256",
++        "evidence_sha256",
++        "binding_revision",
++        "source_chunks"
++      ],
++      "additionalProperties": false
++    },
++    "native_reservation_pair": {
++      "type": "object",
++      "properties": {
++        "native": {
++          "type": "object",
++          "properties": {
++            "reservationId": {
++              "type": "string",
++              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++              "not": {
++                "const": "00000000-0000-0000-0000-000000000000"
++              }
++            },
++            "runtimeId": {
++              "type": "string",
++              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++              "not": {
++                "const": "00000000-0000-0000-0000-000000000000"
++              }
++            },
++            "threadId": {
++              "type": "string",
++              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++              "not": {
++                "const": "00000000-0000-0000-0000-000000000000"
++              }
++            },
++            "turnId": {
++              "type": "string",
++              "minLength": 1,
++              "maxLength": 256,
++              "pattern": "^[^\\u0000]+$"
++            },
++            "rolloutPath": {
++              "type": "string",
++              "minLength": 1,
++              "maxLength": 4096,
++              "pattern": "^/[^\\u0000]*$"
++            },
++            "admissionGeneration": {
++              "type": "string",
++              "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
++            },
++            "expiresInMs": {
++              "type": "integer",
++              "minimum": 1,
++              "maximum": 5000
++            }
++          },
++          "required": [
++            "reservationId",
++            "runtimeId",
++            "threadId",
++            "turnId",
++            "rolloutPath",
++            "admissionGeneration",
++            "expiresInMs"
++          ],
++          "additionalProperties": false
++        },
++        "frontend": {
++          "type": "object",
++          "properties": {
++            "runtime_id": {
++              "type": "string",
++              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++              "not": {
++                "const": "00000000-0000-0000-0000-000000000000"
++              }
++            },
++            "generation": {
++              "type": "string",
++              "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
++            }
++          },
++          "required": [
++            "runtime_id",
++            "generation"
++          ],
++          "additionalProperties": false
++        }
++      },
++      "required": [
++        "native",
++        "frontend"
++      ],
++      "additionalProperties": false
++    },
++    "native_claim_binding": {
++      "type": "object",
++      "properties": {
++        "source": {
++          "$ref": "#/$defs/native_source_binding"
++        },
++        "capsule": {
++          "$ref": "#/$defs/native_capsule_storage_receipt"
++        },
++        "reservation": {
++          "$ref": "#/$defs/native_reservation_pair"
++        }
++      },
++      "required": [
++        "source",
++        "capsule",
++        "reservation"
++      ],
++      "additionalProperties": false
++    },
++    "native_claim": {
++      "properties": {
++        "claim_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "claimant": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "closed": {
++          "type": "boolean"
++        },
++        "epoch": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "expected_seq": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "expires_at_ms": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "release_seq": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "seq": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "session_id": {
++          "minLength": 1,
++          "type": "string"
++        },
++        "token": {
++          "minimum": 1,
++          "type": "integer"
++        },
++        "v": {
++          "const": 1
++        },
++        "mode": {
++          "const": "native_v1"
++        },
++        "operation_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "host_claim_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "native": {
++          "$ref": "#/$defs/native_claim_binding"
++        }
++      },
++      "required": [
++        "v",
++        "session_id",
++        "epoch",
++        "claim_id",
++        "token",
++        "claimant",
++        "seq",
++        "expected_seq",
++        "expires_at_ms",
++        "closed",
++        "mode",
++        "operation_id",
++        "host_claim_id",
++        "native"
++      ],
++      "type": "object"
++    },
++    "rotation_native_claim.request": {
++      "type": "object",
++      "properties": {
++        "v": {
++          "const": 1
++        },
++        "session_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "epoch": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "claimant": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 110,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "host_claim_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "lease_ms": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 5000
++        },
++        "source": {
++          "$ref": "#/$defs/native_source_binding"
++        },
++        "capsule": {
++          "$ref": "#/$defs/native_capsule_storage_receipt"
++        },
++        "reservation": {
++          "$ref": "#/$defs/native_reservation_pair"
++        }
++      },
++      "required": [
++        "v",
++        "session_id",
++        "epoch",
++        "claimant",
++        "host_claim_id",
++        "lease_ms",
++        "source",
++        "capsule",
++        "reservation"
++      ],
++      "additionalProperties": false
++    },
++    "rotation_native_claim.response": {
++      "$ref": "#/$defs/native_claim"
++    },
++    "rotation_native_release.request": {
++      "type": "object",
++      "properties": {
++        "v": {
++          "const": 1
++        },
++        "session_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "epoch": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "claim_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 160,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "token": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "host_claim_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        }
++      },
++      "required": [
++        "v",
++        "session_id",
++        "epoch",
++        "claim_id",
++        "token",
++        "host_claim_id"
++      ],
++      "additionalProperties": false
++    },
++    "rotation_native_release.response": {
++      "allOf": [
+         {
+-          "maxProperties": 5
++          "$ref": "#/$defs/native_claim"
+         },
+         {
+-          "required": [
+-            "wall_ms",
+-            "idle_ms",
+-            "tool_errors",
+-            "consecutive_tool_errors",
+-            "retries",
+-            "in_flight_tool",
+-            "turn_id_fresh",
+-            "transcript_bytes_at_stop",
+-            "transcript_mtime_ms_at_stop",
+-            "flush_verified_next_turn",
+-            "capsule",
+-            "owner",
+-            "client",
+-            "progress_marker"
+-          ]
++          "properties": {
++            "closed": {
++              "const": true
++            }
++          }
+         }
+       ]
+     }
+-  }
++  },
++  "$id": "urn:chitta:rotation:1",
++  "$schema": "https://json-schema.org/draft/2020-12/schema"
+ }
+diff --git a/chitta/src/task_native_rotation_test.cpp b/chitta/src/task_native_rotation_test.cpp
+new file mode 100644
+index 0000000..883bbd7
+--- /dev/null
++++ b/chitta/src/task_native_rotation_test.cpp
+@@ -0,0 +1,156 @@
++#include <chitta/task_ledger.hpp>
++#include <cassert>
++#include <atomic>
++#include <iostream>
++#include <thread>
++using json = nlohmann::json;
++static unsigned checks = 0;
++static void check(bool ok) { ++checks; assert(ok); }
++static const std::string sid = "11111111-1111-4111-8111-111111111111";
++static const std::string opid = "22222222-2222-4222-8222-222222222222";
++static json usage() {
++    json c = {{"input",10},{"cached_input",4},{"uncached_input",6},{"output",2},{"reasoning",1},{"responses",1},{"tool_calls",0}};
++    json u = {{"turn",c},{"session",c},{"context_tokens",10},{"context_window",64000},{"model","fixture"}};
++    u["session"]["turns"] = 1;
++    for (auto k : {"wall_ms","idle_ms","tool_errors","consecutive_tool_errors","retries","in_flight_tool",
++         "turn_id_fresh","transcript_bytes_at_stop","transcript_mtime_ms_at_stop","flush_verified_next_turn",
++         "capsule","owner","client","progress_marker"}) u[k] = {{"value",nullptr},{"provenance","absent"}};
++    u["client"] = {{"value","codex"},{"provenance","hook"}};
++    u["in_flight_tool"] = {{"value",false},{"provenance","transcript"}};
++    u["turn_id_fresh"] = {{"value",true},{"provenance","transcript"}};
++    u["transcript_bytes_at_stop"] = {{"value",100},{"provenance","hook"}};
++    u["transcript_mtime_ms_at_stop"] = {{"value",1000},{"provenance","hook"}};
++    return u;
++}
++struct Fixture {
++    chitta::TaskLedger ledger;
++    std::vector<json> wal;
++    json turn;
++    Fixture() {
++        run("session_bind", {{"client","codex"},{"owner","relay"},{"cwd","/repo"}});
++        turn = run("turn_complete", {{"turn_id","completed"},{"usage",usage()}});
++    }
++    json run(const std::string& op, json a = json::object()) {
++        a["v"] = 1; a["session_id"] = sid;
++        return ledger.run(op,a,[&](const json& b){wal.push_back(b);});
++    }
++    json args() {
++        json owner = {{"session_id",sid},{"client","codex"},{"cwd","/repo"},{"pane_id","pane"},
++            {"agent_pid",101},{"agent_start",102},{"worker_pid",201},{"worker_start",202},{"node_boot_id","boot"}};
++        json source = {{"enrollment",owner},{"turn_id","completed"},{"turn_seq",turn.at("seq")},
++            {"transcript_mtime_ms",1000},{"transcript_bytes",100},{"source_sha256",std::string(64,'a')},
++            {"evidence_sha256",std::string(64,'b')},{"binding_revision","binding"},{"source_chunks",1}};
++        json n = {{"reservationId","44444444-4444-4444-8444-444444444444"},
++            {"runtimeId","55555555-5555-4555-8555-555555555555"},{"threadId",sid},{"turnId","completed"},
++            {"rolloutPath","/private/sessions/source.jsonl"},{"admissionGeneration","18446744073709551615"},{"expiresInMs",5000}};
++        return {{"v",1},{"session_id",sid},{"epoch",opid},{"claimant","relay"},
++            {"host_claim_id","33333333-3333-4333-8333-333333333333"},{"lease_ms",5000},{"source",source},
++            {"capsule",{{"artifact_id",std::string(64,'c')},{"sha256",std::string(64,'d')},{"bytes",1024}}},
++            {"reservation",{{"native",n},{"frontend",{{"runtime_id","66666666-6666-4666-8666-666666666666"},{"generation","0"}}}}}};
++    }
++};
++static json release_args(const json& c) {
++    return {{"v",1},{"session_id",sid},{"epoch",c.at("epoch")},{"claim_id",c.at("claim_id")},
++        {"token",c.at("token")},{"host_claim_id",c.value("host_claim_id",opid)}};
++}
++template <typename F> static void refused(F f) {
++    bool rejected = false; try { f(); } catch (const std::exception&) { rejected = true; } check(rejected);
++}
++int main() {
++    Fixture f; const auto args = f.args(); const auto before = f.run("rotation_status");
++    refused([&]{f.ledger.run("rotation_native_claim",args,[](const json&){throw std::runtime_error("WAL failed");});});
++    check(f.run("rotation_status")==before);
++    const auto claim = f.run("rotation_native_claim",args);
++    check(claim.at("mode")=="native_v1" && claim.at("expected_seq")==f.turn.at("seq"));
++    check(claim.at("operation_id")==opid && claim.at("host_claim_id")!=claim.at("claim_id"));
++    auto status = f.run("rotation_status");
++    check(status.at("claim")==claim && status.at("signal").is_null() && status.at("live")==true);
++    chitta::TaskLedger recovered;
++    for (const auto& b:f.wal) recovered.replay(b);
++    check(recovered.run("rotation_status",{{"session_id",sid}},[](const json&){})==status);
++    refused([&]{f.run("rotation_native_claim",args);});
++    auto different=args; different["epoch"]="77777777-7777-4777-8777-777777777777";
++    refused([&]{f.run("rotation_native_claim",different);});
++    for(auto op:{"rotation_claim","rotation_release","rotation_signal","rotation_intent","rotation_bind","rotation_ack","rotation_abandon_intent","capsule_save"}) {
++        auto a=release_args(claim); a["claimant"]="relay"; a["lease_ms"]=5000; a["expected_seq"]=f.turn.at("seq");
++        refused([&]{f.run(op,a);});
++    }
++    auto release=release_args(claim), bad=release; bad["token"]=0;
++    refused([&]{f.run("rotation_native_release",bad);});
++    bad=release; bad["host_claim_id"]=opid; refused([&]{f.run("rotation_native_release",bad);});
++    refused([&]{f.ledger.run("rotation_native_release",release,[](const json&){throw std::runtime_error("WAL failed");});});
++    check(f.run("rotation_status")==status);
++    const auto released=f.run("rotation_native_release",release);
++    check(released.at("closed")==true && f.run("rotation_status").at("live")==false);
++    const auto size=f.wal.size();
++    check(f.run("rotation_native_release",release)==released && f.wal.size()==size);
++    refused([&]{f.run("rotation_native_claim",args);});
++    std::vector<std::pair<std::string,json>> changes={
++        {"/epoch","bad"},{"/host_claim_id",opid},{"/source/enrollment/session_id",opid},
++        {"/source/enrollment/client","claude"},{"/source/enrollment/cwd","/different"},
++        {"/source/enrollment/agent_start",0},{"/source/enrollment/worker_pid",-1},
++        {"/source/turn_id","different"},{"/source/turn_seq",999},{"/source/transcript_bytes",101},
++        {"/source/transcript_mtime_ms",1001},{"/source/source_sha256",std::string(64,'Z')},
++        {"/source/evidence_sha256","bad"},{"/source/source_chunks",129},{"/capsule/bytes",16385},
++        {"/capsule/artifact_id","../artifact"},{"/reservation/native/threadId",opid},
++        {"/reservation/native/turnId","different"},
++        {"/reservation/native/reservationId","00000000-0000-0000-0000-000000000000"},
++        {"/reservation/native/rolloutPath","relative"},{"/reservation/native/admissionGeneration","18446744073709551616"},
++        {"/reservation/native/admissionGeneration","01"},{"/reservation/native/expiresInMs",5001},
++        {"/reservation/frontend/generation","-1"},{"/lease_ms",0},{"/lease_ms",5001},{"/lease_ms",1.5}};
++    for(const auto& [path,value]:changes) {
++        Fixture g; auto a=g.args(); a[json::json_pointer(path)]=value; const auto unchanged=g.run("rotation_status");
++        refused([&]{g.run("rotation_native_claim",a);}); check(g.run("rotation_status")==unchanged);
++    }
++    for(auto path:{"/source","/capsule","/reservation","/reservation/native","/reservation/frontend","/source/enrollment"}) {
++        Fixture g; auto a=g.args(); a[json::json_pointer(path)]["unknown"]="unexpected";
++        refused([&]{g.run("rotation_native_claim",a);});
++    }
++    for(auto observation:{"turn_id_fresh","in_flight_tool"}) {
++        Fixture g; auto u=usage(); u[observation]={{"value",nullptr},{"provenance","absent"}};
++        g.turn=g.run("turn_complete",{{"turn_id","next"},{"usage",u}});
++        auto a=g.args(); a["source"]["turn_id"]="next"; a["reservation"]["native"]["turnId"]="next";
++        refused([&]{g.run("rotation_native_claim",a);});
++    }
++    {
++        Fixture g; g.run("turn_complete",{{"turn_id","next-without-usage"}});
++        refused([&]{g.run("rotation_native_claim",g.args());});
++    }
++    {
++        Fixture g; g.run("session_bind",{{"owner","desktop"}});
++        refused([&]{g.run("rotation_native_claim",g.args());});
++    }
++    {
++        Fixture g;
++        g.run("rotation_signal",{{"epoch","legacy"},{"action","rotate"},{"reason","test"},{"usage",json::object()}});
++        json a={{"epoch","legacy"},{"claimant","legacy"},{"lease_ms",5000},{"expected_seq",g.turn.at("seq")}};
++        refused([&]{g.run("rotation_claim",a);});
++        g.turn=g.run("turn_complete",{{"turn_id","next"},{"usage",usage()}}); a["expected_seq"]=g.turn.at("seq");
++        const auto legacy=g.run("rotation_claim",a); check(legacy.at("expected_seq")==g.turn.at("seq"));
++        auto n=g.args(); n["source"]["turn_id"]="next"; n["reservation"]["native"]["turnId"]="next";
++        refused([&]{g.run("rotation_native_claim",n);});
++        refused([&]{g.run("rotation_native_release",release_args(legacy));});
++    }
++    {
++        Fixture g; auto row=g.run("session_get"); auto metadata=json::parse(row.at("metadata_json").get<std::string>());
++        auto c=chitta::rotation::apply("rotation_native_claim",g.args(),metadata,row,20,1000);
++        check(chitta::rotation::has_open_claim(metadata,5999));
++        check(!chitta::rotation::has_open_claim(metadata,6000));
++        check(chitta::rotation::apply("rotation_native_release",release_args(c),metadata,row,21,7000).at("closed")==true);
++        metadata["rotation"]["epochs"][opid]["claim"]=c;
++        metadata["rotation"]["epochs"][opid]["intent"]={{"state","submitted"}};
++        refused([&]{chitta::rotation::apply("rotation_native_release",release_args(c),metadata,row,22,1001);});
++    }
++    {
++        Fixture g; std::atomic<int> wins{0}; std::vector<std::thread> workers; const auto a=g.args();
++        for(int i=0;i<16;++i) workers.emplace_back([&,i] {
++            auto q=a; auto id=opid; id[0]="0123456789abcdef"[i]; q["epoch"]=id;
++            try {g.run("rotation_native_claim",q); ++wins;} catch(const std::exception&) {}
++        });
++        for(auto& w:workers) w.join(); check(wins==1);
++        chitta::TaskLedger r; for(const auto& b:g.wal) r.replay(b);
++        check(r.run("rotation_status",{{"session_id",sid}},[](const json&){})==g.run("rotation_status"));
++    }
++    std::cout<<json({{"checks",checks},{"request",args},{"claim",claim},{"status",status},
++        {"release_request",release},{"release_response",released}}).dump()<<"\n";
++}
+diff --git a/docs/NATIVE-ROTATION-RESERVATION.md b/docs/NATIVE-ROTATION-RESERVATION.md
+new file mode 100644
+index 0000000..3e3af6e
+--- /dev/null
++++ b/docs/NATIVE-ROTATION-RESERVATION.md
+@@ -0,0 +1,44 @@
++# Native rotation reservation claim — source contract
++
++This adds rotation_native_claim and rotation_native_release to chitta.rotation/1.
++The record mode is native_v1. It is a bounded reservation stage, not a close,
++restore or receipt acknowledgement API. Host intent/commit/reconciliation is
++still required before the full native transaction is available.
++
++A claim requires a Relay-owned Codex session and the exact latest completed turn,
++including native turn ID, fresh-turn/no-tool observations and both transcript
++watermarks. The request binds a durable host capsule storage receipt and the
++complete source binding to the paired core and foreground reservation receipts.
++The operation/epoch and host claim are distinct UUIDs. Chitta separately issues
++its monotone token and session:sequence claim ID; these identifiers are not
++interchangeable.
++
++Unlike the legacy rotation_claim operation, this explicit native operation does
++not require a later model turn after a rotation signal. It records evidence for
++a caller holding the actual native reservations. JSON receipts, ledger records,
++or replayed status cannot recreate those reservations or authorize a close.
++The frontend and native ordered owner must still revalidate their own capabilities.
++
++The lifetime is at most five seconds and cannot exceed the advertised native
++reservation lifetime. The host must independently enforce the original monotonic
++native deadline before and after the ledger call. Expiry never extends native
++authority. This API has no renewal and never reuses an existing operation ID.
++An uncertain claim response must be looked up by its exact epoch, not resubmitted.
++
++One live claim, of either mode, excludes another claim for the same session.
++Every legacy rotation mutation is refused when targeting a native claim.
++Ordinary completed-turn telemetry remains recordable; a changed turn prevents
++new claims and must invalidate the host's pending native reservation.
++
++Native release requires the exact epoch, issued claim ID/token and host UUID.
++It is idempotent and can close an expired reservation. It cannot release a claim
++from another mode or operation and refuses an existing intent. The future commit
++contract must define sticky accepted intent, receipt validation and recovery
++before any destructive operation is exposed.
++
++All mutations run inside TaskLedger's existing serialized durable transaction.
++WAL persistence failure leaves the prior in-memory state intact. The native
++record survives WAL replay and appears through the existing rotation_status.
++Capsule body bytes remain in the host's private immutable artifact store; this
++ledger record contains their digest and source binding, not model-visible owner
++metadata, credentials, environment or command-line arguments.

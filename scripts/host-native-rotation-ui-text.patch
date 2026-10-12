@@ -1,0 +1,2118 @@
+diff --git a/Sources/Relay/RelayHostRotationRPC.swift b/Sources/Relay/RelayHostRotationRPC.swift
+new file mode 100644
+--- /dev/null
++++ b/Sources/Relay/RelayHostRotationRPC.swift
+@@ -0,0 +1,276 @@
++import Foundation
++
++/// Uses the existing pane worker. Probe requests never attach an input client
++/// or start a provider; writes use this viewer's current terminal input lease.
++enum RelayHostRotationRPC {
++    enum Operation: String, Encodable, Sendable { case status, enroll, disable }
++
++    struct Enrollment: Codable, Equatable, Sendable {
++        let sessionID: String
++        let client: String
++        let cwd: String
++        let paneID: String
++        let agentPID: Int
++        let agentStart: UInt64
++        let workerPID: Int
++        let workerStart: UInt64
++        let nodeBootID: String
++        enum CodingKeys: String, CodingKey {
++            case sessionID = "session_id", client, cwd, paneID = "pane_id"
++            case agentPID = "agent_pid", agentStart = "agent_start"
++            case workerPID = "worker_pid", workerStart = "worker_start", nodeBootID = "node_boot_id"
++        }
++        func valid(for paneID: UUID) -> Bool {
++            self.paneID == paneID.uuidString.lowercased() && validIdentifier(sessionID) &&
++                ["claude", "codex"].contains(client) && validDirectory(cwd) &&
++                agentPID > 1 && agentStart > 0 && workerPID > 1 && workerStart > 0 &&
++                !nodeBootID.isEmpty && nodeBootID.utf8.count <= 128
++        }
++    }
++
++    struct Decision: Decodable, Equatable, Sendable {
++        let v: Int
++        let decision: String
++    }
++    struct Preparation: Decodable, Equatable, Sendable {
++        let state: String
++        let code: String?
++        var hint: String? {
++            switch code {
++            case "spending_limit": return "This host reached a spending or request limit. Review the Handoff text settings."
++            case "text_backend_disabled": return "Enable Handoff text on this host to prepare a saved handoff."
++            case "reconciliation_required": return "Review the unresolved Handoff text requests before continuing."
++            case "text_settings_unavailable", "text_service_unavailable": return "Read Handoff text status. Update this host's helper if the text service remains unavailable."
++            case "completed_turn_unavailable": return "Wait for a completed turn in the original CLI before preparing a handoff."
++            case "source_unavailable", "source_changed", "invalid_source_binding", "generation_changed": return "The original session changed. Keep it open and wait for its next completed turn."
++            case "ledger_unavailable", "capsule_storage_unavailable", "capsule_receipt_binding_mismatch": return "The host could not verify a saved handoff. Keep the original session open and check Chitta on this host."
++            case "merge_limit", "incomplete_source_coverage": return "This conversation exceeds the supported handoff limits. Keep the original session open."
++            default: return state.contains("failed") || state.contains("unavailable") ?
++                "Handoff preparation could not finish. Keep the original session open and read Handoff text status." : nil
++            }
++        }
++    }
++    struct Status: Decodable, Equatable, Sendable {
++        let version: Int?
++        let operationID: String?
++        let operation: String?
++        let enabled: Bool?
++        let state: String
++        let generation: UInt64?
++        let enrollment: Enrollment?
++        let lifecycle: String?
++        let refreshCapability: String?
++        let nextEvaluationMS: Int64?
++        let decision: Decision?
++        let preparation: Preparation?
++        let nativeRecoveryState: String?
++        let message: String?
++        enum CodingKeys: String, CodingKey {
++            case version = "v", operationID = "operation_id", operation, enabled, state, generation, enrollment
++            case lifecycle, refreshCapability = "refresh_capability", nextEvaluationMS = "next_evaluation_ms"
++            case decision, preparation, nativeRecoveryState = "native_recovery_state", message
++        }
++        var isUnsupported: Bool { state == "unsupported" }
++        func valid(for paneID: UUID) -> Bool {
++            guard !state.isEmpty, state.utf8.count <= 80,
++                  (message?.utf8.count ?? 0) <= 8192 else { return false }
++            if isUnsupported { return version == nil && enabled == nil }
++            guard version == 1, enabled != nil, generation != nil,
++                  lifecycle?.isEmpty == false, (lifecycle?.utf8.count ?? 0) <= 80,
++                  refreshCapability?.isEmpty == false, (refreshCapability?.utf8.count ?? 0) <= 80,
++                  (nativeRecoveryState?.utf8.count ?? 0) <= 160,
++                  nextEvaluationMS.map({ $0 >= 0 }) ?? true,
++                  decision.map({ $0.v == 1 && !$0.decision.isEmpty && $0.decision.utf8.count <= 80 }) ?? true,
++                  preparation.map({ !$0.state.isEmpty && $0.state.utf8.count <= 80 && ($0.code?.utf8.count ?? 0) <= 1024 }) ?? true
++            else { return false }
++            if ["not_enrolled", "invalid_saved_state", "saved_state_unavailable"].contains(state) {
++                return enabled == false && (operationID == nil || operationID == "")
++            }
++            if operation == "disable", enabled == false, enrollment?.paneID == "" {
++                return validOperationID(operationID ?? "") && enrollment?.agentPID == 0 && enrollment?.agentStart == 0
++            }
++            return validOperationID(operationID ?? "") && ["enroll", "disable"].contains(operation ?? "") &&
++                enrollment?.valid(for: paneID) == true
++        }
++        var title: String {
++            if isUnsupported { return "Host update required" }
++            if state.contains("unavailable") || state.contains("failed") || state.contains("invalid") {
++                return "Needs attention"
++            }
++            if enabled != true { return state == "human_takeover" ? "Paused after your input" : "Off" }
++            if nativeRecoveryState != nil || state.contains("pending") && state.contains("native") {
++                return "Finishing recovery"
++            }
++            if state == "native_refused" { return "Waiting for a new completed turn" }
++            if state.contains("unavailable") || state.contains("failed") || state.contains("invalid") {
++                return "Needs attention"
++            }
++            if state == "awaiting_completed_turn" { return "Waiting for a completed turn" }
++            if state.hasPrefix("native_") { return "Managing context" }
++            return "Monitoring context"
++        }
++    }
++
++    struct NativeBinding: Decodable, Equatable, Sendable {
++        struct Producer: Decodable, Equatable, Sendable {
++            let paneID: String
++            let provider: String
++            let processID: Int
++            let processStart: UInt64
++            enum CodingKeys: String, CodingKey {
++                case paneID = "pane_id", provider, processID = "process_id", processStart = "process_start"
++            }
++        }
++        let version: Int
++        let sessionID: String
++        let transcriptPath: String
++        let revision: String
++        let producer: Producer
++        enum CodingKeys: String, CodingKey {
++            case version, sessionID = "session_id", transcriptPath = "transcript_path", revision, producer
++        }
++        func valid(for paneID: UUID) -> Bool {
++            version == 1 && producer.paneID == paneID.uuidString.lowercased() &&
++                ["claude", "codex"].contains(producer.provider) && producer.processID > 1 &&
++                producer.processStart > 0 && validIdentifier(sessionID) &&
++                validDirectory(transcriptPath) && !revision.isEmpty && revision.utf8.count <= 128
++        }
++    }
++
++
++    struct NativeCandidate: Decodable, Equatable, Sendable {
++        let version: Int
++        let state: String
++        let cwd: String
++        let binding: NativeBinding
++        enum CodingKeys: String, CodingKey { case version = "v", state, cwd, binding }
++        func valid(for paneID: UUID) -> Bool {
++            version == 1 && state == "ready" && validDirectory(cwd) && binding.valid(for: paneID)
++        }
++    }
++
++    struct Request: Encodable, Sendable {
++        let version = 1
++        let operation: Operation
++        var id: String? = nil
++        var sessionID: String? = nil
++        var client: String? = nil
++        var cwd: String? = nil
++        var agentPID: Int? = nil
++        var agentStart: UInt64? = nil
++        enum CodingKeys: String, CodingKey {
++            case version = "v", operation, id, sessionID = "session_id", client, cwd
++            case agentPID = "agent_pid", agentStart = "agent_start"
++        }
++        var valid: Bool {
++            switch operation {
++            case .status:
++                return id == nil && sessionID == nil && client == nil && cwd == nil && agentPID == nil && agentStart == nil
++            case .disable:
++                return validOperationID(id ?? "") && sessionID == nil && client == nil && cwd == nil &&
++                    agentPID == nil && agentStart == nil
++            case .enroll:
++                return validOperationID(id ?? "") && validIdentifier(sessionID ?? "") &&
++                    ["claude", "codex"].contains(client ?? "") && validDirectory(cwd ?? "") &&
++                    (agentPID ?? 0) > 1 && (agentStart ?? 0) > 0
++            }
++        }
++    }
++
++    enum Failure: LocalizedError {
++        case unavailable, changedConnection, invalidResponse, refused(String)
++        var errorDescription: String? {
++            switch self {
++            case .unavailable: "Connect to this pane and take terminal control to change context management."
++            case .changedConnection: "The pane or input ownership changed. Read host status before trying again."
++            case .invalidResponse: "The host response could not be verified. Read host status; do not repeat the previous request."
++            case .refused(let message): message
++            }
++        }
++    }
++
++    static func newOperationID() -> String { UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased() }
++    static func validOperationID(_ value: String) -> Bool {
++        value.utf8.count == 32 && value.allSatisfy { "0123456789abcdef".contains($0) }
++    }
++    static func validIdentifier(_ value: String) -> Bool {
++        !value.isEmpty && value.utf8.count <= 110 &&
++            value.range(of: #"^[A-Za-z0-9][A-Za-z0-9_.-]*$"#, options: .regularExpression) != nil
++    }
++    static func validDirectory(_ value: String) -> Bool {
++        value.hasPrefix("/") && value.utf8.count <= 4096 && !value.contains("\0")
++    }
++
++    static func decode(_ data: Data, paneID: UUID, request: Request) throws -> Status {
++        guard data.count <= 262_144 else { throw Failure.invalidResponse }
++        let response = try JSONDecoder().decode(Status.self, from: data)
++        if response.state == "refused" {
++            guard (response.message?.utf8.count ?? 0) <= 8192 else { throw Failure.invalidResponse }
++            throw Failure.refused(response.message ?? "The host refused the request. Read status and check the pane's input ownership.")
++        }
++        guard response.valid(for: paneID) else { throw Failure.invalidResponse }
++        if request.operation != .status {
++            guard !response.isUnsupported, response.operationID == request.id,
++                  response.operation == request.operation.rawValue,
++                  response.enabled == (request.operation == .enroll) else { throw Failure.invalidResponse }
++            if request.operation == .enroll {
++                guard let e = response.enrollment, e.sessionID == request.sessionID, e.client == request.client,
++                      e.cwd == request.cwd, e.agentPID == request.agentPID, e.agentStart == request.agentStart
++                else { throw Failure.invalidResponse }
++            }
++        }
++        return response
++    }
++
++    @MainActor static func send(_ request: Request, profile: ConnectionProfile, paneID: UUID,
++        lease: RelayPromptEditorControlLease? = nil,
++        currentLease: () -> RelayPromptEditorControlLease? = { nil }) async throws -> Status {
++        guard request.valid, profile.backend == .relay else { throw Failure.unavailable }
++        if request.operation != .status {
++            guard let lease, lease.paneID == paneID, lease.hostID == profile.id,
++                  currentLease() == lease else { throw Failure.changedConnection }
++        }
++        let command = RelayHostExecution.daemonCommand(profile: profile, arguments: [
++            "rotation-supervisor-rpc", paneID.uuidString.lowercased(),
++            (lease?.clientID ?? RelayClientIdentity.id).uuidString.lowercased()
++        ])
++        // HostExecution preserves an uncertain job ID. Never resubmit writes.
++        let output = try await RelayHostExecution.capture(profile: profile, command: command,
++            input: JSONEncoder().encode(request), timeout: 15, maximumBytes: 262_144)
++        try Task.checkCancellation()
++        if let lease, request.operation != .status, currentLease() != lease { throw Failure.changedConnection }
++        guard output.exitCode == 0 else { throw Failure.invalidResponse }
++        return try decode(output.stdout, paneID: paneID, request: request)
++    }
++
++    @MainActor static func readNativeBinding(profile: ConnectionProfile, paneID: UUID) async throws -> NativeBinding {
++        let command = RelayHostExecution.daemonCommand(profile: profile,
++            arguments: ["agent-binding", "--native", paneID.uuidString.lowercased()])
++        let output = try await RelayHostExecution.capture(profile: profile, command: command,
++            timeout: 12, maximumBytes: 65_536)
++        try Task.checkCancellation()
++        guard output.exitCode == 0 else { throw Failure.unavailable }
++        let binding = try JSONDecoder().decode(NativeBinding.self, from: output.stdout)
++        guard binding.valid(for: paneID) else { throw Failure.invalidResponse }
++        return binding
++    }
++
++    @MainActor static func readNativeCandidate(profile: ConnectionProfile, paneID: UUID) async throws -> NativeCandidate {
++        struct Probe: Encodable { let v = 1; let operation = "native_candidate" }
++        struct Refusal: Decodable { let state: String?; let message: String? }
++        let command = RelayHostExecution.daemonCommand(profile: profile, arguments: [
++            "rotation-supervisor-rpc", paneID.uuidString.lowercased(), RelayClientIdentity.id.uuidString.lowercased()
++        ])
++        let output = try await RelayHostExecution.capture(profile: profile, command: command,
++            input: JSONEncoder().encode(Probe()), timeout: 15, maximumBytes: 65_536)
++        try Task.checkCancellation()
++        guard output.exitCode == 0 else { throw Failure.unavailable }
++        if let refusal = try? JSONDecoder().decode(Refusal.self, from: output.stdout),
++           refusal.state == "refused" || refusal.state == "unsupported" {
++            throw Failure.refused(refusal.message ?? "This host cannot verify the native session directory. Update the host helper and read status.")
++        }
++        let candidate = try JSONDecoder().decode(NativeCandidate.self, from: output.stdout)
++        guard candidate.valid(for: paneID) else { throw Failure.invalidResponse }
++        return candidate
++    }
++}
+diff --git a/Sources/Relay/RelayHostRotationTextRPC.swift b/Sources/Relay/RelayHostRotationTextRPC.swift
+new file mode 100644
+--- /dev/null
++++ b/Sources/Relay/RelayHostRotationTextRPC.swift
+@@ -0,0 +1,189 @@
++import Foundation
++
++enum RelayHostRotationTextRPC {
++    static let providers = ["anthropic_api", "claude_account", "codex_account"]
++    static func providerName(_ value: String) -> String {
++        switch value {
++        case "anthropic_api": "Claude API"
++        case "claude_account": "Claude Code account"
++        case "codex_account": "Codex account"
++        default: "Unknown provider"
++        }
++    }
++
++    struct Settings: Codable, Equatable, Sendable {
++        var enabled = false
++        var providers = ["anthropic_api"]
++        var dailyLimitMicrousd: Int64 = 0
++        var monthlyLimitMicrousd: Int64 = 0
++        var maxRequestsPerDay = 0
++        var codexModel: String? = nil
++        var claudePath: String? = nil
++        var codexPath: String? = nil
++        enum CodingKeys: String, CodingKey {
++            case enabled, providers, dailyLimitMicrousd = "daily_limit_microusd"
++            case monthlyLimitMicrousd = "monthly_limit_microusd", maxRequestsPerDay = "max_requests_per_day"
++            case codexModel = "codex_model", claudePath = "claude_path", codexPath = "codex_path"
++        }
++        var valid: Bool {
++            guard !providers.isEmpty, providers.count <= 3, Set(providers).count == providers.count,
++                  providers.allSatisfy({ RelayHostRotationTextRPC.providers.contains($0) }),
++                  (0...200_000_000).contains(dailyLimitMicrousd),
++                  (0...200_000_000).contains(monthlyLimitMicrousd),
++                  (0...10_000).contains(maxRequestsPerDay) else { return false }
++            if enabled && (maxRequestsPerDay == 0 || providers.contains("anthropic_api") &&
++                min(dailyLimitMicrousd, monthlyLimitMicrousd) < 1_000_000) { return false }
++            if let codexModel, codexModel.range(of: #"^[A-Za-z0-9_.-]{1,128}$"#, options: .regularExpression) == nil { return false }
++            return [claudePath, codexPath].allSatisfy { $0.map(RelayHostRotationRPC.validDirectory) ?? true }
++        }
++    }
++
++    struct Status: Decodable, Equatable, Sendable {
++        let version: Int?
++        let status: String?
++        let configurationID: String?
++        let settings: Settings?
++        let day: String?
++        let month: String?
++        let requestsToday: Int?
++        let chargedTodayMicrousd: Int64?
++        let chargedMonthMicrousd: Int64?
++        let unresolved: [String]?
++        let state: String?
++        enum CodingKeys: String, CodingKey {
++            case version = "v", status, configurationID = "configuration_id", settings, day, month
++            case requestsToday = "requests_today", chargedTodayMicrousd = "charged_today_microusd"
++            case chargedMonthMicrousd = "charged_month_microusd", unresolved, state
++        }
++        var isUnsupported: Bool { state == "unsupported" }
++        var isNotConfigured: Bool { status == "not_configured" }
++        var valid: Bool {
++            if isUnsupported { return version == nil && status == nil && settings == nil }
++            guard version == 1 else { return false }
++            if isNotConfigured { return settings == nil && configurationID == nil }
++            guard ["ready", "reconciliation_required"].contains(status ?? ""), let settings, settings.valid,
++                  let configurationID, configurationID.isEmpty || RelayHostRotationRPC.validOperationID(configurationID),
++                  let requestsToday, requestsToday >= 0,
++                  let chargedTodayMicrousd, chargedTodayMicrousd >= 0,
++                  let chargedMonthMicrousd, chargedMonthMicrousd >= chargedTodayMicrousd,
++                  let unresolved, unresolved.count <= 16, Set(unresolved).count == unresolved.count,
++                  unresolved.allSatisfy(RelayHostRotationRPC.validOperationID),
++                  (status == "reconciliation_required") == !unresolved.isEmpty,
++                  day?.range(of: #"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"#, options: .regularExpression) != nil,
++                  month?.range(of: #"^[0-9]{4}-[0-9]{2}$"#, options: .regularExpression) != nil
++            else { return false }
++            return day?.hasPrefix((month ?? "") + "-") == true
++        }
++    }
++
++    enum Operation: String, Encodable, Sendable {
++        case status = "text_status", configure = "text_configure", abandon = "text_abandon"
++    }
++    struct Request: Encodable, Sendable {
++        let v = 1
++        let operation: Operation
++        var id: String? = nil
++        var settings: Settings? = nil
++        var operationID: String? = nil
++        enum CodingKeys: String, CodingKey {
++            case v, operation, id, settings = "text_settings", operationID = "text_operation_id"
++        }
++        var valid: Bool {
++            switch operation {
++            case .status: return id == nil && settings == nil && operationID == nil
++            case .configure: return RelayHostRotationRPC.validOperationID(id ?? "") && settings?.valid == true && operationID == nil
++            case .abandon: return id == nil && settings == nil && RelayHostRotationRPC.validOperationID(operationID ?? "")
++            }
++        }
++    }
++
++    struct AbandonReceipt: Decodable, Sendable {
++        let v: Int
++        let status: String
++        let operationID: String
++        let chargedMicrousd: Int64
++        enum CodingKeys: String, CodingKey { case v, status, operationID = "operation_id", chargedMicrousd = "charged_microusd" }
++    }
++
++    static func checkFailure(_ data: Data) throws {
++        struct Failure: Decodable { let state: String?; let message: String?; let status: String?; let code: String? }
++        guard data.count <= 262_144 else { throw RelayHostRotationRPC.Failure.invalidResponse }
++        let failure = try JSONDecoder().decode(Failure.self, from: data)
++        if failure.state == "refused" {
++            guard (failure.message?.utf8.count ?? 0) <= 8192 else { throw RelayHostRotationRPC.Failure.invalidResponse }
++            throw RelayHostRotationRPC.Failure.refused(failure.message ?? "The host refused the change. Check terminal control and read status.")
++        }
++        if failure.status == "failed" {
++            let message: String
++            switch failure.code {
++            case "invalid_settings", "positive_limits_required": message = "Choose a provider and positive request limits. Claude API also needs daily and monthly budgets of at least $1."
++            case "invalid_cli_path": message = "Use an absolute path to the account CLI on this host."
++            case "invalid_model": message = "Enter a valid Codex model name."
++            case "operation_identity_conflict": message = "Another configuration owns this request ID. Read the current host settings."
++            case "reconciliation_required": message = "An earlier request has an unknown outcome. Review it before continuing."
++            default: message = "The host's text service is unavailable. Check its helper and Python installation, then read status."
++            }
++            throw RelayHostRotationRPC.Failure.refused(message)
++        }
++    }
++
++    static func decode(_ data: Data, request: Request) throws -> Status {
++        try checkFailure(data)
++        guard request.valid, request.operation != .abandon else { throw RelayHostRotationRPC.Failure.invalidResponse }
++        let status = try JSONDecoder().decode(Status.self, from: data)
++        guard status.valid else { throw RelayHostRotationRPC.Failure.invalidResponse }
++        if request.operation == .configure {
++            guard !status.isUnsupported, status.configurationID == request.id, status.settings == request.settings else {
++                throw RelayHostRotationRPC.Failure.invalidResponse
++            }
++        }
++        return status
++    }
++
++    static func decodeAbandon(_ data: Data, operationID: String) throws {
++        try checkFailure(data)
++        let receipt = try JSONDecoder().decode(AbandonReceipt.self, from: data)
++        guard receipt.v == 1, receipt.operationID == operationID, receipt.status == "abandoned",
++              receipt.chargedMicrousd >= 0 else { throw RelayHostRotationRPC.Failure.invalidResponse }
++    }
++
++    @MainActor static func send(_ request: Request, profile: ConnectionProfile, paneID: UUID,
++        lease: RelayPromptEditorControlLease? = nil,
++        currentLease: () -> RelayPromptEditorControlLease? = { nil }) async throws -> Data {
++        guard request.valid, profile.backend == .relay else { throw RelayHostRotationRPC.Failure.unavailable }
++        if request.operation != .status {
++            guard let lease, lease.paneID == paneID, lease.hostID == profile.id, currentLease() == lease else {
++                throw RelayHostRotationRPC.Failure.changedConnection
++            }
++        }
++        let command = RelayHostExecution.daemonCommand(profile: profile, arguments: [
++            "rotation-supervisor-rpc", paneID.uuidString.lowercased(),
++            (lease?.clientID ?? RelayClientIdentity.id).uuidString.lowercased()
++        ])
++        let output = try await RelayHostExecution.capture(profile: profile, command: command,
++            input: JSONEncoder().encode(request), timeout: 15, maximumBytes: 262_144)
++        try Task.checkCancellation()
++        if let lease, request.operation != .status, currentLease() != lease { throw RelayHostRotationRPC.Failure.changedConnection }
++        guard output.exitCode == 0 else { throw RelayHostRotationRPC.Failure.invalidResponse }
++        return output.stdout
++    }
++
++    // Decimal entry is converted with integer arithmetic. No rounding or
++    // floating-point conversion can silently change a spending ceiling.
++    static func parseDollars(_ text: String) -> Int64? {
++        let value = text.trimmingCharacters(in: .whitespaces)
++        guard value.range(of: #"^[0-9]{1,3}(\.[0-9]{1,6})?$"#, options: .regularExpression) != nil else { return nil }
++        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
++        guard let whole = Int64(parts[0]) else { return nil }
++        let fractional = parts.count > 1 ? String(parts[1]) : ""
++        guard let micro = Int64(fractional + String(repeating: "0", count: 6-fractional.count)) else { return nil }
++        let amount = whole * 1_000_000 + micro
++        return amount <= 200_000_000 ? amount : nil
++    }
++    static func dollars(_ amount: Int64) -> String {
++        guard amount >= 0 else { return "0" }
++        let fraction = String(format: "%06lld", amount % 1_000_000)
++        let trimmed = fraction.replacingOccurrences(of: #"0+$"#, with: "", options: .regularExpression)
++        return String(amount / 1_000_000) + (trimmed.isEmpty ? "" : "." + trimmed)
++    }
++}
+diff --git a/Sources/Relay/RelayHostRotationTextView.swift b/Sources/Relay/RelayHostRotationTextView.swift
+new file mode 100644
+--- /dev/null
++++ b/Sources/Relay/RelayHostRotationTextView.swift
+@@ -0,0 +1,185 @@
++import SwiftUI
++
++struct RelayHostRotationTextPanel: View {
++    @ObservedObject var pane: PaneModel
++    @State private var status: RelayHostRotationTextRPC.Status?
++    @State private var settings = RelayHostRotationTextRPC.Settings()
++    @State private var daily = "0"
++    @State private var monthly = "0"
++    @State private var requests = "0"
++    @State private var busy = false
++    @State private var needsStatus = false
++    @State private var error: String?
++    @State private var acknowledgeID: String?
++    @State private var confirmAcknowledgement = false
++
++    private var pendingSettings: RelayHostRotationTextRPC.Settings? {
++        guard let day = RelayHostRotationTextRPC.parseDollars(daily),
++              let month = RelayHostRotationTextRPC.parseDollars(monthly),
++              requests.range(of: #"^[0-9]{1,5}$"#, options: .regularExpression) != nil,
++              let count = Int(requests) else { return nil }
++        var value = settings
++        value.dailyLimitMicrousd = day; value.monthlyLimitMicrousd = month; value.maxRequestsPerDay = count
++        return value.valid ? value : nil
++    }
++    private var validationMessage: String? {
++        if RelayHostRotationTextRPC.parseDollars(daily) == nil ||
++            RelayHostRotationTextRPC.parseDollars(monthly) == nil {
++            return "Enter dollar budgets from 0 to 200, with up to six decimal places."
++        }
++        if settings.enabled && settings.providers.contains("codex_account") && settings.codexModel == nil {
++            return "Choose the Codex model used by the saved account."
++        }
++        if pendingSettings == nil {
++            return "Choose at least one provider and a request cap up to 10,000. When enabled, the cap must be positive; Claude API also needs budgets of at least $1."
++        }
++        return nil
++    }
++    private var canChange: Bool {
++        !busy && !needsStatus && status != nil && status?.isUnsupported != true && pane.runtime.canConfigureHostRotation
++    }
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: RelayTheme.spacing(10)) {
++            HStack {
++                Text("Handoff text").font(.subheadline.weight(.semibold))
++                Spacer()
++                if busy { ProgressView().controlSize(.small) }
++            }
++            if let status, !status.isUnsupported {
++                Toggle("Generate handoff text", isOn: $settings.enabled).disabled(!canChange)
++                    .accessibilityIdentifier("relay.context-management.text-enabled")
++                Text("Settings and limits apply to this host. Generation stays off until you save enabled settings.")
++                    .font(.caption).foregroundStyle(.secondary)
++                providerOrder.disabled(!canChange)
++                HStack {
++                    amountField("Daily budget ($)", text: $daily)
++                    amountField("Monthly budget ($)", text: $monthly)
++                }.disabled(!canChange)
++                amountField("Maximum requests per day", text: $requests).disabled(!canChange)
++                DisclosureGroup("Account options") {
++                    VStack(alignment: .leading, spacing: 8) {
++                        TextField("Codex model", text: optionalString(\.codexModel))
++                        TextField("Claude CLI path (optional)", text: optionalString(\.claudePath))
++                        TextField("Codex CLI path (optional)", text: optionalString(\.codexPath))
++                        Text("CLI paths are absolute paths on this host. Existing saved logins stay with the CLI.")
++                            .font(.caption).foregroundStyle(.secondary)
++                    }.textFieldStyle(.roundedBorder).disabled(!canChange)
++                }
++                if let usage = status.requestsToday {
++                    Text("Today: \(usage) requests · $\(RelayHostRotationTextRPC.dollars(status.chargedTodayMicrousd ?? 0)) charged")
++                        .font(.caption).foregroundStyle(.secondary)
++                    Text("This month: $\(RelayHostRotationTextRPC.dollars(status.chargedMonthMicrousd ?? 0)) charged")
++                        .font(.caption).foregroundStyle(.secondary)
++                }
++                if settings.providers.contains("anthropic_api") {
++                    Text("Claude API uses the host's configured credential. Each possible API request reserves $1 until its outcome is known. These limits do not cover other hosts or applications.")
++                        .font(.caption).foregroundStyle(.secondary)
++                }
++                if let unresolved = status.unresolved, !unresolved.isEmpty {
++                    Text("Earlier requests need review before more text can be generated.")
++                        .font(.caption).foregroundStyle(.orange)
++                    ForEach(unresolved, id: \.self) { id in
++                        HStack {
++                            Text(id).font(.caption.monospaced()).textSelection(.enabled)
++                                .lineLimit(1).truncationMode(.middle)
++                            Button("Acknowledge") { acknowledgeID = id; confirmAcknowledgement = true }
++                                .disabled(!canChange)
++                        }
++                    }
++                }
++                if let validationMessage {
++                    Text(validationMessage).font(.caption).foregroundStyle(.secondary)
++                }
++                HStack {
++                    Button("Read text status") { Task { await refresh() } }.disabled(busy)
++                        .accessibilityIdentifier("relay.context-management.text-refresh")
++                    Spacer()
++                    Button("Save text settings") { Task { await save() } }
++                        .disabled(!canChange || validationMessage != nil || pendingSettings == status.settings)
++                        .accessibilityIdentifier("relay.context-management.text-save")
++                }
++            } else if status?.isUnsupported == true {
++                Text("Update this host's Relay helper to configure handoff text.")
++                    .font(.caption).foregroundStyle(.secondary)
++                Button("Read text status") { Task { await refresh() } }.disabled(busy)
++            } else if !busy {
++                Button("Read text status") { Task { await refresh() } }
++            }
++            if let error {
++                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
++                    .accessibilityIdentifier("relay.context-management.text-error")
++            }
++        }
++        .task { await refresh() }
++        .confirmationDialog("Acknowledge the unknown request outcome?", isPresented: $confirmAcknowledgement, titleVisibility: .visible) {
++            Button("Acknowledge and keep the charge") {
++                if let id = acknowledgeID { Task { await acknowledge(id) } }
++            }
++            Button("Cancel", role: .cancel) { acknowledgeID = nil }
++        } message: {
++            Text("Confirm that the original request has stopped before acknowledging it. Its reserved usage remains charged, and the request will not be retried.")
++        }
++    }
++
++    private var providerOrder: some View {
++        VStack(alignment: .leading, spacing: 6) {
++            Text("Providers, in order").font(.caption).foregroundStyle(.secondary)
++            ForEach(Array(settings.providers.enumerated()), id: \.element) { index, provider in
++                HStack(spacing: 8) {
++                    Text(RelayHostRotationTextRPC.providerName(provider)).font(.caption)
++                    Spacer()
++                    Button { settings.providers.swapAt(index, index-1) } label: { Image(systemName: "arrow.up") }
++                        .disabled(index == 0).help("Move earlier")
++                    Button { settings.providers.remove(at: index) } label: { Image(systemName: "minus.circle") }
++                        .disabled(settings.providers.count == 1).help("Remove provider")
++                }
++            }
++            Menu("Add provider") {
++                ForEach(RelayHostRotationTextRPC.providers.filter { !settings.providers.contains($0) }, id: \.self) { provider in
++                    Button(RelayHostRotationTextRPC.providerName(provider)) { settings.providers.append(provider) }
++                }
++            }.disabled(settings.providers.count == 3)
++            Text("The next provider is tried only if the previous one is unavailable before submission.")
++                .font(.caption).foregroundStyle(.secondary)
++        }
++    }
++    private func amountField(_ title: String, text: Binding<String>) -> some View {
++        VStack(alignment: .leading, spacing: 4) {
++            Text(title).font(.caption).foregroundStyle(.secondary)
++            TextField(title, text: text).textFieldStyle(.roundedBorder)
++        }
++    }
++    private func optionalString(_ key: WritableKeyPath<RelayHostRotationTextRPC.Settings, String?>) -> Binding<String> {
++        Binding(get: { settings[keyPath: key] ?? "" },
++                set: { settings[keyPath: key] = $0.isEmpty ? nil : $0 })
++    }
++    @MainActor private func accept(_ result: RelayHostRotationTextRPC.Status) {
++        status = result; needsStatus = false; error = nil
++        settings = result.settings ?? .init()
++        daily = RelayHostRotationTextRPC.dollars(settings.dailyLimitMicrousd)
++        monthly = RelayHostRotationTextRPC.dollars(settings.monthlyLimitMicrousd)
++        requests = String(settings.maxRequestsPerDay)
++    }
++    @MainActor private func refresh() async {
++        guard !busy else { return }
++        busy = true
++        defer { busy = false }
++        do { accept(try await pane.runtime.readHostRotationTextStatus()) }
++        catch { status = nil; self.error = error.localizedDescription }
++    }
++    @MainActor private func save() async {
++        guard canChange, let value = pendingSettings, validationMessage == nil else { return }
++        busy = true; error = nil
++        defer { busy = false }
++        do { accept(try await pane.runtime.configureHostRotationText(value)) }
++        catch { needsStatus = true; self.error = error.localizedDescription }
++    }
++    @MainActor private func acknowledge(_ operationID: String) async {
++        guard canChange else { return }
++        busy = true; error = nil
++        defer { busy = false; acknowledgeID = nil }
++        do { accept(try await pane.runtime.abandonHostRotationText(operationID: operationID)) }
++        catch { needsStatus = true; self.error = error.localizedDescription }
++    }
++}
+diff --git a/Sources/Relay/RelayHostRotationView.swift b/Sources/Relay/RelayHostRotationView.swift
+new file mode 100644
+--- /dev/null
++++ b/Sources/Relay/RelayHostRotationView.swift
+@@ -0,0 +1,132 @@
++import SwiftUI
++
++struct RelayHostRotationButton: View {
++    @ObservedObject var workspace: WorkspaceModel
++    @State private var presented = false
++    var body: some View {
++        RelayIconAction("Context management", symbol: "arrow.triangle.2.circlepath") { presented = true }
++            .accessibilityIdentifier("relay.tools.context-management")
++            .popover(isPresented: $presented) {
++                if let pane = workspace.activePane, pane.contentKind == .terminal {
++                    RelayHostRotationPanel(pane: pane).id(pane.id)
++                } else {
++                    Text("Select a terminal pane to manage its context.")
++                        .padding(RelayTheme.spacing(18)).frame(width: 360)
++                }
++            }
++    }
++}
++
++private struct RelayHostRotationPanel: View {
++    @ObservedObject var pane: PaneModel
++    @State private var status: RelayHostRotationRPC.Status?
++    @State private var busy = false
++    @State private var needsStatus = false
++    @State private var error: String?
++
++    private var hostName: String { pane.profile.kind == .local ? "This Mac" : pane.profile.host }
++    private var canChange: Bool {
++        !busy && !needsStatus && status != nil && status?.isUnsupported != true && pane.runtime.canConfigureHostRotation
++    }
++    var body: some View {
++        ScrollView {
++        VStack(alignment: .leading, spacing: RelayTheme.spacing(12)) {
++            HStack {
++                Text("Context management").font(.headline)
++                Spacer()
++                if busy { ProgressView().controlSize(.small) }
++            }
++            Text(hostName).font(.caption).foregroundStyle(.secondary)
++            if let status {
++                Text(status.title).font(.subheadline.weight(.semibold))
++                if status.isUnsupported {
++                    Text("Update this host's Relay helper to use context management.")
++                        .font(.caption).foregroundStyle(.secondary)
++                } else {
++                    if let enrollment = status.enrollment, enrollment.valid(for: pane.id) {
++                        Text(enrollment.client == "codex" ? "Codex" : "Claude Code")
++                            .font(.caption).foregroundStyle(.secondary)
++                        Text(enrollment.cwd).font(.caption).textSelection(.enabled)
++                            .lineLimit(2).truncationMode(.middle)
++                    }
++                    Text("The host monitors completed turns. Typing in the terminal pauses automatic management.")
++                        .font(.caption).foregroundStyle(.secondary)
++                    if status.lifecycle == "unavailable" {
++                        Text("Native context rotation is not available for this session.")
++                            .font(.caption).foregroundStyle(.secondary)
++                    }
++                    if status.refreshCapability != "supported" {
++                        Text("Prompt-cache refresh is not verified for this session.")
++                            .font(.caption).foregroundStyle(.secondary)
++                    }
++                    if let milliseconds = status.nextEvaluationMS, milliseconds > 0 {
++                        Text("Next check: \(Date(timeIntervalSince1970: Double(milliseconds) / 1000).formatted(date: .omitted, time: .standard))")
++                            .font(.caption).foregroundStyle(.secondary)
++                    }
++                    if let hint = status.preparation?.hint {
++                        Text(hint).font(.caption).foregroundStyle(.orange)
++                    }
++                    if status.nativeRecoveryState != nil || status.state.contains("failed") ||
++                        status.state.contains("unavailable") || status.state.contains("invalid") {
++                        Text("Keep the original session open. Read status after recovery; a pending operation must finish before enrollment can change.")
++                            .font(.caption).foregroundStyle(.secondary)
++                    }
++                }
++            } else if !busy {
++                Text("Read the host's current status to continue.").font(.caption).foregroundStyle(.secondary)
++            }
++            if let error {
++                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
++                    .accessibilityIdentifier("relay.context-management.error")
++            }
++            HStack {
++                Button("Read status") { Task { await refresh() } }.disabled(busy)
++                    .accessibilityIdentifier("relay.context-management.refresh")
++                Spacer()
++                if status?.enabled == true {
++                    Button("Pause") { Task { await configure(enabled: false) } }.disabled(!canChange)
++                        .accessibilityIdentifier("relay.context-management.disable")
++                } else {
++                    Button("Enable") { Task { await configure(enabled: true) } }.disabled(!canChange)
++                        .accessibilityIdentifier("relay.context-management.enroll")
++                }
++            }
++            if !pane.runtime.canConfigureHostRotation && pane.profile.backend == .relay {
++                Text("Connect and take terminal control to change this setting.")
++                    .font(.caption).foregroundStyle(.secondary)
++            }
++            Divider()
++            RelayHostRotationTextPanel(pane: pane).disabled(busy)
++        }
++        .padding(RelayTheme.spacing(18))
++        }
++        .frame(width: 430).frame(maxHeight: 680)
++        .task { await refresh() }
++    }
++
++    @MainActor private func refresh() async {
++        guard !busy else { return }
++        busy = true
++        defer { busy = false }
++        do {
++            let result = try await pane.runtime.readHostRotationStatus()
++            status = result; error = nil; needsStatus = false
++        } catch {
++            status = nil; self.error = error.localizedDescription
++        }
++    }
++
++    @MainActor private func configure(enabled: Bool) async {
++        guard canChange else { return }
++        busy = true; error = nil
++        defer { busy = false }
++        do {
++            status = try await pane.runtime.configureHostRotation(enabled: enabled)
++            needsStatus = false
++        } catch {
++            // No retry or implicit reenrollment after an uncertain response.
++            needsStatus = true
++            self.error = error.localizedDescription
++        }
++    }
++}
+diff --git a/Sources/Relay/Resources/Rotation/text_backend.py b/Sources/Relay/Resources/Rotation/text_backend.py
+--- a/Sources/Relay/Resources/Rotation/text_backend.py
++++ b/Sources/Relay/Resources/Rotation/text_backend.py
+@@ -495,11 +495,16 @@
+     def close(self):
+         self.db.close()
+ 
+-    def _settings(self):
+-        row = self.db.execute("SELECT value FROM settings WHERE singleton=1").fetchone()
++    def _configuration(self):
++        row = self.db.execute("SELECT operation_id, value FROM settings WHERE singleton=1").fetchone()
+         if row is None:
+             raise DraftError("journal_corrupt")
+-        return validated_settings(parse_json(row["value"]))
++        if row["operation_id"]:
++            valid_operation_id(row["operation_id"])
++        return row["operation_id"], validated_settings(parse_json(row["value"]))
++
++    def _settings(self):
++        return self._configuration()[1]
+ 
+     def configure(self, operation_id, settings):
+         valid_operation_id(operation_id)
+@@ -543,8 +548,9 @@
+         day, month, count, daily, monthly = self._usage()
+         unresolved = [r[0] for r in self.db.execute(
+             "SELECT id FROM operations WHERE state IN ('pending','uncertain') ORDER BY rowid LIMIT 16")]
++        configuration_id, settings = self._configuration()
+         return {"v": 1, "status": "ready" if not unresolved else "reconciliation_required",
+-                "settings": self._settings(), "day": day, "month": month,
++                "configuration_id": configuration_id, "settings": settings, "day": day, "month": month,
+                 "requests_today": count, "charged_today_microusd": daily,
+                 "charged_month_microusd": monthly, "unresolved": unresolved}
+ 
+diff --git a/Sources/Relay/TerminalRuntime.swift b/Sources/Relay/TerminalRuntime.swift
+--- a/Sources/Relay/TerminalRuntime.swift
++++ b/Sources/Relay/TerminalRuntime.swift
+@@ -2049,6 +2049,106 @@
+         } catch { return nil }
+     }
+ 
++    var canConfigureHostRotation: Bool {
++        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
++              conversationInputLease == nil else { return false }
++        return io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id, requireIdleInput: false) != nil
++    }
++
++    func readHostRotationStatus() async throws -> RelayHostRotationRPC.Status {
++        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay else {
++            throw RelayHostRotationRPC.Failure.unavailable
++        }
++        let profile = pane.profile
++        let result = try await RelayHostRotationRPC.send(.init(operation: .status),
++            profile: profile, paneID: pane.id)
++        guard self.pane === pane, pane.profile == profile else { throw RelayHostRotationRPC.Failure.changedConnection }
++        return result
++    }
++
++    func configureHostRotation(enabled: Bool) async throws -> RelayHostRotationRPC.Status {
++        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
++              conversationInputLease == nil,
++              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id, requireIdleInput: false),
++              let events = io.promptEditorLeaseEvents() else { throw RelayHostRotationRPC.Failure.unavailable }
++        let profile = pane.profile
++        let revision = pane.agentInputRevision
++        let inputLease = UUID()
++        conversationInputLease = inputLease
++        defer { if conversationInputLease == inputLease { conversationInputLease = nil } }
++        func currentLease(_ idle: Bool) -> RelayPromptEditorControlLease? {
++            guard self.pane === pane, pane.profile == profile, pane.agentInputRevision == revision,
++                  conversationInputLease == inputLease else { return nil }
++            return io.promptEditorControlLease(paneID: pane.id, hostID: profile.id, requireIdleInput: idle)
++        }
++        try await RelayPromptEditorLeaseWaiter.wait(for: lease, events: events,
++            identity: { currentLease(false) }, ready: { currentLease(enabled) })
++        var request = RelayHostRotationRPC.Request(operation: enabled ? .enroll : .disable,
++            id: RelayHostRotationRPC.newOperationID())
++        if enabled {
++            let candidate = try await RelayHostRotationRPC.readNativeCandidate(profile: profile, paneID: pane.id)
++            let original = candidate.binding
++            let directory = candidate.cwd
++            let observed = try await RelayHostRotationRPC.readNativeBinding(profile: profile, paneID: pane.id)
++            guard original == observed, currentLease(true) == lease else {
++                throw RelayHostRotationRPC.Failure.changedConnection
++            }
++            request.sessionID = original.sessionID
++            request.client = original.producer.provider
++            request.cwd = directory
++            request.agentPID = original.producer.processID
++            request.agentStart = original.producer.processStart
++        }
++        return try await RelayHostRotationRPC.send(request, profile: profile, paneID: pane.id, lease: lease,
++            currentLease: { currentLease(enabled) })
++    }
++
++    func readHostRotationTextStatus() async throws -> RelayHostRotationTextRPC.Status {
++        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay else {
++            throw RelayHostRotationRPC.Failure.unavailable
++        }
++        let profile = pane.profile
++        let request = RelayHostRotationTextRPC.Request(operation: .status)
++        let data = try await RelayHostRotationTextRPC.send(request, profile: profile, paneID: pane.id)
++        guard self.pane === pane, pane.profile == profile else { throw RelayHostRotationRPC.Failure.changedConnection }
++        return try RelayHostRotationTextRPC.decode(data, request: request)
++    }
++
++    func configureHostRotationText(_ settings: RelayHostRotationTextRPC.Settings) async throws -> RelayHostRotationTextRPC.Status {
++        let request = RelayHostRotationTextRPC.Request(operation: .configure,
++            id: RelayHostRotationRPC.newOperationID(), settings: settings)
++        let data = try await changeHostRotationText(request)
++        return try RelayHostRotationTextRPC.decode(data, request: request)
++    }
++
++    func abandonHostRotationText(operationID: String) async throws -> RelayHostRotationTextRPC.Status {
++        let request = RelayHostRotationTextRPC.Request(operation: .abandon, operationID: operationID)
++        let data = try await changeHostRotationText(request)
++        try RelayHostRotationTextRPC.decodeAbandon(data, operationID: operationID)
++        return try await readHostRotationTextStatus()
++    }
++
++    private func changeHostRotationText(_ request: RelayHostRotationTextRPC.Request) async throws -> Data {
++        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
++              conversationInputLease == nil,
++              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id, requireIdleInput: false),
++              let events = io.promptEditorLeaseEvents() else { throw RelayHostRotationRPC.Failure.unavailable }
++        let profile = pane.profile
++        let revision = pane.agentInputRevision
++        let inputLease = UUID()
++        conversationInputLease = inputLease
++        defer { if conversationInputLease == inputLease { conversationInputLease = nil } }
++        func currentLease() -> RelayPromptEditorControlLease? {
++            guard self.pane === pane, pane.profile == profile, pane.agentInputRevision == revision,
++                  conversationInputLease == inputLease else { return nil }
++            return io.promptEditorControlLease(paneID: pane.id, hostID: profile.id, requireIdleInput: false)
++        }
++        try await RelayPromptEditorLeaseWaiter.wait(for: lease, events: events,
++            identity: { currentLease() }, ready: { currentLease() })
++        return try await RelayHostRotationTextRPC.send(request, profile: profile, paneID: pane.id,
++            lease: lease, currentLease: { currentLease() })
++    }
++
+     fileprivate func promptEditorRequest(_ request: RelayPromptEditorRPC.Request, inputLease: UUID,
+         expectedControlLease lease: RelayPromptEditorControlLease) async throws -> RelayPromptEditorRPC.Response {
+         guard conversationInputLease == inputLease, let pane, let events = io.promptEditorLeaseEvents(),
+diff --git a/Sources/Relay/WorkspaceView.swift b/Sources/Relay/WorkspaceView.swift
+--- a/Sources/Relay/WorkspaceView.swift
++++ b/Sources/Relay/WorkspaceView.swift
+@@ -1084,6 +1084,7 @@
+             .accessibilityIdentifier("relay.workspace.recover-panels")
+             Divider().frame(width: 22)
+             RelayExecutionContextButton(workspace: workspace)
++            RelayHostRotationButton(workspace: workspace)
+             ChromeButton(symbol: "waveform.path.ecg.rectangle", help: "Monitoring · performance, energy, processes and agents") {
+                 workspace.togglePerformancePanel()
+             }.accessibilityIdentifier("relay.tools.monitoring")
+diff --git a/Tests/RelayTests/RelayHostRotationRPCTests.swift b/Tests/RelayTests/RelayHostRotationRPCTests.swift
+new file mode 100644
+--- /dev/null
++++ b/Tests/RelayTests/RelayHostRotationRPCTests.swift
+@@ -0,0 +1,120 @@
++import Foundation
++import XCTest
++@testable import Relay
++
++final class RelayHostRotationRPCTests: XCTestCase {
++    private let pane = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
++    private let operationID = String(repeating: "a", count: 32)
++    private func data(_ object: [String: Any]) throws -> Data {
++        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
++    }
++    private func enrollment() -> [String: Any] {
++        ["session_id": "22222222-2222-4222-8222-222222222222", "client": "codex", "cwd": "/repo",
++         "pane_id": pane.uuidString.lowercased(), "agent_pid": 101, "agent_start": 102,
++         "worker_pid": 201, "worker_start": 202, "node_boot_id": "boot"]
++    }
++    private func enrolled() -> [String: Any] {
++        ["v": 1, "operation_id": operationID, "operation": "enroll", "enabled": true,
++         "state": "pending_evaluation", "generation": 1, "enrollment": enrollment(),
++         "lifecycle": "unavailable", "refresh_capability": "unverified"]
++    }
++    private func enrollRequest() -> RelayHostRotationRPC.Request {
++        .init(operation: .enroll, id: operationID,
++              sessionID: "22222222-2222-4222-8222-222222222222", client: "codex", cwd: "/repo",
++              agentPID: 101, agentStart: 102)
++    }
++
++    func testReadOnlyProbeAndUnsupportedShape() throws {
++        let request = RelayHostRotationRPC.Request(operation: .status)
++        XCTAssertTrue(request.valid)
++        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
++        XCTAssertEqual(Set(object.keys), ["v", "operation"])
++        XCTAssertTrue(try RelayHostRotationRPC.decode(data(["state": "unsupported"]), paneID: pane, request: request).isUnsupported)
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(["state": "unsupported"]), paneID: pane, request: enrollRequest()))
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(["state": "unsupported", "v": 1, "enabled": true]), paneID: pane, request: request))
++    }
++
++    func testInitialStatusDoesNotInventEnrollment() throws {
++        let object: [String: Any] = ["v": 1, "enabled": false, "state": "not_enrolled", "generation": 0,
++                                    "lifecycle": "unavailable", "refresh_capability": "unverified"]
++        let status = try RelayHostRotationRPC.decode(data(object), paneID: pane, request: .init(operation: .status))
++        XCTAssertEqual(status.title, "Off")
++        XCTAssertNil(status.enrollment)
++        var invalid = object; invalid["enabled"] = true
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(invalid), paneID: pane, request: .init(operation: .status)))
++    }
++
++    func testEnrollmentMatchesExactReceipt() throws {
++        let request = enrollRequest()
++        XCTAssertTrue(request.valid)
++        let status = try RelayHostRotationRPC.decode(data(enrolled()), paneID: pane, request: request)
++        XCTAssertEqual(status.enrollment?.agentPID, 101)
++        for (key, value) in ["operation_id": String(repeating: "b", count: 32), "operation": "disable"] {
++            var object = enrolled(); object[key] = value
++            XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: request))
++        }
++        var object = enrolled(); object["enabled"] = false
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: request))
++        for (key, value) in ["pane_id": UUID().uuidString.lowercased(), "cwd": "/different", "session_id": "different"] {
++            var binding = enrollment(); binding[key] = value; object = enrolled(); object["enrollment"] = binding
++            XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: request))
++        }
++        var binding = enrollment(); binding["agent_pid"] = 102; object = enrolled(); object["enrollment"] = binding
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: request))
++    }
++
++    func testUInt64IdentityRemainsExact() throws {
++        var request = enrollRequest(); request.agentStart = UInt64.max
++        let wire = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
++        XCTAssertTrue(wire.contains("18446744073709551615"))
++        let body = String(decoding: try data(enrolled()), as: UTF8.self)
++            .replacingOccurrences(of: "\"agent_start\":102", with: "\"agent_start\":18446744073709551615")
++        let status = try RelayHostRotationRPC.decode(Data(body.utf8), paneID: pane, request: request)
++        XCTAssertEqual(status.enrollment?.agentStart, UInt64.max)
++    }
++
++    func testRequestShapesRejectUnboundWrites() {
++        var request = enrollRequest(); request.agentStart = 0; XCTAssertFalse(request.valid)
++        request = enrollRequest(); request.cwd = "relative"; XCTAssertFalse(request.valid)
++        request = enrollRequest(); request.client = "shell"; XCTAssertFalse(request.valid)
++        request = enrollRequest(); request.id = UUID().uuidString; XCTAssertFalse(request.valid)
++        request = .init(operation: .disable, id: operationID); XCTAssertTrue(request.valid)
++        request.sessionID = "session"; XCTAssertFalse(request.valid)
++        request = .init(operation: .status); request.id = operationID; XCTAssertFalse(request.valid)
++    }
++
++    func testRefusalAndCorruptStatusAreErrors() throws {
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(["state": "refused", "message": "input lease changed"]),
++            paneID: pane, request: enrollRequest())) { error in
++            XCTAssertEqual(error.localizedDescription, "input lease changed")
++        }
++        var object = enrolled(); object["generation"] = -1
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: .init(operation: .status)))
++        object = enrolled(); object["enrollment"] = nil
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: .init(operation: .status)))
++        XCTAssertThrowsError(try RelayHostRotationRPC.decode(Data(repeating: 32, count: 262_145), paneID: pane, request: .init(operation: .status)))
++    }
++
++    func testHumanTakeoverAndRecoveryAreVisible() throws {
++        var object = enrolled(); object["state"] = "human_takeover"; object["enabled"] = false
++        XCTAssertEqual(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: .init(operation: .status)).title, "Paused after your input")
++        object = enrolled(); object["state"] = "native_refused"
++        XCTAssertEqual(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: .init(operation: .status)).title, "Waiting for a new completed turn")
++        object = enrolled(); object["state"] = "native_finalization_pending"
++        XCTAssertEqual(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: .init(operation: .status)).title, "Finishing recovery")
++        object = enrolled(); object["enabled"] = false; object["state"] = "persistence_failed"
++        XCTAssertEqual(try RelayHostRotationRPC.decode(data(object), paneID: pane, request: .init(operation: .status)).title, "Needs attention")
++    }
++
++    func testNativeBindingRequiresOriginalProviderIdentity() throws {
++        let object: [String: Any] = ["version": 1, "session_id": "session", "transcript_path": "/private/source.jsonl",
++                                    "revision": "revision", "producer": ["pane_id": pane.uuidString.lowercased(),
++                                    "provider": "claude", "process_id": 101, "process_start": 102]]
++        let binding = try JSONDecoder().decode(RelayHostRotationRPC.NativeBinding.self, from: data(object))
++        XCTAssertTrue(binding.valid(for: pane))
++        XCTAssertFalse(binding.valid(for: UUID()))
++        var invalid = object
++        invalid["producer"] = ["pane_id": pane.uuidString.lowercased(), "provider": "shell", "process_id": 101, "process_start": 102]
++        XCTAssertFalse(try JSONDecoder().decode(RelayHostRotationRPC.NativeBinding.self, from: data(invalid)).valid(for: pane))
++    }
++}
+diff --git a/Tests/RelayTests/RelayHostRotationTextRPCTests.swift b/Tests/RelayTests/RelayHostRotationTextRPCTests.swift
+new file mode 100644
+--- /dev/null
++++ b/Tests/RelayTests/RelayHostRotationTextRPCTests.swift
+@@ -0,0 +1,133 @@
++import Foundation
++import XCTest
++@testable import Relay
++
++final class RelayHostRotationTextRPCTests: XCTestCase {
++    private let operationID = String(repeating: "a", count: 32)
++    private let pane = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
++    private func data(_ value: [String: Any]) throws -> Data {
++        try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
++    }
++    private func settings() -> RelayHostRotationTextRPC.Settings {
++        .init(enabled: true, providers: ["anthropic_api", "codex_account"],
++              dailyLimitMicrousd: 1_000_000, monthlyLimitMicrousd: 5_000_000,
++              maxRequestsPerDay: 20, codexModel: "fixture-model", codexPath: "/host/bin/codex")
++    }
++    private func status(_ settings: RelayHostRotationTextRPC.Settings? = nil) throws -> [String: Any] {
++        ["v": 1, "status": "ready", "configuration_id": operationID,
++         "settings": try JSONSerialization.jsonObject(with: JSONEncoder().encode(settings ?? self.settings())),
++         "day": "2026-10-11", "month": "2026-10", "requests_today": 1,
++         "charged_today_microusd": 100, "charged_month_microusd": 1000, "unresolved": []]
++    }
++    private func configureRequest() -> RelayHostRotationTextRPC.Request {
++        .init(operation: .configure, id: operationID, settings: settings())
++    }
++
++    func testExactDollarConversionAndBounds() {
++        for (input, amount) in ["0": Int64(0), "1": 1_000_000, "0.000001": 1, "199.999999": 199_999_999, "200": 200_000_000] {
++            XCTAssertEqual(RelayHostRotationTextRPC.parseDollars(input), amount)
++            XCTAssertEqual(RelayHostRotationTextRPC.parseDollars(RelayHostRotationTextRPC.dollars(amount)), amount)
++        }
++        for input in ["200.000001", "201", "-1", "1,5", "1e2", "NaN", "1.0000001", ".5", "1."] {
++            XCTAssertNil(RelayHostRotationTextRPC.parseDollars(input), input)
++        }
++    }
++
++    func testDisabledDefaultsAndProviderOrderArePreserved() throws {
++        let defaults = RelayHostRotationTextRPC.Settings()
++        XCTAssertTrue(defaults.valid); XCTAssertFalse(defaults.enabled)
++        let request = configureRequest(); XCTAssertTrue(request.valid)
++        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
++        XCTAssertEqual(Set(object.keys), ["v", "operation", "id", "text_settings"])
++        let decoded = try JSONDecoder().decode(RelayHostRotationTextRPC.Settings.self,
++            from: JSONEncoder().encode(settings()))
++        XCTAssertEqual(decoded.providers, ["anthropic_api", "codex_account"])
++        XCTAssertEqual(decoded.codexPath, "/host/bin/codex")
++        XCTAssertEqual(decoded.codexModel, "fixture-model")
++    }
++
++    func testConfigurationReceiptRequiresCurrentIDAndExactSettings() throws {
++        let request = configureRequest()
++        let response = try RelayHostRotationTextRPC.decode(data(status()), request: request)
++        XCTAssertEqual(response.configurationID, operationID)
++        XCTAssertEqual(response.settings, settings())
++        var body = try status(); body["configuration_id"] = String(repeating: "b", count: 32)
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decode(data(body), request: request))
++        body = try status(); body["configuration_id"] = nil
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decode(data(body), request: request))
++        var changed = settings(); changed.maxRequestsPerDay = 21
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decode(data(status(changed)), request: request))
++    }
++
++    func testReadStatusSupportsNewAndOlderHostStates() throws {
++        let request = RelayHostRotationTextRPC.Request(operation: .status)
++        XCTAssertTrue(request.valid)
++        let initial = try RelayHostRotationTextRPC.decode(data(["v": 1, "status": "not_configured", "enabled": false]), request: request)
++        XCTAssertTrue(initial.isNotConfigured); XCTAssertNil(initial.settings)
++        XCTAssertTrue(try RelayHostRotationTextRPC.decode(data(["state": "unsupported"]), request: request).isUnsupported)
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decode(data(["state": "unsupported"]), request: configureRequest()))
++    }
++
++    func testUnresolvedStatusAndAcknowledgementKeepExactIdentity() throws {
++        let id = String(repeating: "c", count: 32)
++        var body = try status(); body["status"] = "reconciliation_required"; body["unresolved"] = [id]
++        let request = RelayHostRotationTextRPC.Request(operation: .status)
++        XCTAssertEqual(try RelayHostRotationTextRPC.decode(data(body), request: request).unresolved, [id])
++        body["unresolved"] = [id, id]
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decode(data(body), request: request))
++        let receipt: [String: Any] = ["v": 1, "status": "abandoned", "operation_id": id, "charged_microusd": 1_000_000]
++        XCTAssertNoThrow(try RelayHostRotationTextRPC.decodeAbandon(data(receipt), operationID: id))
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decodeAbandon(data(receipt), operationID: operationID))
++        var pending = receipt; pending["status"] = "pending"
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decodeAbandon(data(pending), operationID: id))
++    }
++
++    func testInvalidSettingsAndRequestShapesAreRefused() {
++        var value = settings(); value.providers = ["anthropic_api", "anthropic_api"]; XCTAssertFalse(value.valid)
++        value = settings(); value.dailyLimitMicrousd = 999_999; XCTAssertFalse(value.valid)
++        value = settings(); value.monthlyLimitMicrousd = 200_000_001; XCTAssertFalse(value.valid)
++        value = settings(); value.maxRequestsPerDay = 0; XCTAssertFalse(value.valid)
++        value = settings(); value.codexPath = "relative"; XCTAssertFalse(value.valid)
++        value = settings(); value.codexModel = "untrusted model"; XCTAssertFalse(value.valid)
++        var request = RelayHostRotationTextRPC.Request(operation: .status); request.id = operationID; XCTAssertFalse(request.valid)
++        request = .init(operation: .abandon, operationID: operationID); XCTAssertTrue(request.valid)
++        request.settings = settings(); XCTAssertFalse(request.valid)
++    }
++
++    func testRefusalAndBudgetErrorsAreActionable() throws {
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decode(data(["state": "refused", "message": "input lease changed"]),
++            request: configureRequest())) { XCTAssertEqual($0.localizedDescription, "input lease changed") }
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decode(data(["v": 1, "status": "failed", "code": "positive_limits_required"]),
++            request: configureRequest())) { XCTAssertTrue($0.localizedDescription.contains("at least $1")) }
++        var body = try status(); body["charged_today_microusd"] = -1
++        XCTAssertThrowsError(try RelayHostRotationTextRPC.decode(data(body), request: .init(operation: .status)))
++    }
++
++    func testNativeCandidateUsesProjectDirectoryAndExactProcessIncarnation() throws {
++        let body: [String: Any] = ["v": 1, "state": "ready", "cwd": "/native/project",
++            "binding": ["version": 1, "session_id": "fixture-session", "transcript_path": "/private/source.jsonl",
++                        "revision": "native-revision", "producer": ["pane_id": pane.uuidString.lowercased(),
++                        "provider": "codex", "process_id": 101, "process_start": 102]]]
++        let wire = String(decoding: try data(body), as: UTF8.self)
++            .replacingOccurrences(of: "\"process_start\":102", with: "\"process_start\":18446744073709551615")
++        let candidate = try JSONDecoder().decode(RelayHostRotationRPC.NativeCandidate.self, from: Data(wire.utf8))
++        XCTAssertTrue(candidate.valid(for: pane)); XCTAssertFalse(candidate.valid(for: UUID()))
++        XCTAssertEqual(candidate.cwd, "/native/project")
++        XCTAssertEqual(candidate.binding.producer.processStart, UInt64.max)
++    }
++    func testPreparationHintsPointToTheRequiredAction() throws {
++        let budget = try JSONDecoder().decode(RelayHostRotationRPC.Preparation.self,
++            from: data(["state": "budget_limited", "code": "spending_limit"]))
++        XCTAssertTrue(budget.hint?.contains("Handoff text settings") == true)
++        let disabled = try JSONDecoder().decode(RelayHostRotationRPC.Preparation.self,
++            from: data(["state": "disabled", "code": "text_backend_disabled"]))
++        XCTAssertTrue(disabled.hint?.hasPrefix("Enable Handoff text") == true)
++        let recovery = try JSONDecoder().decode(RelayHostRotationRPC.Preparation.self,
++            from: data(["state": "reconciliation_required", "code": "reconciliation_required"]))
++        XCTAssertTrue(recovery.hint?.contains("unresolved") == true)
++        let complete = try JSONDecoder().decode(RelayHostRotationRPC.Preparation.self,
++            from: data(["state": "complete"]))
++        XCTAssertNil(complete.hint)
++    }
++
++}
+diff --git a/remote/relayd/internal/daemon/host_rotation.go b/remote/relayd/internal/daemon/host_rotation.go
+--- a/remote/relayd/internal/daemon/host_rotation.go
++++ b/remote/relayd/internal/daemon/host_rotation.go
+@@ -656,7 +656,57 @@
+ 	return nil
+ }
+ 
++// Reject ambiguous envelopes and fields outside this RPC's supported surface.
++func decodeHostRotationRequest(data []byte) (hostRotationRequest, error) {
++	var request hostRotationRequest
++	if len(data) > 8192 || !rotationSourceJSONUnambiguous(data) {
++		return request, errors.New("invalid host rotation request")
++	}
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	decoder.DisallowUnknownFields()
++	if decoder.Decode(&request) != nil || request.Version != 1 {
++		return request, errors.New("invalid host rotation request")
++	}
++	emptyNative := request.SessionID == "" && request.Client == "" && request.CWD == "" &&
++		request.AgentPID == 0 && request.AgentStart == 0
++	emptyText := len(request.TextSettings) == 0 && request.TextOperationID == ""
++	valid := false
++	switch request.Operation {
++	case "status", "native_candidate":
++		valid = request.ID == "" && emptyNative && emptyText
++	case "enroll":
++		valid = validPromptEditorID(request.ID) && validSessionID.MatchString(request.SessionID) &&
++			(request.Client == "claude" || request.Client == "codex") &&
++			filepath.IsAbs(request.CWD) && len(request.CWD) <= 4096 && !bytes.ContainsRune([]byte(request.CWD), 0) &&
++			request.AgentPID > 1 && request.AgentStart > 0 && emptyText
++	case "disable":
++		valid = validPromptEditorID(request.ID) && emptyNative && emptyText
++	case "text_status":
++		valid = request.ID == "" && emptyNative && len(request.TextSettings) == 0 &&
++			(request.TextOperationID == "" || validPromptEditorID(request.TextOperationID))
++	case "text_configure":
++		valid = validPromptEditorID(request.ID) && emptyNative && len(request.TextSettings) > 0 && request.TextOperationID == ""
++	case "text_abandon":
++		valid = request.ID == "" && emptyNative && len(request.TextSettings) == 0 && validPromptEditorID(request.TextOperationID)
++	}
++	if !valid {
++		return request, errors.New("invalid host rotation request")
++	}
++	return request, nil
++}
++
++type hostRotationRPCServices struct {
++	readCandidate func(context.Context, string) (hostRotationNativeCandidate, error)
++	textService   func(context.Context, string, string, any) (json.RawMessage, error)
++}
++
+ func serveHostRotationRequest(connection net.Conn, writer *protocol.Writer, hello protocol.HelloPayload, session *Session, config WorkerConfig) {
++	serveHostRotationRequestWithServices(connection, writer, hello, session, config,
++		hostRotationRPCServices{readHostRotationNativeCandidate, hostRotationTextService})
++}
++
++func serveHostRotationRequestWithServices(connection net.Conn, writer *protocol.Writer, hello protocol.HelloPayload,
++	session *Session, config WorkerConfig, services hostRotationRPCServices) {
+ 	reply := func(v any) {
+ 		f, err := protocol.JSONFrame(protocol.Status, v)
+ 		if err == nil {
+@@ -664,9 +714,8 @@
+ 		}
+ 	}
+ 	uid, _, err := PeerCredentials(connection)
+-	var req hostRotationRequest
+-	if err != nil || uid != os.Getuid() || len(hello.HostRotation) > 8192 ||
+-		json.Unmarshal(hello.HostRotation, &req) != nil || req.Version != 1 {
++	req, decodeErr := decodeHostRotationRequest(hello.HostRotation)
++	if err != nil || uid != os.Getuid() || decodeErr != nil {
+ 		reply(map[string]any{"state": "refused"})
+ 		return
+ 	}
+@@ -684,7 +733,7 @@
+ 	textReply := func(operation string, args any) {
+ 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+ 		defer cancel()
+-		value, err := hostRotationTextService(ctx, filepath.Dir(config.ManifestPath), operation, args)
++		value, err := services.textService(ctx, filepath.Dir(config.ManifestPath), operation, args)
+ 		if err != nil {
+ 			reply(map[string]any{"state": "refused", "message": err.Error()})
+ 			return
+@@ -696,10 +745,60 @@
+ 		return
+ 	}
+ 
++	// Native directory discovery is read-only and runs outside the input mutex.
++	// Enroll derives its directory independently of the UI's shell working directory.
++	var candidate hostRotationNativeCandidate
++	var inputRevision uint64
++	if req.Operation == "enroll" {
++		if !validPromptEditorID(req.ID) || !session.promptEditorControlIsCurrent(hello.ClientID) {
++			reply(map[string]any{"state": "refused", "message": "current terminal input lease and operation identity required"})
++			return
++		}
++		session.inputMu.Lock()
++		inputRevision = session.humanInputRevision
++		session.inputMu.Unlock()
++	}
++	if req.Operation == "native_candidate" || req.Operation == "enroll" {
++		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
++		candidate, err = services.readCandidate(ctx, config.SessionID)
++		cancel()
++		if err != nil {
++			reply(map[string]any{"state": "refused", "message": err.Error()})
++			return
++		}
++		if req.Operation == "native_candidate" {
++			reply(candidate)
++			return
++		}
++		if !candidate.matches(req, config.SessionID) {
++			reply(map[string]any{"state": "refused", "message": "enrollment differs from the verified native session"})
++			return
++		}
++	}
++
+ 	if !session.promptEditorControlIsCurrent(hello.ClientID) {
+ 		reply(map[string]any{"state": "refused", "message": "current terminal input lease required"})
+ 		return
+ 	}
++	// These host-wide settings require the current pane lease at acceptance.
++	// The text service performs no terminal input. Release the input lock before
++	// its subprocess/journal work so saving settings never holds up human typing.
++	if req.Operation == "text_configure" || req.Operation == "text_abandon" {
++		session.inputMu.Lock()
++		current := session.promptEditorControlIsCurrent(hello.ClientID)
++		session.inputMu.Unlock()
++		if !current {
++			reply(map[string]any{"state": "refused", "message": "terminal input lease changed"})
++			return
++		}
++		if req.Operation == "text_configure" {
++			textReply("configure", map[string]any{"operation_id": req.ID, "settings": req.TextSettings})
++		} else {
++			textReply("abandon", map[string]any{"operation_id": req.TextOperationID})
++		}
++		return
++	}
++
+ 	// Serialize enrollment against human input; normal input immediately
+ 	// disables the monitor rather than being blocked by the monitor.
+ 	session.inputMu.Lock()
+@@ -709,24 +808,11 @@
+ 		return
+ 	}
+ 
+-	// These host-wide settings still require the current pane input lease.
+-	// No transcript/config JSON can select a secret or network endpoint.
+-	if req.Operation == "text_configure" {
+-		if !validPromptEditorID(req.ID) || len(req.TextSettings) == 0 {
+-			reply(map[string]any{"state": "refused", "message": "invalid text configuration"})
+-			return
+-		}
+-		textReply("configure", map[string]any{"operation_id": req.ID, "settings": req.TextSettings})
+-		return
+-	}
+-	if req.Operation == "text_abandon" {
+-		if !validPromptEditorID(req.TextOperationID) {
+-			reply(map[string]any{"state": "refused", "message": "invalid text operation"})
+-			return
+-		}
+-		textReply("abandon", map[string]any{"operation_id": req.TextOperationID})
+-		return
+-	}
++	if req.Operation == "enroll" && session.humanInputRevision != inputRevision {
++		reply(map[string]any{"state": "refused", "message": "human input arrived during enrollment; read status before enabling again"})
++		return
++	}
++
+ 	e := hostRotationEnrollment{}
+ 	if req.Operation == "enroll" {
+ 		manifest, readErr := loadManifest(config.ManifestPath)
+@@ -739,7 +825,7 @@
+ 		e = hostRotationEnrollment{SessionID: req.SessionID, Client: req.Client, CWD: req.CWD,
+ 			PaneID: config.SessionID, AgentPID: req.AgentPID, AgentStart: req.AgentStart,
+ 			WorkerPID: manifest.WorkerPID, WorkerStart: manifest.WorkerStartTime, NodeBootID: manifest.NodeBootID}
+-		if err := verifyHostRotationEnrollment(e); err != nil {
++		if err := candidate.verifyEnrollment(e); err != nil {
+ 			reply(map[string]any{"state": "refused", "message": err.Error()})
+ 			return
+ 		}
+diff --git a/remote/relayd/internal/daemon/host_rotation_enrollment.go b/remote/relayd/internal/daemon/host_rotation_enrollment.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_enrollment.go
+@@ -0,0 +1,207 @@
++package daemon
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"unicode/utf8"
++)
++
++// Discovery reads only the verified provider transcript. It neither enrolls a
++// pane nor obtains terminal input ownership.
++type hostRotationNativeCandidate struct {
++	Version int                `json:"v"`
++	State   string             `json:"state"`
++	CWD     string             `json:"cwd"`
++	Binding AgentBindingRecord `json:"binding"`
++	path    string
++	info    os.FileInfo
++}
++
++func sameHostRotationNativeBinding(a, b AgentBindingRecord) bool {
++	return a.Version == b.Version && a.Producer == b.Producer && a.SessionID == b.SessionID &&
++		a.TranscriptPath == b.TranscriptPath && a.Revision != "" && a.Revision == b.Revision
++}
++
++func readHostRotationNativeCandidate(ctx context.Context, pane string) (hostRotationNativeCandidate, error) {
++	var empty hostRotationNativeCandidate
++	before, err := ReadNativeAgentBinding(pane)
++	if err != nil {
++		return empty, err
++	}
++	if ctx.Err() != nil {
++		return empty, ctx.Err()
++	}
++	candidate, err := readHostRotationNativeDirectory(ctx, before)
++	if err != nil {
++		return empty, err
++	}
++	after, err := ReadNativeAgentBinding(pane)
++	if err != nil || !sameHostRotationNativeBinding(before, after) {
++		return empty, errors.New("native session changed during directory discovery")
++	}
++	if ctx.Err() != nil {
++		return empty, ctx.Err()
++	}
++	if err := candidate.verifyFile(); err != nil {
++		return empty, err
++	}
++	return candidate, nil
++}
++
++func readHostRotationNativeDirectory(ctx context.Context, binding AgentBindingRecord) (hostRotationNativeCandidate, error) {
++	var empty hostRotationNativeCandidate
++	if binding.Version != 1 || binding.Revision == "" || !validSessionID.MatchString(binding.SessionID) {
++		return empty, errors.New("native session directory unavailable")
++	}
++	path, err := rotationSourcePath(binding.TranscriptPath, binding.Producer.Provider)
++	if err != nil {
++		return empty, err
++	}
++	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
++	if err != nil {
++		return empty, errors.New("native transcript unavailable")
++	}
++	file := os.NewFile(uintptr(fd), path)
++	defer file.Close()
++	before, err := file.Stat()
++	current, statErr := os.Lstat(path)
++	if err != nil || statErr != nil || !sameRotationSourceFile(before, current) ||
++		before.Size() <= 0 || before.Size() > rotationSourceFileLimit {
++		return empty, errors.New("native transcript changed or exceeds directory discovery limit")
++	}
++	cwd, err := parseHostRotationNativeDirectory(ctx, io.LimitReader(file, rotationSourceFileLimit+1),
++		binding.Producer.Provider, binding.SessionID)
++	if err != nil {
++		return empty, err
++	}
++	after, err := file.Stat()
++	if err != nil || !sameRotationSourceFile(before, after) {
++		return empty, errors.New("native transcript changed")
++	}
++	candidate := hostRotationNativeCandidate{Version: 1, State: "ready", CWD: cwd,
++		Binding: binding, path: path, info: before}
++	if err := candidate.verifyFile(); err != nil {
++		return empty, err
++	}
++	return candidate, nil
++}
++
++// Metadata is checked across the bounded stream so mixed session/directory
++// records cannot select a directory. Public message bodies are never returned.
++func parseHostRotationNativeDirectory(ctx context.Context, reader io.Reader, provider, session string) (string, error) {
++	if provider != "codex" && provider != "claude" {
++		return "", errors.New("unsupported native provider")
++	}
++	scanner := bufio.NewScanner(reader)
++	scanner.Buffer(make([]byte, 64<<10), rotationSourceLineLimit)
++	cwd, identified, records := "", false, 0
++	for scanner.Scan() {
++		if ctx.Err() != nil {
++			return "", ctx.Err()
++		}
++		records++
++		if records > 200000 {
++			return "", errors.New("native directory record limit exceeded")
++		}
++		line := scanner.Bytes()
++		if !utf8.Valid(line) || !rotationSourceJSONUnambiguous(line) {
++			return "", errors.New("invalid native directory metadata")
++		}
++		var row rotationSourceRow
++		if json.Unmarshal(line, &row) != nil {
++			return "", errors.New("invalid native directory record")
++		}
++		observed := ""
++		if provider == "codex" {
++			if row.Type == "response_item" && !identified {
++				return "", errors.New("native directory identity must precede messages")
++			}
++			if row.Type != "session_meta" {
++				continue
++			}
++			var meta struct {
++				ID           string          `json:"id"`
++				CWD          string          `json:"cwd"`
++				ThreadSource string          `json:"thread_source"`
++				Source       json.RawMessage `json:"source"`
++			}
++			if identified || json.Unmarshal(row.Payload, &meta) != nil || meta.ID != session ||
++				(meta.ThreadSource != "" && meta.ThreadSource != "user") ||
++				(meta.ThreadSource == "" && string(meta.Source) != `"cli"`) {
++				return "", errors.New("native directory session identity mismatch")
++			}
++			observed = meta.CWD
++		} else {
++			if (row.Type != "user" && row.Type != "assistant") || row.Sidechain {
++				continue
++			}
++			if row.SessionID != session {
++				return "", errors.New("native directory session identity mismatch")
++			}
++			observed = row.CWD
++		}
++		if !filepath.IsAbs(observed) || len(observed) > 4096 || strings.ContainsRune(observed, 0) ||
++			(identified && cwd != observed) {
++			return "", errors.New("native session directory is missing or inconsistent")
++		}
++		cwd, identified = observed, true
++	}
++	if scanner.Err() != nil {
++		return "", errors.New("native directory line limit or read failure")
++	}
++	if ctx.Err() != nil {
++		return "", ctx.Err()
++	}
++	if !identified {
++		return "", errors.New("native session directory metadata unavailable")
++	}
++	return cwd, nil
++}
++
++func (c hostRotationNativeCandidate) matches(req hostRotationRequest, pane string) bool {
++	return c.Version == 1 && c.State == "ready" && c.Binding.Producer.PaneID == pane &&
++		c.Binding.SessionID == req.SessionID && c.Binding.Producer.Provider == req.Client &&
++		c.CWD == req.CWD && c.Binding.Producer.ProcessID == req.AgentPID &&
++		c.Binding.Producer.ProcessStart == req.AgentStart
++}
++
++func (c hostRotationNativeCandidate) verifyFile() error {
++	path, err := rotationSourcePath(c.Binding.TranscriptPath, c.Binding.Producer.Provider)
++	if err != nil || path != c.path {
++		return errors.New("native directory source path changed")
++	}
++	current, err := os.Lstat(path)
++	if err != nil || !sameRotationSourceFile(c.info, current) {
++		return errors.New("native directory source changed")
++	}
++	return nil
++}
++
++// Slow metadata/native reads happen before Session.inputMu. This final check
++// uses only file/kernel identity while human input and enrollment are serialized.
++// Later evaluation and rotation still re-observe the native runtime and ledger.
++func (c hostRotationNativeCandidate) verifyEnrollment(e hostRotationEnrollment) error {
++	server := NewServer()
++	manifest, err := loadManifest(server.manifestPath(e.PaneID))
++	if err != nil || manifest.SessionID != e.PaneID || manifest.WorkerPID != e.WorkerPID ||
++		manifest.WorkerStartTime != e.WorkerStart || manifest.NodeBootID != e.NodeBootID ||
++		validateWorkerIdentity(manifest) != nil {
++		return errors.New("host rotation worker identity changed")
++	}
++	start, err := NativeAgentIncarnation(e.PaneID, e.AgentPID, e.Client)
++	if err != nil || start != e.AgentStart {
++		return errors.New("host rotation provider identity changed")
++	}
++	provider, pid := nativeBindingFrontend(manifest.ShellPID)
++	if provider != e.Client || pid != e.AgentPID {
++		return errors.New("host rotation frontend selection changed")
++	}
++	return c.verifyFile()
++}
+diff --git a/remote/relayd/internal/daemon/host_rotation_enrollment_test.go b/remote/relayd/internal/daemon/host_rotation_enrollment_test.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_enrollment_test.go
+@@ -0,0 +1,252 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/relay-terminal/relayd/internal/protocol"
++)
++
++func TestHostRotationNativeDirectoryUsesSessionMetadata(t *testing.T) {
++	for _, source := range []string{
++		`{"type":"session_meta","payload":{"id":"fixture-session","cwd":"/native/project","source":"cli"}}` + "\n",
++		`{"type":"session_meta","payload":{"id":"fixture-session","cwd":"/native/project","thread_source":"user"}}` + "\n",
++	} {
++		cwd, err := parseHostRotationNativeDirectory(context.Background(), strings.NewReader(source), "codex", "fixture-session")
++		if err != nil || cwd != "/native/project" {
++			t.Fatalf("native -C directory was lost: %q %v", cwd, err)
++		}
++	}
++	claude := strings.ReplaceAll(rotationClaudeFixtureRow("user", "u", "", "public", nil), "/fixture", "/native/project") +
++		rotationClaudeFixtureRow("assistant", "side", "", "ignored", map[string]any{"isSidechain": true, "cwd": "/other", "sessionId": "other"}) +
++		strings.ReplaceAll(rotationClaudeFixtureRow("assistant", "a", "u", "public", nil), "/fixture", "/native/project")
++	cwd, err := parseHostRotationNativeDirectory(context.Background(), strings.NewReader(claude), "claude", "fixture-session")
++	if err != nil || cwd != "/native/project" {
++		t.Fatalf("root Claude directory was lost: %q %v", cwd, err)
++	}
++}
++
++func TestHostRotationNativeDirectoryRefusesMixedOrAmbiguousIdentity(t *testing.T) {
++	base := `{"type":"session_meta","payload":{"id":"fixture-session","cwd":"/native/project","source":"cli"}}` + "\n"
++	for name, source := range map[string]string{
++		"other_session":   strings.Replace(base, "fixture-session", "another", 1),
++		"relative":        strings.Replace(base, "/native/project", "relative", 1),
++		"missing":         strings.Replace(base, `"cwd":"/native/project",`, "", 1),
++		"duplicate_key":   strings.Replace(base, `"cwd":"/native/project"`, `"cwd":"/shell","cwd":"/native/project"`, 1),
++		"second_metadata": base + base,
++		"nested":          strings.Replace(base, `"source":"cli"`, `"source":{"subagent":{}}`, 1),
++		"early_message":   `{"type":"response_item","payload":{}}` + "\n" + base,
++		"bad_record":      base + "{",
++		"large_line":      base + strings.Repeat("x", rotationSourceLineLimit+1),
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := parseHostRotationNativeDirectory(context.Background(), strings.NewReader(source), "codex", "fixture-session"); err == nil {
++				t.Fatal("ambiguous directory accepted")
++			}
++		})
++	}
++	claude := rotationClaudeFixtureRow("user", "u", "", "public", nil) +
++		rotationClaudeFixtureRow("assistant", "a", "u", "public", map[string]any{"cwd": "/changed"})
++	if _, err := parseHostRotationNativeDirectory(context.Background(), strings.NewReader(claude), "claude", "fixture-session"); err == nil {
++		t.Fatal("mixed Claude directories accepted")
++	}
++	if _, err := parseHostRotationNativeDirectory(context.Background(), strings.NewReader(""), "codex", "fixture-session"); err == nil {
++		t.Fatal("missing metadata accepted")
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := parseHostRotationNativeDirectory(ctx, strings.NewReader(base), "codex", "fixture-session"); !errors.Is(err, context.Canceled) {
++		t.Fatal("cancelled discovery continued", err)
++	}
++}
++
++func TestHostRotationNativeDirectoryRetainsFileIdentity(t *testing.T) {
++	home := t.TempDir()
++	t.Setenv("HOME", home)
++	directory := filepath.Join(home, ".codex", "sessions")
++	if err := os.MkdirAll(directory, 0700); err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(directory, "fixture.jsonl")
++	source := []byte(`{"type":"session_meta","payload":{"id":"fixture-session","cwd":"/native/project","source":"cli"}}` + "\n")
++	if err := os.WriteFile(path, source, 0600); err != nil {
++		t.Fatal(err)
++	}
++	binding := AgentBindingRecord{Version: 1, SessionID: "fixture-session", TranscriptPath: path, Revision: "native-revision",
++		Producer: agentProducer{PaneID: "fixture-pane", Provider: "codex", ProcessID: 101, ProcessStart: 102}}
++	candidate, err := readHostRotationNativeDirectory(context.Background(), binding)
++	if err != nil || candidate.CWD != "/native/project" {
++		t.Fatal(candidate.CWD, err)
++	}
++	if err := os.WriteFile(path, append(source, []byte(`{"type":"event_msg","payload":{}}`+"\n")...), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if candidate.verifyFile() == nil {
++		t.Fatal("changed transcript retained discovery")
++	}
++	if err := os.Chmod(path, 0666); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := readHostRotationNativeDirectory(context.Background(), binding); err == nil {
++		t.Fatal("shared transcript accepted")
++	}
++}
++
++func TestHostRotationNativeCandidateMatchesExactEnrollment(t *testing.T) {
++	candidate := hostRotationNativeCandidate{Version: 1, State: "ready", CWD: "/native/project", Binding: AgentBindingRecord{
++		Version: 1, SessionID: "fixture-session", TranscriptPath: "/source.jsonl", Revision: "revision",
++		Producer: agentProducer{PaneID: "fixture-pane", Provider: "codex", ProcessID: 101, ProcessStart: ^uint64(0)}}}
++	request := hostRotationRequest{SessionID: "fixture-session", Client: "codex", CWD: "/native/project", AgentPID: 101, AgentStart: ^uint64(0)}
++	if !candidate.matches(request, "fixture-pane") {
++		t.Fatal("native candidate did not match")
++	}
++	for name, change := range map[string]func(*hostRotationRequest){
++		"cwd":      func(r *hostRotationRequest) { r.CWD = "/shell" },
++		"session":  func(r *hostRotationRequest) { r.SessionID = "other" },
++		"provider": func(r *hostRotationRequest) { r.Client = "claude" },
++		"pid":      func(r *hostRotationRequest) { r.AgentPID++ },
++		"start":    func(r *hostRotationRequest) { r.AgentStart-- },
++	} {
++		t.Run(name, func(t *testing.T) {
++			bad := request
++			change(&bad)
++			if candidate.matches(bad, "fixture-pane") {
++				t.Fatal("different enrollment accepted")
++			}
++		})
++	}
++	if candidate.matches(request, "another-pane") {
++		t.Fatal("candidate accepted a different pane")
++	}
++}
++
++func TestHostRotationHumanInputRevisionRejectsReplayedInput(t *testing.T) {
++	sink, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer sink.Close()
++	session := &Session{pty: sink, inputSequences: map[[16]byte]uint64{}}
++	if err := session.input([]byte("human")); err != nil {
++		t.Fatal(err)
++	}
++	if session.humanInputRevision != 1 {
++		t.Fatal("ordinary human input did not invalidate discovery")
++	}
++	client := [16]byte{1}
++	if err := session.acknowledgedInput(client, 1, []byte("next")); err != nil {
++		t.Fatal(err)
++	}
++	if err := session.acknowledgedInput(client, 1, []byte("replay")); err != nil {
++		t.Fatal(err)
++	}
++	if session.humanInputRevision != 2 {
++		t.Fatal("acknowledged input replay advanced revision")
++	}
++}
++
++func TestHostRotationEnrollmentDoesNotBlockOrOverrideHumanInput(t *testing.T) {
++	root, err := os.MkdirTemp("/tmp", "relay-enroll-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(root)
++	listener, err := net.Listen("unix", filepath.Join(root, "test.sock"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	sink, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer sink.Close()
++	supervisor := newHostRotationSupervisor(filepath.Join(root, "rotation", "state.json"), func(context.Context, hostRotationEnrollment, time.Time) (json.RawMessage, error) {
++		return nil, errors.New("unused")
++	})
++	defer supervisor.close()
++	session := &Session{pty: sink, hostRotation: supervisor}
++	if !session.acquireControl("controller") {
++		t.Fatal("control unavailable")
++	}
++	started, release, served := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	releaseDiscovery := func() { releaseOnce.Do(func() { close(release) }) }
++	defer releaseDiscovery()
++	readCandidate := func(context.Context, string) (hostRotationNativeCandidate, error) {
++		close(started)
++		<-release
++		return hostRotationNativeCandidate{Version: 1, State: "ready", CWD: "/native/project", Binding: AgentBindingRecord{
++			Version: 1, SessionID: "fixture-session", TranscriptPath: "/unused.jsonl", Revision: "revision",
++			Producer: agentProducer{PaneID: "fixture-pane", Provider: "codex", ProcessID: 101, ProcessStart: 102}}}, nil
++	}
++	go func() {
++		defer close(served)
++		c, err := listener.Accept()
++		if err != nil {
++			return
++		}
++		defer c.Close()
++		frame, err := protocol.ReadFrame(c)
++		if err != nil {
++			return
++		}
++		var hello protocol.HelloPayload
++		if protocol.DecodeJSON(frame, &hello) != nil {
++			return
++		}
++		serveHostRotationRequestWithServices(c, protocol.NewWriter(c), hello, session, WorkerConfig{SessionID: "fixture-pane"}, hostRotationRPCServices{readCandidate: readCandidate})
++	}()
++	client, err := net.DialTimeout("unix", listener.Addr().String(), time.Second)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer client.Close()
++	_ = client.SetDeadline(time.Now().Add(3 * time.Second))
++	request, _ := json.Marshal(hostRotationRequest{Version: 1, Operation: "enroll", ID: strings.Repeat("a", 32),
++		SessionID: "fixture-session", Client: "codex", CWD: "/native/project", AgentPID: 101, AgentStart: 102})
++	frame, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{ClientID: "controller", HostRotation: request})
++	if err := protocol.NewWriter(client).Write(frame); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-started:
++	case <-time.After(time.Second):
++		t.Fatal("discovery did not start")
++	}
++	inputDone := make(chan error, 1)
++	go func() { inputDone <- session.input([]byte("human draft")) }()
++	select {
++	case err := <-inputDone:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		releaseDiscovery()
++		t.Fatal("discovery blocked human input")
++	}
++	releaseDiscovery()
++	frame, err = protocol.ReadFrame(client)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var response struct {
++		State   string `json:"state"`
++		Message string `json:"message"`
++	}
++	if protocol.DecodeJSON(frame, &response) != nil || response.State != "refused" || !strings.Contains(response.Message, "human input") {
++		t.Fatalf("human takeover overwritten: %+v", response)
++	}
++	<-served
++	if supervisor.snapshot().Enabled {
++		t.Fatal("human-owned session enrolled")
++	}
++}
+diff --git a/remote/relayd/internal/daemon/host_rotation_rpc_test.go b/remote/relayd/internal/daemon/host_rotation_rpc_test.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_rpc_test.go
+@@ -0,0 +1,153 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/relay-terminal/relayd/internal/protocol"
++)
++
++func TestHostRotationRPCRejectsUnknownAndAmbiguousRequests(t *testing.T) {
++	for name, raw := range map[string]string{
++		"duplicate":                   `{"v":1,"operation":"status","operation":"enroll"}`,
++		"unknown":                     `{"v":1,"operation":"status","api_key":"must-not-be-read"}`,
++		"trailing":                    `{"v":1,"operation":"status"}{}`,
++		"unsupported":                 `{"v":1,"operation":"future_write"}`,
++		"unbound_enroll":              `{"v":1,"operation":"enroll","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
++		"candidate_write_fields":      `{"v":1,"operation":"native_candidate","cwd":"/shell"}`,
++		"configuration_native_fields": `{"v":1,"operation":"text_configure","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","text_settings":{},"agent_pid":123}`,
++		"abandon_missing_id":          `{"v":1,"operation":"text_abandon"}`,
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := decodeHostRotationRequest([]byte(raw)); err == nil {
++				t.Fatal("unbound or ambiguous request accepted")
++			}
++		})
++	}
++	for _, raw := range []string{
++		`{"v":1,"operation":"status"}`,
++		`{"v":1,"operation":"native_candidate"}`,
++		`{"v":1,"operation":"disable","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
++		`{"v":1,"operation":"text_status"}`,
++		`{"v":1,"operation":"text_status","text_operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
++		`{"v":1,"operation":"text_configure","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","text_settings":{"enabled":false}}`,
++		`{"v":1,"operation":"text_abandon","text_operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
++	} {
++		if _, err := decodeHostRotationRequest([]byte(raw)); err != nil {
++			t.Fatal("supported envelope refused", raw, err)
++		}
++	}
++}
++
++func TestHostRotationTextSettingsDoNotBlockHumanInput(t *testing.T) {
++	for _, operation := range []string{"text_configure", "text_abandon"} {
++		t.Run(operation, func(t *testing.T) {
++			root, err := os.MkdirTemp("/tmp", "relay-text-rpc-")
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer os.RemoveAll(root)
++			listener, err := net.Listen("unix", filepath.Join(root, "test.sock"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer listener.Close()
++			sink, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer sink.Close()
++			supervisor := newHostRotationSupervisor(filepath.Join(root, "rotation", "state.json"), func(context.Context, hostRotationEnrollment, time.Time) (json.RawMessage, error) {
++				return nil, errors.New("unused")
++			})
++			defer supervisor.close()
++			session := &Session{pty: sink, hostRotation: supervisor}
++			if !session.acquireControl("controller") {
++				t.Fatal("control unavailable")
++			}
++			started, release, served := make(chan struct{}), make(chan struct{}), make(chan struct{})
++			var once sync.Once
++			releaseService := func() { once.Do(func() { close(release) }) }
++			defer releaseService()
++			services := hostRotationRPCServices{textService: func(context.Context, string, string, any) (json.RawMessage, error) {
++				close(started)
++				<-release
++				return json.RawMessage(`{"v":1,"status":"ready"}`), nil
++			}}
++			go func() {
++				defer close(served)
++				c, err := listener.Accept()
++				if err != nil {
++					return
++				}
++				defer c.Close()
++				frame, err := protocol.ReadFrame(c)
++				if err != nil {
++					return
++				}
++				var hello protocol.HelloPayload
++				if protocol.DecodeJSON(frame, &hello) != nil {
++					return
++				}
++				serveHostRotationRequestWithServices(c, protocol.NewWriter(c), hello, session, WorkerConfig{SessionID: "fixture-pane"}, services)
++			}()
++			client, err := net.DialTimeout("unix", listener.Addr().String(), time.Second)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer client.Close()
++			_ = client.SetDeadline(time.Now().Add(3 * time.Second))
++			request := hostRotationRequest{Version: 1, Operation: operation}
++			if operation == "text_configure" {
++				request.ID = strings.Repeat("a", 32)
++				request.TextSettings = json.RawMessage(`{"enabled":false}`)
++			} else {
++				request.TextOperationID = strings.Repeat("a", 32)
++			}
++			raw, _ := json.Marshal(request)
++			frame, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{ClientID: "controller", HostRotation: raw})
++			if err := protocol.NewWriter(client).Write(frame); err != nil {
++				t.Fatal(err)
++			}
++			select {
++			case <-started:
++			case <-time.After(time.Second):
++				t.Fatal("text service did not start")
++			}
++			inputDone := make(chan error, 1)
++			go func() { inputDone <- session.input([]byte("human draft")) }()
++			select {
++			case err := <-inputDone:
++				if err != nil {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				releaseService()
++				t.Fatal("saving settings blocked human input")
++			}
++			releaseService()
++			frame, err = protocol.ReadFrame(client)
++			if err != nil {
++				t.Fatal(err)
++			}
++			var response struct {
++				Status string `json:"status"`
++			}
++			if protocol.DecodeJSON(frame, &response) != nil || response.Status != "ready" {
++				t.Fatal("text configuration response lost")
++			}
++			<-served
++			if session.humanInputRevision != 1 {
++				t.Fatal("human input was lost")
++			}
++		})
++	}
++}
+diff --git a/remote/relayd/internal/daemon/host_rotation_text.py b/remote/relayd/internal/daemon/host_rotation_text.py
+--- a/remote/relayd/internal/daemon/host_rotation_text.py
++++ b/remote/relayd/internal/daemon/host_rotation_text.py
+@@ -495,11 +495,16 @@
+     def close(self):
+         self.db.close()
+ 
+-    def _settings(self):
+-        row = self.db.execute("SELECT value FROM settings WHERE singleton=1").fetchone()
++    def _configuration(self):
++        row = self.db.execute("SELECT operation_id, value FROM settings WHERE singleton=1").fetchone()
+         if row is None:
+             raise DraftError("journal_corrupt")
+-        return validated_settings(parse_json(row["value"]))
++        if row["operation_id"]:
++            valid_operation_id(row["operation_id"])
++        return row["operation_id"], validated_settings(parse_json(row["value"]))
++
++    def _settings(self):
++        return self._configuration()[1]
+ 
+     def configure(self, operation_id, settings):
+         valid_operation_id(operation_id)
+@@ -543,8 +548,9 @@
+         day, month, count, daily, monthly = self._usage()
+         unresolved = [r[0] for r in self.db.execute(
+             "SELECT id FROM operations WHERE state IN ('pending','uncertain') ORDER BY rowid LIMIT 16")]
++        configuration_id, settings = self._configuration()
+         return {"v": 1, "status": "ready" if not unresolved else "reconciliation_required",
+-                "settings": self._settings(), "day": day, "month": month,
++                "configuration_id": configuration_id, "settings": settings, "day": day, "month": month,
+                 "requests_today": count, "charged_today_microusd": daily,
+                 "charged_month_microusd": monthly, "unresolved": unresolved}
+ 
+diff --git a/remote/relayd/internal/daemon/session.go b/remote/relayd/internal/daemon/session.go
+--- a/remote/relayd/internal/daemon/session.go
++++ b/remote/relayd/internal/daemon/session.go
+@@ -61,6 +61,7 @@
+ 	process                *exec.Cmd
+ 	resizeMu               sync.Mutex
+ 	inputMu                sync.Mutex
++	humanInputRevision     uint64 // inputMu; invalidates enrollment prepared outside this lock
+ 	rotationControlled     bool
+ 	rotationGuardDirectory string
+ 	rotationHumanInputSeen bool
+@@ -939,6 +940,7 @@
+ 	if exited {
+ 		return io.ErrClosedPipe
+ 	}
++	session.humanInputRevision++
+ 	if supervisor != nil {
+ 		supervisor.humanInput()
+ 	}
+@@ -970,6 +972,7 @@
+ 	}
+ 	supervisor := session.hostRotation
+ 	session.mu.Unlock()
++	session.humanInputRevision++
+ 	if supervisor != nil {
+ 		supervisor.humanInput()
+ 	}
+diff --git a/scripts/verify-rotation-text-backend.py b/scripts/verify-rotation-text-backend.py
+--- a/scripts/verify-rotation-text-backend.py
++++ b/scripts/verify-rotation-text-backend.py
+@@ -89,6 +89,24 @@
+         self.configure()
+         self.assertFalse(self.journal.status()["settings"]["enabled"])
+         self.assertCode("operation_identity_conflict", lambda: self.configure(max_requests_per_day=1))
++
++    def test_configuration_receipt_tracks_current_saved_settings(self):
++        self.assertEqual(self.journal.status()["configuration_id"], "")
++        saved = self.configure()
++        self.assertEqual(saved["configuration_id"], "a"*32)
++        other = text.TextJournal(self.root)
++        try:
++            self.assertEqual(other.status()["configuration_id"], "a"*32)
++            settings = {**SETTINGS, "enabled": False, "providers": ["codex_account", "claude_account"],
++                        "codex_model": "fixture-model", "claude_path": "/owned/claude"}
++            current = other.configure("b"*32, settings)
++            self.assertEqual(current["configuration_id"], "b"*32)
++            replay = self.configure()
++            self.assertEqual(replay["configuration_id"], "b"*32)
++            self.assertEqual(replay["settings"], settings)
++            self.assertEqual(self.calls, 0)
++        finally:
++            other.close()
+ 
+     def test_uncertain_blocks_then_abandon_keeps_charge(self):
+         self.configure()

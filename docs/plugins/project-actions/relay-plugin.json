@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 3,
+  "id": "relay.project-actions",
+  "name": "Project actions",
+  "version": "0.2.0",
+  "repository": "genomewalker/relay-plugin-project-actions",
+  "permissions": [
+    {
+      "kind": "projectRead",
+      "reason": "Recognize Swift, Go, Rust, npm and Make projects and display build/test inspection commands."
+    },
+    {"kind": "projectExecute", "reason": "Run an explicitly reviewed command as your user in the captured project directory. Requires confirmation for each action."}
+  ],
+  "contributions": [
+    {
+      "id": "main",
+      "kind": "tool",
+      "title": "Project actions",
+      "text": "Recognize Swift, Go, Rust, npm and Make projects and display build/test inspection commands.",
+      "operation": "projectActions"
+    },
+    {"id": "run", "kind": "tool", "title": "Run project command", "text": "Review the executable, arguments, environment, directory and timeout before a single execution. No automatic retries.", "operation": "projectRun"}
+  ]
+}

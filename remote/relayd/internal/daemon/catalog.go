@@ -48,6 +48,7 @@ type CatalogPane struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 	Recoverable       bool      `json:"recoverable"`
 	Unfiled           bool      `json:"unfiled"`
+	Retained          bool      `json:"retained,omitempty"`
 }
 
 type storedCatalog struct {
@@ -72,6 +73,7 @@ func (server *Server) recordCatalogEntry(hello protocol.HelloPayload, manifest w
 		catalog = storedCatalog{Schema: catalogSchemaVersion, Panes: make(map[string]CatalogPane)}
 	}
 	entry := catalog.Panes[manifest.SessionID]
+	previous := entry
 	entry = mergeManifest(entry, manifest)
 	entry.NodeID, _ = currentNodeIdentity()
 	if hello.WorkspaceID != "" {
@@ -90,6 +92,16 @@ func (server *Server) recordCatalogEntry(hello protocol.HelloPayload, manifest w
 		entry.ContentKind = hello.ContentKind
 	}
 	entry.Unfiled = entry.WorkspaceID == "" || entry.TabID == ""
+	// Runtime cursors and timestamps are read from the worker manifests by
+	// CatalogSnapshot. Reconnecting unchanged panes must not serialize one
+	// fsync of the entire catalog per terminal and agent observer.
+	stablePrevious, stableEntry := previous, entry
+	stablePrevious.LastSequence, stableEntry.LastSequence = 0, 0
+	stablePrevious.LastEventSequence, stableEntry.LastEventSequence = 0, 0
+	stablePrevious.UpdatedAt, stableEntry.UpdatedAt = time.Time{}, time.Time{}
+	if stablePrevious == stableEntry {
+		return nil
+	}
 	catalog.Panes[manifest.SessionID] = entry
 	catalog.Schema = catalogSchemaVersion
 	catalog.Revision++

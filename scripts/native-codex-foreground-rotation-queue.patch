@@ -1,0 +1,862 @@
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -233,6 +233,7 @@
+ mod model_defaults;
+ mod new_session;
+ mod rotation;
++mod rotation_commit;
+ mod turn_tips;
+ pub(crate) use new_session::has_launch_setting;
+ mod clipboard;
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -122,6 +122,12 @@
+             event => (event, None),
+         };
+         match event {
++            AppEvent::CommitContextRotation(request) => {
++                (*request).refuse("context rotation commit requires the foreground queue owner");
++            }
++            AppEvent::ReconcileContextRotation(request) => {
++                request.refuse("context rotation reconciliation requires the foreground queue owner");
++            }
+             AppEvent::PrepareContextRotation(request) => {
+                 request.refuse("context rotation requires the foreground queue owner");
+             }
+--- a/codex-rs/tui/src/app/rotation.rs
++++ b/codex-rs/tui/src/app/rotation.rs
+@@ -97,3 +97,209 @@
+             && self.chat_widget.rotation_input_ready(turn_id)
+     }
+ }
++
++/// Events from the installed widget stay separate from unrelated foreground work.
++/// The queue owner retains this until it has verified the target and can resume dispatch.
++pub(super) struct NativeRotationStagedEvents {
++    receiver: mpsc::UnboundedReceiver<AppEvent>,
++    deferred: VecDeque<AppEvent>,
++}
++
++impl NativeRotationStagedEvents {
++    /// Preserve startup events and subsequent widget events on one ordered forwarding lane.
++    /// This publishes events; it does not release the foreground input reservation.
++    pub(super) fn forward(self, destination: AppEventSender) {
++        let Self {
++            mut receiver,
++            mut deferred,
++        } = self;
++        tokio::spawn(async move {
++            while let Some(event) = deferred.pop_front() {
++                if destination.app_event_tx.send(event).is_err() {
++                    return;
++                }
++            }
++            while let Some(event) = receiver.recv().await {
++                // AppEventSender logged these at their origin. Do not log them twice.
++                if destination.app_event_tx.send(event).is_err() {
++                    return;
++                }
++            }
++        });
++    }
++}
++
++impl App {
++    /// Install only the actual target retained by this sealed foreground/native pair.
++    /// The caller must keep both guards and the returned events through completion.
++    pub(super) async fn install_context_rotation_target(
++        &mut self,
++        tui: &mut tui::Tui,
++        native: &crate::app_server_session::context_rotation::NativeContextRotationCommit,
++        frontend: &crate::tui::rotation::FrontendRotationCommit,
++        attachment: &codex_app_server_client::NativeRotationAttachedTarget,
++    ) -> Result<NativeRotationStagedEvents> {
++        if !native.validates_attached_target(frontend, attachment) {
++            return Err(color_eyre::eyre::eyre!(
++                "rotation target has no matching foreground owner"
++            ));
++        }
++        let codex_app_server_client::NativeRotationCommitOutcome::Restored(owned) =
++            attachment.outcome().as_ref()
++        else {
++            return Err(color_eyre::eyre::eyre!(
++                "rotation outcome has no restored target"
++            ));
++        };
++        let receipt = owned.receipt();
++        let source_id = receipt.source.thread_id;
++        let target_id = attachment.target().thread_id;
++        if self.primary_thread_id != Some(source_id)
++            || self.active_thread_id != Some(source_id)
++            || self.chat_widget.thread_id() != Some(source_id)
++            || source_id == target_id
++            || receipt.target_thread_id != target_id
++            || !self.pending_primary_events.is_empty()
++            || self.pending_thread_switch_resets != 0
++            || !attachment.target().thread.matches_native_rotation_runtime(
++                target_id,
++                receipt.target_runtime_id,
++                &receipt.target_rollout_path,
++            )
++        {
++            return Err(color_eyre::eyre::eyre!(
++                "foreground or native target changed before attachment"
++            ));
++        }
++        let session =
++            crate::app_server_session::native_rotation_attachment::native_rotation_target_session(
++                attachment,
++            )
++            .await;
++        let config = attachment.config().as_ref().clone();
++        // Do every fallible screen operation before taking the source receiver.
++        // No queued reset may later erase the target's freshly installed history.
++        self.reset_for_thread_switch(tui)?;
++        self.store_active_thread_receiver().await;
++
++        let (event_tx, mut receiver) = mpsc::unbounded_channel();
++        let staged_sender = AppEventSender::new(event_tx);
++        let mut init = self.chatwidget_init_for_forked_or_resumed_thread(
++            tui,
++            config.clone(),
++            /*initial_user_message*/ None,
++        );
++        // The generic initializer deliberately carries the previous model. Rotation uses
++        // the settings observed from the retained target, including optional absence.
++        init.model = Some(session.model.clone());
++        init.app_event_tx = staged_sender.clone();
++        self.config = config;
++        self.file_search
++            .update_search_dir(self.config.cwd.to_path_buf());
++        self.replace_chat_widget(ChatWidget::new_with_app_event(init));
++        self.chat_widget
++            .note_rendered_width(tui.terminal.last_known_screen_size.width);
++
++        // Only this widget's startup history enters the staging lane. Other tasks keep
++        // their existing sender and their events remain in the foreground owner's queue.
++        let foreground_sender = std::mem::replace(&mut self.app_event_tx, staged_sender);
++        let installed = self
++            .enqueue_primary_thread_session_with_presentation(
++                session,
++                Vec::new(),
++                super::session_lifecycle::ThreadAttachPresentation::SessionLineage,
++            )
++            .await;
++        self.app_event_tx = foreground_sender;
++        installed?;
++        // The native target contains the exact CompactedItem capsule. There was no model
++        // turn during restoration, so display a notice without manufacturing a Turn.
++        self.chat_widget.add_info_message(
++            "Context restored from the previous session.".to_string(),
++            /*hint*/ None,
++        );
++
++        let mut deferred = VecDeque::new();
++        // Snapshot the synchronous startup batch. Later asynchronous events stay ordered
++        // behind it and cannot keep this installation loop running indefinitely.
++        for _ in 0..receiver.len() {
++            let Ok(event) = receiver.try_recv() else {
++                break;
++            };
++            match event {
++                AppEvent::InsertHistoryCell(cell) => self.insert_history_cell(tui, cell),
++                event => deferred.push_back(event),
++            }
++        }
++        Ok(NativeRotationStagedEvents { receiver, deferred })
++    }
++}
++
++#[cfg(test)]
++mod native_rotation_staged_event_tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[tokio::test]
++    async fn context_rotation_staged_events_wait_for_foreground_publication() {
++        let (source, receiver) = mpsc::unbounded_channel();
++        let (destination, mut output) = mpsc::unbounded_channel();
++        source
++            .send(AppEvent::EndInitialHistoryReplayBuffer)
++            .unwrap();
++        let staged = NativeRotationStagedEvents {
++            receiver,
++            deferred: VecDeque::from([AppEvent::ResetTranscriptForThreadSwitch]),
++        };
++        assert!(output.try_recv().is_err());
++        staged.forward(AppEventSender::new(destination));
++        assert!(matches!(
++            output.recv().await,
++            Some(AppEvent::ResetTranscriptForThreadSwitch)
++        ));
++        assert!(matches!(
++            output.recv().await,
++            Some(AppEvent::EndInitialHistoryReplayBuffer)
++        ));
++        source
++            .send(AppEvent::BeginInitialHistoryReplayBuffer)
++            .unwrap();
++        drop(source);
++        assert!(matches!(
++            output.recv().await,
++            Some(AppEvent::BeginInitialHistoryReplayBuffer)
++        ));
++        assert_eq!(output.recv().await.is_none(), true);
++    }
++
++    #[tokio::test]
++    async fn context_rotation_staged_events_keep_unrelated_foreground_events() {
++        let (source, receiver) = mpsc::unbounded_channel();
++        let (destination, mut output) = mpsc::unbounded_channel();
++        destination
++            .send(AppEvent::BeginInitialHistoryReplayBuffer)
++            .unwrap();
++        source
++            .send(AppEvent::EndInitialHistoryReplayBuffer)
++            .unwrap();
++        drop(source);
++        NativeRotationStagedEvents {
++            receiver,
++            deferred: VecDeque::from([AppEvent::ResetTranscriptForThreadSwitch]),
++        }
++        .forward(AppEventSender::new(destination));
++        assert!(matches!(
++            output.recv().await,
++            Some(AppEvent::BeginInitialHistoryReplayBuffer)
++        ));
++        assert!(matches!(
++            output.recv().await,
++            Some(AppEvent::ResetTranscriptForThreadSwitch)
++        ));
++        assert!(matches!(
++            output.recv().await,
++            Some(AppEvent::EndInitialHistoryReplayBuffer)
++        ));
++        assert_eq!(output.recv().await.is_none(), true);
++    }
++}
+--- /dev/null
++++ b/codex-rs/tui/src/app/rotation_commit.rs
+@@ -0,0 +1,293 @@
++//! The foreground queue owns both real reservations across lost replies and reconciliation.
++use super::*;
++use crate::app_server_session::context_rotation::ContextRotationCommitRequest;
++use crate::app_server_session::context_rotation::ContextRotationReconcileRequest;
++use crate::app_server_session::context_rotation::ContextRotationStatus;
++use crate::app_server_session::context_rotation::NativeContextRotationCommit;
++use crate::tui::rotation::FrontendRotationCommit;
++use codex_app_server_client::NativeRotationAttachment;
++use codex_app_server_client::NativeRotationReceipt;
++
++#[derive(Default)]
++pub(super) struct ContextRotationQueue {
++    owner: Option<ForegroundContextRotation>,
++    deferred: VecDeque<AppEvent>,
++}
++
++struct ForegroundContextRotation {
++    operation_id: uuid::Uuid,
++    source: NativeRotationReceipt,
++    native: NativeContextRotationCommit,
++    frontend: FrontendRotationCommit,
++    installed_target: Option<ThreadId>,
++    staged: Option<super::rotation::NativeRotationStagedEvents>,
++    terminal: Option<ContextRotationStatus>,
++}
++
++impl ContextRotationQueue {
++    pub(super) fn is_fenced(&self) -> bool {
++        self.owner
++            .as_ref()
++            .is_some_and(|owner| owner.terminal.is_none())
++    }
++
++    pub(super) fn can_prepare(&self) -> bool {
++        // A terminal native owner remains retained until the host acknowledges it.
++        self.owner.is_none()
++    }
++
++    pub(super) fn has_deferred(&self) -> bool {
++        !self.deferred.is_empty()
++    }
++
++    pub(super) fn defer(&mut self, event: AppEvent) {
++        self.deferred.push_back(event);
++    }
++
++    pub(super) async fn next_event(
++        &mut self,
++        receiver: &mut mpsc::UnboundedReceiver<AppEvent>,
++    ) -> Option<AppEvent> {
++        if !self.is_fenced()
++            && let Some(event) = self.deferred.pop_front()
++        {
++            return Some(event);
++        }
++        receiver.recv().await
++    }
++
++    pub(super) async fn commit(
++        &mut self,
++        app: &mut App,
++        tui: &mut tui::Tui,
++        events: &mpsc::UnboundedReceiver<AppEvent>,
++        request: ContextRotationCommitRequest,
++    ) {
++        if request.reply.is_closed() {
++            return;
++        }
++        let source = request.request.source().clone();
++        if self.owner.is_some()
++            || self.has_deferred()
++            || !app.frontend_rotation_ready(events, source.thread_id, &source.turn_id)
++        {
++            request.refuse("foreground rotation owner or queues are busy");
++            return;
++        }
++        let ContextRotationCommitRequest {
++            operation_id,
++            prepared,
++            request,
++            reply,
++        } = request;
++        let (reservation, native) = match prepared.into_commit(request) {
++            Ok(pair) => pair,
++            Err(error) => {
++                let _ = reply.send(ContextRotationStatus::Refused {
++                    operation_id,
++                    reason: error.to_string(),
++                });
++                return;
++            }
++        };
++        let frontend = match tui.seal_context_rotation(reservation) {
++            Ok(frontend) => frontend,
++            Err(error) => {
++                let _ = reply.send(ContextRotationStatus::Refused {
++                    operation_id,
++                    reason: format!("frontend seal refused: {error:?}"),
++                });
++                return;
++            }
++        };
++        self.owner = Some(ForegroundContextRotation {
++            operation_id,
++            source,
++            native,
++            frontend,
++            installed_target: None,
++            staged: None,
++            terminal: None,
++        });
++        // Ownership is already stored before the first commit await. A closed caller
++        // cannot drop a native transaction or unlock its frontend.
++        let status = self
++            .owner
++            .as_mut()
++            .expect("stored foreground owner")
++            .advance(app, tui)
++            .await;
++        let _ = reply.send(status);
++    }
++
++    pub(super) async fn reconcile(
++        &mut self,
++        app: &mut App,
++        tui: &mut tui::Tui,
++        request: ContextRotationReconcileRequest,
++    ) {
++        let Some(owner) = self
++            .owner
++            .as_mut()
++            .filter(|owner| owner.operation_id == request.operation_id)
++        else {
++            request.refuse("operation is not retained by this foreground owner");
++            return;
++        };
++        let status = owner.advance(app, tui).await;
++        let _ = request.reply.send(status);
++    }
++}
++
++impl ForegroundContextRotation {
++    fn pending(&self, reason: impl Into<String>) -> ContextRotationStatus {
++        ContextRotationStatus::Pending {
++            operation_id: self.operation_id,
++            reason: reason.into(),
++        }
++    }
++
++    async fn advance(&mut self, app: &mut App, tui: &mut tui::Tui) -> ContextRotationStatus {
++        if let Some(terminal) = &self.terminal {
++            return terminal.clone();
++        }
++        // Only the native observation is bounded. Never cancel a partly installed widget.
++        let attachment = match tokio::time::timeout(
++            std::time::Duration::from_secs(5),
++            self.native.attach(&self.frontend),
++        )
++        .await
++        {
++            Ok(Ok(attachment)) => attachment,
++            Ok(Err(error)) => return self.pending(error.to_string()),
++            Err(_) => {
++                return self.pending("native outcome is unresolved; ownership remains sealed");
++            }
++        };
++        let terminal = match attachment {
++            NativeRotationAttachment::Restored(attachment) => {
++                let target_id = attachment.target().thread_id;
++                if self.installed_target.is_none() {
++                    match app
++                        .install_context_rotation_target(
++                            tui,
++                            &self.native,
++                            &self.frontend,
++                            &attachment,
++                        )
++                        .await
++                    {
++                        Ok(staged) => {
++                            self.staged = Some(staged);
++                            self.installed_target = Some(target_id);
++                        }
++                        Err(error) => return self.pending(error.to_string()),
++                    }
++                }
++                let codex_app_server_client::NativeRotationCommitOutcome::Restored(owned) =
++                    attachment.outcome().as_ref()
++                else {
++                    return self.pending("native target evidence changed");
++                };
++                let receipt = owned.receipt();
++                let exact = self.installed_target == Some(target_id)
++                    && self.native.validates_attached_target(&self.frontend, &attachment)
++                    && app.primary_thread_id == Some(target_id)
++                    && app.active_thread_id == Some(target_id)
++                    && app.chat_widget.thread_id() == Some(target_id)
++                    && app.active_thread_rx.as_ref().is_some_and(|receiver| !receiver.is_closed())
++                    && app.primary_session_configured.as_ref().is_some_and(|session| {
++                        crate::app_server_session::native_rotation_attachment::native_rotation_target_matches_session(
++                            &attachment, session,
++                        )
++                    })
++                    && attachment.target().thread.matches_native_rotation_runtime(
++                        target_id, receipt.target_runtime_id, &receipt.target_rollout_path,
++                    );
++                if !exact {
++                    return self
++                        .pending("installed target no longer matches its retained native owner");
++                }
++                ContextRotationStatus::Restored {
++                    operation_id: self.operation_id,
++                    outcome: std::sync::Arc::clone(attachment.outcome()),
++                }
++            }
++            NativeRotationAttachment::SourceRetained(source) => {
++                let source_id = self.source.thread_id;
++                if self.installed_target.is_some()
++                    || self.staged.is_some()
++                    || source.receipt() != &self.source
++                    || !source.matches_runtime()
++                    || app.primary_thread_id != Some(source_id)
++                    || app.active_thread_id != Some(source_id)
++                    || app.chat_widget.thread_id() != Some(source_id)
++                    || app
++                        .active_thread_rx
++                        .as_ref()
++                        .is_none_or(|receiver| receiver.is_closed())
++                {
++                    return self.pending("original source could not be independently confirmed");
++                }
++                ContextRotationStatus::SourceRetained {
++                    operation_id: self.operation_id,
++                    source: source.receipt().clone(),
++                }
++            }
++        };
++        if tui.complete_context_rotation(&self.frontend).is_err() {
++            return self.pending("foreground input completion could not be confirmed");
++        }
++        self.terminal = Some(terminal.clone());
++        if let Some(staged) = self.staged.take() {
++            staged.forward(app.app_event_tx.clone());
++        }
++        terminal
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn context_rotation_deferred_foreground_events_preserve_order() {
++        let mut queue = ContextRotationQueue::default();
++        let (send, mut receive) = mpsc::unbounded_channel();
++        queue.defer(AppEvent::ResetTranscriptForThreadSwitch);
++        queue.defer(AppEvent::BeginInitialHistoryReplayBuffer);
++        send.send(AppEvent::EndInitialHistoryReplayBuffer).unwrap();
++        assert!(queue.has_deferred());
++        assert!(matches!(
++            queue.next_event(&mut receive).await,
++            Some(AppEvent::ResetTranscriptForThreadSwitch)
++        ));
++        assert!(matches!(
++            queue.next_event(&mut receive).await,
++            Some(AppEvent::BeginInitialHistoryReplayBuffer)
++        ));
++        assert!(!queue.has_deferred());
++        assert!(matches!(
++            queue.next_event(&mut receive).await,
++            Some(AppEvent::EndInitialHistoryReplayBuffer)
++        ));
++        assert!(queue.can_prepare());
++        assert!(!queue.is_fenced());
++    }
++
++    #[tokio::test]
++    async fn context_rotation_reconcile_refusal_does_not_claim_a_retained_source() {
++        let operation_id = uuid::Uuid::new_v4();
++        let (reply, receive) = tokio::sync::oneshot::channel();
++        ContextRotationReconcileRequest {
++            operation_id,
++            reply,
++        }
++        .refuse("unknown operation");
++        assert!(
++            matches!(receive.await.unwrap(), ContextRotationStatus::Refused {
++            operation_id: observed, ..
++        } if observed == operation_id)
++        );
++    }
++}
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -1040,6 +1040,7 @@
+             );
+         }
+ 
++        let mut context_rotation = super::rotation_commit::ContextRotationQueue::default();
+         let mut listen_for_app_server_events = true;
+         let mut reconnect = None;
+         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
+@@ -1070,6 +1071,29 @@
+             Ok(exit_reason)
+         } else {
+             loop {
++                // An unresolved rotation owns the whole foreground, including the queues.
++                // Read only control requests; retain every ordinary event in arrival order.
++                if context_rotation.is_fenced() {
++                    match context_rotation.next_event(&mut app_event_rx).await {
++                        Some(AppEvent::ReconcileContextRotation(request)) => {
++                            context_rotation.reconcile(&mut app, tui, request).await;
++                        }
++                        Some(AppEvent::CommitContextRotation(request)) => {
++                            (*request).refuse("another foreground rotation is unresolved");
++                        }
++                        Some(AppEvent::PrepareContextRotation(request)) => {
++                            request.refuse("foreground rotation reconciliation is pending");
++                        }
++                        Some(AppEvent::PrepareFrontendRotation(request)) => {
++                            let _ = request
++                                .reply
++                                .send(Err(crate::tui::rotation::FrontendRotationError::Busy));
++                        }
++                        Some(event) => context_rotation.defer(event),
++                        None => std::future::pending::<()>().await,
++                    }
++                    continue;
++                }
+                 // Reconnect can dismiss an overlay from the server-event path.
+                 if app.overlay.is_none() {
+                     if !tui.is_owned_screen() && tui.is_alt_screen_active() {
+@@ -1130,7 +1154,8 @@
+                 }
+                 // Replay queues history and operations. A buffered closure must not switch
+                 // widgets before those app events have been applied.
+-                let has_pending_app_events = !app_event_rx.is_empty();
++                let has_pending_app_events =
++                    context_rotation.has_deferred() || !app_event_rx.is_empty();
+                 let initial_session_header_pending = waiting_for_initial_session_header
+                     && app.primary_session_configured.is_some()
+                     && has_pending_app_events;
+@@ -1148,13 +1173,29 @@
+                     .rate_limit_refresh_interval()
+                     .and_then(|interval| app.rate_limit_refresh_state.poll_deadline(interval));
+                 let control = select! {
+-                    Some(event) = app_event_rx.recv() => {
++                    Some(event) = context_rotation.next_event(&mut app_event_rx) => {
+                         let event = match event {
++                            AppEvent::CommitContextRotation(request) => {
++                                context_rotation.commit(&mut app, tui, &app_event_rx, *request).await;
++                                continue;
++                            }
++                            AppEvent::ReconcileContextRotation(request) => {
++                                context_rotation.reconcile(&mut app, tui, request).await;
++                                continue;
++                            }
+                             AppEvent::PrepareContextRotation(request) => {
++                                if !context_rotation.can_prepare() {
++                                    request.refuse("previous rotation is retained for host acknowledgement");
++                                    continue;
++                                }
+                                 app.prepare_context_rotation(tui, &app_event_rx, &app_server, request);
+                                 continue;
+                             }
+                             AppEvent::PrepareFrontendRotation(request) => {
++                                if !context_rotation.can_prepare() {
++                                    let _ = request.reply.send(Err(crate::tui::rotation::FrontendRotationError::Busy));
++                                    continue;
++                                }
+                                 app.prepare_frontend_rotation(tui, &app_event_rx, request);
+                                 continue;
+                             }
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -280,6 +280,12 @@
+ pub(crate) enum AppEvent {
+     PrepareFrontendRotation(crate::tui::rotation::FrontendRotationRequest),
+     PrepareContextRotation(crate::app_server_session::context_rotation::ContextRotationRequest),
++    CommitContextRotation(
++        Box<crate::app_server_session::context_rotation::ContextRotationCommitRequest>,
++    ),
++    ReconcileContextRotation(
++        crate::app_server_session::context_rotation::ContextRotationReconcileRequest,
++    ),
+     SecuritySetupLoaded {
+         request_id: uuid::Uuid,
+         identity: crate::security_setup::Identity,
+--- a/codex-rs/tui/src/app_event_sender.rs
++++ b/codex-rs/tui/src/app_event_sender.rs
+@@ -30,6 +30,54 @@
+ }
+ 
+ impl AppEventSender {
++    /// The caller must verify durable host intent before handing off the owned pair.
++    pub(crate) async fn commit_context_rotation(
++        &self,
++        prepared: crate::app_server_session::context_rotation::PreparedContextRotation,
++        operation_id: uuid::Uuid,
++        host_claim_id: uuid::Uuid,
++        capsule_sha256: String,
++        capsule: String,
++    ) -> color_eyre::Result<crate::app_server_session::context_rotation::ContextRotationStatus>
++    {
++        let (reply, receive) = tokio::sync::oneshot::channel();
++        let request =
++            crate::app_server_session::context_rotation::ContextRotationCommitRequest::new(
++                prepared,
++                operation_id,
++                host_claim_id,
++                capsule_sha256,
++                capsule,
++                reply,
++            )?;
++        self.send(AppEvent::CommitContextRotation(Box::new(request)));
++        Ok(
++            crate::app_server_session::context_rotation::await_context_rotation_reply(
++                operation_id,
++                receive,
++            )
++            .await,
++        )
++    }
++
++    pub(crate) async fn reconcile_context_rotation(
++        &self,
++        operation_id: uuid::Uuid,
++    ) -> crate::app_server_session::context_rotation::ContextRotationStatus {
++        let (reply, receive) = tokio::sync::oneshot::channel();
++        self.send(AppEvent::ReconcileContextRotation(
++            crate::app_server_session::context_rotation::ContextRotationReconcileRequest {
++                operation_id,
++                reply,
++            },
++        ));
++        crate::app_server_session::context_rotation::await_context_rotation_reply(
++            operation_id,
++            receive,
++        )
++        .await
++    }
++
+     pub(crate) fn prepare_context_rotation(
+         &self,
+         thread_id: ThreadId,
+--- a/codex-rs/tui/src/app_server_session/context_rotation.rs
++++ b/codex-rs/tui/src/app_server_session/context_rotation.rs
+@@ -217,6 +217,25 @@
+             .await?;
+         self.outcome = Some(std::sync::Arc::clone(&outcome));
+         Ok(outcome)
++    }
++
++    /// Attachment authority is the exact outcome retained by this paired owner.
++    pub(crate) fn validates_attached_target(
++        &self,
++        frontend: &FrontendRotationCommit,
++        attachment: &codex_app_server_client::NativeRotationAttachedTarget,
++    ) -> bool {
++        frontend.matches_reservation(
++            self.frontend_runtime_id,
++            self.frontend_generation,
++            self.request.source().thread_id,
++            &self.request.source().turn_id,
++        ) && self.outcome.as_ref().is_some_and(|outcome| {
++            std::sync::Arc::ptr_eq(outcome, attachment.outcome())
++                && matches!(outcome.as_ref(),
++                    NativeRotationCommitOutcome::Restored(owned)
++                        if &owned.receipt().source == self.request.source())
++        })
+     }
+ 
+     pub(crate) async fn attach(
+@@ -343,3 +362,124 @@
+ #[cfg(test)]
+ #[path = "context_rotation_tests.rs"]
+ mod tests;
++
++/// A caller must verify its durable host intent before constructing this owned request.
++/// The actual paired reservation is moved to the foreground; identifiers cannot replace it.
++pub(crate) struct ContextRotationCommitRequest {
++    pub(crate) operation_id: Uuid,
++    pub(crate) prepared: PreparedContextRotation,
++    pub(crate) request: NativeRotationCommitRequest,
++    pub(crate) reply: tokio::sync::oneshot::Sender<ContextRotationStatus>,
++}
++
++impl std::fmt::Debug for ContextRotationCommitRequest {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ContextRotationCommitRequest")
++            .field("operation_id", &self.operation_id)
++            .field("source", self.request.source())
++            .finish_non_exhaustive()
++    }
++}
++
++impl ContextRotationCommitRequest {
++    pub(crate) fn new(
++        prepared: PreparedContextRotation,
++        operation_id: Uuid,
++        host_claim_id: Uuid,
++        capsule_sha256: String,
++        capsule: String,
++        reply: tokio::sync::oneshot::Sender<ContextRotationStatus>,
++    ) -> Result<Self> {
++        let request =
++            prepared.bound_commit_request(operation_id, host_claim_id, capsule_sha256, capsule)?;
++        Ok(Self {
++            operation_id,
++            prepared,
++            request,
++            reply,
++        })
++    }
++
++    pub(crate) fn refuse(self, reason: impl Into<String>) {
++        let _ = self.reply.send(ContextRotationStatus::Refused {
++            operation_id: self.operation_id,
++            reason: reason.into(),
++        });
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct ContextRotationReconcileRequest {
++    pub(crate) operation_id: Uuid,
++    pub(crate) reply: tokio::sync::oneshot::Sender<ContextRotationStatus>,
++}
++
++impl ContextRotationReconcileRequest {
++    pub(crate) fn refuse(self, reason: impl Into<String>) {
++        let _ = self.reply.send(ContextRotationStatus::Refused {
++            operation_id: self.operation_id,
++            reason: reason.into(),
++        });
++    }
++}
++
++/// Completion is reported only after the queue owner installed the exact native target,
++/// or independently verified its original source, and completed its input reservation.
++#[derive(Debug, Clone)]
++pub(crate) enum ContextRotationStatus {
++    Refused {
++        operation_id: Uuid,
++        reason: String,
++    },
++    Pending {
++        operation_id: Uuid,
++        reason: String,
++    },
++    Restored {
++        operation_id: Uuid,
++        outcome: std::sync::Arc<NativeRotationCommitOutcome>,
++    },
++    SourceRetained {
++        operation_id: Uuid,
++        source: NativeRotationReceipt,
++    },
++}
++
++pub(crate) async fn await_context_rotation_reply(
++    operation_id: Uuid,
++    reply: tokio::sync::oneshot::Receiver<ContextRotationStatus>,
++) -> ContextRotationStatus {
++    match tokio::time::timeout(Duration::from_secs(10), reply).await {
++        Ok(Ok(status)) => status,
++        Ok(Err(_)) => ContextRotationStatus::Pending {
++            operation_id,
++            reason: "foreground reply was lost; reconcile the same operation".into(),
++        },
++        Err(_) => ContextRotationStatus::Pending {
++            operation_id,
++            reason: "foreground reply timed out; reconcile the same operation".into(),
++        },
++    }
++}
++
++#[cfg(test)]
++mod context_rotation_commit_reply_tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn context_rotation_lost_commit_reply_is_pending() {
++        let id = Uuid::new_v4();
++        let (send, receive) = tokio::sync::oneshot::channel();
++        drop(send);
++        assert!(matches!(await_context_rotation_reply(id, receive).await,
++            ContextRotationStatus::Pending { operation_id, .. } if operation_id == id));
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn context_rotation_expired_commit_reply_is_pending() {
++        let id = Uuid::new_v4();
++        let (_send, receive) = tokio::sync::oneshot::channel();
++        assert!(matches!(await_context_rotation_reply(id, receive).await,
++            ContextRotationStatus::Pending { operation_id, .. } if operation_id == id));
++    }
++}
+--- a/codex-rs/tui/src/app_server_session/native_rotation_attachment.rs
++++ b/codex-rs/tui/src/app_server_session/native_rotation_attachment.rs
+@@ -23,6 +23,20 @@
+             entry_count,
+         }),
+     )
++}
++
++/// Compare live native settings with the installed UI snapshot. Global message-history
++/// counters can change in other sessions and are not native thread ownership evidence.
++pub(crate) fn native_rotation_target_matches_session(
++    attachment: &NativeRotationAttachedTarget,
++    session: &ThreadSessionState,
++) -> bool {
++    &map_native_rotation_session(
++        attachment.settings(),
++        &attachment.target().session_configured,
++        attachment.instruction_sources().to_vec(),
++        session.message_history,
++    ) == session
+ }
+ 
+ fn map_native_rotation_session(

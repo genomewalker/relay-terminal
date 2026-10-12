@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -20,6 +21,29 @@ func CanonicalAgentEnvelope(provider string, raw []byte, source string) ([]byte,
 		provider = "unknown"
 	}
 	event := canonicalNativeEvent(provider, input)
+	// JSON-RPC IDs belong to the outer request, not params.approvalId. Read
+	// them as raw JSON so large integer IDs survive without float conversion.
+	if provider == "codex" {
+		var frame struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params struct {
+				RequestID json.RawMessage `json:"requestId"`
+			} `json:"params"`
+		}
+		if json.Unmarshal(raw, &frame) == nil {
+			var id json.RawMessage
+			switch frame.Method {
+			case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval":
+				id = frame.ID
+			case "serverRequest/resolved":
+				id = frame.Params.RequestID
+			}
+			if key, ok := codexRequestID(id); ok {
+				event["approval_id"] = key
+			}
+		}
+	}
 	event["source"] = source
 	if _, ok := event["occurred_at"]; !ok {
 		event["occurred_at"] = time.Now().UTC().Format(time.RFC3339Nano)
@@ -32,7 +56,48 @@ func CanonicalAgentEnvelope(provider string, raw []byte, source string) ([]byte,
 
 func canonicalNativeEvent(provider string, input map[string]any) map[string]any {
 	if input["hook_event_name"] != nil || input["event_type"] != nil {
-		return copyAgentMetadata(input)
+		event := copyAgentMetadata(input)
+		if provider == "claude" && input["hook_event_name"] == "PostToolUse" && (input["tool_name"] == "TaskCreate" || input["tool_name"] == "TaskUpdate") {
+			arguments, _ := input["tool_input"].(map[string]any)
+			response, _ := input["tool_response"].(map[string]any)
+			task, _ := response["task"].(map[string]any)
+			id, _ := task["id"].(string)
+			if id == "" {
+				id, _ = arguments["taskId"].(string)
+			}
+			subject, _ := task["subject"].(string)
+			if subject == "" {
+				subject, _ = arguments["subject"].(string)
+			}
+			status, _ := task["status"].(string)
+			if status == "" {
+				status, _ = arguments["status"].(string)
+			}
+			if input["tool_name"] == "TaskCreate" && status == "" {
+				status = "pending"
+			}
+			if id != "" && len(id) <= 256 && len(subject) <= 2048 && (status == "" || status == "pending" || status == "in_progress" || status == "completed" || status == "deleted") {
+				event["hook_event_name"] = "TaskChanged"
+				event["task_id"], event["task_subject"], event["task_status"] = id, subject, status
+			}
+		}
+		if input["hook_event_name"] == "PostToolUse" && input["tool_name"] == "TodoWrite" {
+			arguments, _ := input["tool_input"].(map[string]any)
+			if rows, ok := arguments["todos"].([]any); ok && len(rows) <= 100 {
+				steps := make([]taskPlanStep, 0, len(rows))
+				for _, row := range rows {
+					entry, _ := row.(map[string]any)
+					text, _ := entry["content"].(string)
+					status, _ := entry["status"].(string)
+					steps = append(steps, taskPlanStep{Step: text, Status: status})
+				}
+				if validTaskPlan(steps) {
+					event["hook_event_name"] = "PlanUpdated"
+					event["plan"] = steps
+				}
+			}
+		}
+		return event
 	}
 	method, _ := input["method"].(string)
 	params, _ := input["params"].(map[string]any)
@@ -74,7 +139,26 @@ func canonicalNativeEvent(provider string, input map[string]any) map[string]any 
 		event["hook_event_name"] = "turn/completed"
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval":
 		event["hook_event_name"] = "PermissionRequest"
-	case "item/mcpToolCall/progress", "turn/plan/updated":
+	case "serverRequest/resolved":
+		event["hook_event_name"] = "PermissionResolved"
+	case "turn/plan/updated":
+		event["hook_event_name"] = "PlanUpdated"
+		if rows, ok := params["plan"].([]any); ok && len(rows) <= 100 {
+			steps := make([]taskPlanStep, 0, len(rows))
+			for _, row := range rows {
+				entry, _ := row.(map[string]any)
+				text, _ := entry["step"].(string)
+				status, _ := entry["status"].(string)
+				if status == "inProgress" {
+					status = "in_progress"
+				}
+				steps = append(steps, taskPlanStep{Step: text, Status: status})
+			}
+			if validTaskPlan(steps) {
+				event["plan"] = steps
+			}
+		}
+	case "item/mcpToolCall/progress":
 		event["hook_event_name"] = "AgentProgress"
 	case "thread/tokenUsage/updated":
 		event["hook_event_name"] = "ResourceUsage"
@@ -176,6 +260,7 @@ func copyAgentMetadata(input map[string]any) map[string]any {
 		"to_peer_id": true, "message_type": true, "delivery": true, "approval_id": true,
 		"progress_percent": true, "artifact_type": true, "input_tokens": true,
 		"cached_input_tokens": true, "output_tokens": true,
+		"task_id": true, "task_subject": true, "task_status": true,
 	}
 	result := make(map[string]any)
 	for key, value := range input {
@@ -211,4 +296,32 @@ func ValidateNativeAgentSource(source string) error {
 	default:
 		return fmt.Errorf("unsupported agent event source %q", source)
 	}
+}
+
+// canonical request IDs for observed provider events.
+func codexRequestID(raw json.RawMessage) (string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || len(raw) > 512 {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		if s == "" {
+			return "", false
+		}
+		encoded, _ := json.Marshal(s)
+		return string(encoded), true
+	}
+	for i, b := range raw {
+		if b == '-' && i == 0 {
+			continue
+		}
+		if b < '0' || b > '9' {
+			return "", false
+		}
+	}
+	if !json.Valid(raw) {
+		return "", false
+	}
+	return string(raw), true
 }

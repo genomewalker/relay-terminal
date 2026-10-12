@@ -12,6 +12,8 @@ import (
 // renderer otherwise shows the right screen while interpreting its keyboard,
 // mouse, and paste input with stale defaults.
 type terminalModeState struct {
+	osc           []byte
+	commandActive bool
 	escapeState   uint8
 	csi           []byte
 	keyboardStack []int
@@ -39,6 +41,9 @@ func (state *terminalModeState) ingest(data []byte) {
 			}
 		case 1:
 			switch value {
+			case ']':
+				state.escapeState = 3
+				state.osc = state.osc[:0]
 			case '[':
 				state.escapeState = 2
 				state.csi = state.csi[:0]
@@ -48,6 +53,23 @@ func (state *terminalModeState) ingest(data []byte) {
 				state.escapeState = 1
 			default:
 				state.escapeState = 0
+			}
+		case 3, 4:
+			wasEscape := state.escapeState == 4
+			if value == 0x07 || (wasEscape && value == 0x5c) {
+				state.applyOSC(state.osc)
+				state.osc = state.osc[:0]
+				state.escapeState = 0
+			} else if value == 0x1b {
+				state.escapeState = 4
+			} else {
+				if wasEscape && len(state.osc) < 256 {
+					state.osc = append(state.osc, 0x1b)
+				}
+				if len(state.osc) < 256 {
+					state.osc = append(state.osc, value)
+				}
+				state.escapeState = 3
 			}
 		case 2:
 			if value == 0x1b {
@@ -72,7 +94,38 @@ func (state *terminalModeState) reset() {
 	state.escapeState = 0
 	state.csi = state.csi[:0]
 	state.keyboardStack = []int{0}
+	state.osc = state.osc[:0]
+	state.commandActive = false
 	clear(state.privateModes)
+}
+
+// Prompt markers come from the shell after a command returns. A crashed TUI
+// may never send its protocol teardown, so its durable modes must not survive
+// into a later attachment at shell input. Preserve shell bracketed paste.
+func (state *terminalModeState) applyOSC(sequence []byte) {
+	payload := string(sequence)
+	fields := strings.Split(payload, ";")
+	if len(fields) < 2 || fields[0] != "133" {
+		return
+	}
+	switch fields[1] {
+	case "C":
+		state.commandActive = true
+	case "A", "B", "P":
+		if fields[1] == "P" && (len(fields) < 3 || fields[2] != "k=i") {
+			return
+		}
+		if !state.commandActive {
+			return
+		}
+		state.keyboardStack = []int{0}
+		for _, mode := range durablePrivateModes {
+			if mode != 2004 {
+				state.privateModes[mode] = false
+			}
+		}
+		state.commandActive = false
+	}
 }
 
 func (state *terminalModeState) applyCSI(sequence []byte) {

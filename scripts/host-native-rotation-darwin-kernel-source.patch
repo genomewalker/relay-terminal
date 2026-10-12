@@ -1,0 +1,333 @@
+diff --git a/remote/relayd/internal/daemon/native_codex_open_darwin.go b/remote/relayd/internal/daemon/native_codex_open_darwin.go
+--- a/remote/relayd/internal/daemon/native_codex_open_darwin.go
++++ b/remote/relayd/internal/daemon/native_codex_open_darwin.go
+@@ -105,11 +105,7 @@
+ }
+ 
+ func darwinOpenCodexTranscript(ctx context.Context, pid int) (string, string, string, error) {
+-	raw, err := nativeLsof(ctx, "-a", "-p", strconv.Itoa(pid), "-FnftDi")
+-	if err != nil {
+-		return "", "", "", err
+-	}
+-	descriptors, err := darwinNativeTranscriptDescriptors(raw, pid)
++	descriptors, err := darwinKernelTranscriptDescriptors(ctx, pid)
+ 	if err != nil {
+ 		return "", "", "", err
+ 	}
+diff --git a/remote/relayd/internal/daemon/native_codex_descriptors_darwin.go b/remote/relayd/internal/daemon/native_codex_descriptors_darwin.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/native_codex_descriptors_darwin.go
+@@ -0,0 +1,136 @@
++//go:build darwin
++
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"errors"
++	"os"
++	"runtime"
++	"strings"
++	"syscall"
++	"unicode/utf8"
++	"unsafe"
++
++	"golang.org/x/sys/unix"
++)
++
++// Public macOS proc_info ABI, checked against the installed SDK's libproc.h
++// and sys/proc_info.h on both supported Darwin architectures. The libproc
++// wrappers issue PIDINFO=2 and PIDFDINFO=3; no subprocess or cgo is required.
++const (
++	darwinNativeFDLimit       = 4096
++	darwinNativeFDRecordSize  = 8
++	darwinNativeVnodeInfoSize = 1200
++	darwinNativeVnodePath     = 176
++	darwinNativeVnodePathSize = 1024
++)
++
++type darwinNativeFD struct {
++	number uint32
++	kind   uint32
++}
++
++func darwinNativeFDRecords(data []byte) ([]darwinNativeFD, error) {
++	if len(data) == 0 || len(data)%darwinNativeFDRecordSize != 0 ||
++		len(data)/darwinNativeFDRecordSize > darwinNativeFDLimit {
++		return nil, errors.New("native descriptor inventory incomplete or exceeds limit")
++	}
++	result := make([]darwinNativeFD, 0, len(data)/darwinNativeFDRecordSize)
++	seen := map[uint32]bool{}
++	for offset := 0; offset < len(data); offset += darwinNativeFDRecordSize {
++		number := binary.LittleEndian.Uint32(data[offset:])
++		kind := binary.LittleEndian.Uint32(data[offset+4:])
++		if number >= darwinNativeFDLimit || seen[number] {
++			return nil, errors.New("native descriptor identity ambiguous or exceeds limit")
++		}
++		seen[number] = true
++		result = append(result, darwinNativeFD{number, kind})
++	}
++	return result, nil
++}
++
++func darwinNativeVnodeDescriptor(number uint32, data []byte) (darwinNativeTranscriptDescriptor, bool, error) {
++	var empty darwinNativeTranscriptDescriptor
++	if number >= darwinNativeFDLimit || len(data) != darwinNativeVnodeInfoSize {
++		return empty, false, errors.New("native vnode inventory incomplete")
++	}
++	mode := binary.LittleEndian.Uint16(data[28:])
++	if mode&syscall.S_IFMT != syscall.S_IFREG {
++		return empty, false, nil
++	}
++	pathData := data[darwinNativeVnodePath : darwinNativeVnodePath+darwinNativeVnodePathSize]
++	end := bytes.IndexByte(pathData, 0)
++	if end < 0 {
++		return empty, false, errors.New("native vnode path truncated")
++	}
++	path := string(pathData[:end])
++	if !strings.HasSuffix(path, ".jsonl") {
++		return empty, false, nil
++	}
++	device := uint64(binary.LittleEndian.Uint32(data[24:]))
++	inode := binary.LittleEndian.Uint64(data[32:])
++	uid := binary.LittleEndian.Uint32(data[40:])
++	links := binary.LittleEndian.Uint16(data[30:])
++	if inode == 0 || int(uid) != os.Getuid() || links != 1 ||
++		!utf8.ValidString(path) || !strings.HasPrefix(path, "/") {
++		return empty, false, errors.New("native transcript vnode identity unavailable")
++	}
++	return darwinNativeTranscriptDescriptor{int(number), path, device, inode}, true, nil
++}
++
++func darwinNativeProcInfo(ctx context.Context, call, pid, flavor, arg int, buffer []byte) (int, error) {
++	if err := ctx.Err(); err != nil {
++		return 0, err
++	}
++	if pid <= 1 || len(buffer) == 0 {
++		return 0, errors.New("invalid native descriptor process or buffer")
++	}
++	count, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, uintptr(call), uintptr(pid),
++		uintptr(flavor), uintptr(arg), uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
++	runtime.KeepAlive(buffer)
++	if errno != 0 {
++		return 0, errno
++	}
++	if err := ctx.Err(); err != nil {
++		return 0, err
++	}
++	if count == 0 || count > uintptr(len(buffer)) {
++		return 0, errors.New("native descriptor observation unavailable")
++	}
++	return int(count), nil
++}
++
++func darwinKernelTranscriptDescriptors(ctx context.Context, pid int) ([]darwinNativeTranscriptDescriptor, error) {
++	// One spare entry makes a full/truncated inventory unambiguously ineligible.
++	buffer := make([]byte, (darwinNativeFDLimit+1)*darwinNativeFDRecordSize)
++	count, err := darwinNativeProcInfo(ctx, 2, pid, 1, 0, buffer)
++	if err != nil {
++		return nil, err
++	}
++	records, err := darwinNativeFDRecords(buffer[:count])
++	if err != nil {
++		return nil, err
++	}
++	result := []darwinNativeTranscriptDescriptor{}
++	for _, record := range records {
++		if record.kind != 1 { // PROX_FDTYPE_VNODE
++			continue
++		}
++		vnode := make([]byte, darwinNativeVnodeInfoSize)
++		count, err := darwinNativeProcInfo(ctx, 3, pid, 2, int(record.number), vnode)
++		if err != nil {
++			return nil, err
++		}
++		value, eligible, err := darwinNativeVnodeDescriptor(record.number, vnode[:count])
++		if err != nil {
++			return nil, err
++		}
++		if eligible {
++			result = append(result, value)
++		}
++	}
++	return result, nil
++}
+diff --git a/remote/relayd/internal/daemon/native_codex_descriptors_darwin_test.go b/remote/relayd/internal/daemon/native_codex_descriptors_darwin_test.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/native_codex_descriptors_darwin_test.go
+@@ -0,0 +1,98 @@
++//go:build darwin
++
++package daemon
++
++import (
++	"context"
++	"encoding/binary"
++	"os"
++	"strings"
++	"syscall"
++	"testing"
++)
++
++func TestDarwinNativeFDRecordBounds(t *testing.T) {
++	row := make([]byte, 8)
++	binary.LittleEndian.PutUint32(row, 12)
++	binary.LittleEndian.PutUint32(row[4:], 1)
++	got, err := darwinNativeFDRecords(row)
++	if err != nil || len(got) != 1 || got[0] != (darwinNativeFD{12, 1}) {
++		t.Fatal("kernel fd fields lost", got, err)
++	}
++	outOfRange := append([]byte(nil), row...)
++	binary.LittleEndian.PutUint32(outOfRange, 4096)
++	for name, data := range map[string][]byte{
++		"empty": nil, "partial": row[:7], "duplicate": append(append([]byte(nil), row...), row...),
++		"out_of_range": outOfRange, "truncated_or_excess": make([]byte, 4097*8),
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := darwinNativeFDRecords(data); err == nil {
++				t.Fatal("incomplete or ambiguous inventory accepted")
++			}
++		})
++	}
++}
++
++func TestDarwinNativeVnodeRecordBounds(t *testing.T) {
++	record := func() []byte {
++		data := make([]byte, 1200)
++		binary.LittleEndian.PutUint32(data[24:], 0x1000014)
++		binary.LittleEndian.PutUint16(data[28:], syscall.S_IFREG|0600)
++		binary.LittleEndian.PutUint16(data[30:], 1)
++		binary.LittleEndian.PutUint64(data[32:], 98765)
++		binary.LittleEndian.PutUint32(data[40:], uint32(os.Getuid()))
++		copy(data[176:], "/private/tmp/fixture sessions/rollout α.jsonl")
++		return data
++	}
++	want := darwinNativeTranscriptDescriptor{12, "/private/tmp/fixture sessions/rollout α.jsonl", 0x1000014, 98765}
++	got, eligible, err := darwinNativeVnodeDescriptor(12, record())
++	if err != nil || !eligible || got != want {
++		t.Fatal("kernel vnode fields lost", got, eligible, err)
++	}
++	for name, change := range map[string]func([]byte) []byte{
++		"short":      func(d []byte) []byte { return d[:1199] },
++		"large":      func(d []byte) []byte { return append(d, 0) },
++		"zero_inode": func(d []byte) []byte { binary.LittleEndian.PutUint64(d[32:], 0); return d },
++		"other_uid":  func(d []byte) []byte { binary.LittleEndian.PutUint32(d[40:], uint32(os.Getuid()+1)); return d },
++		"extra_link": func(d []byte) []byte { binary.LittleEndian.PutUint16(d[30:], 2); return d },
++		"relative_path": func(d []byte) []byte {
++			copy(d[176:], strings.Repeat("\x00", 1024))
++			copy(d[176:], "relative.jsonl")
++			return d
++		},
++		"truncated_path": func(d []byte) []byte { copy(d[176:], strings.Repeat("a", 1024)); return d },
++		"invalid_utf8":   func(d []byte) []byte { d[180] = 255; return d },
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, _, err := darwinNativeVnodeDescriptor(12, change(record())); err == nil {
++				t.Fatal("incomplete or unsafe vnode accepted")
++			}
++		})
++	}
++	for name, change := range map[string]func([]byte){
++		"directory": func(d []byte) { binary.LittleEndian.PutUint16(d[28:], syscall.S_IFDIR|0700) },
++		"unrelated": func(d []byte) {
++			copy(d[176:], strings.Repeat("\x00", 1024))
++			copy(d[176:], "/private/tmp/unrelated.log")
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			data := record()
++			change(data)
++			if _, eligible, err := darwinNativeVnodeDescriptor(12, data); err != nil || eligible {
++				t.Fatal("unrelated vnode accepted", eligible, err)
++			}
++		})
++	}
++}
++
++func TestDarwinNativeKernelDescriptorContextAndIdentity(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := darwinKernelTranscriptDescriptors(ctx, os.Getpid()); err != context.Canceled {
++		t.Fatal("cancellation not respected", err)
++	}
++	if _, err := darwinKernelTranscriptDescriptors(context.Background(), 1); err == nil {
++		t.Fatal("invalid native process accepted")
++	}
++}
+diff --git a/remote/relayd/internal/daemon/host_rotation.go b/remote/relayd/internal/daemon/host_rotation.go
+--- a/remote/relayd/internal/daemon/host_rotation.go
++++ b/remote/relayd/internal/daemon/host_rotation.go
+@@ -637,23 +637,31 @@
+ }
+ 
+ func verifyHostRotationEnrollment(e hostRotationEnrollment) error {
++	_, err := readHostRotationEnrollmentBinding(e)
++	return err
++}
++
++// Return the association from the same worker/provider observation. Source
++// collection uses this observation before and after its bounded file read.
++func readHostRotationEnrollmentBinding(e hostRotationEnrollment) (AgentBindingRecord, error) {
++	var empty AgentBindingRecord
+ 	if !validSessionID.MatchString(e.PaneID) || !validSessionID.MatchString(e.SessionID) ||
+ 		(e.Client != "claude" && e.Client != "codex") || !filepath.IsAbs(e.CWD) || len(e.CWD) > 4096 ||
+ 		e.AgentPID <= 1 || e.AgentStart == 0 || e.WorkerPID <= 1 || e.WorkerStart == 0 || e.NodeBootID == "" {
+-		return errors.New("invalid host rotation enrollment")
++		return empty, errors.New("invalid host rotation enrollment")
+ 	}
+ 	server := NewServer()
+ 	manifest, err := loadManifest(server.manifestPath(e.PaneID))
+ 	if err != nil || manifest.SessionID != e.PaneID || manifest.WorkerPID != e.WorkerPID ||
+ 		manifest.WorkerStartTime != e.WorkerStart || manifest.NodeBootID != e.NodeBootID || validateWorkerIdentity(manifest) != nil {
+-		return errors.New("host rotation worker identity changed")
++		return empty, errors.New("host rotation worker identity changed")
+ 	}
+ 	binding, err := ReadNativeAgentBinding(e.PaneID)
+ 	if err != nil || binding.SessionID != e.SessionID || binding.Producer.Provider != e.Client ||
+ 		binding.Producer.ProcessID != e.AgentPID || binding.Producer.ProcessStart != e.AgentStart {
+-		return errors.New("host rotation provider identity changed")
+-	}
+-	return nil
++		return empty, errors.New("host rotation provider identity changed")
++	}
++	return binding, nil
+ }
+ 
+ // Reject ambiguous envelopes and fields outside this RPC's supported surface.
+diff --git a/remote/relayd/internal/daemon/host_rotation_source.go b/remote/relayd/internal/daemon/host_rotation_source.go
+--- a/remote/relayd/internal/daemon/host_rotation_source.go
++++ b/remote/relayd/internal/daemon/host_rotation_source.go
+@@ -64,11 +64,11 @@
+ 	if boundary.TurnSeq == 0 || boundary.TranscriptMtimeMS <= 0 || boundary.TranscriptBytes <= 0 || ctx.Err() != nil {
+ 		return empty, errors.New("completed transcript boundary unavailable")
+ 	}
+-	if err := verifyHostRotationEnrollment(e); err != nil {
++	before, err := readHostRotationEnrollmentBinding(e)
++	if err != nil {
+ 		return empty, err
+ 	}
+-	before, err := ReadNativeAgentBinding(e.PaneID)
+-	if err != nil || before.Revision == "" || before.SessionID != e.SessionID ||
++	if before.Revision == "" || before.SessionID != e.SessionID ||
+ 		before.Producer.Provider != e.Client || before.Producer.ProcessID != e.AgentPID ||
+ 		before.Producer.ProcessStart != e.AgentStart {
+ 		return empty, errors.New("capsule source binding unavailable")
+@@ -77,13 +77,10 @@
+ 	if err != nil {
+ 		return empty, err
+ 	}
+-	after, err := ReadNativeAgentBinding(e.PaneID)
++	after, err := readHostRotationEnrollmentBinding(e)
+ 	if err != nil || after.Revision != before.Revision || after.TranscriptPath != before.TranscriptPath ||
+ 		after.SessionID != before.SessionID || after.Producer != before.Producer {
+ 		return empty, errors.New("capsule source binding changed")
+-	}
+-	if err := verifyHostRotationEnrollment(e); err != nil {
+-		return empty, err
+ 	}
+ 	if ctx.Err() != nil {
+ 		return empty, ctx.Err()

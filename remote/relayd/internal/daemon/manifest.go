@@ -109,6 +109,9 @@ func validateWorkerIdentity(manifest workerManifest) error {
 	if manifest.WorkerPID <= 1 || manifest.WorkerStartTime == 0 || manifest.NodeBootID == "" {
 		return errors.New("incomplete worker identity")
 	}
+	if legacy, err := validateLegacyWorkerIdentity(manifest); legacy {
+		return err
+	}
 	bootID, err := nodeBootID()
 	if err != nil {
 		return err

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +17,36 @@ func TestClaudeHookSettings(t *testing.T) {
 	for _, event := range []string{"PermissionRequest", "SubagentStart", "SubagentStop", "SessionEnd"} {
 		if !strings.Contains(claudeHookSettings, `"`+event+`"`) {
 			t.Fatalf("Claude hook settings are missing %s", event)
+		}
+	}
+}
+
+func TestHookEventUnavailableDaemonDoesNotFailClaude(t *testing.T) {
+	if os.Getenv("RELAY_EVENT_TEST_HELPER") == "1" {
+		runEvent([]string{
+			"--socket", os.Getenv("RELAY_EVENT_TEST_SOCKET"),
+			"--session", "00000000-0000-4000-8000-000000000000",
+			"--agent", "claude", "--source", os.Getenv("RELAY_EVENT_TEST_SOURCE"),
+		})
+		return
+	}
+	for _, test := range []struct {
+		source  string
+		wantErr bool
+	}{
+		{source: "hook"},
+		{source: "provider-native", wantErr: true},
+	} {
+		command := exec.Command(os.Args[0], "-test.run=^TestHookEventUnavailableDaemonDoesNotFailClaude$")
+		command.Env = append(os.Environ(),
+			"RELAY_EVENT_TEST_HELPER=1",
+			"RELAY_EVENT_TEST_SOCKET="+filepath.Join(t.TempDir(), "missing.sock"),
+			"RELAY_EVENT_TEST_SOURCE="+test.source,
+		)
+		command.Stdin = strings.NewReader(`{"hook_event_name":"Stop"}`)
+		output, err := command.CombinedOutput()
+		if (err != nil) != test.wantErr {
+			t.Fatalf("source %s: error %v, output %q", test.source, err, output)
 		}
 	}
 }

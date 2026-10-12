@@ -1,6 +1,9 @@
 import Foundation
 
 struct PersistedAgentPaneState: Codable, Sendable {
+    var plans: [AgentTaskPlan]? = nil
+    var processRootIdentityVersion: Int? = nil
+    var processRoots: [PersistedAgentProcessRoot]? = nil
     let cursor: UInt64
     let kind: AgentKind
     let phase: AgentPhase
@@ -10,6 +13,12 @@ struct PersistedAgentPaneState: Codable, Sendable {
     let resourceUsage: AgentResourceUsage?
     let progressPercent: Int?
     let pendingApprovals: Int
+
+    var hasCurrentProcessRootState: Bool {
+        processRootIdentityVersion == 1 && processRoots != nil
+    }
+
+    var replayCursor: UInt64 { hasCurrentProcessRootState ? cursor : 0 }
 }
 
 final class AgentStateStore: @unchecked Sendable {
@@ -29,9 +38,8 @@ final class AgentStateStore: @unchecked Sendable {
     }
 
     init(directory: URL? = nil) {
-        self.directory = directory ?? FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        )[0].appendingPathComponent("Relay/AgentState", isDirectory: true)
+        self.directory = directory ?? RelayStateProfile.applicationSupportRoot
+            .appendingPathComponent("Relay/AgentState", isDirectory: true)
         SecureFiles.createPrivateDirectory(at: self.directory)
     }
 
@@ -119,6 +127,9 @@ extension PersistedAgentPaneState {
             return copy
         }
         return PersistedAgentPaneState(
+            plans: AgentTaskPlan.bounded(plans ?? []),
+            processRootIdentityVersion: (processRoots?.count ?? 0) <= 1_024 ? processRootIdentityVersion : nil,
+            processRoots: (processRoots?.count ?? 0) <= 1_024 ? processRoots : nil,
             cursor: cursor,
             kind: kind,
             phase: phase,

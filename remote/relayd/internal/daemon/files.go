@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -17,6 +19,82 @@ import (
 	"strings"
 	"time"
 )
+
+// Search is requested by the user, not a persistent recursive watcher. Stream
+// Git's ignore-aware paths with explicit time, scan and result budgets.
+func FindEditorFiles(path, query string) ([]FileEntry, error) {
+	page, err := SearchEditorFiles(path, query, true)
+	return page.Entries, err
+}
+
+type FileSearchPage struct {
+	Entries   []FileEntry `json:"entries"`
+	Truncated bool        `json:"truncated"`
+	Warning   string      `json:"warning,omitempty"`
+}
+
+func SearchEditorFiles(path, query string, includeUntracked bool) (FileSearchPage, error) {
+	page := FileSearchPage{Entries: make([]FileEntry, 0)}
+	root, err := resolveUserPath(path, true)
+	if err != nil {
+		return page, err
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return page, nil
+	}
+	// Read the index before considering untracked paths. Combining --cached
+	// and --others lets a slow untracked directory delay all tracked results.
+	passes := [][]string{{"--cached"}}
+	if includeUntracked {
+		passes = append(passes, []string{"--others", "--exclude-standard"})
+	}
+	seen := make(map[string]bool)
+	for _, pass := range passes {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		args := append([]string{"-C", root, "ls-files", "-z"}, pass...)
+		cmd := exec.CommandContext(ctx, "git", args...)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			cancel()
+			return page, err
+		}
+		if err := cmd.Start(); err != nil {
+			cancel()
+			return page, err
+		}
+		reader := bufio.NewReaderSize(stdout, 65536)
+		bounded := false
+		for scanned := 0; scanned < 100000; scanned++ {
+			name, readErr := reader.ReadString(0)
+			if readErr != nil {
+				break
+			}
+			name = strings.TrimSuffix(name, "\x00")
+			if !seen[name] && strings.Contains(strings.ToLower(name), query) {
+				seen[name] = true
+				page.Entries = append(page.Entries, FileEntry{Name: name, Path: filepath.Join(root, name)})
+			}
+			if len(page.Entries) == 200 || scanned == 99999 {
+				bounded = true
+				cancel()
+				break
+			}
+		}
+		waitErr := cmd.Wait()
+		timedOut := ctx.Err() == context.DeadlineExceeded
+		cancel()
+		if bounded || timedOut {
+			page.Truncated = true
+			page.Warning = "Search limit reached; showing partial results. Narrow the search or browse a folder."
+			break
+		}
+		if waitErr != nil {
+			return page, errors.New("Git file search failed; check repository access or browse folders directly")
+		}
+	}
+	return page, nil
+}
 
 const maxEditorFileBytes = 16 << 20
 const maxImportedFileBytes = 64 << 20
@@ -39,6 +117,7 @@ type FileDocument struct {
 	ContentBase64  string `json:"content_base64"`
 	ModificationNS int64  `json:"modification_ns"`
 	Mode           uint32 `json:"mode"`
+	Directory      bool   `json:"directory,omitempty"`
 }
 
 type FileDiff struct {
@@ -49,15 +128,34 @@ type FileDiff struct {
 
 func ResolveWorkspace(parentSessionID, requested string) (WorkspaceInfo, error) {
 	path := strings.TrimSpace(requested)
-	if path == "" && validSessionID.MatchString(parentSessionID) {
-		manifestPath := NewServer().manifestPath(parentSessionID)
-		if parent, err := loadManifest(manifestPath); err == nil && validateWorkerIdentity(parent) == nil {
-			if directory, cwdErr := processWorkingDirectory(parent.ShellPID); cwdErr == nil {
-				path = directory
-			} else {
-				path = parent.WorkingDirectory
-			}
+	if path == "" && parentSessionID != "" {
+		if !validSessionID.MatchString(parentSessionID) {
+			return WorkspaceInfo{}, errors.New("valid parent session required")
 		}
+		manifestPath := NewServer().manifestPath(parentSessionID)
+		parent, err := loadManifest(manifestPath)
+		if err != nil || parent.State == "exited" || parent.ShellPID <= 1 || validateWorkerIdentity(parent) != nil {
+			return WorkspaceInfo{}, errors.New("parent session is unavailable")
+		}
+		start, err := processStartTime(parent.ShellPID)
+		if err != nil {
+			return WorkspaceInfo{}, errors.New("parent shell is unavailable")
+		}
+		// Confirm the recorded shell still belongs to this exact live worker.
+		// Looking up a stale shell PID alone could observe a reused process.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		output, parentErr := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(parent.ShellPID), "-o", "ppid=").Output()
+		cancel()
+		ppid, parseErr := strconv.Atoi(strings.TrimSpace(string(output)))
+		if parentErr != nil || parseErr != nil || len(output) > 256 || ppid != parent.WorkerPID {
+			return WorkspaceInfo{}, errors.New("parent shell identity changed")
+		}
+		directory, cwdErr := processWorkingDirectory(parent.ShellPID)
+		after, identityErr := processStartTime(parent.ShellPID)
+		if cwdErr != nil || identityErr != nil || after != start || validateWorkerIdentity(parent) != nil {
+			return WorkspaceInfo{}, errors.New("parent working directory is unavailable")
+		}
+		path = directory
 	}
 	resolved, err := resolveUserPath(path, true)
 	if err != nil {
@@ -101,6 +199,13 @@ func ReadEditorFile(path string) (FileDocument, error) {
 	resolved, err := resolveUserPath(path, false)
 	if err != nil {
 		return FileDocument{}, err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return FileDocument{}, err
+	}
+	if info.IsDir() {
+		return FileDocument{Path: resolved, Directory: true, Mode: uint32(info.Mode().Perm())}, nil
 	}
 	state, err := readEditorFileState(resolved)
 	if err != nil {
@@ -237,18 +342,37 @@ func ImportFile(directory, name string, reader io.Reader) (FileEntry, error) {
 		return FileEntry{}, errors.New("import filename is invalid")
 	}
 
+	// Keep incomplete bytes out of the requested destination. A successful
+	// hard link publishes the fully flushed file without overwriting a collision.
+	staging, err := os.CreateTemp(resolvedDirectory, ".relay-import-")
+	if err != nil {
+		return FileEntry{}, err
+	}
+	defer os.Remove(staging.Name())
+	defer staging.Close()
+	written, err := io.Copy(staging, io.LimitReader(reader, maxImportedFileBytes+1))
+	if err != nil {
+		return FileEntry{}, err
+	}
+	if written > maxImportedFileBytes {
+		return FileEntry{}, errors.New("import file exceeds 64 MiB")
+	}
+	if err := staging.Sync(); err != nil {
+		return FileEntry{}, err
+	}
+	if err := staging.Close(); err != nil {
+		return FileEntry{}, err
+	}
 	extension := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, extension)
 	var destination string
-	var destinationFile *os.File
 	for attempt := 0; attempt < 1000; attempt++ {
 		candidateName := name
 		if attempt > 0 {
 			candidateName = stem + "-" + strconv.Itoa(attempt+1) + extension
 		}
 		candidate := filepath.Join(resolvedDirectory, candidateName)
-		destinationFile, err = os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
+		if err = os.Link(staging.Name(), candidate); err == nil {
 			destination = candidate
 			break
 		}
@@ -256,35 +380,22 @@ func ImportFile(directory, name string, reader io.Reader) (FileEntry, error) {
 			return FileEntry{}, err
 		}
 	}
-	if destinationFile == nil {
+	if destination == "" {
 		return FileEntry{}, errors.New("could not choose an unused import filename")
 	}
-	keep := false
-	defer func() {
-		_ = destinationFile.Close()
-		if !keep {
-			_ = os.Remove(destination)
-		}
-	}()
-
-	written, err := io.Copy(destinationFile, io.LimitReader(reader, maxImportedFileBytes+1))
+	parent, err := os.Open(resolvedDirectory)
 	if err != nil {
 		return FileEntry{}, err
 	}
-	if written > maxImportedFileBytes {
-		return FileEntry{}, errors.New("import file exceeds 64 MiB")
-	}
-	if err := destinationFile.Sync(); err != nil {
-		return FileEntry{}, err
-	}
-	if err := destinationFile.Close(); err != nil {
+	err = parent.Sync()
+	parent.Close()
+	if err != nil {
 		return FileEntry{}, err
 	}
 	info, err := os.Stat(destination)
 	if err != nil {
 		return FileEntry{}, err
 	}
-	keep = true
 	return FileEntry{
 		Name: filepath.Base(destination), Path: destination, Size: info.Size(),
 		ModificationNS: info.ModTime().UnixNano(),

@@ -68,7 +68,8 @@ enum ProcessCapture {
         errors: Pipe,
         input: Data? = nil,
         timeout: TimeInterval = 30,
-        maximumBytesPerStream: Int = 64 << 20
+        maximumBytesPerStream: Int = 64 << 20,
+        shouldCancel: (@Sendable () -> Bool)? = nil
     ) throws -> CapturedProcessOutput {
         precondition(maximumBytesPerStream > 0)
         let capturedOutput = LockedData()
@@ -76,6 +77,19 @@ enum ProcessCapture {
         let failure = CaptureFailure()
         let readers = DispatchGroup()
         try process.run()
+        let cancellationTimer = shouldCancel.map { check in
+            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            timer.schedule(deadline: .now(), repeating: .milliseconds(100))
+            timer.setEventHandler {
+                if check(), process.isRunning {
+                    failure.record(.readFailed("Operation cancelled"))
+                    process.terminate()
+                }
+            }
+            timer.resume()
+            return timer
+        }
+        defer { cancellationTimer?.cancel() }
         readers.enter()
         DispatchQueue.global(qos: .utility).async {
             read(

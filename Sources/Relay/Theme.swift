@@ -1,27 +1,86 @@
+import AppKit
 import SwiftUI
 
 enum RelayTheme {
     // The application chrome is deliberately independent from the terminal
     // palette. A terminal theme should not recolor navigation and controls.
-    static let canvas = Color(hex: 0x212121)
-    static let sidebar = Color(hex: 0x171717)
-    static let surface = Color(hex: 0x2F2F2F)
-    static let elevated = Color(hex: 0x353535)
-    static let hover = Color(hex: 0x2A2A2A)
-    static let line = Color(hex: 0x3D3D3D)
-    static let accent = Color(hex: 0x2FC6A0)
-    static let accentDim = Color(hex: 0x173D35)
-    // Retain the old names while view code migrates to semantic tokens.
+    // App-wide template. Edit these values to restyle every Relay surface.
+    static let colorScheme: ColorScheme = .dark
+    static let appearanceName: NSAppearance.Name = .darkAqua
+    static let canvas = Color(hex: 0x171717)
+    static let sidebar = Color(hex: 0x1B1B1B)
+    static let surface = Color(hex: 0x222222)
+    static let elevated = Color(hex: 0x2A2A2A)
+    static let text = Color(hex: 0xEBEBEB)
+    static let textMuted = Color(hex: 0xAAAAAA)
+    static let textFaint = Color(hex: 0x969696)
+    static let stroke = text.opacity(0.07)
+    static let line = stroke
+    static let wash = text.opacity(0.08)
+    static let bubble = text.opacity(0.10)
+    static let hover = text.opacity(0.15)
+    static let codeFill = text.opacity(0.05)
+    static let composerFill = text.opacity(0.03)
+    static let accent = Color(hex: 0x8DB7EB)
+    static let accentDim = surface
     static let blue = accent
     static let blueDim = accentDim
-    static let mint = Color(hex: 0x66CDAA)
-    static let coral = Color(hex: 0xE68B82)
-    static let red = Color(hex: 0xD86F68)
-    static let text = Color(hex: 0xECECEC)
-    static let textMuted = Color(hex: 0xB4B4B4)
-    // Small metadata text uses this token extensively. #9D9D9D remains above
-    // 4.5:1 even on the elevated #353535 surface.
-    static let textFaint = Color(hex: 0x9D9D9D)
+    static let mint = accent
+    static let coral = Color(hex: 0xDDA398)
+    static let red = Color(hex: 0xDE827B)
+
+    static let typeScale: CGFloat = 1
+    static let spacingScale: CGFloat = 1
+    static let cornerScale: CGFloat = 1
+    static let contentWidth: CGFloat = 760
+    static let gutter: CGFloat = 20
+    static let controlSize: ControlSize = .small
+    static func font(size: CGFloat, weight: Font.Weight = .regular,
+                     design: Font.Design = .default) -> Font {
+        .system(size: size * typeScale, weight: weight, design: design)
+    }
+    static func font(_ style: Font.TextStyle, design: Font.Design = .default) -> Font {
+        let size: CGFloat
+        switch style {
+        case .largeTitle: size = 26
+        case .title: size = 22
+        case .title2: size = 17
+        case .title3: size = 15
+        case .caption, .caption2: size = 11
+        case .footnote: size = 12
+        default: size = 13
+        }
+        return font(size: size, weight: style == .headline ? .semibold : .regular, design: design)
+    }
+
+    @MainActor static func alert() -> NSAlert {
+        let alert = NSAlert(); configureAppearance(alert.window); return alert
+    }
+    @MainActor static func alert(error: Error) -> NSAlert {
+        let alert = NSAlert(error: error); configureAppearance(alert.window); return alert
+    }
+    @MainActor static func openPanel() -> NSOpenPanel {
+        let panel = NSOpenPanel(); configureAppearance(panel); return panel
+    }
+    @MainActor static func savePanel() -> NSSavePanel {
+        let panel = NSSavePanel(); configureAppearance(panel); return panel
+    }
+    static func spacing(_ value: CGFloat) -> CGFloat { value * spacingScale }
+    static func cornerRadius(_ value: CGFloat) -> CGFloat { value * cornerScale }
+    static let body = font(size: 13)
+    static let label = font(size: 12, weight: .medium)
+    static let caption = font(size: 11)
+    static let code = font(size: 12, design: .monospaced)
+
+    // Visual configuration only. Sheets and panels retain native roles, focus,
+    // modal behavior and traffic-light policy.
+    @MainActor static func configureAppearance(_ window: NSWindow) {
+        let background = NSColor(canvas)
+        if window.backgroundColor != background { window.backgroundColor = background }
+        if window.appearance?.name != appearanceName { window.appearance = NSAppearance(named: appearanceName) }
+        if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
+    }
+
 }
 
 extension Color {
@@ -33,5 +92,88 @@ extension Color {
             blue: Double(hex & 0xff) / 255,
             opacity: alpha
         )
+    }
+}
+
+/// Use on every presentation root; descendants and sheets inherit the template.
+struct RelaySurfaceStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(RelayTheme.body)
+            .foregroundStyle(RelayTheme.text)
+            .tint(RelayTheme.accent)
+            .controlSize(RelayTheme.controlSize)
+            .preferredColorScheme(RelayTheme.colorScheme)
+            .background(RelayTheme.canvas)
+            .background(RelaySurfaceAppearanceMarker().frame(width: 0, height: 0))
+    }
+}
+
+extension View {
+    func relaySurface() -> some View { modifier(RelaySurfaceStyle()) }
+}
+
+private struct RelaySurfaceAppearanceMarker: NSViewRepresentable {
+    final class Marker: NSView {
+        private weak var configuredWindow: NSWindow?
+        private var scheduled = false
+        func schedule() {
+            guard window != nil, configuredWindow !== window, !scheduled else { return }
+            scheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.scheduled = false
+                guard let window = self.window, self.configuredWindow !== window else { return }
+                RelayTheme.configureAppearance(window)
+                self.configuredWindow = window
+            }
+        }
+        override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); schedule() }
+    }
+    func makeNSView(context: Context) -> NSView { Marker(frame: .zero) }
+    func updateNSView(_ view: NSView, context: Context) { (view as? Marker)?.schedule() }
+}
+
+/// Solid primary action, matching the composer submit treatment.
+struct RelayPrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+    @Environment(\.colorScheme) private var scheme
+    func makeBody(configuration: Configuration) -> some View {
+        let ink: Color = scheme == .dark ? .white : .black
+        let paper: Color = scheme == .dark ? .black : .white
+        configuration.label
+            .font(RelayTheme.font(size: 12, weight: .medium))
+            .padding(.horizontal, RelayTheme.spacing(10)).frame(height: 26)
+            .foregroundStyle(enabled ? paper : paper.opacity(0.6))
+            .background(ink.opacity(enabled ? (configuration.isPressed ? 0.85 : 1) : 0.28),
+                        in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)))
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+/// Quiet text button used for secondary actions such as Copy or Show more.
+struct RelayQuietButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(RelayTheme.caption)
+            .foregroundStyle(configuration.isPressed ? Color.primary : RelayTheme.textMuted)
+            .padding(.horizontal, RelayTheme.spacing(6)).frame(height: 22)
+            .background(configuration.isPressed ? RelayTheme.wash : .clear,
+                        in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(5)))
+            .contentShape(Rectangle())
+    }
+}
+
+
+struct RelaySecondaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.font(RelayTheme.label)
+            .padding(.horizontal, RelayTheme.spacing(10)).frame(minHeight: 26)
+            .foregroundStyle(RelayTheme.text.opacity(enabled ? 1 : 0.45))
+            .background(configuration.isPressed ? RelayTheme.wash : RelayTheme.surface,
+                        in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)))
+            .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)).strokeBorder(RelayTheme.stroke))
     }
 }

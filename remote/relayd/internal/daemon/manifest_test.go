@@ -99,6 +99,19 @@ func TestEnsureWorkerPreservesUnreadableRecoveryMetadata(t *testing.T) {
 	}
 }
 
+func TestRestoredPaneNeverStartsReplacementWorker(t *testing.T) {
+	server := &Server{stateDir: t.TempDir(), executable: "/must-not-start-a-replacement"}
+	const sessionID = "restored-pane"
+	if _, err := server.ensureWorker(protocol.HelloPayload{
+		SessionID: sessionID, RequireExistingWorker: true,
+	}); err == nil {
+		t.Fatal("missing saved pane must not start a replacement")
+	}
+	if _, err := os.Stat(server.manifestPath(sessionID)); !os.IsNotExist(err) {
+		t.Fatalf("missing pane acquired a replacement manifest: %v", err)
+	}
+}
+
 func TestEnsureWorkerPreservesOwnerAfterProbeTimeout(t *testing.T) {
 	dir, err := os.MkdirTemp("", "relay-probe-")
 	if err != nil {

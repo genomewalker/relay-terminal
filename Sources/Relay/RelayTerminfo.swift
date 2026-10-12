@@ -216,7 +216,7 @@ enum RelayTerminfo {
     }
 
     private static func bundledEntryURL() -> URL? {
-        Bundle.module.url(
+        RelayResources.bundle?.url(
             forResource: name,
             withExtension: nil,
             subdirectory: "Terminfo/78"

@@ -1,0 +1,130 @@
+diff --git a/codex-rs/codex-mcp/src/runtime/status.rs b/codex-rs/codex-mcp/src/runtime/status.rs
+index 1cab528..820ff04 100644
+--- a/codex-rs/codex-mcp/src/runtime/status.rs
++++ b/codex-rs/codex-mcp/src/runtime/status.rs
+@@ -12,6 +12,15 @@ use crate::mcp::compute_auth_statuses;
+ use crate::mcp::effective_mcp_servers;
+ 
+ impl McpRuntime {
++    /// Read connection health without tool discovery, model catalog
++    /// construction, or starting dormant clients.
++    pub async fn published_connection_statuses(
++        &self,
++    ) -> std::collections::HashMap<String, codex_protocol::mcp::McpServerConnectionStatus> {
++        let current = self.current.load_full();
++        current.connections.connection_statuses().await
++    }
++
+     /// Reuses the selected connection and catalog without starting unrelated servers.
+     /// Configuration and metadata belong to the same captured runtime publication.
+     pub async fn server_status_snapshot(
+diff --git a/codex-rs/core/src/session/mcp_prewarm.rs b/codex-rs/core/src/session/mcp_prewarm.rs
+index 4356991..9e07c3d 100644
+--- a/codex-rs/core/src/session/mcp_prewarm.rs
++++ b/codex-rs/core/src/session/mcp_prewarm.rs
+@@ -4,6 +4,18 @@
+ //! newest thread state; exact model steps remain the correctness path.
+ 
+ use super::*;
++use codex_protocol::mcp::McpServerConnectionStatus;
++use std::time::Duration;
++
++fn relay_mcp_recovery_needed(statuses: impl Iterator<Item = McpServerConnectionStatus>) -> bool {
++    statuses
++        .into_iter()
++        .any(|status| status == McpServerConnectionStatus::Failed)
++}
++
++fn relay_mcp_retry_delay(previous: Duration) -> Duration {
++    previous.saturating_mul(2).min(Duration::from_secs(300))
++}
+ 
+ impl Session {
+     pub(crate) fn request_mcp_runtime_refresh(&self) {
+@@ -25,8 +37,11 @@ impl Session {
+     ) {
+         let session = Arc::downgrade(self);
+         let shutdown = self.mcp_prewarm_shutdown.clone();
++        let relay_managed = std::env::var("RELAY_NATIVE_MESSAGES").as_deref() == Ok("1");
+         let worker = self.services.runtime_handle.spawn(async move {
++            let mut recovery_delay = Duration::from_secs(30);
+             loop {
++                let mut recovery_check = false;
+                 let auth_changed = tokio::select! {
+                     biased;
+                     _ = shutdown.cancelled() => break,
+@@ -42,10 +57,31 @@ impl Session {
+                         }
+                         true
+                     },
++                    _ = tokio::time::sleep(recovery_delay), if relay_managed => {
++                        recovery_check = true;
++                        false
++                    },
+                 };
+                 let Some(session) = session.upgrade() else {
+                     break;
+                 };
++                if recovery_check {
++                    let statuses = session
++                        .services
++                        .mcp_runtime
++                        .published_connection_statuses()
++                        .await;
++                    if !relay_mcp_recovery_needed(statuses.values().copied()) {
++                        recovery_delay = Duration::from_secs(30);
++                        continue;
++                    }
++                    // Reconcile the latest policy. The manager reuses healthy
++                    // exact clients and replaces failed clients; do not force
++                    // reconnect all servers or submit a model turn.
++                    session.mark_mcp_runtime_dirty();
++                    recovery_delay = relay_mcp_retry_delay(recovery_delay);
++                    tracing::info!("Relay is reconciling failed MCP connections");
++                }
+                 if auth_changed {
+                     session.mark_mcp_runtime_dirty();
+                 }
+@@ -80,3 +116,42 @@ impl Session {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod relay_recovery_tests {
++    use super::*;
++
++    #[test]
++    fn retries_only_failed_connections() {
++        use McpServerConnectionStatus::*;
++        assert!(relay_mcp_recovery_needed([Connected, Failed].into_iter()));
++        assert!(!relay_mcp_recovery_needed(
++            [
++                NotStarted,
++                Starting,
++                Connected,
++                AuthenticationRequired,
++                Cancelled,
++                Disabled
++            ]
++            .into_iter()
++        ));
++        assert!(!relay_mcp_recovery_needed(std::iter::empty()));
++    }
++
++    #[test]
++    fn bounds_recovery_backoff() {
++        assert_eq!(
++            relay_mcp_retry_delay(Duration::from_secs(30)),
++            Duration::from_secs(60)
++        );
++        assert_eq!(
++            relay_mcp_retry_delay(Duration::from_secs(240)),
++            Duration::from_secs(300)
++        );
++        assert_eq!(
++            relay_mcp_retry_delay(Duration::from_secs(300)),
++            Duration::from_secs(300)
++        );
++    }
++}

@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-target_host="${1:?usage: scripts/install-relayd.sh <ssh-host>}"
+target_host="${1:?usage: scripts/install-relayd.sh <ssh-host> [--no-restart]}"
+upgrade_supervisor=1
+case "${2:-}" in
+    "") ;;
+    --no-restart) upgrade_supervisor=0 ;;
+    *) echo "usage: scripts/install-relayd.sh <ssh-host> [--no-restart]" >&2; exit 2 ;;
+esac
+if [[ $# -gt 2 ]]; then
+    echo "usage: scripts/install-relayd.sh <ssh-host> [--no-restart]" >&2
+    exit 2
+fi
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
-relayd_version="${RELAYD_VERSION:-${RELAY_VERSION:-0.5.2}}"
+relayd_version="${RELAYD_VERSION:-${RELAY_VERSION:-0.5.3}}"
 remote_arch="$(ssh "$target_host" uname -m)"
 
 case "$remote_arch" in
@@ -28,12 +38,14 @@ upload_token="$(date +%s)-$$"
 remote_upload=".local/share/relay/relayd-upload-$upload_token"
 ssh "$target_host" 'mkdir -p ~/.local/bin ~/.local/share/relay/bin ~/.local/share/relay/shims'
 scp "$build_dir/relayd" "$target_host:~/$remote_upload"
-ssh "$target_host" sh -s -- "$go_arch" "$remote_upload" "$payload_hash" <<'REMOTE_INSTALL'
+ssh "$target_host" sh -s -- "$go_arch" "$remote_upload" "$payload_hash" "$upgrade_supervisor" "$upload_token" <<'REMOTE_INSTALL'
 set -eu
 umask 077
 architecture="$1"
 upload="$HOME/$2"
 expected_hash="$3"
+upgrade_supervisor="$4"
+upload_token="$5"
 bin_dir="$HOME/.local/bin"
 relay_root="$HOME/.local/share/relay"
 payload_dir="$relay_root/bin"
@@ -68,6 +80,16 @@ if [ "$actual_hash" != "$expected_hash" ]; then
     exit 1
 fi
 chmod 700 "$upload"
+if [ -f "$payload_dir/relayd-linux-$architecture" ]; then
+    # Keep the prior executable recoverable even when the supervisor handoff
+    # refuses because jobs are active. Never overwrite a prior backup.
+    previous_backup="$payload_dir/relayd-linux-$architecture.before-$upload_token"
+    if [ -e "$previous_backup" ]; then
+        echo "previous payload backup already exists; installation deferred" >&2
+        exit 1
+    fi
+    cp -p "$payload_dir/relayd-linux-$architecture" "$previous_backup"
+fi
 mv -f "$upload" "$payload_dir/relayd-linux-$architecture"
 temporary_launcher="$(mktemp "$bin_dir/.relayd-launcher.XXXXXX")"
 cat > "$temporary_launcher" <<'RELAY_LAUNCHER'
@@ -119,8 +141,11 @@ else
     echo "left existing rcode command unchanged" >&2
 fi
 "$bin_dir/relayd" --version
-if ! "$bin_dir/relayd" upgrade-supervisor --force; then
-    sleep 1
-    "$bin_dir/relayd" upgrade-supervisor
+if [ "$upgrade_supervisor" = 0 ]; then
+    echo "Installed helper; running supervisor and workers left unchanged."
+elif ! "$bin_dir/relayd" upgrade-supervisor --force; then
+    echo "Helper staged, but supervisor upgrade was refused; running jobs and workers were retained." >&2
+    echo "After the blocker is resolved, run: ~/.local/bin/relayd upgrade-supervisor --force" >&2
+    exit 1
 fi
 REMOTE_INSTALL

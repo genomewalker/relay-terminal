@@ -1,0 +1,83 @@
+diff --git a/codex-rs/tui/src/app/rotation.rs b/codex-rs/tui/src/app/rotation.rs
+--- a/codex-rs/tui/src/app/rotation.rs
++++ b/codex-rs/tui/src/app/rotation.rs
+@@ -234,6 +234,9 @@
+         // No queued reset may later erase the target's freshly installed history.
+         self.reset_for_thread_switch(tui)?;
+         self.store_active_thread_receiver().await;
++        // The source receiver is retained in its channel. Release its foreground
++        // identity so the canonical activation path can take the target receiver.
++        self.clear_active_thread().await;
+ 
+         let (event_tx, mut receiver) = mpsc::unbounded_channel();
+         let staged_sender = AppEventSender::new(event_tx);
+diff --git a/codex-rs/tui/src/app/tests/rotation.rs b/codex-rs/tui/src/app/tests/rotation.rs
+--- a/codex-rs/tui/src/app/tests/rotation.rs
++++ b/codex-rs/tui/src/app/tests/rotation.rs
+@@ -133,3 +133,52 @@
+     );
+     assert!(!app.frontend_rotation_ready(&events, id, "completed"));
+ }
++
++#[tokio::test]
++async fn context_rotation_source_detach_retains_channel_and_activates_target() -> Result<()> {
++    let (mut app, _events, _ops) = make_test_app_with_channels().await;
++    let source_id = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(source_id, app.config.cwd.to_path_buf()),
++        Vec::new(),
++    )
++    .await?;
++    assert_eq!(app.active_thread_id, Some(source_id));
++    assert!(app.active_thread_rx.is_some());
++
++    app.store_active_thread_receiver().await;
++    app.clear_active_thread().await;
++
++    assert_eq!(app.active_thread_id, None);
++    assert!(app.active_thread_rx.is_none());
++    let source_channel = app.thread_event_channels.get(&source_id).unwrap();
++    assert!(source_channel.receiver.is_some());
++    assert!(!source_channel.store.lock().await.active);
++
++    let target_id = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(target_id, app.config.cwd.to_path_buf()),
++        Vec::new(),
++    )
++    .await?;
++    assert_eq!(
++        (
++            app.primary_thread_id,
++            app.active_thread_id,
++            app.chat_widget.thread_id()
++        ),
++        (Some(target_id), Some(target_id), Some(target_id))
++    );
++    assert!(
++        app.active_thread_rx
++            .as_ref()
++            .is_some_and(|receiver| !receiver.is_closed())
++    );
++    let source_channel = app.thread_event_channels.get(&source_id).unwrap();
++    assert!(source_channel.receiver.is_some());
++    assert!(!source_channel.store.lock().await.active);
++    let target_channel = app.thread_event_channels.get(&target_id).unwrap();
++    assert!(target_channel.receiver.is_none());
++    assert!(target_channel.store.lock().await.active);
++    Ok(())
++}
+diff --git a/codex-rs/tui/src/app/tests/realtime_requests.rs b/codex-rs/tui/src/app/tests/realtime_requests.rs
+--- a/codex-rs/tui/src/app/tests/realtime_requests.rs
++++ b/codex-rs/tui/src/app/tests/realtime_requests.rs
+@@ -28,6 +28,10 @@
+         " ".repeat(cwd.len().saturating_sub(placeholder.len()))
+     );
+     rendered
++        .replace(
++            &format!("(v{})", crate::version::CODEX_CLI_VERSION),
++            "(v0.0.0)",
++        )
+         .replace(&cwd, &padded_placeholder)
+         .lines()
+         .map(str::trim_end)

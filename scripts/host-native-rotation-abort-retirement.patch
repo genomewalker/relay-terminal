@@ -1,0 +1,1481 @@
+--- a/remote/relayd/internal/daemon/host_rotation.go
++++ b/remote/relayd/internal/daemon/host_rotation.go
+@@ -54,11 +54,12 @@
+ 	UpdatedAt        time.Time              `json:"updated_at"`
+ 	// Evaluation never grants permission to submit input. These capabilities
+ 	// are reported separately until native clear/restore and refresh exist.
+-	Lifecycle           string                        `json:"lifecycle"`
+-	RefreshCapability   string                        `json:"refresh_capability"`
+-	Preparation         *hostRotationPreparation      `json:"preparation,omitempty"`
+-	NativeTransition    *hostRotationNativeTransition `json:"native_transition,omitempty"`
+-	NativeRecoveryState string                        `json:"native_recovery_state,omitempty"`
++	Lifecycle             string                             `json:"lifecycle"`
++	RefreshCapability     string                             `json:"refresh_capability"`
++	Preparation           *hostRotationPreparation           `json:"preparation,omitempty"`
++	NativeTransition      *hostRotationNativeTransition      `json:"native_transition,omitempty"`
++	NativeAbortTransition *hostRotationNativeAbortTransition `json:"native_abort_transition,omitempty"`
++	NativeRecoveryState   string                             `json:"native_recovery_state,omitempty"`
+ }
+ 
+ type hostRotationRequest struct {
+@@ -134,7 +135,9 @@
+ 	if data, err := privatePromptEditorBytes(path, 262144); err == nil {
+ 		var saved hostRotationRecord
+ 		if json.Unmarshal(data, &saved) == nil && saved.Version == 1 && validPromptEditorID(saved.OperationID) &&
+-			(saved.NativeTransition == nil || saved.NativeTransition.valid()) {
++			(saved.NativeTransition == nil || saved.NativeTransition.valid()) &&
++			(saved.NativeAbortTransition == nil || saved.NativeAbortTransition.valid()) &&
++			!(saved.NativeTransition != nil && !saved.NativeTransition.Finalized && saved.NativeAbortTransition != nil && !saved.NativeAbortTransition.Finalized) {
+ 			s.record = saved
+ 			s.record.Generation++
+ 			s.record.NextEvaluationMS = 0
+@@ -145,7 +148,11 @@
+ 			s.record.RefreshCapability = "unverified"
+ 			if saved.Enabled {
+ 				s.record.State = "revalidating"
+-				if saved.NativeTransition != nil && !saved.NativeTransition.Finalized {
++				if saved.NativeAbortTransition != nil && saved.NativeAbortTransition.Finalized &&
++					(saved.State == "native_refused" || saved.State == "awaiting_completed_turn") {
++					s.record.State = saved.State
++				}
++				if saved.NativeTransition != nil && !saved.NativeTransition.Finalized || saved.NativeAbortTransition != nil && !saved.NativeAbortTransition.Finalized {
+ 					s.record.State = "native_finalization_pending"
+ 				}
+ 			}
+@@ -156,6 +163,7 @@
+ 		s.record.State = "saved_state_unavailable"
+ 	}
+ 	if s.record.Enabled || s.record.NativeTransition != nil && !s.record.NativeTransition.Finalized ||
++		s.record.NativeAbortTransition != nil && !s.record.NativeAbortTransition.Finalized ||
+ 		workerDirectory != "" && s.record.Enrollment.Client == "codex" {
+ 		s.notify()
+ 	}
+@@ -191,6 +199,10 @@
+ 	if r.NativeTransition != nil {
+ 		copied := *r.NativeTransition
+ 		r.NativeTransition = &copied
++	}
++	if r.NativeAbortTransition != nil {
++		copied := *r.NativeAbortTransition
++		r.NativeAbortTransition = &copied
+ 	}
+ 	return r
+ }
+@@ -354,7 +366,8 @@
+ 		}
+ 		return nil
+ 	}
+-	if req.Operation == "enroll" && s.record.NativeTransition != nil && !s.record.NativeTransition.Finalized {
++	if req.Operation == "enroll" && (s.record.NativeTransition != nil && !s.record.NativeTransition.Finalized ||
++		s.record.NativeAbortTransition != nil && !s.record.NativeAbortTransition.Finalized) {
+ 		return errors.New("native finalization is pending")
+ 	}
+ 	if req.Operation == "enroll" && s.nativeWorkerDirectory != "" {
+@@ -377,6 +390,11 @@
+ 	s.record.Enabled = req.Operation == "enroll"
+ 	if s.record.Enabled {
+ 		s.record.Enrollment = enrollment
++		// A new explicit enrollment may retry with fresh admission. Historical
++		// abort and finalization receipts remain in the immutable host journal.
++		if s.record.NativeAbortTransition != nil && s.record.NativeAbortTransition.Finalized {
++			s.record.NativeAbortTransition = nil
++		}
+ 		s.record.State = "pending_evaluation"
+ 	} else {
+ 		s.record.State = "disabled"
+@@ -422,7 +440,8 @@
+ 		timerC = nil
+ 		if s.recoverNativeTransition() {
+ 			pending := s.snapshot()
+-			if pending.NativeTransition != nil && !pending.NativeTransition.Finalized && s.finalizeNative != nil {
++			if (pending.NativeTransition != nil && !pending.NativeTransition.Finalized ||
++				pending.NativeAbortTransition != nil && !pending.NativeAbortTransition.Finalized) && s.finalizeNative != nil {
+ 				timer.Reset(5 * time.Second)
+ 				timerC = timer.C
+ 			}
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_native_abort_finalization.go
+@@ -0,0 +1,344 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++
++	"golang.org/x/sys/unix"
++)
++
++// A refusal completes on the original source, without a destination enrollment.
++// Pending cleanup survives restart and remains gated while supervision is disabled.
++type hostRotationNativeAbortTransition struct {
++	Version          int                            `json:"v"`
++	Source           hostRotationEnrollment         `json:"source"`
++	TurnID           string                         `json:"turn_id"`
++	TurnSeq          uint64                         `json:"turn_seq"`
++	RequestSHA256    string                         `json:"request_sha256"`
++	RetirementSHA256 string                         `json:"retirement_sha256"`
++	Retirement       hostNativeAbortRetirementProof `json:"retirement"`
++	Finalized        bool                           `json:"finalized"`
++}
++type hostNativeAbortFinalizationProof struct {
++	Version    int                               `json:"v"`
++	State      string                            `json:"state"`
++	Transition hostRotationNativeAbortTransition `json:"transition"`
++}
++type hostNativeAbortFinalizationDependencies struct {
++	hostNativeAbortDependencies
++	after func(string) error
++}
++
++func (t hostRotationNativeAbortTransition) identity() hostRotationNativeAbortTransition {
++	t.Finalized = false
++	return t
++}
++func (t hostRotationNativeAbortTransition) valid() bool {
++	r := t.Retirement
++	return t.Version == 1 && t.Source.Client == "codex" && validHostNativeUUID(t.Source.SessionID) &&
++		t.Source.SessionID == r.SessionID && t.TurnID != "" && t.TurnSeq > 0 && t.Source.AgentPID > 1 && t.Source.WorkerPID > 1 &&
++		t.Source.AgentStart != 0 && t.Source.WorkerStart != 0 && r.Version == 1 && r.State == "native_abort_retired" &&
++		validHostNativeUUID(r.OperationID) && validHostNativeUUID(r.HostClaimID) && r.OperationID != r.HostClaimID &&
++		nativeWireHash(r.AbortSnapshotSHA256) && nativeWireHash(t.RequestSHA256) && nativeWireHash(t.RetirementSHA256)
++}
++func hostNativeAbortFinalizationPhase(link hostRotationNativeAbortTransition, state string) hostNativeAbortFinalizationProof {
++	return hostNativeAbortFinalizationProof{1, state, link.identity()}
++}
++func readHostNativeAbortFinalizationPhase(root *os.File, link hostRotationNativeAbortTransition, state string) (bool, error) {
++	raw, err := readHostNativeClaimFile(root, link.Retirement.OperationID+"."+state+".json")
++	if errors.Is(err, os.ErrNotExist) {
++		return false, nil
++	}
++	if err != nil {
++		return false, err
++	}
++	if !hostNativeRegistrationExactShape(raw, hostNativeAbortFinalizationPhase(link, state)) {
++		return false, errors.New("native abort finalization record changed")
++	}
++	return true, nil
++}
++func verifyHostNativeAbortFinalizationHistoryAt(root *os.File, link hostRotationNativeAbortTransition) error {
++	if !link.valid() {
++		return errors.New("invalid native abort finalization transition")
++	}
++	for _, state := range []string{"host_abort_finalization_requested", "host_abort_finalized"} {
++		exists, err := readHostNativeAbortFinalizationPhase(root, link, state)
++		if err != nil {
++			return err
++		}
++		if !exists {
++			return errors.New("native abort finalization history incomplete")
++		}
++	}
++	raw, err := readHostNativeClaimFile(root, link.Retirement.OperationID+".native_abort_retired.json")
++	if err != nil || hostRotationCapsuleHash(raw) != link.RetirementSHA256 || !hostNativeRegistrationExactShape(raw, link.Retirement) {
++		return errors.New("native abort finalization retirement changed")
++	}
++	raw, err = readHostNativeClaimFile(root, link.Retirement.OperationID+".native_abort_ack_requested.json")
++	requested := link.Retirement
++	requested.State = "native_abort_ack_requested"
++	if err != nil || !hostNativeRegistrationExactShape(raw, requested) {
++		return errors.New("native abort finalization retirement intent changed")
++	}
++	raw, err = readHostNativeClaimFile(root, link.Retirement.OperationID+".request.json")
++	var q hostNativeClaimRequest
++	if err != nil || hostRotationCapsuleHash(raw) != link.RequestSHA256 || decodeHostNativeRecord(raw, &q) != nil ||
++		validateHostNativeStoredRequest(q) != nil || q.SessionID != link.Source.SessionID || q.Epoch != link.Retirement.OperationID ||
++		q.HostClaimID != link.Retirement.HostClaimID || q.Source.Enrollment != link.Source || q.Source.TurnID != link.TurnID || q.Source.TurnSeq != link.TurnSeq {
++		return errors.New("native abort finalization source changed")
++	}
++	return nil
++}
++func readHostNativeAbortFinalizationInput(directory, sessionID string) (*hostNativeAbortRetirementInput, hostRotationNativeAbortTransition, error) {
++	var link hostRotationNativeAbortTransition
++	root, lock, err := lockHostNativeClaimRoot(directory, false)
++	if err != nil {
++		return nil, link, err
++	}
++	defer root.Close()
++	defer lock.Close()
++	input, err := readHostNativeAbortRetirementInputAt(root, directory, sessionID)
++	if err != nil {
++		return nil, link, err
++	}
++	for _, state := range []string{"native_abort_ack_requested", "native_abort_retired"} {
++		raw, err := readHostNativeClaimFile(root, input.receipt.Epoch+"."+state+".json")
++		if err != nil || !hostNativeRegistrationExactShape(raw, hostNativeAbortRetirementPhase(input, state)) {
++			return nil, link, errors.New("native abort finalization requires durable retirement")
++		}
++		if state == "native_abort_retired" {
++			link = hostRotationNativeAbortTransition{Version: 1, Source: input.abort.completion.request.Source.Enrollment,
++				TurnID: input.abort.completion.request.Source.TurnID, TurnSeq: input.abort.completion.request.Source.TurnSeq,
++				RequestSHA256: input.abort.completion.journal.requestSHA256, RetirementSHA256: hostRotationCapsuleHash(raw),
++				Retirement: hostNativeAbortRetirementPhase(input, state)}
++		}
++	}
++	if !link.valid() {
++		return nil, link, errors.New("native abort finalization identity unavailable")
++	}
++	for _, state := range []string{"host_abort_finalization_requested", "host_abort_finalized"} {
++		if _, err := readHostNativeAbortFinalizationPhase(root, link, state); err != nil {
++			return nil, link, err
++		}
++	}
++	return input, link, nil
++}
++func writeHostNativeAbortFinalizationPhase(directory string, input *hostNativeAbortRetirementInput, link hostRotationNativeAbortTransition, state string) error {
++	root, lock, err := lockHostNativeClaimRoot(directory, false)
++	if err != nil {
++		return err
++	}
++	defer root.Close()
++	defer lock.Close()
++	current, err := readHostNativeAbortRetirementInputAt(root, directory, link.Source.SessionID)
++	if err != nil || current.fingerprint != input.fingerprint {
++		return errors.New("native abort finalization receipt changed")
++	}
++	for _, phase := range []string{"native_abort_ack_requested", "native_abort_retired"} {
++		raw, err := readHostNativeClaimFile(root, link.Retirement.OperationID+"."+phase+".json")
++		if err != nil || !hostNativeRegistrationExactShape(raw, hostNativeAbortRetirementPhase(input, phase)) ||
++			(phase == "native_abort_retired" && hostRotationCapsuleHash(raw) != link.RetirementSHA256) {
++			return errors.New("native abort finalization retirement changed")
++		}
++	}
++	if state == "host_abort_finalized" {
++		exists, err := readHostNativeAbortFinalizationPhase(root, link, "host_abort_finalization_requested")
++		if err != nil {
++			return err
++		}
++		if !exists {
++			return errors.New("native abort finalization intent unavailable")
++		}
++	}
++	raw, _ := json.Marshal(hostNativeAbortFinalizationPhase(link, state))
++	return writeHostNativeClaimFile(root, link.Retirement.OperationID+"."+state+".json", raw, true)
++}
++func finishHostNativeAbortFinalizationFence(directory string, link hostRotationNativeAbortTransition) error {
++	root, lock, err := lockHostNativeClaimRoot(directory, false)
++	if err != nil {
++		return err
++	}
++	defer root.Close()
++	defer lock.Close()
++	if err := verifyHostNativeAbortFinalizationHistoryAt(root, link); err != nil {
++		return err
++	}
++	raw, err := readHostNativeClaimFile(root, link.Source.SessionID+".active.json")
++	if errors.Is(err, os.ErrNotExist) {
++		return root.Sync()
++	}
++	if err != nil {
++		return err
++	}
++	want := hostNativeClaimActive{Version: 1, OperationID: link.Retirement.OperationID, RequestSHA256: link.RequestSHA256}
++	if !hostNativeRegistrationExactShape(raw, want) {
++		return errors.New("native abort finalization will not remove another active operation")
++	}
++	if err := unix.Unlinkat(int(root.Fd()), link.Source.SessionID+".active.json", 0); err != nil {
++		return err
++	}
++	return root.Sync()
++}
++func (s *hostRotationSupervisor) completeNativeAbortTransitionLocked(link hostRotationNativeAbortTransition) error {
++	if s.record.NativeAbortTransition == nil || s.record.NativeAbortTransition.identity() != link.identity() ||
++		s.record.Enrollment != link.Source {
++		return errors.New("native abort supervisor transition changed")
++	}
++	if s.record.NativeAbortTransition.Finalized {
++		return nil
++	}
++	completed := link
++	completed.Finalized = true
++	s.record.NativeAbortTransition = &completed
++	s.record.NativeRecoveryState = ""
++	s.record.Generation++
++	s.record.NextEvaluationMS = 0
++	s.record.Fingerprint = ""
++	s.record.Decision = nil
++	s.record.Preparation = nil
++	if s.record.Enabled {
++		s.record.State = "native_refused"
++	}
++	if err := s.saveLocked(); err != nil {
++		s.record.NativeAbortTransition = &link
++		s.record.Enabled = false
++		s.record.State = "persistence_failed"
++		return err
++	}
++	return nil
++}
++func recoverHostNativeAbortFinalizedTransition(s *hostRotationSupervisor, directory string, link hostRotationNativeAbortTransition) (bool, error) {
++	root, lock, err := lockHostNativeClaimRoot(directory, false)
++	if err != nil {
++		return false, err
++	}
++	exists, err := readHostNativeAbortFinalizationPhase(root, link, "host_abort_finalized")
++	if err == nil && exists {
++		err = verifyHostNativeAbortFinalizationHistoryAt(root, link)
++	}
++	lock.Close()
++	root.Close()
++	if err != nil || !exists {
++		return false, err
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.record.NativeAbortTransition == nil || s.record.NativeAbortTransition.identity() != link.identity() ||
++		s.record.Enrollment != link.Source {
++		return false, errors.New("native abort supervisor recovery identity changed")
++	}
++	if s.record.NativeTransition != nil && !s.record.NativeTransition.Finalized {
++		return false, errors.New("another native transition is pending")
++	}
++	if s.record.NativeAbortTransition.Finalized {
++		return true, nil
++	}
++	if err := finishHostNativeAbortFinalizationFence(directory, link); err != nil {
++		return false, err
++	}
++	if err := s.completeNativeAbortTransitionLocked(link); err != nil {
++		return false, err
++	}
++	s.notify()
++	return true, nil
++}
++func finalizeHostNativeRefusal(ctx context.Context, s *hostRotationSupervisor, directory, sessionID string, deps hostNativeAbortFinalizationDependencies) error {
++	if s == nil || !validHostNativeUUID(sessionID) {
++		return errors.New("native abort finalization source unavailable")
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	saved := s.snapshot()
++	if link := saved.NativeAbortTransition; link != nil && link.Source.SessionID == sessionID {
++		if !link.valid() {
++			return errors.New("invalid saved native abort transition")
++		}
++		done, err := recoverHostNativeAbortFinalizedTransition(s, directory, *link)
++		if err != nil || done {
++			return err
++		}
++	}
++	if deps.owner == nil || deps.ledger == nil {
++		return errors.New("native abort finalization evidence unavailable")
++	}
++	input, link, err := readHostNativeAbortFinalizationInput(directory, sessionID)
++	if err != nil {
++		return err
++	}
++	if err := verifyHostNativeAbortRetirementEvidence(ctx, deps.hostNativeAbortDependencies, input); err != nil {
++		return err
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.record.Enrollment != link.Source {
++		return errors.New("native abort source supervision changed")
++	}
++	if s.record.NativeTransition != nil && !s.record.NativeTransition.Finalized {
++		return errors.New("another native transition is pending")
++	}
++	old := s.record.NativeAbortTransition
++	if old != nil && !old.Finalized && old.identity() != link.identity() {
++		return errors.New("another native abort transition is pending")
++	}
++	step := func(name string) error {
++		if deps.after != nil {
++			return deps.after(name)
++		}
++		return nil
++	}
++	// Persist the supervisor link before any local finalization. Restart cannot
++	// evaluate the source until the exact historical completion clears its fence.
++	if old == nil || old.identity() != link.identity() {
++		pending := link
++		s.record.NativeAbortTransition = &pending
++		s.record.Generation++
++		s.record.NextEvaluationMS = 0
++		s.record.Fingerprint = ""
++		s.record.Decision = nil
++		s.record.Preparation = nil
++		if s.record.Enabled {
++			s.record.State = "native_abort_finalization_pending"
++		}
++		if err := s.saveLocked(); err != nil {
++			s.record.Enabled = false
++			s.record.State = "persistence_failed"
++			return err
++		}
++	}
++	if err := step("supervisor_pending"); err != nil {
++		return err
++	}
++	if err := writeHostNativeAbortFinalizationPhase(directory, input, link, "host_abort_finalization_requested"); err != nil {
++		return err
++	}
++	if err := step("intent"); err != nil {
++		return err
++	}
++	// The original enrollment and current human enable/disable choice are retained.
++	if err := writeHostNativeAbortFinalizationPhase(directory, input, link, "host_abort_finalized"); err != nil {
++		return err
++	}
++	if err := step("completion"); err != nil {
++		return err
++	}
++	if err := finishHostNativeAbortFinalizationFence(directory, link); err != nil {
++		return err
++	}
++	if err := step("fence_removed"); err != nil {
++		return err
++	}
++	if err := s.completeNativeAbortTransitionLocked(link); err != nil {
++		return err
++	}
++	if err := step("supervisor_complete"); err != nil {
++		return err
++	}
++	s.notify()
++	return nil
++}
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_native_abort_retirement.go
+@@ -0,0 +1,210 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"reflect"
++)
++
++type hostNativeAbortRetirementInput struct {
++	abort       *hostNativeAbortInput
++	receipt     hostNativeAbortReceipt
++	fingerprint string
++}
++type hostNativeAbortRetirementProof struct {
++	Version             int    `json:"v"`
++	State               string `json:"state"`
++	AbortSnapshotSHA256 string `json:"abort_snapshot_sha256"`
++	SessionID           string `json:"session_id"`
++	OperationID         string `json:"operation_id"`
++	HostClaimID         string `json:"host_claim_id"`
++}
++type hostNativeAbortRetirementDependencies struct {
++	hostNativeAbortDependencies
++	retire func(context.Context, hostRotationEnrollment, hostNativeRefusalRecord) (nativeRotationReply, error)
++}
++
++func readHostNativeAbortRetirementInputAt(root *os.File, directory, sessionID string) (*hostNativeAbortRetirementInput, error) {
++	input, err := readHostNativeAbortInputAt(root, directory, sessionID)
++	if err != nil {
++		return nil, err
++	}
++	hashes := map[string]string{"refusal": input.fingerprint}
++	var received hostNativeAbortPhase
++	q := hostNativeAbortRequestFor(input)
++	for _, state := range []string{"ledger_abort_requested", "ledger_abort_received"} {
++		raw, err := readHostNativeClaimFile(root, q.Epoch+"."+state+".json")
++		var phase hostNativeAbortPhase
++		if err != nil || decodeHostNativeRecord(raw, &phase) != nil || !hostNativeRegistrationExactShape(raw, phase) ||
++			phase.Version != 1 || phase.State != state || phase.RefusalSnapshotSHA256 != input.fingerprint ||
++			!reflect.DeepEqual(phase.Refusal, input.refusal) || phase.Request != q {
++			return nil, errors.New("native refusal retirement lacks exact durable ledger abort")
++		}
++		if state == "ledger_abort_requested" {
++			if phase.Abort != nil {
++				return nil, errors.New("native refusal retirement abort request changed")
++			}
++		} else {
++			if phase.Abort == nil {
++				return nil, errors.New("native refusal retirement abort receipt unavailable")
++			}
++			received = phase
++		}
++		hashes[state] = hostRotationCapsuleHash(raw)
++	}
++	raw, _ := json.Marshal(received.Abort)
++	receipt, err := decodeHostNativeAbort(raw, q, input.completion.intent.Seq)
++	if err != nil {
++		return nil, err
++	}
++	raw, _ = json.Marshal(hashes)
++	return &hostNativeAbortRetirementInput{input, receipt, hostRotationCapsuleHash(raw)}, nil
++}
++func readHostNativeAbortRetirementInput(directory, sessionID string) (*hostNativeAbortRetirementInput, error) {
++	if !validHostNativeUUID(sessionID) {
++		return nil, errors.New("invalid native refusal retirement source")
++	}
++	root, lock, err := lockHostNativeClaimRoot(directory, false)
++	if err != nil {
++		return nil, err
++	}
++	defer root.Close()
++	defer lock.Close()
++	return readHostNativeAbortRetirementInputAt(root, directory, sessionID)
++}
++func hostNativeAbortRetirementPhase(input *hostNativeAbortRetirementInput, state string) hostNativeAbortRetirementProof {
++	r := input.abort.completion.request
++	return hostNativeAbortRetirementProof{1, state, input.fingerprint, r.SessionID, r.Epoch, r.HostClaimID}
++}
++func recordHostNativeAbortRetirement(input *hostNativeAbortRetirementInput, finish bool) (bool, error) {
++	c := input.abort.completion
++	root, lock, err := lockHostNativeClaimRoot(c.journal.workerDirectory, false)
++	if err != nil {
++		return false, err
++	}
++	defer root.Close()
++	defer lock.Close()
++	current, err := readHostNativeAbortRetirementInputAt(root, c.journal.workerDirectory, c.request.SessionID)
++	if err != nil || current.fingerprint != input.fingerprint {
++		return false, errors.New("native refusal retirement abort changed")
++	}
++	read := func(state string) (bool, error) {
++		raw, err := readHostNativeClaimFile(root, c.request.Epoch+"."+state+".json")
++		if errors.Is(err, os.ErrNotExist) {
++			return false, nil
++		}
++		if err != nil {
++			return false, err
++		}
++		if !hostNativeRegistrationExactShape(raw, hostNativeAbortRetirementPhase(input, state)) {
++			return false, errors.New("native refusal retirement phase changed")
++		}
++		return true, nil
++	}
++	requested, err := read("native_abort_ack_requested")
++	if err != nil {
++		return false, err
++	}
++	completed, err := read("native_abort_retired")
++	if err != nil {
++		return false, err
++	}
++	if !requested {
++		if finish || completed {
++			return false, errors.New("native refusal retirement lacks durable request")
++		}
++		raw, _ := json.Marshal(hostNativeAbortRetirementPhase(input, "native_abort_ack_requested"))
++		if err := writeHostNativeClaimFile(root, c.request.Epoch+".native_abort_ack_requested.json", raw, false); err != nil {
++			return false, err
++		}
++	}
++	if finish && !completed {
++		raw, _ := json.Marshal(hostNativeAbortRetirementPhase(input, "native_abort_retired"))
++		if err := writeHostNativeClaimFile(root, c.request.Epoch+".native_abort_retired.json", raw, true); err != nil {
++			return false, err
++		}
++		completed = true
++	}
++	return completed, nil
++}
++func verifyHostNativeAbortRetirementEvidence(ctx context.Context, deps hostNativeAbortDependencies, input *hostNativeAbortRetirementInput) error {
++	if err := verifyHostNativeAbortEvidence(ctx, deps, input.abort); err != nil {
++		return err
++	}
++	observed, err := reconcileHostNativeAbort(ctx, deps, input.abort)
++	if err != nil {
++		return err
++	}
++	if observed == nil || *observed != input.receipt {
++		return errors.New("native refusal retirement ledger abort changed")
++	}
++	return ctx.Err()
++}
++
++// This acknowledges only the already cancelled terminal native operation.
++// The source remains attached. The active host fence is retained for finalization.
++func retireHostNativeRefusal(ctx context.Context, directory, sessionID string, deps hostNativeAbortRetirementDependencies) (*hostNativeAbortRetirementProof, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if deps.owner == nil || deps.ledger == nil || deps.retire == nil {
++		return nil, errors.New("native refusal retirement dependencies unavailable")
++	}
++	input, err := readHostNativeAbortRetirementInput(directory, sessionID)
++	if err != nil {
++		return nil, err
++	}
++	check := func() error {
++		return verifyHostNativeAbortRetirementEvidence(ctx, deps.hostNativeAbortDependencies, input)
++	}
++	if err := check(); err != nil {
++		return nil, err
++	}
++	completed, err := recordHostNativeAbortRetirement(input, false)
++	if err != nil {
++		return nil, err
++	}
++	if !completed {
++		if err := check(); err != nil {
++			return nil, err
++		}
++		c := input.abort.completion
++		reply, err := deps.retire(ctx, c.request.Source.Enrollment, input.abort.refusal.Receipt)
++		if err != nil {
++			return nil, err
++		}
++		command := nativeRotationCommand{Operation: "acknowledge", ThreadID: c.request.SessionID, OperationID: c.request.Epoch, HostClaimID: c.request.HostClaimID}
++		if reply.Version != 1 || reply.State != "acknowledged" || validateNativeRotationReply(command, reply) != nil {
++			return nil, errors.New("native refusal retirement is not confirmed")
++		}
++		if err := check(); err != nil {
++			return nil, err
++		}
++		if _, err := recordHostNativeAbortRetirement(input, true); err != nil {
++			return nil, err
++		}
++	}
++	proof := hostNativeAbortRetirementPhase(input, "native_abort_retired")
++	return &proof, nil
++}
++func (session *Session) retireNativeRefusal(ctx context.Context, e hostRotationEnrollment, r hostNativeRefusalRecord) (nativeRotationReply, error) {
++	if err := ctx.Err(); err != nil {
++		return nativeRotationReply{}, err
++	}
++	if session == nil || e.PaneID != session.id || e.WorkerPID != os.Getpid() || e.Client != "codex" {
++		return nativeRotationReply{}, errors.New("native refusal retirement worker changed")
++	}
++	if err := verifyHostNativeRefusalOwner(e, r); err != nil {
++		return nativeRotationReply{}, err
++	}
++	session.nativeRotationMu.Lock()
++	bridge := session.nativeRotation
++	session.nativeRotationMu.Unlock()
++	if bridge == nil || bridge.providerPID != e.AgentPID || bridge.providerStart != e.AgentStart ||
++		!nativeRotationCallerMatches(bridge.helperPID, e.AgentPID, e.AgentStart) {
++		return nativeRotationReply{}, errors.New("native refusal retirement foreground bridge unavailable")
++	}
++	return bridge.acknowledgeNativeCommit(ctx, e.SessionID, r.OperationID, r.ClaimID)
++}
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_native_abort_retirement_test.go
+@@ -0,0 +1,253 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++)
++
++type nativeAbortRetirementHarness struct {
++	*nativeAbortHarness
++	deps           hostNativeAbortRetirementDependencies
++	retireCalls    int
++	retired        bool
++	retireMutation string
++}
++
++func nativeAbortRetirementFixture(t *testing.T) *nativeAbortRetirementHarness {
++	t.Helper()
++	h := &nativeAbortRetirementHarness{nativeAbortHarness: nativeAbortFixture(t)}
++	if _, err := h.nativeAbortHarness.run(); err != nil {
++		t.Fatal(err)
++	}
++	h.deps.hostNativeAbortDependencies = h.nativeAbortHarness.deps
++	h.deps.retire = func(ctx context.Context, e hostRotationEnrollment, r hostNativeRefusalRecord) (nativeRotationReply, error) {
++		if err := ctx.Err(); err != nil {
++			return nativeRotationReply{}, err
++		}
++		h.retireCalls++
++		if e != h.host.source.Enrollment || r != h.receipt {
++			t.Fatal("refusal retirement source changed")
++		}
++		raw, err := os.ReadFile(h.phase("native_abort_ack_requested"))
++		input, readErr := readHostNativeAbortRetirementInput(h.host.dir, h.claim.request.SessionID)
++		if err != nil || readErr != nil || !hostNativeRegistrationExactShape(raw, hostNativeAbortRetirementPhase(input, "native_abort_ack_requested")) {
++			t.Fatal("native refusal ACK preceded exact durable intent", err, readErr)
++		}
++		reply := nativeRotationReply{Version: 1, State: "acknowledged", OperationID: r.OperationID, HostClaimID: r.ClaimID}
++		h.retired = true
++		switch h.retireMutation {
++		case "lost":
++			return nativeRotationReply{}, errors.New("ACK reply lost")
++		case "pending":
++			reply.State = "pending"
++		case "operation":
++			reply.OperationID = r.ClaimID
++		case "claim":
++			reply.HostClaimID = r.OperationID
++		case "version":
++			reply.Version = 0
++		case "source":
++			reply.Source = &r.Source
++		case "journal":
++			reply.JournalDirectory = h.path
++		case "native_changed":
++			writeNativeCompletionJSON(t, filepath.Join(h.path, "refused.json"), map[string]any{})
++		case "host_changed":
++			writeNativeCompletionJSON(t, h.phase("ledger_abort_received"), map[string]any{})
++		case "ledger_changed":
++			h.nativeAbortHarness.mutation = "claim_open"
++		}
++		return reply, nil
++	}
++	return h
++}
++func (h *nativeAbortRetirementHarness) run() (*hostNativeAbortRetirementProof, error) {
++	return retireHostNativeRefusal(context.Background(), h.host.dir, h.claim.request.SessionID, h.deps)
++}
++func (h *nativeAbortRetirementHarness) noRetired(t *testing.T) {
++	t.Helper()
++	if _, err := os.Stat(h.phase("native_abort_retired")); !errors.Is(err, os.ErrNotExist) {
++		t.Fatal("unverified retirement recorded", err)
++	}
++	h.unchanged(t)
++}
++func TestHostNativeAbortRetirementDurableAndIdempotent(t *testing.T) {
++	h := nativeAbortRetirementFixture(t)
++	first, err := h.run()
++	if err != nil || first == nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(h.phase("native_abort_retired"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	again, err := h.run()
++	if err != nil || !reflect.DeepEqual(first, again) || h.retireCalls != 1 || h.calls != 1 {
++		t.Fatal("retirement replayed external work", err)
++	}
++	after, err := os.Stat(h.phase("native_abort_retired"))
++	if err != nil || !os.SameFile(info, after) {
++		t.Fatal("retirement replaced proof", err)
++	}
++	if !h.retired || first.State != "native_abort_retired" || first.SessionID != h.receipt.Source.ThreadID {
++		t.Fatal("source retirement not bound")
++	}
++	h.unchanged(t)
++}
++func TestHostNativeAbortRetirementLostReplyRetriesExactAck(t *testing.T) {
++	for _, mode := range []string{"lost", "pending"} {
++		t.Run(mode, func(t *testing.T) {
++			h := nativeAbortRetirementFixture(t)
++			h.retireMutation = mode
++			if _, err := h.run(); err == nil {
++				t.Fatal("uncertain ACK completed")
++			}
++			h.noRetired(t)
++			before, err := os.ReadFile(h.phase("native_abort_ack_requested"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			h.retireMutation = ""
++			if _, err := h.run(); err != nil || h.retireCalls != 2 || h.calls != 1 {
++				t.Fatal("exact ACK retry failed", err)
++			}
++			after, _ := os.ReadFile(h.phase("native_abort_ack_requested"))
++			if string(before) != string(after) {
++				t.Fatal("retry request changed")
++			}
++			h.unchanged(t)
++		})
++	}
++}
++func TestHostNativeAbortRetirementRequiresDurableAbort(t *testing.T) {
++	for _, mode := range []string{"missing_requested", "missing_received", "partial_received", "receipt_changed", "partial_ack", "orphan_retired", "owner", "ledger", "cancelled"} {
++		t.Run(mode, func(t *testing.T) {
++			h := nativeAbortRetirementFixture(t)
++			ctx := context.Background()
++			switch mode {
++			case "missing_requested":
++				if err := os.Remove(h.phase("ledger_abort_requested")); err != nil {
++					t.Fatal(err)
++				}
++			case "missing_received":
++				if err := os.Remove(h.phase("ledger_abort_received")); err != nil {
++					t.Fatal(err)
++				}
++			case "partial_received":
++				if err := os.WriteFile(h.phase("ledger_abort_received"), []byte("{"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "receipt_changed":
++				raw, _ := os.ReadFile(h.phase("ledger_abort_received"))
++				var p hostNativeAbortPhase
++				if json.Unmarshal(raw, &p) != nil {
++					t.Fatal("fixture")
++				}
++				p.Abort.Seq++
++				writeNativeCompletionJSON(t, h.phase("ledger_abort_received"), p)
++			case "partial_ack":
++				if err := os.WriteFile(h.phase("native_abort_ack_requested"), []byte("{"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "orphan_retired":
++				if err := os.WriteFile(h.phase("native_abort_retired"), []byte("{"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "owner":
++				h.deps.owner = func(hostRotationEnrollment, hostNativeRefusalRecord) error { return errors.New("owner changed") }
++			case "ledger":
++				h.nativeAbortHarness.mutation = "claim_open"
++			case "cancelled":
++				var cancel context.CancelFunc
++				ctx, cancel = context.WithCancel(ctx)
++				cancel()
++			}
++			if r, err := retireHostNativeRefusal(ctx, h.host.dir, h.claim.request.SessionID, h.deps); err == nil || r != nil || h.retireCalls != 0 {
++				t.Fatal("unproven retirement submitted", err)
++			}
++			if mode != "orphan_retired" {
++				h.noRetired(t)
++			} else {
++				h.unchanged(t)
++			}
++		})
++	}
++}
++func TestHostNativeAbortRetirementRejectsReplyAndPostAckChanges(t *testing.T) {
++	for _, mode := range []string{"operation", "claim", "version", "source", "journal", "native_changed", "host_changed", "ledger_changed", "owner_changed", "cancelled"} {
++		t.Run(mode, func(t *testing.T) {
++			h := nativeAbortRetirementFixture(t)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			switch mode {
++			case "owner_changed":
++				h.deps.owner = func(e hostRotationEnrollment, r hostNativeRefusalRecord) error {
++					if h.retired {
++						return errors.New("owner changed")
++					}
++					return h.owner(e, r)
++				}
++			case "cancelled":
++				base := h.deps.retire
++				h.deps.retire = func(ctx context.Context, e hostRotationEnrollment, r hostNativeRefusalRecord) (nativeRotationReply, error) {
++					reply, err := base(ctx, e, r)
++					cancel()
++					return reply, err
++				}
++			default:
++				h.retireMutation = mode
++			}
++			if r, err := retireHostNativeRefusal(ctx, h.host.dir, h.claim.request.SessionID, h.deps); err == nil || r != nil || h.retireCalls != 1 {
++				t.Fatal("conflicting ACK completed", err)
++			}
++			h.noRetired(t)
++		})
++	}
++}
++func TestHostNativeAbortRetirementRetryRejectsChangedMarker(t *testing.T) {
++	h := nativeAbortRetirementFixture(t)
++	h.retireMutation = "lost"
++	if _, err := h.run(); err == nil {
++		t.Fatal("lost reply accepted")
++	}
++	raw, _ := os.ReadFile(h.phase("native_abort_ack_requested"))
++	var p hostNativeAbortRetirementProof
++	if json.Unmarshal(raw, &p) != nil {
++		t.Fatal("fixture")
++	}
++	p.HostClaimID = p.OperationID
++	writeNativeCompletionJSON(t, h.phase("native_abort_ack_requested"), p)
++	h.retireMutation = ""
++	if _, err := h.run(); err == nil || h.retireCalls != 1 {
++		t.Fatal("changed request replayed")
++	}
++	h.noRetired(t)
++}
++func TestHostNativeAbortRetirementBridgeKeepsSourceAndOnlyAcknowledges(t *testing.T) {
++	bridge, peer := nativeRotationTestBridge(t)
++	h := nativeAbortFixture(t)
++	r := h.receipt
++	done := make(chan error, 1)
++	go func() {
++		_, err := bridge.acknowledgeNativeCommit(context.Background(), r.Source.ThreadID, r.OperationID, r.ClaimID)
++		done <- err
++	}()
++	q := nativeWireCommand(t, peer)
++	if q.Operation != "acknowledge" || q.ThreadID != r.Source.ThreadID || q.OperationID != r.OperationID || q.HostClaimID != r.ClaimID ||
++		q.Commit != nil || q.ReservationID != "" {
++		t.Fatal("ACK attempted another native operation")
++	}
++	raw, _ := json.Marshal(nativeRotationReply{Version: 1, ID: q.ID, State: "acknowledged", OperationID: r.OperationID, HostClaimID: r.ClaimID})
++	if err := bridge.receive(raw); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	h.unchanged(t)
++}
+--- a/remote/relayd/internal/daemon/host_rotation_native_driver.go
++++ b/remote/relayd/internal/daemon/host_rotation_native_driver.go
+@@ -22,9 +22,10 @@
+ 
+ type hostNativeDriverDependencies struct {
+ 	hostNativeRetirementDependencies
+-	acquire      func(context.Context, hostRotationEnrollment, hostRotationPreparation, func() error) (hostNativeDriverClaim, error)
+-	observe      func(context.Context, hostRotationEnrollment, string, string) (nativeRotationReply, error)
+-	refusalOwner func(hostRotationEnrollment, hostNativeRefusalRecord) error
++	acquire       func(context.Context, hostRotationEnrollment, hostRotationPreparation, func() error) (hostNativeDriverClaim, error)
++	observe       func(context.Context, hostRotationEnrollment, string, string) (nativeRotationReply, error)
++	refusalOwner  func(hostRotationEnrollment, hostNativeRefusalRecord) error
++	retireRefusal func(context.Context, hostRotationEnrollment, hostNativeRefusalRecord) (nativeRotationReply, error)
+ }
+ 
+ type hostNativeTransactionDriver struct {
+@@ -43,8 +44,9 @@
+ 		acquire: func(ctx context.Context, e hostRotationEnrollment, p hostRotationPreparation, guard func() error) (hostNativeDriverClaim, error) {
+ 			return session.claimNativeContextRotation(ctx, directory, e, p, guard)
+ 		},
+-		observe:      session.observeNativeContextRotation,
+-		refusalOwner: verifyHostNativeRefusalOwner,
++		observe:       session.observeNativeContextRotation,
++		refusalOwner:  verifyHostNativeRefusalOwner,
++		retireRefusal: session.retireNativeRefusal,
+ 	}}
+ }
+ 
+@@ -66,6 +68,10 @@
+ 	if err := guard(); err != nil {
+ 		return hostNativeDriverPending("native_start_cancelled", err)
+ 	}
++	if previous := s.snapshot().NativeAbortTransition; previous != nil && previous.Finalized && previous.Source == e &&
++		(p.TurnID == previous.TurnID || p.TurnSeq <= previous.TurnSeq) {
++		return hostNativeDriverPending("native_retry_requires_new_turn", errors.New("native refusal requires a new completed turn or explicit re-enrollment"))
++	}
+ 	claim, err := d.deps.acquire(ctx, e, p, guard)
+ 	if err != nil {
+ 		return hostNativeDriverPending("native_claim_pending", err)
+@@ -119,7 +125,7 @@
+ 		if _, err := verifyAndRecordHostNativeRefusal(ctx, d.directory, e.SessionID, observed.JournalDirectory, d.deps.refusalOwner); err != nil {
+ 			return hostNativeDriverPending("native_refusal_verification_pending", err)
+ 		}
+-		return d.abortRefusal(ctx, e)
++		return d.abortRefusal(ctx, s, e)
+ 	case "restored":
+ 	default:
+ 		return hostNativeDriverPending("native_completion_unavailable", errors.New("native restoration unavailable"))
+@@ -182,6 +188,13 @@
+ 		return hostNativeDriverPending("native_recovery_cancelled", err)
+ 	}
+ 	saved := s.snapshot()
++	if link := saved.NativeAbortTransition; link != nil && !link.Finalized {
++		if err := finalizeHostNativeRefusal(ctx, s, d.directory, link.Source.SessionID,
++			hostNativeAbortFinalizationDependencies{hostNativeAbortDependencies: hostNativeAbortDependencies{owner: d.deps.refusalOwner, ledger: d.deps.ledger}}); err != nil {
++			return hostNativeDriverPending("native_abort_finalization_pending", err)
++		}
++		return hostNativeDriverResult{}, nil
++	}
+ 	if link := saved.NativeTransition; link != nil && !link.Finalized {
+ 		if err := finalizeHostNativeCompletion(ctx, s, d.directory, link.Source.SessionID,
+ 			hostNativeFinalizationDependencies{hostNativeRegistrationDependencies: d.deps.hostNativeRegistrationDependencies}); err != nil {
+@@ -217,7 +230,7 @@
+ 		return hostNativeDriverPending("native_refusal_verification_pending", err)
+ 	}
+ 	if refusal != nil {
+-		return d.abortRefusal(ctx, e)
++		return d.abortRefusal(ctx, s, e)
+ 	}
+ 	receipt, err := readHostNativeDriverReceipt(d.directory, input)
+ 	if err != nil {
+@@ -272,11 +285,18 @@
+ 	return bridge.observeNativeCommit(ctx, e.SessionID, operationID, hostClaimID)
+ }
+ 
+-func (d *hostNativeTransactionDriver) abortRefusal(ctx context.Context, e hostRotationEnrollment) (hostNativeDriverResult, error) {
+-	if _, err := abortHostNativeRefusal(ctx, d.directory, e.SessionID, hostNativeAbortDependencies{
+-		owner: d.deps.refusalOwner, ledger: d.deps.ledger,
++func (d *hostNativeTransactionDriver) abortRefusal(ctx context.Context, s *hostRotationSupervisor, e hostRotationEnrollment) (hostNativeDriverResult, error) {
++	deps := hostNativeAbortDependencies{owner: d.deps.refusalOwner, ledger: d.deps.ledger}
++	if _, err := abortHostNativeRefusal(ctx, d.directory, e.SessionID, deps); err != nil {
++		return hostNativeDriverPending("native_abort_pending", err)
++	}
++	if _, err := retireHostNativeRefusal(ctx, d.directory, e.SessionID, hostNativeAbortRetirementDependencies{
++		hostNativeAbortDependencies: deps, retire: d.deps.retireRefusal,
+ 	}); err != nil {
+-		return hostNativeDriverPending("native_abort_pending", err)
+-	}
+-	return hostNativeDriverPending("native_abort_retirement_pending", nil)
+-}
++		return hostNativeDriverPending("native_abort_retirement_pending", err)
++	}
++	if err := finalizeHostNativeRefusal(ctx, s, d.directory, e.SessionID, hostNativeAbortFinalizationDependencies{hostNativeAbortDependencies: deps}); err != nil {
++		return hostNativeDriverPending("native_abort_finalization_pending", err)
++	}
++	return hostNativeDriverResult{}, nil
++}
+--- a/remote/relayd/internal/daemon/host_rotation_native_finalization.go
++++ b/remote/relayd/internal/daemon/host_rotation_native_finalization.go
+@@ -292,6 +292,9 @@
+ 	}
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	if s.record.NativeAbortTransition != nil && !s.record.NativeAbortTransition.Finalized {
++		return errors.New("native abort finalization is pending")
++	}
+ 	old := s.record.NativeTransition
+ 	if old != nil && !old.Finalized && old.identity() != link.identity() {
+ 		return errors.New("another native transition is pending")
+@@ -372,6 +375,10 @@
+ func nativeHostRotationFinalizer(workerDirectory string) func(context.Context, *hostRotationSupervisor) error {
+ 	return func(ctx context.Context, s *hostRotationSupervisor) error {
+ 		r := s.snapshot()
++		if r.NativeAbortTransition != nil && !r.NativeAbortTransition.Finalized {
++			return finalizeHostNativeRefusal(ctx, s, workerDirectory, r.NativeAbortTransition.Source.SessionID,
++				hostNativeAbortFinalizationDependencies{hostNativeAbortDependencies: hostNativeAbortDependencies{owner: verifyHostNativeRefusalOwner, ledger: callHostNativeLedger}})
++		}
+ 		if r.NativeTransition == nil || r.NativeTransition.Finalized {
+ 			return nil
+ 		}
+@@ -386,7 +393,8 @@
+ // either source or target, and it remains recoverable while disabled.
+ func (s *hostRotationSupervisor) recoverNativeTransition() bool {
+ 	r := s.snapshot()
+-	if r.NativeTransition == nil || r.NativeTransition.Finalized {
++	if (r.NativeTransition == nil || r.NativeTransition.Finalized) &&
++		(r.NativeAbortTransition == nil || r.NativeAbortTransition.Finalized) {
+ 		return false
+ 	}
+ 	if s.finalizeNative == nil {
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_native_abort_finalization_test.go
+@@ -0,0 +1,437 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type nativeAbortFinalizationHarness struct {
++	*nativeAbortRetirementHarness
++	supervisor *hostRotationSupervisor
++	deps       hostNativeAbortFinalizationDependencies
++}
++
++func nativeAbortFinalizationFixture(t *testing.T) *nativeAbortFinalizationHarness {
++	t.Helper()
++	h := &nativeAbortFinalizationHarness{nativeAbortRetirementHarness: nativeAbortRetirementFixture(t)}
++	if _, err := h.nativeAbortRetirementHarness.run(); err != nil {
++		t.Fatal(err)
++	}
++	h.supervisor = &hostRotationSupervisor{path: filepath.Join(h.host.dir, "rotation-supervision", "fixture.json"),
++		record: hostRotationRecord{Version: 1, OperationID: strings.Repeat("1", 32), Operation: "enroll", Enrollment: h.host.source.Enrollment,
++			Enabled: true, State: "preparation_prepared", Generation: 10},
++		wake: make(chan struct{}, 1), done: make(chan struct{}), stopped: make(chan struct{}), updated: make(chan struct{}, 1)}
++	if err := h.supervisor.saveLocked(); err != nil {
++		t.Fatal(err)
++	}
++	h.deps.hostNativeAbortDependencies = h.nativeAbortHarness.deps
++	return h
++}
++func (h *nativeAbortFinalizationHarness) run() error {
++	return finalizeHostNativeRefusal(context.Background(), h.supervisor, h.host.dir, h.claim.request.SessionID, h.deps)
++}
++func (h *nativeAbortFinalizationHarness) activePath() string {
++	return filepath.Join(h.host.dir, hostNativeClaimDirectory, h.claim.request.SessionID+".active.json")
++}
++func (h *nativeAbortFinalizationHarness) assertFinal(t *testing.T, enabled bool) {
++	t.Helper()
++	r := h.supervisor.snapshot()
++	if r.NativeAbortTransition == nil || !r.NativeAbortTransition.Finalized || !r.NativeAbortTransition.valid() ||
++		r.Enrollment != h.host.source.Enrollment || r.Enabled != enabled || r.NativeTransition != nil {
++		t.Fatal("source abort finalization changed enrollment or control", r)
++	}
++	if _, err := os.Stat(h.activePath()); !errors.Is(err, os.ErrNotExist) {
++		t.Fatal("source fence remains", err)
++	}
++	raw, err := os.ReadFile(h.phase("host_abort_finalized"))
++	if err != nil || !hostNativeRegistrationExactShape(raw, hostNativeAbortFinalizationPhase(*r.NativeAbortTransition, "host_abort_finalized")) {
++		t.Fatal("source finalization not durable", err)
++	}
++	if h.retireCalls != 1 || h.calls != 1 {
++		t.Fatal("finalization repeated external work")
++	}
++}
++func TestHostNativeAbortFinalizationKeepsSourceAndIsDescriptive(t *testing.T) {
++	h := nativeAbortFinalizationFixture(t)
++	if err := h.run(); err != nil {
++		t.Fatal(err)
++	}
++	h.assertFinal(t, true)
++	before := h.supervisor.snapshot()
++	h.deps.hostNativeAbortDependencies = hostNativeAbortDependencies{}
++	if err := h.run(); err != nil {
++		t.Fatal("completed finalization needed provider", err)
++	}
++	if h.supervisor.snapshot().Generation != before.Generation {
++		t.Fatal("repeat changed supervisor")
++	}
++	clone := h.supervisor.snapshot()
++	clone.NativeAbortTransition.Source.SessionID = "changed"
++	if h.supervisor.snapshot().NativeAbortTransition.Source.SessionID != h.claim.request.SessionID {
++		t.Fatal("snapshot aliases transition")
++	}
++}
++func TestHostNativeAbortFinalizationRecoversEveryDurableBoundary(t *testing.T) {
++	for _, stage := range []string{"supervisor_pending", "intent", "completion", "fence_removed", "supervisor_complete"} {
++		t.Run(stage, func(t *testing.T) {
++			h := nativeAbortFinalizationFixture(t)
++			h.deps.after = func(at string) error {
++				if at == stage {
++					return errors.New("simulated process loss")
++				}
++				return nil
++			}
++			if h.run() == nil {
++				t.Fatal("fault did not interrupt")
++			}
++			var evaluations atomic.Int32
++			deps := h.deps
++			deps.after = nil
++			if stage == "completion" || stage == "fence_removed" {
++				deps.hostNativeAbortDependencies = hostNativeAbortDependencies{}
++			}
++			resumed := newHostRotationSupervisorWithFinalizer(h.supervisor.path,
++				func(_ context.Context, e hostRotationEnrollment, _ time.Time) (json.RawMessage, error) {
++					if e != h.host.source.Enrollment {
++						t.Error("another source evaluated")
++					}
++					if _, err := os.Stat(h.activePath()); !errors.Is(err, os.ErrNotExist) {
++						t.Error("source evaluated before fence cleanup")
++					}
++					evaluations.Add(1)
++					return json.RawMessage(`{"v":1,"decision":"hold"}`), nil
++				},
++				func(ctx context.Context, s *hostRotationSupervisor) error {
++					return finalizeHostNativeRefusal(ctx, s, h.host.dir, h.claim.request.SessionID, deps)
++				})
++			defer resumed.close()
++			h.supervisor = resumed
++			awaitHostRotation(t, resumed, func(r hostRotationRecord) bool {
++				return r.NativeAbortTransition != nil && r.NativeAbortTransition.Finalized && r.State == "native_refused"
++			})
++			h.assertFinal(t, true)
++			if evaluations.Load() != 0 {
++				t.Fatal("unexpected evaluations", evaluations.Load())
++			}
++		})
++	}
++}
++func TestHostNativeAbortFinalizationPreservesHumanControl(t *testing.T) {
++	for _, mode := range []string{"disabled", "human_takeover"} {
++		t.Run(mode, func(t *testing.T) {
++			h := nativeAbortFinalizationFixture(t)
++			h.deps.after = func(stage string) error {
++				if stage == "intent" {
++					return errors.New("pause")
++				}
++				return nil
++			}
++			if h.run() == nil {
++				t.Fatal("pause")
++			}
++			if mode == "disabled" {
++				if err := h.supervisor.configure(hostRotationRequest{Operation: "disable", ID: strings.Repeat("2", 32)}, hostRotationEnrollment{}); err != nil {
++					t.Fatal(err)
++				}
++			} else {
++				h.supervisor.humanInput()
++			}
++			before := h.supervisor.snapshot()
++			if err := h.supervisor.configure(hostRotationRequest{Operation: "enroll", ID: strings.Repeat("3", 32)}, h.host.source.Enrollment); err == nil {
++				t.Fatal("pending abort re-enrolled")
++			}
++			var evaluations atomic.Int32
++			deps := h.deps
++			deps.after = nil
++			resumed := newHostRotationSupervisorWithFinalizer(h.supervisor.path,
++				func(context.Context, hostRotationEnrollment, time.Time) (json.RawMessage, error) {
++					evaluations.Add(1)
++					return nil, errors.New("must not evaluate")
++				},
++				func(ctx context.Context, s *hostRotationSupervisor) error {
++					return finalizeHostNativeRefusal(ctx, s, h.host.dir, h.claim.request.SessionID, deps)
++				})
++			defer resumed.close()
++			h.supervisor = resumed
++			r := awaitHostRotation(t, resumed, func(r hostRotationRecord) bool {
++				return r.NativeAbortTransition != nil && r.NativeAbortTransition.Finalized
++			})
++			if r.Enabled || r.State != mode || r.OperationID != before.OperationID || r.Operation != before.Operation || evaluations.Load() != 0 {
++				t.Fatal("human control lost", r)
++			}
++			h.assertFinal(t, false)
++		})
++	}
++}
++func TestHostNativeAbortFinalizationWithoutRecoveryNeverEvaluates(t *testing.T) {
++	h := nativeAbortFinalizationFixture(t)
++	h.deps.after = func(stage string) error {
++		if stage == "supervisor_pending" {
++			return errors.New("pause")
++		}
++		return nil
++	}
++	if h.run() == nil {
++		t.Fatal("pause")
++	}
++	evaluated := make(chan struct{}, 1)
++	resumed := newHostRotationSupervisor(h.supervisor.path, func(context.Context, hostRotationEnrollment, time.Time) (json.RawMessage, error) {
++		evaluated <- struct{}{}
++		return nil, errors.New("must not evaluate")
++	})
++	defer resumed.close()
++	select {
++	case <-evaluated:
++		t.Fatal("pending abort evaluated")
++	case <-time.After(50 * time.Millisecond):
++	}
++	r := resumed.snapshot()
++	if r.NativeAbortTransition == nil || r.NativeAbortTransition.Finalized {
++		t.Fatal("pending abort lost")
++	}
++}
++func TestHostNativeAbortFinalizationRequiresVerifiedRetirement(t *testing.T) {
++	for _, mode := range []string{"missing_retired", "missing_ack", "partial_retired", "partial_intent", "partial_complete", "owner", "ledger", "supervisor_owner", "cancelled"} {
++		t.Run(mode, func(t *testing.T) {
++			h := nativeAbortFinalizationFixture(t)
++			ctx := context.Background()
++			switch mode {
++			case "missing_retired":
++				if err := os.Remove(h.phase("native_abort_retired")); err != nil {
++					t.Fatal(err)
++				}
++			case "missing_ack":
++				if err := os.Remove(h.phase("native_abort_ack_requested")); err != nil {
++					t.Fatal(err)
++				}
++			case "partial_retired":
++				if err := os.WriteFile(h.phase("native_abort_retired"), []byte("{"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "partial_intent":
++				writeNativeCompletionJSON(t, h.phase("host_abort_finalization_requested"), map[string]any{})
++			case "partial_complete":
++				writeNativeCompletionJSON(t, h.phase("host_abort_finalized"), map[string]any{})
++			case "owner":
++				h.deps.owner = func(hostRotationEnrollment, hostNativeRefusalRecord) error { return errors.New("owner changed") }
++			case "ledger":
++				h.nativeAbortHarness.mutation = "claim_open"
++			case "supervisor_owner":
++				h.supervisor.record.Enrollment.SessionID = "00000000-0000-0000-0000-000000000999"
++			case "cancelled":
++				var cancel context.CancelFunc
++				ctx, cancel = context.WithCancel(ctx)
++				cancel()
++			}
++			if err := finalizeHostNativeRefusal(ctx, h.supervisor, h.host.dir, h.claim.request.SessionID, h.deps); err == nil {
++				t.Fatal("unverified abort finalized")
++			}
++			if h.supervisor.snapshot().NativeAbortTransition != nil {
++				t.Fatal("unverified supervisor link")
++			}
++			if _, err := os.Stat(h.activePath()); err != nil {
++				t.Fatal("source fence removed")
++			}
++		})
++	}
++}
++func TestHostNativeAbortFinalizationNeverRemovesNewerFenceOrChangedHistory(t *testing.T) {
++	for _, mode := range []string{"other_active", "retired", "ack", "request", "intent", "completion", "supervisor"} {
++		t.Run(mode, func(t *testing.T) {
++			h := nativeAbortFinalizationFixture(t)
++			h.deps.after = func(stage string) error {
++				if stage == "completion" {
++					return errors.New("pause")
++				}
++				return nil
++			}
++			if h.run() == nil {
++				t.Fatal("pause")
++			}
++			switch mode {
++			case "other_active":
++				raw, _ := os.ReadFile(h.activePath())
++				var a hostNativeClaimActive
++				if json.Unmarshal(raw, &a) != nil {
++					t.Fatal("fixture")
++				}
++				a.OperationID = "00000000-0000-0000-0000-000000000999"
++				writeNativeCompletionJSON(t, h.activePath(), a)
++			case "retired":
++				writeNativeCompletionJSON(t, h.phase("native_abort_retired"), map[string]any{})
++			case "ack":
++				writeNativeCompletionJSON(t, h.phase("native_abort_ack_requested"), map[string]any{})
++			case "request":
++				writeNativeCompletionJSON(t, h.phase("request"), map[string]any{})
++			case "intent":
++				writeNativeCompletionJSON(t, h.phase("host_abort_finalization_requested"), map[string]any{})
++			case "completion":
++				writeNativeCompletionJSON(t, h.phase("host_abort_finalized"), map[string]any{})
++			case "supervisor":
++				h.supervisor.record.Enrollment.SessionID = "00000000-0000-0000-0000-000000000999"
++			}
++			h.deps.after = nil
++			h.deps.hostNativeAbortDependencies = hostNativeAbortDependencies{}
++			if h.run() == nil {
++				t.Fatal("changed history finalized")
++			}
++			if _, err := os.Stat(h.activePath()); err != nil {
++				t.Fatal("conflicting fence removed")
++			}
++			if h.supervisor.snapshot().NativeAbortTransition.Finalized {
++				t.Fatal("conflict marked complete")
++			}
++		})
++	}
++}
++func TestHostNativeAbortDriverCompletesRefusalWithoutCommitReplay(t *testing.T) {
++	for _, mode := range []string{"enabled", "disabled", "human_takeover", "observation"} {
++		t.Run(mode, func(t *testing.T) {
++			h := nativeAbortFinalizationFixture(t)
++			// Preserve the claim/intent/handoff/refusal, remove only fixture-created
++			// downstream receipts so production recovery drives the entire stage.
++			for _, phase := range []string{"ledger_abort_requested", "ledger_abort_received", "native_abort_ack_requested", "native_abort_retired"} {
++				if err := os.Remove(h.phase(phase)); err != nil {
++					t.Fatal(err)
++				}
++			}
++			h.aborted = nil
++			h.calls = 0
++			h.retireCalls = 0
++			h.retired = false
++			if mode == "disabled" || mode == "human_takeover" {
++				h.supervisor.record.Enabled = false
++				h.supervisor.record.State = mode
++			}
++			d := &hostNativeTransactionDriver{directory: h.host.dir, deps: hostNativeDriverDependencies{
++				hostNativeRetirementDependencies: hostNativeRetirementDependencies{hostNativeRegistrationDependencies: hostNativeRegistrationDependencies{ledger: h.nativeAbortHarness.deps.ledger}},
++				refusalOwner:                     h.owner, retireRefusal: h.depsRetire(),
++				acquire: func(context.Context, hostRotationEnrollment, hostRotationPreparation, func() error) (hostNativeDriverClaim, error) {
++					t.Fatal("recovery claimed")
++					return nil, errors.New("forbidden")
++				},
++				observe: func(context.Context, hostRotationEnrollment, string, string) (nativeRotationReply, error) {
++					t.Fatal("durable refusal re-observed")
++					return nativeRotationReply{}, errors.New("forbidden")
++				},
++			}}
++			var result hostNativeDriverResult
++			var err error
++			if mode == "observation" {
++				reply := nativeRotationReply{Version: 1, State: "source_retained", OperationID: h.claim.request.Epoch, HostClaimID: h.claim.request.HostClaimID, Source: &h.receipt.Source, JournalDirectory: h.path}
++				result, err = d.completeObservation(context.Background(), h.supervisor, h.host.source.Enrollment, reply)
++			} else {
++				result, err = d.recover(context.Background(), h.supervisor)
++			}
++			if err != nil || result.Pending {
++				t.Fatal("source recovery incomplete", result, err)
++			}
++			h.assertFinal(t, mode == "enabled" || mode == "observation")
++			if mode == "disabled" || mode == "human_takeover" {
++				if h.supervisor.snapshot().State != mode {
++					t.Fatal("human state changed")
++				}
++			}
++		})
++	}
++}
++func (h *nativeAbortFinalizationHarness) depsRetire() func(context.Context, hostRotationEnrollment, hostNativeRefusalRecord) (nativeRotationReply, error) {
++	return h.nativeAbortRetirementHarness.deps.retire
++}
++func TestHostNativeAbortDriverRecoversAfterFenceRemovalWithoutProvider(t *testing.T) {
++	h := nativeAbortFinalizationFixture(t)
++	h.deps.after = func(stage string) error {
++		if stage == "fence_removed" {
++			return errors.New("pause")
++		}
++		return nil
++	}
++	if h.run() == nil {
++		t.Fatal("pause")
++	}
++	d := &hostNativeTransactionDriver{directory: h.host.dir}
++	r, err := d.recover(context.Background(), h.supervisor)
++	if err != nil || r.Pending {
++		t.Fatal("historical cleanup needed provider", r, err)
++	}
++	h.assertFinal(t, true)
++}
++
++func TestHostNativeAbortFinalizationDoesNotReevaluateRefusedTurnOnRestart(t *testing.T) {
++	h := nativeAbortFinalizationFixture(t)
++	if err := h.run(); err != nil {
++		t.Fatal(err)
++	}
++	var evaluations atomic.Int32
++	resumed := newHostRotationSupervisor(h.supervisor.path, func(context.Context, hostRotationEnrollment, time.Time) (json.RawMessage, error) {
++		evaluations.Add(1)
++		return nil, errors.New("must wait for another completed turn")
++	})
++	defer resumed.close()
++	if r := resumed.snapshot(); !r.Enabled || r.State != "native_refused" || r.NextEvaluationMS != 0 {
++		t.Fatal("restart armed refused turn", r)
++	}
++	select {
++	case <-resumed.updated:
++	case <-time.After(50 * time.Millisecond):
++	}
++	if evaluations.Load() != 0 {
++		t.Fatal("refused turn reevaluated")
++	}
++	h.supervisor = resumed
++	h.assertFinal(t, true)
++}
++func TestHostNativeAbortDriverRequiresNewTurnOrExplicitReenrollment(t *testing.T) {
++	h := nativeAbortFinalizationFixture(t)
++	if err := h.run(); err != nil {
++		t.Fatal(err)
++	}
++	acquired := 0
++	d := &hostNativeTransactionDriver{directory: h.host.dir, deps: hostNativeDriverDependencies{
++		acquire: func(context.Context, hostRotationEnrollment, hostRotationPreparation, func() error) (hostNativeDriverClaim, error) {
++			acquired++
++			return nil, errors.New("fixture admission boundary")
++		},
++	}}
++	p := hostRotationPreparation{State: "prepared", Capsule: &h.claim.request.Capsule, TurnID: h.claim.request.Source.TurnID, TurnSeq: h.claim.request.Source.TurnSeq}
++	for _, mutation := range []string{"same", "new_id_old_seq", "same_id_new_seq"} {
++		q := p
++		if mutation == "new_id_old_seq" {
++			q.TurnID = "new-turn"
++		}
++		if mutation == "same_id_new_seq" {
++			q.TurnSeq++
++		}
++		result, err := d.start(context.Background(), h.supervisor, h.host.source.Enrollment, q, func() error { return nil })
++		if err == nil || result.State != "native_retry_requires_new_turn" || acquired != 0 {
++			t.Fatal("refused turn reacquired", mutation, result, err)
++		}
++	}
++	fresh := p
++	fresh.TurnID = "new-turn"
++	fresh.TurnSeq++
++	result, _ := d.start(context.Background(), h.supervisor, h.host.source.Enrollment, fresh, func() error { return nil })
++	if acquired != 1 || result.State != "native_claim_pending" {
++		t.Fatal("fresh turn was not admitted")
++	}
++	if err := h.supervisor.configure(hostRotationRequest{Operation: "enroll", ID: strings.Repeat("4", 32)}, h.host.source.Enrollment); err != nil {
++		t.Fatal(err)
++	}
++	if h.supervisor.snapshot().NativeAbortTransition != nil {
++		t.Fatal("explicit enrollment did not arm fresh admission")
++	}
++	result, _ = d.start(context.Background(), h.supervisor, h.host.source.Enrollment, p, func() error { return nil })
++	if acquired != 2 || result.State != "native_claim_pending" {
++		t.Fatal("explicit retry was not admitted")
++	}
++	if _, err := os.Stat(h.phase("host_abort_finalized")); err != nil {
++		t.Fatal("explicit enrollment lost durable history")
++	}
++}

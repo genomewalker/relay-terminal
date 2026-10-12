@@ -10,10 +10,7 @@ let package = Package(
         .executable(name: "relay-bridge", targets: ["RelayBridge"])
     ],
     dependencies: [
-        .package(
-            url: "https://github.com/genomewalker/libghostty-spm.git",
-            revision: "859807b2d92ec8e2e57806b311fad23afe5f16c4"
-        )
+        .package(path: "Vendor/libghostty-spm")
     ],
     targets: [
         .executableTarget(
@@ -25,7 +22,10 @@ let package = Package(
             resources: [
                 .copy("Resources/Editor"),
                 .copy("Resources/SidePanel"),
-                .copy("Resources/Terminfo")
+                .copy("Resources/Terminfo"),
+                .copy("Resources/Rotation"),
+                .copy("Resources/RichContent"),
+                .copy("Resources/VPN")
             ],
             linkerSettings: [
                 .linkedFramework("WebKit"),

@@ -1,0 +1,392 @@
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -250,3 +250,8 @@
+ pub use session::native_rotation::NativeRotationError;
+ pub use session::native_rotation::NativeRotationReceipt;
+ pub use session::native_rotation::NativeRotationReservation;
++
++pub use session::native_rotation::commit::NativeRotationCommitOutcome;
++pub use session::native_rotation::commit::NativeRotationCommitReceipt;
++pub use session::native_rotation::commit::NativeRotationCommitRequest;
++pub use session::native_rotation::commit::NativeRotationCommittedSession;
+--- a/codex-rs/core/src/session/native_rotation.rs
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -1,5 +1,5 @@
+-//! Native preparation only. The receipt does not authorize a capsule write,
+-//! frontend draft replacement, writer shutdown, clear or restore.
++//! Native reservation and owned transaction support. Serialized receipts alone
++//! never authorize frontend replacement, writer shutdown, clear or restore.
+ use super::activity_admission::ActivityReservation;
+ use super::rotation_dispatch::DispatchLease;
+ use super::session::Session;
+@@ -246,6 +246,8 @@
+ 
+ #[path = "native_rotation_close.rs"]
+ pub(crate) mod close;
++#[path = "native_rotation_commit.rs"]
++pub(crate) mod commit;
+ #[path = "native_rotation_journal.rs"]
+ mod journal;
+ #[path = "native_rotation_restore.rs"]
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation_commit.rs
+@@ -0,0 +1,188 @@
++//! Typed in-process transaction boundary for an owned native reservation.
++//! The embedding foreground owner must verify its durable host intent and keep
++//! input sealed through attachment. Requests and receipts alone confer no ownership.
++use super::NativeRotationError;
++use super::NativeRotationReceipt;
++use super::NativeRotationReservation;
++use super::close::NativeCloseOutcome;
++use super::close::NativeCloseRequest;
++use super::close::NativeClosedSession;
++use super::restore::digest;
++use crate::NewThread;
++use codex_protocol::ThreadId;
++use std::path::PathBuf;
++use std::sync::Arc;
++
++/// Structurally validated input. This is not a host-claim or frontend capability.
++pub struct NativeRotationCommitRequest {
++    operation_id: uuid::Uuid,
++    host_claim_id: uuid::Uuid,
++    source: NativeRotationReceipt,
++    capsule_sha256: String,
++    capsule: String,
++}
++
++impl NativeRotationCommitRequest {
++    pub fn new(
++        operation_id: uuid::Uuid,
++        host_claim_id: uuid::Uuid,
++        source: NativeRotationReceipt,
++        capsule_sha256: String,
++        capsule: String,
++    ) -> Result<Self, NativeRotationError> {
++        if operation_id.is_nil()
++            || operation_id == host_claim_id
++            || host_claim_id.is_nil()
++            || capsule.trim().is_empty()
++            || capsule.len() > 16 * 1024
++            || capsule.contains('\0')
++            || digest(capsule.as_bytes()) != capsule_sha256
++        {
++            return Err(NativeRotationError::InvalidRequest);
++        }
++        Ok(Self {
++            operation_id,
++            host_claim_id,
++            source,
++            capsule_sha256,
++            capsule,
++        })
++    }
++}
++
++/// Descriptive evidence for journal/process verification; it cannot recreate a lease.
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
++pub struct NativeRotationCommitReceipt {
++    pub operation_id: uuid::Uuid,
++    pub host_claim_id: uuid::Uuid,
++    pub source: NativeRotationReceipt,
++    pub target_thread_id: ThreadId,
++    pub target_runtime_id: uuid::Uuid,
++    pub target_rollout_path: PathBuf,
++    pub capsule_sha256: String,
++    pub settings_sha256: String,
++    pub process_id: u32,
++    pub journal_directory: PathBuf,
++}
++
++/// Retains the actual restored thread and its native owner state through attachment.
++/// There is no constructor, deserializer or clone from a serialized receipt.
++pub struct NativeRotationCommittedSession {
++    closed: Box<NativeClosedSession>,
++    receipt: NativeRotationCommitReceipt,
++}
++
++impl std::fmt::Debug for NativeRotationCommittedSession {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter
++            .debug_struct("NativeRotationCommittedSession")
++            .field("receipt", &self.receipt)
++            .finish_non_exhaustive()
++    }
++}
++
++impl NativeRotationCommittedSession {
++    pub fn target(&self) -> &NewThread {
++        self.closed
++            .restored
++            .as_ref()
++            .expect("restored target checked on construction")
++    }
++
++    pub fn receipt(&self) -> &NativeRotationCommitReceipt {
++        &self.receipt
++    }
++}
++
++/// Keep this phase intact until the foreground and host reconcile their own state.
++#[derive(Debug)]
++#[must_use = "native rotation completion must be retained and reconciled"]
++pub enum NativeRotationCommitOutcome {
++    /// This transaction did not seal; the foreground must still revalidate its source.
++    Refused(NativeRotationError),
++    Restored(Box<NativeRotationCommittedSession>),
++    ReconciliationRequired(NativeRotationError),
++}
++
++impl NativeRotationReservation {
++    /// Consume the real native lease after the embedding owner has verified its host
++    /// claim and sealed foreground input. This adds no JSON-RPC or model-facing route.
++    /// The caller must retain the returned owner until that exact target is attached.
++    pub async fn commit_capsule(
++        self,
++        request: NativeRotationCommitRequest,
++    ) -> NativeRotationCommitOutcome {
++        if self.receipt() != &request.source {
++            return NativeRotationCommitOutcome::Refused(NativeRotationError::InvalidRequest);
++        }
++        let NativeRotationCommitRequest {
++            operation_id,
++            host_claim_id,
++            source,
++            capsule_sha256,
++            capsule,
++        } = request;
++        let mut close_request =
++            NativeCloseRequest::new(operation_id, host_claim_id, capsule_sha256.clone());
++        close_request.restore_capsule = Some(capsule);
++        let closed = match self.close_for_rotation_outcome(close_request).await {
++            NativeCloseOutcome::Refused(error) => {
++                return NativeRotationCommitOutcome::Refused(error);
++            }
++            NativeCloseOutcome::ReconciliationRequired(error) => {
++                return NativeRotationCommitOutcome::ReconciliationRequired(error);
++            }
++            NativeCloseOutcome::Completed(closed) => closed,
++        };
++        let Some((target, restored)) = closed
++            .restored
++            .as_ref()
++            .zip(closed.restore_receipt.as_ref())
++        else {
++            return NativeRotationCommitOutcome::ReconciliationRequired(
++                NativeRotationError::RestoreFailed(
++                    "native completion has no restored owner".into(),
++                ),
++            );
++        };
++        let registered = {
++            let threads = closed.manager.threads.read().await;
++            threads
++                .get(&target.thread_id)
++                .is_some_and(|thread| Arc::ptr_eq(thread, &target.thread) && thread.is_running())
++        };
++        if closed.receipt.operation_id != operation_id
++            || closed.receipt.claim_id != host_claim_id
++            || closed.receipt.source != source
++            || closed.receipt.capsule_sha256 != capsule_sha256
++            || restored.capsule_sha256 != capsule_sha256
++            || restored.thread_id != target.thread_id
++            || restored.thread_id == source.thread_id
++            || restored.runtime_id != target.thread.session.native_rotation.runtime_id
++            || restored.process_id != std::process::id()
++            || !registered
++        {
++            return NativeRotationCommitOutcome::ReconciliationRequired(
++                NativeRotationError::RestoreFailed(
++                    "native restoration ownership changed before handoff".into(),
++                ),
++            );
++        }
++        let receipt = NativeRotationCommitReceipt {
++            operation_id,
++            host_claim_id,
++            source,
++            target_thread_id: restored.thread_id,
++            target_runtime_id: restored.runtime_id,
++            target_rollout_path: restored.rollout_path.clone(),
++            capsule_sha256,
++            settings_sha256: restored.settings_sha256.clone(),
++            process_id: restored.process_id,
++            journal_directory: closed.receipt.journal_directory.clone(),
++        };
++        NativeRotationCommitOutcome::Restored(Box::new(NativeRotationCommittedSession {
++            closed,
++            receipt,
++        }))
++    }
++}
+--- /dev/null
++++ b/codex-rs/core/src/thread_manager/native_rotation_commit_tests.rs
+@@ -0,0 +1,159 @@
++use super::Fixture;
++use super::native_close_directory;
++use super::native_close_fixture_finished;
++use crate::NativeRotationCommitOutcome;
++use crate::NativeRotationCommitRequest;
++use crate::NativeRotationError;
++use crate::NativeRotationReceipt;
++use codex_protocol::ThreadId;
++use pretty_assertions::assert_eq;
++use sha2::Digest;
++use std::sync::Arc;
++
++fn commit_request(
++    source: NativeRotationReceipt,
++    capsule: &str,
++) -> (NativeRotationCommitRequest, uuid::Uuid, uuid::Uuid) {
++    let operation = uuid::Uuid::new_v4();
++    let claim = uuid::Uuid::new_v4();
++    let request = NativeRotationCommitRequest::new(
++        operation,
++        claim,
++        source,
++        format!("{:x}", sha2::Sha256::digest(capsule.as_bytes())),
++        capsule.into(),
++    )
++    .unwrap();
++    (request, operation, claim)
++}
++
++#[tokio::test]
++async fn native_commit_request_bounds_bytes_and_requires_exact_capsule_digest() {
++    let fixture = Fixture::completed().await;
++    let lease = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let source = lease.receipt().clone();
++    for capsule in [
++        String::new(),
++        "   ".into(),
++        "bad\0capsule".into(),
++        "x".repeat(16 * 1024 + 1),
++        "π".repeat(8 * 1024 + 1),
++    ] {
++        let request = NativeRotationCommitRequest::new(
++            uuid::Uuid::new_v4(),
++            uuid::Uuid::new_v4(),
++            source.clone(),
++            format!("{:x}", sha2::Sha256::digest(capsule.as_bytes())),
++            capsule,
++        );
++        assert!(matches!(request, Err(NativeRotationError::InvalidRequest)));
++    }
++    assert!(matches!(
++        NativeRotationCommitRequest::new(
++            uuid::Uuid::new_v4(),
++            uuid::Uuid::new_v4(),
++            source.clone(),
++            "a".repeat(64),
++            "different body".into(),
++        ),
++        Err(NativeRotationError::InvalidRequest)
++    ));
++    let digest = format!("{:x}", sha2::Sha256::digest(b"body"));
++    let id = uuid::Uuid::new_v4();
++    for (operation, claim) in [(uuid::Uuid::nil(), id), (id, uuid::Uuid::nil()), (id, id)] {
++        assert!(matches!(
++            NativeRotationCommitRequest::new(
++                operation,
++                claim,
++                source.clone(),
++                digest.clone(),
++                "body".into(),
++            ),
++            Err(NativeRotationError::InvalidRequest)
++        ));
++    }
++    drop(lease);
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_commit_requires_the_exact_source_of_the_consumed_lease() {
++    let fixture = Fixture::completed().await;
++    for change in 0..5 {
++        let lease = fixture
++            .root
++            .thread
++            .prepare_context_rotation(fixture.turn.clone())
++            .await
++            .unwrap();
++        let revoked = lease.revoked();
++        let mut source = lease.receipt().clone();
++        match change {
++            0 => source.runtime_id = uuid::Uuid::new_v4(),
++            1 => source.thread_id = ThreadId::new(),
++            2 => source.turn_id.push_str("-changed"),
++            3 => source.rollout_path.push("changed"),
++            4 => source.admission_generation += 1,
++            _ => unreachable!(),
++        }
++        let (request, operation, _) = commit_request(source, "capsule");
++        assert!(matches!(
++            lease.commit_capsule(request).await,
++            NativeRotationCommitOutcome::Refused(NativeRotationError::InvalidRequest)
++        ));
++        revoked.await;
++        assert!(!native_close_directory(&fixture, operation).exists());
++        assert!(
++            fixture
++                .manager
++                .get_thread(fixture.root.thread_id)
++                .await
++                .is_ok()
++        );
++    }
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_commit_returns_the_owned_target_and_bound_restoration_evidence() {
++    let fixture = Fixture::completed().await;
++    let lease = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let source = lease.receipt().clone();
++    let capsule = format!("π{}", "x".repeat(16 * 1024 - 2));
++    let (request, operation, claim) = commit_request(source.clone(), &capsule);
++    let outcome = lease.commit_capsule(request).await;
++    let NativeRotationCommitOutcome::Restored(owned) = outcome else {
++        panic!("native commit did not restore: {outcome:?}");
++    };
++    let receipt = owned.receipt();
++    assert_eq!(receipt.operation_id, operation);
++    assert_eq!(receipt.host_claim_id, claim);
++    assert_eq!(receipt.source, source);
++    assert_eq!(receipt.target_thread_id, owned.target().thread_id);
++    assert_eq!(receipt.process_id, std::process::id());
++    assert_eq!(
++        receipt.capsule_sha256,
++        format!("{:x}", sha2::Sha256::digest(capsule.as_bytes()))
++    );
++    let registered = fixture
++        .manager
++        .get_thread(receipt.target_thread_id)
++        .await
++        .unwrap();
++    assert!(Arc::ptr_eq(&registered, &owned.target().thread));
++    assert!(receipt.target_rollout_path.is_file());
++    assert!(receipt.journal_directory.join("restored.json").is_file());
++    owned.target().thread.shutdown_and_wait().await.unwrap();
++    drop(owned);
++    native_close_fixture_finished(fixture).await;
++}
+--- a/codex-rs/core/src/thread_manager/native_rotation_tests.rs
++++ b/codex-rs/core/src/thread_manager/native_rotation_tests.rs
+@@ -1499,3 +1499,6 @@
+ 
+ #[path = "native_rotation_outcome_tests.rs"]
+ mod outcome_tests;
++
++#[path = "native_rotation_commit_tests.rs"]
++mod commit_tests;

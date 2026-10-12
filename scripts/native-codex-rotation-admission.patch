@@ -1,0 +1,844 @@
+--- /dev/null
++++ b/codex-rs/core/src/session/submission_admission.rs
+@@ -0,0 +1,78 @@
++//! Submission admission for a native rotation transaction.
++//!
++//! The receiver owner must reserve from its ordered dispatch loop, never while
++//! another task may dequeue an operation. This gate also covers task admission;
++//! frontend input, pending mailbox state and durable history require separate checks.
++use super::Submission;
++use super::activity_admission::ActivityAdmission;
++use super::activity_admission::ActivityReservation;
++use async_channel::SendError;
++use async_channel::Sender;
++
++#[derive(Clone)]
++pub(crate) struct SubmissionSender {
++    sender: Sender<Submission>,
++    admission: ActivityAdmission,
++}
++
++/// Holds channel and task admission until dropped; waiting input stays owned.
++pub(crate) struct SubmissionReservation {
++    sender: Sender<Submission>,
++    activity: ActivityReservation,
++}
++
++impl From<Sender<Submission>> for SubmissionSender {
++    fn from(sender: Sender<Submission>) -> Self {
++        Self::new(sender, ActivityAdmission::default())
++    }
++}
++
++impl SubmissionSender {
++    pub(crate) fn new(sender: Sender<Submission>, admission: ActivityAdmission) -> Self {
++        Self { sender, admission }
++    }
++
++    pub(crate) async fn send(&self, submission: Submission) -> Result<(), SendError<Submission>> {
++        let Some(_admission) = self.admission.enter().await else {
++            return Err(SendError(submission));
++        };
++        self.sender.send(submission).await
++    }
++
++    pub(crate) fn is_closed(&self) -> bool {
++        self.sender.is_closed()
++    }
++
++    pub(crate) fn generation(&self) -> Option<u64> {
++        self.admission.generation()
++    }
++
++    /// Call only from the receiver's ordered dispatch loop. Fails immediately
++    /// for queued input, active or starting tasks, pending attempts or stale evidence.
++    pub(crate) fn try_reserve(&self, expected_generation: u64) -> Option<SubmissionReservation> {
++        let activity = self.admission.try_reserve(expected_generation)?;
++        if self.sender.is_closed() || !self.sender.is_empty() {
++            return None;
++        }
++        Some(SubmissionReservation {
++            sender: self.sender.clone(),
++            activity,
++        })
++    }
++}
++
++impl SubmissionReservation {
++    pub(crate) fn is_current(&self) -> bool {
++        self.activity.is_current() && !self.sender.is_closed() && self.sender.is_empty()
++    }
++
++    /// A successful channel seal is not a durable-history or native-clear receipt.
++    pub(crate) fn close_if_current(self) -> bool {
++        self.activity
++            .seal_if_current(|| self.sender.is_empty() && self.sender.close())
++    }
++}
++
++#[cfg(test)]
++#[path = "submission_admission_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/core/src/session/submission_admission_tests.rs
+@@ -0,0 +1,129 @@
++use super::SubmissionSender;
++use crate::session::Submission;
++use codex_protocol::protocol::Op;
++use futures::poll;
++use std::task::Poll;
++
++fn submission(id: &str) -> Submission {
++    Submission {
++        id: id.to_owned(),
++        op: Op::Shutdown,
++        trace: None,
++        parent_turn_id: None,
++        root_turn_id: None,
++        residency_guard: None,
++    }
++}
++
++#[tokio::test]
++async fn reservation_keeps_waiting_input_and_detects_its_attempt() {
++    let (raw, receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    let reservation = sender.try_reserve(0).expect("idle channel");
++    let peer = sender.clone();
++    let pending = peer.send(submission("peer"));
++    tokio::pin!(pending);
++    assert!(matches!(poll!(&mut pending), Poll::Pending));
++    assert!(!reservation.is_current());
++    assert!(receiver.is_empty());
++    assert!(!reservation.close_if_current());
++    pending.await.expect("input is preserved on release");
++    assert_eq!(receiver.recv().await.unwrap().id, "peer");
++    assert!(!sender.is_closed());
++}
++
++#[tokio::test]
++async fn accepted_input_must_be_drained_before_reservation() {
++    let (raw, receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    sender.send(submission("first")).await.unwrap();
++    assert!(sender.try_reserve(1).is_none());
++    assert_eq!(receiver.recv().await.unwrap().id, "first");
++    assert!(sender.try_reserve(0).is_none());
++    assert!(sender.try_reserve(1).unwrap().is_current());
++}
++
++#[tokio::test]
++async fn cancelled_waiter_still_invalidates_boundary() {
++    let (raw, receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    let reservation = sender.try_reserve(0).unwrap();
++    {
++        let pending = sender.send(submission("cancelled"));
++        tokio::pin!(pending);
++        assert!(matches!(poll!(&mut pending), Poll::Pending));
++    }
++    assert!(!reservation.close_if_current());
++    assert!(receiver.is_empty());
++    assert!(sender.try_reserve(1).unwrap().is_current());
++}
++
++#[tokio::test]
++async fn dropping_reservation_reopens_unchanged_channel() {
++    let (raw, receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    let reservation = sender.try_reserve(0).unwrap();
++    assert!(sender.try_reserve(0).is_none());
++    drop(reservation);
++    sender.send(submission("next")).await.unwrap();
++    assert_eq!(receiver.recv().await.unwrap().id, "next");
++}
++
++#[tokio::test]
++async fn successful_close_rejects_later_input_without_accepting_it() {
++    let (raw, receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    assert!(sender.try_reserve(0).unwrap().close_if_current());
++    let rejected = sender.send(submission("late")).await.unwrap_err();
++    assert_eq!(rejected.0.id, "late");
++    assert!(receiver.recv().await.is_err());
++    assert!(sender.try_reserve(1).is_none());
++}
++
++#[tokio::test]
++async fn full_channel_waiter_prevents_reservation_without_losing_order() {
++    let (raw, receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    sender.send(submission("first")).await.unwrap();
++    let pending = sender.send(submission("second"));
++    tokio::pin!(pending);
++    assert!(matches!(poll!(&mut pending), Poll::Pending));
++    assert!(sender.try_reserve(2).is_none());
++    assert_eq!(receiver.recv().await.unwrap().id, "first");
++    pending.await.unwrap();
++    assert_eq!(receiver.recv().await.unwrap().id, "second");
++    assert!(sender.try_reserve(2).unwrap().is_current());
++}
++
++#[tokio::test]
++async fn receiver_closure_invalidates_reservation() {
++    let (raw, receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    let reservation = sender.try_reserve(0).unwrap();
++    receiver.close();
++    assert!(!reservation.is_current());
++    assert!(!reservation.close_if_current());
++}
++
++#[tokio::test]
++async fn active_task_permit_excludes_submission_reservation() {
++    let (raw, _receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    let task = sender.admission.enter().await.unwrap();
++    assert!(sender.try_reserve(1).is_none());
++    drop(task);
++    assert!(sender.try_reserve(1).unwrap().is_current());
++}
++
++#[tokio::test]
++async fn attempted_task_start_invalidates_channel_seal() {
++    let (raw, _receiver) = async_channel::bounded(1);
++    let sender = SubmissionSender::from(raw);
++    let reservation = sender.try_reserve(0).unwrap();
++    let pending = sender.admission.enter();
++    tokio::pin!(pending);
++    assert!(matches!(poll!(&mut pending), Poll::Pending));
++    assert!(!reservation.close_if_current());
++    assert!(pending.await.is_some());
++    assert!(!sender.is_closed());
++}
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -240,6 +240,7 @@
+ mod submission;
+ pub(crate) use reasoning_effort::RequestEffortUsage;
+ pub(crate) use submission::Submission;
++pub(crate) mod activity_admission;
+ mod input_queue;
+ mod mcp;
+ mod mcp_prewarm;
+@@ -258,6 +259,7 @@
+ mod step_activation;
+ pub(crate) mod step_context;
+ pub(crate) mod step_settings;
++pub(crate) mod submission_admission;
+ mod thread_settings;
+ pub(crate) mod time_reminder;
+ mod token_budget;
+@@ -402,7 +404,7 @@
+ /// completion future observes that shutdown.
+ #[derive(Clone)]
+ pub(crate) struct SessionIo {
+-    pub(crate) tx_sub: Sender<Submission>,
++    pub(crate) tx_sub: submission_admission::SubmissionSender,
+     pub(crate) rx_event: Receiver<Event>,
+     // Last known status of the agent.
+     pub(crate) agent_status: watch::Receiver<AgentStatus>,
+@@ -927,6 +929,8 @@
+                 .await;
+         }
+         let thread_id = session.thread_id;
++        let tx_sub =
++            submission_admission::SubmissionSender::new(tx_sub, session.activity_admission.clone());
+         #[cfg(unix)]
+         let relay_inbox = if std::env::var("RELAY_NATIVE_MESSAGES").as_deref() == Ok("1") {
+             match crate::relay_native_inbox::start(
+@@ -5233,4 +5237,6 @@
+ mod elicitation_holders_tests;
+ 
+ #[cfg(test)]
++mod activity_admission_session_tests;
++#[cfg(test)]
+ pub(crate) mod tests;
+--- a/codex-rs/core/src/relay_native_inbox.rs
++++ b/codex-rs/core/src/relay_native_inbox.rs
+@@ -1,7 +1,7 @@
+ //! Exposes the existing inter-agent submission path through an owned native inbox.
+ //! No terminal input, session replacement, policy override, or alternate model loop.
+ use crate::session::Submission;
+-use async_channel::Sender;
++use crate::session::submission_admission::SubmissionSender;
+ use codex_protocol::AgentPath;
+ use codex_protocol::protocol::InterAgentCommunication;
+ use codex_protocol::protocol::Op;
+@@ -29,11 +29,7 @@
+     }
+ }
+ 
+-pub(crate) async fn start(
+-    thread: String,
+-    cwd: PathBuf,
+-    tx: Sender<Submission>,
+-) -> io::Result<Inbox> {
++pub(crate) async fn start(thread: String, cwd: PathBuf, tx: SubmissionSender) -> io::Result<Inbox> {
+     let executable = std::env::current_exe()?.with_file_name("codex-peer-worker");
+     let home = dirs::home_dir().ok_or_else(|| io::Error::other("home unavailable"))?;
+     let mut child = Command::new(executable)
+--- a/codex-rs/core/src/codex_delegate.rs
++++ b/codex-rs/core/src/codex_delegate.rs
+@@ -164,7 +164,7 @@
+ 
+     // Forward public events from the sub-agent to the consumer.
+     let caller_io = SessionIo {
+-        tx_sub: tx_ops,
++        tx_sub: tx_ops.into(),
+         rx_event: rx_sub,
+         agent_status: io.agent_status.clone(),
+         session_loop_termination: io.session_loop_termination.clone(),
+@@ -282,7 +282,7 @@
+         session,
+         SessionIo {
+             rx_event: rx_bridge,
+-            tx_sub: tx_closed,
++            tx_sub: tx_closed.into(),
+             agent_status,
+             session_loop_termination,
+         },
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -6755,6 +6755,7 @@
+         conversation: Arc::new(RealtimeConversationManager::new()),
+         realtime_history: None,
+         active_turn: Mutex::new(None),
++        activity_admission: Default::default(),
+         async_hook_results,
+         input_queue: super::input_queue::InputQueue::new(),
+         services,
+@@ -7864,7 +7865,7 @@
+     let (tx_sub, rx_sub) = async_channel::bounded(1);
+     let (_tx_event, rx_event) = async_channel::unbounded();
+     let io = SessionIo {
+-        tx_sub,
++        tx_sub: tx_sub.into(),
+         rx_event,
+         agent_status: watch::channel(AgentStatus::PendingInit).1,
+         session_loop_termination: completed_session_loop_termination(),
+@@ -8692,7 +8693,7 @@
+         tokio::time::sleep(StdDuration::from_millis(50)).await;
+     });
+     let io = Arc::new(SessionIo {
+-        tx_sub,
++        tx_sub: tx_sub.into(),
+         rx_event,
+         agent_status: watch::channel(AgentStatus::PendingInit).1,
+         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+@@ -8728,7 +8729,7 @@
+         let _ = shutdown_complete_rx.await;
+     });
+     let io = Arc::new(SessionIo {
+-        tx_sub,
++        tx_sub: tx_sub.into(),
+         rx_event,
+         agent_status: watch::channel(AgentStatus::PendingInit).1,
+         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+@@ -9031,6 +9032,7 @@
+         conversation: Arc::new(RealtimeConversationManager::new()),
+         realtime_history: None,
+         active_turn: Mutex::new(None),
++        activity_admission: Default::default(),
+         async_hook_results,
+         input_queue: super::input_queue::InputQueue::new(),
+         services,
+--- a/codex-rs/core/src/session/extension_interruption_tests.rs
++++ b/codex-rs/core/src/session/extension_interruption_tests.rs
+@@ -45,7 +45,7 @@
+     let thread = CodexThread::new(
+         Arc::clone(&session),
+         SessionIo {
+-            tx_sub,
++            tx_sub: tx_sub.into(),
+             rx_event,
+             agent_status: watch::channel(AgentStatus::PendingInit).1,
+             session_loop_termination: completed_session_loop_termination(),
+--- a/codex-rs/core/src/guardian/review_session_tests.rs
++++ b/codex-rs/core/src/guardian/review_session_tests.rs
+@@ -149,7 +149,7 @@
+         GuardianReviewSession {
+             session,
+             io: SessionIo {
+-                tx_sub,
++                tx_sub: tx_sub.into(),
+                 rx_event,
+                 agent_status,
+                 session_loop_termination: crate::session::completed_session_loop_termination(),
+--- /dev/null
++++ b/codex-rs/core/src/session/activity_admission.rs
+@@ -0,0 +1,129 @@
++//! Admission shared by native submissions, task startup and running tasks.
++//! Reservations are acquired without waiting, so nested activity cannot deadlock
++//! behind a queued exclusive waiter.
++use std::sync::Arc;
++use std::sync::Mutex;
++use tokio::sync::OwnedRwLockReadGuard;
++use tokio::sync::OwnedRwLockWriteGuard;
++use tokio::sync::RwLock;
++
++#[derive(Clone)]
++pub(crate) struct ActivityAdmission {
++    activity: Arc<RwLock<()>>,
++    state: Arc<Mutex<AdmissionState>>,
++}
++
++struct AdmissionState {
++    generation: Option<u64>,
++    waiting: usize,
++    closed: bool,
++}
++
++/// Counts an attempt until it either owns a read permit or is cancelled.
++struct AdmissionAttempt {
++    state: Arc<Mutex<AdmissionState>>,
++}
++
++pub(crate) struct ActivityReservation {
++    state: Arc<Mutex<AdmissionState>>,
++    generation: u64,
++    _activity: OwnedRwLockWriteGuard<()>,
++}
++
++impl Default for ActivityAdmission {
++    fn default() -> Self {
++        Self {
++            activity: Arc::new(RwLock::new(())),
++            state: Arc::new(Mutex::new(AdmissionState {
++                generation: Some(0),
++                waiting: 0,
++                closed: false,
++            })),
++        }
++    }
++}
++
++impl Drop for AdmissionAttempt {
++    fn drop(&mut self) {
++        self.state
++            .lock()
++            .expect("activity admission poisoned")
++            .waiting -= 1;
++    }
++}
++
++impl ActivityAdmission {
++    fn attempt(&self) -> Option<AdmissionAttempt> {
++        let mut state = self.state.lock().expect("activity admission poisoned");
++        if state.closed {
++            return None;
++        }
++        state.generation = state.generation.and_then(|value| value.checked_add(1));
++        state.waiting += 1;
++        Some(AdmissionAttempt {
++            state: Arc::clone(&self.state),
++        })
++    }
++
++    /// The permit can be cloned to cover both task registration and its future.
++    pub(crate) async fn enter(&self) -> Option<Arc<OwnedRwLockReadGuard<()>>> {
++        let attempt = self.attempt()?;
++        let permit = Arc::clone(&self.activity).read_owned().await;
++        if self
++            .state
++            .lock()
++            .expect("activity admission poisoned")
++            .closed
++        {
++            return None;
++        }
++        drop(attempt);
++        Some(Arc::new(permit))
++    }
++
++    pub(crate) fn generation(&self) -> Option<u64> {
++        self.state
++            .lock()
++            .expect("activity admission poisoned")
++            .generation
++    }
++
++    pub(crate) fn try_reserve(&self, expected: u64) -> Option<ActivityReservation> {
++        let activity = Arc::clone(&self.activity).try_write_owned().ok()?;
++        let state = self.state.lock().expect("activity admission poisoned");
++        if state.closed || state.waiting != 0 || state.generation != Some(expected) {
++            return None;
++        }
++        Some(ActivityReservation {
++            state: Arc::clone(&self.state),
++            generation: expected,
++            _activity: activity,
++        })
++    }
++}
++
++impl ActivityReservation {
++    pub(crate) fn is_current(&self) -> bool {
++        let state = self.state.lock().expect("activity admission poisoned");
++        !state.closed && state.waiting == 0 && state.generation == Some(self.generation)
++    }
++
++    /// The synchronous action runs under the attempt-registration lock.
++    /// Failed actions leave admission open. Successful actions seal future work.
++    pub(crate) fn seal_if_current(&self, seal: impl FnOnce() -> bool) -> bool {
++        let mut state = self.state.lock().expect("activity admission poisoned");
++        if state.closed
++            || state.waiting != 0
++            || state.generation != Some(self.generation)
++            || !seal()
++        {
++            return false;
++        }
++        state.closed = true;
++        true
++    }
++}
++
++#[cfg(test)]
++#[path = "activity_admission_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/core/src/session/activity_admission_tests.rs
+@@ -0,0 +1,89 @@
++use super::ActivityAdmission;
++use futures::poll;
++use std::task::Poll;
++
++#[tokio::test]
++async fn permit_covers_startup_and_all_cloned_execution_owners() {
++    let admission = ActivityAdmission::default();
++    let startup = admission.enter().await.unwrap();
++    let running = startup.clone();
++    let generation = admission.generation().unwrap();
++    assert!(admission.try_reserve(generation).is_none());
++    drop(startup);
++    assert!(admission.try_reserve(generation).is_none());
++    drop(running);
++    assert!(admission.try_reserve(generation).unwrap().is_current());
++}
++
++#[tokio::test]
++async fn registered_attempt_cannot_be_mistaken_for_idle() {
++    let admission = ActivityAdmission::default();
++    let attempt = admission.attempt().unwrap();
++    let generation = admission.generation().unwrap();
++    // Exercise the interval between registering an attempt and polling its lock.
++    assert!(admission.try_reserve(generation).is_none());
++    drop(attempt);
++    assert!(admission.try_reserve(generation).unwrap().is_current());
++}
++
++#[tokio::test]
++async fn blocked_task_invalidates_reservation_and_resumes_after_release() {
++    let admission = ActivityAdmission::default();
++    let reservation = admission.try_reserve(0).unwrap();
++    let pending = admission.enter();
++    tokio::pin!(pending);
++    assert!(matches!(poll!(&mut pending), Poll::Pending));
++    assert!(!reservation.is_current());
++    assert!(!reservation.seal_if_current(|| panic!("stale seal must not run")));
++    drop(reservation);
++    let running = pending.await.unwrap();
++    assert!(admission.try_reserve(1).is_none());
++    drop(running);
++    assert!(admission.try_reserve(1).unwrap().is_current());
++}
++
++#[tokio::test]
++async fn cancellation_releases_waiter_but_never_restores_old_evidence() {
++    let admission = ActivityAdmission::default();
++    let reservation = admission.try_reserve(0).unwrap();
++    {
++        let pending = admission.enter();
++        tokio::pin!(pending);
++        assert!(matches!(poll!(&mut pending), Poll::Pending));
++    }
++    assert!(!reservation.is_current());
++    drop(reservation);
++    assert!(admission.try_reserve(0).is_none());
++    assert!(admission.try_reserve(1).unwrap().is_current());
++}
++
++#[tokio::test]
++async fn sealing_refuses_future_task_admission() {
++    let admission = ActivityAdmission::default();
++    let reservation = admission.try_reserve(0).unwrap();
++    assert!(reservation.seal_if_current(|| true));
++    drop(reservation);
++    assert!(admission.enter().await.is_none());
++    assert!(admission.try_reserve(0).is_none());
++}
++
++#[tokio::test]
++async fn failed_seal_preserves_admission() {
++    let admission = ActivityAdmission::default();
++    let reservation = admission.try_reserve(0).unwrap();
++    assert!(!reservation.seal_if_current(|| false));
++    assert!(reservation.is_current());
++    drop(reservation);
++    assert!(admission.enter().await.is_some());
++}
++
++#[tokio::test]
++async fn overflow_disables_reservation_without_losing_activity() {
++    let admission = ActivityAdmission::default();
++    admission.state.lock().unwrap().generation = Some(u64::MAX);
++    let running = admission.enter().await.unwrap();
++    assert_eq!(admission.generation(), None);
++    drop(running);
++    assert!(admission.try_reserve(u64::MAX).is_none());
++    assert!(admission.enter().await.is_some());
++}
+--- /dev/null
++++ b/codex-rs/core/src/session/activity_admission_session_tests.rs
+@@ -0,0 +1,111 @@
++//! Offline checks that exercise admission through actual Session task entry points.
++use super::tests::HeldStepTask;
++use super::tests::make_session_and_context_with_rx;
++use crate::state::TaskKind;
++use codex_protocol::protocol::TurnAbortReason;
++use futures::poll;
++use std::sync::Arc;
++use std::task::Poll;
++use tokio::sync::Notify;
++
++#[tokio::test]
++async fn reserved_session_cannot_begin_task_preparation() {
++    let (session, context, _events) = make_session_and_context_with_rx().await;
++    let before = session.state.lock().await.last_started_turn_id.clone();
++    let generation = session.activity_admission.generation().unwrap();
++    let reservation = session.activity_admission.try_reserve(generation).unwrap();
++    let start = session.start_task(
++        context,
++        Vec::new(),
++        HeldStepTask {
++            kind: TaskKind::Regular,
++            finish: Arc::new(Notify::new()),
++        },
++    );
++    tokio::pin!(start);
++    assert!(matches!(poll!(&mut start), Poll::Pending));
++    assert!(session.active_turn.lock().await.is_none());
++    assert_eq!(session.state.lock().await.last_started_turn_id, before);
++    assert!(!reservation.is_current());
++    drop(reservation);
++    start.await;
++    let generation = session.activity_admission.generation().unwrap();
++    assert!(session.activity_admission.try_reserve(generation).is_none());
++    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
++}
++
++#[tokio::test]
++async fn cancelled_replacement_attempt_leaves_session_idle() {
++    let (session, context, _events) = make_session_and_context_with_rx().await;
++    let generation = session.activity_admission.generation().unwrap();
++    let reservation = session.activity_admission.try_reserve(generation).unwrap();
++    {
++        let start = session.spawn_task(
++            context,
++            Vec::new(),
++            HeldStepTask {
++                kind: TaskKind::Regular,
++                finish: Arc::new(Notify::new()),
++            },
++        );
++        tokio::pin!(start);
++        assert!(matches!(poll!(&mut start), Poll::Pending));
++        assert!(session.active_turn.lock().await.is_none());
++    }
++    assert!(!reservation.is_current());
++    drop(reservation);
++    let generation = session.activity_admission.generation().unwrap();
++    assert!(
++        session
++            .activity_admission
++            .try_reserve(generation)
++            .unwrap()
++            .is_current()
++    );
++}
++
++#[tokio::test]
++async fn completion_mailbox_wakeup_is_fenced_before_it_reads_pending_work() {
++    let (session, _context, _events) = make_session_and_context_with_rx().await;
++    let generation = session.activity_admission.generation().unwrap();
++    let reservation = session.activity_admission.try_reserve(generation).unwrap();
++    let wakeup = session.maybe_start_turn_for_pending_work_with_sub_id("wake".to_owned());
++    tokio::pin!(wakeup);
++    assert!(matches!(poll!(&mut wakeup), Poll::Pending));
++    assert!(!reservation.is_current());
++    assert!(session.active_turn.lock().await.is_none());
++    drop(reservation);
++    wakeup.await;
++    let generation = session.activity_admission.generation().unwrap();
++    assert!(
++        session
++            .activity_admission
++            .try_reserve(generation)
++            .unwrap()
++            .is_current()
++    );
++}
++
++#[tokio::test]
++async fn cache_prewarm_is_fenced_before_auth_or_provider_work() {
++    let (session, _context, _events) = make_session_and_context_with_rx().await;
++    let generation = session.activity_admission.generation().unwrap();
++    let reservation = session.activity_admission.try_reserve(generation).unwrap();
++    {
++        let warmup =
++            session.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::History);
++        tokio::pin!(warmup);
++        assert!(matches!(poll!(&mut warmup), Poll::Pending));
++    }
++    assert!(!reservation.is_current());
++    assert!(session.state.lock().await.startup_prewarm.is_none());
++    drop(reservation);
++    let generation = session.activity_admission.generation().unwrap();
++    assert!(
++        session
++            .activity_admission
++            .try_reserve(generation)
++            .unwrap()
++            .is_current()
++    );
++}
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -90,6 +90,7 @@
+     pub(crate) conversation: Arc<RealtimeConversationManager>,
+     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
+     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
++    pub(crate) activity_admission: super::activity_admission::ActivityAdmission,
+     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
+     pub(crate) input_queue: InputQueue,
+     pub(crate) services: SessionServices,
+@@ -1801,6 +1802,7 @@
+                     && services.live_thread.is_some())
+                 .then(|| Mutex::new(Default::default())),
+                 active_turn: Mutex::new(None),
++                activity_admission: super::activity_admission::ActivityAdmission::default(),
+                 async_hook_results,
+                 input_queue: InputQueue::new(),
+                 services,
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -274,6 +274,9 @@
+         input: Vec<TurnInput>,
+         task: T,
+     ) {
++        let Some(_admission) = self.activity_admission.enter().await else {
++            return;
++        };
+         self.abort_all_tasks(TurnAbortReason::Replaced).await;
+         self.clear_connector_selection().await;
+         self.start_task(turn_context, input, task).await;
+@@ -289,6 +292,11 @@
+         input: Vec<TurnInput>,
+         task: T,
+     ) {
++        // Cover preparation before active_turn is reserved, registration itself,
++        // and the spawned future through completion/flush callbacks.
++        let Some(admission) = self.activity_admission.enter().await else {
++            return;
++        };
+         self.activate_plugin_selection(&turn_context).await;
+         // Inherited or recovered roots are applied before task start. Otherwise this
+         // task owns its turn, including background work. Later mail cannot change it.
+@@ -361,8 +369,10 @@
+             codex.turn.token_usage.reasoning_output_tokens = field::Empty,
+             codex.turn.token_usage.total_tokens = field::Empty,
+         );
++        let task_admission = Arc::clone(&admission);
+         let handle = tokio::spawn(
+             async move {
++                let _admission = task_admission;
+                 let ctx_for_finish = Arc::clone(&ctx);
+                 let task_result = task_for_run
+                     .run(
+@@ -452,6 +462,9 @@
+         self: &Arc<Self>,
+         sub_id: String,
+     ) {
++        let Some(_admission) = self.activity_admission.enter().await else {
++            return;
++        };
+         if !self.input_queue.has_pending_mailbox_items().await
+             || (!self.input_queue.has_trigger_turn_mailbox_items().await
+                 && !self.has_outstanding_durable_sleep())
+--- a/codex-rs/core/src/tasks/user_shell.rs
++++ b/codex-rs/core/src/tasks/user_shell.rs
+@@ -109,6 +109,10 @@
+     cancellation_token: CancellationToken,
+     mode: UserShellCommandMode,
+ ) {
++    // Auxiliary shell work can outlive the main turn; keep its own permit.
++    let Some(_admission) = session.activity_admission.enter().await else {
++        return;
++    };
+     session
+         .services
+         .session_telemetry
+--- a/codex-rs/core/src/codex_delegate_tests.rs
++++ b/codex-rs/core/src/codex_delegate_tests.rs
+@@ -39,7 +39,7 @@
+     let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+     let io = Arc::new(SessionIo {
+-        tx_sub,
++        tx_sub: tx_sub.into(),
+         rx_event: rx_events,
+         agent_status,
+         session_loop_termination: completed_session_loop_termination(),
+@@ -135,7 +135,7 @@
+     let (_tx_events, rx_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+     let io = Arc::new(SessionIo {
+-        tx_sub,
++        tx_sub: tx_sub.into(),
+         rx_event: rx_events,
+         agent_status,
+         session_loop_termination: completed_session_loop_termination(),
+--- a/codex-rs/core/src/session/startup_prewarm.rs
++++ b/codex-rs/core/src/session/startup_prewarm.rs
+@@ -207,6 +207,9 @@
+ 
+ impl Session {
+     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, input: PrewarmInput) {
++        let Some(admission) = self.activity_admission.enter().await else {
++            return;
++        };
+         let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
+         let mut state = self.state.lock().await;
+         if state.shutting_down {
+@@ -234,7 +237,9 @@
+             && self.services.code_mode_service.is_available()
+         {
+             let session = Arc::clone(self);
++            let code_admission = Arc::clone(&admission);
+             tokio::spawn(async move {
++                let _admission = code_admission;
+                 if session.services.code_mode_service.session().await.is_err() {
+                     warn!("code-mode host startup prewarm failed");
+                 }
+@@ -245,7 +250,9 @@
+             // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
+             // register or engage this session's bearer fallback before the first user request.
+             let model_client = self.services.model_client.clone();
++            let auth_admission = Arc::clone(&admission);
+             tokio::spawn(async move {
++                let _admission = auth_admission;
+                 if let Err(err) = model_client.prewarm_auth().await {
+                     warn!("startup auth prewarm failed: {err:#}");
+                 }
+@@ -256,8 +263,10 @@
+         let session_telemetry = self.services.session_telemetry.clone();
+         let started_at = Instant::now();
+         let startup_prewarm_session = Arc::clone(self);
++        let startup_admission = Arc::clone(&admission);
+         let startup_prewarm = tokio::spawn(
+             async move {
++                let _admission = startup_admission;
+                 let result = schedule_startup_prewarm_inner(startup_prewarm_session, input).await;
+                 let status = if result.is_ok() { "ready" } else { "failed" };
+                 session_telemetry.record_startup_phase(

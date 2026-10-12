@@ -1,0 +1,161 @@
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -620,6 +620,21 @@
+         replay_kind: Option<ReplayKind>,
+     ) {
+         self.restore_realtime_transcripts_before_turn(&notification.turn_id);
++        // A committed live receipt confirms only its exact local submission. Retire
++        // the marker before display deduplication can skip an already rendered echo.
++        if replay_kind.is_none()
++            && self
++                .thread_id()
++                .is_some_and(|thread_id| notification.thread_id == thread_id.to_string())
++            && let ThreadItem::UserMessage {
++                client_id: Some(client_id),
++                ..
++            } = &notification.item
++            && self.input_queue.pending_user_message_client_id.as_deref()
++                == Some(client_id.as_str())
++        {
++            self.input_queue.pending_user_message_client_id = None;
++        }
+         if replay_kind.is_none()
+             && self.is_realtime_delegated_reasoning_turn(&notification.turn_id)
+             && realtime::is_private_realtime_agent_item(&notification.item)
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -2177,3 +2177,132 @@
+     assert!(chat.input_queue.user_turn_pending_start);
+     assert!(!chat.rotation_input_ready(turn_id));
+ }
++
++#[tokio::test]
++async fn frontend_rotation_exact_live_user_receipt_retires_submission_marker() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
++    let client_id = chat
++        .input_queue
++        .pending_user_message_client_id
++        .clone()
++        .unwrap();
++    let retry_prompt = chat.safety_buffering_prompt.clone();
++    assert!(!chat.rotation_input_ready(turn_id));
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: thread_id.to_string(),
++            turn_id: turn_id.to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::UserMessage {
++                id: "exact-live-user-receipt".to_string(),
++                client_id: Some(client_id),
++                content: vec![AppServerUserInput::Text {
++                    text: "Explain the request".to_string(),
++                    text_elements: Vec::new(),
++                }],
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.input_queue.pending_user_message_client_id, None);
++    assert_eq!(chat.safety_buffering_prompt, retry_prompt);
++    assert!(chat.turn_lifecycle.agent_turn_running);
++    assert!(!chat.rotation_input_ready(turn_id));
++    handle_turn_completed(&mut chat, turn_id, /*duration_ms*/ None);
++    assert_eq!(chat.safety_buffering_prompt, None);
++    assert_eq!(chat.rotation_input_blocker(turn_id), None);
++}
++
++#[tokio::test]
++async fn frontend_rotation_nonmatching_user_receipts_preserve_submission_marker() {
++    for (foreign_thread, receipt_id, replay_kind) in [
++        (false, None, None),
++        (false, Some("other-submission"), None),
++        (true, Some("matching"), None),
++        (
++            false,
++            Some("matching"),
++            Some(ReplayKind::ResumeInitialMessages),
++        ),
++        (false, Some("matching"), Some(ReplayKind::ThreadSnapshot)),
++    ] {
++        let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++        let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
++        let pending_id = chat
++            .input_queue
++            .pending_user_message_client_id
++            .clone()
++            .unwrap();
++        let client_id = receipt_id.map(|id| {
++            if id == "matching" {
++                pending_id.clone()
++            } else {
++                id.to_string()
++            }
++        });
++        chat.handle_server_notification(
++            ServerNotification::ItemCompleted(ItemCompletedNotification {
++                thread_id: if foreign_thread {
++                    ThreadId::new().to_string()
++                } else {
++                    thread_id.to_string()
++                },
++                turn_id: turn_id.to_string(),
++                completed_at_ms: 0,
++                item: AppServerThreadItem::UserMessage {
++                    id: "nonmatching-user-receipt".to_string(),
++                    client_id,
++                    content: vec![AppServerUserInput::Text {
++                        text: "Explain the request".to_string(),
++                        text_elements: Vec::new(),
++                    }],
++                },
++            }),
++            replay_kind,
++        );
++        assert_eq!(
++            chat.input_queue.pending_user_message_client_id,
++            Some(pending_id)
++        );
++        assert!(!chat.rotation_input_ready(turn_id));
++    }
++}
++
++#[tokio::test]
++async fn frontend_rotation_delayed_receipt_preserves_newer_submission_and_draft() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
++    let old_id = chat
++        .input_queue
++        .pending_user_message_client_id
++        .clone()
++        .unwrap();
++    chat.input_queue.pending_user_message_client_id = Some("newer-submission".to_string());
++    chat.bottom_pane
++        .set_composer_text("human draft".to_string(), Vec::new(), Vec::new());
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: thread_id.to_string(),
++            turn_id: turn_id.to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::UserMessage {
++                id: "delayed-user-receipt".to_string(),
++                client_id: Some(old_id),
++                content: vec![AppServerUserInput::Text {
++                    text: "Explain the request".to_string(),
++                    text_elements: Vec::new(),
++                }],
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        chat.input_queue.pending_user_message_client_id,
++        Some("newer-submission".to_string())
++    );
++    assert_eq!(chat.composer_text_with_pending(), "human draft");
++    assert!(!chat.rotation_input_ready(turn_id));
++}

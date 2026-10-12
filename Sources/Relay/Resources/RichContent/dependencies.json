@@ -1,0 +1,14 @@
+[
+  {
+    "name": "katex",
+    "version": "0.18.10",
+    "integrity": "sha512-/B6p9eY9DX7aHBfpkHdpirDTZ5QH9xTwL9y837PWuzuv41O5jFdqNQwVQEQsimY0/iVNkwBY4+4hMfhQ7d4Dbw==",
+    "files": 63
+  },
+  {
+    "name": "mermaid",
+    "version": "12.0.0",
+    "integrity": "sha512-/wQXC9iBxoGV8p3erbvaXs9h77VyLDBH6GdayVjj3hEcSQhFU4N1WUhUppotCEqlIxI2pRMwjwBSwTB1MfZBgQ==",
+    "files": 2
+  }
+]

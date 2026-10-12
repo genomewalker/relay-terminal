@@ -1,0 +1,2220 @@
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -3000,6 +3000,7 @@
+  "serde_json",
+  "serial_test",
+  "sha1 0.10.6",
++ "sha2 0.10.9",
+  "shlex",
+  "similar",
+  "tempfile",
+--- a/codex-rs/core/Cargo.toml
++++ b/codex-rs/core/Cargo.toml
+@@ -107,6 +107,7 @@
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
+ sha1 = { workspace = true }
++sha2 = { workspace = true }
+ shlex = { workspace = true }
+ similar = { workspace = true }
+ tempfile = { workspace = true }
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -328,6 +328,14 @@
+ 
+     /// Checkpoint initialization without activating speculative persistence.
+     pub async fn checkpoint_preparation(&self) -> std::io::Result<()> {
++        let _admission = self
++            .session
++            .activity_admission
++            .enter()
++            .await
++            .ok_or_else(|| {
++                std::io::Error::other("thread checkpoint admission is closed by native rotation")
++            })?;
+         self.session
+             .try_ensure_rollout_materialized(PersistContext::ThreadPreparation)
+             .await
+@@ -335,6 +343,9 @@
+ 
+     #[doc(hidden)]
+     pub async fn ensure_rollout_materialized(&self) {
++        let Some(_admission) = self.session.activity_admission.enter().await else {
++            return;
++        };
+         self.session
+             .ensure_rollout_materialized(PersistContext::Standard)
+             .await;
+@@ -354,6 +365,14 @@
+     }
+ 
+     pub async fn flush_rollout(&self) -> std::io::Result<()> {
++        let _admission = self
++            .session
++            .activity_admission
++            .enter()
++            .await
++            .ok_or_else(|| {
++                std::io::Error::other("thread checkpoint admission is closed by native rotation")
++            })?;
+         self.session.flush_rollout().await
+     }
+ 
+@@ -658,6 +677,14 @@
+     ///
+     /// Serializes snapshot capture and persistence with accepted settings updates.
+     pub async fn checkpoint_thread_settings(&self) -> ThreadStoreResult<()> {
++        let _admission = self
++            .session
++            .activity_admission
++            .enter()
++            .await
++            .ok_or_else(|| ThreadStoreError::Internal {
++                message: "thread settings checkpoint admission is closed by native rotation".into(),
++            })?;
+         self.session.checkpoint_thread_settings().await
+     }
+ 
+@@ -755,6 +782,16 @@
+         &self,
+         update: crate::context::UserGoalUpdate,
+     ) -> CodexResult<()> {
++        let _admission = self
++            .session
++            .activity_admission
++            .enter()
++            .await
++            .ok_or_else(|| {
++                CodexErr::InvalidRequest(
++                    "thread context admission is closed by native rotation".into(),
++                )
++            })?;
+         self.session.record_user_goal_update(update).await;
+         self.checkpoint_preparation().await?;
+         Ok(())
+@@ -762,6 +799,16 @@
+ 
+     /// Record raw Responses API items without starting a new turn.
+     pub async fn inject_response_items(&self, items: Vec<ResponseItem>) -> CodexResult<()> {
++        let _admission = self
++            .session
++            .activity_admission
++            .enter()
++            .await
++            .ok_or_else(|| {
++                CodexErr::InvalidRequest(
++                    "thread context admission is closed by native rotation".into(),
++                )
++            })?;
+         self.inject_response_items_for_turn(items).await?;
+         self.checkpoint_preparation().await?;
+         Ok(())
+@@ -776,6 +823,16 @@
+         &self,
+         items: Vec<ResponseItem>,
+     ) -> CodexResult<()> {
++        let _admission = self
++            .session
++            .activity_admission
++            .enter()
++            .await
++            .ok_or_else(|| {
++                CodexErr::InvalidRequest(
++                    "thread context admission is closed by native rotation".into(),
++                )
++            })?;
+         if items.is_empty() {
+             return Err(CodexErr::InvalidRequest(
+                 "items must not be empty".to_string(),
+@@ -865,6 +922,14 @@
+         patch: ThreadMetadataPatch,
+         include_archived: bool,
+     ) -> ThreadStoreResult<StoredThread> {
++        let _admission = self
++            .session
++            .activity_admission
++            .enter()
++            .await
++            .ok_or_else(|| ThreadStoreError::Internal {
++                message: "thread metadata admission is closed by native rotation".into(),
++            })?;
+         let live_thread = self
+             .session
+             .live_thread_for_persistence("update thread metadata")
+@@ -876,6 +941,14 @@
+ 
+     /// Appends rollout items through the live thread so derived metadata stays in sync.
+     pub async fn append_rollout_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
++        let _admission = self
++            .session
++            .activity_admission
++            .enter()
++            .await
++            .ok_or_else(|| ThreadStoreError::Internal {
++                message: "rollout append admission is closed by native rotation".into(),
++            })?;
+         let live_thread = self
+             .session
+             .live_thread_for_persistence("append rollout items")
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -254,6 +254,9 @@
+     sess: &Arc<Session>,
+     mode: ThreadMemoryMode,
+ ) -> anyhow::Result<()> {
++    let _admission = sess.activity_admission.enter().await.ok_or_else(|| {
++        anyhow::anyhow!("thread memory mode admission is closed by native rotation")
++    })?;
+     let live_thread = sess.live_thread_for_persistence("update thread memory mode")?;
+     live_thread.persist(PersistContext::Standard).await?;
+     live_thread.flush().await?;
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -587,6 +587,8 @@
+             git_enrichment_policy,
+             windows_sandbox_proxy_settings_mode,
+         } = args;
++        let native_restore =
++            thread_extension_init.get::<native_rotation::restore::NativeRestoreStartup>();
+         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+         let (tx_event, rx_event) = async_channel::unbounded();
+ 
+@@ -641,7 +643,7 @@
+         };
+ 
+         let mut config = Arc::new(config);
+-        let refresh_strategy = if session_source.is_non_root_agent() {
++        let refresh_strategy = if native_restore.is_some() || session_source.is_non_root_agent() {
+             codex_models_manager::manager::RefreshStrategy::Offline
+         } else {
+             codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
+@@ -740,9 +742,12 @@
+             token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
+         }
+         let configured_config = Arc::clone(&config);
+-        let multi_agent_version = config.multi_agent_version_override().or_else(|| {
+-            resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
+-        });
++        let multi_agent_version = match &native_restore {
++            Some(restore) => restore.multi_agent_version,
++            None => config.multi_agent_version_override().or_else(|| {
++                resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
++            }),
++        };
+         let history_mode = conversation_history.get_history_mode(
+             requested_history_mode.unwrap_or_else(|| thread_store.default_history_mode()),
+         );
+@@ -869,6 +874,10 @@
+             dynamic_tools,
+             user_shell_override,
+         };
++        let session_configuration = native_restore
++            .as_ref()
++            .map(|restore| restore.configuration.clone())
++            .unwrap_or(session_configuration);
+         session_configuration
+             .validate(&environment_selections)
+             .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+@@ -923,6 +932,12 @@
+                 Err(error) => map_session_init_error(&error, &config.codex_home),
+             }
+         })?;
++        if let Some(restore) = &native_restore {
++            restore
++                .verify(&session)
++                .await
++                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
++        }
+         if let Some(message) = initial_service_tier_warning {
+             session
+                 .send_event_raw(Event {
+@@ -936,7 +951,9 @@
+             submission_admission::SubmissionSender::new(tx_sub, session.activity_admission.clone())
+                 .with_dispatch(rx_sub);
+         #[cfg(unix)]
+-        let relay_inbox = if std::env::var("RELAY_NATIVE_MESSAGES").as_deref() == Ok("1") {
++        let relay_inbox = if native_restore.is_none()
++            && std::env::var("RELAY_NATIVE_MESSAGES").as_deref() == Ok("1")
++        {
+             match crate::relay_native_inbox::start(
+                 thread_id.to_string(),
+                 configured_config.cwd.to_path_buf(),
+@@ -956,9 +973,36 @@
+ 
+         // This task will run until Op::Shutdown is received.
+         let session_for_loop = Arc::clone(&session);
++        #[cfg(unix)]
++        let restore_sender = native_restore.as_ref().map(|_| tx_sub.clone());
+         let session_loop_handle = tokio::spawn(async move {
++            if let Some(restore) = &native_restore {
++                if !restore.wait_for_commit().await {
++                    handlers::shutdown_session_runtime(&session_for_loop).await;
++                    if let Ok(live) =
++                        session_for_loop.live_thread_for_persistence("abort native restoration")
++                    {
++                        let _ = live.shutdown().await;
++                    }
++                    return;
++                }
++            }
+             #[cfg(unix)]
+-            let _relay_inbox = relay_inbox;
++            let _relay_inbox = if let Some(sender) = restore_sender {
++                if std::env::var("RELAY_NATIVE_MESSAGES").as_deref() == Ok("1") {
++                    crate::relay_native_inbox::start(
++                        thread_id.to_string(),
++                        configured_config.cwd.to_path_buf(),
++                        sender,
++                    )
++                    .await
++                    .ok()
++                } else {
++                    None
++                }
++            } else {
++                relay_inbox
++            };
+             submission_loop(session_for_loop, configured_config, rx_sub)
+                 .instrument(info_span!("session_loop", thread_id = %thread_id))
+                 .await;
+@@ -2018,6 +2062,11 @@
+         app_server_client_version: Option<String>,
+         mcp_elicitations_auto_deny: bool,
+     ) -> ConstraintResult<()> {
++        let _admission = self
++            .activity_admission
++            .enter()
++            .await
++            .ok_or(crate::config::ConstraintError::SessionClosed)?;
+         self.update_settings(SessionSettingsUpdate {
+             app_server_client_name,
+             app_server_client_version,
+@@ -4297,7 +4346,16 @@
+         }
+ 
+         let selected = config.multi_agent_version_for_model(model_info.multi_agent_version);
+-
++        // Reconstructing a native capsule needs a turn context, but is not a
++        // genuine first turn. Preserve the source's unresolved runtime choice.
++        if self
++            .services
++            .thread_extension_data
++            .get::<native_rotation::restore::NativeRestoreStartup>()
++            .is_some_and(|restore| restore.retains_unresolved_multi_agent_mode())
++        {
++            return selected;
++        }
+         self.set_multi_agent_version_if_unset(selected)
+     }
+ 
+--- a/codex-rs/core/src/session/native_rotation.rs
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -18,6 +18,8 @@
+     InvalidRequest,
+     #[error("native close could not be confirmed: {0}")]
+     CloseFailed(String),
++    #[error("native restoration could not be confirmed: {0}")]
++    RestoreFailed(String),
+     #[error("native session has closed or changed owner")]
+     Closed,
+     #[error("native reservation expired")]
+@@ -233,6 +235,8 @@
+ pub(crate) mod close;
+ #[path = "native_rotation_journal.rs"]
+ mod journal;
++#[path = "native_rotation_restore.rs"]
++pub(crate) mod restore;
+ 
+ #[cfg(test)]
+ #[path = "native_rotation_tests.rs"]
+--- a/codex-rs/core/src/session/native_rotation_close.rs
++++ b/codex-rs/core/src/session/native_rotation_close.rs
+@@ -32,8 +32,11 @@
+     pub(crate) operation_id: uuid::Uuid,
+     pub(crate) claim_id: uuid::Uuid,
+     pub(crate) capsule_sha256: String,
++    pub(crate) restore_capsule: Option<String>,
+     #[cfg(test)]
+     pub(crate) test_after_seal: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
++    #[cfg(test)]
++    pub(crate) test_after_restore: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+ }
+ 
+ impl NativeCloseRequest {
+@@ -46,8 +49,11 @@
+             operation_id,
+             claim_id,
+             capsule_sha256,
++            restore_capsule: None,
+             #[cfg(test)]
+             test_after_seal: None,
++            #[cfg(test)]
++            test_after_restore: None,
+         }
+     }
+ 
+@@ -62,6 +68,15 @@
+         {
+             return Err(NativeRotationError::InvalidRequest);
+         }
++        if let Some(capsule) = &self.restore_capsule {
++            if capsule.trim().is_empty()
++                || capsule.len() > 256 * 1024
++                || capsule.contains('\0')
++                || super::restore::digest(capsule.as_bytes()) != self.capsule_sha256
++            {
++                return Err(NativeRotationError::InvalidRequest);
++            }
++        }
+         Ok(())
+     }
+ }
+@@ -82,6 +97,8 @@
+     pub(crate) configuration: SessionConfiguration,
+     pub(crate) source: Arc<Session>,
+     pub(crate) manager: Arc<ThreadManagerState>,
++    pub(crate) restored: Option<crate::thread_manager::NewThread>,
++    pub(crate) restore_receipt: Option<super::restore::NativeRestoreReceipt>,
+ }
+ 
+ impl std::fmt::Debug for NativeClosedSession {
+@@ -133,10 +150,25 @@
+         .session_configuration
+         .codex_home
+         .to_path_buf();
+-    let journal = match NativeCloseJournal::begin(home, receipt.clone(), &request).await {
+-        Ok(journal) => journal,
+-        Err(error) => return refused(error),
+-    };
++    let restore = match request.restore_capsule.as_ref() {
++        Some(capsule) => match super::restore::NativeRestoreStartup::capture(
++            &session,
++            &manager_owner,
++            capsule.clone(),
++            request.capsule_sha256.clone(),
++        )
++        .await
++        {
++            Ok(restore) => Some(restore),
++            Err(error) => return refused(error),
++        },
++        None => None,
++    };
++    let journal =
++        match NativeCloseJournal::begin(home, receipt.clone(), &request, restore.as_ref()).await {
++            Ok(journal) => journal,
++            Err(error) => return refused(error),
++        };
+     let configuration = {
+         // Manager registration and the session's live settings are rechecked
+         // under their own locks. Attempt-registration locks establish one seal
+@@ -146,6 +178,15 @@
+         let eligible = !reply.is_closed()
+             && Instant::now() < deadline
+             && !state.shutting_down
++            && restore
++                .as_ref()
++                .is_none_or(|restore| restore.matches_source_runtime(&session))
++            && restore.as_ref().is_none_or(|restore| {
++                restore.matches_source_configuration(&state.session_configuration)
++            })
++            && restore
++                .as_ref()
++                .is_none_or(|restore| !registered.contains_key(&restore.target_id()))
+             && state.last_started_turn_id.as_deref() == Some(receipt.turn_id.as_str())
+             && session.native_rotation.matches(&receipt.turn_id)
+             && registered.get(&receipt.thread_id).is_some_and(|thread| {
+@@ -154,7 +195,11 @@
+         if eligible
+             && manager.perform_if_current(|| {
+                 reservation.seal_if_current(|| {
+-                    if !manager_owner.fence_native_rotation(receipt.thread_id, receipt.runtime_id) {
++                    if !manager_owner.fence_native_rotation(
++                        receipt.thread_id,
++                        receipt.runtime_id,
++                        restore.as_ref().map(|restore| restore.target_id()),
++                    ) {
+                         return false;
+                     }
+                     state.shutting_down = true;
+@@ -211,15 +256,87 @@
+     if let Err(error) = journal.record("closed").await {
+         return (true, Err(error));
+     }
++    let (restored, restore_receipt) = if let Some(restore) = &restore {
++        let result = manager_owner
++            .restore_native_rotation(&session, restore)
++            .await;
++        let thread = match result {
++            Ok(thread) => thread,
++            Err(error) => {
++                let _ = journal.record("restore_failed").await;
++                return (
++                    true,
++                    Err(NativeRotationError::RestoreFailed(error.to_string())),
++                );
++            }
++        };
++        #[cfg(test)]
++        if let Some((entered, proceed)) = request.test_after_restore.as_ref() {
++            let ready = proceed.notified();
++            tokio::pin!(ready);
++            ready.as_mut().enable();
++            entered.notify_one();
++            ready.await;
++        }
++        let verified = match restore.receipt() {
++            Ok(verified) => verified,
++            Err(error) => {
++                restore.abort();
++                let _ = thread.thread.shutdown_and_wait().await;
++                let _ = journal.record("restore_failed").await;
++                return (true, Err(error));
++            }
++        };
++        if let Err(error) = journal.restored(verified.clone()).await {
++            restore.abort();
++            let _ = thread.thread.shutdown_and_wait().await;
++            let _ = journal.record("restore_failed").await;
++            return (true, Err(error));
++        }
++        (Some(thread), Some(verified))
++    } else {
++        (None, None)
++    };
+     // The old writer has closed and the immutable close record is durable.
+     // A later deliberate resume may create a distinct runtime for this ID.
+-    if !manager_owner.finish_native_rotation_fence(receipt.thread_id, receipt.runtime_id) {
++    let published = match &restored {
++        Some(thread) => {
++            manager_owner
++                .publish_native_restoration(thread, receipt.thread_id, receipt.runtime_id)
++                .await
++        }
++        None => {
++            manager_owner.finish_native_rotation_fences(receipt.thread_id, receipt.runtime_id, None)
++        }
++    };
++    if !published {
++        if let Some(restore) = &restore {
++            restore.abort();
++        }
++        if let Some(thread) = &restored {
++            let _ = thread.thread.shutdown_and_wait().await;
++        }
++        let _ = journal
++            .record(if restore.is_some() {
++                "restore_failed"
++            } else {
++                "failed"
++            })
++            .await;
+         return (
+             true,
+             Err(NativeRotationError::CloseFailed(
+-                "source runtime ownership fence changed during close".into(),
++                "runtime ownership changed before native publication; reconcile the operation"
++                    .into(),
+             )),
+         );
++    }
++    if let Some(restore) = &restore {
++        restore.commit();
++    }
++    if let Some(thread) = &restored {
++        manager_owner.notify_thread_created(thread.thread_id);
++        thread.thread.emit_thread_ready_lifecycle().await;
+     }
+     let closed = NativeClosedSession {
+         receipt: NativeCloseReceipt {
+@@ -232,6 +349,8 @@
+         configuration,
+         source: Arc::clone(&session),
+         manager: manager_owner,
++        restored,
++        restore_receipt,
+     };
+     // Unlike ordinary shutdown, this notification follows both a successful
+     // writer close and its durable operation receipt.
+--- a/codex-rs/core/src/session/native_rotation_journal.rs
++++ b/codex-rs/core/src/session/native_rotation_journal.rs
+@@ -16,6 +16,9 @@
+     claim_id: uuid::Uuid,
+     capsule_sha256: String,
+     source: NativeRotationReceipt,
++    destination_thread_id: Option<codex_protocol::ThreadId>,
++    settings_sha256: Option<String>,
++    restored: Option<super::restore::NativeRestoreReceipt>,
+ }
+ 
+ pub(super) struct NativeCloseJournal {
+@@ -28,6 +31,7 @@
+         home: PathBuf,
+         source: NativeRotationReceipt,
+         request: &NativeCloseRequest,
++        restore: Option<&super::restore::NativeRestoreStartup>,
+     ) -> Result<Self, NativeRotationError> {
+         let record = Record {
+             v: 1,
+@@ -36,6 +40,9 @@
+             claim_id: request.claim_id,
+             capsule_sha256: request.capsule_sha256.clone(),
+             source,
++            destination_thread_id: restore.map(|restore| restore.target_id()),
++            settings_sha256: restore.map(|restore| restore.settings_sha256().to_owned()),
++            restored: None,
+         };
+         tokio::task::spawn_blocking(move || {
+             let root = home.join("relay-context-rotation");
+@@ -58,8 +65,25 @@
+         &self.directory
+     }
+ 
++    pub(super) async fn restored(
++        &self,
++        receipt: super::restore::NativeRestoreReceipt,
++    ) -> Result<(), NativeRotationError> {
++        let directory = self.directory.clone();
++        let mut record = self.record.clone();
++        record.state = "restored".into();
++        record.restored = Some(receipt);
++        tokio::task::spawn_blocking(move || write_record(&directory, &record))
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))
++    }
++
+     pub(super) async fn record(&self, state: &'static str) -> Result<(), NativeRotationError> {
+-        assert!(matches!(state, "aborted" | "sealed" | "closed" | "failed"));
++        assert!(matches!(
++            state,
++            "aborted" | "sealed" | "closed" | "failed" | "restore_failed"
++        ));
+         let directory = self.directory.clone();
+         let mut record = self.record.clone();
+         record.state = state.into();
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation_restore.rs
+@@ -0,0 +1,498 @@
++//! Private startup capability carried only by the accepted native rotation owner.
++//! No model turn is submitted. Input dispatch remains parked until the durable
++//! restored record and both writer fences have been committed.
++use super::NativeRotationError;
++use crate::agents_md_manager::AgentsMdManager;
++use crate::environment_selection::TurnEnvironmentSnapshot;
++use crate::session::session::Session;
++use crate::session::session::SessionConfiguration;
++use crate::thread_manager::StartThreadOptions;
++use crate::thread_manager::ThreadManagerState;
++use codex_history::CompactedItem;
++use codex_history::InitialHistory;
++use codex_history::ResponseItemEnvelope;
++use codex_history::RolloutItem;
++use codex_protocol::ThreadId;
++use codex_protocol::models::BaseInstructionsProvenance;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::MultiAgentVersion;
++use codex_protocol::protocol::ThreadMemoryMode;
++use sha2::Digest;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::Weak;
++use tokio::sync::watch;
++
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
++pub(crate) struct NativeRestoreReceipt {
++    pub(crate) thread_id: ThreadId,
++    pub(crate) runtime_id: uuid::Uuid,
++    pub(crate) rollout_path: PathBuf,
++    pub(crate) capsule_sha256: String,
++    pub(crate) settings_sha256: String,
++    pub(crate) process_id: u32,
++}
++
++#[derive(Clone)]
++pub(crate) struct NativeRestoreStartup {
++    pub(in crate::session) configuration: SessionConfiguration,
++    pub(in crate::session) instructions: Arc<AgentsMdManager>,
++    pub(in crate::session) multi_agent_version: Option<MultiAgentVersion>,
++    pub(in crate::session) base_instructions_provenance: Option<BaseInstructionsProvenance>,
++    pub(in crate::session) mcp_elicitations_auto_deny: bool,
++    memory_mode: Option<ThreadMemoryMode>,
++    source_thread_name: Option<String>,
++    source_id: ThreadId,
++    source_runtime: uuid::Uuid,
++    target_id: ThreadId,
++    manager: Weak<ThreadManagerState>,
++    environments: TurnEnvironmentSnapshot,
++    capsule: String,
++    capsule_sha256: String,
++    settings_sha256: String,
++    activation: watch::Sender<Option<bool>>,
++    verified: Arc<Mutex<Option<NativeRestoreReceipt>>>,
++}
++
++pub(super) fn digest(bytes: &[u8]) -> String {
++    format!("{:x}", sha2::Sha256::digest(bytes))
++}
++
++fn settings_digest(
++    configuration: &SessionConfiguration,
++    mcp_elicitations_auto_deny: bool,
++    memory_mode: &Option<ThreadMemoryMode>,
++) -> Result<String, NativeRotationError> {
++    // The receipt contains only a digest; runtime provider/auth handles never
++    // enter persistence. Their identity and the complete environment/shell policy
++    // are checked separately in memory, including fields without wire serialization.
++    let proof = serde_json::json!({
++        "settings": configuration.thread_settings_snapshot(&configuration.environments),
++        "mcp_elicitations_auto_deny": mcp_elicitations_auto_deny,
++        "memory_mode": memory_mode,
++        "environments": configuration.environments.iter().map(|selection| serde_json::json!({
++            "environment_id": selection.environment_id,
++            "cwd": selection.cwd,
++            "workspace_roots": selection.workspace_roots,
++        })).collect::<Vec<_>>(),
++        "base_instructions": configuration.base_instructions,
++        "developer_instructions": configuration.developer_instructions,
++        "thread_name": configuration.thread_name,
++        "dynamic_tools": configuration.dynamic_tools,
++        "originator": configuration.originator,
++        "client_name": configuration.app_server_client_name,
++        "client_version": configuration.app_server_client_version,
++        "metrics_service_name": configuration.metrics_service_name,
++        "allow_login_shell": configuration.allow_login_shell,
++        "trusted_guardian_reviewer": configuration.trusted_guardian_reviewer,
++        "history_mode": configuration.history_mode,
++        "session_source": configuration.session_source,
++        "thread_source": configuration.thread_source,
++    });
++    serde_json::to_vec(&proof)
++        .map(|bytes| digest(&bytes))
++        .map_err(|error| NativeRotationError::Persistence(error.to_string()))
++}
++
++async fn persisted_memory_mode(
++    session: &Session,
++) -> Result<Option<ThreadMemoryMode>, NativeRotationError> {
++    let Some(database) = session.state_db() else {
++        // Database-free stores cannot accept memory-mode changes.
++        return Ok(None);
++    };
++    let name = database
++        .get_thread_memory_mode(session.thread_id)
++        .await
++        .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++        .ok_or_else(|| {
++            NativeRotationError::Persistence("thread memory mode is unavailable".into())
++        })?;
++    serde_json::from_value(serde_json::Value::String(name))
++        .map(Some)
++        .map_err(|error| NativeRotationError::Persistence(error.to_string()))
++}
++
++impl NativeRestoreStartup {
++    pub(super) async fn capture(
++        source: &Arc<Session>,
++        manager: &Arc<ThreadManagerState>,
++        capsule: String,
++        capsule_sha256: String,
++    ) -> Result<Self, NativeRotationError> {
++        let stored_name = source
++            .live_thread_for_persistence("capture native rotation metadata")
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++            .read_thread(false, false)
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++            .name;
++        let memory_mode = persisted_memory_mode(source).await?;
++        let environments = source.services.turn_environments.snapshot().await;
++        let state = source.state.lock().await;
++        let mut configuration = state.session_configuration.clone();
++        let source_thread_name = configuration.thread_name.clone();
++        configuration.thread_name = stored_name;
++        configuration.forked_from_thread_id = Some(source.thread_id);
++        configuration.parent_thread_id = None;
++        let mcp_elicitations_auto_deny = source.services.mcp_runtime.elicitations_auto_deny();
++        let settings_sha256 =
++            settings_digest(&configuration, mcp_elicitations_auto_deny, &memory_mode)?;
++        let target_id = source.services.local_agent_runtime.generate_thread_id();
++        if target_id == source.thread_id {
++            return Err(NativeRotationError::InvalidRequest);
++        }
++        let (activation, _) = watch::channel(None);
++        Ok(Self {
++            configuration,
++            instructions: Arc::clone(&source.services.agents_md_manager),
++            multi_agent_version: source.multi_agent_version.get().copied(),
++            base_instructions_provenance: state.base_instructions_provenance.clone(),
++            mcp_elicitations_auto_deny,
++            memory_mode,
++            source_thread_name,
++            source_id: source.thread_id,
++            source_runtime: source.native_rotation.runtime_id,
++            target_id,
++            manager: Arc::downgrade(manager),
++            environments,
++            capsule,
++            capsule_sha256,
++            settings_sha256,
++            activation,
++            verified: Arc::new(Mutex::new(None)),
++        })
++    }
++
++    pub(in crate::session) fn retains_unresolved_multi_agent_mode(&self) -> bool {
++        self.multi_agent_version.is_none() && self.activation.borrow().is_none()
++    }
++
++    pub(crate) fn target_id(&self) -> ThreadId {
++        self.target_id
++    }
++    pub(super) fn settings_sha256(&self) -> &str {
++        &self.settings_sha256
++    }
++
++    pub(crate) fn authorizes(&self, manager: &ThreadManagerState, target: ThreadId) -> bool {
++        std::ptr::eq(self.manager.as_ptr(), manager)
++            && target == self.target_id
++            && self.activation.borrow().is_none()
++            && manager.native_rotation_fence_matches(self.source_id, self.source_runtime)
++            && manager.native_rotation_fence_matches(self.target_id, self.source_runtime)
++    }
++
++    pub(super) fn matches_source_runtime(&self, session: &Session) -> bool {
++        session.services.mcp_runtime.elicitations_auto_deny() == self.mcp_elicitations_auto_deny
++    }
++
++    pub(super) fn matches_source_configuration(
++        &self,
++        configuration: &SessionConfiguration,
++    ) -> bool {
++        // Metadata renames do not update the source's cached configuration name.
++        // Mutation admission keeps the captured stored name stable through the seal.
++        if configuration.thread_name != self.source_thread_name {
++            return false;
++        }
++        let mut effective = configuration.clone();
++        effective.thread_name = self.configuration.thread_name.clone();
++        self.matches_configuration(&effective)
++    }
++
++    pub(super) fn matches_configuration(&self, configuration: &SessionConfiguration) -> bool {
++        configuration.environments == self.configuration.environments
++            && configuration.shell_environment_policy == self.configuration.shell_environment_policy
++            && Arc::ptr_eq(&configuration.provider, &self.configuration.provider)
++            && Arc::ptr_eq(
++                &configuration.step_settings,
++                &self.configuration.step_settings,
++            )
++            && Arc::ptr_eq(
++                &configuration.original_config_do_not_use,
++                &self.configuration.original_config_do_not_use,
++            )
++            && settings_digest(
++                configuration,
++                self.mcp_elicitations_auto_deny,
++                &self.memory_mode,
++            )
++            .is_ok_and(|digest| digest == self.settings_sha256)
++    }
++
++    fn item(&self) -> ResponseItem {
++        let mut item = ResponseItem::Message {
++            id: Some(codex_protocol::ResponseItemId::with_suffix(
++                "msg",
++                self.target_id,
++            )),
++            role: "user".into(),
++            content: vec![ContentItem::InputText {
++                text: self.capsule.clone(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        };
++        // Replay classifies message content, even for a text-only capsule.
++        // Persist that canonical form so live history and the checkpoint match exactly.
++        let content = codex_context_fragments::to_annotated_content(&mut item)
++            .expect("the native capsule is a message");
++        let _ = codex_context_fragments::set_annotated_content(&mut item, content);
++        item
++    }
++
++    fn checkpoint(&self) -> CompactedItem {
++        CompactedItem {
++            message: self.capsule.clone(),
++            replacement_history: Some(vec![ResponseItemEnvelope {
++                item: self.item(),
++                metadata: None,
++            }]),
++            guardian_history: None,
++            retained_context: None,
++            mcp_resource_origins: None,
++            window_number: None,
++            first_window_id: None,
++            previous_window_id: None,
++            window_id: None,
++            compaction_response_id: None,
++            latest_token_usage_record: None,
++            resume_metadata: None,
++        }
++    }
++
++    pub(crate) fn options(&self, source: &Session) -> StartThreadOptions {
++        let mut options =
++            StartThreadOptions::new(source.build_effective_session_config(&self.configuration));
++        options.initial_history =
++            InitialHistory::Forked(vec![RolloutItem::Compacted(self.checkpoint())]);
++        options.reserved_thread_id = Some(self.target_id);
++        options.environments = Some(self.configuration.environments.clone());
++        options.inherited_environments = Some(self.environments.clone());
++        options.history_mode = Some(self.configuration.history_mode);
++        options.session_source = Some(self.configuration.session_source.clone());
++        options.thread_source = self.configuration.thread_source.clone();
++        options.dynamic_tools = self.configuration.dynamic_tools.clone();
++        options.metrics_service_name = self.configuration.metrics_service_name.clone();
++        options.disabled_plugin_ids = Some(self.configuration.disabled_plugin_ids.clone());
++        options.client_mcp_extensions = source.services.client_mcp_extensions.clone();
++        options.thread_extension_init.insert(self.clone());
++        options
++    }
++
++    /// Runs before any submission sender, native inbox or receiver task exists.
++    pub(in crate::session) async fn verify(
++        &self,
++        session: &Session,
++    ) -> Result<(), NativeRotationError> {
++        let manager = self.manager.upgrade().ok_or(NativeRotationError::Closed)?;
++        if !self.authorizes(&manager, session.thread_id) {
++            return Err(NativeRotationError::RestoreFailed(
++                "destination startup ownership changed".into(),
++            ));
++        }
++        if !self.matches_source_runtime(session) {
++            return Err(NativeRotationError::RestoreFailed(
++                "live MCP elicitation setting changed".into(),
++            ));
++        }
++        if session.native_rotation.runtime_id == self.source_runtime {
++            return Err(NativeRotationError::RestoreFailed(
++                "destination reused the source runtime".into(),
++            ));
++        }
++        if session.multi_agent_version.get().copied() != self.multi_agent_version {
++            return Err(NativeRotationError::RestoreFailed(format!(
++                "multi-agent mode changed during startup: expected {:?}, got {:?}",
++                self.multi_agent_version,
++                session.multi_agent_version.get().copied()
++            )));
++        }
++        if !Arc::ptr_eq(&session.services.agents_md_manager, &self.instructions) {
++            return Err(NativeRotationError::RestoreFailed(
++                "instruction provider ownership changed".into(),
++            ));
++        }
++        {
++            let state = session.state.lock().await;
++            if !self.matches_configuration(&state.session_configuration)
++                || state.session_configuration.forked_from_thread_id != Some(self.source_id)
++                || state.session_configuration.parent_thread_id.is_some()
++                || state.base_instructions_provenance != self.base_instructions_provenance
++            {
++                return Err(NativeRotationError::RestoreFailed(
++                    "live settings changed during restoration".into(),
++                ));
++            }
++        }
++        let environments = session.services.turn_environments.snapshot().await;
++        let expected_handles = self.environments.captured_environments();
++        let actual_handles = environments.captured_environments();
++        if environments.all_selections() != self.environments.all_selections()
++            || actual_handles.len() != expected_handles.len()
++            || expected_handles.iter().any(|(id, expected)| {
++                match (expected, actual_handles.get(id)) {
++                    (Some(expected), Some(Some(actual))) => !Arc::ptr_eq(expected, actual),
++                    (None, Some(None)) => false,
++                    _ => true,
++                }
++            })
++        {
++            return Err(NativeRotationError::RestoreFailed(
++                "environment selection or runtime ownership changed".into(),
++            ));
++        }
++        let history = session.clone_history().await;
++        let items: Vec<_> = history.raw_items().collect();
++        let expected_item = self.item();
++        if items != vec![&expected_item] {
++            // Report only shape/equality flags, never capsule or transcript text.
++            let comparison = match (items.first().copied(), &expected_item) {
++                (
++                    Some(ResponseItem::Message {
++                        id,
++                        role,
++                        content,
++                        phase,
++                        internal_chat_message_metadata_passthrough,
++                    }),
++                    ResponseItem::Message {
++                        id: expected_id,
++                        role: expected_role,
++                        content: expected_content,
++                        phase: expected_phase,
++                        internal_chat_message_metadata_passthrough: expected_metadata,
++                    },
++                ) => format!(
++                    "id={}, role={}, content={}, phase={}, metadata={}",
++                    id == expected_id,
++                    role == expected_role,
++                    content == expected_content,
++                    phase == expected_phase,
++                    internal_chat_message_metadata_passthrough == expected_metadata,
++                ),
++                _ => "first item is absent or is not a message".into(),
++            };
++            return Err(NativeRotationError::RestoreFailed(format!(
++                "restored history differs from the capsule: count={}, {comparison}",
++                items.len(),
++            )));
++        }
++        let live = session
++            .live_thread_for_persistence("verify native restoration")
++            .map_err(|error| NativeRotationError::RestoreFailed(error.to_string()))?;
++        let stored = live
++            .read_thread(false, false)
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?;
++        let stored = if stored.name != self.configuration.thread_name {
++            live.update_metadata(
++                codex_thread_store::ThreadMetadataPatch {
++                    name: Some(self.configuration.thread_name.clone()),
++                    ..Default::default()
++                },
++                false,
++            )
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++        } else {
++            stored
++        };
++        if stored.name != self.configuration.thread_name {
++            return Err(NativeRotationError::RestoreFailed(
++                "restored thread name differs from the source metadata".into(),
++            ));
++        }
++        let actual_memory_mode = persisted_memory_mode(session).await?;
++        if actual_memory_mode != self.memory_mode {
++            let Some(expected) = &self.memory_mode else {
++                return Err(NativeRotationError::RestoreFailed(
++                    "thread memory mode storage changed during restoration".into(),
++                ));
++            };
++            live.update_memory_mode(expected.clone(), false)
++                .await
++                .map_err(|error| NativeRotationError::Persistence(error.to_string()))?;
++            if persisted_memory_mode(session).await? != self.memory_mode {
++                return Err(NativeRotationError::RestoreFailed(
++                    "restored thread memory mode differs from the source".into(),
++                ));
++            }
++        }
++        live.flush()
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?;
++        if session
++            .native_rotation
++            .persistence_failed
++            .load(std::sync::atomic::Ordering::Acquire)
++        {
++            return Err(NativeRotationError::Persistence(
++                "restored writer reported an earlier failure".into(),
++            ));
++        }
++        let rollout_path = live
++            .local_rollout_path()
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++            .ok_or(NativeRotationError::Unsupported)?;
++        let persisted = tokio::fs::read_to_string(&rollout_path)
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?;
++        let expected = serde_json::to_value(RolloutItem::Compacted(self.checkpoint()))
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?;
++        if !persisted.lines().any(|line| {
++            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
++                value["type"] == expected["type"] && value["payload"] == expected["payload"]
++            })
++        }) {
++            return Err(NativeRotationError::RestoreFailed(
++                "durable capsule checkpoint is missing".into(),
++            ));
++        }
++        *self
++            .verified
++            .lock()
++            .expect("native restore receipt poisoned") = Some(NativeRestoreReceipt {
++            thread_id: session.thread_id,
++            runtime_id: session.native_rotation.runtime_id,
++            rollout_path,
++            capsule_sha256: self.capsule_sha256.clone(),
++            settings_sha256: self.settings_sha256.clone(),
++            process_id: std::process::id(),
++        });
++        Ok(())
++    }
++
++    pub(super) fn receipt(&self) -> Result<NativeRestoreReceipt, NativeRotationError> {
++        self.verified
++            .lock()
++            .expect("native restore receipt poisoned")
++            .clone()
++            .ok_or_else(|| {
++                NativeRotationError::RestoreFailed("startup has no verified receipt".into())
++            })
++    }
++
++    pub(crate) fn abort(&self) {
++        self.activation.send_replace(Some(false));
++    }
++    pub(super) fn commit(&self) {
++        self.activation.send_replace(Some(true));
++    }
++
++    pub(in crate::session) async fn wait_for_commit(&self) -> bool {
++        let mut receiver = self.activation.subscribe();
++        loop {
++            if let Some(committed) = *receiver.borrow_and_update() {
++                return committed;
++            }
++            if receiver.changed().await.is_err() {
++                return false;
++            }
++        }
++    }
++}
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -785,6 +785,8 @@
+                 .model(),
+             session_configuration.provider
+         );
++        let native_restore =
++            thread_extension_init.get::<super::native_rotation::restore::NativeRestoreStartup>();
+         let base_instructions_provenance = if config.base_instructions.is_some() {
+             Some(
+                 config
+@@ -805,6 +807,10 @@
+             Some(BaseInstructionsProvenance::Model {
+                 model: model_info.slug.clone(),
+             })
++        };
++        let base_instructions_provenance = match &native_restore {
++            Some(restore) => restore.base_instructions_provenance.clone(),
++            None => base_instructions_provenance,
+         };
+         let forked_from_id = session_configuration
+             .forked_from_thread_id
+@@ -1445,7 +1451,9 @@
+             turn_environments.update_selections(environment_selections);
+             session_configuration.environments = turn_environments.selections();
+             let resolved_environments = turn_environments.snapshot().await;
+-            let agents_md_manager = Arc::new(AgentsMdManager::new(instructions));
++            let agents_md_manager = native_restore.as_ref()
++                .map(|restore| Arc::clone(&restore.instructions))
++                .unwrap_or_else(|| Arc::new(AgentsMdManager::new(instructions)));
+             let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
+                 Arc::clone(&config),
+                 Arc::clone(&plugins_manager),
+@@ -1458,7 +1466,9 @@
+                 otel.name = "session_init.plugin_skill_warmup",
+             ));
+             let thread_name_lookup = async {
+-                if config.ephemeral && matches!(&initial_history, InitialHistory::Forked(_)) {
++                if native_restore.is_some() {
++                    session_configuration.thread_name.clone()
++                } else if config.ephemeral && matches!(&initial_history, InitialHistory::Forked(_)) {
+                     None
+                 } else {
+                     thread_title_from_thread_store(live_thread.as_ref(), &thread_store, thread_id)
+@@ -1470,7 +1480,13 @@
+                 otel.name = "session_init.thread_name_lookup",
+             ));
+             let (instruction_refresh, plugin_skill_errors, thread_name) = tokio::join!(
+-                agents_md_manager.refresh(config.as_ref(), &resolved_environments),
++                async {
++                    if native_restore.is_some() {
++                        (Ok(agents_md_manager.get_loaded().await), Vec::new())
++                    } else {
++                        agents_md_manager.refresh(config.as_ref(), &resolved_environments).await
++                    }
++                },
+                 plugin_skill_warmup,
+                 thread_name_lookup,
+             );
+@@ -1813,6 +1829,11 @@
+                 forked_from_ordinal_exclusive,
+                 next_internal_sub_id: AtomicU64::new(0),
+             });
++            if let Some(restore) = &native_restore {
++                sess.services.mcp_runtime.set_elicitations_auto_deny(
++                    restore.mcp_elicitations_auto_deny,
++                );
++            }
+             if let Some(startup) = &startup {
+                 let _ = startup.session.set(Arc::clone(&sess));
+             }
+@@ -1904,8 +1925,10 @@
+                 &inherited_environments,
+                 &session_configuration.environments,
+             );
+-            sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base)
+-                .await;
++            if native_restore.is_none() {
++                sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base)
++                    .await;
++            }
+             let session_start_source = match &initial_history {
+                 InitialHistory::Forked(_) if forked_from_id.is_some() => {
+                     codex_hooks::SessionStartSource::Fork
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -932,6 +932,19 @@
+         patch: ThreadMetadataPatch,
+         include_archived: bool,
+     ) -> CodexResult<StoredThread> {
++        // Cover both the live route and cold-store fallback. Attempting a write
++        // invalidates preparation; a sealed operation rejects both writer IDs.
++        let _admission = self
++            .state
++            .rotation_admission
++            .enter()
++            .await
++            .ok_or_else(|| CodexErr::Fatal("thread mutation admission is closed".into()))?;
++        if self.state.native_rotation_is_fenced(thread_id) {
++            return Err(CodexErr::InvalidRequest(
++                "thread metadata is fenced by an unfinished native rotation".into(),
++            ));
++        }
+         if let Ok(thread) = self.get_thread(thread_id).await {
+             if thread.config_snapshot().await.ephemeral {
+                 return Err(CodexErr::InvalidRequest(format!(
+@@ -980,6 +993,19 @@
+         section: Option<&str>,
+         before_thread_id: Option<ThreadId>,
+     ) -> CodexResult<()> {
++        // Cover both the live route and cold-store fallback. Attempting a write
++        // invalidates preparation; a sealed operation rejects both writer IDs.
++        let _admission = self
++            .state
++            .rotation_admission
++            .enter()
++            .await
++            .ok_or_else(|| CodexErr::Fatal("thread mutation admission is closed".into()))?;
++        if self.state.native_rotation_is_fenced(thread_id) {
++            return Err(CodexErr::InvalidRequest(
++                "thread metadata is fenced by an unfinished native rotation".into(),
++            ));
++        }
+         if let Ok(thread) = self.get_thread(thread_id).await {
+             if thread.config_snapshot().await.ephemeral {
+                 return Err(CodexErr::InvalidRequest(format!(
+@@ -2163,7 +2189,10 @@
+                 }) => Some(*parent_thread_id),
+                 _ => None,
+             });
+-        if self.native_rotation_is_fenced(rotation_target)
++        let native_restore_authorized = thread_extension_init
++            .get::<crate::session::native_rotation::restore::NativeRestoreStartup>()
++            .is_some_and(|restore| restore.authorizes(self, rotation_target));
++        if (self.native_rotation_is_fenced(rotation_target) && !native_restore_authorized)
+             || rotation_parent.is_some_and(|parent| self.native_rotation_is_fenced(parent))
+         {
+             return Err(CodexErr::InvalidRequest(
+@@ -2418,7 +2447,21 @@
+         let new_thread = self
+             .finalize_thread_spawn(session, io, tracked_session_source, initial_host_config)
+             .await?;
+-        new_thread.thread.emit_thread_ready_lifecycle().await;
++        let staged_native_restore = new_thread
++            .thread
++            .session
++            .services
++            .thread_extension_data
++            .get::<crate::session::native_rotation::restore::NativeRestoreStartup>()
++            .is_some();
++        if staged_native_restore && source_changed_during_startup.load(Ordering::Acquire) {
++            return Err(CodexErr::Fatal(
++                "native restoration inputs changed during startup".into(),
++            ));
++        }
++        if !staged_native_restore {
++            new_thread.thread.emit_thread_ready_lifecycle().await;
++        }
+         if source_changed_during_startup.load(Ordering::Acquire) {
+             new_thread.thread.session.request_mcp_runtime_refresh();
+         }
+@@ -2446,6 +2489,32 @@
+                 return Err(CodexErr::SessionConfiguredNotFirstEvent);
+             }
+         };
++
++        // The accepted rotation owner keeps the replacement private until its
++        // durable receipt exists. Public lookups/settings cannot obtain it here.
++        if let Some(restore) = session
++            .services
++            .thread_extension_data
++            .get::<crate::session::native_rotation::restore::NativeRestoreStartup>(
++        ) {
++            if !restore.authorizes(self, thread_id) {
++                return Err(CodexErr::Fatal(
++                    "native restoration owner changed before staging".into(),
++                ));
++            }
++            let thread = Arc::new(CodexThread::new(
++                session,
++                io,
++                ThreadStartupMetadata::from(&session_configured),
++                session_configured.rollout_path.clone(),
++                session_source,
++            ));
++            return Ok(NewThread {
++                thread_id,
++                thread,
++                session_configured,
++            });
++        }
+ 
+         {
+             let mut threads = self.threads.write().await;
+--- a/codex-rs/core/src/thread_manager/native_rotation_tests.rs
++++ b/codex-rs/core/src/thread_manager/native_rotation_tests.rs
+@@ -61,11 +61,50 @@
+     }
+ }
+ 
++struct CountingInstructionsProvider {
++    calls: std::sync::atomic::AtomicUsize,
++    text: std::sync::Mutex<String>,
++}
++impl CountingInstructionsProvider {
++    fn new(text: &str) -> Self {
++        Self {
++            calls: std::sync::atomic::AtomicUsize::new(0),
++            text: std::sync::Mutex::new(text.to_owned()),
++        }
++    }
++    fn calls(&self) -> usize {
++        self.calls.load(std::sync::atomic::Ordering::SeqCst)
++    }
++}
++impl codex_extension_api::UserInstructionsProvider for CountingInstructionsProvider {
++    fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
++        Box::pin(async move {
++            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++            codex_extension_api::LoadedUserInstructions {
++                instructions: Some(codex_extension_api::Instructions {
++                    text: self.text.lock().unwrap().clone(),
++                    source: None,
++                }),
++                warnings: Vec::new(),
++            }
++        })
++    }
++}
++impl codex_extension_api::ThreadInstructionsProvider for CountingInstructionsProvider {
++    fn load_thread_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
++        codex_extension_api::UserInstructionsProvider::load_user_instructions(self)
++    }
++    fn share_with_subagents(&self) -> bool {
++        false
++    }
++}
++
+ struct Fixture {
+     manager: ThreadManager,
+     root: NewThread,
+     server: MockServer,
+     _home: TempDir,
++    config: crate::config::Config,
+     turn: String,
+ }
+ 
+@@ -74,7 +113,22 @@
+         Self::finished(Outcome::Success).await
+     }
+ 
++    async fn completed_with_metadata() -> Self {
++        Self::finished_with_instructions(Outcome::Success, None, true).await
++    }
++
+     async fn finished(outcome: Outcome) -> Self {
++        Self::finished_with_instructions(outcome, None, false).await
++    }
++
++    async fn finished_with_instructions(
++        outcome: Outcome,
++        instructions: Option<(
++            Arc<CountingInstructionsProvider>,
++            Arc<CountingInstructionsProvider>,
++        )>,
++        metadata_database: bool,
++    ) -> Self {
+         let server = MockServer::start().await;
+         let home = tempfile::tempdir().unwrap();
+         let mut config = test_config().await;
+@@ -88,17 +142,49 @@
+             .unwrap();
+         config.model_provider.base_url = Some(server.uri());
+         config.model_provider.supports_websockets = false;
+-        let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
++        let state_db = if metadata_database {
++            let runtime = codex_state::StateRuntime::init(
++                codex_state::SqliteConfig::new_for_testing(config.codex_home.clone()),
++                config.model_provider_id.clone(),
++            )
++            .await
++            .unwrap();
++            runtime.mark_backfill_complete(None).await.unwrap();
++            Some(runtime)
++        } else {
++            None
++        };
++        let mut manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+             CodexAuth::from_api_key("dummy"),
+             config.model_provider.clone(),
+             config.codex_home.to_path_buf(),
+             Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
++            state_db.clone(),
+         );
+         Arc::get_mut(&mut manager.state).unwrap().thread_store =
+-            super::thread_store_from_config(&config, /*state_db*/ None);
++            super::thread_store_from_config(&config, state_db);
++        if let Some((global, _)) = &instructions {
++            Arc::get_mut(&mut manager.state)
++                .unwrap()
++                .user_instructions_provider = global.clone();
++        }
++        let environments = if instructions.is_some() {
++            vec![codex_protocol::protocol::TurnEnvironmentSelection {
++                environment_id: "local".into(),
++                cwd: codex_utils_path_uri::PathUri::from_abs_path(&config.cwd),
++                workspace_roots: Vec::new(),
++                config: codex_protocol::protocol::EnvironmentConfigState::FromThread,
++            }]
++        } else {
++            Vec::new()
++        };
++        let fixture_config = config.clone();
+         let root = manager
+             .start_thread(StartThreadOptions {
+-                environments: Some(Vec::new()),
++                environments: Some(environments),
++                thread_instructions_provider: instructions.as_ref().map(|(_, provider)| {
++                    provider.clone() as Arc<dyn codex_extension_api::ThreadInstructionsProvider>
++                }),
+                 ..StartThreadOptions::new(config)
+             })
+             .await
+@@ -129,6 +215,7 @@
+             root,
+             server,
+             _home: home,
++            config: fixture_config,
+             turn,
+         }
+     }
+@@ -758,3 +845,654 @@
+     drop(close.await.unwrap().unwrap());
+     native_close_fixture_finished(fixture).await;
+ }
++
++fn native_restore_request(
++    capsule: &str,
++) -> crate::session::native_rotation::close::NativeCloseRequest {
++    use sha2::Digest;
++    let mut request = native_close_request();
++    request.capsule_sha256 = format!("{:x}", sha2::Sha256::digest(capsule.as_bytes()));
++    request.restore_capsule = Some(capsule.to_owned());
++    request
++}
++
++#[tokio::test]
++async fn native_restore_creates_a_verified_capsule_and_preserves_live_settings() {
++    let fixture = Fixture::completed_with_metadata().await;
++    fixture
++        .root
++        .thread
++        .restore_thread_settings(crate::codex_thread::CodexThreadSettingsOverrides {
++            model: Some("gpt-5.1-codex".into()),
++            effort: Some(Some(codex_protocol::openai_models::ReasoningEffort::High)),
++            approval_policy: Some(codex_protocol::protocol::AskForApproval::OnRequest),
++            permission_profile: Some(codex_protocol::models::PermissionProfile::workspace_write()),
++            disabled_plugin_ids: Some(vec!["rotation-kept-plugin".into()]),
++            ..Default::default()
++        })
++        .await
++        .unwrap();
++    fixture.root.thread.session.stop_mcp_prewarm_worker().await;
++    fixture
++        .root
++        .thread
++        .set_app_server_client_info(
++            Some("native-rotation-client".into()),
++            Some("42".into()),
++            true,
++        )
++        .await
++        .unwrap();
++    fixture.root.thread.session.stop_mcp_prewarm_worker().await;
++    let renamed = fixture
++        .manager
++        .update_thread_metadata(
++            fixture.root.thread_id,
++            codex_thread_store::ThreadMetadataPatch {
++                name: Some(Some("Actual renamed task".into())),
++                ..Default::default()
++            },
++            false,
++        )
++        .await
++        .unwrap();
++    assert_eq!(renamed.name.as_deref(), Some("Actual renamed task"));
++    let expected_settings = fixture.root.thread.thread_settings_snapshot().await;
++    assert_eq!(expected_settings.model, "gpt-5.1-codex");
++    let before = fixture.root.thread.config_snapshot().await;
++    let database = fixture
++        .root
++        .thread
++        .state_db()
++        .expect("metadata fixture database");
++    let previous_memory_mode = database
++        .get_thread_memory_mode(fixture.root.thread_id)
++        .await
++        .unwrap()
++        .unwrap();
++    let (memory_mode, expected_memory_mode) = if previous_memory_mode == "enabled" {
++        (
++            codex_protocol::protocol::ThreadMemoryMode::Disabled,
++            "disabled",
++        )
++    } else {
++        (
++            codex_protocol::protocol::ThreadMemoryMode::Enabled,
++            "enabled",
++        )
++    };
++    fixture
++        .root
++        .thread
++        .set_thread_memory_mode(memory_mode)
++        .await
++        .unwrap();
++    let capsule =
++        "Continue the real task.\nKeep the accepted settings and the exact literal $PATH.";
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let source_runtime = reservation.receipt().runtime_id;
++    let mut closed = reservation
++        .close_for_rotation(native_restore_request(capsule))
++        .await
++        .unwrap();
++    let restored = closed.restored.take().expect("replacement thread");
++    let receipt = closed
++        .restore_receipt
++        .as_ref()
++        .expect("verified restore receipt");
++    assert_ne!(restored.thread_id, fixture.root.thread_id);
++    assert_ne!(receipt.runtime_id, source_runtime);
++    assert_eq!(receipt.thread_id, restored.thread_id);
++    assert_eq!(receipt.process_id, std::process::id());
++    assert_ne!(
++        Some(receipt.rollout_path.clone()),
++        fixture.root.thread.rollout_path()
++    );
++    let restored_metadata = restored
++        .thread
++        .session
++        .live_thread_for_persistence("verify restored test name")
++        .unwrap()
++        .read_thread(false, false)
++        .await
++        .unwrap();
++    assert_eq!(restored_metadata.name, renamed.name);
++    assert_eq!(
++        database
++            .get_thread_memory_mode(restored.thread_id)
++            .await
++            .unwrap()
++            .as_deref(),
++        Some(expected_memory_mode),
++    );
++    assert!(
++        restored
++            .thread
++            .session
++            .services
++            .mcp_runtime
++            .elicitations_auto_deny()
++    );
++    let after = restored.thread.config_snapshot().await;
++    assert_eq!(
++        serde_json::to_value(restored.thread.thread_settings_snapshot().await).unwrap(),
++        serde_json::to_value(expected_settings).unwrap()
++    );
++    assert_eq!(before.model, after.model);
++    assert_eq!(before.approval_policy, after.approval_policy);
++    assert_eq!(before.permission_profile, after.permission_profile);
++    assert_eq!(before.service_tier, after.service_tier);
++    assert_eq!(after.forked_from_thread_id, Some(fixture.root.thread_id));
++    assert!(Arc::ptr_eq(
++        &fixture.root.thread.session.services.agents_md_manager,
++        &restored.thread.session.services.agents_md_manager
++    ));
++    let saved: serde_json::Value = serde_json::from_slice(
++        &std::fs::read(closed.receipt.journal_directory.join("restored.json")).unwrap(),
++    )
++    .unwrap();
++    assert_eq!(saved["state"], "restored");
++    assert_eq!(
++        saved["restored"]["thread_id"],
++        restored.thread_id.to_string()
++    );
++    assert_eq!(saved["restored"]["capsule_sha256"], receipt.capsule_sha256);
++    assert!(
++        !fixture
++            .manager
++            .state
++            .native_rotation_is_fenced(fixture.root.thread_id)
++    );
++    assert!(
++        !fixture
++            .manager
++            .state
++            .native_rotation_is_fenced(restored.thread_id)
++    );
++    restored.thread.shutdown_and_wait().await.unwrap();
++    drop(closed);
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_restore_rejects_bad_capsules_before_closing_or_journaling() {
++    let fixture = Fixture::completed().await;
++    for capsule in [
++        String::new(),
++        "bad\0capsule".into(),
++        "x".repeat(256 * 1024 + 1),
++    ] {
++        let request = native_restore_request(&capsule);
++        let directory = native_close_directory(&fixture, request.operation_id);
++        let reservation = fixture
++            .root
++            .thread
++            .prepare_context_rotation(fixture.turn.clone())
++            .await
++            .unwrap();
++        assert_eq!(
++            reservation.close_for_rotation(request).await.err(),
++            Some(NativeRotationError::InvalidRequest)
++        );
++        assert!(!directory.exists());
++    }
++    let mut request = native_restore_request("one");
++    request.restore_capsule = Some("two".into());
++    let directory = native_close_directory(&fixture, request.operation_id);
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    assert_eq!(
++        reservation.close_for_rotation(request).await.err(),
++        Some(NativeRotationError::InvalidRequest)
++    );
++    assert!(!directory.exists());
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_ok()
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_restore_finishes_after_the_accepted_caller_disconnects() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request =
++        native_restore_request("The owner must finish this capsule after caller loss.");
++    let directory = native_close_directory(&fixture, request.operation_id);
++    let entered = Arc::new(Notify::new());
++    let proceed = Arc::new(Notify::new());
++    request.test_after_seal = Some((Arc::clone(&entered), Arc::clone(&proceed)));
++    let accepted = entered.notified();
++    tokio::pin!(accepted);
++    accepted.as_mut().enable();
++    let caller = tokio::spawn(reservation.close_for_rotation(request));
++    accepted.await;
++    caller.abort();
++    assert!(caller.await.unwrap_err().is_cancelled());
++    proceed.notify_one();
++    tokio::time::timeout(
++        std::time::Duration::from_secs(5),
++        fixture.root.thread.wait_until_terminated(),
++    )
++    .await
++    .unwrap();
++    let saved: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(directory.join("restored.json")).unwrap()).unwrap();
++    let target: codex_protocol::ThreadId =
++        serde_json::from_value(saved["restored"]["thread_id"].clone()).unwrap();
++    let restored = fixture.manager.get_thread(target).await.unwrap();
++    assert!(!directory.join("restore_failed.json").exists());
++    restored.shutdown_and_wait().await.unwrap();
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_restore_stays_private_and_metadata_fenced_until_its_durable_receipt() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request = native_restore_request("Private until the immutable restore receipt.");
++    let directory = native_close_directory(&fixture, request.operation_id);
++    let entered = Arc::new(Notify::new());
++    let proceed = Arc::new(Notify::new());
++    request.test_after_restore = Some((Arc::clone(&entered), Arc::clone(&proceed)));
++    let accepted = entered.notified();
++    tokio::pin!(accepted);
++    accepted.as_mut().enable();
++    let caller = tokio::spawn(reservation.close_for_rotation(request));
++    tokio::time::timeout(std::time::Duration::from_secs(5), accepted)
++        .await
++        .unwrap();
++    let saved: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(directory.join("intent.json")).unwrap()).unwrap();
++    let target: codex_protocol::ThreadId =
++        serde_json::from_value(saved["destination_thread_id"].clone()).unwrap();
++    assert!(
++        fixture
++            .root
++            .thread
++            .update_thread_metadata(
++                codex_thread_store::ThreadMetadataPatch {
++                    name: Some(Some("must not reach the sealed writer".into())),
++                    ..Default::default()
++                },
++                false,
++            )
++            .await
++            .is_err()
++    );
++    assert!(fixture.root.thread.append_rollout_items(&[]).await.is_err());
++    assert!(fixture.root.thread.checkpoint_preparation().await.is_err());
++    assert!(fixture.root.thread.flush_rollout().await.is_err());
++    assert!(
++        fixture
++            .root
++            .thread
++            .checkpoint_thread_settings()
++            .await
++            .is_err()
++    );
++    assert!(
++        fixture
++            .root
++            .thread
++            .set_app_server_client_info(None, None, true)
++            .await
++            .is_err()
++    );
++    assert!(
++        fixture
++            .root
++            .thread
++            .inject_response_items(Vec::new())
++            .await
++            .is_err()
++    );
++    assert!(
++        fixture
++            .root
++            .thread
++            .inject_response_items_for_turn(Vec::new())
++            .await
++            .is_err()
++    );
++    let old_path = fixture.root.thread.rollout_path().unwrap();
++    let before_materialization = std::fs::read(&old_path).unwrap();
++    fixture.root.thread.ensure_rollout_materialized().await;
++    assert_eq!(std::fs::read(&old_path).unwrap(), before_materialization);
++    assert!(
++        fixture
++            .root
++            .thread
++            .set_thread_memory_mode(codex_protocol::protocol::ThreadMemoryMode::Disabled,)
++            .await
++            .is_err()
++    );
++    assert!(directory.join("closed.json").is_file());
++    assert!(!directory.join("restored.json").exists());
++    assert!(
++        !fixture
++            .manager
++            .state
++            .threads
++            .read()
++            .await
++            .contains_key(&target)
++    );
++    assert!(fixture.manager.get_thread(target).await.is_err());
++    for id in [fixture.root.thread_id, target] {
++        assert!(fixture.manager.state.native_rotation_is_fenced(id));
++        let error = fixture
++            .manager
++            .update_thread_metadata(
++                id,
++                codex_thread_store::ThreadMetadataPatch {
++                    name: Some(Some("must not change".into())),
++                    ..Default::default()
++                },
++                false,
++            )
++            .await
++            .err()
++            .expect("metadata must be fenced");
++        assert!(error.to_string().contains("native rotation"), "{error}");
++        let error = fixture
++            .manager
++            .move_thread_to_section(id, None, None)
++            .await
++            .unwrap_err();
++        assert!(error.to_string().contains("native rotation"), "{error}");
++    }
++    proceed.notify_one();
++    let mut closed = caller.await.unwrap().unwrap();
++    let restored = closed.restored.take().unwrap();
++    assert_eq!(restored.thread_id, target);
++    assert!(directory.join("restored.json").is_file());
++    assert!(Arc::ptr_eq(
++        &fixture.manager.get_thread(target).await.unwrap(),
++        &restored.thread
++    ));
++    restored.thread.shutdown_and_wait().await.unwrap();
++    drop(closed);
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_restore_journal_failure_closes_the_private_target_and_retains_both_fences() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request = native_restore_request("An unconfirmed restoration must remain unpublished.");
++    let directory = native_close_directory(&fixture, request.operation_id);
++    let entered = Arc::new(Notify::new());
++    let proceed = Arc::new(Notify::new());
++    request.test_after_restore = Some((Arc::clone(&entered), Arc::clone(&proceed)));
++    let accepted = entered.notified();
++    tokio::pin!(accepted);
++    accepted.as_mut().enable();
++    let caller = tokio::spawn(reservation.close_for_rotation(request));
++    tokio::time::timeout(std::time::Duration::from_secs(5), accepted)
++        .await
++        .unwrap();
++    let saved: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(directory.join("intent.json")).unwrap()).unwrap();
++    let target: codex_protocol::ThreadId =
++        serde_json::from_value(saved["destination_thread_id"].clone()).unwrap();
++    std::fs::create_dir(directory.join("restored.json")).unwrap();
++    proceed.notify_one();
++    assert!(matches!(
++        caller.await.unwrap(),
++        Err(NativeRotationError::Persistence(_))
++    ));
++    assert!(directory.join("closed.json").is_file());
++    assert!(directory.join("restore_failed.json").is_file());
++    assert!(!directory.join("restored.json").is_file());
++    for id in [fixture.root.thread_id, target] {
++        assert!(fixture.manager.state.native_rotation_is_fenced(id));
++        assert!(fixture.manager.get_thread(id).await.is_err());
++    }
++    let config = (*fixture.root.thread.config().await).clone();
++    let replay = fixture
++        .manager
++        .start_thread(StartThreadOptions {
++            reserved_thread_id: Some(target),
++            environments: Some(Vec::new()),
++            ..StartThreadOptions::new(config)
++        })
++        .await
++        .err()
++        .expect("unconfirmed writer cannot be reopened");
++    assert!(replay.to_string().contains("native rotation"), "{replay}");
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_restore_preserves_instruction_callbacks_and_exact_environment_handles() {
++    let global = Arc::new(CountingInstructionsProvider::new(
++        "Applied global instructions",
++    ));
++    let private = Arc::new(CountingInstructionsProvider::new(
++        "Applied private instructions",
++    ));
++    let fixture = Fixture::finished_with_instructions(
++        Outcome::Success,
++        Some((Arc::clone(&global), Arc::clone(&private))),
++        false,
++    )
++    .await;
++    let instructions = Arc::clone(&fixture.root.thread.session.services.agents_md_manager);
++    let before_loaded = instructions
++        .get_loaded()
++        .await
++        .expect("applied instructions");
++    let before_applied = instructions.inherited_instructions().await;
++    assert_eq!(
++        before_applied.user.unwrap().text,
++        "Applied global instructions"
++    );
++    assert_eq!(
++        before_applied.thread.unwrap().text,
++        "Applied private instructions"
++    );
++    assert!(
++        before_applied.thread_provider.is_none(),
++        "private provider cannot be inherited by an ordinary fork"
++    );
++    let before_counts = (global.calls(), private.calls());
++    assert!(before_counts.0 > 0 && before_counts.1 > 0);
++    let environments = fixture
++        .root
++        .thread
++        .session
++        .services
++        .turn_environments
++        .snapshot()
++        .await;
++    let before_handles = environments.ready_environment_handles();
++    assert_eq!(before_handles.len(), 1);
++    assert!(before_handles.contains_key("local"));
++    *global.text.lock().unwrap() = "Refreshed global instructions".into();
++    *private.text.lock().unwrap() = "Refreshed private instructions".into();
++
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut closed = reservation
++        .close_for_rotation(native_restore_request(
++            "Carry applied providers and the selected local environment.",
++        ))
++        .await
++        .unwrap();
++    let restored = closed.restored.take().unwrap();
++    let target = &restored.thread.session;
++    assert!(Arc::ptr_eq(
++        &instructions,
++        &target.services.agents_md_manager
++    ));
++    assert!(Arc::ptr_eq(
++        &before_loaded,
++        &target
++            .services
++            .agents_md_manager
++            .get_loaded()
++            .await
++            .unwrap()
++    ));
++    assert_eq!((global.calls(), private.calls()), before_counts);
++    let after = target.services.turn_environments.snapshot().await;
++    assert_eq!(after.all_selections(), environments.all_selections());
++    let after_handles = after.ready_environment_handles();
++    assert_eq!(after_handles.len(), before_handles.len());
++    for (id, expected) in &before_handles {
++        assert!(Arc::ptr_eq(expected, after_handles.get(id).unwrap()));
++    }
++
++    let (refreshed, warnings) = target
++        .services
++        .agents_md_manager
++        .refresh(&fixture.config, &after)
++        .await;
++    refreshed.unwrap();
++    assert!(warnings.is_empty());
++    assert_eq!(
++        (global.calls(), private.calls()),
++        (before_counts.0 + 1, before_counts.1 + 1)
++    );
++    let applied = target
++        .services
++        .agents_md_manager
++        .inherited_instructions()
++        .await;
++    assert_eq!(applied.user.unwrap().text, "Refreshed global instructions");
++    assert_eq!(
++        applied.thread.unwrap().text,
++        "Refreshed private instructions"
++    );
++    restored.thread.shutdown_and_wait().await.unwrap();
++    drop(closed);
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn direct_metadata_mutation_revokes_native_preparation_before_writing() {
++    let fixture = Fixture::completed_with_metadata().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let source = Arc::clone(&fixture.root.thread);
++    let mutation = tokio::spawn(async move {
++        source
++            .update_thread_metadata(
++                codex_thread_store::ThreadMetadataPatch {
++                    name: Some(Some("Allowed after preparation revocation".into())),
++                    ..Default::default()
++                },
++                false,
++            )
++            .await
++    });
++    tokio::time::timeout(std::time::Duration::from_secs(5), reservation.revoked())
++        .await
++        .unwrap();
++    drop(reservation);
++    let renamed = mutation.await.unwrap().unwrap();
++    assert_eq!(
++        renamed.name.as_deref(),
++        Some("Allowed after preparation revocation")
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn external_checkpoints_and_context_writes_revoke_native_preparation() {
++    for action in 0..7 {
++        let fixture = Fixture::completed_with_metadata().await;
++        let reservation = fixture
++            .root
++            .thread
++            .prepare_context_rotation(fixture.turn.clone())
++            .await
++            .unwrap();
++        let source = Arc::clone(&fixture.root.thread);
++        let mutation = tokio::spawn(async move {
++            let item = codex_protocol::models::ResponseItem::Message {
++                id: None,
++                role: "user".into(),
++                content: vec![codex_protocol::models::ContentItem::InputText {
++                    text: "External input retains user ownership.".into(),
++                }],
++                phase: None,
++                internal_chat_message_metadata_passthrough: None,
++            };
++            match action {
++                0 => source
++                    .checkpoint_preparation()
++                    .await
++                    .map_err(|error| error.to_string()),
++                1 => {
++                    source.ensure_rollout_materialized().await;
++                    Ok(())
++                }
++                2 => source
++                    .flush_rollout()
++                    .await
++                    .map_err(|error| error.to_string()),
++                3 => source
++                    .checkpoint_thread_settings()
++                    .await
++                    .map_err(|error| error.to_string()),
++                4 => source
++                    .inject_response_items_for_turn(vec![item])
++                    .await
++                    .map_err(|error| error.to_string()),
++                5 => source
++                    .inject_response_items(vec![item])
++                    .await
++                    .map_err(|error| error.to_string()),
++                6 => source
++                    .set_thread_memory_mode(codex_protocol::protocol::ThreadMemoryMode::Disabled)
++                    .await
++                    .map_err(|error| error.to_string()),
++                _ => unreachable!(),
++            }
++        });
++        tokio::time::timeout(std::time::Duration::from_secs(5), reservation.revoked())
++            .await
++            .unwrap();
++        drop(reservation);
++        mutation.await.unwrap().unwrap();
++        fixture.close().await;
++    }
++}
+--- a/codex-rs/core/src/thread_manager/rotation_admission.rs
++++ b/codex-rs/core/src/thread_manager/rotation_admission.rs
+@@ -20,40 +20,120 @@
+             .contains_key(&thread_id)
+     }
+ 
+-    /// Caller owns the manager reservation and seals the session in the same action.
++    pub(crate) fn native_rotation_fence_matches(
++        &self,
++        thread_id: codex_protocol::ThreadId,
++        runtime_id: uuid::Uuid,
++    ) -> bool {
++        self.native_rotation_fences
++            .lock()
++            .expect("native rotation fences poisoned")
++            .get(&thread_id)
++            == Some(&runtime_id)
++    }
++
++    /// Reserve both writers in one action. Collision cannot leave a partial fence.
+     pub(crate) fn fence_native_rotation(
+         &self,
+         thread_id: codex_protocol::ThreadId,
+         runtime_id: uuid::Uuid,
++        destination: Option<codex_protocol::ThreadId>,
+     ) -> bool {
+         let mut fences = self
+             .native_rotation_fences
+             .lock()
+             .expect("native rotation fences poisoned");
+-        if let std::collections::hash_map::Entry::Vacant(entry) = fences.entry(thread_id) {
+-            entry.insert(runtime_id);
+-            true
+-        } else {
+-            false
++        if fences.contains_key(&thread_id)
++            || destination.is_some_and(|target| target == thread_id || fences.contains_key(&target))
++        {
++            return false;
++        }
++        fences.insert(thread_id, runtime_id);
++        if let Some(target) = destination {
++            fences.insert(target, runtime_id);
++        }
++        true
++    }
++
++    pub(crate) async fn restore_native_rotation(
++        self: &Arc<Self>,
++        source: &Arc<crate::session::session::Session>,
++        restore: &crate::session::native_rotation::restore::NativeRestoreStartup,
++    ) -> codex_protocol::error::Result<super::NewThread> {
++        let manager = super::ThreadManager {
++            state: Arc::clone(self),
++            _test_codex_home_guard: None,
++        };
++        let options = restore.options(source);
++        let control = manager.agent_control_for_config(&options.config);
++        let startup = Arc::new(crate::session::startup::SessionStartup::default());
++        let mut request = super::ThreadSpawnRequest::new(
++            options,
++            Arc::clone(&source.services.auth_manager),
++            control,
++        );
++        request.startup = Some(Arc::clone(&startup));
++        request.inherited_exec_policy = Some(Arc::clone(&source.services.exec_policy));
++        request.inherited_instructions =
++            Some(crate::agents_md_manager::SessionInstructions::default());
++        request.forked_from_thread_id = Some(source.thread_id);
++        let result = self.spawn_thread(request).await;
++        match result {
++            Ok(thread) => {
++                startup.persistence.lock().await.commit();
++                Ok(thread)
++            }
++            Err(error) => {
++                restore.abort();
++                startup.cleanup().await;
++                Err(error)
++            }
+         }
+     }
+ 
+-    /// Only a confirmed closed writer may release its exact old runtime fence.
+-    pub(crate) fn finish_native_rotation_fence(
++    /// Publication and paired fence release share the registry lock. Until
++    /// this action the replacement exists only in the accepted owner's handle.
++    pub(crate) async fn publish_native_restoration(
+         &self,
+-        thread_id: codex_protocol::ThreadId,
+-        runtime_id: uuid::Uuid,
++        restored: &super::NewThread,
++        source: codex_protocol::ThreadId,
++        runtime: uuid::Uuid,
++    ) -> bool {
++        let mut threads = self.threads.write().await;
++        if threads.contains_key(&restored.thread_id)
++            || !self.native_rotation_fence_matches(source, runtime)
++            || !self.native_rotation_fence_matches(restored.thread_id, runtime)
++        {
++            return false;
++        }
++        threads.insert(restored.thread_id, Arc::clone(&restored.thread));
++        if !self.finish_native_rotation_fences(source, runtime, Some(restored.thread_id)) {
++            threads.remove(&restored.thread_id);
++            return false;
++        }
++        true
++    }
++
++    pub(crate) fn finish_native_rotation_fences(
++        &self,
++        source: codex_protocol::ThreadId,
++        runtime: uuid::Uuid,
++        destination: Option<codex_protocol::ThreadId>,
+     ) -> bool {
+         let mut fences = self
+             .native_rotation_fences
+             .lock()
+             .expect("native rotation fences poisoned");
+-        if fences.get(&thread_id) == Some(&runtime_id) {
+-            fences.remove(&thread_id);
+-            true
+-        } else {
+-            false
++        if fences.get(&source) != Some(&runtime)
++            || destination.is_some_and(|target| fences.get(&target) != Some(&runtime))
++        {
++            return false;
+         }
++        fences.remove(&source);
++        if let Some(target) = destination {
++            fences.remove(&target);
++        }
++        true
+     }
+ 
+     pub(crate) fn local_rotation_admission(&self) -> Option<ActivityAdmission> {

@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -15,14 +14,15 @@ import (
 )
 
 type WorkerConfig struct {
-	SocketPath       string
-	ManifestPath     string
-	SessionID        string
-	Token            string
-	Command          string
-	WorkingDirectory string
-	Cols             uint16
-	Rows             uint16
+	SocketPath         string
+	ManifestPath       string
+	SessionID          string
+	Token              string
+	Command            string
+	WorkingDirectory   string
+	Cols               uint16
+	Rows               uint16
+	RotationControlled bool
 }
 
 func ServeWorker(config WorkerConfig) error {
@@ -50,14 +50,13 @@ func ServeWorker(config WorkerConfig) error {
 	if err != nil {
 		return err
 	}
+	session.rotationControlled = config.RotationControlled
+	session.rotationGuardDirectory = filepath.Join(filepath.Dir(config.ManifestPath), "rotation-input", config.SessionID)
 	eventPath := filepath.Join(filepath.Dir(filepath.Dir(config.ManifestPath)), "events", config.SessionID+".jsonl")
 	if err := session.enableEventJournal(eventPath); err != nil {
 		_ = session.signal(syscall.SIGTERM)
 		return err
 	}
-	transcriptFrames, stopTranscripts := observeAgentTranscripts(session.agentProcessSnapshot)
-	defer stopTranscripts()
-	go forwardTranscriptEvents(session, transcriptFrames)
 	bootID, err := nodeBootID()
 	if err != nil {
 		_ = session.signal(syscall.SIGTERM)
@@ -74,12 +73,25 @@ func ServeWorker(config WorkerConfig) error {
 		ShellPID: session.processID(), NodeBootID: bootID,
 		SocketPath: config.SocketPath, Token: config.Token,
 		Command: config.Command, WorkingDirectory: config.WorkingDirectory,
-		State: "running", Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "client_count_v1", "terminal_mode_state_v1"}, CreatedAt: time.Now().UTC(),
+		State: "running", Capabilities: []string{"host_rotation_v1", "host_rotation_text_v1", "host_rotation_credentials_v1", "native_rotation_bridge_v1", "input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1"}, CreatedAt: time.Now().UTC(),
 	}
 	if err := storeManifest(config.ManifestPath, manifest); err != nil {
 		_ = session.signal(syscall.SIGTERM)
 		return err
 	}
+
+	hostRotation := newHostRotationSupervisorWithDriver(
+		filepath.Join(filepath.Dir(config.ManifestPath), "rotation-supervision", config.SessionID+".json"), evaluateHostRotation,
+		nativeHostRotationFinalizer(filepath.Dir(config.ManifestPath)), filepath.Dir(config.ManifestPath),
+		nativeHostRotationTransactionDriver(session, filepath.Dir(config.ManifestPath)),
+		nativeHostRotationPreparer(filepath.Dir(config.ManifestPath)))
+	session.mu.Lock()
+	session.hostRotation = hostRotation
+	session.mu.Unlock()
+	defer hostRotation.close()
+	transcriptFrames, stopTranscripts := observeAgentTranscripts(session.agentProcessSnapshot)
+	defer stopTranscripts()
+	go forwardTranscriptEvents(session, transcriptFrames)
 
 	stopped := make(chan struct{})
 	persistenceDone := make(chan struct{})
@@ -211,6 +223,20 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		return
 	}
 	writer := protocol.NewWriter(connection)
+	if hello.NativeRotationBridge {
+		serveNativeRotationBridge(connection, writer, session, config.SessionID)
+		return
+	}
+	if len(hello.HostRotation) > 0 {
+		serveHostRotationRequest(connection, writer, hello, session, config)
+		return
+	}
+	if len(hello.PromptEditor) > 0 {
+		servePromptEditorRequest(connection, writer, hello, session, func() (PromptOwnerBinding, error) {
+			return ReadVerifiedPromptOwnerBinding(config.SessionID)
+		}, validatePromptEditorCapability)
+		return
+	}
 	if hello.Probe {
 		_, _, exited, exitCode := session.snapshot()
 		state := "ready"
@@ -220,6 +246,16 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
 			State: state, ExitCode: exitCode, WorkerPID: os.Getpid(),
 		})
+		_ = writer.Write(status)
+		return
+	}
+	if hello.GuardedInput {
+		state := "refused"
+		if err := session.guardedRotationInput(hello.GuardedOperationID, hello.GuardedAgentPID,
+			hello.GuardedProcessStart, hello.GuardedText); err == nil {
+			state = "accepted"
+		}
+		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: state, WorkerPID: os.Getpid()})
 		_ = writer.Write(status)
 		return
 	}
@@ -243,51 +279,31 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	}
 	controlGranted := session.acquireControl(hello.ClientID)
 	gracefulDetach := false
-	repaintAfterSequence := uint64(0)
-	attachRedrew := false
 	if controlGranted {
 		defer func() { session.releaseControl(hello.ClientID, gracefulDetach) }()
 		// A replay is cursor-addressed for the PTY grid that produced it. Apply
 		// the native pane geometry and capture its SIGWINCH redraw before taking
 		// the attachment snapshot.
-		repaintAfterSequence, attachRedrew = session.resizeForAttach(
+		session.resizeForAttach(
 			hello.Cols,
 			hello.Rows,
-			hello.LastSeq == 0 || hello.RepaintPulse,
+			hello.LastSeq == 0 || hello.RepaintPulse || session.needsFreshAttachReplay(hello.LastSeq),
 		)
 	}
 
-	viewer, replay, outputReset, eventReset, clientCount := session.attach(
-		hello.LastSeq, hello.LastEventSeq, !hello.TerminalOnly,
+	viewer, replay, outputReset, eventReset, clientCount := session.attachWithProgramStatus(
+		hello.LastSeq, hello.LastEventSeq, !hello.TerminalOnly, hello.ObserveProgramStatus,
 	)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "client_count_v1", "terminal_mode_state_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1"},
 		OutputReset: outputReset, EventReset: eventReset,
 		ControlGranted: &controlGranted, ClientCount: clientCount,
 	})
 	if err := writer.Write(attached); err != nil {
 		return
 	}
-	if attachRedrew && reconnectRepaintNeedsBarrier(replay, repaintAfterSequence, hello.Rows) {
-		// SIGWINCH repaints from primary-screen TUIs such as Codex and Claude
-		// are usually cursor-addressed deltas. Make this connection's captured
-		// repaint authoritative so a local renderer cannot retain stale cells
-		// from its previous presentation. This frame is deliberately not added
-		// to the session ring or broadcast to other attached clients.
-		// Sequence zero is presentation-only. It cannot move the resume cursor
-		// backwards or resurrect an invalid high cursor after output_reset.
-		if err := writer.Write(protocol.OutputFrame(0, []byte("\x1b[2J\x1b[H"))); err != nil {
-			return
-		}
-	}
-	for _, frame := range replay {
-		if err := writer.Write(frame); err != nil {
-			return
-		}
-	}
-	caughtUp, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "caught_up"})
-	if err := writer.Write(caughtUp); err != nil {
+	if err := writeTerminalReplay(writer, replay); err != nil {
 		return
 	}
 	stopWriter := make(chan struct{})
@@ -343,6 +359,16 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 			return
 		}
 		switch frame.Type {
+		case protocol.Capabilities:
+			if len(frame.Payload) > 256 {
+				continue
+			}
+			var negotiation struct {
+				ObserveProgramStatus *bool `json:"observe_program_status"`
+			}
+			if protocol.DecodeJSON(frame, &negotiation) == nil && negotiation.ObserveProgramStatus != nil {
+				session.setProgramStatusObservation(viewer, *negotiation.ObserveProgramStatus)
+			}
 		case protocol.Input:
 			if controlGranted {
 				_ = session.input(frame.Payload)
@@ -382,65 +408,21 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	}
 }
 
-// A resize can coincide with unrelated streaming output. Only add a clear
-// barrier when the post-resize bytes look like a cursor-addressed screen
-// repaint; ordinary shell/build/tail output must retain its scrollback. A TUI
-// that already emitted its own clear is self-contained and needs no help.
-func reconnectRepaintNeedsBarrier(frames []protocol.Frame, afterSequence uint64, rows uint16) bool {
-	data := make([]byte, 0, 4096)
+// Replay is an ordered terminal stream, not a complete screen image. Preserve
+// bytes and sequence numbers, including partial CSI sequences across frames.
+// Only the application may clear its screen; cursor-addressed rows do not
+// establish that a repaint replaces every visible cell.
+func writeTerminalReplay(writer *protocol.Writer, frames []protocol.Frame) error {
 	for _, frame := range frames {
-		sequence, output, err := protocol.ParseOutput(frame)
-		if err != nil || sequence <= afterSequence {
-			continue
-		}
-		data = append(data, output...)
-	}
-	if len(data) < 256 || bytes.Contains(data, []byte("\x1b[2J")) ||
-		bytes.Contains(data, []byte("\x1b[3J")) || bytes.Contains(data, []byte("\x1bc")) {
-		return false
-	}
-	addressedRows := cursorAddressedRows(data)
-	requiredRows := 3
-	if rows > 0 && rows < 5 {
-		requiredRows = 2
-	}
-	return len(addressedRows) >= requiredRows
-}
-
-func cursorAddressedRows(data []byte) map[uint16]struct{} {
-	addressed := make(map[uint16]struct{})
-	for index := 0; index+2 < len(data); index++ {
-		if data[index] != 0x1b || data[index+1] != '[' {
-			continue
-		}
-		cursor := index + 2
-		row := uint32(0)
-		hasRow := false
-		for cursor < len(data) && data[cursor] >= '0' && data[cursor] <= '9' {
-			hasRow = true
-			row = row*10 + uint32(data[cursor]-'0')
-			if row > uint32(^uint16(0)) {
-				break
-			}
-			cursor++
-		}
-		if !hasRow {
-			row = 1
-		}
-		if cursor >= len(data) || (data[cursor] != ';' && data[cursor] != 'H' && data[cursor] != 'f') {
-			continue
-		}
-		for cursor < len(data) && data[cursor] != 'H' && data[cursor] != 'f' {
-			if data[cursor] != ';' && (data[cursor] < '0' || data[cursor] > '9') {
-				break
-			}
-			cursor++
-		}
-		if cursor < len(data) && (data[cursor] == 'H' || data[cursor] == 'f') && row > 0 && row <= uint32(^uint16(0)) {
-			addressed[uint16(row)] = struct{}{}
+		if err := writer.Write(frame); err != nil {
+			return err
 		}
 	}
-	return addressed
+	caughtUp, err := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "caught_up"})
+	if err != nil {
+		return err
+	}
+	return writer.Write(caughtUp)
 }
 
 func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *Session, lastEventSequence uint64) {

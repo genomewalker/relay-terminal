@@ -2,14 +2,44 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+@MainActor private func copyWorkspaceID(_ id: UUID) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(id.uuidString.lowercased(), forType: .string)
+}
+
 private extension UTType {
     static let relayWorkspaceTab = UTType(exportedAs: "dev.relay.workspace-tab")
+}
+
+private struct NetworkCoverKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+private extension EnvironmentValues {
+    var networkCoverActive: Bool {
+        get { self[NetworkCoverKey.self] }
+        set { self[NetworkCoverKey.self] = newValue }
+    }
+}
+
+extension Notification.Name {
+    static let relayShowHPC = Notification.Name("relay.showHPC")
+    static let relayShowPlugin = Notification.Name("relay.showPlugin")
+    static let relayConnectPaneSessions = Notification.Name("relay.connect-pane-sessions")
+}
+
+private struct PaneConnectionRequest: Identifiable {
+    let id: UUID
 }
 
 struct WorkspaceView: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var preferences = RelayPreferences.shared
     @State private var showingQuitConfirmation = false
+    @State private var hpcPaneID: UUID?
+    @State private var pluginPaneID: UUID?
+    @State private var pluginToolID = ""
+    @State private var paneConnectionRequest: PaneConnectionRequest?
     @State private var showingRelaydOnboarding = false
     @State private var showingRelaydManager = false
     @State private var preferredRelaydProfile: ConnectionProfile?
@@ -20,35 +50,67 @@ struct WorkspaceView: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            HStack(spacing: 0) {
+        HStack(spacing: RelayTheme.spacing(0)) {
+            WorkspaceToolRail(workspace: workspace)
                 if workspace.sidebarVisible {
                     SessionManager(workspace: workspace)
                         .frame(width: preferences.compactInterface ? 244 : 260)
                     Rectangle().fill(RelayTheme.line.opacity(0.38)).frame(width: 1)
-                }
-                VStack(spacing: 0) {
+            }
+            VStack(spacing: RelayTheme.spacing(0)) {
+                WorkspaceTabRail(workspace: workspace)
+                    if let issue = workspace.workspacePersistenceIssue {
+                        Label(issue, systemImage: "exclamationmark.triangle")
+                            .font(RelayTheme.font(size: 11, weight: .medium))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, RelayTheme.spacing(12))
+                            .padding(.vertical, RelayTheme.spacing(7))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RelayTheme.surface)
+                    } else if workspace.workspacePendingChanges > 0 {
+                        Label("\(workspace.workspacePendingChanges) saved workspace change drafts await recovery", systemImage: "tray.full")
+                            .font(RelayTheme.font(size: 11, weight: .medium))
+                            .padding(.horizontal, RelayTheme.spacing(12))
+                            .padding(.vertical, RelayTheme.spacing(7))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RelayTheme.surface)
+                    }
                     if RelayLaunchMode.isSafeMode {
-                        HStack(spacing: 7) {
+                        HStack(spacing: RelayTheme.spacing(7)) {
                             Image(systemName: "shield")
                             Text("Safe mode · workspace restore and artifact previews are disabled")
                             Spacer()
                         }
-                        .font(.system(size: 10.5, weight: .medium))
+                        .font(RelayTheme.font(size: 10.5, weight: .medium))
                         .foregroundStyle(RelayTheme.textMuted)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, RelayTheme.spacing(12))
                         .frame(height: 30)
                         .background(RelayTheme.surface)
                         .accessibilityLabel("Relay is running in safe mode")
                     }
-                    WorkspaceBar(workspace: workspace)
+                    PaneLinkSelectionBar(workspace: workspace, selection: workspace.paneLinkSelection)
                     Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
+                    ZStack {
                     if let tab = workspace.selectedTab {
-                        WorkspaceCanvas(tab: tab, workspace: workspace)
+                        WorkspaceDockLayout(tab: tab, workspace: workspace)
+                            .environment(\.networkCoverActive, workspace.networkVisible)
                             .background(RelayTheme.canvas)
+                            .opacity(workspace.networkVisible ? 0.42 : 1)
+                            .allowsHitTesting(!workspace.networkVisible)
+                            .accessibilityHidden(workspace.networkVisible)
+                    }
+                    if workspace.networkVisible {
+                        PeerNetworkView(workspace: workspace)
+                    }
                     }
                 }
             }
-            if let selection = workspace.agentInspector,
+            if !workspace.networkVisible {
+                RBoundedWorkspaceHost(workspace: workspace)
+                    .padding(.trailing, RelayTheme.spacing(220))
+                    .zIndex(100)
+            }
+            if !workspace.networkVisible, let selection = workspace.agentInspector,
                let pane = workspace.panes[selection.paneID] {
                 AgentInspectorPanel(
                     pane: pane,
@@ -61,17 +123,48 @@ struct WorkspaceView: View {
                 // previous agent's content lingers until the pane publishes.
                 .id(selection)
                 .padding(.top, workspace.isFullScreen ? 50 : 58)
-                .padding(.trailing, 18)
+                .padding(.trailing, RelayTheme.spacing(228))
                 .zIndex(500)
             }
-            if workspace.intelligencePanelVisible {
+            if !workspace.networkVisible && workspace.intelligencePanelVisible {
                 AgentIntelligencePanel(
                     workspace: workspace,
                     close: workspace.closeIntelligencePanel
                 )
                 .padding(.top, workspace.isFullScreen ? 50 : 58)
-                .padding(.trailing, 18)
+                .padding(.trailing, RelayTheme.spacing(228))
                 .zIndex(650)
+            }
+            if !workspace.networkVisible && workspace.assistantVisible {
+                RelayAssistantPanel(workspace: workspace, controller: workspace.assistantController)
+                    .padding(.top, workspace.isFullScreen ? 50 : 58)
+                    .padding(.trailing, RelayTheme.spacing(50))
+                    .zIndex(700)
+            }
+            if let id = pluginPaneID, let pane = workspace.panes[id] {
+                PluginWorkspaceOverlay(workspace: workspace, pane: pane, toolID: pluginToolID,
+                                       close: { pluginPaneID = nil })
+                    .id(id.uuidString + pluginToolID)
+                    .frame(maxWidth: 1120, maxHeight: 650)
+                    .padding(.horizontal, RelayTheme.spacing(32))
+                    .padding(.top, RelayTheme.spacing(68))
+                    .padding(.bottom, RelayTheme.spacing(28))
+                    .padding(.trailing, RelayTheme.spacing(220))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    .background(RelayTheme.canvas.opacity(0.58))
+                    .zIndex(680)
+            }
+            if let id = hpcPaneID, let pane = workspace.panes[id] {
+                HPCDiscoveryWorkspace(workspace: workspace, preferredPaneID: pane.id, close: { hpcPaneID = nil })
+                    .id(id)
+                    .frame(maxWidth: 1120, maxHeight: 650)
+                    .padding(.horizontal, RelayTheme.spacing(32))
+                    .padding(.top, RelayTheme.spacing(68))
+                    .padding(.bottom, RelayTheme.spacing(28))
+                    .padding(.trailing, RelayTheme.spacing(220))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    .background(RelayTheme.canvas.opacity(0.58))
+                    .zIndex(680)
             }
             if workspace.performancePanelVisible {
                 RelayPerformancePanel(
@@ -79,60 +172,76 @@ struct WorkspaceView: View {
                     close: workspace.closePerformancePanel
                 )
                 .padding(.top, workspace.isFullScreen ? 50 : 58)
-                .padding(.trailing, 18)
+                .padding(.trailing, RelayTheme.spacing(228))
                 .zIndex(700)
             }
 
-            RelayWindowControls(isFullScreen: workspace.isFullScreen)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .padding(.leading, 14)
-                .padding(.top, workspace.isFullScreen ? 13 : 15)
-                .zIndex(1_000)
         }
         .background(RelayTheme.canvas)
+        .environmentObject(workspace.paneLinkSelection)
+        .task { workspace.refreshPaneLinkMemberships() }
+        .onReceive(NotificationCenter.default.publisher(for: .relayShowHPC)) { _ in
+            guard let pane = workspace.activePane else { return }
+            workspace.selectedTab?.chrome.hide()
+            pluginPaneID = nil
+            hpcPaneID = nil
+            RelayToolWindowCoordinator.shared.showHPC(workspace: workspace, pane: pane)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .relayShowPlugin)) { notification in
+            guard let pane = workspace.activePane else { return }
+            workspace.selectedTab?.chrome.hide()
+            hpcPaneID = nil
+            pluginPaneID = nil
+            RelayToolWindowCoordinator.shared.show(workspace: workspace, pane: pane,
+                                                   toolID: notification.object as? String ?? "")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .relayConnectPaneSessions)) { notification in
+            guard let id = notification.object as? UUID, workspace.panes[id] != nil else { return }
+            paneConnectionRequest = PaneConnectionRequest(id: id)
+        }
+        .sheet(item: $paneConnectionRequest) { request in
+            PeerNetworkTopologyView(workspace: workspace, connectionOnly: true, startingPaneID: request.id, manage: {})
+        }
         .tint(RelayTheme.accent)
-        // The workspace already provides a compact draggable chrome row and
-        // its own visible window controls. Do not also reserve AppKit's empty
-        // hidden-titlebar safe area above it.
-        .ignoresSafeArea(.container, edges: .top)
+        .modifier(RPresentationPersistence(workspace: workspace))
         .overlay(alignment: .bottom) {
             if showingQuitConfirmation {
-                HStack(spacing: 10) {
+                HStack(spacing: RelayTheme.spacing(10)) {
                     Image(systemName: "power")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(RelayTheme.font(size: 11, weight: .medium))
                         .foregroundStyle(RelayTheme.coral)
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
                         Text("Press ⌘Q again to quit")
-                            .font(.system(size: 11.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 11.5, weight: .medium))
                         Text("Remote sessions keep running")
-                            .font(.system(size: 10.5))
+                            .font(RelayTheme.font(size: 11))
                             .foregroundStyle(RelayTheme.textMuted)
                     }
                 }
                 .foregroundStyle(RelayTheme.text)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, RelayTheme.spacing(14))
                 .frame(height: 48)
-                .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous)
                         .stroke(RelayTheme.line.opacity(0.9))
                 }
                 .shadow(color: .black.opacity(0.32), radius: 18, y: 8)
-                .padding(.bottom, 20)
+                .padding(.bottom, RelayTheme.spacing(20))
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Press Command Q again to quit. Remote sessions keep running.")
                 .allowsHitTesting(false)
             } else if showingPaneCloseNotice && workspace.canReopenClosedPane {
-                HStack(spacing: 11) {
+                HStack(spacing: RelayTheme.spacing(11)) {
                     Image(systemName: workspace.lastClosedPaneWasRemote ? "rectangle.badge.minus" : "xmark.square")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(RelayTheme.font(size: 11, weight: .medium))
                         .foregroundStyle(RelayTheme.textMuted)
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
                         Text(workspace.lastClosedPaneWasRemote ? "Pane detached" : "Pane closed")
-                            .font(.system(size: 11.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 11.5, weight: .medium))
                         Text(workspace.lastClosedPaneWasRemote ? "Its remote process is still running" : "You can reopen it now")
-                            .font(.system(size: 10.5))
+                            .font(RelayTheme.font(size: 11))
                             .foregroundStyle(RelayTheme.textMuted)
                     }
                     Button("Undo") {
@@ -141,27 +250,36 @@ struct WorkspaceView: View {
                         workspace.reopenLastClosedPane()
                     }
                     .buttonStyle(.plain)
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.accent)
-                    .padding(.leading, 5)
+                    .padding(.leading, RelayTheme.spacing(5))
                     .accessibilityHint("Reopens the most recently closed pane")
                 }
                 .foregroundStyle(RelayTheme.text)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, RelayTheme.spacing(14))
                 .frame(height: 48)
-                .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous)
                         .stroke(RelayTheme.line.opacity(0.9))
                 }
                 .shadow(color: .black.opacity(0.32), radius: 18, y: 8)
-                .padding(.bottom, 20)
+                .padding(.bottom, RelayTheme.spacing(20))
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .accessibilityElement(children: .contain)
             }
         }
         .sheet(isPresented: $workspace.isHostLauncherPresented) {
             HostLauncher(workspace: workspace)
+        }
+        .sheet(isPresented: $workspace.isRecoveryPresented) {
+            RelayRecoveryView(workspace: workspace)
+        }
+        .sheet(isPresented: $workspace.isPaneLinkPresented, onDismiss: {
+            workspace.updateTerminalFocusOwnership()
+            if let id = workspace.activePaneID { workspace.panes[id]?.runtime.focus() }
+        }) {
+            PaneMessagingLinkView(workspace: workspace)
         }
         .sheet(isPresented: $workspace.isConnectionSheetPresented) {
             ConnectionSheet(workspace: workspace)
@@ -275,75 +393,6 @@ struct WorkspaceView: View {
     }
 }
 
-private struct RelayWindowControls: View {
-    let isFullScreen: Bool
-    @State private var hovered: WindowControlKind?
-
-    var body: some View {
-        HStack(spacing: 8) {
-            control(.close)
-            control(.minimize)
-            control(.zoom)
-        }
-        .accessibilityElement(children: .contain)
-    }
-
-    private func control(_ kind: WindowControlKind) -> some View {
-        Button {
-            guard let window = NSApp.windows.first(where: { $0.identifier == .relayWorkspaceWindow })
-                ?? NSApp.keyWindow else { return }
-            switch kind {
-            case .close: window.performClose(nil)
-            case .minimize: window.miniaturize(nil)
-            case .zoom: window.toggleFullScreen(nil)
-            }
-        } label: {
-            ZStack {
-                Circle().fill(kind.color)
-                if hovered != nil {
-                    Image(systemName: kind.symbol)
-                        .font(.system(size: 6.5, weight: .black))
-                        .foregroundStyle(Color.black.opacity(0.58))
-                }
-            }
-            .frame(width: 12, height: 12)
-            .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .onHover { inside in hovered = inside ? kind : nil }
-        .accessibilityLabel(kind.accessibilityLabel(isFullScreen: isFullScreen))
-        .help(kind.accessibilityLabel(isFullScreen: isFullScreen))
-    }
-}
-
-private enum WindowControlKind: Equatable {
-    case close, minimize, zoom
-
-    var color: Color {
-        switch self {
-        case .close: Color(red: 1, green: 0.37, blue: 0.34)
-        case .minimize: Color(red: 1, green: 0.74, blue: 0.18)
-        case .zoom: Color(red: 0.16, green: 0.78, blue: 0.27)
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .close: "xmark"
-        case .minimize: "minus"
-        case .zoom: "arrow.up.left.and.arrow.down.right"
-        }
-    }
-
-    func accessibilityLabel(isFullScreen: Bool) -> String {
-        switch self {
-        case .close: "Close Relay window"
-        case .minimize: "Minimize Relay window"
-        case .zoom: isFullScreen ? "Exit full screen" : "Enter full screen"
-        }
-    }
-}
-
 private struct AgentIntelligencePanel: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var store = AgentIntelligenceStore.shared
@@ -365,7 +414,7 @@ private struct AgentIntelligencePanel: View {
             headerHeight: 54,
             onDragActivityChanged: { isDragging = $0 }
         ) {
-            VStack(spacing: 0) {
+            VStack(spacing: RelayTheme.spacing(0)) {
                 panelHeader
                 Divider().overlay(RelayTheme.line.opacity(0.5))
                 searchBar
@@ -376,9 +425,9 @@ private struct AgentIntelligencePanel: View {
                 statusBar
             }
             .frame(width: 570, height: 620)
-            .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+            .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 15, style: .continuous)
+                RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous)
                     .stroke(RelayTheme.line.opacity(0.9))
             }
             .shadow(color: .black.opacity(isDragging ? 0.18 : 0.42), radius: isDragging ? 5 : 26, y: isDragging ? 2 : 14)
@@ -392,33 +441,33 @@ private struct AgentIntelligencePanel: View {
     }
 
     private var panelHeader: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: RelayTheme.spacing(10)) {
             ZStack {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7), style: .continuous)
                     .fill(RelayTheme.blue.opacity(0.14))
                 Image(systemName: "sparkles")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.blue)
             }
             .frame(width: 28, height: 28)
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
                 Text("Agent activity")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(RelayTheme.font(size: 13, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                 Text(store.unreadCount == 0 ? "You're caught up" : "\(store.unreadCount) since you last checked")
-                    .font(.system(size: 9.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(store.attentionCount > 0 ? RelayTheme.coral : RelayTheme.textFaint)
             }
             Spacer()
             if store.unreadCount > 0 {
                 Button("Mark all read") { store.markAllRead() }
                     .buttonStyle(.plain)
-                    .font(.system(size: 10, weight: .medium))
+                    .font(RelayTheme.font(size: 10, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
             }
             Button(action: close) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(RelayTheme.font(size: 10, weight: .medium))
                     .frame(width: 26, height: 26)
                     .background(RelayTheme.surface, in: Circle())
             }
@@ -428,19 +477,19 @@ private struct AgentIntelligencePanel: View {
             .help("Close agent activity")
             .accessibilityLabel("Close agent activity")
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, RelayTheme.spacing(14))
         .frame(height: 54)
         .contentShape(Rectangle())
     }
 
     private var searchBar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: RelayTheme.spacing(8)) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 10, weight: .medium))
+                .font(RelayTheme.font(size: 10, weight: .medium))
                 .foregroundStyle(RelayTheme.textFaint)
             TextField("Search work, failures, files, or peer handoffs", text: $query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 11.5))
+                .font(RelayTheme.font(size: 11.5))
                 .foregroundStyle(RelayTheme.text)
             if search.isRefining {
                 ProgressView().controlSize(.mini)
@@ -448,30 +497,30 @@ private struct AgentIntelligencePanel: View {
             } else if !query.isEmpty {
                 Button { query = "" } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 11))
+                        .font(RelayTheme.font(size: 11))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textFaint)
                 .accessibilityLabel("Clear search")
             }
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, RelayTheme.spacing(10))
         .frame(height: 32)
-        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .padding(.horizontal, 14)
-        .padding(.top, 12)
+        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+        .padding(.horizontal, RelayTheme.spacing(14))
+        .padding(.top, RelayTheme.spacing(12))
     }
 
     private var scopePicker: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: RelayTheme.spacing(6)) {
             ForEach(AgentInboxScope.allCases) { value in
                 Button {
                     scope = value
                 } label: {
                     Text(value.label)
-                        .font(.system(size: 9.5, weight: scope == value ? .semibold : .medium))
+                        .font(RelayTheme.font(size: 11, weight: scope == value ? .semibold : .medium))
                         .foregroundStyle(scope == value ? RelayTheme.text : RelayTheme.textMuted)
-                        .padding(.horizontal, 9)
+                        .padding(.horizontal, RelayTheme.spacing(9))
                         .frame(height: 24)
                         .background(
                             scope == value ? RelayTheme.surface : Color.clear,
@@ -483,56 +532,56 @@ private struct AgentIntelligencePanel: View {
             Spacer()
             if store.attentionCount > 0 {
                 Label("\(store.attentionCount) need you", systemImage: "exclamationmark.circle.fill")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(RelayTheme.font(size: 9, weight: .medium))
                     .foregroundStyle(RelayTheme.coral)
             }
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, RelayTheme.spacing(14))
         .frame(height: 42)
     }
 
     @ViewBuilder
     private var inbox: some View {
         if visibleItems.isEmpty {
-            VStack(spacing: 9) {
+            VStack(spacing: RelayTheme.spacing(9)) {
                 Image(systemName: query.isEmpty ? "checkmark.circle" : "magnifyingglass")
-                    .font(.system(size: 21, weight: .light))
+                    .font(RelayTheme.font(size: 21, weight: .light))
                     .foregroundStyle(RelayTheme.textFaint)
                 Text(query.isEmpty ? "No activity in this view" : "No matching activity")
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ScrollView {
-                LazyVStack(spacing: 2) {
+                LazyVStack(spacing: RelayTheme.spacing(2)) {
                     ForEach(visibleItems) { item in
                         AgentInboxRow(item: item) {
                             workspace.openInboxItem(item)
                         }
                     }
                 }
-                .padding(8)
+                .padding(RelayTheme.spacing(8))
             }
         }
     }
 
     private var statusBar: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: RelayTheme.spacing(6)) {
             Image(systemName: ProcessInfo.processInfo.isLowPowerModeEnabled ? "leaf.fill" : "cpu")
-                .font(.system(size: 9))
+                .font(RelayTheme.font(size: 9))
             Text(ProcessInfo.processInfo.isLowPowerModeEnabled
                  ? "Model work paused in Low Power Mode"
                  : search.usedSystemIntelligence
                  ? "Search refined on this Mac"
                  : "Structured events · on-device intelligence")
-                .font(.system(size: 9.5, weight: .medium))
+                .font(RelayTheme.font(size: 9.5, weight: .medium))
             Spacer()
             Text("\(store.items.count) events")
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
         }
         .foregroundStyle(RelayTheme.textFaint)
-        .padding(.horizontal, 14)
+        .padding(.horizontal, RelayTheme.spacing(14))
         .frame(height: 34)
     }
 
@@ -554,18 +603,18 @@ private struct AgentInboxRow: View {
 
     var body: some View {
         Button(action: open) {
-            HStack(alignment: .top, spacing: 10) {
+            HStack(alignment: .top, spacing: RelayTheme.spacing(10)) {
                 ZStack {
                     Circle().fill(item.kind.color.opacity(0.13))
                     Image(systemName: item.kind.symbol)
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(RelayTheme.font(size: 10, weight: .medium))
                         .foregroundStyle(item.kind.color)
                 }
                 .frame(width: 28, height: 28)
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+                    HStack(spacing: RelayTheme.spacing(6)) {
                         Text(item.title)
-                            .font(.system(size: 11, weight: item.isRead ? .medium : .semibold))
+                            .font(RelayTheme.font(size: 11, weight: item.isRead ? .medium : .semibold))
                             .foregroundStyle(item.isRead ? RelayTheme.textMuted : RelayTheme.text)
                             .lineLimit(1)
                         if !item.isRead {
@@ -574,17 +623,17 @@ private struct AgentInboxRow: View {
                         }
                         Spacer()
                         Text(Self.relativeFormatter.localizedString(for: item.occurredAt, relativeTo: Date()))
-                            .font(.system(size: 8.5, weight: .medium))
+                            .font(RelayTheme.font(size: 11, weight: .medium))
                             .foregroundStyle(RelayTheme.textFaint)
                     }
                     if !item.detail.isEmpty {
                         Text(item.detail)
-                            .font(.system(size: 9.5))
+                            .font(RelayTheme.font(size: 11))
                             .foregroundStyle(RelayTheme.textMuted)
                             .lineLimit(2)
                             .multilineTextAlignment(.leading)
                     }
-                    HStack(spacing: 5) {
+                    HStack(spacing: RelayTheme.spacing(5)) {
                         Text(item.host)
                         Text("·")
                         Text(item.provider.label)
@@ -596,14 +645,14 @@ private struct AgentInboxRow: View {
                                 .accessibilityLabel("Summarized on this Mac")
                         }
                     }
-                    .font(.system(size: 8.5, weight: .medium))
+                    .font(RelayTheme.font(size: 8.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textFaint)
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 9)
+            .padding(.horizontal, RelayTheme.spacing(10))
+            .padding(.vertical, RelayTheme.spacing(9))
             .background(hovering ? RelayTheme.surface.opacity(0.72) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9), style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -616,6 +665,7 @@ private struct AgentInboxRow: View {
 private struct AgentInspectorSnapshot: Equatable {
     let kind: AgentKind
     let agent: SubagentActivity?
+    let plans: [AgentTaskPlan]
 }
 
 private struct AgentInspectorPanel: View {
@@ -651,19 +701,19 @@ private struct AgentInspectorPanel: View {
             headerHeight: 42,
             onDragActivityChanged: dragActivityChanged
         ) {
-            VStack(spacing: 0) {
+            VStack(spacing: RelayTheme.spacing(0)) {
                 inspectorTitleBar
                 if !collapsed {
                     Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(height: 1)
                     if let agent = snapshot.agent {
                         inspectorContent(agent)
                     } else {
-                        VStack(spacing: 10) {
+                        VStack(spacing: RelayTheme.spacing(10)) {
                             Image(systemName: "person.crop.circle.badge.questionmark")
-                                .font(.system(size: 24))
+                                .font(RelayTheme.font(size: 24))
                                 .foregroundStyle(RelayTheme.textFaint)
                             Text("This agent is no longer available")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(RelayTheme.font(size: 12, weight: .medium))
                                 .foregroundStyle(RelayTheme.textMuted)
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -675,9 +725,9 @@ private struct AgentInspectorPanel: View {
                 height: collapsed ? 42 : min(max(panelSize.height + resizeOffset.height, 260), 760)
             )
             .background(RelayTheme.sidebar)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous)
                     .stroke(RelayTheme.line.opacity(0.85), lineWidth: 1)
                     .allowsHitTesting(false)
             }
@@ -714,20 +764,20 @@ private struct AgentInspectorPanel: View {
     }
 
     private var inspectorTitleBar: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: RelayTheme.spacing(9)) {
             Image(systemName: snapshot.kind.symbol)
-                .font(.system(size: 11, weight: .semibold))
+                .font(RelayTheme.font(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textMuted)
             Text("Agent thread")
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(RelayTheme.font(size: 11.5, weight: .medium))
                 .foregroundStyle(RelayTheme.text)
             Text(snapshot.kind.label)
-                .font(.system(size: 9.5, weight: .medium))
+                .font(RelayTheme.font(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textFaint)
             Spacer()
             Button { collapsed.toggle() } label: {
                 Image(systemName: collapsed ? "chevron.down" : "chevron.up")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(RelayTheme.font(size: 9, weight: .medium))
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
@@ -737,7 +787,7 @@ private struct AgentInspectorPanel: View {
             .accessibilityLabel(collapsed ? "Expand agent inspector" : "Collapse agent inspector")
             Button(action: showTerminal) {
                 Image(systemName: "terminal")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(RelayTheme.font(size: 10, weight: .medium))
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
@@ -747,7 +797,7 @@ private struct AgentInspectorPanel: View {
             .accessibilityLabel("Show parent terminal")
             Button(action: close) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(RelayTheme.font(size: 9, weight: .medium))
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
@@ -755,7 +805,7 @@ private struct AgentInspectorPanel: View {
             .focusEffectDisabled()
             .accessibilityLabel("Close agent inspector")
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, RelayTheme.spacing(12))
         .frame(height: 42)
         .background(RelayTheme.surface.opacity(0.7))
         .contentShape(Rectangle())
@@ -766,7 +816,7 @@ private struct AgentInspectorPanel: View {
             Capsule()
                 .fill(titleFocused ? RelayTheme.accent : Color.clear)
                 .frame(height: 2)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, RelayTheme.spacing(14))
                 .accessibilityHidden(true)
         }
         .accessibilityLabel("Movable agent inspector")
@@ -779,7 +829,12 @@ private struct AgentInspectorPanel: View {
     private static func capture(pane: PaneModel, subagentID: String) -> AgentInspectorSnapshot {
         AgentInspectorSnapshot(
             kind: pane.kind,
-            agent: pane.subagents.first { $0.id == subagentID }
+            agent: pane.subagents.first { $0.id == subagentID },
+            plans: pane.taskPlans.filter { plan in
+                let agent = pane.subagents.first { $0.id == subagentID }
+                return plan.id == pane.kind.rawValue + ":" + subagentID ||
+                    agent?.threadID.map { plan.id == pane.kind.rawValue + ":" + $0 } == true
+            }
         )
     }
 
@@ -796,75 +851,87 @@ private struct AgentInspectorPanel: View {
     }
 
     private func inspectorContent(_ agent: SubagentActivity) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
+            ForEach(snapshot.plans) { plan in
+                DisclosureGroup("Task plan · \(plan.completedCount)/\(plan.steps.count) completed") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: RelayTheme.spacing(6)) {
+                            ForEach(Array(plan.steps.enumerated()), id: \.offset) { _, step in
+                                Label(step.text, systemImage: step.status == .completed ? "checkmark.circle" : step.status == .in_progress ? "circle.lefthalf.filled" : "circle")
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }.frame(maxHeight: 180)
+                }.padding(RelayTheme.spacing(12))
+            }
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(9)) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(agent.label)
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(RelayTheme.font(size: 16, weight: .medium))
                         .foregroundStyle(RelayTheme.text)
                         .textSelection(.enabled)
                     Spacer()
-                    HStack(spacing: 5) {
+                    HStack(spacing: RelayTheme.spacing(5)) {
                         Circle().fill(agent.phase.color).frame(width: 6, height: 6)
                         Text(agent.phase == .active ? "Working" : "Finished")
-                            .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                            .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                             .foregroundStyle(agent.phase.color)
                     }
                 }
-                HStack(spacing: 14) {
+                HStack(spacing: RelayTheme.spacing(14)) {
                     Label(agent.startedAt.formatted(date: .omitted, time: .shortened), systemImage: "play.fill")
                     if let completedAt = agent.completedAt {
                         Label(completedAt.formatted(date: .omitted, time: .shortened), systemImage: "checkmark")
                     }
                     if let threadID = agent.threadID {
                         Text(String(threadID.prefix(12)))
-                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                             .help(threadID)
                     }
                 }
-                .font(.system(size: 9.5, weight: .medium))
+                .font(RelayTheme.font(size: 9.5, weight: .medium))
                 .foregroundStyle(RelayTheme.textFaint)
             }
-            .padding(16)
+            .padding(RelayTheme.spacing(16))
 
             Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: RelayTheme.spacing(12)) {
                     if agent.updates.isEmpty {
-                        VStack(alignment: .leading, spacing: 7) {
+                        VStack(alignment: .leading, spacing: RelayTheme.spacing(7)) {
                             Text(agent.phase == .active ? "Waiting for the first progress update" : "No result text was recorded")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(RelayTheme.font(size: 12, weight: .medium))
                                 .foregroundStyle(RelayTheme.textMuted)
                             Text("Relay captured the lifecycle, but this CLI did not expose a readable progress message for this thread.")
-                                .font(.system(size: 10.5))
+                                .font(RelayTheme.font(size: 11))
                                 .foregroundStyle(RelayTheme.textFaint)
                         }
-                        .padding(.vertical, 4)
+                        .padding(.vertical, RelayTheme.spacing(4))
                     } else {
                         ForEach(agent.updates) { update in
-                            VStack(alignment: .leading, spacing: 5) {
+                            VStack(alignment: .leading, spacing: RelayTheme.spacing(5)) {
                                 Text(update.occurredAt.formatted(date: .omitted, time: .shortened))
-                                    .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+                                    .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                                     .foregroundStyle(RelayTheme.textFaint)
                                 Text(update.message)
-                                    .font(.system(size: 11.5))
+                                    .font(RelayTheme.font(size: 11.5))
                                     .foregroundStyle(RelayTheme.text)
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .padding(11)
-                            .background(RelayTheme.surface.opacity(0.62), in: RoundedRectangle(cornerRadius: 9))
+                            .padding(RelayTheme.spacing(11))
+                            .background(RelayTheme.surface.opacity(0.62), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9)))
                         }
                     }
                 }
-                .padding(14)
+                .padding(RelayTheme.spacing(14))
             }
         }
     }
 }
 
-private struct WorkspaceBar: View {
+private struct WorkspaceTabRail: View {
     @ObservedObject var workspace: WorkspaceModel
     @State private var draggedTabID: UUID?
 
@@ -882,33 +949,38 @@ private struct WorkspaceBar: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 8) {
-                if !workspace.sidebarVisible {
-                    ChromeButton(symbol: "sidebar.left", help: "Show navigator") {
-                        workspace.sidebarVisible = true
+        HStack(spacing: RelayTheme.spacing(8)) {
+            Menu {
+                ForEach(workspace.navigationSessionIDs, id: \.self) { id in
+                    Button { workspace.selectSession(id) } label: {
+                        if id == workspace.selectedTab?.sessionID {
+                            Label(workspace.navigationSessionName(id), systemImage: "checkmark")
+                        } else { Text(workspace.navigationSessionName(id)) }
                     }
                 }
-                if !workspace.isFullScreen {
-                    if !workspace.sidebarVisible {
-                        Text("Relay")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(RelayTheme.text)
-                    }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(sessionName).lineLimit(1).truncationMode(.tail)
+                    Image(systemName: "chevron.down").font(RelayTheme.font(size: 8, weight: .medium))
                 }
             }
-
-            Text(sessionName)
-                .font(.system(size: 11.5, weight: .semibold))
-                .foregroundStyle(RelayTheme.textMuted)
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .help("Switch session")
+                .accessibilityLabel("Switch session, " + sessionName)
+                .accessibilityIdentifier("relay.navigation.session-switcher")
+                .font(RelayTheme.font(size: 12, weight: .semibold))
+                .foregroundStyle(RelayTheme.text)
                 .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, workspace.sidebarVisible ? 0 : 28)
+                .frame(width: 156, alignment: .leading)
 
-            Rectangle()
-                .fill(RelayTheme.line.opacity(0.65))
-                .frame(width: 1, height: 18)
+            Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(width: 1, height: 24)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
+                HStack(spacing: RelayTheme.spacing(3)) {
                     ForEach(Array(sessionTabs.enumerated()), id: \.element.id) { index, tab in
                         let fallbackLabel = index == 0 ? "Main" : "Tab \(index + 1)"
                         WorkspaceTab(
@@ -920,85 +992,165 @@ private struct WorkspaceBar: View {
                             togglePin: { workspace.toggleTabPin(tab.id) },
                             rename: { workspace.beginRenameTab(tab.id) },
                             close: { workspace.closeTab(tab.id) },
+                            recover: { workspace.reconnectPanels(in: tab.id) },
+                            reopenClosed: { workspace.reopenLastClosedPane(in: tab.id) },
+                            recovering: workspace.recoveringTabIDs.contains(tab.id),
                             draggedTabID: $draggedTabID,
-                            move: { sourceID, placement in
-                                workspace.moveTab(sourceID, relativeTo: tab.id, placement: placement)
-                            }
+                            move: { sourceID, placement in workspace.moveTab(sourceID, relativeTo: tab.id, placement: placement) }
                         )
+                        .frame(width: 158)
                     }
                     ChromeButton(symbol: "plus", help: "New tab in this session · ⌘T") {
                         workspace.newTabInActiveSession()
                     }
+                    .padding(.leading, RelayTheme.spacing(3))
                 }
+                .padding(.horizontal, RelayTheme.spacing(4))
             }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, RelayTheme.spacing(8))
+        .frame(height: 36)
+        .background(RelayTheme.canvas)
+        .overlay(alignment: .bottom) { Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1) }
+    }
+}
 
-            Spacer(minLength: 8)
+private struct WorkspaceToolRail: View {
+    @ObservedObject private var plugins = RelayPluginManager.shared
+    @ObservedObject var workspace: WorkspaceModel
 
-            HStack(spacing: 6) {
-                ChromeButton(symbol: "waveform.path.ecg.rectangle", help: "Performance") {
-                    workspace.togglePerformancePanel()
-                }
-                if workspace.activePane?.profile.kind == .ssh,
-                   workspace.activePane?.profile.backend == .relay {
-                    ChromeButton(symbol: "curlybraces", help: "Open remote editor · ⇧⌘E") {
-                        workspace.openEditorForActive()
-                    }
-                }
-                ChromeButton(symbol: "rectangle.split.2x1", help: "Split remote pane right · ⌘D") {
-                    workspace.splitActive(axis: .horizontal)
-                }
-                ChromeButton(symbol: "rectangle.split.1x2", help: "Split remote pane down · ⇧⌘D") {
-                    workspace.splitActive(axis: .vertical)
-                }
-                ChromeButton(symbol: "rectangle.on.rectangle", help: "New floating remote pane · ⌥⌘F") {
-                    workspace.newFloatingPane()
-                }
-                Menu {
-                    Button("Balance pane layout") { workspace.balanceActiveTabPanes() }
-                    Button("Zoom active pane") { workspace.toggleActivePaneZoom() }
-                    Button("Float or dock active pane") { workspace.toggleActivePaneFloating() }
-                    Divider()
-                    Button("New local session") { workspace.newTab(profile: .local) }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 12, weight: .semibold))
-                        .frame(width: 30, height: 30)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .foregroundStyle(RelayTheme.textMuted)
-                .help("More workspace actions")
-                if workspace.isFullScreen {
-                    ChromeButton(symbol: "plus", help: "Connect to a host · ⌘K") {
-                        workspace.presentHostLauncher()
-                    }
-                } else {
-                    Button {
-                        workspace.presentHostLauncher()
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 10.5, weight: .semibold))
-                            Text("Connect")
-                                .font(.system(size: 11.5, weight: .medium))
-                        }
-                        .padding(.horizontal, 12)
-                        .frame(height: 29)
-                        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(RelayTheme.text)
-                }
+    private struct RailTool: Identifiable {
+        let id: String
+        let title: String
+        let symbol: String
+    }
+
+    private var railTools: [RailTool] {
+        plugins.installations.keys.sorted().flatMap { id -> [RailTool] in
+            guard plugins.installations[id]?.enabled == true,
+                  let package = plugins.reviewedInstallations[id]?.package else { return [] }
+            return package.contributions.compactMap { entry in
+                guard entry.kind == .tool, let operation = entry.operation else { return nil }
+                let toolID = id + ":" + entry.id
+                // The plots button already opens this exact contribution.
+                guard toolID != "relay.radian:results", operation != .agentActivity, !operation.isHPC else { return nil }
+                return RailTool(id: toolID, title: entry.title, symbol: symbol(for: operation))
             }
         }
-        .padding(.leading, workspace.sidebarVisible ? 10 : 76)
-        .padding(.trailing, 10)
-        .frame(height: workspace.isFullScreen ? 38 : 44)
-        .background {
-            RelayWindowDragRegion()
-                .background(RelayTheme.canvas)
-                .accessibilityHidden(true)
+    }
+
+    private func symbol(for operation: RelayPluginOperation) -> String {
+        switch operation {
+        case .agentActivity: return "sparkles"
+        case .artifacts: return "shippingbox"
+        case .gitReview: return "point.3.connected.trianglepath.dotted"
+        case .transfers: return "arrow.left.arrow.right"
+        case .projectActions: return "hammer"
+        case .projectRun: return "play.rectangle"
+        case .hpcJobs: return "server.rack"
+        case .hpcAccounting: return "chart.bar"
+        case .hpcDetails: return "list.bullet.rectangle"
+        case .hpcLogs: return "text.alignleft"
+        case .hpcSubmit: return "paperplane"
+        case .hpcCancel: return "stop.circle"
+        case .vpn: return "lock.shield"
+        case .rWorkspace: return "r.square"
         }
+    }
+
+    private func revealPlugin(_ id: String) {
+        NotificationCenter.default.post(name: .relayShowPlugin, object: id)
+    }
+
+    private var railButtons: some View {
+        VStack(spacing: RelayTheme.spacing(5)) {
+            ChromeButton(symbol: "network", help: workspace.networkVisible ? "Back to workspace" : "Network") {
+                if workspace.networkVisible { workspace.hideNetwork() } else { workspace.showNetwork() }
+            }.accessibilityIdentifier("relay.navigation.network")
+            RelaySubscriptionQuotaButton(workspace: workspace)
+            ChromeButton(symbol: "sparkles", help: "Relay Assistant") { workspace.assistantVisible.toggle() }
+                .accessibilityIdentifier("relay.tools.assistant")
+            ChromeButton(symbol: "server.rack", help: "Connect to a host · ⌘K") { workspace.presentHostLauncher() }
+                .accessibilityIdentifier("relay.tools.connect")
+            ChromeButton(symbol: "terminal", help: "New local session") { workspace.newTab(profile: .local) }
+                .accessibilityIdentifier("relay.tools.local-session")
+            ChromeButton(symbol: "rectangle.split.2x1", help: "Split pane right · ⌘D") { workspace.splitActive(axis: .horizontal) }
+            ChromeButton(symbol: "rectangle.split.1x2", help: "Split pane down · ⇧⌘D") { workspace.splitActive(axis: .vertical) }
+            ChromeButton(symbol: "arrow.clockwise", help: "Reconnect panels in this tab") {
+                if let tabID = workspace.selectedTabID { workspace.reconnectPanels(in: tabID) }
+            }
+            .disabled(workspace.selectedTabID.map { workspace.recoveringTabIDs.contains($0) } ?? true)
+            .accessibilityIdentifier("relay.workspace.recover-panels")
+            Divider().frame(width: 22)
+            RelayExecutionContextButton(workspace: workspace)
+            RelayHostRotationButton(workspace: workspace)
+            ChromeButton(symbol: "waveform.path.ecg.rectangle", help: "Monitoring · performance, energy, processes and agents") {
+                workspace.togglePerformancePanel()
+            }.accessibilityIdentifier("relay.tools.monitoring")
+            Menu {
+                Button("Open remote editor") { workspace.openEditorForActive() }
+                    .disabled(workspace.activePane?.profile.kind != .ssh || workspace.activePane?.profile.backend != .relay)
+                Button("R workspace") { RelayToolWindowCoordinator.shared.showR(workspace: workspace) }
+                Button("R plots and tables") { revealPlugin("relay.radian:results") }
+                Button("HPC") { NotificationCenter.default.post(name: .relayShowHPC, object: nil) }
+                Divider()
+                ForEach(railTools) { tool in
+                    Button(tool.title) { revealPlugin(tool.id) }
+                        .accessibilityIdentifier("relay.tools." + tool.id)
+                }
+                Divider()
+                Button("Restore closed panes…") { workspace.isRecoveryPresented = true }
+                Button("New floating pane") { workspace.newFloatingPane() }
+            } label: {
+                RelayToolbarMenuIcon(symbol: "wrench.and.screwdriver", title: "Tools")
+            }
+            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+            .frame(width: 30, height: 30)
+            .foregroundStyle(RelayTheme.textMuted).help("Tools: editor, R, HPC, files and transfers")
+            .accessibilityLabel("Tools")
+            .accessibilityIdentifier("relay.tools.menu")
+            Divider().frame(width: 22)
+            Menu {
+                Button("Balance pane layout") { workspace.balanceActiveTabPanes() }
+                Button("Zoom active pane") { workspace.toggleActivePaneZoom() }
+                Button("Float or dock active pane") { workspace.toggleActivePaneFloating() }
+                Button("Tile floating panes") { workspace.arrangeFloatingPanes(cascade: false) }
+                Button("Cascade floating panes") { workspace.arrangeFloatingPanes(cascade: true) }
+                Button("Restore previous layout") { workspace.restorePaneArrangement() }
+                Divider()
+                Button("New local session") { workspace.newTab(profile: .local) }
+            } label: {
+                RelayToolbarMenuIcon(symbol: "ellipsis", title: "Layout actions")
+            }
+            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+            .frame(width: 30, height: 30)
+            .foregroundStyle(RelayTheme.textMuted).help("Pane layout actions")
+            .accessibilityLabel("Layout actions")
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: RelayTheme.spacing(6)) {
+            ChromeButton(symbol: workspace.sidebarVisible ? "sidebar.left" : "sidebar.right",
+                         help: workspace.sidebarVisible ? "Hide sessions" : "Show sessions") {
+                workspace.sidebarVisible.toggle()
+            }
+            .accessibilityLabel(workspace.sidebarVisible ? "Hide sessions" : "Show sessions")
+            .accessibilityIdentifier("relay.sessions.toggle-sidebar")
+            Divider().frame(width: 22)
+            ScrollView(.vertical, showsIndicators: true) {
+                railButtons.padding(.vertical, RelayTheme.spacing(4))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.top, RelayTheme.spacing(7))
+        .padding(.bottom, RelayTheme.spacing(7))
+        .frame(width: 46)
+        .frame(maxHeight: .infinity)
+        .background(RelayTheme.sidebar)
+        .overlay(alignment: .trailing) { Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(width: 1) }
+        .onAppear { plugins.refresh() }
     }
 }
 
@@ -1011,6 +1163,9 @@ private struct WorkspaceTab: View {
     let togglePin: () -> Void
     let rename: () -> Void
     let close: () -> Void
+    let recover: () -> Void
+    let reopenClosed: () -> Void
+    let recovering: Bool
     @Binding var draggedTabID: UUID?
     let move: (UUID, TabMovePlacement) -> Void
     @State private var hovering = false
@@ -1018,21 +1173,21 @@ private struct WorkspaceTab: View {
     @State private var tabWidth: CGFloat = 1
 
     var body: some View {
-        HStack(spacing: 1) {
+        HStack(spacing: RelayTheme.spacing(1)) {
             Button(action: select) {
-                HStack(spacing: 4) {
+                HStack(spacing: RelayTheme.spacing(4)) {
                     if pinned {
                         Image(systemName: "pin.fill")
-                            .font(.system(size: 7.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 7.5, weight: .medium))
                             .foregroundStyle(RelayTheme.textFaint)
                     }
                     Text(label)
-                        .font(.system(size: 11.5, weight: isSelected ? .semibold : .medium))
+                        .font(RelayTheme.font(size: 11.5, weight: .medium))
                         .lineLimit(1)
                 }
-                .padding(.leading, 9)
-                .padding(.trailing, 4)
-                .frame(height: 29)
+                .padding(.leading, RelayTheme.spacing(10))
+                .padding(.trailing, RelayTheme.spacing(6))
+                .frame(maxWidth: .infinity, minHeight: 33, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -1041,8 +1196,8 @@ private struct WorkspaceTab: View {
             )
             Button(action: close) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 7.5, weight: .bold))
-                    .frame(width: 18, height: 29)
+                    .font(RelayTheme.font(size: 7.5, weight: .medium))
+                    .frame(width: 22, height: 33)
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
@@ -1052,19 +1207,20 @@ private struct WorkspaceTab: View {
             .accessibilityLabel("Close \(label) tab")
         }
         .foregroundStyle(isSelected ? RelayTheme.text : RelayTheme.textMuted)
-        .background(isSelected ? RelayTheme.accentDim.opacity(0.48) : hovering ? RelayTheme.hover.opacity(0.45) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .overlay(alignment: .bottom) {
+        .background(isSelected ? RelayTheme.surface : hovering ? RelayTheme.hover.opacity(0.45) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6), style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6), style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .leading) {
             if isSelected {
                 Capsule()
                     .fill(RelayTheme.accent)
-                    .frame(height: 2)
-                    .padding(.horizontal, 7)
+                    .frame(width: 2, height: 19)
+                    .padding(.leading, RelayTheme.spacing(1))
                 }
         }
         .overlay {
-            HStack(spacing: 0) {
+            HStack(spacing: RelayTheme.spacing(0)) {
                 if dropPlacement == .before {
                     Capsule().fill(RelayTheme.accent).frame(width: 2, height: 21)
                 }
@@ -1104,6 +1260,10 @@ private struct WorkspaceTab: View {
         .contextMenu {
             Button(pinned ? "Unpin tab" : "Pin tab", action: togglePin)
             Button("Rename tab…", action: rename)
+            Button("Copy Tab ID") { copyWorkspaceID(tab.id) }
+            Button(recovering ? "Reconnecting panels…" : "Reconnect panels", action: recover)
+                .disabled(recovering)
+            Button("Reopen last closed pane", action: reopenClosed)
             Divider()
             Button("Close tab", action: close)
         }
@@ -1159,19 +1319,8 @@ private struct ChromeButton: View {
     let symbol: String
     let help: String
     let action: () -> Void
-    @State private var hovering = false
-
     var body: some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 12, weight: .semibold))
-                .frame(width: 30, height: 30)
-                .background(hovering ? RelayTheme.hover : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(RelayTheme.textMuted)
-        .onHover { hovering = $0 }
-        .help(help)
+        RelayIconAction(help, symbol: symbol, action: action)
         .accessibilityLabel(Text(help.split(separator: "·").first.map(String.init) ?? help))
     }
 }
@@ -1188,10 +1337,20 @@ private struct SessionTabGroup: Identifiable {
     var tabs: [TabModel]
 }
 
+private struct TabSearchHit: Identifiable {
+    let id: String
+    let tab: TabModel
+    let pane: PaneModel?
+    let detail: String
+}
+
 private struct SessionManager: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var activityIndex: WorkspaceActivityIndex
     @ObservedObject private var intelligence = AgentIntelligenceStore.shared
+    @State private var tabSearchQuery = ""
+    @State private var tabSearchHits: [TabSearchHit] = []
+    @State private var tabSearchTask: Task<Void, Never>?
 
     init(workspace: WorkspaceModel) {
         self.workspace = workspace
@@ -1204,7 +1363,7 @@ private struct SessionManager: View {
 
     private var activityBadgeLabel: String {
         intelligence.attentionCount > 0
-            ? "\(intelligence.attentionCount) need you"
+            ? "\(intelligence.attentionCount) need attention"
             : "\(intelligence.unreadCount) unread"
     }
 
@@ -1245,12 +1404,84 @@ private struct SessionManager: View {
         return groups
     }
 
+    private func searchTabs(_ rawQuery: String) {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { tabSearchHits = []; return }
+        let needle = query.lowercased()
+        func matches(_ fields: [String]) -> Bool {
+            fields.contains { $0.localizedStandardContains(query) }
+        }
+
+        var hits: [TabSearchHit] = []
+        for tab in workspace.tabs {
+            let sessionName = workspace.sessionDisplayName(tab.sessionID, fallback: tab.name)
+            let tabMatches = matches([tab.name, tab.id.uuidString, tab.sessionID.uuidString, sessionName])
+            if tabMatches {
+                hits.append(TabSearchHit(
+                    id: "\(tab.id.uuidString):tab", tab: tab, pane: nil,
+                    detail: "Session · \(sessionName) · Tab ID · \(tab.id.uuidString.lowercased())"
+                ))
+            }
+            for paneID in workspace.paneIDs(inTab: tab.id) {
+                guard let pane = workspace.panes[paneID] else { continue }
+                let location = [pane.directory, pane.editorRuntime.directoryPath,
+                                pane.editorRuntime.workspacePath, pane.editorRuntime.currentPath]
+                    .compactMap { $0 }
+                let metadataMatches = matches([
+                    pane.id.uuidString, pane.displayName, pane.title, pane.profile.name,
+                    pane.profile.host, pane.profile.user, pane.profile.destination,
+                    pane.profile.connectionKey, pane.activitySummary, pane.phase.rawValue,
+                    pane.contentKind.rawValue
+                ] + location)
+
+                var textExcerpt: String?
+                if needle.count >= 2 {
+                    var content: String?
+                    if pane.contentKind == .terminal, pane.connectionState == .connected {
+                        content = pane.runtime.sidePanelViewportText()
+                    } else if pane.contentKind == .editor {
+                        content = pane.editorRuntime.controlSnapshot().content
+                    }
+                    if !pane.recentConversationContext.isEmpty {
+                        content = [content, pane.recentConversationContext.joined(separator: "\n")]
+                            .compactMap { $0 }.joined(separator: "\n")
+                    }
+                    if let content,
+                       let line = content.split(whereSeparator: \.isNewline)
+                        .map(String.init).first(where: { $0.localizedStandardContains(query) }) {
+                        let compact = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if compact.count > 100, let range = compact.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) {
+                            let start = compact.index(range.lowerBound, offsetBy: -min(36, compact.distance(from: compact.startIndex, to: range.lowerBound)), limitedBy: compact.startIndex) ?? compact.startIndex
+                            let end = compact.index(range.upperBound, offsetBy: min(48, compact.distance(from: range.upperBound, to: compact.endIndex)), limitedBy: compact.endIndex) ?? compact.endIndex
+                            textExcerpt = "…\(compact[start..<end])…"
+                        } else {
+                            textExcerpt = String(compact.prefix(100))
+                        }
+                    }
+                }
+
+                guard metadataMatches || textExcerpt != nil else { continue }
+                let detail: String
+                if let textExcerpt {
+                    detail = "Text · \(pane.displayName) · \(textExcerpt)"
+                } else if !location.isEmpty {
+                    detail = "\(pane.displayName) · \(location.joined(separator: " · "))"
+                } else {
+                    detail = "\(pane.displayName) · \(pane.profile.name) · Pane ID · \(pane.id.uuidString.lowercased())"
+                }
+                hits.append(TabSearchHit(id: "\(tab.id.uuidString):\(pane.id.uuidString)", tab: tab, pane: pane, detail: detail))
+            }
+            if hits.count >= 100 { break }
+        }
+        tabSearchHits = hits
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: RelayTheme.spacing(0)) {
             Color.clear.frame(height: workspace.isFullScreen ? 38 : 42)
-            HStack(spacing: 8) {
+            HStack(spacing: RelayTheme.spacing(8)) {
                 Text("Sessions")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(RelayTheme.font(size: 13, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                 Spacer()
                 Button {
@@ -1258,14 +1489,14 @@ private struct SessionManager: View {
                 } label: {
                     ZStack(alignment: .topTrailing) {
                         Image(systemName: workspace.intelligencePanelVisible ? "sparkles.rectangle.stack.fill" : "sparkles.rectangle.stack")
-                            .font(.system(size: 11, weight: .medium))
+                            .font(RelayTheme.font(size: 11, weight: .medium))
                             .frame(width: 26, height: 26)
                         if activityBadgeCount > 0 {
                             Text(activityBadgeCount > 99 ? "99+" : "\(activityBadgeCount)")
-                                .font(.system(size: 6.5, weight: .bold, design: .rounded))
+                                .font(RelayTheme.font(size: 11, weight: .medium))
                                 .foregroundStyle(Color.white)
-                                .padding(.horizontal, 3)
-                                .frame(minWidth: 11, minHeight: 11)
+                                .padding(.horizontal, RelayTheme.spacing(3))
+                                .frame(minWidth: 17, minHeight: 17)
                                 .background(intelligence.attentionCount > 0 ? RelayTheme.coral : RelayTheme.blue, in: Capsule())
                                 .offset(x: 3, y: 1)
                         }
@@ -1281,59 +1512,126 @@ private struct SessionManager: View {
                     workspace.presentHostLauncher()
                 } label: {
                     Image(systemName: "square.and.pencil")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(RelayTheme.font(size: 11, weight: .medium))
                         .frame(width: 26, height: 26)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
                 .help("Connect to a host")
-                Button {
-                    workspace.sidebarVisible = false
-                } label: {
-                    Image(systemName: "sidebar.left")
-                        .font(.system(size: 11, weight: .medium))
-                        .frame(width: 26, height: 26)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .help("Hide sessions")
             }
-            .padding(.leading, 14)
-            .padding(.trailing, 10)
+            .padding(.leading, RelayTheme.spacing(14))
+            .padding(.trailing, RelayTheme.spacing(10))
             .frame(height: 44)
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(nodeGroups) { group in
-                        SessionNodeSection(group: group, workspace: workspace)
+            HStack(spacing: RelayTheme.spacing(7)) {
+                Image(systemName: "magnifyingglass")
+                    .font(RelayTheme.font(size: 11, weight: .medium))
+                    .foregroundStyle(RelayTheme.textFaint)
+                TextField("Search tabs, text, paths, IDs…", text: $tabSearchQuery)
+                    .textFieldStyle(.plain)
+                    .font(RelayTheme.font(size: 11.5))
+                    .accessibilityIdentifier("relay.tabs.search")
+                    .onChange(of: tabSearchQuery) { _, value in
+                        tabSearchTask?.cancel()
+                        if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            tabSearchHits = []
+                        } else {
+                            tabSearchTask = Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 200_000_000)
+                                guard !Task.isCancelled else { return }
+                                searchTabs(value)
+                            }
+                        }
                     }
+                if !tabSearchQuery.isEmpty {
+                    Button {
+                        tabSearchQuery = ""
+                        tabSearchHits = []
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(RelayTheme.font(size: 12))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(RelayTheme.textFaint)
+                    .accessibilityLabel("Clear tab search")
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
+            }
+            .padding(.horizontal, RelayTheme.spacing(9))
+            .frame(height: 32)
+            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+            .padding(.horizontal, RelayTheme.spacing(10))
+            .padding(.bottom, RelayTheme.spacing(6))
+
+            ScrollView {
+                if tabSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    LazyVStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
+                        ForEach(nodeGroups) { group in
+                            SessionNodeSection(group: group, workspace: workspace)
+                        }
+                    }
+                    .padding(.horizontal, RelayTheme.spacing(8))
+                    .padding(.vertical, RelayTheme.spacing(6))
+                } else if tabSearchHits.isEmpty {
+                    Text("No matching tabs")
+                        .font(RelayTheme.font(size: 11.5))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(RelayTheme.spacing(16))
+                } else {
+                    LazyVStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
+                        ForEach(tabSearchHits) { hit in
+                            Button {
+                                if let pane = hit.pane { workspace.revealPane(pane.id) }
+                                else if let paneID = hit.tab.allPaneIDs.first { workspace.revealPane(paneID) }
+                                else { workspace.selectTab(hit.tab.id) }
+                            } label: {
+                                VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
+                                    Text(hit.tab.name.isEmpty ? "Untitled tab" : hit.tab.name)
+                                        .font(RelayTheme.font(size: 11.5, weight: .medium))
+                                        .foregroundStyle(RelayTheme.text)
+                                        .lineLimit(1)
+                                    Text(hit.detail)
+                                        .font(RelayTheme.font(size: 10.5))
+                                        .foregroundStyle(RelayTheme.textMuted)
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.leading)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, RelayTheme.spacing(9))
+                                .padding(.vertical, RelayTheme.spacing(7))
+                                .background(RelayTheme.surface.opacity(0.72), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7)))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("relay.tabs.search-result.\(hit.tab.id.uuidString.lowercased())")
+                        }
+                    }
+                    .padding(.horizontal, RelayTheme.spacing(8))
+                    .padding(.vertical, RelayTheme.spacing(6))
+                }
             }
 
             Spacer(minLength: 0)
             Button {
                 workspace.presentHostLauncher()
             } label: {
-                HStack(spacing: 8) {
+                HStack(spacing: RelayTheme.spacing(8)) {
                     Image(systemName: "plus")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(RelayTheme.font(size: 10, weight: .medium))
                         .foregroundStyle(RelayTheme.textMuted)
                     Text("New connection")
-                        .font(.system(size: 11.5, weight: .medium))
+                        .font(RelayTheme.font(size: 11.5, weight: .medium))
                         .foregroundStyle(RelayTheme.text)
                     Spacer()
                     Text("⌘K")
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
                 }
-                .padding(.horizontal, 12)
+                .padding(.horizontal, RelayTheme.spacing(12))
                 .frame(height: 36)
-                .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9), style: .continuous))
             }
             .buttonStyle(.plain)
-            .padding(8)
+            .padding(RelayTheme.spacing(8))
         }
         .background(RelayTheme.sidebar)
     }
@@ -1352,12 +1650,12 @@ private struct SessionNodeSection: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 7) {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
+            HStack(spacing: RelayTheme.spacing(7)) {
                 Group {
                     if differentiateWithoutColor {
                         Image(systemName: nodeConnected ? "wifi" : "wifi.slash")
-                            .font(.system(size: 8, weight: .semibold))
+                            .font(RelayTheme.font(size: 8, weight: .medium))
                     } else {
                         Circle()
                             .fill(nodeConnected ? RelayTheme.mint : RelayTheme.textFaint)
@@ -1366,15 +1664,15 @@ private struct SessionNodeSection: View {
                 }
                 .accessibilityLabel(nodeConnected ? "Connected" : "Disconnected")
                 Text(group.name)
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
                     .lineLimit(1)
                 Spacer()
                 Text("\(group.sessions.count)")
-                    .font(.system(size: 9.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textFaint)
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, RelayTheme.spacing(8))
             .frame(height: 30)
 
             ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
@@ -1386,7 +1684,7 @@ private struct SessionNodeSection: View {
                 )
             }
         }
-        .padding(.bottom, 7)
+        .padding(.bottom, RelayTheme.spacing(7))
     }
 }
 
@@ -1396,52 +1694,49 @@ private struct AttachedSessionRow: View {
     @ObservedObject var workspace: WorkspaceModel
 
     private var selected: Bool { session.tabs.contains { $0.id == workspace.selectedTabID } }
+    private var expanded: Bool { workspace.navigationState.isExpanded(.session, id: session.id) }
     private var panes: [PaneModel] {
         session.tabs.flatMap(\.allPaneIDs).compactMap { workspace.panes[$0] }
     }
-    /// Keep a background session expanded only while its root agent is
-    /// actively working or needs attention. Subagent history is intentionally
-    /// shown at the owning pane instead of as a host-level "thread" total.
-    private var hasActiveAgentWork: Bool {
-        panes.contains { pane in
-            guard pane.contentKind == .terminal, pane.kind != .shell else { return false }
-            return switch pane.phase {
-            case .connecting, .active, .needsInput: true
-            case .quiet, .exited: false
-            }
-        }
-    }
     var body: some View {
-        VStack(spacing: 1) {
-            HStack(spacing: 3) {
+        VStack(spacing: RelayTheme.spacing(1)) {
+            HStack(spacing: RelayTheme.spacing(3)) {
+                Button { workspace.toggleNavigationGroup(.session, id: session.id) } label: {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(RelayTheme.font(size: 8.5, weight: .medium))
+                        .frame(width: 24, height: 30)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textFaint)
+                .help(expanded ? "Collapse session" : "Expand session")
+                .accessibilityIdentifier("relay.navigation.session-disclosure." + session.id.uuidString.lowercased())
                 Button {
-                    if let tab = session.tabs.first { workspace.selectTab(tab.id) }
+                    workspace.selectSession(session.id)
                 } label: {
-                HStack(spacing: 7) {
+                HStack(spacing: RelayTheme.spacing(7)) {
                     Capsule()
                         .fill(selected ? RelayTheme.accent : Color.clear)
-                        .frame(width: 3, height: 18)
+                        .frame(width: 2, height: 16)
                     Image(systemName: "rectangle.stack")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(RelayTheme.font(size: 9, weight: .medium))
                         .foregroundStyle(selected ? RelayTheme.textMuted : RelayTheme.textFaint)
                     if workspace.isSessionPinned(session.id) {
                         Image(systemName: "pin.fill")
-                            .font(.system(size: 7.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 7.5, weight: .medium))
                             .foregroundStyle(RelayTheme.textFaint)
                     }
                     Text(label)
-                        .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
+                        .font(RelayTheme.font(size: 11.5, weight: .medium))
                         .foregroundStyle(selected ? RelayTheme.text : RelayTheme.textMuted)
                         .lineLimit(1)
                     Spacer(minLength: 3)
                     Text("\(session.tabs.count) tab\(session.tabs.count == 1 ? "" : "s")")
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
                 }
-                .padding(.horizontal, 6)
+                .padding(.horizontal, RelayTheme.spacing(6))
                 .frame(height: 34)
-                .background(selected ? RelayTheme.accentDim.opacity(0.24) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(Color.clear)
                 .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -1451,12 +1746,13 @@ private struct AttachedSessionRow: View {
                     }
                     Button("New tab") { workspace.newTab(inSession: session.id) }
                     Button("Rename session…") { workspace.beginRenameSession(session.id, fallback: label) }
+                    Button("Copy Session ID") { copyWorkspaceID(session.id) }
                     Divider()
                     Button("Detach session") { workspace.closeSession(session.id) }
                 }
                 Button { workspace.newTab(inSession: session.id) } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(RelayTheme.font(size: 9, weight: .medium))
                         .frame(width: 24, height: 24)
                 }
                 .buttonStyle(.plain)
@@ -1464,7 +1760,7 @@ private struct AttachedSessionRow: View {
                 .help("New tab in session")
             }
 
-            if selected || hasActiveAgentWork {
+            if expanded {
                 ForEach(session.tabs) { tab in
                     let tabIndex = session.tabs.firstIndex(where: { $0.id == tab.id }) ?? 0
                     SessionTabSection(
@@ -1484,31 +1780,28 @@ private struct SessionTabSection: View {
     @ObservedObject var tab: TabModel
     let fallbackLabel: String
     @ObservedObject var workspace: WorkspaceModel
-    @State private var expanded: Bool
+    private var expanded: Bool { workspace.navigationState.isExpanded(.tab, id: tab.id) }
 
     init(tab: TabModel, fallbackLabel: String, workspace: WorkspaceModel) {
         self.tab = tab
         self.fallbackLabel = fallbackLabel
         self.workspace = workspace
-        let containsActiveAgent = tab.allPaneIDs.compactMap { workspace.panes[$0] }
-            .contains { $0.contentKind == .terminal && $0.kind != .shell }
-        _expanded = State(initialValue: tab.id == workspace.selectedTabID || containsActiveAgent)
     }
 
     private var panes: [PaneModel] { tab.allPaneIDs.compactMap { workspace.panes[$0] } }
     private var activeAgents: Int {
-        panes.reduce(0) { $0 + ($1.contentKind == .terminal && $1.kind != .shell ? 1 + $1.activeSubagents : 0) }
+        panes.filter { $0.contentKind == .terminal && $0.kind != .shell && $0.phase == .active }.count
     }
     private var displayName: String { workspace.tabDisplayName(tab, fallback: fallbackLabel) }
 
     var body: some View {
-        VStack(spacing: 1) {
-            HStack(spacing: 4) {
+        VStack(spacing: RelayTheme.spacing(1)) {
+            HStack(spacing: RelayTheme.spacing(4)) {
                 Button {
-                    expanded.toggle()
+                    workspace.toggleNavigationGroup(.tab, id: tab.id)
                 } label: {
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 8, weight: .bold))
+                        .font(RelayTheme.font(size: 8, weight: .medium))
                         .frame(width: 16, height: 24)
                 }
                 .buttonStyle(.plain)
@@ -1518,19 +1811,19 @@ private struct SessionTabSection: View {
                 Button {
                     workspace.selectTab(tab.id)
                 } label: {
-                    HStack(spacing: 6) {
+                    HStack(spacing: RelayTheme.spacing(6)) {
                         Image(systemName: "rectangle")
-                            .font(.system(size: 8.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 8.5, weight: .medium))
                         if workspace.isTabPinned(tab.id) {
                             Image(systemName: "pin.fill")
-                                .font(.system(size: 7, weight: .semibold))
+                                .font(RelayTheme.font(size: 7, weight: .medium))
                         }
                         Text(displayName)
-                            .font(.system(size: 10, weight: tab.id == workspace.selectedTabID ? .semibold : .medium))
+                            .font(RelayTheme.font(size: 11, weight: .medium))
                             .lineLimit(1)
                         Spacer(minLength: 4)
                         Text("\(panes.count)")
-                            .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+                            .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                         if activeAgents > 0 {
                             Circle().fill(RelayTheme.mint).frame(width: 5, height: 5)
                         }
@@ -1544,15 +1837,16 @@ private struct SessionTabSection: View {
                         workspace.toggleTabPin(tab.id)
                     }
                     Button("Rename tab…") { workspace.beginRenameTab(tab.id) }
+                    Button("Copy Tab ID") { copyWorkspaceID(tab.id) }
                     Button("Close tab") { workspace.closeTab(tab.id) }
                 }
             }
-            .padding(.leading, 21)
-            .padding(.trailing, 9)
-            .frame(height: 27)
+            .padding(.leading, RelayTheme.spacing(21))
+            .padding(.trailing, RelayTheme.spacing(9))
+            .frame(height: 30)
             .background(
-                tab.id == workspace.selectedTabID ? RelayTheme.accentDim.opacity(0.34) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                Color.clear,
+                in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6), style: .continuous)
             )
 
             if expanded {
@@ -1565,9 +1859,6 @@ private struct SessionTabSection: View {
                     )
                 }
             }
-        }
-        .onChange(of: workspace.selectedTabID) { _, selectedID in
-            if selectedID == tab.id { expanded = true }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Tab \(displayName), \(panes.count) panes")
@@ -1582,15 +1873,15 @@ private struct PanePresence: View {
         Group {
             if differentiateWithoutColor {
                 Image(systemName: pane.phase == .needsInput ? "exclamationmark" : pane.kind == .shell ? "terminal" : "bolt.fill")
-                    .font(.system(size: 7, weight: .bold))
+                    .font(RelayTheme.font(size: 7, weight: .medium))
             } else {
                 Circle()
                     .fill(pane.phase == .needsInput ? RelayTheme.coral : pane.kind == .shell ? RelayTheme.textFaint : RelayTheme.mint)
                     .frame(width: 5, height: 5)
             }
         }
-            .help("\(pane.kind.label): \(pane.phase.label)")
-            .accessibilityLabel("\(pane.kind.label): \(pane.phase.label)")
+            .help("\(pane.harnessLabel): \(pane.phase.label)")
+            .accessibilityLabel("\(pane.harnessLabel): \(pane.phase.label)")
     }
 }
 
@@ -1622,8 +1913,9 @@ private struct SessionPaneRow: View {
     }
 
     private func revealPane() {
-        if workspace.selectedTabID != tabID { workspace.selectTab(tabID) }
+        if workspace.networkVisible || workspace.selectedTabID != tabID { workspace.selectTab(tabID) }
         workspace.selectPane(pane.id)
+        workspace.networkVisible = false
         pane.focus()
     }
 
@@ -1632,24 +1924,24 @@ private struct SessionPaneRow: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: RelayTheme.spacing(0)) {
             Button(action: revealPane) {
-                HStack(spacing: 7) {
+                HStack(spacing: RelayTheme.spacing(7)) {
                 Capsule()
                     .fill(active ? RelayTheme.accent : Color.clear)
                     .frame(width: 2, height: 16)
                 Image(systemName: pane.contentKind == .editor ? "curlybraces" : pane.kind.symbol)
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(pane.contentKind == .editor ? RelayTheme.blue : pane.phase.color)
                     .frame(width: 14)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(pane.contentKind == .editor ? pane.displayName : pane.kind == .shell ? pane.displayName : pane.kind.label)
-                        .font(.system(size: 10.5, weight: active ? .semibold : .medium))
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
+                    Text(pane.contentKind == .editor ? pane.displayName : pane.kind == .shell ? pane.displayName : pane.harnessLabel)
+                        .font(RelayTheme.font(size: 11, weight: .medium))
                         .foregroundStyle(active ? RelayTheme.text : RelayTheme.textMuted)
                         .lineLimit(1)
-                    if pane.contentKind == .terminal && pane.kind != .shell {
+                    if pane.contentKind == .terminal && pane.kind != .shell && (active || pane.phase == .needsInput) {
                         Text(AgentLabelFormatter.activity(pane.activitySummary))
-                            .font(.system(size: 8.5, weight: .medium))
+                            .font(RelayTheme.font(size: 11, weight: .medium))
                             .foregroundStyle(RelayTheme.textFaint)
                             .lineLimit(1)
                     }
@@ -1657,29 +1949,33 @@ private struct SessionPaneRow: View {
                 Spacer(minLength: 0)
                 if pane.activeSubagents > 0 {
                     Text("\(pane.activeSubagents)")
-                        .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                        .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.mint)
                 }
                 if isFloating {
                     Image(systemName: "macwindow.on.rectangle")
-                        .font(.system(size: 8.5, weight: .semibold))
+                        .font(RelayTheme.font(size: 8.5, weight: .medium))
                         .foregroundStyle(RelayTheme.textFaint)
                         .help("Floating pane")
                 }
                 Circle().fill(pane.connectionState.color).frame(width: 5, height: 5)
                 }
-                .padding(.leading, 22)
+                .padding(.leading, RelayTheme.spacing(22))
                 .padding(.trailing, pane.subagents.isEmpty ? 9 : 54)
-                .frame(height: pane.contentKind == .terminal && pane.kind != .shell ? 38 : 29)
-                .background(active ? RelayTheme.accentDim.opacity(0.58) : hovering ? RelayTheme.surface.opacity(0.7) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .frame(height: pane.contentKind == .terminal && pane.kind != .shell && (active || pane.phase == .needsInput) ? 38 : 30)
+                .background(active ? RelayTheme.hover.opacity(0.35) : hovering ? RelayTheme.surface.opacity(0.7) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7), style: .continuous))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
             .contextMenu {
                 Button("Rename pane…") { workspace.beginRenamePane(pane.id) }
+                Button("Copy Pane ID") { copyWorkspaceID(pane.id) }
                 if pane.contentKind == .terminal {
+                    Button("Connect with other sessions…") {
+                        NotificationCenter.default.post(name: .relayConnectPaneSessions, object: pane.id)
+                    }
                     Menu("Agent type") {
                         ForEach(AgentKind.allCases, id: \.self) { kind in
                             Button {
@@ -1724,33 +2020,33 @@ private struct SessionPaneRow: View {
                     Button {
                         agentThreadsExpanded.toggle()
                     } label: {
-                        HStack(spacing: 5) {
+                        HStack(spacing: RelayTheme.spacing(5)) {
                             AgentPulse(phase: pane.phase, activeCount: pane.activeSubagents)
                             Text(pane.activeSubagents > 0 ? "\(pane.activeSubagents)/\(pane.subagents.count)" : "\(pane.subagents.count)")
-                                .font(.system(size: 8, weight: .semibold, design: .rounded))
+                                .font(RelayTheme.font(size: 8, weight: .medium, design: .rounded))
                             Image(systemName: agentThreadsExpanded ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 8, weight: .bold))
+                                .font(RelayTheme.font(size: 8, weight: .medium))
                         }
                         .frame(minWidth: 45, minHeight: 29)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(RelayTheme.textFaint)
-                    .padding(.trailing, 3)
+                    .padding(.trailing, RelayTheme.spacing(3))
                     .help(agentThreadsExpanded ? "Hide agent focus" : "Show agent focus")
                     .accessibilityLabel(agentThreadsExpanded ? "Hide agent focus" : "Show agent focus, \(pane.activeSubagents) active")
                 }
             }
 
-            if agentThreadsExpanded {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Text(showingAllAgents ? "THREADS" : "FOCUS")
-                            .font(.system(size: 8, weight: .bold, design: .rounded))
+            if agentThreadsExpanded && !workspace.networkVisible {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+                    HStack(spacing: RelayTheme.spacing(6)) {
+                        Text(showingAllAgents ? "Agent threads" : "Recent activity")
+                            .font(RelayTheme.font(size: 8, weight: .medium, design: .rounded))
                             .tracking(0.8)
                             .foregroundStyle(RelayTheme.textFaint)
                         if attention.snapshot.attentionCount > 0 {
                             Text("\(attention.snapshot.attentionCount) need you")
-                                .font(.system(size: 8, weight: .semibold))
+                                .font(RelayTheme.font(size: 8, weight: .medium))
                                 .foregroundStyle(RelayTheme.coral)
                         }
                         Spacer()
@@ -1760,7 +2056,7 @@ private struct SessionPaneRow: View {
                                 agentQuery = ""
                             }
                             .buttonStyle(.plain)
-                            .font(.system(size: 9, weight: .semibold))
+                            .font(RelayTheme.font(size: 9, weight: .medium))
                             .foregroundStyle(RelayTheme.textMuted)
                         } else {
                             Button {
@@ -1771,7 +2067,7 @@ private struct SessionPaneRow: View {
                                       : attention.snapshot.usedSystemIntelligence
                                       ? "wand.and.stars.inverse"
                                       : "wand.and.stars")
-                                    .font(.system(size: 8, weight: .medium))
+                                    .font(RelayTheme.font(size: 8, weight: .medium))
                                     .foregroundStyle(attention.snapshot.usedSystemIntelligence
                                                      ? RelayTheme.mint : RelayTheme.textFaint)
                                     .frame(width: 18, height: 18)
@@ -1786,25 +2082,25 @@ private struct SessionPaneRow: View {
                                                 : "Refine focus on this Mac")
                         }
                     }
-                    .padding(.leading, 43)
-                    .padding(.trailing, 9)
-                    .padding(.top, 4)
+                    .padding(.leading, RelayTheme.spacing(43))
+                    .padding(.trailing, RelayTheme.spacing(9))
+                    .padding(.top, RelayTheme.spacing(4))
 
                     if showingAllAgents {
-                        HStack(spacing: 6) {
+                        HStack(spacing: RelayTheme.spacing(6)) {
                             Image(systemName: "magnifyingglass")
-                                .font(.system(size: 9, weight: .medium))
+                                .font(RelayTheme.font(size: 9, weight: .medium))
                                 .foregroundStyle(RelayTheme.textFaint)
                             TextField("Find a thread", text: $agentQuery)
                                 .textFieldStyle(.plain)
-                                .font(.system(size: 10.5))
+                                .font(RelayTheme.font(size: 10.5))
                                 .accessibilityLabel("Find an agent thread")
                         }
-                        .padding(.horizontal, 8)
+                        .padding(.horizontal, RelayTheme.spacing(8))
                         .frame(height: 26)
-                        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                        .padding(.leading, 35)
-                        .padding(.trailing, 7)
+                        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7), style: .continuous))
+                        .padding(.leading, RelayTheme.spacing(35))
+                        .padding(.trailing, RelayTheme.spacing(7))
                     }
 
                     ForEach(showingAllAgents ? searchedAgents : focusedAgents) { subagent in
@@ -1819,22 +2115,22 @@ private struct SessionPaneRow: View {
 
                     if showingAllAgents && searchedAgents.isEmpty {
                         Text("No matching threads")
-                            .font(.system(size: 10))
+                            .font(RelayTheme.font(size: 11))
                             .foregroundStyle(RelayTheme.textFaint)
-                            .padding(.leading, 43)
+                            .padding(.leading, RelayTheme.spacing(43))
                             .frame(height: 25)
                     } else if !showingAllAgents && attention.snapshot.hiddenCount > 0 {
                         Button {
                             showingAllAgents = true
                         } label: {
-                            HStack(spacing: 6) {
+                            HStack(spacing: RelayTheme.spacing(6)) {
                                 Image(systemName: "magnifyingglass")
-                                    .font(.system(size: 8.5, weight: .semibold))
+                                    .font(RelayTheme.font(size: 8.5, weight: .medium))
                                 Text("Search \(attention.snapshot.hiddenCount) more")
-                                    .font(.system(size: 9.5, weight: .medium))
+                                    .font(RelayTheme.font(size: 11, weight: .medium))
                             }
                             .foregroundStyle(RelayTheme.textFaint)
-                            .padding(.leading, 43)
+                            .padding(.leading, RelayTheme.spacing(43))
                             .frame(height: 25)
                             .contentShape(Rectangle())
                         }
@@ -1842,7 +2138,7 @@ private struct SessionPaneRow: View {
                         .accessibilityHint("Shows searchable agent history")
                     }
                 }
-                .padding(.bottom, 4)
+                .padding(.bottom, RelayTheme.spacing(4))
             }
         }
         .onAppear {
@@ -1873,7 +2169,7 @@ private struct AgentPulse: View {
     let activeCount: Int
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 1.5) {
+        HStack(alignment: .bottom, spacing: RelayTheme.spacing(1.5)) {
             ForEach([4.0, 7.0, 5.0], id: \.self) { height in
                 Capsule()
                     .fill(phase == .needsInput ? RelayTheme.coral : activeCount > 0 ? RelayTheme.mint : RelayTheme.textFaint)
@@ -1896,7 +2192,7 @@ private struct AgentFocusRow: View {
     var body: some View {
         let displayLabel = AgentAttentionPolicy.displayLabel(for: agent)
         Button(action: open) {
-            HStack(spacing: 7) {
+            HStack(spacing: RelayTheme.spacing(7)) {
                 ZStack {
                     Rectangle()
                         .fill(RelayTheme.line.opacity(0.7))
@@ -1907,33 +2203,33 @@ private struct AgentFocusRow: View {
                                height: agent.phase == .needsInput ? 7 : 5)
                 }
                 .frame(width: 9)
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 4) {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
+                    HStack(spacing: RelayTheme.spacing(4)) {
                         if pinned {
                             Image(systemName: "pin.fill")
-                                .font(.system(size: 7))
+                                .font(RelayTheme.font(size: 7))
                                 .foregroundStyle(RelayTheme.textFaint)
                         }
                         Text(displayLabel)
-                            .font(.system(size: 9.75, weight: agent.phase == .needsInput ? .semibold : .medium))
+                            .font(RelayTheme.font(size: 11, weight: .medium))
                             .foregroundStyle(agent.phase == .exited ? RelayTheme.textFaint : RelayTheme.textMuted)
                             .lineLimit(1)
                     }
                     Text(agent.provider.label)
-                        .font(.system(size: 8, weight: .medium))
+                        .font(RelayTheme.font(size: 11, weight: .regular))
                         .foregroundStyle(RelayTheme.textFaint)
                 }
                 Spacer(minLength: 2)
                 Text(agent.phase.label)
-                    .font(.system(size: 8, weight: .semibold, design: .rounded))
+                    .font(RelayTheme.font(size: 11, weight: .regular))
                     .foregroundStyle(agent.phase.color)
                     .lineLimit(1)
             }
-            .padding(.leading, 39)
-            .padding(.trailing, 9)
+            .padding(.leading, RelayTheme.spacing(39))
+            .padding(.trailing, RelayTheme.spacing(9))
             .frame(height: 31)
             .background(hovering ? RelayTheme.surface.opacity(0.55) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6), style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1991,14 +2287,14 @@ private struct HostLauncher: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 12) {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            HStack(spacing: RelayTheme.spacing(12)) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(RelayTheme.font(size: 16, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
-                TextField(selectedProfile == nil ? "Search hosts or enter an SSH alias…" : "Remote sessions", text: $query)
+                TextField(selectedProfile == nil ? "Search hosts or enter an SSH alias…" : "Sessions", text: $query)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 16, weight: .regular))
+                    .font(RelayTheme.font(size: 16, weight: .regular))
                     .foregroundStyle(RelayTheme.text)
                     .focused($searchFocused)
                     .onSubmit(connectFirstResult)
@@ -2011,19 +2307,19 @@ private struct HostLauncher: View {
                     .foregroundStyle(RelayTheme.textFaint)
                 }
                 Text("esc")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 4)
-                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .padding(.horizontal, RelayTheme.spacing(7))
+                    .padding(.vertical, RelayTheme.spacing(4))
+                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6), style: .continuous))
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, RelayTheme.spacing(14))
             .frame(height: 48)
-            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .padding(12)
+            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(4), style: .continuous))
+            .padding(RelayTheme.spacing(16))
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
+                LazyVStack(alignment: .leading, spacing: RelayTheme.spacing(6)) {
                     if let selectedProfile {
                         HStack {
                             Button {
@@ -2037,21 +2333,21 @@ private struct HostLauncher: View {
                             .buttonStyle(.plain)
                             .foregroundStyle(RelayTheme.textMuted)
                             Spacer()
-                            Text(selectedProfile.name)
-                                .font(.system(size: 11.5, weight: .semibold))
+                            Text(selectedProfile.kind == .local ? "This Mac" : selectedProfile.name)
+                                .font(RelayTheme.font(size: 11.5, weight: .medium))
                                 .foregroundStyle(RelayTheme.text)
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
+                        .padding(.horizontal, RelayTheme.spacing(8))
+                        .padding(.vertical, RelayTheme.spacing(5))
 
                         if loadingCatalog {
-                            HStack(spacing: 10) {
+                            HStack(spacing: RelayTheme.spacing(10)) {
                                 ProgressView().controlSize(.small)
-                                Text("Reading remote sessions…")
-                                    .font(.system(size: 12))
+                                Text("Reading Relay sessions…")
+                                    .font(RelayTheme.font(size: 12))
                                     .foregroundStyle(RelayTheme.textMuted)
                             }
-                            .padding(16)
+                            .padding(RelayTheme.spacing(16))
                         } else {
                             HostResultRow(
                                 title: "New session",
@@ -2061,27 +2357,30 @@ private struct HostLauncher: View {
                             ) { workspace.newTab(profile: selectedProfile) }
 
                             if let catalogError {
-                                VStack(alignment: .leading, spacing: 8) {
+                                VStack(alignment: .leading, spacing: RelayTheme.spacing(8)) {
                                     Text(catalogError)
-                                        .font(.system(size: 11.5))
+                                        .font(RelayTheme.font(size: 11.5))
                                         .foregroundStyle(RelayTheme.coral)
                                         .lineLimit(3)
                                     Button("Retry") { loadCatalog(for: selectedProfile) }
                                         .buttonStyle(.plain)
-                                        .font(.system(size: 11.5, weight: .semibold))
+                                        .font(RelayTheme.font(size: 11.5, weight: .medium))
                                         .foregroundStyle(RelayTheme.blue)
                                 }
-                                .padding(12)
+                                .padding(RelayTheme.spacing(12))
                             } else if let sessions = remoteCatalog?.sessions, !sessions.isEmpty {
                                 Text("On this host")
-                                    .font(.system(size: 10.5, weight: .bold))
+                                    .font(RelayTheme.font(size: 11, weight: .medium))
                                     .foregroundStyle(RelayTheme.textMuted)
-                                    .padding(.horizontal, 8)
-                                    .padding(.top, 8)
+                                    .padding(.horizontal, RelayTheme.spacing(8))
+                                    .padding(.top, RelayTheme.spacing(8))
                                 ForEach(sessions) { session in
                                     RemoteSessionResultRow(
                                         session: session,
                                         attachedPaneIDs: Set(workspace.panes.keys),
+                                        recoverInNewWindow: {
+                                            workspace.attachRemoteSession(profile: selectedProfile, remote: session, inNewWindow: true)
+                                        },
                                         attachSession: {
                                             workspace.attachRemoteSession(profile: selectedProfile, remote: session)
                                         },
@@ -2096,18 +2395,18 @@ private struct HostLauncher: View {
                                     )
                                 }
                             } else {
-                                Text("No detached Relay sessions on this host.")
-                                    .font(.system(size: 11.5))
+                                Text("No detached Relay sessions here.")
+                                    .font(RelayTheme.font(size: 11.5))
                                     .foregroundStyle(RelayTheme.textMuted)
-                                    .padding(12)
+                                    .padding(RelayTheme.spacing(12))
                             }
                         }
                     } else {
                         Text(query.isEmpty ? "Recent and configured" : "Matches")
-                            .font(.system(size: 10.5, weight: .bold))
+                            .font(RelayTheme.font(size: 11, weight: .medium))
                             .foregroundStyle(RelayTheme.textMuted)
-                            .padding(.horizontal, 8)
-                            .padding(.top, 5)
+                            .padding(.horizontal, RelayTheme.spacing(8))
+                            .padding(.top, RelayTheme.spacing(5))
 
                         if query.isEmpty {
                             HostResultRow(
@@ -2116,6 +2415,12 @@ private struct HostLauncher: View {
                                 symbol: "laptopcomputer",
                                 badge: "Local"
                             ) { workspace.newTab(profile: .local) }
+                            HostResultRow(
+                                title: "Recover local sessions",
+                                subtitle: "Reattach existing terminals on this Mac",
+                                symbol: "lifepreserver",
+                                badge: "Recover"
+                            ) { selectHost(.local) }
                         }
 
                         ForEach(filteredHosts) { profile in
@@ -2132,10 +2437,10 @@ private struct HostLauncher: View {
 
                         if let typedHost {
                             Text("Connect directly")
-                                .font(.system(size: 10.5, weight: .bold))
+                                .font(RelayTheme.font(size: 11, weight: .medium))
                                 .foregroundStyle(RelayTheme.textMuted)
-                                .padding(.horizontal, 8)
-                                .padding(.top, 8)
+                                .padding(.horizontal, RelayTheme.spacing(8))
+                                .padding(.top, RelayTheme.spacing(8))
                             HostResultRow(
                                 title: typedHost.host,
                                 subtitle: "Use this SSH hostname or config alias",
@@ -2145,28 +2450,28 @@ private struct HostLauncher: View {
                         }
 
                         if filteredHosts.isEmpty && typedHost == nil {
-                            VStack(spacing: 8) {
+                            VStack(spacing: RelayTheme.spacing(8)) {
                                 Image(systemName: "network.slash")
-                                    .font(.system(size: 24, weight: .medium))
+                                    .font(RelayTheme.font(size: 24, weight: .medium))
                                     .foregroundStyle(RelayTheme.textFaint)
                                 Text("No SSH host matches “\(query)”")
-                                    .font(.system(size: 13, weight: .semibold))
+                                    .font(RelayTheme.font(size: 13, weight: .medium))
                                     .foregroundStyle(RelayTheme.text)
                                 Text("Try an alias from ~/.ssh/config or enter a hostname.")
-                                    .font(.system(size: 11.5))
+                                    .font(RelayTheme.font(size: 11.5))
                                     .foregroundStyle(RelayTheme.textMuted)
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 42)
+                            .padding(.vertical, RelayTheme.spacing(42))
                         }
                     }
                 }
-                .padding(12)
+                .padding(RelayTheme.spacing(12))
             }
 
             HStack {
                 Label("SSH config, keys and ProxyJump stay with OpenSSH", systemImage: "key.horizontal")
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(RelayTheme.font(size: 10.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
                 Spacer()
                 Button("Edit connection…") {
@@ -2177,16 +2482,16 @@ private struct HostLauncher: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(RelayTheme.font(size: 11.5, weight: .medium))
                 .foregroundStyle(RelayTheme.blue)
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, RelayTheme.spacing(18))
             .frame(height: 48)
             .background(RelayTheme.surface.opacity(0.45))
         }
         .frame(width: 640, height: 520)
         .background(RelayTheme.sidebar)
-        .preferredColorScheme(.dark)
+        .relaySurface()
         .onAppear { searchFocused = true }
         .onDisappear { catalogRetryTask?.cancel() }
         .onExitCommand { workspace.isHostLauncherPresented = false }
@@ -2240,6 +2545,7 @@ private struct HostLauncher: View {
 private struct RemoteSessionResultRow: View {
     let session: RemoteSessionRecord
     let attachedPaneIDs: Set<UUID>
+    let recoverInNewWindow: () -> Void
     let attachSession: () -> Void
     let recoverPane: (RemoteCatalogPane) -> Void
     @State private var hovering = false
@@ -2251,6 +2557,15 @@ private struct RemoteSessionResultRow: View {
         }
     }
 
+    private var ownerWindow: NSWindow? {
+        session.workspaceID.flatMap(UUID.init(uuidString:)).flatMap { RecoveryWindowRegistry.shared.liveWindow(for: $0) }
+    }
+
+    private var origin: RecoveryWindowOrigin? {
+        session.workspaceID.flatMap(UUID.init(uuidString:)).flatMap { RecoveryWindowRegistry.shared.origin(for: $0) }
+            ?? session.workspaceSnapshot?.recoveryWindow
+    }
+
     private var detachedPanes: [RemoteCatalogPane] {
         session.panes.filter { pane in
             pane.recoverable
@@ -2259,55 +2574,124 @@ private struct RemoteSessionResultRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
             Button {
-                if isAttached && !detachedPanes.isEmpty {
-                    expanded.toggle()
-                } else {
+                if isAttached && ownerWindow != nil {
                     attachSession()
+                } else {
+                    expanded.toggle()
                 }
             } label: {
-                HStack(spacing: 12) {
+                HStack(spacing: RelayTheme.spacing(12)) {
                     ZStack {
-                        RoundedRectangle(cornerRadius: 10)
+                        RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10))
                             .fill(hovering ? RelayTheme.hover : RelayTheme.surface)
                             .frame(width: 42, height: 42)
                         Image(systemName: session.isUnfiled ? "lifepreserver" : "rectangle.stack")
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(RelayTheme.font(size: 15, weight: .medium))
                             .foregroundStyle(session.recoverable ? RelayTheme.mint : RelayTheme.textFaint)
                     }
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
                         Text(session.label)
-                            .font(.system(size: 13.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 13.5, weight: .medium))
                             .foregroundStyle(session.recoverable ? RelayTheme.text : RelayTheme.textMuted)
                         Text("\(session.tabCount) tab\(session.tabCount == 1 ? "" : "s") · \(session.panes.count) pane\(session.panes.count == 1 ? "" : "s")")
-                            .font(.system(size: 11))
+                            .font(RelayTheme.font(size: 11))
                             .foregroundStyle(RelayTheme.textMuted)
+                        if let origin {
+                            Text(origin.name)
+                                .font(RelayTheme.font(size: 10))
+                                .foregroundStyle(RelayTheme.textMuted)
+                        }
                     }
                     Spacer()
-                    if isAttached && !detachedPanes.isEmpty {
+                    if isAttached {
+                        Text(ownerWindow.map { "Open in \($0.title)" } ?? "Open in this workspace")
+                    } else if !detachedPanes.isEmpty {
                         Text("\(detachedPanes.count) detached")
                         Image(systemName: expanded ? "chevron.down" : "chevron.right")
                     } else {
                         Text(session.recoverable ? (session.isUnfiled ? "Recover" : "Attach") : "Unavailable")
                     }
                 }
-                .font(.system(size: 9.5, weight: .semibold))
+                .font(RelayTheme.font(size: 9.5, weight: .medium))
                 .foregroundStyle(session.recoverable ? RelayTheme.mint : RelayTheme.textFaint)
-                .padding(.horizontal, 8)
-                .frame(height: 58)
+                .padding(.horizontal, RelayTheme.spacing(8))
+                .frame(minHeight: 58)
                 .background(hovering ? RelayTheme.elevated.opacity(0.6) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                            in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(!session.recoverable)
             .onHover { hovering = $0 }
 
+            Button(expanded ? "Hide tabs and recovery options" : "Show tabs and recovery options") {
+                expanded.toggle()
+            }
+            .buttonStyle(.plain)
+            .font(RelayTheme.font(size: 10))
+            .foregroundStyle(RelayTheme.blue)
+            .padding(.leading, RelayTheme.spacing(62))
+
             if expanded {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(8)) {
+                    if let origin {
+                        Text("Original window: \(origin.name) · \(origin.lastActive.formatted(date: .abbreviated, time: .shortened))")
+                    } else {
+                        Text("Original window unknown · saved before window tracking")
+                    }
+                    if let snapshot = session.workspaceSnapshot {
+                        ForEach(snapshot.tabs, id: \.id) { tab in
+                            HStack {
+                                Image(systemName: "rectangle.split.2x1")
+                                RecoveryLayoutPreview(layout: tab.layout)
+                                    .frame(width: 70, height: 32)
+                                Text(tab.name)
+                                Spacer()
+                                Text("\(session.panes.filter { $0.tabID == tab.id.uuidString.lowercased() || $0.tabID == tab.id.uuidString }.count) panes")
+                            }
+                        }
+                    } else {
+                        ForEach(session.panes) { pane in Text(pane.title ?? "Terminal") }
+                    }
+                    HStack {
+                        Button(isAttached ? "Show session" : "Recover into this window", action: attachSession)
+                        if !isAttached { Button("Recover into new window", action: recoverInNewWindow) }
+                    }
+                }
+                .font(RelayTheme.font(size: 11))
+                .foregroundStyle(RelayTheme.textMuted)
+                .padding(.horizontal, RelayTheme.spacing(12))
+                .padding(.vertical, RelayTheme.spacing(8))
                 ForEach(detachedPanes) { pane in
                     RemotePaneRecoveryRow(pane: pane) { recoverPane(pane) }
-                        .padding(.leading, 30)
+                        .padding(.leading, RelayTheme.spacing(30))
+                }
+            }
+        }
+    }
+}
+
+private struct RecoveryLayoutPreview: View {
+    let layout: PaneLayout
+
+    var body: some View {
+        switch layout {
+        case .pane:
+            RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(2))
+                .fill(RelayTheme.blue.opacity(0.25))
+                .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(2)).stroke(RelayTheme.blue.opacity(0.6)))
+        case .split(_, let axis, let first, let second):
+            if axis == .horizontal {
+                HStack(spacing: RelayTheme.spacing(2)) {
+                    AnyView(RecoveryLayoutPreview(layout: first))
+                    AnyView(RecoveryLayoutPreview(layout: second))
+                }
+            } else {
+                VStack(spacing: RelayTheme.spacing(2)) {
+                    AnyView(RecoveryLayoutPreview(layout: first))
+                    AnyView(RecoveryLayoutPreview(layout: second))
                 }
             }
         }
@@ -2327,29 +2711,29 @@ private struct RemotePaneRecoveryRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) {
+            HStack(spacing: RelayTheme.spacing(10)) {
                 Image(systemName: "terminal")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
                     .frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
                     Text(pane.title ?? "Recovered pane")
-                        .font(.system(size: 11.5, weight: .semibold))
+                        .font(RelayTheme.font(size: 11.5, weight: .medium))
                         .foregroundStyle(RelayTheme.text)
                     Text("\(location) · \(pane.paneID.prefix(8))")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(RelayTheme.font(size: 11, design: .monospaced))
                         .foregroundStyle(RelayTheme.textMuted)
                         .lineLimit(1)
                 }
                 Spacer()
                 Text("Recover")
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.mint)
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, RelayTheme.spacing(10))
             .frame(height: 46)
             .background(hovering ? RelayTheme.elevated.opacity(0.7) : RelayTheme.surface.opacity(0.35),
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9), style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2368,46 +2752,201 @@ private struct HostResultRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
+            HStack(spacing: RelayTheme.spacing(12)) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 10)
+                    RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10))
                         .fill(hovering ? RelayTheme.hover : RelayTheme.surface)
                         .frame(width: 42, height: 42)
                     Image(systemName: symbol)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(RelayTheme.font(size: 15, weight: .medium))
                         .foregroundStyle(RelayTheme.textMuted)
                 }
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
                     Text(title)
-                        .font(.system(size: 13.5, weight: .semibold))
+                        .font(RelayTheme.font(size: 13.5, weight: .medium))
                         .foregroundStyle(RelayTheme.text)
                     Text(subtitle)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(RelayTheme.font(size: 11, weight: .medium))
                         .foregroundStyle(RelayTheme.textMuted)
                         .lineLimit(1)
                 }
                 Spacer()
                 Text(badge)
-                    .font(.system(size: 9.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(hovering ? RelayTheme.textMuted : RelayTheme.textFaint)
                 Image(systemName: "arrow.turn.down.left")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(RelayTheme.font(size: 10, weight: .medium))
                     .foregroundStyle(hovering ? RelayTheme.textMuted : RelayTheme.textFaint)
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, RelayTheme.spacing(10))
             .frame(height: 58)
-            .background(hovering ? RelayTheme.elevated : Color.clear, in: RoundedRectangle(cornerRadius: 12))
+            .background(hovering ? RelayTheme.elevated : Color.clear, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)))
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
     }
 }
 
+/// Adds contextual tools beside the terminal canvas without replacing or
+/// reparenting the canvas itself. Ghostty surfaces therefore keep their native
+/// attachment leases while this sibling appears and disappears.
+private struct WorkspaceDockLayout: View {
+    @ObservedObject var tab: TabModel
+    @ObservedObject var workspace: WorkspaceModel
+    @ObservedObject private var chrome: WorkspaceChrome
+
+    init(tab: TabModel, workspace: WorkspaceModel) {
+        self.tab = tab
+        self.workspace = workspace
+        _chrome = ObservedObject(wrappedValue: tab.chrome)
+    }
+
+    var body: some View {
+        let rightSurface = chrome.rightSurface(rLayoutEditorID: tab.rLayoutEditorID)
+        Group {
+            if let pane = workspace.activePane,
+               pane.profile.kind == .ssh,
+               pane.contentKind == .terminal,
+               case .contextDock = rightSurface,
+               chrome.destination != .rWorkspace {
+                // Claude's SSH question renderer keeps a narrow frame after a
+                // side panel closes, even when the PTY has the correct size.
+                // Float contextual tools over remote terminals so opening the
+                // dock never changes their PTY grid in the first place.
+                ZStack(alignment: .trailing) {
+                    WorkspaceCanvas(tab: tab, workspace: workspace)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    HStack(spacing: RelayTheme.spacing(0)) {
+                        WorkspaceDockDivider(chrome: chrome)
+                        WorkspaceContextDock(tab: tab, workspace: workspace, chrome: chrome)
+                            .frame(width: chrome.width)
+                    }
+                    .frame(maxHeight: .infinity)
+                    .background(RelayTheme.surface)
+                    .shadow(color: .black.opacity(0.25), radius: 12, x: -5)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+            } else {
+                HStack(spacing: RelayTheme.spacing(0)) {
+                    WorkspaceCanvas(tab: tab, workspace: workspace)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if case .contextDock = rightSurface {
+                        WorkspaceDockDivider(chrome: chrome)
+                        WorkspaceContextDock(tab: tab, workspace: workspace, chrome: chrome)
+                            .frame(width: chrome.width)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                    }
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.16), value: chrome.visible)
+    }
+}
+
+private struct WorkspaceDockDivider: View {
+    @ObservedObject var chrome: WorkspaceChrome
+    @State private var initialWidth: Double?
+
+    var body: some View {
+        Rectangle()
+            .fill(RelayTheme.line.opacity(0.7))
+            .frame(width: 6)
+            .overlay { Rectangle().fill(RelayTheme.line).frame(width: 1) }
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if initialWidth == nil { initialWidth = chrome.width }
+                    chrome.setWidth((initialWidth ?? chrome.width) - value.translation.width)
+                }
+                .onEnded { _ in initialWidth = nil })
+            .accessibilityLabel("Resize context panel")
+    }
+}
+
+private struct WorkspaceContextDock: View {
+    @ObservedObject var tab: TabModel
+    @ObservedObject var workspace: WorkspaceModel
+    @ObservedObject var chrome: WorkspaceChrome
+
+    var body: some View {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            if let anchor = chrome.anchor {
+                HStack(spacing: RelayTheme.spacing(8)) {
+                    Text(chrome.unresolved ? "Pane unavailable" : "Pane: \(anchor.profile.kind == .ssh ? anchor.profile.host : "This Mac")")
+                        .font(.caption)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if let pane = workspace.activePane, pane.id != anchor.paneID {
+                        Button("Use active pane") {
+                            let next = WorkspaceContextAnchor(paneID: pane.id, profile: pane.profile,
+                                                              directory: pane.directory)
+                            _ = chrome.useContext(next)
+                        }
+                        .disabled(chrome.hasDraft)
+                    }
+                    Toggle("Follow active pane", isOn: Binding(
+                        get: { chrome.followsActivePane },
+                        set: { enabled in
+                            chrome.setFollowing(enabled)
+                            if enabled, let pane = workspace.activePane {
+                                chrome.activeContextChanged(WorkspaceContextAnchor(
+                                    paneID: pane.id, profile: pane.profile, directory: pane.directory))
+                            }
+                        }))
+                        .toggleStyle(.checkbox)
+                        .disabled(chrome.hasDraft || chrome.unresolved)
+                }
+                .padding(.horizontal, RelayTheme.spacing(12))
+                .padding(.vertical, RelayTheme.spacing(6))
+                Divider()
+            }
+            Group {
+            if chrome.destination == .rWorkspace,
+               let id = tab.rLayoutEditorID,
+               let editor = workspace.panes[id] {
+                RLayoutResultsDock(runtime: editor.editorRuntime)
+            } else if let anchor = chrome.anchor {
+                RelayPluginToolsView(
+                    workspace: workspace,
+                    presentation: workspace.pluginPresentation(
+                        paneID: anchor.paneID, profile: anchor.profile, directory: anchor.directory),
+                    chrome: chrome,
+                    presentationStyle: .dock
+                )
+                // The presenter claim lives in view-local @State, while each
+                // pane owns a distinct retained presentation. Recreate the
+                // view when Follow Active Pane changes its anchor so the old
+                // claim is released and the new pane receives its own lease.
+                .id(anchor.paneID)
+            } else {
+                ContentUnavailableView(
+                    "No pane selected",
+                    systemImage: "rectangle.dashed",
+                    description: Text("Select a terminal pane and reopen contextual tools.")
+                )
+            }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(RelayTheme.surface)
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { workspace.dockWillTakeFocus() })
+    }
+}
+
 private struct WorkspaceCanvas: View {
+    @ObservedObject private var toolWindows = RelayToolWindowCoordinator.shared
     @ObservedObject var tab: TabModel
     @ObservedObject var workspace: WorkspaceModel
 
     var body: some View {
+        canvas.frame(minWidth: 380)
+    }
+
+    private var canvas: some View {
         ZStack(alignment: .topLeading) {
             if let zoomedID = workspace.zoomedPaneID,
                tab.allPaneIDs.contains(zoomedID),
@@ -2434,7 +2973,7 @@ private struct WorkspaceCanvas: View {
 
             if workspace.zoomedPaneID == nil {
                 GeometryReader { proxy in
-                    ForEach(tab.floatingPanes) { placement in
+                    ForEach(tab.floatingPanes.filter { !$0.isMinimized }) { placement in
                     if let pane = workspace.panes[placement.paneID] {
                         FloatingPaneWindow(
                             pane: pane,
@@ -2453,6 +2992,7 @@ private struct WorkspaceCanvas: View {
                             },
                             zoom: { workspace.togglePaneZoom(pane.id) },
                             dock: { workspace.dockFloatingPane(pane.id) },
+                            minimize: { workspace.minimizeFloatingPane(pane.id) },
                             rename: { workspace.beginRenamePane(pane.id) },
                             terminate: { workspace.requestTerminatePane(pane.id) },
                             close: {
@@ -2463,10 +3003,110 @@ private struct WorkspaceCanvas: View {
                         .zIndex(Double(tab.floatingPanes.firstIndex(where: { $0.paneID == pane.id }) ?? 0) + 10)
                     }
                 }
+                .onAppear { tab.canvasSize = proxy.size }
+                .onChange(of: proxy.size) { _, size in tab.canvasSize = size }
                 }
             }
         }
+        .overlay {
+            if let id = toolWindows.embeddedAgentPaneID, tab.allPaneIDs.contains(id),
+               let pane = workspace.panes[id] {
+                GeometryReader { geometry in
+                    FloatingAgentConversation(pane: pane, bounds: geometry.size,
+                        terminal: { workspace.selectPane(id); pane.focus() },
+                        close: { toolWindows.embeddedAgentPaneID = nil })
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if tab.floatingPanes.contains(where: \.isMinimized) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: RelayTheme.spacing(6)) {
+                        ForEach(tab.floatingPanes.filter(\.isMinimized)) { placement in
+                            if let pane = workspace.panes[placement.paneID] {
+                                Button { workspace.selectPane(pane.id) } label: {
+                                    Label(pane.customName ?? (pane.kind == .shell ? pane.displayName : pane.harnessLabel), systemImage: "arrow.up.forward.square")
+                                        .font(RelayTheme.font(size: 11, weight: .medium))
+                                        .lineLimit(1)
+                                        .padding(.horizontal, RelayTheme.spacing(10)).padding(.vertical, RelayTheme.spacing(6))
+                                        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)))
+                                }
+                                .buttonStyle(.plain)
+                                .help("Restore \(pane.displayName) — session is still running")
+                                .accessibilityLabel("Restore minimized pane \(pane.kind == .shell ? pane.displayName : pane.harnessLabel)")
+                            }
+                        }
+                    }.padding(RelayTheme.spacing(6))
+                }.background(RelayTheme.canvas)
+            }
+        }
         .clipped()
+    }
+}
+
+private struct FloatingAgentConversation: View {
+    @ObservedObject var pane: PaneModel
+    let bounds: CGSize
+    let terminal: () -> Void
+    let close: () -> Void
+    @State private var origin = CGPoint(x: 24, y: 24)
+    @State private var size = CGSize(width: 740, height: 620)
+    @GestureState private var movement: CGSize = .zero
+    @GestureState private var resizing: CGSize = .zero
+    private var width: CGFloat { min(max(360, size.width + resizing.width), max(1, bounds.width - 16)) }
+    private var height: CGFloat { min(max(320, size.height + resizing.height), max(1, bounds.height - 16)) }
+    private var x: CGFloat { min(max(8, origin.x + movement.width), max(8, bounds.width - width - 8)) }
+    private var y: CGFloat { min(max(8, origin.y + movement.height), max(8, bounds.height - height - 8)) }
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label("Conversation · " + pane.displayName, systemImage: "text.bubble")
+                    .font(RelayTheme.font(size: 12, weight: .medium)).lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("relay.agent.embedded." + pane.id.uuidString)
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture().updating($movement) { value, offset, _ in offset = value.translation }
+                        .onEnded { value in
+                            origin = CGPoint(x: min(max(8, origin.x + value.translation.width), max(8, bounds.width - width - 8)),
+                                             y: min(max(8, origin.y + value.translation.height), max(8, bounds.height - height - 8)))
+                        })
+                Button(action: terminal) { Image(systemName: "terminal") }.help("Return to the original terminal")
+                    .accessibilityIdentifier("relay.agent.embedded.terminal")
+                Button(action: close) { Image(systemName: "xmark") }.help("Close conversation; keep the agent running")
+                    .accessibilityIdentifier("relay.agent.embedded.close")
+            }
+            .buttonStyle(.plain).padding(10).background(RelayTheme.elevated)
+            RelayAgentConversationHostView(pane: pane).id(pane.id)
+        }
+        .frame(width: width, height: height)
+        .background(RelayTheme.canvas)
+        .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
+        .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)).stroke(RelayTheme.line))
+        .overlay(alignment: .bottomTrailing) {
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(RelayTheme.font(size: 11)).padding(8).contentShape(Rectangle())
+                .gesture(DragGesture().updating($resizing) { value, offset, _ in offset = value.translation }
+                    .onEnded { value in
+                        size = CGSize(width: min(max(360, size.width + value.translation.width), max(1, bounds.width - 16)),
+                                      height: min(max(320, size.height + value.translation.height), max(1, bounds.height - 16)))
+                    })
+                .accessibilityLabel("Resize agent conversation")
+        }
+        .shadow(color: .black.opacity(0.25), radius: 16, y: 6)
+        .offset(x: x, y: y)
+    }
+}
+
+private struct RLayoutResultsDock: View {
+    @ObservedObject var runtime: RemoteEditorRuntime
+    var body: some View {
+        if runtime.showsRResults, let scope = runtime.rResultsScope {
+            RWorkspaceResults(scope: scope, runtime: runtime)
+                .id(scope.paneID.uuidString + ":" + scope.root)
+        } else {
+            Button("Show results") { runtime.showsRResults = true }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 }
 
@@ -2480,6 +3120,7 @@ private struct FloatingPaneWindow: View {
     let resize: (Double, Double) -> Void
     let zoom: () -> Void
     let dock: () -> Void
+    let minimize: () -> Void
     let rename: () -> Void
     let terminate: () -> Void
     let close: () -> Void
@@ -2527,7 +3168,7 @@ private struct FloatingPaneWindow: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: RelayTheme.spacing(0)) {
             floatingTitleBar
             Rectangle().fill(RelayTheme.line.opacity(0.85)).frame(height: 1)
             PaneView(
@@ -2544,9 +3185,9 @@ private struct FloatingPaneWindow: View {
         }
         .frame(width: width, height: height)
         .background(RelayTheme.canvas)
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(13), style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
+            RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(13), style: .continuous)
                 .stroke(isActive ? RelayTheme.accent.opacity(0.45) : RelayTheme.line.opacity(0.75), lineWidth: 1)
                 .allowsHitTesting(false)
         }
@@ -2563,21 +3204,21 @@ private struct FloatingPaneWindow: View {
     }
 
     private var floatingTitleBar: some View {
-        HStack(spacing: 9) {
-            HStack(spacing: 9) {
+        HStack(spacing: RelayTheme.spacing(9)) {
+            HStack(spacing: RelayTheme.spacing(9)) {
                 Capsule()
                     .fill(isActive ? RelayTheme.accent : RelayTheme.textFaint)
                     .frame(width: 16, height: 3)
                 Text(pane.displayName)
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                     .lineLimit(1)
                     .onTapGesture(count: 2) { rename() }
                 Text(pane.profile.kind == .ssh ? pane.profile.host : "This Mac")
-                    .font(.system(size: 9.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
+                    .padding(.horizontal, RelayTheme.spacing(7))
+                    .padding(.vertical, RelayTheme.spacing(3))
                     .background(RelayTheme.surface, in: Capsule())
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -2616,7 +3257,7 @@ private struct FloatingPaneWindow: View {
                 Capsule()
                     .fill(titleFocused ? RelayTheme.textMuted.opacity(0.7) : Color.clear)
                     .frame(height: 1)
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, RelayTheme.spacing(8))
                     .accessibilityHidden(true)
             }
             .accessibilityLabel("Move floating pane \(pane.displayName)")
@@ -2633,10 +3274,21 @@ private struct FloatingPaneWindow: View {
                 move(Double(baseOriginX), Double(min(bounds.height - baseHeight - edgeInset, baseOriginY + 20))); return .handled
             }
 
-            HStack(spacing: 0) {
+            HStack(spacing: RelayTheme.spacing(0)) {
+                Button(action: minimize) {
+                    Image(systemName: "minus")
+                        .font(RelayTheme.font(size: 9, weight: .medium))
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RelayTheme.textMuted)
+                .focusEffectDisabled()
+                .help("Minimize pane — keep session running")
+                .accessibilityLabel("Minimize floating pane")
                 Button(action: dock) {
                     Image(systemName: "rectangle.portrait.and.arrow.right")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(RelayTheme.font(size: 9, weight: .medium))
                         .frame(width: 24, height: 24)
                         .contentShape(Rectangle())
                 }
@@ -2648,7 +3300,7 @@ private struct FloatingPaneWindow: View {
 
                 Button(action: close) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(RelayTheme.font(size: 9, weight: .medium))
                         .frame(width: 24, height: 24)
                         .contentShape(Rectangle())
                 }
@@ -2660,7 +3312,7 @@ private struct FloatingPaneWindow: View {
             }
             .frame(height: 24)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, RelayTheme.spacing(10))
         .frame(height: 36)
         .background(RelayTheme.elevated)
     }
@@ -2689,7 +3341,7 @@ private struct FloatingPaneWindow: View {
                 Circle()
                     .fill(resizeFocused ? RelayTheme.textMuted.opacity(0.8) : Color.clear)
                     .frame(width: 4, height: 4)
-                    .padding(3)
+                    .padding(RelayTheme.spacing(3))
                     .accessibilityHidden(true)
             }
             .accessibilityLabel("Resize floating pane")
@@ -2750,7 +3402,62 @@ private struct SplitPaneTree: View {
     }
 }
 
+private struct PaneLinkSelectionBar: View {
+    @ObservedObject var workspace: WorkspaceModel
+    @ObservedObject var selection: PaneLinkSelection
+    var body: some View {
+        Group {
+            if selection.active || selection.resultMessage != nil {
+                HStack {
+                    if selection.pairMode || selection.resultMessage != nil {
+                        PaneLinkPairControls(workspace: workspace, selection: selection)
+                    } else {
+                        Label("Select panes to link", systemImage: "link")
+                        Text("\(selection.paneIDs.count) selected · up to 8").foregroundStyle(.secondary)
+                        Toggle("Across app", isOn: Binding(
+                            get: { selection.acrossApp },
+                            set: { selection.setAcrossApp($0) }
+                        ))
+                        .toggleStyle(.checkbox)
+                        .help("By default, panes in this tab and window are available. Turn this on to include panes anywhere in Relay.")
+                    }
+                    Spacer()
+                    Button { selection.cancel() } label: { Image(systemName: "xmark").frame(width: 28, height: 28) }
+                        .buttonStyle(.plain).help("Cancel linking · Escape").accessibilityLabel("Cancel linking")
+                        .keyboardShortcut(.cancelAction)
+                    if selection.active && !selection.pairMode {
+                    Button { selection.reviewing = true } label: {
+                        Image(systemName: "link.badge.plus")
+                            .frame(width: 28)
+                            .font(RelayTheme.font(size: 11, weight: .medium))
+                            .padding(.horizontal, RelayTheme.spacing(10))
+                            .frame(height: 28)
+                    }
+                    .buttonStyle(RelayPrimaryButtonStyle())
+                    .help("Link selected panes")
+                    .accessibilityLabel("Link selected panes")
+                        .disabled(selection.paneIDs.count < 2)
+                    }
+                }.font(RelayTheme.font(size: 11.5)).padding(.horizontal, RelayTheme.spacing(12)).padding(.vertical, RelayTheme.spacing(4)).background(RelayTheme.surface)
+            }
+        }
+        .sheet(isPresented: $selection.reviewing, onDismiss: { selection.cancel() }) {
+            PeerNetworkTopologyView(workspace: workspace, connectionOnly: true,
+                startingTabID: selection.startingTabID,
+                initiallyAcrossApp: selection.acrossApp,
+                requestedPaneIDs: selection.paneIDs, manage: {})
+        }
+        .onChange(of: selection.active) { _, active in
+            workspace.updateTerminalFocusOwnership()
+            if !active, let id = workspace.activePaneID { workspace.panes[id]?.runtime.focus() }
+        }
+    }
+}
+
 private struct PaneView: View {
+    @ObservedObject private var toolWindows = RelayToolWindowCoordinator.shared
+    @EnvironmentObject private var linkSelection: PaneLinkSelection
+    @Environment(\.networkCoverActive) private var networkCoverActive
     @ObservedObject var pane: PaneModel
     @ObservedObject private var preferences = RelayPreferences.shared
     let isActive: Bool
@@ -2764,23 +3471,42 @@ private struct PaneView: View {
     var close: (() -> Void)? = nil
     var isFloating = false
     var isZoomed = false
+    var inToolWindow = false
     @State private var paneSize: CGSize = .zero
+    @State private var linkHovered = false
+    @State private var richContentPresented = false
+    @State private var sessionEndedNoticeDismissed = false
     @StateObject private var dropPreview = PaneDropPreviewModel()
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: RelayTheme.spacing(0)) {
             paneHeader
             ZStack {
-                if pane.contentKind == .editor {
+                if toolWindows.rPaneIDs.contains(pane.id) && !inToolWindow {
+                    VStack(spacing: RelayTheme.spacing(10)) {
+                        Image(systemName: "macwindow")
+                        Text("Open in RStudio workspace")
+                        Button("Show window") { toolWindows.focusR(paneID: pane.id) }
+                        Button("Return to tab") { toolWindows.returnRPaneToTab(paneID: pane.id) }
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .foregroundStyle(RelayTheme.textMuted)
+                } else if pane.contentKind == .editor {
                     QuickEditorPane(pane: pane)
                         .id(pane.id)
                 } else {
-                    TerminalSurface(pane: pane)
+                    TerminalSurface(pane: pane, covered: networkCoverActive || pane.nativeConversationVisible)
                         .equatable()
                         // A terminal backend is immutable after its NSView is created.
                         // Key the representable by the remote session so switching tabs
                         // cannot reuse a local-shell surface for an SSH pane.
                         .id(pane.id)
+                        .overlay {
+                            if pane.nativeConversationVisible {
+                                RelayAgentConversationHostView(pane: pane)
+                                    .background(RelayTheme.canvas)
+                                    .accessibilityIdentifier("relay.agent.native-pane")
+                            }
+                        }
                 }
                 if pane.connectionState == .connecting && !pane.hasTerminalSnapshot {
                     ConnectingOverlay(host: pane.profile.host, contentKind: pane.contentKind)
@@ -2792,16 +3518,20 @@ private struct PaneView: View {
                         waitingForNetwork: pane.connectionState.isWaitingForNetwork
                     )
                         .frame(maxHeight: .infinity, alignment: .top)
-                        .padding(12)
+                        .padding(RelayTheme.spacing(12))
                 } else if pane.isRestoringTerminal && !pane.hasTerminalSnapshot {
                     RestoringTerminalOverlay(host: pane.profile.host)
-                } else if let exitCode = pane.remoteExitCode {
+                } else if let exitCode = pane.remoteExitCode, !sessionEndedNoticeDismissed {
                     SessionEndedOverlay(
                         exitCode: exitCode,
-                        restart: { pane.restartRuntime() },
-                        detach: {
+                        restart: {
+                            NotificationCenter.default.post(name: .relayRestartExitedPane, object: pane.id)
+                        },
+                        dismiss: { sessionEndedNoticeDismissed = true },
+                        close: {
                             select()
-                            NotificationCenter.default.post(name: .relayClosePane, object: pane.id)
+                            if let close { close() }
+                            else { NotificationCenter.default.post(name: .relayClosePane, object: pane.id) }
                         }
                     )
                 } else if let message = pane.connectionState.errorMessage {
@@ -2817,7 +3547,7 @@ private struct PaneView: View {
                             } : nil
                     )
                         .frame(maxHeight: .infinity, alignment: .top)
-                        .padding(12)
+                        .padding(RelayTheme.spacing(12))
                 }
                 if preferences.artifactPresentation == .preview,
                    let artifact = pane.artifacts.last {
@@ -2825,7 +3555,7 @@ private struct PaneView: View {
                         pane.dismissArtifact(artifact.id)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                    .padding(12)
+                    .padding(RelayTheme.spacing(12))
                     .zIndex(100)
                 }
             }
@@ -2837,18 +3567,24 @@ private struct PaneView: View {
                 .frame(height: min(300, max(120, paneSize.height * 0.4)))
             }
         }
+        .onChange(of: pane.richContentRequested) { _, requested in
+            if requested { richContentPresented = true; pane.richContentRequested = false }
+        }
+        .onChange(of: richContentPresented) { _, presented in
+            if presented { RelayRichContentWindow.shared.show(pane: pane); richContentPresented = false }
+        }
         .background(RelayTheme.canvas)
         .overlay {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
+            RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(2), style: .continuous)
                 .stroke(RelayTheme.line.opacity(0.55), lineWidth: 1)
                 .allowsHitTesting(false)
         }
         .overlay(alignment: .leading) {
-            if isActive {
+            if isActive && !linkSelection.active {
                 Capsule()
                     .fill(RelayTheme.accent)
                     .frame(width: 2, height: 28)
-                    .padding(.leading, 1)
+                    .padding(.leading, RelayTheme.spacing(1))
                     .allowsHitTesting(false)
             }
         }
@@ -2856,6 +3592,42 @@ private struct PaneView: View {
             if let placement = dropPreview.placement {
                 PaneDropPreview(placement: placement)
                     .allowsHitTesting(false)
+            }
+        }
+        .overlay {
+            if linkSelection.active && !linkSelection.pairMode && linkSelection.canSelect(pane.id) {
+                Button {
+                    if pane.contentKind == .terminal { linkSelection.toggle(pane.id) }
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(2), style: .continuous)
+                            .fill(Color.accentColor.opacity(linkSelection.paneIDs.contains(pane.id) ? 0.035 : 0))
+                        RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(2), style: .continuous)
+                            .strokeBorder(linkSelection.paneIDs.contains(pane.id) ? Color.accentColor : Color.secondary.opacity(linkHovered ? 0.5 : 0),
+                                          lineWidth: linkSelection.paneIDs.contains(pane.id) ? 1.5 : 1)
+                        if linkSelection.paneIDs.contains(pane.id) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(RelayTheme.font(size: 13, weight: .medium))
+                                .foregroundStyle(Color.accentColor)
+                                .padding(RelayTheme.spacing(3)).background(RelayTheme.canvas, in: Circle())
+                                .padding(.top, RelayTheme.spacing(5)).padding(.trailing, RelayTheme.spacing(8))
+                        }
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                    .onHover { linkHovered = $0 && pane.contentKind == .terminal && linkSelection.canSelect(pane.id) }
+                    .help(pane.contentKind == .terminal ? "Click to select or deselect this session" : "Only terminal panes can be linked")
+                    .accessibilityLabel("\(linkSelection.paneIDs.contains(pane.id) ? "Deselect" : "Select") session in \(pane.displayName)")
+                    .accessibilityValue(pane.contentKind != .terminal ? "Unavailable" : (linkSelection.paneIDs.contains(pane.id) ? "Selected" : "Not selected"))
+            }
+        }
+        .onChange(of: linkSelection.active) { _, _ in linkHovered = false }
+        .onChange(of: pane.nativeConversationVisible) { _, visible in
+            if !visible {
+                pane.runtime.conversationComposerOwnsFocus = false
+                Task { @MainActor in
+                    await Task.yield()
+                    if !pane.nativeConversationVisible { pane.focus() }
+                }
             }
         }
         .onGeometryChange(for: CGSize.self) { proxy in proxy.size } action: { paneSize = $0 }
@@ -3018,20 +3790,20 @@ private struct PaneDropPreview: View {
             let rect = previewRect(in: proxy.size)
             ZStack(alignment: .topLeading) {
                 RelayTheme.canvas.opacity(0.18)
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(5), style: .continuous)
                     .fill(RelayTheme.blue.opacity(0.16))
                     .overlay {
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(5), style: .continuous)
                             .stroke(RelayTheme.blue.opacity(0.9), lineWidth: 2)
                     }
                     .frame(width: rect.width, height: rect.height)
                     .offset(x: rect.minX, y: rect.minY)
 
                 Text(label)
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .tracking(0.7)
                     .foregroundStyle(RelayTheme.text)
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, RelayTheme.spacing(8))
                     .frame(height: 22)
                     .background(RelayTheme.elevated.opacity(0.92), in: Capsule())
                     .position(x: rect.midX, y: rect.midY)
@@ -3082,13 +3854,14 @@ private struct QuickEditorContent: View {
     @ObservedObject private var preferences = RelayPreferences.shared
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: RelayTheme.spacing(0)) {
             if runtime.navigatorVisible {
                 EditorNavigator(runtime: runtime)
                     .frame(width: 210)
                 Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(width: 1)
             }
-            VStack(spacing: 0) {
+            HSplitView {
+              VStack(spacing: RelayTheme.spacing(0)) {
                 editorToolbar
                 Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
                 MonacoEditorSurface(
@@ -3098,19 +3871,48 @@ private struct QuickEditorContent: View {
                         fontSize: preferences.fontSize
                     )
                 )
+                .overlay {
+                    if runtime.currentPath == nil {
+                        ZStack {
+                            RelayTheme.canvas
+                            Text("Choose a file to edit or review")
+                                .font(RelayTheme.font(size: 12))
+                                .foregroundStyle(RelayTheme.textMuted)
+                        }
+                        .allowsHitTesting(false)
+                    }
+                }
                 editorStatus
+              }.frame(minWidth: 220)
+              if runtime.showsRResults, !runtime.externalRResults, let scope = runtime.rResultsScope {
+                  RWorkspaceResults(scope: scope, runtime: runtime)
+                      .id(scope.paneID.uuidString + ":" + scope.root)
+                      .frame(minWidth: 320, idealWidth: 380)
+              }
             }
         }
         .background(RelayTheme.canvas)
     }
 
     private var editorToolbar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: RelayTheme.spacing(8)) {
+            Menu {
+                if runtime.recentDocuments.isEmpty { Text("No recent documents") }
+                ForEach(runtime.recentDocuments, id: \.id) { document in
+                    Button(document.path + (document.dirty ? " — recovered draft" : "")) {
+                        runtime.reopenRecovered(document)
+                    }
+                }
+            } label: { Image(systemName: "clock.arrow.circlepath") }
+            .menuStyle(.borderlessButton).fixedSize()
+            .help("Reopen a recent document or recovered draft")
+            .accessibilityLabel("Recent documents")
+            .onAppear { runtime.refreshRecentDocuments() }
             Button {
                 runtime.navigatorVisible.toggle()
             } label: {
                 Image(systemName: "sidebar.left")
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(RelayTheme.font(size: 10.5, weight: .medium))
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
@@ -3119,7 +3921,7 @@ private struct QuickEditorContent: View {
 
             if let path = runtime.currentPath {
                 Text(TerminalPathSyntax.lastComponent(path))
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                     .lineLimit(1)
                 if runtime.isDirty {
@@ -3127,48 +3929,70 @@ private struct QuickEditorContent: View {
                 }
             } else {
                 Text("Choose a file")
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
             }
             Spacer(minLength: 8)
             if runtime.isBusy { ProgressView().controlSize(.mini).tint(RelayTheme.accent) }
-            Button(runtime.isDiff ? "Edit" : "Changes") { runtime.toggleDiff() }
+            if runtime.canRunR {
+                RelayIconAction(runtime.showsRResults ? "Hide results" : "Show results", symbol: "sidebar.right") {
+                    runtime.showsRResults.toggle()
+                    if runtime.showsRResults { runtime.navigatorVisible = false }
+                }
+                    .buttonStyle(.plain)
+                RelayIconAction("Run R selection or current line · ⌘Enter", symbol: "play.fill") { runtime.requestRunSelection() }
+                    .buttonStyle(.plain)
+                    .help("Run selection or current line in the linked R console · ⌘Enter")
+                    .accessibilityLabel("Run R selection or current line")
+                RelayIconAction("Run full R file · ⇧⌘Enter", symbol: "play.rectangle") { runtime.requestRunFile() }
+                    .buttonStyle(.plain)
+                    .help("Run the complete editor file, including unsaved edits, in the linked R console · ⇧⌘Enter")
+                    .accessibilityLabel("Run full R file")
+                RelayIconAction("Format R document", symbol: "text.alignleft") { runtime.requestEditorAction("format") }
+                    .disabled(runtime.rEditorToolBusy || runtime.rSession == nil)
+                RelayIconAction("Check R code", symbol: "checkmark.circle") { runtime.requestEditorAction("lint") }
+                    .disabled(runtime.rEditorToolBusy || runtime.rSession == nil)
+                RelayIconAction("Open R help for selection or word", symbol: "questionmark.circle") { runtime.requestEditorAction("help") }
+                    .disabled(runtime.rEditorToolBusy || runtime.rSession == nil)
+            }
+            RelayIconAction("Undo · ⌘Z", symbol: "arrow.uturn.backward") { runtime.undo(redo: false) }
+                .disabled(runtime.currentPath == nil)
+            RelayIconAction("Redo · ⇧⌘Z", symbol: "arrow.uturn.forward") { runtime.undo(redo: true) }
+                .disabled(runtime.currentPath == nil)
+            RelayIconAction(runtime.isDiff ? "Return to editor" : "Show changes", symbol: runtime.isDiff ? "pencil" : "rectangle.split.2x1") { runtime.toggleDiff() }
                 .buttonStyle(.plain)
-                .font(.system(size: 10.5, weight: .medium))
+                .font(RelayTheme.font(size: 10.5, weight: .medium))
                 .foregroundStyle(runtime.currentPath == nil ? RelayTheme.textFaint : RelayTheme.textMuted)
                 .disabled(runtime.currentPath == nil)
-            Button("Save") { runtime.requestSave() }
+            RelayIconAction("Save · ⌘S", symbol: "square.and.arrow.down") { runtime.requestSave() }
                 .buttonStyle(.plain)
-                .font(.system(size: 10.5, weight: .semibold))
+                .font(RelayTheme.font(size: 10.5, weight: .medium))
                 .foregroundStyle(runtime.isDirty ? RelayTheme.text : RelayTheme.textMuted)
-                .padding(.horizontal, 9)
-                .frame(height: 24)
-                .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 7))
-                .disabled(runtime.currentPath == nil)
+                .disabled(runtime.currentPath == nil || !runtime.isDirty || runtime.isBusy)
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, RelayTheme.spacing(8))
         .frame(height: 32)
         .background(RelayTheme.canvas)
     }
 
     private var editorStatus: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: RelayTheme.spacing(8)) {
             if let error = runtime.operationError {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(RelayTheme.coral)
                 Text(error).foregroundStyle(RelayTheme.coral)
             } else {
-                Text(runtime.status)
+                Text(runtime.rLastRequest == nil ? runtime.status : runtime.rSessionStatus)
                     .foregroundStyle(RelayTheme.textFaint)
             }
             Spacer()
             if runtime.isDiff { Text("Diff") }
             Text("UTF-8")
         }
-        .font(.system(size: 9.5, weight: .medium))
+        .font(RelayTheme.font(size: 9.5, weight: .medium))
         .foregroundStyle(RelayTheme.textFaint)
         .lineLimit(1)
-        .padding(.horizontal, 9)
+        .padding(.horizontal, RelayTheme.spacing(9))
         .frame(height: 23)
         .background(RelayTheme.surface.opacity(0.7))
     }
@@ -3176,76 +4000,92 @@ private struct QuickEditorContent: View {
 
 private struct EditorNavigator: View {
     @ObservedObject var runtime: RemoteEditorRuntime
-    @State private var query = ""
+
+    private var query: String { runtime.searchQuery }
+    private var includeUntracked: Bool { runtime.includeUntrackedFiles }
 
     private var visibleEntries: [RemoteFileEntry] {
         guard !query.isEmpty else { return runtime.entries }
-        return runtime.entries.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        return runtime.searchResults
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 7) {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            HStack(spacing: RelayTheme.spacing(7)) {
                 Button { runtime.goUp() } label: {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(RelayTheme.font(size: 9, weight: .medium))
                         .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(runtime.directoryPath == runtime.workspacePath ? RelayTheme.textFaint : RelayTheme.textMuted)
                 .disabled(runtime.directoryPath == runtime.workspacePath)
                 Text(runtime.directoryPath.isEmpty ? "Files" : TerminalPathSyntax.lastComponent(runtime.directoryPath))
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                     .lineLimit(1)
                 Spacer()
             }
-            .padding(.horizontal, 7)
+            .padding(.horizontal, RelayTheme.spacing(7))
             .frame(height: 31)
 
-            HStack(spacing: 6) {
+            HStack(spacing: RelayTheme.spacing(6)) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 9.5))
+                    .font(RelayTheme.font(size: 9.5))
                     .foregroundStyle(RelayTheme.textFaint)
-                TextField("Filter files", text: $query)
+                TextField("Search repository files", text: $runtime.searchQuery)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 10.5))
+                    .font(RelayTheme.font(size: 10.5))
                     .foregroundStyle(RelayTheme.text)
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, RelayTheme.spacing(8))
             .frame(height: 27)
-            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 7))
-            .padding(.horizontal, 7)
-            .padding(.bottom, 6)
+            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7)))
+            .padding(.horizontal, RelayTheme.spacing(7))
+            .padding(.bottom, RelayTheme.spacing(6))
 
             Rectangle().fill(RelayTheme.line.opacity(0.4)).frame(height: 1)
+            if !query.isEmpty {
+                Toggle("Include untracked files", isOn: $runtime.includeUntrackedFiles)
+                    .toggleStyle(.checkbox)
+                    .font(RelayTheme.font(size: 10.5))
+                    .padding(.horizontal, RelayTheme.spacing(7))
+                    .help("Also search files not tracked by Git; discovery may be slower on shared storage.")
+                Text(runtime.searchStatus)
+                    .font(RelayTheme.font(size: 11))
+                    .foregroundStyle(RelayTheme.textMuted)
+                    .padding(RelayTheme.spacing(7))
+            }
             ScrollView {
-                LazyVStack(spacing: 1) {
+                LazyVStack(spacing: RelayTheme.spacing(1)) {
                     ForEach(visibleEntries) { entry in
                         Button { runtime.openEntry(entry) } label: {
-                            HStack(spacing: 7) {
+                            HStack(spacing: RelayTheme.spacing(7)) {
                                 Image(systemName: entry.directory ? "folder" : fileSymbol(entry.name))
-                                    .font(.system(size: 10, weight: .medium))
+                                    .font(RelayTheme.font(size: 10, weight: .medium))
                                     .foregroundStyle(entry.directory ? RelayTheme.blue : RelayTheme.textMuted)
                                     .frame(width: 13)
                                 Text(entry.name)
-                                    .font(.system(size: 10.5, weight: .medium))
+                                    .font(RelayTheme.font(size: 11, weight: .medium))
                                     .foregroundStyle(RelayTheme.textMuted)
                                     .lineLimit(1)
                                 Spacer(minLength: 0)
                             }
-                            .padding(.horizontal, 8)
+                            .padding(.horizontal, RelayTheme.spacing(8))
                             .frame(height: 25)
                             .background(runtime.currentPath == entry.path ? RelayTheme.surface : Color.clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
+                                        in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)))
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(5)
+                .padding(RelayTheme.spacing(5))
             }
         }
         .background(RelayTheme.canvas)
+        .task(id: runtime.workspacePath + "\u{0}" + query + "\u{0}" + String(includeUntracked)) {
+            await runtime.searchFiles(query, includeUntracked: includeUntracked)
+        }
     }
 
     private func fileSymbol(_ name: String) -> String {
@@ -3334,17 +4174,17 @@ private struct ArtifactPreview: View {
     private var displayedZoom: CGFloat { min(6, max(1, imageZoom * pinchZoom)) }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                HStack(spacing: 7) {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            HStack(spacing: RelayTheme.spacing(8)) {
+                HStack(spacing: RelayTheme.spacing(7)) {
                     Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(RelayTheme.font(size: 9, weight: .medium))
                         .foregroundStyle(RelayTheme.textFaint)
                     Image(systemName: "photo")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(RelayTheme.font(size: 10, weight: .medium))
                         .foregroundStyle(RelayTheme.blue)
                     Text(artifact.filename)
-                        .font(.system(size: 10.5, weight: .medium))
+                        .font(RelayTheme.font(size: 11, weight: .medium))
                         .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -3366,12 +4206,12 @@ private struct ArtifactPreview: View {
                 }
                 .help("Drag to move · double-click to reset")
 
-                HStack(spacing: 0) {
+                HStack(spacing: RelayTheme.spacing(0)) {
                     Button {
                         setZoom(imageZoom - 0.25)
                     } label: {
                         Image(systemName: "minus")
-                            .font(.system(size: 9.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 9.5, weight: .medium))
                             .frame(
                                 width: FloatingArtifactChromeMetrics.controlLength,
                                 height: FloatingArtifactChromeMetrics.controlLength
@@ -3388,7 +4228,7 @@ private struct ArtifactPreview: View {
                         resetImageView()
                     } label: {
                         Text("\(Int((imageZoom * 100).rounded()))%")
-                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                             .frame(width: 38, height: FloatingArtifactChromeMetrics.controlLength)
                             .contentShape(Rectangle())
                     }
@@ -3401,7 +4241,7 @@ private struct ArtifactPreview: View {
                         setZoom(imageZoom + 0.25)
                     } label: {
                         Image(systemName: "plus")
-                            .font(.system(size: 9.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 9.5, weight: .medium))
                             .frame(
                                 width: FloatingArtifactChromeMetrics.controlLength,
                                 height: FloatingArtifactChromeMetrics.controlLength
@@ -3416,7 +4256,7 @@ private struct ArtifactPreview: View {
 
                     Button(action: dismiss) {
                         Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(RelayTheme.font(size: 9, weight: .medium))
                             .frame(
                                 width: FloatingArtifactChromeMetrics.controlLength,
                                 height: FloatingArtifactChromeMetrics.controlLength
@@ -3435,7 +4275,9 @@ private struct ArtifactPreview: View {
             .frame(height: FloatingArtifactChromeMetrics.titleBarHeight)
             .background(RelayTheme.elevated)
 
-            if let image = artifact.image {
+            if artifact.isPDF {
+                RelayPDFPreview(data: artifact.data).frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let image = artifact.image {
                 GeometryReader { proxy in
                     Image(nsImage: image)
                         .resizable()
@@ -3471,8 +4313,8 @@ private struct ArtifactPreview: View {
         }
         .frame(width: displayedSize.width, height: displayedSize.height)
         .background(RelayTheme.elevated)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.55)) }
+        .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line.opacity(0.55)) }
         .shadow(color: .black.opacity(0.3), radius: 16, y: 7)
         .overlay {
             ZStack {
@@ -3532,12 +4374,12 @@ private struct ArtifactPreview: View {
             .focused($focusedResizeCorner, equals: corner)
             .focusEffectDisabled()
             .overlay {
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(5), style: .continuous)
                     .stroke(
                         focusedResizeCorner == corner ? RelayTheme.textMuted.opacity(0.65) : Color.clear,
                         lineWidth: 1
                     )
-                    .padding(6)
+                    .padding(RelayTheme.spacing(6))
                     .accessibilityHidden(true)
             }
             .accessibilityAdjustableAction { direction in
@@ -3586,17 +4428,17 @@ private struct InlineArtifactView: View {
     let dismiss: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 7) {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            HStack(spacing: RelayTheme.spacing(7)) {
                 Image(systemName: "photo")
                     .foregroundStyle(RelayTheme.blue)
                 Text(artifact.filename)
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 Button(action: dismiss) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(RelayTheme.font(size: 9, weight: .medium))
                         .frame(width: 24, height: 24)
                 }
                 .buttonStyle(.plain)
@@ -3604,10 +4446,12 @@ private struct InlineArtifactView: View {
                 .focusEffectDisabled()
                 .accessibilityLabel("Close inline image")
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, RelayTheme.spacing(10))
             .frame(height: 32)
 
-            if let image = artifact.image {
+            if artifact.isPDF {
+                RelayPDFPreview(data: artifact.data).frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let image = artifact.image {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
@@ -3626,41 +4470,52 @@ private struct InlineArtifactView: View {
 private struct SessionEndedOverlay: View {
     let exitCode: Int
     let restart: () -> Void
-    let detach: () -> Void
+    let dismiss: () -> Void
+    let close: () -> Void
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: RelayTheme.spacing(12)) {
             Image(systemName: "checkmark.circle")
-                .font(.system(size: 18, weight: .medium))
+                .font(RelayTheme.font(size: 18, weight: .medium))
                 .foregroundStyle(RelayTheme.textMuted)
             Text("Remote process ended")
-                .font(.system(size: 12.5, weight: .semibold))
+                .font(RelayTheme.font(size: 12.5, weight: .medium))
                 .foregroundStyle(RelayTheme.text)
-            Text("Exit code \(exitCode)")
-                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+            Text(exitCode == -1 ? "Process terminated" : "Exit code \(exitCode)")
+                .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(RelayTheme.textMuted)
-            HStack(spacing: 8) {
-                Button("Detach", action: detach)
+            HStack(spacing: RelayTheme.spacing(8)) {
+                Button("Close pane", action: close)
                     .buttonStyle(.plain)
                     .foregroundStyle(RelayTheme.textMuted)
-                    .padding(.horizontal, 11)
+                    .padding(.horizontal, RelayTheme.spacing(11))
                     .frame(height: 28)
-                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 7))
+                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7)))
                 Button("Restart", action: restart)
                     .buttonStyle(.plain)
                     .foregroundStyle(RelayTheme.canvas)
-                    .padding(.horizontal, 12)
+                    .padding(.horizontal, RelayTheme.spacing(12))
                     .frame(height: 28)
-                    .background(RelayTheme.blue, in: RoundedRectangle(cornerRadius: 7))
+                    .background(RelayTheme.blue, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7)))
             }
+            Button("Dismiss", action: dismiss)
+                .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
+                .foregroundStyle(RelayTheme.textMuted)
+            Text("Restart opens a new shell. Saved provider sessions remain available to resume.")
+                .font(RelayTheme.font(size: 10))
+                .foregroundStyle(RelayTheme.textMuted)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 250)
         }
-        .padding(20)
-        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.55)) }
+        .padding(RelayTheme.spacing(20))
+        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line.opacity(0.55)) }
     }
 }
 
 private struct ConnectionPath: View {
+    @EnvironmentObject private var linkSelection: PaneLinkSelection
     @ObservedObject var pane: PaneModel
     let active: Bool
     let compact: Bool
@@ -3675,29 +4530,35 @@ private struct ConnectionPath: View {
     @ObservedObject private var preferences = RelayPreferences.shared
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: RelayTheme.spacing(8)) {
             Circle()
                 .fill(pane.connectionState.color)
                 .frame(width: 6, height: 6)
+            if let inputMessage = pane.terminalInputMessage {
+                Label("Typing paused", systemImage: "keyboard")
+                    .font(RelayTheme.font(size: 10, weight: .medium))
+                    .foregroundStyle(.orange).lineLimit(1)
+                    .help(inputMessage).accessibilityLabel("Typing paused. " + inputMessage)
+            }
             Text(pane.displayName)
-                .font(.system(size: 11.5, weight: active ? .semibold : .medium))
+                .font(RelayTheme.font(size: 11.5, weight: .medium))
                 .lineLimit(1)
                 .onTapGesture(count: 2) { rename?() }
             if pane.profile.kind == .ssh, pane.displayName != pane.profile.host {
                 Text(pane.profile.host)
-                    .font(.system(size: 9.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textFaint)
                     .lineLimit(1)
             }
             if pane.profile.kind == .ssh {
-                Text(pane.profile.backend == .relay ? "Relay" : "SSH")
-                    .font(.system(size: 9.5, weight: .medium))
+                Text(pane.profile.backend == .relay ? "" : "SSH")
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
             }
             if let directory = pane.directory, !directory.isEmpty {
                 let component = TerminalPathSyntax.lastComponent(directory)
                 Text(component.isEmpty ? "/" : component)
-                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                    .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(RelayTheme.textFaint)
                     .lineLimit(1)
                     .help(directory)
@@ -3705,32 +4566,35 @@ private struct ConnectionPath: View {
             }
             if pane.contentKind == .editor {
                 Label("Editor", systemImage: "curlybraces")
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.blue)
+                    .lineLimit(1)
             } else if pane.kind != .shell {
-                Label(pane.activeSubagents > 0 ? String(pane.activeSubagents) + " agents" : pane.kind.label,
+                Label(pane.activeSubagents > 0 ? String(pane.activeSubagents) + " agents" : pane.harnessLabel,
                       systemImage: pane.kind.symbol)
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(pane.phase.color)
+                    .lineLimit(1)
                 Text(AgentLabelFormatter.activity(pane.activitySummary))
-                    .font(.system(size: 9.5, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textFaint)
                     .lineLimit(1)
                     .layoutPriority(-1)
                 if pane.pendingAgentApprovals > 0 {
                     Image(systemName: "hand.raised.fill")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(RelayTheme.font(size: 9, weight: .medium))
                         .foregroundStyle(RelayTheme.coral)
                         .accessibilityLabel("\(pane.pendingAgentApprovals) pending agent approvals")
                 }
                 if let usage = pane.agentResourceUsage {
                     Text("\(usage.inputTokens + usage.outputTokens) tok")
-                        .font(.system(size: 8.5, weight: .medium, design: .monospaced))
+                        .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
                         .help("Input \(usage.inputTokens), cached \(usage.cachedInputTokens), output \(usage.outputTokens)")
                 }
             }
             Spacer(minLength: 8)
+            RelayProgramStatusBadge(pane: pane)
             if let progress = pane.terminalProgressPercent {
                 ProgressView(value: Double(progress), total: 100)
                     .progressViewStyle(.linear)
@@ -3740,29 +4604,46 @@ private struct ConnectionPath: View {
                     .accessibilityValue("\(progress) percent")
             } else if pane.terminalProgressState == "indeterminate" {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.accent)
                     .help("Command in progress")
                     .accessibilityLabel("Command in progress")
             }
             if let exitCode = pane.lastCommandExitCode {
                 Image(systemName: exitCode == 0 ? "checkmark.circle" : "xmark.circle")
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(exitCode == 0 ? RelayTheme.textFaint : RelayTheme.coral)
                     .help(commandStatusHelp(exitCode: exitCode, durationNanos: pane.lastCommandDurationNanos))
                     .accessibilityLabel(exitCode == 0 ? "Last command succeeded" : "Last command exited with status \(exitCode)")
             }
-            if pane.connectionState != .connected {
-                Text(pane.connectionState.label)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(pane.connectionState.color)
+            if pane.connectionState != .connected || pane.connectionStatusLabel != "Connected" {
+                Text(pane.connectionStatusLabel)
+                    .font(RelayTheme.font(size: 11, weight: .medium))
+                    .foregroundStyle(pane.phase == .exited ? RelayTheme.red : pane.connectionState.color)
             }
-            if toggleFloating != nil || toggleZoom != nil || close != nil {
-                HStack(spacing: 0) {
+            if pane.contentKind == .terminal || toggleFloating != nil || toggleZoom != nil || close != nil {
+                HStack(spacing: RelayTheme.spacing(0)) {
+                    if pane.contentKind == .terminal {
+                        PaneHeaderLinkButton(paneID: pane.id)
+                    }
+                    if pane.contentKind == .terminal {
+                        Button(action: toggleConversation) {
+                            Image(systemName: pane.nativeConversationVisible ? "terminal" : "text.bubble")
+                                .font(RelayTheme.font(size: 9.5, weight: .medium))
+                                .frame(width: 24, height: 24)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .focusEffectDisabled()
+                        .help(pane.nativeConversationVisible ? "Return to terminal" : "View this pane's CLI conversation")
+                        .accessibilityLabel(pane.nativeConversationVisible ? "Return to terminal" : "View CLI conversation")
+                        .accessibilityIdentifier("relay.agent.open-conversation." + pane.id.uuidString.lowercased())
+                    }
                     if let toggleFloating {
                         Button(action: toggleFloating) {
                             Image(systemName: isFloating ? "rectangle.portrait.and.arrow.right" : "macwindow.on.rectangle")
-                                .font(.system(size: 9.5, weight: .semibold))
+                                .font(RelayTheme.font(size: 9.5, weight: .medium))
                                 .frame(width: 24, height: 24)
                                 .contentShape(Rectangle())
                         }
@@ -3775,7 +4656,7 @@ private struct ConnectionPath: View {
                     if let toggleZoom {
                         Button(action: toggleZoom) {
                             Image(systemName: zoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                                .font(.system(size: 9.5, weight: .semibold))
+                                .font(RelayTheme.font(size: 9.5, weight: .medium))
                                 .frame(width: 24, height: 24)
                                 .contentShape(Rectangle())
                         }
@@ -3788,7 +4669,7 @@ private struct ConnectionPath: View {
                     if let close {
                         Button(action: close) {
                             Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .bold))
+                                .font(RelayTheme.font(size: 9, weight: .medium))
                                 .frame(width: 24, height: 24)
                                 .contentShape(Rectangle())
                         }
@@ -3810,7 +4691,23 @@ private struct ConnectionPath: View {
         .onTapGesture(perform: select)
         .contextMenu {
             if let rename { Button("Rename pane…", action: rename) }
+            Button("Copy Pane ID") { copyWorkspaceID(pane.id) }
             if pane.contentKind == .terminal {
+                Button("Reconnect pane") {
+                    NotificationCenter.default.post(name: .relayReconnectPane, object: pane.id)
+                }
+                if pane.remoteExitCode != nil || pane.phase == .exited {
+                    Button("Resume saved conversation") {
+                        NotificationCenter.default.post(name: .relayResumeSavedConversation, object: pane.id)
+                    }
+                    Button("Open new shell") {
+                        NotificationCenter.default.post(name: .relayRestartExitedPane, object: pane.id)
+                    }
+                }
+                Button(pane.nativeConversationVisible ? "Return to terminal" : "View CLI conversation", action: toggleConversation)
+                Button("Connect with other sessions…") {
+                    NotificationCenter.default.post(name: .relayConnectPaneSessions, object: pane.id)
+                }
                 Menu("Agent type") {
                     ForEach(AgentKind.allCases, id: \.self) { kind in
                         Button {
@@ -3831,6 +4728,15 @@ private struct ConnectionPath: View {
         }
     }
 
+    private func toggleConversation() {
+        select()
+        if pane.nativeConversationVisible {
+            pane.nativeConversationVisible = false
+        } else {
+            RelayToolWindowCoordinator.shared.showAgent(pane: pane)
+        }
+    }
+
     private func commandStatusHelp(exitCode: Int, durationNanos: UInt64?) -> String {
         guard let durationNanos else { return "Last command exited with status \(exitCode)" }
         let seconds = Double(durationNanos) / 1_000_000_000
@@ -3843,20 +4749,20 @@ private struct ConnectingOverlay: View {
     let contentKind: PaneContentKind
 
     var body: some View {
-        VStack(spacing: 13) {
+        VStack(spacing: RelayTheme.spacing(13)) {
             ProgressView()
                 .controlSize(.small)
                 .tint(RelayTheme.accent)
             Text(contentKind == .editor ? "Opening remote workspace" : "Opening remote session")
-                .font(.system(size: 13, weight: .semibold))
+                .font(RelayTheme.font(size: 13, weight: .medium))
                 .foregroundStyle(RelayTheme.text)
             Text(contentKind == .editor ? "\(host)  →  code editor" : "\(host)  →  native terminal")
-                .font(.system(size: 11, weight: .medium))
+                .font(RelayTheme.font(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textMuted)
         }
-        .padding(22)
-        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.5)) }
+        .padding(RelayTheme.spacing(22))
+        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line.opacity(0.5)) }
     }
 }
 
@@ -3866,20 +4772,20 @@ private struct RestoringTerminalOverlay: View {
     var body: some View {
         ZStack {
             RelayTheme.canvas
-            VStack(spacing: 13) {
+            VStack(spacing: RelayTheme.spacing(13)) {
                 ProgressView()
                     .controlSize(.small)
                     .tint(RelayTheme.accent)
                 Text("Restoring terminal")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(RelayTheme.font(size: 13, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                 Text("Showing the current screen on \(host)")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(RelayTheme.font(size: 11, weight: .medium))
                     .foregroundStyle(RelayTheme.textMuted)
             }
-            .padding(22)
-            .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay { RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line.opacity(0.5)) }
+            .padding(RelayTheme.spacing(22))
+            .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line.opacity(0.5)) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -3891,15 +4797,15 @@ private struct ConnectionErrorBanner: View {
     var manageRelayd: (() -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: RelayTheme.spacing(9)) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(RelayTheme.coral)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
                 Text("Could not reach the remote session")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                 Text(message)
-                    .font(.system(size: 10.5))
+                    .font(RelayTheme.font(size: 11))
                     .foregroundStyle(RelayTheme.textMuted)
                     .lineLimit(2)
             }
@@ -3907,25 +4813,25 @@ private struct ConnectionErrorBanner: View {
             if let manageRelayd {
                 Button("Install relayd", action: manageRelayd)
                     .buttonStyle(.plain)
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 10.5, weight: .medium))
                     .foregroundStyle(RelayTheme.blue)
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, RelayTheme.spacing(10))
                     .frame(height: 26)
-                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 7))
+                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7)))
             }
             if let retry {
                 Button("Retry", action: retry)
                     .buttonStyle(.plain)
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 10.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, RelayTheme.spacing(10))
                     .frame(height: 26)
-                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 7))
+                    .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7)))
             }
         }
-        .padding(11)
-        .background(RelayTheme.surface.opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
-        .overlay { RoundedRectangle(cornerRadius: 10).stroke(RelayTheme.coral.opacity(0.35)) }
+        .padding(RelayTheme.spacing(11))
+        .background(RelayTheme.surface.opacity(0.96), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
+        .overlay { RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)).stroke(RelayTheme.coral.opacity(0.35)) }
     }
 }
 
@@ -3935,15 +4841,15 @@ private struct ConnectionRecoveryBanner: View {
     let waitingForNetwork: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: RelayTheme.spacing(10)) {
             Image(systemName: waitingForNetwork ? "network.slash" : "arrow.trianglehead.2.clockwise.rotate.90")
                 .foregroundStyle(waitingForNetwork ? RelayTheme.coral : RelayTheme.blue)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
                 Text(waitingForNetwork ? "VPN or network unavailable" : "Reconnecting to \(host)")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                 Text(message)
-                    .font(.system(size: 10.5))
+                    .font(RelayTheme.font(size: 11))
                     .foregroundStyle(RelayTheme.textMuted)
                     .lineLimit(2)
             }
@@ -3952,11 +4858,788 @@ private struct ConnectionRecoveryBanner: View {
                 .controlSize(.small)
                 .tint(RelayTheme.accent)
         }
-        .padding(11)
-        .background(RelayTheme.surface.opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
+        .padding(RelayTheme.spacing(11))
+        .background(RelayTheme.surface.opacity(0.96), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
         .overlay {
-            RoundedRectangle(cornerRadius: 10)
+            RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10))
                 .stroke((waitingForNetwork ? RelayTheme.coral : RelayTheme.blue).opacity(0.32))
+        }
+    }
+}
+
+@MainActor
+private final class RelayNativeToolWindow: NSWindow {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           event.charactersIgnoringModifiers == "w" {
+            performClose(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+@MainActor
+func showOriginalCLIConversation(pane: PaneModel) {
+    RelayToolWindowCoordinator.shared.showAgent(pane: pane)
+}
+
+@MainActor
+private final class RelayToolWindowCoordinator: NSObject, ObservableObject, NSWindowDelegate {
+    static let shared = RelayToolWindowCoordinator()
+    @Published private(set) var rPaneIDs: Set<UUID> = []
+    @Published private(set) var detachedRPanels: Set<String> = []
+    @Published var extraRPanels: [String: [RExtraPanel]] = [:]
+    @Published var embeddedRWorkspaces: [String: REmbeddedContent] = [:]
+    @Published var embeddedRPanels: [String: REmbeddedContent] = [:]
+    @Published var minimizedRPanels: Set<String> = []
+    @Published var selectedRWorkspace: String?
+    @Published var minimizedRWorkspaces: Set<String> = []
+    @Published var rPanelPlacements: [String: RPanelPlacement] = [:]
+    private var rPrimaryEditors: [String: UUID] = [:]
+    var initiallyFloatedRPanelKeys: Set<String> = []
+    private var windows: [String: NSWindow] = [:]
+    private var rWindows: [String: Set<UUID>] = [:]
+    private var rPanelParents: [String: String] = [:]
+
+    private func present<Content: View>(_ key: String, title: String, content: Content) {
+        if let window = windows[key] { window.makeKeyAndOrderFront(nil); return }
+        let vpnWindow = key.hasSuffix(":relay.vpn:main")
+        let size = vpnWindow ? NSSize(width: 560, height: 560) : NSSize(width: 1120, height: 700)
+        let window = RelayNativeToolWindow(contentRect: NSRect(origin: .zero, size: size),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                              backing: .buffered, defer: false)
+        window.title = title
+        RelayToolSurface.configure(window)
+        window.minSize = vpnWindow ? NSSize(width: 480, height: 440) : NSSize(width: 720, height: 460)
+        window.level = .normal
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.fullScreenAuxiliary, .moveToActiveSpace]
+        window.isReleasedWhenClosed = false
+        window.tabbingMode = .disallowed
+        window.delegate = self
+        let hosting = NSHostingView(rootView: content.relaySurface().environment(\.relayNativeToolSurface, true))
+        hosting.sizingOptions = []
+        window.contentView = hosting
+        window.setContentSize(size)
+        windows[key] = window
+        if let parent = NSApp.windows.first(where: {
+            $0.identifier?.rawValue == "dev.relay.terminal.workspace" && $0.isVisible
+        }) {
+            window.setFrameOrigin(NSPoint(x: parent.frame.midX - window.frame.width / 2,
+                                          y: parent.frame.midY - window.frame.height / 2))
+        } else {
+            window.center()
+        }
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func show(workspace: WorkspaceModel, pane: PaneModel, toolID: String) {
+        let key = pane.id.uuidString + ":" + toolID
+        let parts = toolID.split(separator: ":", maxSplits: 1).map(String.init)
+        let package = parts.first.flatMap { RelayPluginManager.shared.reviewedInstallations[$0]?.package }
+        let title = package?.contributions.first(where: { parts.count == 2 && $0.id == parts[1] })?.title ?? "Tool"
+        present(key, title: title, content: StandalonePluginWorkspace(workspace: workspace, pane: pane, toolID: toolID))
+    }
+
+    @Published var embeddedAgentPaneID: UUID?
+
+    func showAgent(pane: PaneModel) {
+        embeddedAgentPaneID = nil
+        pane.nativeConversationVisible = true
+        windows["Agent:" + pane.id.uuidString]?.close()
+    }
+
+    private func showDetachedAgent(pane: PaneModel) {
+        let key = "Agent:" + pane.id.uuidString
+        present(key, title: "Agent conversation · " + pane.displayName, content: RelayAgentConversationHostView(pane: pane))
+        windows[key]?.identifier = NSUserInterfaceItemIdentifier("relay.agent." + pane.id.uuidString)
+    }
+
+    func showHPC(workspace: WorkspaceModel, pane: PaneModel) {
+        let key = "HPC"
+        present(key, title: "HPC", content: HPCDiscoveryWorkspace(
+            workspace: workspace, preferredPaneID: pane.id,
+            close: { [weak self] in self?.windows[key]?.close() }))
+    }
+
+    func showR(workspace: WorkspaceModel, consoleID requestedConsoleID: UUID? = nil, restoring: Bool = false) {
+        guard let active = workspace.activePane else { return }
+        let consoleID = requestedConsoleID ?? (active.contentKind == .editor
+            ? active.remoteParentSessionID.flatMap(UUID.init(uuidString:)) : active.id)
+        guard let consoleID, let console = workspace.panes[consoleID] else { return }
+        let key = consoleID.uuidString + ":RStudio"
+        if embeddedRWorkspaces[key] != nil {
+            minimizedRWorkspaces.remove(key)
+            selectedRWorkspace = key
+            return
+        }
+        guard console.kind == .shell else {
+            workspace.operationError = "Select an R console or a shell before opening the RStudio workspace."
+            return
+        }
+        let editor: PaneModel
+        do { editor = try workspace.prepareFloatingRWorkspace(consoleID: consoleID) }
+        catch { workspace.operationError = error.localizedDescription; return }
+        editor.editorRuntime.showsRResults = true
+        editor.editorRuntime.externalRResults = true
+        if restoring { editor.editorRuntime.refreshRSession() }
+        else { editor.editorRuntime.connectRWorkspaceWhenReady() }
+        rPrimaryEditors[key] = editor.id
+        let ids = Set([console.id, editor.id] + (extraRPanels[key] ?? []).compactMap { $0.pane?.id })
+        rWindows[key] = ids
+        rPaneIDs.formUnion(ids)
+        embeddedRWorkspaces[key] = REmbeddedContent(
+            title: "R workspace · " + console.profile.host,
+            owner: ObjectIdentifier(workspace),
+            content: AnyView(RStandaloneWorkspace(workspace: workspace, editor: editor, console: console)
+                .environmentObject(workspace.paneLinkSelection)))
+        selectedRWorkspace = key
+    }
+
+    func presentationSnapshot(workspace: WorkspaceModel) -> [RWorkspacePresentation] {
+        embeddedRWorkspaces.keys.sorted().compactMap { key in
+            guard embeddedRWorkspaces[key]?.owner == ObjectIdentifier(workspace),
+                  let consoleID = UUID(uuidString: String(key.split(separator: ":")[0])),
+                  let editorID = rPrimaryEditors[key],
+                  let tabID = workspace.rPresentationTabID(consoleID: consoleID) else { return nil }
+            return RWorkspacePresentation(consoleID: consoleID, editorID: editorID, tabID: tabID,
+                selected: selectedRWorkspace == key, minimized: minimizedRWorkspaces.contains(key),
+                placement: rPanelPlacements[key], extras: (extraRPanels[key] ?? []).map { panel in
+                    let child = panel.id.uuidString
+                    return RExtraPresentation(id: panel.id, title: panel.title, paneID: panel.pane?.id,
+                        returnsToTab: panel.returnsToTab, floating: detachedRPanels.contains(child),
+                        minimized: minimizedRPanels.contains(child), placement: rPanelPlacements[child])
+                })
+        }
+    }
+
+    func restorePresentations(workspace: WorkspaceModel) {
+        guard workspace.captureRPresentations == nil else { return }
+        let saved = workspace.savedRPresentations
+        let selectedTab = workspace.selectedTabID
+        let active = workspace.activePaneID
+        for item in saved {
+            guard workspace.panes[item.consoleID] != nil else { continue }
+            workspace.selectedTabID = item.tabID
+            workspace.activePaneID = item.consoleID
+            let key = item.consoleID.uuidString + ":RStudio"
+            rPanelPlacements[key] = item.placement
+            extraRPanels[key] = item.extras.compactMap { extra in
+                if let id = extra.paneID, workspace.panes[id] == nil { return nil }
+                let child = extra.id.uuidString
+                rPanelPlacements[child] = extra.placement
+                if extra.minimized { minimizedRPanels.insert(child) }
+                // A docked panel must not be floated by its initial onAppear.
+                if !extra.floating { initiallyFloatedRPanelKeys.insert(child) }
+                return RExtraPanel(id: extra.id, title: extra.title,
+                    pane: extra.paneID.flatMap { workspace.panes[$0] }, returnsToTab: extra.returnsToTab)
+            }
+            showR(workspace: workspace, consoleID: item.consoleID, restoring: true)
+            for extra in extraRPanels[key] ?? [] where item.extras.first(where: { $0.id == extra.id })?.floating == true {
+                guard let editor = workspace.panes[item.editorID] else { continue }
+                initiallyFloatedRPanelKeys.insert(extra.id.uuidString)
+                let restoredContent = AnyView(Group {
+                    if let pane = extra.pane {
+                        PaneView(pane: pane, isActive: true, compactChrome: true,
+                            select: { if pane.contentKind == .terminal { workspace.selectPane(pane.id) } }, inToolWindow: true)
+                            .environmentObject(workspace.paneLinkSelection)
+                    } else {
+                        RLayoutResultsDock(runtime: editor.editorRuntime)
+                    }
+                })
+                detachRPanel(key: extra.id.uuidString, parent: key, title: "RStudio · " + extra.title, content: restoredContent)
+            }
+            if item.minimized { minimizedRWorkspaces.insert(key) }
+        }
+        if let selected = saved.first(where: \.selected) {
+            selectedRWorkspace = selected.consoleID.uuidString + ":RStudio"
+        }
+        workspace.selectedTabID = selectedTab
+        workspace.activePaneID = active
+        workspace.captureRPresentations = { [weak self, weak workspace] in
+            guard let self, let workspace else { return [] }
+            return self.presentationSnapshot(workspace: workspace)
+        }
+    }
+
+    func addExistingRTerminal(_ pane: PaneModel, parent: String) {
+        guard !rPaneIDs.contains(pane.id), pane.contentKind == .terminal else { return }
+        extraRPanels[parent, default: []].append(RExtraPanel(title: pane.harnessLabel + " · " + pane.displayName, pane: pane, returnsToTab: true))
+        rWindows[parent, default: []].insert(pane.id)
+        rPaneIDs.insert(pane.id)
+    }
+
+    func newRWorkspace(workspace: WorkspaceModel, console: PaneModel) {
+        do {
+            let newConsole = try workspace.addFloatingRPanel(consoleID: console.id, contentKind: .terminal)
+            showR(workspace: workspace, consoleID: newConsole.id)
+        } catch { workspace.operationError = error.localizedDescription }
+    }
+
+    func returnRPaneToTab(paneID: UUID) {
+        guard let key = rWindows.first(where: { $0.value.contains(paneID) })?.key else { return }
+        if let panel = extraRPanels[key]?.first(where: { $0.pane?.id == paneID && $0.returnsToTab }) {
+            let panelKey = panel.id.uuidString
+            dockEmbeddedRPanel(panelKey)
+            extraRPanels[key]?.removeAll { $0.id == panel.id }
+            initiallyFloatedRPanelKeys.remove(panelKey)
+            rWindows[key]?.remove(paneID)
+            rPaneIDs.remove(paneID)
+            return
+        }
+        closeEmbeddedRWorkspace(key)
+    }
+
+    func focusR(paneID: UUID) {
+        if let key = rWindows.first(where: { $0.value.contains(paneID) })?.key {
+            minimizedRWorkspaces.remove(key)
+            selectedRWorkspace = key
+        }
+    }
+
+    func detachRPanel<Content: View>(key: String, parent: String, title: String, content: Content) {
+        guard let owner = embeddedRWorkspaces[parent]?.owner else { return }
+        rPanelParents[key] = parent
+        detachedRPanels.insert(key)
+        embeddedRPanels[key] = REmbeddedContent(title: title, owner: owner, content: AnyView(content))
+    }
+
+    func focusRPanel(_ key: String) {
+        if let parent = rPanelParents[key] { selectedRWorkspace = parent }
+    }
+
+    func dockEmbeddedRPanel(_ key: String) {
+        minimizedRPanels.remove(key)
+        embeddedRPanels.removeValue(forKey: key)
+        detachedRPanels.remove(key)
+        rPanelParents.removeValue(forKey: key)
+    }
+
+    func panelsForRWorkspace(_ key: String) -> [String] {
+        rPanelParents.filter { $0.value == key }.map(\.key).sorted()
+    }
+
+    func closeEmbeddedRWorkspace(_ key: String) {
+        minimizedRWorkspaces.remove(key)
+        for child in panelsForRWorkspace(key) { dockEmbeddedRPanel(child) }
+        embeddedRWorkspaces.removeValue(forKey: key)
+        if selectedRWorkspace == key { selectedRWorkspace = nil }
+        if let ids = rWindows.removeValue(forKey: key) {
+            extraRPanels[key]?.removeAll { $0.returnsToTab }
+            rPaneIDs.subtract(ids)
+        }
+    }
+
+    func registerExtraRPanel(_ panel: RExtraPanel, parent: String) {
+        extraRPanels[parent, default: []].append(panel)
+        if let pane = panel.pane {
+            rWindows[parent, default: []].insert(pane.id)
+            rPaneIDs.insert(pane.id)
+        }
+    }
+
+    func closeExtraRPanel(_ key: String, parent: String, workspace: WorkspaceModel, consoleID: UUID) {
+        guard let panel = extraRPanels[parent]?.first(where: { $0.id.uuidString == key }) else { return }
+        if let pane = panel.pane, !panel.returnsToTab,
+           !workspace.closeFloatingRPanel(pane.id, consoleID: consoleID) { return }
+        dockEmbeddedRPanel(key)
+        extraRPanels[parent]?.removeAll { $0.id.uuidString == key }
+        initiallyFloatedRPanelKeys.remove(key)
+        if let pane = panel.pane {
+            rWindows[parent]?.remove(pane.id)
+            rPaneIDs.remove(pane.id)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              let key = windows.first(where: { $0.value === window })?.key else { return }
+        window.contentView = nil
+        windows[key] = nil
+        if let parent = rPanelParents.removeValue(forKey: key) {
+            detachedRPanels.remove(key)
+            windows[parent]?.makeKeyAndOrderFront(nil)
+        }
+        let children = rPanelParents.filter { $0.value == key }.map(\.key)
+        for child in children { windows[child]?.close() }
+        if let ids = rWindows.removeValue(forKey: key) {
+            extraRPanels[key]?.removeAll { $0.returnsToTab }
+            rPaneIDs.subtract(ids)
+        }
+    }
+}
+
+private struct StandalonePluginWorkspace: View {
+    @ObservedObject var workspace: WorkspaceModel
+    let pane: PaneModel
+    let toolID: String
+    @StateObject private var presentation = PluginToolPresentation()
+    @StateObject private var chrome = WorkspaceChrome()
+    var body: some View {
+        RelayPluginToolsView(workspace: workspace, presentation: presentation,
+                             chrome: chrome, presentationStyle: .floating)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(RelayTheme.surface)
+            .onAppear {
+                presentation.captureOnce(id: pane.id,
+                profile: workspace.executionContext()?.profile ?? pane.profile,
+                directory: workspace.executionContext()?.directory ?? pane.directory)
+                presentation.selection = toolID
+                chrome.reveal(.files, initial: WorkspaceContextAnchor(paneID: pane.id,
+                               profile: pane.profile, directory: pane.directory))
+            }
+    }
+}
+
+private struct REmbeddedContent {
+    let title: String
+    let owner: ObjectIdentifier
+    let content: AnyView
+}
+
+private struct RPresentationPersistence: ViewModifier {
+    @ObservedObject var workspace: WorkspaceModel
+    @ObservedObject private var windows = RelayToolWindowCoordinator.shared
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear { windows.restorePresentations(workspace: workspace) }
+            .onChange(of: windows.presentationSnapshot(workspace: workspace)) { _, _ in
+                workspace.persistRPresentation()
+            }
+            .onChange(of: workspace.sidebarVisible) { _, _ in workspace.persistRPresentation() }
+    }
+}
+
+private struct RBoundedWorkspaceHost: View {
+    @ObservedObject var workspace: WorkspaceModel
+    @ObservedObject private var windows = RelayToolWindowCoordinator.shared
+
+    var body: some View {
+        if let key = windows.selectedRWorkspace,
+           let item = windows.embeddedRWorkspaces[key],
+           let consoleID = UUID(uuidString: String(key.prefix(36))),
+           workspace.selectedTab?.allPaneIDs.contains(consoleID) == true,
+           item.owner == ObjectIdentifier(workspace) {
+            ZStack(alignment: .bottomTrailing) {
+            RBoundedPanel(title: item.title, initialSize: CGSize(width: 1120, height: 740),
+                          closeLabel: "Close R workspace", close: { windows.closeEmbeddedRWorkspace(key) },
+                          minimize: { windows.minimizedRWorkspaces.insert(key) },
+                          savedPlacement: windows.rPanelPlacements[key],
+                          placementChanged: { windows.rPanelPlacements[key] = $0; workspace.persistRPresentation() }) {
+                item.content
+            }.id(key)
+                .opacity(windows.minimizedRWorkspaces.contains(key) ? 0 : 1)
+                .allowsHitTesting(!windows.minimizedRWorkspaces.contains(key))
+                .accessibilityHidden(windows.minimizedRWorkspaces.contains(key))
+            if windows.minimizedRWorkspaces.contains(key) {
+                Button {
+                    windows.minimizedRWorkspaces.remove(key)
+                } label: { Label(item.title, systemImage: "r.square") }
+                    .help("Restore R workspace")
+                    .accessibilityLabel("Restore R workspace")
+                    .padding(RelayTheme.spacing(12)).background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)))
+                    .padding(RelayTheme.spacing(12))
+            }
+            }
+                .padding(.top, workspace.isFullScreen ? 40 : 46)
+                .padding(.leading, workspace.sidebarVisible
+                         ? (RelayPreferences.shared.compactInterface ? 245 : 261) : 0)
+        }
+    }
+}
+
+// Both levels live in the parent's view hierarchy; geometry is always clamped
+// to that parent, including during drags, resizes and main-window resizing.
+private struct RBoundedPanel<Content: View>: View {
+    let title: String
+    let initialSize: CGSize
+    let closeLabel: String
+    let close: () -> Void
+    var minimize: (() -> Void)? = nil
+    var showsClose = true
+    var savedPlacement: RPanelPlacement? = nil
+    var placementChanged: ((RPanelPlacement) -> Void)? = nil
+    @ViewBuilder let content: () -> Content
+    @State private var origin = CGPoint(x: 16, y: 16)
+    @State private var size: CGSize?
+    @State private var maximized = false
+    @State private var dragStart: CGPoint?
+    @State private var resizeStart: CGSize?
+    @State private var coordinateID = UUID()
+
+    var body: some View {
+        GeometryReader { geometry in
+            let base = size ?? initialSize
+            let width = maximized ? geometry.size.width : min(geometry.size.width, max(min(360, geometry.size.width), base.width))
+            let height = maximized ? geometry.size.height : min(geometry.size.height, max(min(240, geometry.size.height), base.height))
+            let x = maximized ? 0 : min(max(0, origin.x), max(0, geometry.size.width - width))
+            let y = maximized ? 0 : min(max(0, origin.y), max(0, geometry.size.height - height))
+            VStack(spacing: RelayTheme.spacing(0)) {
+                HStack {
+                    Text(title).font(RelayTheme.font(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { maximized.toggle() }
+                        .gesture(DragGesture(coordinateSpace: .named(coordinateID))
+                            .onChanged { value in
+                                guard !maximized else { return }
+                                if dragStart == nil { dragStart = CGPoint(x: x, y: y) }
+                                guard let start = dragStart else { return }
+                                origin = CGPoint(
+                                    x: min(max(0, start.x + value.translation.width), max(0, geometry.size.width - width)),
+                                    y: min(max(0, start.y + value.translation.height), max(0, geometry.size.height - height)))
+                            }.onEnded { _ in dragStart = nil })
+                    Button { maximized.toggle() } label: {
+                        Image(systemName: maximized ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                    }.buttonStyle(.plain)
+                        .help(maximized ? "Restore size" : "Maximise inside Relay")
+                        .accessibilityLabel(maximized ? "Restore " + title : "Maximise " + title)
+                    if let minimize {
+                        Button(action: minimize) { Image(systemName: "minus") }
+                            .buttonStyle(.plain).help("Minimise panel")
+                            .accessibilityLabel("Minimise " + title)
+                    }
+                    if showsClose {
+                    Button(action: close) { Image(systemName: "xmark") }
+                        .buttonStyle(.plain).help(closeLabel).accessibilityLabel(closeLabel)
+                    }
+                }.padding(RelayTheme.spacing(10)).background(RelayTheme.surface)
+                Divider()
+                content().frame(maxWidth: .infinity, maxHeight: .infinity).clipped()
+            }
+            .frame(width: width, height: height)
+            .background(RelayTheme.canvas)
+            .overlay(alignment: .bottomTrailing) {
+                if !maximized {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(RelayTheme.font(size: 10)).padding(RelayTheme.spacing(7)).background(RelayTheme.surface)
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture(coordinateSpace: .named(coordinateID))
+                        .onChanged { value in
+                            if resizeStart == nil {
+                                resizeStart = CGSize(width: width, height: height)
+                                origin = CGPoint(x: x, y: y)
+                            }
+                            guard let start = resizeStart else { return }
+                            size = CGSize(width: min(geometry.size.width - origin.x, max(360, start.width + value.translation.width)),
+                                          height: min(geometry.size.height - origin.y, max(240, start.height + value.translation.height)))
+                        }.onEnded { _ in resizeStart = nil })
+                    .accessibilityLabel("Resize " + title)
+                }
+            }
+            .overlay(Rectangle().stroke(RelayTheme.line, lineWidth: 1))
+            .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
+            .offset(x: x, y: y)
+        }.coordinateSpace(name: coordinateID).clipped()
+        .onAppear {
+            if let savedPlacement {
+                origin = CGPoint(x: savedPlacement.x, y: savedPlacement.y)
+                size = CGSize(width: savedPlacement.width, height: savedPlacement.height)
+                maximized = savedPlacement.maximized
+            }
+        }
+        .onChange(of: origin) { _, _ in savePlacement() }
+        .onChange(of: size) { _, _ in savePlacement() }
+        .onChange(of: maximized) { _, _ in savePlacement() }
+    }
+
+    private func savePlacement() {
+        let actual = size ?? initialSize
+        placementChanged?(RPanelPlacement(x: origin.x, y: origin.y, width: actual.width,
+            height: actual.height, maximized: maximized))
+    }
+}
+
+private struct RStandaloneWorkspace: View {
+    @ObservedObject var workspace: WorkspaceModel
+    let editor: PaneModel
+    let console: PaneModel
+    private var parentKey: String { console.id.uuidString + ":RStudio" }
+    private var extraPanels: [RExtraPanel] { windows.extraRPanels[parentKey] ?? [] }
+    @ObservedObject private var windows = RelayToolWindowCoordinator.shared
+    @State private var terminalDropTargeted = false
+    @State private var showingTerminalPicker = false
+    @State private var selectedTerminalIDs: Set<UUID> = []
+    @State private var rLinkNotice: String?
+    private func linkTerminal(_ pane: PaneModel) {
+        windows.addExistingRTerminal(pane, parent: parentKey)
+        guard let session = editor.editorRuntime.rSession else { return }
+        Task { @MainActor in
+            do {
+                _ = try await RAutomationController.shared.authorize(paneID: console.id,
+                    expected: session.session_id, id: UUID(), workspace: workspace)
+            } catch { rLinkNotice = error.localizedDescription }
+        }
+    }
+    var body: some View {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            HStack {
+                Button { addPanel(.terminal) } label: {
+                    Image(systemName: "terminal")
+                }.buttonStyle(.plain)
+                    .frame(width: 30, height: 30)
+                    .help("New floating console")
+                    .accessibilityLabel("New floating console")
+                Button {
+                    selectedTerminalIDs.removeAll()
+                    showingTerminalPicker = true
+                } label: {
+                    Label("Add existing terminal", systemImage: "rectangle.stack.badge.plus")
+                        .labelStyle(.iconOnly)
+                }.buttonStyle(.plain)
+                    .font(RelayTheme.font(size: 11))
+                    .padding(.horizontal, RelayTheme.spacing(10)).frame(height: 30)
+                    .background(terminalDropTargeted ? RelayTheme.accent.opacity(0.2) : RelayTheme.surface,
+                                in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)))
+                    .help("Add an existing Claude, Codex or terminal pane")
+                    .popover(isPresented: $showingTerminalPicker) {
+                        VStack(alignment: .leading, spacing: RelayTheme.spacing(8)) {
+                            Text("Add existing terminal").font(.headline)
+                            Text("From this R workspace’s original tab")
+                                .font(.caption).foregroundStyle(RelayTheme.textMuted)
+                            Text("Linked agents can run code in this R session. Use Pause MCP analysis to stop them.")
+                                .font(.caption).foregroundStyle(RelayTheme.textMuted)
+                            if let rLinkNotice { Text(rLinkNotice).font(.caption) }
+                            ForEach(availableTerminals) { pane in
+                                Toggle(pane.harnessLabel + " · " + pane.displayName, isOn: Binding(
+                                    get: { selectedTerminalIDs.contains(pane.id) },
+                                    set: { selected in
+                                        if selected { selectedTerminalIDs.insert(pane.id) }
+                                        else { selectedTerminalIDs.remove(pane.id) }
+                                    }))
+                                    .toggleStyle(.checkbox)
+                            }
+                            if availableTerminals.isEmpty { Text("No other terminals available in the original tab") }
+                            HStack {
+                                Button("Cancel") { showingTerminalPicker = false }
+                                Spacer()
+                                Button("Add selected") {
+                                    for pane in availableTerminals where selectedTerminalIDs.contains(pane.id) {
+                                        linkTerminal(pane)
+                                    }
+                                    showingTerminalPicker = false
+                                    selectedTerminalIDs.removeAll()
+                                }.disabled(selectedTerminalIDs.isEmpty)
+                            }
+                        }.padding(RelayTheme.spacing(14))
+                    }
+                    .onDrop(of: [UTType.utf8PlainText], isTargeted: $terminalDropTargeted) { providers in
+                        if let id = PaneDragCoordinator.shared.paneID,
+                           let pane = availableTerminals.first(where: { $0.id == id }) {
+                            linkTerminal(pane)
+                            PaneDragCoordinator.shared.paneID = nil
+                            return true
+                        }
+                        guard let provider = providers.first else { return false }
+                        provider.loadObject(ofClass: NSString.self) { object, _ in
+                            guard let text = object as? String, let id = UUID(uuidString: text) else { return }
+                            Task { @MainActor in
+                                guard let pane = availableTerminals.first(where: { $0.id == id }) else { return }
+                                linkTerminal(pane)
+                            }
+                        }
+                        return true
+                    }
+                Spacer()
+            }.padding(RelayTheme.spacing(10))
+            Divider()
+        GeometryReader { geometry in
+        HStack(spacing: RelayTheme.spacing(1)) {
+            VStack(spacing: RelayTheme.spacing(1)) {
+                RDetachablePanel(title: "Editor", key: parentKey + ":editor", parent: parentKey, allowsFloating: false) {
+                PaneView(pane: editor, isActive: true,
+                         compactChrome: true, select: {}, inToolWindow: true)
+                    .environmentObject(workspace.paneLinkSelection)
+                }.frame(height: max(0, geometry.size.height * 0.65 - 1))
+                RDetachablePanel(title: "Console", key: parentKey + ":console", parent: parentKey, allowsFloating: false) {
+                PaneView(pane: console, isActive: workspace.activePaneID == console.id,
+                         compactChrome: true, select: { workspace.selectPane(console.id) }, inToolWindow: true)
+                    .environmentObject(workspace.paneLinkSelection)
+                }
+            }.frame(width: max(0, geometry.size.width * 0.65 - 1))
+            RDetachablePanel(title: "Results", key: parentKey + ":results", parent: parentKey, allowsFloating: false) {
+            RLayoutResultsDock(runtime: editor.editorRuntime)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }.background(RelayTheme.line)
+        }
+        .background {
+            ForEach(extraPanels.filter { !windows.detachedRPanels.contains($0.id.uuidString) }) { panel in
+                RDetachablePanel(title: panel.title, key: panel.id.uuidString, parent: parentKey,
+                                 initiallyFloating: true) {
+                    if let pane = panel.pane {
+                        PaneView(pane: pane, isActive: true, compactChrome: true,
+                                 select: { if pane.contentKind == .terminal { workspace.selectPane(pane.id) } },
+                                 inToolWindow: true)
+                            .environmentObject(workspace.paneLinkSelection)
+                    } else {
+                        RLayoutResultsDock(runtime: editor.editorRuntime)
+                    }
+                }.frame(width: 0, height: 0).hidden()
+            }
+        }
+        }.background(RelayTheme.canvas)
+        .overlay {
+            ForEach(windows.panelsForRWorkspace(parentKey), id: \.self) { key in
+                if let panel = windows.embeddedRPanels[key] {
+                    RBoundedPanel(title: panel.title, initialSize: CGSize(width: 620, height: 420),
+                                  closeLabel: "Close floating console", close: {
+                                      windows.closeExtraRPanel(key, parent: parentKey, workspace: workspace, consoleID: console.id)
+                                  },
+                                  minimize: { windows.minimizedRPanels.insert(key) },
+                                  savedPlacement: windows.rPanelPlacements[key],
+                                  placementChanged: { windows.rPanelPlacements[key] = $0; workspace.persistRPresentation() }) {
+                        panel.content
+                    }.id(key)
+                        .opacity(windows.minimizedRPanels.contains(key) ? 0 : 1)
+                        .allowsHitTesting(!windows.minimizedRPanels.contains(key))
+                        .accessibilityHidden(windows.minimizedRPanels.contains(key))
+                }
+            }
+        }
+        .overlay(alignment: .bottomLeading) {
+            let minimized = windows.panelsForRWorkspace(parentKey).filter { windows.minimizedRPanels.contains($0) }
+            if !minimized.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack {
+                        ForEach(minimized, id: \.self) { key in
+                            Button {
+                                windows.minimizedRPanels.remove(key)
+                            } label: {
+                                Label(windows.embeddedRPanels[key]?.title ?? "Panel", systemImage: "macwindow")
+                            }.help("Restore minimised panel")
+                        }
+                    }.padding(RelayTheme.spacing(8))
+                }.fixedSize(horizontal: false, vertical: true)
+                    .background(RelayTheme.surface)
+            }
+        }
+    }
+
+    private var availableTerminals: [PaneModel] {
+        workspace.rWorkspaceTerminalCandidates(consoleID: console.id).filter {
+            !windows.rPaneIDs.contains($0.id)
+        }
+    }
+
+    private func addPanel(_ kind: PaneContentKind?) {
+        do {
+            let pane = try kind.map { try workspace.addFloatingRPanel(consoleID: console.id, contentKind: $0) }
+            let name = kind == .editor ? "Editor" : (kind == .terminal ? "Console" : "Results")
+            windows.registerExtraRPanel(RExtraPanel(title: name + " \(extraPanels.count + 2)", pane: pane), parent: parentKey)
+        } catch { workspace.operationError = error.localizedDescription }
+    }
+}
+
+private struct RExtraPanel: Identifiable {
+    var id = UUID()
+    let title: String
+    let pane: PaneModel?
+    var returnsToTab = false
+}
+
+private struct RDetachablePanel<Content: View>: View {
+    let title: String
+    let key: String
+    let parent: String
+    var initiallyFloating = false
+    var allowsFloating = true
+    @State private var presentedInitially = false
+    @ViewBuilder let content: () -> Content
+    @ObservedObject private var windows = RelayToolWindowCoordinator.shared
+
+    var body: some View {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            HStack {
+                Text(title).font(RelayTheme.font(size: 11, weight: .medium))
+                Spacer()
+                if allowsFloating && !windows.detachedRPanels.contains(key) {
+                    Button {
+                        windows.detachRPanel(key: key, parent: parent, title: "RStudio · " + title,
+                                             content: content())
+                    } label: {
+                        Label("Float \(title.lowercased())", systemImage: "macwindow.on.rectangle")
+                    }.labelStyle(.iconOnly).buttonStyle(.plain)
+                        .help("Float \(title.lowercased()) inside this R workspace")
+                }
+            }.padding(RelayTheme.spacing(8))
+            Divider()
+            if windows.detachedRPanels.contains(key) {
+                VStack(spacing: RelayTheme.spacing(10)) {
+                    Image(systemName: "macwindow")
+                    Text("\(title) is in a floating window")
+                    Button("Show \(title.lowercased()) window") { windows.focusRPanel(key) }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .foregroundStyle(RelayTheme.textMuted)
+            } else {
+                content()
+            }
+        }.frame(minHeight: 140).background(RelayTheme.canvas)
+        .onAppear {
+            guard initiallyFloating, !presentedInitially else { return }
+            presentedInitially = true
+            guard !windows.initiallyFloatedRPanelKeys.contains(key) else { return }
+            windows.initiallyFloatedRPanelKeys.insert(key)
+            windows.detachRPanel(key: key, parent: parent, title: "RStudio · " + title, content: content())
+        }
+    }
+}
+
+private struct PluginWorkspaceOverlay: View {
+    @ObservedObject var workspace: WorkspaceModel
+    let pane: PaneModel
+    let toolID: String
+    let close: () -> Void
+    @StateObject private var presentation = PluginToolPresentation()
+    @StateObject private var chrome = WorkspaceChrome()
+
+    var body: some View {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            HStack {
+                Text("Plugins").font(RelayTheme.font(size: 14, weight: .medium))
+                Text(pane.profile.kind == .ssh ? pane.profile.host : "This Mac")
+                    .font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
+                Spacer()
+                RelayIconAction("Close plugins", symbol: "xmark", action: close)
+            }.padding(RelayTheme.spacing(16))
+            Rectangle().fill(RelayTheme.line).frame(height: 1)
+            RelayPluginToolsView(workspace: workspace, presentation: presentation,
+                                 chrome: chrome, presentationStyle: .floating)
+        }
+        .background(RelayTheme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)))
+        .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line).allowsHitTesting(false))
+        .onAppear {
+            presentation.captureOnce(id: pane.id,
+                profile: workspace.executionContext()?.profile ?? pane.profile,
+                directory: workspace.executionContext()?.directory ?? pane.directory)
+            presentation.selection = toolID
+            chrome.reveal(.files, initial: WorkspaceContextAnchor(paneID: pane.id,
+                           profile: pane.profile, directory: pane.directory))
+        }
+    }
+}
+
+struct HPCClusterWorkspaceOverlay: View {
+    @ObservedObject var workspace: WorkspaceModel
+    let pane: PaneModel
+    let close: () -> Void
+    @ObservedObject var presentation: PluginToolPresentation
+    @ObservedObject var chrome: WorkspaceChrome
+    var body: some View {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            RelayPluginToolsView(workspace: workspace, presentation: presentation, chrome: chrome, presentationStyle: .overlay)
+        }
+        .background(RelayTheme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)))
+        .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line).allowsHitTesting(false))
+        .onAppear {
+            presentation.captureOnce(id: pane.id,
+                profile: workspace.executionContext()?.profile ?? pane.profile,
+                directory: workspace.executionContext()?.directory ?? pane.directory)
+            presentation.selection = "relay.hpc-jobs:main"
+            chrome.reveal(.jobs, initial: WorkspaceContextAnchor(paneID: pane.id, profile: pane.profile, directory: pane.directory))
         }
     }
 }

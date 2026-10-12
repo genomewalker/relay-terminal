@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,14 +23,19 @@ import (
 var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,96}$`)
 
 type Server struct {
-	mu              sync.Mutex
-	workerLocks     sync.Map
-	executable      string
-	buildVersion    string
-	protocolVersion int
-	stateDir        string
-	runtimeDir      string
-	workspaceLeases map[string]workspaceLease
+	hostJobs              sync.Map
+	hostJobsMu            sync.Mutex
+	hostUpgradeUntil      time.Time
+	mu                    sync.Mutex
+	workerLocks           sync.Map
+	legacyViewportTickets sync.Map
+	legacyViewportQueues  sync.Map
+	executable            string
+	buildVersion          string
+	protocolVersion       int
+	stateDir              string
+	runtimeDir            string
+	workspaceLeases       map[string]workspaceLease
 }
 
 func NewServer() *Server {
@@ -164,9 +170,22 @@ func (server *Server) serveConnection(connection net.Conn) {
 		return
 	}
 	if hello.Probe {
+		prepared := false
+		if hello.PrepareUpgrade {
+			if err := server.prepareHostUpgrade(); err != nil {
+				blocked, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+					State: "blocked", Message: err.Error(), SupervisorPID: os.Getpid(),
+				})
+				_ = protocol.NewWriter(connection).Write(blocked)
+				return
+			}
+			prepared = true
+		}
 		ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-			State: "ready", Version: server.buildVersion,
+			UpgradePrepared: prepared,
+			State:           "ready", Version: server.buildVersion,
 			ProtocolVersion: server.protocolVersion, SupervisorPID: os.Getpid(),
+			Capabilities: []string{"agent_binding_v1"},
 		})
 		_ = protocol.NewWriter(connection).Write(ready)
 		return
@@ -186,11 +205,13 @@ func (server *Server) serveConnection(connection net.Conn) {
 		// Durable workers keep running across relayd upgrades. Give an older
 		// worker the same pre-attach full-repaint contract through its existing
 		// PTY, then clear the flag so it is not pulsed a second time.
-		workerLock := server.workerLock(manifest.SessionID)
-		workerLock.Lock()
-		pulseErr := pulseLegacyWorkerViewport(manifest, hello.Cols, hello.Rows)
-		workerLock.Unlock()
-		if pulseErr == nil {
+		ticket := server.legacyViewportTicket(manifest.SessionID).Add(1)
+		_, applied, pulseErr := server.applyLatestLegacyViewport(
+			manifest.SessionID, ticket, func() (uint64, error) {
+				return 0, pulseLegacyWorkerViewport(manifest, hello.Cols, hello.Rows, hello.ClientID)
+			},
+		)
+		if applied && pulseErr == nil {
 			hello.RepaintPulse = false
 		}
 	}
@@ -209,6 +230,10 @@ func (server *Server) serveConnection(connection net.Conn) {
 	}
 	workerHello, _ := protocol.JSONFrame(protocol.Hello, hello)
 	if err := protocol.NewWriter(worker).Write(workerHello); err != nil {
+		return
+	}
+	if hello.EventOnly && hello.BindAgent {
+		server.forwardAuthenticatedAgentEvents(connection, worker, manifest)
 		return
 	}
 	// Current workers capture transcript events themselves. Only compatibility
@@ -236,7 +261,7 @@ func (server *Server) serveConnection(connection net.Conn) {
 		completed <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(connection, worker)
+		_ = forwardTerminalReplay(connection, worker)
 		completed <- struct{}{}
 	}()
 	<-completed
@@ -246,6 +271,7 @@ type multiplexedSession struct {
 	connection       net.Conn
 	terminalOnly     bool
 	durableSessionID string
+	clientID         string
 	outbound         chan protocol.Frame
 	closed           chan struct{}
 	closeOnce        sync.Once
@@ -254,6 +280,39 @@ type multiplexedSession struct {
 	viewportCommitV2 bool
 	manifestCached   bool
 	manifest         workerManifest
+}
+
+// One active legacy repaint and one replaceable pending repaint per durable
+// worker. Slow TUIs cannot accumulate a goroutine for every drag-resize frame.
+type latestViewportQueue struct {
+	mu      sync.Mutex
+	pending func()
+	running bool
+}
+
+func (queue *latestViewportQueue) submit(work func()) {
+	queue.mu.Lock()
+	queue.pending = work
+	if !queue.running {
+		queue.running = true
+		go queue.run()
+	}
+	queue.mu.Unlock()
+}
+
+func (queue *latestViewportQueue) run() {
+	for {
+		queue.mu.Lock()
+		work := queue.pending
+		queue.pending = nil
+		if work == nil {
+			queue.running = false
+			queue.mu.Unlock()
+			return
+		}
+		queue.mu.Unlock()
+		work()
+	}
 }
 
 func newMultiplexedSession(
@@ -370,11 +429,12 @@ func (session *multiplexedSession) compatibilityManifest(path string) (workerMan
 // so authentication, replay, compatibility, and worker isolation retain one
 // implementation instead of growing a parallel code path.
 func (server *Server) serveNodeMultiplex(connection net.Conn) {
-	writer := protocol.NewWriter(connection)
+	writer := protocol.NewScheduledWriter(connection)
+	reader := protocol.NewFragmentReader(connection)
 	ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
 		State: "ready", Version: server.buildVersion,
 		ProtocolVersion: server.protocolVersion, SupervisorPID: os.Getpid(),
-		Capabilities: []string{"node_mux_v1", "node_mux_v2", "viewport_commit_compat_v1", "viewport_commit_compat_v2"},
+		Capabilities: []string{"wire_fragments_v1", "node_scheduling_v1", "host_rpc_v1", "node_mux_v1", "node_mux_v2", "viewport_commit_compat_v1", "viewport_commit_compat_v2"},
 	})
 	if writer.Write(ready) != nil {
 		return
@@ -407,9 +467,20 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 	}()
 
 	for {
-		envelope, err := protocol.ReadFrame(connection)
+		envelope, err := reader.Read()
 		if err != nil {
 			return
+		}
+		if envelope.Type == protocol.Capabilities {
+			var negotiation struct {
+				WireFragments bool `json:"wire_fragments"`
+			}
+			if protocol.DecodeJSON(envelope, &negotiation) != nil || !negotiation.WireFragments {
+				return
+			}
+			reader.Enabled = true
+			writer.EnableFragments()
+			continue
 		}
 		// Node-level heartbeat frames stay outside virtual pane envelopes. This
 		// lets one low-rate probe measure the shared SSH/multiplex path instead of
@@ -418,6 +489,10 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 			if writer.Write(protocol.Frame{Type: protocol.Pong, Payload: envelope.Payload}) != nil {
 				return
 			}
+			continue
+		}
+		if envelope.Type == protocol.HostRequest {
+			go server.serveHostRPC(writer, envelope)
 			continue
 		}
 		sessionID, inner, err := protocol.ParseHostEvent(envelope)
@@ -444,6 +519,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 			}
 			clientSide, serverSide := net.Pipe()
 			virtual := newMultiplexedSession(clientSide, hello.TerminalOnly, hello.SessionID)
+			virtual.clientID = hello.ClientID
 			sessionsMu.Lock()
 			previous := sessions[sessionID]
 			sessions[sessionID] = virtual
@@ -471,9 +547,13 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 						_ = writer.Write(protocol.HostEventFrame(id, status))
 					}
 				}()
+				batch := terminalReplayBatch{emit: func(frame protocol.Frame) error {
+					return writer.Write(protocol.HostEventFrame(id, frame))
+				}}
 				for {
 					frame, readErr := protocol.ReadFrame(session.connection)
 					if readErr != nil {
+						_ = batch.flush()
 						return
 					}
 					session.observeWorkerFrame(frame)
@@ -483,7 +563,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 					if session.terminalOnly && frame.Type == protocol.AgentEvent {
 						continue
 					}
-					if writer.Write(protocol.HostEventFrame(id, frame)) != nil {
+					if batch.write(frame) != nil {
 						return
 					}
 				}
@@ -522,22 +602,35 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 				}
 				generation, cols, rows, parseErr := protocol.ParseViewportCommit(inner)
 				if parseErr == nil {
+					// Client generations are scoped to a route and may restart on
+					// reconnect. Use a server-assigned ticket across all routes of
+					// this durable worker to order their actual PTY mutations.
+					ticket := server.legacyViewportTicket(manifest.SessionID).Add(1)
 					// A freshly installed supervisor can repair presentation for
 					// durable workers created by an older relayd. Run this outside
 					// the node read loop so one slow TUI repaint never stalls the
 					// other multiplexed panes or their heartbeat.
-					go func(routeID string, worker workerManifest) {
-						workerLock := server.workerLock(worker.SessionID)
-						workerLock.Lock()
-						repaintSequence, commitErr := commitLegacyWorkerViewport(worker, cols, rows)
-						workerLock.Unlock()
-						if commitErr != nil {
+					server.legacyViewportQueue(manifest.SessionID).submit(func() {
+						routeID, worker := sessionID, manifest
+						repaintSequence, applied, commitErr := server.applyLatestLegacyViewport(
+							worker.SessionID, ticket, func() (uint64, error) {
+								return commitLegacyWorkerViewport(worker, cols, rows, virtual.clientID)
+							},
+						)
+						if commitErr != nil || !applied ||
+							ticket != server.legacyViewportTicket(worker.SessionID).Load() {
+							return
+						}
+						sessionsMu.Lock()
+						currentRoute := sessions[routeID] == virtual
+						sessionsMu.Unlock()
+						if !currentRoute {
 							return
 						}
 						_ = writer.Write(protocol.HostEventFrame(
 							routeID, protocol.ViewportAckFrame(generation, repaintSequence),
 						))
-					}(sessionID, manifest)
+					})
 					continue
 				}
 			}
@@ -638,12 +731,26 @@ func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest,
 	workerLock.Lock()
 	defer workerLock.Unlock()
 	manifestPath := server.manifestPath(hello.SessionID)
+	rotationClaimed := false
+	if _, claimErr := os.Lstat(filepath.Join(server.stateDir, "rotation-launches", hello.SessionID+".json")); claimErr == nil {
+		rotationClaimed = true
+		if _, manifestErr := os.Lstat(manifestPath); errors.Is(manifestErr, os.ErrNotExist) {
+			return workerManifest{}, errors.New("rotation pane launch is ambiguous; ordinary attach cannot start it")
+		}
+	} else if !errors.Is(claimErr, os.ErrNotExist) {
+		return workerManifest{}, errors.New("rotation pane claim is unreadable")
+	}
 	if manifest, err := loadManifest(manifestPath); err == nil {
 		if state, liveErr := server.workerState(manifest); liveErr == nil && state == "ready" {
 			return manifest, nil
+		} else if rotationClaimed {
+			return workerManifest{}, errors.New("controlled rotation pane cannot be restarted or replaced")
 		} else if manifestPath == server.recoveredManifestPath(hello.SessionID) {
 			return workerManifest{}, fmt.Errorf("recovered pane worker %d is unavailable; retry or explicitly recover another worker", manifest.WorkerPID)
 		} else if liveErr == nil && state == "exited" {
+			if hello.RequireExistingWorker {
+				return workerManifest{}, fmt.Errorf("saved pane worker %d has exited; no replacement was started", manifest.WorkerPID)
+			}
 			server.stopValidatedWorker(manifest)
 		} else if identityErr := validateWorkerIdentity(manifest); identityErr == nil {
 			// A slow handshake is not evidence that the PTY owner died. In
@@ -652,7 +759,12 @@ func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest,
 			// would orphan that terminal and create another shell with the same ID.
 			return workerManifest{}, fmt.Errorf("pane worker %d is still alive but unavailable; retry attachment: %v", manifest.WorkerPID, liveErr)
 		}
+		if hello.RequireExistingWorker {
+			return workerManifest{}, fmt.Errorf("saved pane worker %d cannot be validated; no replacement was started", manifest.WorkerPID)
+		}
 		server.cleanStaleWorker(manifestPath, manifest)
+	} else if rotationClaimed {
+		return workerManifest{}, errors.New("controlled rotation pane metadata is unavailable")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		// Preserve recovery metadata on unreadable/corrupt files. Starting a
 		// replacement without knowing the old owner's identity can fork a pane.
@@ -661,12 +773,38 @@ func (server *Server) ensureWorker(hello protocol.HelloPayload) (workerManifest,
 	if hello.EventOnly || hello.ObserveEvents {
 		return workerManifest{}, errors.New("Relay pane worker is not running")
 	}
+	if hello.RequireExistingWorker {
+		return workerManifest{}, errors.New("saved pane worker is missing; no replacement was started")
+	}
 	return server.startWorker(hello, manifestPath)
 }
 
 func (server *Server) workerLock(sessionID string) *sync.Mutex {
 	lock, _ := server.workerLocks.LoadOrStore(sessionID, &sync.Mutex{})
 	return lock.(*sync.Mutex)
+}
+
+func (server *Server) legacyViewportTicket(sessionID string) *atomic.Uint64 {
+	ticket, _ := server.legacyViewportTickets.LoadOrStore(sessionID, &atomic.Uint64{})
+	return ticket.(*atomic.Uint64)
+}
+
+func (server *Server) legacyViewportQueue(sessionID string) *latestViewportQueue {
+	queue, _ := server.legacyViewportQueues.LoadOrStore(sessionID, &latestViewportQueue{})
+	return queue.(*latestViewportQueue)
+}
+
+func (server *Server) applyLatestLegacyViewport(
+	sessionID string, ticket uint64, apply func() (uint64, error),
+) (uint64, bool, error) {
+	lock := server.workerLock(sessionID)
+	lock.Lock()
+	defer lock.Unlock()
+	if ticket != server.legacyViewportTicket(sessionID).Load() {
+		return 0, false, nil
+	}
+	sequence, err := apply()
+	return sequence, true, err
 }
 
 func (server *Server) workerState(manifest workerManifest) (string, error) {
@@ -703,6 +841,9 @@ func (server *Server) startWorker(hello protocol.HelloPayload, manifestPath stri
 		return workerManifest{}, err
 	}
 	workingDirectory := server.parentWorkingDirectory(hello.ParentSessionID)
+	if hello.WorkingDirectory != "" {
+		workingDirectory = hello.WorkingDirectory
+	}
 	socketPath := server.workerSocketPath(hello.SessionID, token)
 	logDir := filepath.Join(server.stateDir, "logs")
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
@@ -724,6 +865,9 @@ func (server *Server) startWorker(hello protocol.HelloPayload, manifestPath stri
 	workerEnvironment := append(os.Environ(), "RELAY_WORKER_TOKEN="+token)
 	if hello.Command != "" {
 		workerEnvironment = append(workerEnvironment, "RELAY_WORKER_COMMAND_B64="+base64.StdEncoding.EncodeToString([]byte(hello.Command)))
+	}
+	if hello.RotationControlled {
+		workerEnvironment = append(workerEnvironment, "RELAY_ROTATION_WORKER=1")
 	}
 	if workingDirectory != "" {
 		workerEnvironment = append(workerEnvironment, "RELAY_WORKER_CWD_B64="+base64.StdEncoding.EncodeToString([]byte(workingDirectory)))

@@ -241,35 +241,49 @@ extension NSUserInterfaceItemIdentifier {
 
 struct RelayWorkspaceWindowMarker: NSViewRepresentable {
     final class MarkerView: NSView {
+        private var configurationScheduled = false
+        private weak var configuredWindow: NSWindow?
+
+        func scheduleConfiguration() {
+            guard window != nil, configuredWindow !== window, !configurationScheduled else { return }
+            configurationScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.configurationScheduled = false
+                guard let window = self.window, self.configuredWindow !== window else { return }
+                self.configureWindow()
+                self.configuredWindow = window
+                NotificationCenter.default.post(name: .relayWorkspaceWindowConfigured, object: window)
+            }
+        }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            configureWindow()
+            scheduleConfiguration()
         }
 
         func configureWindow() {
             guard let window else { return }
             window.identifier = .relayWorkspaceWindow
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
-            window.styleMask.insert(.fullSizeContentView)
+            RecoveryWindowRegistry.shared.register(window)
+            RelayToolSurface.configure(window)
             // Full-size content includes terminals, editors, image previews,
             // floating panes, and resize handles. Treating all of it as window
             // background lets AppKit steal their drags. WorkspaceBar provides
             // the one explicit drag region for moving the macOS window.
             window.isMovableByWindowBackground = false
-            // Relay draws stable, high-contrast controls inside its unified
-            // title bar. The native buttons become nearly black under
-            // hiddenTitleBar + dark appearance and remain in the hit-testing
-            // path even when visually absent, so remove that duplicate set.
+            // Use AppKit's real traffic lights. A custom SwiftUI control layer
+            // across the workspace obscures native accessibility geometry and
+            // can receive an activation click intended for terminal input.
+            // Keep one control set with native roles, bounds and hit testing.
             for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-                window.standardWindowButton(kind)?.isHidden = true
+                window.standardWindowButton(kind)?.isHidden = false
             }
         }
     }
 
     func makeNSView(context: Context) -> NSView { MarkerView(frame: .zero) }
     func updateNSView(_ nsView: NSView, context: Context) {
-        (nsView as? MarkerView)?.configureWindow()
+        (nsView as? MarkerView)?.scheduleConfiguration()
     }
 }
 

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 3,
+  "id": "relay.vpn",
+  "name": "VPN",
+  "version": "0.1.0",
+  "repository": "genomewalker/relay-plugin-vpn",
+  "permissions": [
+    {
+      "kind": "network",
+      "reason": "Read Cisco VPN state, request temporary OpenConnect login input and disconnect Cisco only when requested. Login details are never stored."
+    }
+  ],
+  "contributions": [
+    {
+      "id": "main",
+      "kind": "tool",
+      "title": "VPN",
+      "text": "Native OpenConnect sign-in, Cisco VPN controls and sleep recovery checks.",
+      "operation": "vpn"
+    }
+  ]
+}

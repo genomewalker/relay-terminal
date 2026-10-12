@@ -1,0 +1,86 @@
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -178,6 +178,11 @@
+         self.clear_guardian_review_status();
+         self.turn_lifecycle.finish();
+         self.clear_safety_buffering();
++        if !from_replay {
++            // A completed live turn no longer owns its retry prompt. Queued follow-up
++            // input can install its own prompt below without losing that new input.
++            self.safety_buffering_prompt = None;
++        }
+         self.update_task_running_state();
+         self.running_commands.clear();
+         self.suppressed_exec_calls.clear();
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -2113,3 +2113,67 @@
+         super::helpers::render_bottom_popup(&chat, /*width*/ 80)
+     );
+ }
++
++#[tokio::test]
++async fn frontend_rotation_live_completion_retires_expired_retry_prompt() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
++    assert_eq!(
++        chat.safety_buffering_prompt,
++        Some(UserMessage::from("Explain the request"))
++    );
++    assert!(!chat.rotation_input_ready(turn_id));
++
++    // This manual backend has not echoed the submitted user message. Completion
++    // must retire its retry prompt while retaining the independent input guard.
++    let pending_client_id = chat.input_queue.pending_user_message_client_id.clone();
++    assert!(pending_client_id.is_some());
++    handle_turn_completed(&mut chat, turn_id, /*duration_ms*/ None);
++
++    assert_eq!(chat.safety_buffering_prompt, None);
++    assert_eq!(
++        chat.input_queue.pending_user_message_client_id,
++        pending_client_id
++    );
++    assert_eq!(
++        chat.rotation_input_blocker(turn_id),
++        Some("widget: input_queue.pending_user_message_client_id.is_none()")
++    );
++    chat.handle_server_notification(
++        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
++            thread_id,
++            turn_id,
++            Some("faster-model"),
++        )),
++        /*replay_kind*/ None,
++    );
++    assert!(!chat.can_retry_safety_buffered_turn(turn_id));
++    assert_eq!(
++        chat.rotation_input_blocker(turn_id),
++        Some("widget: input_queue.pending_user_message_client_id.is_none()")
++    );
++}
++
++#[tokio::test]
++async fn frontend_rotation_completion_retains_new_queued_retry_prompt() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let (_thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
++    chat.input_queue
++        .queued_user_messages
++        .push_back(QueuedUserMessage::from(UserMessage::from(
++            "next human prompt",
++        )));
++    chat.input_queue
++        .queued_user_message_history_records
++        .push_back(UserMessageHistoryRecord::UserMessageText);
++
++    handle_turn_completed(&mut chat, turn_id, /*duration_ms*/ None);
++
++    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
++    assert_eq!(
++        chat.safety_buffering_prompt,
++        Some(UserMessage::from("next human prompt"))
++    );
++    assert!(chat.input_queue.user_turn_pending_start);
++    assert!(!chat.rotation_input_ready(turn_id));
++}

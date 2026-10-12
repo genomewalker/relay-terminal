@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:47471; img-src 'self' data:">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:__RELAY_SIDE_PANEL_PORT__; img-src 'self' data:">
   <link rel="stylesheet" href="/xterm/xterm.css">
   <title>Relay</title>
   <style>
@@ -371,7 +371,7 @@
   function connectTerminal(paneID) {
     disconnectTerminal();
     socketPaneID = paneID; term.reset(); terminalState.textContent = 'Connecting';
-    const next = new WebSocket(`ws://127.0.0.1:47471/api/panes/${paneID}/terminal`, ['relay-v1', token]);
+    const next = new WebSocket(`ws://127.0.0.1:__RELAY_SIDE_PANEL_PORT__/api/panes/${paneID}/terminal`, ['relay-v1', token]);
     next.binaryType = 'arraybuffer'; socket = next;
     next.onopen = () => {
       if (socket !== next) return;

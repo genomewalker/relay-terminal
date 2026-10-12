@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 2,
+  "id": "relay.git-review",
+  "name": "Git review",
+  "version": "0.1.0",
+  "repository": "genomewalker/relay-plugin-git-review",
+  "permissions": [
+    {
+      "kind": "projectRead",
+      "reason": "Inspect tracked file status, staged changes and unstaged changes within the approved directory."
+    }
+  ],
+  "contributions": [
+    {
+      "id": "main",
+      "kind": "tool",
+      "title": "Git review",
+      "text": "Inspect tracked file status, staged changes and unstaged changes within the approved directory.",
+      "operation": "gitReview"
+    }
+  ]
+}

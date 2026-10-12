@@ -83,6 +83,8 @@ struct RemoteSessionRecord: Identifiable, Sendable {
     }
     var label: String {
         if isUnfiled { return panes.first?.title ?? "Recovered pane" }
+        if let id = workspaceID.flatMap(UUID.init(uuidString:)),
+           let name = workspaceSnapshot?.sessionNames?[id], !name.isEmpty { return name }
         return panes.first(where: { !($0.title ?? "").isEmpty })?.title ?? "Remote session"
     }
 }
@@ -108,81 +110,24 @@ enum RemoteCatalogError: LocalizedError {
 
 enum RemoteCatalogService {
     static func load(profile: ConnectionProfile) async throws -> RemoteCatalogSnapshot {
-        try await Task.detached(priority: .userInitiated) {
-            let ssh = Process()
-            let output = Pipe()
-            let errors = Pipe()
-            ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            ssh.arguments = [
-                "-T",
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=8",
-                "-o", "ControlMaster=auto",
-                "-o", "ControlPersist=10m",
-                "-o", "ControlPath=~/.ssh/relay-%C",
-            ] + profile.sshConnectionArguments + ["~/.local/bin/relayd", "sessions"]
-            ssh.standardOutput = output
-            ssh.standardError = errors
-            let captured: CapturedProcessOutput
-            do {
-                captured = try ProcessCapture.run(ssh, output: output, errors: errors, timeout: 12)
-            } catch {
-                throw RemoteCatalogError.failed(error.localizedDescription)
-            }
-            let data = captured.standardOutput
-            let errorData = captured.standardError
-            guard ssh.terminationStatus == 0 else {
-                let message = String(data: errorData, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if SSHConnectionFailure.diagnose(
-                    message ?? "",
-                    terminationStatus: ssh.terminationStatus
-                ).kind == .networkRoute {
-                    throw RemoteCatalogError.networkUnavailable
-                }
-                throw RemoteCatalogError.failed(message?.isEmpty == false ? message! : "Could not read remote sessions.")
-            }
-            guard let snapshot = try? JSONDecoder().decode(RemoteCatalogSnapshot.self, from: data),
-                  snapshot.schema == 1 else {
-                throw RemoteCatalogError.invalidResponse
-            }
-            return snapshot
-        }.value
+        let captured = try await RelayHostExecution.capture(profile: profile,
+            command: RelayHostExecution.daemonCommand(profile: profile, arguments: ["sessions"]))
+        guard captured.exitCode == 0 else {
+            throw RemoteCatalogError.failed(String(data: captured.stderr, encoding: .utf8) ?? "Could not read Relay sessions")
+        }
+        guard let snapshot = try? JSONDecoder().decode(RemoteCatalogSnapshot.self, from: captured.stdout),
+              snapshot.schema == 1 else { throw RemoteCatalogError.invalidResponse }
+        return snapshot
     }
 }
 
 enum RemotePaneControlService {
     static func terminate(profile: ConnectionProfile, paneID: UUID) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            let ssh = Process()
-            let output = Pipe()
-            let errors = Pipe()
-            ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            ssh.arguments = [
-                "-T",
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=8",
-                "-o", "ControlMaster=auto",
-                "-o", "ControlPersist=10m",
-                "-o", "ControlPath=~/.ssh/relay-%C",
-            ] + profile.sshConnectionArguments + [
-                "~/.local/bin/relayd", "terminate",
-                "--session", paneID.uuidString.lowercased(), "--forget",
-            ]
-            ssh.standardOutput = output
-            ssh.standardError = errors
-            let captured: CapturedProcessOutput
-            do {
-                captured = try ProcessCapture.run(ssh, output: output, errors: errors, timeout: 12)
-            } catch {
-                throw RemoteCatalogError.failed(error.localizedDescription)
-            }
-            let errorData = captured.standardError
-            guard ssh.terminationStatus == 0 else {
-                let message = String(data: errorData, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                throw RemoteCatalogError.failed(message?.isEmpty == false ? message! : "Could not terminate the remote pane.")
-            }
-        }.value
+        let captured = try await RelayHostExecution.capture(profile: profile,
+            command: RelayHostExecution.daemonCommand(profile: profile,
+                arguments: ["terminate", "--session", paneID.uuidString.lowercased(), "--forget"]))
+        guard captured.exitCode == 0 else {
+            throw RemoteCatalogError.failed(String(data: captured.stderr, encoding: .utf8) ?? "Could not terminate the remote pane")
+        }
     }
 }

@@ -7,16 +7,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
 type codexTranscriptReader struct {
 	rootPID             int
+	rootStart           uint64
 	path                string
 	offset              int64
 	known               map[string]bool
@@ -26,20 +25,26 @@ type codexTranscriptReader struct {
 }
 
 func (reader *codexTranscriptReader) poll(frames chan<- protocol.Frame, stopped <-chan struct{}) bool {
-	path := reader.path
-	if path == "" {
-		path = codexRootTranscript(reader.rootPID)
+	path := codexRootTranscript(reader.rootPID)
+	if path != reader.path {
+		reader.path = path
+		reader.offset = 0
+		reader.identity = [2]uint64{}
+		reader.discardingOversized = false
+		reader.known = make(map[string]bool)
+		reader.active = make(map[string]bool)
 	}
 	if path == "" {
 		return true
 	}
-	if path != reader.path {
-		reader.path = path
-		reader.offset = 0
-	}
 	cancelled := false
 	readTranscriptLines(path, &reader.offset, &reader.discardingOversized, &reader.identity, func(line []byte) {
 		if cancelled {
+			return
+		}
+		// Do not emit buffered activity after the producer exited or PID reuse.
+		start, err := processStartTime(reader.rootPID)
+		if err != nil || start != reader.rootStart {
 			return
 		}
 		for _, event := range codexTranscriptEvents(line) {
@@ -80,18 +85,19 @@ type codexTranscriptEnvelope struct {
 }
 
 type codexTranscriptEvent struct {
-	HookEventName string `json:"hook_event_name"`
-	AgentID       string `json:"agent_id"`
-	AgentType     string `json:"agent_type,omitempty"`
-	ThreadID      string `json:"thread_id,omitempty"`
-	Message       string `json:"message,omitempty"`
-	OccurredAt    string `json:"occurred_at,omitempty"`
-	Source        string `json:"source"`
-	FromPeerID    string `json:"from_peer_id,omitempty"`
-	ToPeerID      string `json:"to_peer_id,omitempty"`
-	MessageType   string `json:"message_type,omitempty"`
-	Delivery      string `json:"delivery,omitempty"`
-	Status        string `json:"status,omitempty"`
+	Plan          []taskPlanStep `json:"plan"`
+	HookEventName string         `json:"hook_event_name"`
+	AgentID       string         `json:"agent_id"`
+	AgentType     string         `json:"agent_type,omitempty"`
+	ThreadID      string         `json:"thread_id,omitempty"`
+	Message       string         `json:"message,omitempty"`
+	OccurredAt    string         `json:"occurred_at,omitempty"`
+	Source        string         `json:"source"`
+	FromPeerID    string         `json:"from_peer_id,omitempty"`
+	ToPeerID      string         `json:"to_peer_id,omitempty"`
+	MessageType   string         `json:"message_type,omitempty"`
+	Delivery      string         `json:"delivery,omitempty"`
+	Status        string         `json:"status,omitempty"`
 }
 
 func transcriptEventIdentifier(event codexTranscriptEnvelope) string {
@@ -109,6 +115,23 @@ func codexTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 	}
 	if json.Unmarshal(line, &row) != nil {
 		return nil
+	}
+	if row.Type == "event_msg" {
+		var plan struct {
+			Type     string         `json:"type"`
+			Plan     []taskPlanStep `json:"plan"`
+			ThreadID string         `json:"thread_id"`
+		}
+		if json.Unmarshal(row.Payload, &plan) == nil && plan.Type == "plan_update" && validTaskPlan(plan.Plan) {
+			owner := plan.ThreadID
+			if owner == "" {
+				owner = "root"
+			}
+			return []codexTranscriptEnvelope{{Agent: "codex", Event: codexTranscriptEvent{
+				HookEventName: "PlanUpdated", AgentID: owner, ThreadID: plan.ThreadID,
+				OccurredAt: row.Timestamp, Source: "codex-transcript", Plan: plan.Plan,
+			}}}
+		}
 	}
 	switch row.Type {
 	case "event_msg":
@@ -211,6 +234,28 @@ func codexTranscriptEvents(line []byte) []codexTranscriptEnvelope {
 	return nil
 }
 
+type taskPlanStep struct {
+	Step   string `json:"step"`
+	Status string `json:"status"`
+}
+
+func validTaskPlan(steps []taskPlanStep) bool {
+	if steps == nil || len(steps) > 100 {
+		return false
+	}
+	for _, step := range steps {
+		if strings.TrimSpace(step.Step) == "" || len(step.Step) > 2048 {
+			return false
+		}
+		switch step.Status {
+		case "pending", "in_progress", "completed":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 type codexTranscriptContent struct {
 	Text string `json:"text"`
 }
@@ -233,42 +278,46 @@ func codexCollaboratorMessage(text string) string {
 }
 
 func codexRootTranscript(pid int) string {
-	entries, err := os.ReadDir(filepath.Join("/proc", strconv.Itoa(pid), "fd"))
-	if err != nil {
+	return uniqueOpenProviderTranscript(pid, ".codex", "sessions", true)
+}
+
+// Exact open-descriptor discovery deliberately fails closed on ambiguity.
+func uniqueOpenProviderTranscript(pid int, provider, directory string, requireRoot bool) string {
+	start, err := processStartTime(pid)
+	if err != nil || start == 0 {
 		return ""
 	}
-	type candidate struct {
-		path    string
-		updated time.Time
-		root    bool
+	fdDirectory := filepath.Join("/proc", strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(fdDirectory)
+	if err != nil || len(entries) > 16384 {
+		return ""
 	}
-	candidates := make([]candidate, 0, len(entries))
 	seen := make(map[string]bool)
+	selected := ""
+	marker := string(filepath.Separator) + provider + string(filepath.Separator) + directory + string(filepath.Separator)
 	for _, entry := range entries {
-		target, readErr := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "fd", entry.Name()))
-		if readErr != nil || seen[target] || !strings.HasSuffix(target, ".jsonl") ||
-			!strings.Contains(target, string(filepath.Separator)+".codex"+string(filepath.Separator)+"sessions"+string(filepath.Separator)) {
+		target, readErr := os.Readlink(filepath.Join(fdDirectory, entry.Name()))
+		if readErr != nil || seen[target] || !strings.HasSuffix(target, ".jsonl") || !strings.Contains(target, marker) {
 			continue
 		}
 		seen[target] = true
-		info, statErr := os.Stat(target)
-		if statErr != nil {
+		info, statErr := os.Lstat(target)
+		if statErr != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		candidates = append(candidates, candidate{
-			path: target, updated: info.ModTime(), root: codexTranscriptIsRoot(target),
-		})
-	}
-	sort.Slice(candidates, func(left, right int) bool {
-		if candidates[left].root != candidates[right].root {
-			return candidates[left].root
+		if requireRoot && !codexTranscriptIsRoot(target) {
+			continue
 		}
-		return candidates[left].updated.After(candidates[right].updated)
-	})
-	if len(candidates) == 0 {
+		if selected != "" {
+			return ""
+		}
+		selected = target
+	}
+	current, err := processStartTime(pid)
+	if err != nil || current != start {
 		return ""
 	}
-	return candidates[0].path
+	return selected
 }
 
 func codexTranscriptIsRoot(path string) bool {

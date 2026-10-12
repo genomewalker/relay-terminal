@@ -13,12 +13,28 @@
   <div id="editor"></div>
   <div id="empty">Choose a file or run <code>&nbsp;rcode file&nbsp;</code> in a Relay terminal</div>
   <script src="vs/loader.js"></script>
+  <script src="r-language.js"></script>
   <script>
     const bridge = (type, data = {}) => window.webkit.messageHandlers.relay.postMessage({ type, ...data });
     let editor = null, diffEditor = null, currentModel = null, originalModel = null;
     let savedText = '', documentPayload = null, suppressDirty = false, lastDirty = false;
+    let savedVersion = 0, pendingSave = null, saveAgain = false, modelListener = null, viewState = null;
+    let rCompletionSerial = 0;
+    const rCompletionPending = new Map();
+    window.relayComplete = (id, value) => {
+      const complete = rCompletionPending.get(id);
+      rCompletionPending.delete(id);
+      if (complete) complete(value);
+    };
     require.config({ paths: { vs: 'vs' } });
     require(['vs/editor/editor.main'], function () {
+      RelayRLanguage.install(monaco, (type, topic) => new Promise(resolve => {
+        if (rCompletionPending.size >= 4) { resolve(null); return; }
+        const request = ++rCompletionSerial;
+        const timer = setTimeout(() => { rCompletionPending.delete(request); resolve(null); }, type === 'rCompletion' ? 1500 : 10000);
+        rCompletionPending.set(request, value => { clearTimeout(timer); resolve(value); });
+        bridge(type, {request, topic, documentID: documentPayload?.documentID});
+      }));
       monaco.editor.defineTheme('relay-dark', {
         base: 'vs-dark', inherit: true,
         rules: [
@@ -49,50 +65,265 @@
       padding: { top: 10, bottom: 10 }, renderWhitespace: 'selection', roundedSelection: false,
       scrollBeyondLastLine: false, wordWrap: 'off'
     };
-    function uriFor(path, suffix = '') { return monaco.Uri.parse('file://' + path + suffix); }
-    function disposeEditors() {
+    function uriFor(path, suffix = '') { return monaco.Uri.file(path + suffix); }
+    function disposeEditors(disposeModels = true) {
       if (editor) editor.dispose(); if (diffEditor) diffEditor.dispose();
-      if (currentModel) currentModel.dispose(); if (originalModel) originalModel.dispose();
-      editor = diffEditor = currentModel = originalModel = null;
+      if (originalModel) originalModel.dispose();
+      if (disposeModels) {
+        if (modelListener) modelListener.dispose();
+        if (currentModel) currentModel.dispose();
+        currentModel = modelListener = null;
+      }
+      editor = diffEditor = originalModel = null;
+    }
+    function reportDirty() {
+      const dirty = !!currentModel && currentModel.getAlternativeVersionId() !== savedVersion;
+      if (dirty !== lastDirty) {
+        lastDirty = dirty;
+        bridge('dirty', { dirty, documentID: documentPayload.documentID });
+      }
     }
     function installCommands(instance) {
       instance.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => relayRequestSave());
-      const modified = instance.getModifiedEditor ? instance.getModifiedEditor() : instance;
-      modified.onDidChangeModelContent(() => {
-        if (suppressDirty) return;
-        const dirty = modified.getValue() !== savedText;
-        if (dirty !== lastDirty) { lastDirty = dirty; bridge('dirty', { dirty }); }
+      const target = instance.getModifiedEditor ? instance.getModifiedEditor() : instance;
+      // Handle the secondary press before WebKit starts its native menu tracking.
+      // Keep Monaco's menu/actions, including selection-sensitive clipboard tools.
+      const surface = target.getDomNode();
+      let secondaryMenu = false;
+      surface.addEventListener('mousedown', event => {
+        if (event.button !== 2 && !(event.button === 0 && event.ctrlKey)) return;
+        if (event.target.closest('.context-view, .suggest-widget')) return;
+        const hit = target.getTargetAtClientPoint(event.clientX, event.clientY);
+        if (!hit || ![monaco.editor.MouseTargetType.CONTENT_TEXT,
+            monaco.editor.MouseTargetType.CONTENT_EMPTY,
+            monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS].includes(hit.type)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        secondaryMenu = true;
+        target.focus();
+        if (hit.position && !target.getSelections().some(selection => selection.containsPosition(hit.position)))
+          target.setPosition(hit.position);
+        target.getAction('editor.action.showContextMenu').run();
+      }, true);
+      surface.addEventListener('contextmenu', event => {
+        if (!secondaryMenu) return;
+        secondaryMenu = false;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }, true);
+      surface.addEventListener('mouseup', () => { setTimeout(() => { secondaryMenu = false; }, 0); }, true);
+      for (const [method, label] of [['format', 'Format R document'], ['lint', 'Check R code']]) {
+        target.addAction({ id: 'relay.r.' + method, label,
+          contextMenuGroupId: 'navigation', contextMenuOrder: 2,
+          precondition: 'editorLangId == r && !editorReadonly',
+          run: () => {
+            if (!diffEditor && currentModel && currentModel.getValueLength() <= 262144)
+              bridge('rEditorTool', { method, code: currentModel.getValue(), documentID: documentPayload.documentID });
+          }
+        });
+      }
+      target.addAction({
+        id: 'relay.r.help', label: 'Open R Help',
+        contextMenuGroupId: 'navigation', contextMenuOrder: 3,
+        precondition: 'editorLangId == r',
+        run: () => {
+          if (!currentModel || diffEditor) return;
+          const selection = target.getSelection();
+          const word = currentModel.getWordAtPosition(target.getPosition());
+          const topic = selection && !selection.isEmpty()
+            ? currentModel.getValueInRange(selection).trim() : word?.word;
+          if (topic && topic.length <= 512)
+            bridge('rHelp', {topic, documentID: documentPayload.documentID});
+        }
       });
+      target.addAction({
+        id: 'relay.runRSelection', label: 'Run R Selection / Current Line in Linked Console',
+        keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
+        contextMenuGroupId: 'navigation', contextMenuOrder: 1.5,
+        precondition: 'editorLangId == r && !editorReadonly',
+        run: () => {
+          if (diffEditor || !currentModel || currentModel.getLanguageId() !== 'r') return;
+          const selection = target.getSelection();
+          if (!selection) return;
+          const code = selection.isEmpty() ? currentModel.getLineContent(selection.startLineNumber)
+            : currentModel.getValueInRange(selection);
+          if (code.trim()) bridge('runCode', { code, documentID: documentPayload.documentID,
+            advanceLine: selection.isEmpty() ? selection.startLineNumber : null });
+        }
+      });
+      target.addAction({
+        id: 'relay.runRFile', label: 'Run Full R File in Linked Console',
+        keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter],
+        contextMenuGroupId: 'navigation', contextMenuOrder: 1.6,
+        precondition: 'editorLangId == r && !editorReadonly',
+        run: () => {
+          if (diffEditor || !currentModel || currentModel.getLanguageId() !== 'r') return;
+          const range = currentModel.getFullModelRange();
+          const code = currentModel.getValue();
+          if (!code.trim()) return;
+          target.setSelection(range);
+          target.revealRangeInCenterIfOutsideViewport(range);
+          bridge('runCode', {code, documentID: documentPayload.documentID});
+        }
+      });
+      target.onDidFocusEditorText(() => bridge('focus'));
     }
+    window.relaySelectForMCP = (request) => {
+      if (!editor || diffEditor || !currentModel || documentPayload.documentID !== request.documentID ||
+          currentModel.getValue() !== request.expectedContent) throw new Error('Editor document changed; read it again');
+      const r = request.range;
+      if (![r.startLineNumber, r.startColumn, r.endLineNumber, r.endColumn].every(Number.isInteger) ||
+          r.startLineNumber < 1 || r.endLineNumber < r.startLineNumber || r.endLineNumber > currentModel.getLineCount() ||
+          r.startColumn < 1 || r.endColumn < 1 ||
+          r.startColumn > currentModel.getLineMaxColumn(r.startLineNumber) ||
+          r.endColumn > currentModel.getLineMaxColumn(r.endLineNumber) ||
+          (r.startLineNumber === r.endLineNumber && r.endColumn <= r.startColumn)) throw new Error('Invalid or empty range');
+      const range = new monaco.Range(r.startLineNumber, r.startColumn, r.endLineNumber, r.endColumn);
+      const code = currentModel.getValueInRange(range);
+      if (!code.trim() || new TextEncoder().encode(code).length > 65536) throw new Error('Select a nonempty chunk up to 64 KiB');
+      return {documentID: request.documentID, range: r, code, modelVersion: currentModel.getVersionId()};
+    };
+    window.relayEditForMCP = (request) => {
+      if (!editor || diffEditor || !currentModel || pendingSave || documentPayload.documentID !== request.documentID ||
+          currentModel.getValue() !== request.expectedContent) throw new Error('Editor document changed; read it again');
+      if (request.save) {
+        pendingSave = {content: currentModel.getValue(), version: currentModel.getAlternativeVersionId(), documentID: request.documentID};
+        return pendingSave.content;
+      }
+      const r = request.range;
+      if (![r.startLineNumber, r.startColumn, r.endLineNumber, r.endColumn].every(Number.isInteger) ||
+          r.startLineNumber < 1 || r.endLineNumber < r.startLineNumber || r.endLineNumber > currentModel.getLineCount() ||
+          r.startColumn < 1 || r.endColumn < 1 || r.startColumn > currentModel.getLineMaxColumn(r.startLineNumber) ||
+          r.endColumn > currentModel.getLineMaxColumn(r.endLineNumber) ||
+          (r.startLineNumber === r.endLineNumber && r.endColumn < r.startColumn)) throw new Error('Invalid editor range');
+      const range = new monaco.Range(r.startLineNumber, r.startColumn, r.endLineNumber, r.endColumn);
+      const before = currentModel.getValue();
+      const start = currentModel.getOffsetAt(range.getStartPosition());
+      const end = currentModel.getOffsetAt(range.getEndPosition());
+      const next = before.slice(0, start) + request.text + before.slice(end);
+      if (new TextEncoder().encode(next).length > 65536) throw new Error('Resulting document exceeds the editing limit');
+      editor.pushUndoStop();
+      editor.executeEdits('relay.mcp', [{range, text: request.text, forceMoveMarkers: true}]);
+      editor.pushUndoStop();
+      return currentModel.getValue();
+    };
+    window.relayPaste = (text, documentID) => {
+      if (!editor || diffEditor || !currentModel || documentPayload.documentID !== documentID) return;
+      editor.pushUndoStop();
+      editor.trigger('relay.clipboard', 'type', {text});
+      editor.pushUndoStop();
+    };
+    window.relayApplyRTool = (method, result) => {
+      if (!editor || diffEditor || !currentModel) return;
+      if (method === 'format' && typeof result.text === 'string') {
+        editor.pushUndoStop();
+        editor.executeEdits('relay.format', [{range: currentModel.getFullModelRange(), text: result.text}]);
+        editor.pushUndoStop();
+      } else if (method === 'lint' && Array.isArray(result.diagnostics)) {
+        monaco.editor.setModelMarkers(currentModel, 'relay-r', result.diagnostics.map(d => ({
+          startLineNumber: Math.max(1, d.line), endLineNumber: Math.max(1, d.line),
+          startColumn: Math.max(1, d.column), endColumn: Math.max(1, d.column) + 1,
+          message: d.message, source: 'lintr',
+          severity: d.type === 'error' ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning
+        })));
+      }
+    };
     function openSingle(payload) {
-      disposeEditors();
-      currentModel = monaco.editor.createModel(payload.content, payload.language, uriFor(payload.path));
+      disposeEditors(false);
       editor = monaco.editor.create(document.getElementById('editor'), { ...options, model: currentModel });
       installCommands(editor); editor.focus();
     }
     function openDiff(payload) {
-      disposeEditors();
+      disposeEditors(false);
       originalModel = monaco.editor.createModel(payload.original || '', payload.language, uriFor(payload.path, '.relay-original'));
-      currentModel = monaco.editor.createModel(payload.content, payload.language, uriFor(payload.path));
       diffEditor = monaco.editor.createDiffEditor(document.getElementById('editor'), { ...options, renderSideBySide: true });
       diffEditor.setModel({ original: originalModel, modified: currentModel });
       installCommands(diffEditor); diffEditor.getModifiedEditor().focus();
     }
     window.relayOpenDocument = function (payload) {
+      disposeEditors();
+      pendingSave = null; saveAgain = false; viewState = null;
       documentPayload = payload; savedText = payload.content; suppressDirty = true;
+      currentModel = monaco.editor.createModel(payload.content, payload.language, uriFor(payload.path));
+      savedVersion = currentModel.getAlternativeVersionId();
+      modelListener = currentModel.onDidChangeContent(() => {
+        if (!suppressDirty) {
+          bridge('edited', { documentID: documentPayload.documentID, content: currentModel.getValue() });
+          reportDirty();
+        }
+      });
       payload.diff ? openDiff(payload) : openSingle(payload);
       suppressDirty = false; document.body.classList.add('ready');
-      lastDirty = false; bridge('dirty', { dirty: false }); bridge('mode', { diff: !!payload.diff });
+      lastDirty = false; bridge('dirty', { dirty: false, documentID: payload.documentID }); bridge('mode', { diff: !!payload.diff });
+      if (typeof payload.recoveredContent === 'string' && payload.recoveredContent !== payload.content) {
+        currentModel.pushEditOperations([], [{range:currentModel.getFullModelRange(),text:payload.recoveredContent}], () => null);
+        reportDirty();
+      }
+      window.relayLayout();
+      const target = diffEditor ? diffEditor.getModifiedEditor() : editor;
+      if (target && payload.viewState) target.restoreViewState(payload.viewState);
+      if (target) {
+        let timer = null;
+        const remember = () => {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            if (documentPayload?.documentID !== payload.documentID) return;
+            bridge('viewState', {documentID: payload.documentID, viewState: target.saveViewState()});
+          }, 150);
+        };
+        target.onDidChangeCursorSelection(remember);
+        target.onDidScrollChange(remember);
+      }
+    };
+    window.relayRefreshFromDisk = function (request) {
+      if (!editor || diffEditor || !currentModel || pendingSave ||
+          documentPayload.documentID !== request.documentID ||
+          currentModel.getAlternativeVersionId() !== savedVersion ||
+          currentModel.getValue() !== request.expectedContent) return false;
+      const view = editor.saveViewState();
+      suppressDirty = true;
+      try {
+        currentModel.setValue(request.content);
+        savedText = request.content;
+        savedVersion = currentModel.getAlternativeVersionId();
+        documentPayload = {...documentPayload, content: request.content};
+        lastDirty = false;
+        editor.restoreViewState(view);
+      } finally { suppressDirty = false; }
+      return true;
     };
     window.relayRequestSave = function () {
-      const target = diffEditor ? diffEditor.getModifiedEditor() : editor;
-      if (target) bridge('save', { content: target.getValue() });
+      if (!currentModel) return;
+      if (pendingSave) { saveAgain = true; return; }
+      pendingSave = { content: currentModel.getValue(), version: currentModel.getAlternativeVersionId(), documentID: documentPayload.documentID };
+      bridge('save', { content: pendingSave.content, documentID: pendingSave.documentID });
     };
-    window.relayMarkSaved = function () {
+    window.relayLayout = function () {
+      const active = diffEditor || editor;
+      if (!active) return;
+      active.layout();
+      if (diffEditor) {
+        diffEditor.getOriginalEditor().render(true);
+        diffEditor.getModifiedEditor().render(true);
+      } else editor.render(true);
+    };
+    window.relayFocus = function () {
       const target = diffEditor ? diffEditor.getModifiedEditor() : editor;
-      if (target) savedText = target.getValue();
-      lastDirty = false;
-      bridge('dirty', { dirty: false });
+      if (target && !target.hasTextFocus()) target.focus();
+    };
+    window.relayUndo = function (redo) {
+      const target = diffEditor ? diffEditor.getModifiedEditor() : editor;
+      if (target) { target.focus(); target.trigger('relay', redo ? 'redo' : 'undo', null); }
+    };
+    window.relayMarkSaved = function (documentID) {
+      if (!pendingSave || pendingSave.documentID !== documentID) return;
+      savedText = pendingSave.content; savedVersion = pendingSave.version; pendingSave = null;
+      reportDirty();
+      if (saveAgain) { saveAgain = false; window.relayRequestSave(); }
+      return lastDirty;
+    };
+    window.relaySaveFailed = function (documentID) {
+      if (pendingSave && pendingSave.documentID === documentID) { pendingSave = null; saveAgain = false; }
     };
     window.relaySetTypography = function (payload) {
       if (!payload) return;
@@ -111,9 +342,12 @@
       if (!documentPayload) return;
       const target = diffEditor ? diffEditor.getModifiedEditor() : editor;
       const current = target ? target.getValue() : documentPayload.content;
+      viewState = target ? target.saveViewState() : viewState;
       const showDiff = !diffEditor;
       documentPayload = { ...documentPayload, content: current, original: savedText, diff: showDiff };
       showDiff ? openDiff(documentPayload) : openSingle(documentPayload);
+      const replacement = diffEditor ? diffEditor.getModifiedEditor() : editor;
+      if (viewState) replacement.restoreViewState(viewState);
       bridge('mode', { diff: showDiff });
     };
   </script>

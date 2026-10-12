@@ -89,7 +89,7 @@ struct RelaySplitContainer: View {
         secondLength: CGFloat
     ) -> some View {
         if axis == .horizontal {
-            HStack(spacing: 0) {
+            HStack(spacing: RelayTheme.spacing(0)) {
                 first.frame(width: firstLength, height: size.height)
                 splitDivider(total: max(firstLength + secondLength, 1))
                     .frame(width: divider, height: size.height)
@@ -97,7 +97,7 @@ struct RelaySplitContainer: View {
             }
             .frame(width: size.width, height: size.height)
         } else {
-            VStack(spacing: 0) {
+            VStack(spacing: RelayTheme.spacing(0)) {
                 first.frame(width: size.width, height: firstLength)
                 splitDivider(total: max(firstLength + secondLength, 1))
                     .frame(width: size.width, height: divider)

@@ -1,15 +1,17 @@
 import AppKit
 import Darwin
 import GhosttyTerminal
+import OSLog
 import SwiftUI
 
 enum RelayBundledGhosttyResources {
     static let bundleDirectoryName = "GhosttyKit_GhosttyTerminal.bundle"
 
     static func directory(in applicationResourcesURL: URL) -> URL {
-        applicationResourcesURL
-            .appendingPathComponent(bundleDirectoryName, isDirectory: true)
-            .appendingPathComponent("Ghostty", isDirectory: true)
+        let packaged = applicationResourcesURL.appendingPathComponent(bundleDirectoryName, isDirectory: true)
+        let wrapped = packaged.appendingPathComponent("Contents/Resources", isDirectory: true)
+        let root = FileManager.default.fileExists(atPath: wrapped.path) ? wrapped : packaged
+        return root.appendingPathComponent("Ghostty", isDirectory: true)
     }
 
     @discardableResult
@@ -33,6 +35,36 @@ enum RelayBundledGhosttyResources {
             ))
         }
         return true
+    }
+}
+
+enum RelayPresentationVisibilityPolicy {
+    // Keyboard ownership is not visibility. A visible, unfocused terminal
+    // must consume and draw resize/output updates just like a focused one.
+    // `hasVisibleWorkspace == nil` means no workspace window has been tagged
+    // yet (launch, or the marker view has not reached its window). Unknown is
+    // not "occluded": suspending on it pauses every pane and hides its surface
+    // before the workspace exists, and nothing guarantees a later occlusion
+    // notification to undo that.
+    static func allowsUpdates(applicationHidden: Bool, hasVisibleWorkspace: Bool?) -> Bool {
+        !applicationHidden && (hasVisibleWorkspace ?? true)
+    }
+}
+
+enum RelayWorkspaceWindowRecoveryPolicy {
+    static func isOnScreen(frame: CGRect, visibleScreenFrames: [CGRect]) -> Bool {
+        // A display handoff can briefly expose no screens. Do not relocate a
+        // valid saved frame until AppKit has authoritative screen geometry.
+        guard !visibleScreenFrames.isEmpty else { return true }
+        return visibleScreenFrames.contains {
+            let overlap = $0.intersection(frame)
+            return !overlap.isNull && !overlap.isEmpty
+        }
+    }
+
+    static func needsPresentation(isVisible: Bool, isMiniaturized: Bool,
+                                  frame: CGRect, visibleScreenFrames: [CGRect]) -> Bool {
+        !isVisible || isMiniaturized || !isOnScreen(frame: frame, visibleScreenFrames: visibleScreenFrames)
     }
 }
 
@@ -90,13 +122,68 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     private var keyboardMonitor: Any?
     private var quitArmedAt: UInt64?
     private var quitConfirmationTimer: Timer?
+    private var pendingRelaunchArguments: [String]?
+
+    func restartApplication(arguments: [String] = []) {
+        guard pendingRelaunchArguments == nil else { return }
+        pendingRelaunchArguments = arguments
+        NSApp.terminate(nil)
+    }
+
+    private func scheduleRelaunch(arguments: [String]) throws {
+        // Launch Services must see the old UI exit before opening its replacement.
+        // The detached helper only observes that PID; it never signals workers.
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = ["-c", """
+        parent="$1"
+        bundle="$2"
+        shift 2
+        remaining=90
+        while /bin/kill -0 "$parent" 2>/dev/null; do
+            [ "$remaining" -gt 0 ] || exit 1
+            remaining=$((remaining - 1))
+            /bin/sleep 1
+        done
+        exec /usr/bin/open -n "$bundle" --args "$@"
+        """, "relay-relaunch", String(ProcessInfo.processInfo.processIdentifier),
+            Bundle.main.bundleURL.path] + arguments
+        helper.standardInput = FileHandle.nullDevice
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+        try helper.run()
+    }
     private var workspaceActivityObservers: [NSObjectProtocol] = []
     private var windowPresentationObservers: [NSObjectProtocol] = []
     private var presentationSuspensionTask: Task<Void, Never>?
     private let responsivenessMonitor = RelayResponsivenessMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        responsivenessMonitor.start()
+        NSApp.appearance = NSAppearance(named: RelayTheme.appearanceName)
+        windowPresentationObservers.append(NotificationCenter.default.addObserver(
+            forName: .relayApplicationActivityChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if RelayApplicationActivityState.allowsContinuousUpdates {
+                    self.responsivenessMonitor.start()
+                } else {
+                    self.responsivenessMonitor.stop()
+                }
+            }
+        })
+        if RelayApplicationActivityState.allowsContinuousUpdates { responsivenessMonitor.start() }
+        if let profileError = RelayStateProfile.configurationError {
+            let alert = RelayTheme.alert()
+            alert.alertStyle = .critical
+            alert.messageText = "Relay candidate profile is invalid"
+            alert.informativeText = profileError + " Production state was not opened."
+            alert.addButton(withTitle: "Quit")
+            alert.runModal()
+            NSApp.terminate(nil)
+            return
+        }
+        Task { await RelayPluginManager.shared.installBundledVPN() }
         if ProcessInfo.processInfo.environment["RELAY_TERMINAL_DEBUG"] == "1" {
             // Developer-only lifecycle tracing. Deliberately excludes input
             // and output categories so terminal contents and secrets never
@@ -110,10 +197,22 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
         RelayCrashRecovery.shared.beginLaunch()
         RelayDiagnostics.shared.record(category: "app", name: "launched", details: [
             "safe_mode": String(RelayLaunchMode.isSafeMode),
+            "isolated_state": String(RelayStateProfile.isIsolated),
         ])
         keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             let binding = RelayKeyBinding(event: event)
+            if binding == RelayKeyBinding("v", command: true),
+               let editor = RemoteEditorRuntime.owner(of: NSApp.keyWindow?.firstResponder) {
+                editor.pasteFromClipboard()
+                return nil
+            }
+            if event.keyCode == 36,
+               event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+               let editor = RemoteEditorRuntime.owner(of: NSApp.keyWindow?.firstResponder), editor.canRunR {
+                if !event.isARepeat { editor.requestRunSelection() }
+                return nil
+            }
             if binding == RelayKeyBinding("q", command: true) {
                 // A held key must never count as the second deliberate press.
                 guard !event.isARepeat else { return nil }
@@ -127,6 +226,7 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
             if NSApp.keyWindow?.identifier == .relayWorkspaceWindow,
                event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
                let key = event.charactersIgnoringModifiers?.lowercased(),
+               RemoteEditorRuntime.owner(of: NSApp.keyWindow?.firstResponder) == nil,
                !(NSApp.keyWindow?.firstResponder is NSTextView) {
                 let action: RelayClipboardAction? = switch key {
                 case "c": .copy
@@ -177,7 +277,30 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
             },
         ]
         let notificationCenter = NotificationCenter.default
-        windowPresentationObservers = [
+        windowPresentationObservers += [
+            notificationCenter.addObserver(
+                forName: .relayWorkspaceWindowConfigured,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                // Activation can precede the SwiftUI marker's first window.
+                // Recover that same scene once it exists; never create another
+                // workspace/controller or steal focus from another app.
+                Task { @MainActor [weak self] in
+                    guard NSApp.isActive else { return }
+                    self?.presentRecoverableWorkspaceWindowIfNeeded()
+                    self?.updateApplicationPresentationVisibility()
+                }
+            },
+            notificationCenter.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: nil, queue: .main
+            ) { _ in
+                guard ProcessInfo.processInfo.environment["RELAY_TERMINAL_DEBUG"] == "1" else { return }
+                let logger = Logger(subsystem: "dev.vaklab.relay", category: "lifecycle")
+                for frame in Thread.callStackSymbols.prefix(32) {
+                    logger.notice("Window close caller: \(frame, privacy: .public)")
+                }
+            },
             notificationCenter.addObserver(
                 forName: NSWindow.didMiniaturizeNotification,
                 object: nil, queue: .main
@@ -255,6 +378,7 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // Persist layout and tear down transports/children even when the last
         // window closed first (the SwiftUI subscription is already gone).
+        PeerNetworkController.shared.disconnectAll()
         workspace?.shutdown()
         responsivenessMonitor.stop()
         presentationSuspensionTask?.cancel()
@@ -281,6 +405,33 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Keep lifecycle evidence outside the in-memory diagnostics ring: a
+        // normal AppKit quit otherwise looks like a renderer crash afterwards.
+        // Do not log event payloads, terminal contents, or document paths.
+        let event = NSAppleEventManager.shared().currentAppleEvent
+        let eventClass = event?.eventClass ?? 0
+        let eventID = event?.eventID ?? 0
+        let logger = Logger(subsystem: "dev.vaklab.relay", category: "lifecycle")
+        logger.notice("Termination requested event=\(eventClass)/\(eventID) windows=\(sender.windows.count)")
+        for frame in Thread.callStackSymbols.prefix(24) {
+            logger.notice("Termination caller: \(frame, privacy: .public)")
+        }
+        guard workspace?.confirmEditorClose() != false else {
+            pendingRelaunchArguments = nil
+            return .terminateCancel
+        }
+        if let arguments = pendingRelaunchArguments {
+            do { try scheduleRelaunch(arguments: arguments) }
+            catch {
+                pendingRelaunchArguments = nil
+                RelayTheme.alert(error: error).runModal()
+                return .terminateCancel
+            }
+        }
+        return .terminateNow
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
@@ -291,15 +442,20 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     /// instead of creating a second workspace/controller and a second remote
     /// writer.
     private func presentRecoverableWorkspaceWindowIfNeeded() {
-        guard !NSApp.windows.contains(where: { $0.isVisible && !$0.isMiniaturized }) else { return }
-        let workspaceWindow = NSApp.windows.first(where: {
-            $0.identifier == .relayWorkspaceWindow
-        }) ?? NSApp.windows.first(where: {
+        let screens = NSScreen.screens.map(\.visibleFrame)
+        let tagged = NSApp.windows.filter { $0.identifier == .relayWorkspaceWindow }
+        let candidates = tagged.isEmpty ? NSApp.windows.filter {
             $0.canBecomeMain && !($0 is NSPanel)
-        })
-        guard let workspaceWindow else { return }
+        } : tagged
+        // A visible auxiliary panel cannot stand in for a usable workspace.
+        // AppKit's isVisible alone also includes windows wholly off-screen.
+        guard !candidates.contains(where: {
+            !RelayWorkspaceWindowRecoveryPolicy.needsPresentation(isVisible: $0.isVisible,
+                isMiniaturized: $0.isMiniaturized, frame: $0.frame, visibleScreenFrames: screens)
+        }), let workspaceWindow = candidates.first else { return }
         if workspaceWindow.isMiniaturized { workspaceWindow.deminiaturize(nil) }
-        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(workspaceWindow.frame) }) {
+        if !RelayWorkspaceWindowRecoveryPolicy.isOnScreen(frame: workspaceWindow.frame,
+                                                        visibleScreenFrames: screens) {
             workspaceWindow.center()
         }
         workspaceWindow.makeKeyAndOrderFront(nil)
@@ -318,7 +474,7 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
             quitArmedAt = now
             quitConfirmationTimer?.invalidate()
             NotificationCenter.default.post(name: .relayQuitConfirmation, object: true)
-            quitConfirmationTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { _ in
+            quitConfirmationTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     guard let self, self.quitArmedAt == now else { return }
                     self.quitArmedAt = nil
@@ -342,13 +498,14 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
 
     private var applicationHasPresentableWorkspace: Bool {
         let workspaceWindows = NSApp.windows.filter { $0.identifier == .relayWorkspaceWindow }
-        let hasPresentableWorkspace = workspaceWindows.isEmpty || workspaceWindows.contains {
-            $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+        let hasPresentableWorkspace: Bool? = workspaceWindows.isEmpty ? nil : workspaceWindows.contains {
+            $0.isVisible && !$0.isMiniaturized &&
+                (NSApp.isActive || $0.occlusionState.contains(.visible))
         }
-        return !NSApp.isHidden
-            && NSApp.isActive
-            && NSApp.occlusionState.contains(.visible)
-            && hasPresentableWorkspace
+        return RelayPresentationVisibilityPolicy.allowsUpdates(
+            applicationHidden: NSApp.isHidden,
+            hasVisibleWorkspace: hasPresentableWorkspace
+        )
     }
 
     private func scheduleApplicationPresentationSuspension() {
@@ -370,15 +527,17 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
 
 extension Notification.Name {
     static let relayQuitConfirmation = Notification.Name("relay.quit-confirmation")
+    static let relayWorkspaceWindowConfigured = Notification.Name("relay.workspace-window-configured")
     static let relayApplicationActivityChanged = Notification.Name("relay.application-activity-changed")
 }
 
 @main
 struct RelayApp: App {
+    @Environment(\.openWindow) private var openWindow
     @NSApplicationDelegateAdaptor(RelayApplicationDelegate.self) private var applicationDelegate
     @StateObject private var workspace: WorkspaceModel
     @StateObject private var preferences: RelayPreferences
-    private let sidePanelServer: RelaySidePanelServer
+    @StateObject private var sidePanelServer: RelaySidePanelServer
 
     init() {
         // Ghostty's SwiftPM resource accessor can fall back to the build-tree
@@ -393,7 +552,7 @@ struct RelayApp: App {
         let workspace = WorkspaceModel()
         _workspace = StateObject(wrappedValue: workspace)
         _preferences = StateObject(wrappedValue: RelayPreferences.shared)
-        sidePanelServer = RelaySidePanelServer(workspace: workspace)
+        _sidePanelServer = StateObject(wrappedValue: RelaySidePanelServer(workspace: workspace))
     }
 
     private func shortcut(_ command: RelayCommand) -> RelayKeyBinding {
@@ -402,7 +561,11 @@ struct RelayApp: App {
 
     private func performClipboardCommand(_ action: RelayClipboardAction) {
         let firstResponder = NSApp.keyWindow?.firstResponder
-        let isNativeTextEditor = firstResponder is NSTextView
+        if case .paste = action, let editor = RemoteEditorRuntime.owner(of: firstResponder) {
+            editor.pasteFromClipboard()
+            return
+        }
+        let isNativeTextEditor = firstResponder is NSTextView || RemoteEditorRuntime.owner(of: firstResponder) != nil
         if let terminal = firstResponder as? RelayGhosttyView,
            terminal.handleApplicationClipboardAction(action) {
             return
@@ -429,12 +592,17 @@ struct RelayApp: App {
 
     private func performUndoCommand(redo: Bool) {
         let firstResponder = NSApp.keyWindow?.firstResponder
+        if let editor = RemoteEditorRuntime.owner(of: firstResponder) {
+            editor.undo(redo: redo)
+            return
+        }
         if let terminal = firstResponder as? RelayGhosttyView,
            terminal.performPromptHistoryAction(redo: redo) {
             return
         }
         if NSApp.keyWindow?.identifier == .relayWorkspaceWindow,
            !(firstResponder is NSTextView),
+           workspace.activePane?.contentKind == .terminal,
            workspace.activePane?.runtime.handleApplicationUndoAction(redo: redo) == true {
             return
         }
@@ -450,7 +618,8 @@ struct RelayApp: App {
             WorkspaceView(workspace: workspace)
                 .frame(minWidth: 880, minHeight: 560)
                 .background(RelayWorkspaceWindowMarker().frame(width: 0, height: 0))
-                .preferredColorScheme(.dark)
+                .relaySurface()
+                .tint(RelayTheme.accent)
                 .onReceive(NotificationCenter.default.publisher(for: .relaySelectPane)) { note in
                     if let id = note.object as? UUID { workspace.selectPane(id) }
                 }
@@ -462,6 +631,15 @@ struct RelayApp: App {
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .relayClosePane)) { _ in
                     workspace.closeActivePane()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .relayRestartExitedPane)) { note in
+                    if let id = note.object as? UUID { workspace.restartExitedPane(id) }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .relayResumeSavedConversation)) { note in
+                    if let id = note.object as? UUID { workspace.requestResumeSavedConversation(id) }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .relayReconnectPane)) { note in
+                    if let id = note.object as? UUID { workspace.reconnectPane(id) }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .relayTerminatePane)) { note in
                     if let id = note.object as? UUID { workspace.requestTerminatePane(id) }
@@ -480,17 +658,20 @@ struct RelayApp: App {
                 .onReceive(NotificationCenter.default.publisher(
                     for: NSApplication.willTerminateNotification
                 )) { _ in
+                    PeerNetworkController.shared.disconnectAll()
                     workspace.shutdown()
                 }
                 .onAppear { applicationDelegate.workspace = workspace }
         }
         .defaultSize(width: 1320, height: 820)
-        .windowStyle(.hiddenTitleBar)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Restart Relay") { applicationDelegate.restartApplication() }
+            }
             CommandGroup(replacing: .undoRedo) {
-                Button("Undo prompt edit") { performUndoCommand(redo: false) }
+                Button("Undo") { performUndoCommand(redo: false) }
                     .keyboardShortcut("z", modifiers: .command)
-                Button("Redo prompt edit") { performUndoCommand(redo: true) }
+                Button("Redo") { performUndoCommand(redo: true) }
                     .keyboardShortcut("z", modifiers: [.command, .shift])
             }
             CommandGroup(replacing: .pasteboard) {
@@ -554,15 +735,19 @@ struct RelayApp: App {
                 Button("Reopen closed pane") { workspace.reopenLastClosedPane() }
                     .keyboardShortcut(shortcut(.reopenClosedPane).keyEquivalent, modifiers: shortcut(.reopenClosedPane).eventModifiers)
                     .disabled(!workspace.canReopenClosedPane)
+                Button("Restore…") { workspace.isRecoveryPresented = true }
             }
             CommandMenu("Tab") {
                 Button("Previous tab") { workspace.selectTab(offset: -1) }
                     .keyboardShortcut(shortcut(.previousTab).keyEquivalent, modifiers: shortcut(.previousTab).eventModifiers)
                 Button("Next tab") { workspace.selectTab(offset: 1) }
                     .keyboardShortcut(shortcut(.nextTab).keyEquivalent, modifiers: shortcut(.nextTab).eventModifiers)
+                Divider()
+                Button("Previous session") { workspace.selectSession(offset: -1) }
+                Button("Next session") { workspace.selectSession(offset: 1) }
             }
             CommandGroup(after: .sidebar) {
-                Button(workspace.sidebarVisible ? "Hide session rail" : "Show session rail") {
+                Button(workspace.sidebarVisible ? "Hide sessions" : "Show sessions") {
                     workspace.sidebarVisible.toggle()
                 }
                 .keyboardShortcut(shortcut(.toggleSidebar).keyEquivalent, modifiers: shortcut(.toggleSidebar).eventModifiers)
@@ -590,28 +775,48 @@ struct RelayApp: App {
                 }
             }
             CommandMenu("Diagnostics") {
-                Button(workspace.performancePanelVisible ? "Hide performance" : "Show performance") {
+                Button("Reconnect active pane transport") {
+                    guard let pane = workspace.activePane else { return }
+                    Task { @MainActor in
+                        if !(await pane.runtime.reconnectExistingPaneRoute()) {
+                            workspace.operationError = "This pane has no verified multiplexed terminal route to reconnect."
+                        }
+                    }
+                }
+                .keyboardShortcut("r", modifiers: [.command, .option, .shift])
+                .disabled(workspace.activePane?.contentKind != .terminal ||
+                    workspace.activePane?.profile.backend != .relay ||
+                    workspace.activePane?.remoteExitCode != nil)
+                Divider()
+                Button("Network control centre…") {
+                    openWindow(id: "relay-peer-network")
+                }
+                Button(workspace.performancePanelVisible ? "Hide monitoring" : "Show monitoring") {
                     workspace.togglePerformancePanel()
+                }
+                Button("Reset MCP permissions…") {
+                    let alert = RelayTheme.alert()
+                    alert.messageText = "Reset MCP permissions?"
+                    alert.informativeText = "Agents will need your approval again for terminal and workspace control. Running terminal commands are not stopped."
+                    alert.addButton(withTitle: "Cancel")
+                    alert.addButton(withTitle: "Reset permissions")
+                    if alert.runModal() == .alertSecondButtonReturn { MCPWorkspaceGrant.shared.revoke() }
                 }
                 Button("Export diagnostics…") {
                     RelayDiagnostics.shared.presentExportPanel()
                 }
                 Button("Relaunch in safe mode…") {
                     RelayDiagnostics.shared.record(category: "app", name: "safe-mode-relaunch-requested")
-                    let configuration = NSWorkspace.OpenConfiguration()
-                    configuration.arguments = ["--safe-mode"]
-                    NSWorkspace.shared.openApplication(
-                        at: Bundle.main.bundleURL,
-                        configuration: configuration
-                    ) { _, error in
-                        Task { @MainActor in
-                            if let error { NSAlert(error: error).runModal() }
-                            else { NSApp.terminate(nil) }
-                        }
-                    }
+                    applicationDelegate.restartApplication(arguments: ["--safe-mode"])
                 }
             }
         }
+
+        Window("Network control centre", id: "relay-peer-network") {
+            PeerNetworkView(workspace: workspace)
+                .background(RelayStandardWindowMarker().frame(width: 0, height: 0))
+        }
+        .defaultSize(width: 1220, height: 650)
 
         Settings {
             RelaySettingsView()

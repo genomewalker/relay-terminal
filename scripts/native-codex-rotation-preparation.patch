@@ -1,0 +1,1086 @@
+--- a/codex-rs/core/src/session/activity_admission.rs
++++ b/codex-rs/core/src/session/activity_admission.rs
+@@ -57,6 +57,15 @@
+ }
+ 
+ impl ActivityAdmission {
++    pub(crate) fn same_instance(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.activity, &other.activity)
++    }
++
++    /// Invalidate observations before a synchronous background-state mutation.
++    pub(crate) fn invalidate(&self) -> bool {
++        self.attempt().is_some()
++    }
++
+     fn attempt(&self) -> Option<AdmissionAttempt> {
+         let mut state = self.state.lock().expect("activity admission poisoned");
+         if state.closed {
+--- a/codex-rs/core/src/session/submission_admission.rs
++++ b/codex-rs/core/src/session/submission_admission.rs
+@@ -5,8 +5,10 @@
+ //! frontend input, pending mailbox state and durable history require separate checks.
+ use super::Submission;
+ use super::activity_admission::ActivityAdmission;
++#[cfg(test)]
+ use super::activity_admission::ActivityReservation;
+ use super::rotation_dispatch::DispatchError;
++#[cfg(test)]
+ use super::rotation_dispatch::DispatchLease;
+ use super::rotation_dispatch::RotationRequest;
+ use super::rotation_dispatch::SubmissionDispatch;
+@@ -22,6 +24,7 @@
+ }
+ 
+ /// Holds channel and task admission until dropped; waiting input stays owned.
++#[cfg(test)]
+ pub(crate) struct SubmissionReservation {
+     sender: Sender<Submission>,
+     activity: ActivityReservation,
+@@ -52,11 +55,35 @@
+     }
+ 
+     /// Reserves only dispatch and shared activity, not full session quiescence.
++    #[cfg(test)]
+     pub(crate) async fn reserve_dispatch(
+         &self,
+         expected_generation: u64,
+     ) -> Result<DispatchLease, DispatchError> {
+-        RotationRequest::request(self.rotation.as_ref(), expected_generation).await
++        RotationRequest::request(
++            self.rotation.as_ref(),
++            expected_generation,
++            super::rotation_dispatch::RotationTarget::DispatchOnly,
++        )
++        .await
++    }
++
++    pub(crate) async fn prepare_native_rotation(
++        &self,
++        session: &std::sync::Arc<super::session::Session>,
++        turn_id: String,
++    ) -> Result<super::native_rotation::NativeRotationReservation, DispatchError> {
++        let generation = self.generation().ok_or(DispatchError::Unsupported)?;
++        let lease = RotationRequest::request(
++            self.rotation.as_ref(),
++            generation,
++            super::rotation_dispatch::RotationTarget::Native {
++                session: std::sync::Arc::downgrade(session),
++                turn_id,
++            },
++        )
++        .await?;
++        super::native_rotation::NativeRotationReservation::new(lease)
+     }
+ 
+     pub(crate) async fn send(&self, submission: Submission) -> Result<(), SendError<Submission>> {
+@@ -89,6 +116,7 @@
+     }
+ }
+ 
++#[cfg(test)]
+ impl SubmissionReservation {
+     pub(crate) fn is_current(&self) -> bool {
+         self.activity.is_current() && !self.sender.is_closed() && self.sender.is_empty()
+--- a/codex-rs/core/src/session/rotation_dispatch.rs
++++ b/codex-rs/core/src/session/rotation_dispatch.rs
+@@ -3,29 +3,27 @@
+ //! descendant, frontend-input, shutdown or clear receipt.
+ use super::Submission;
+ use super::activity_admission::ActivityAdmission;
++pub(crate) use super::native_rotation::NativeRotationError as DispatchError;
++use super::native_rotation::NativeRotationReceipt;
++use super::native_rotation::PreparedSession;
++use super::session::Session;
+ use async_channel::Receiver;
+ use async_channel::RecvError;
+ use async_channel::Sender;
++use std::sync::Weak;
+ use std::time::Duration;
+ use tokio::sync::oneshot;
+ use tokio::time::Instant;
+ use tokio_util::sync::CancellationToken;
+ 
+ const MAX_RESERVATION: Duration = Duration::from_secs(5);
+-
+-#[derive(Debug, PartialEq, Eq)]
+-pub(crate) enum DispatchError {
+-    Busy,
+-    Closed,
+-    Expired,
+-    Unsupported,
+-}
+ 
+ /// Dropping the lease releases dispatch; invalidation and expiry revoke it.
+ /// A future commit command must be checked by the receiver owner atomically.
+ pub(crate) struct DispatchLease {
+     _release: oneshot::Sender<()>,
+     revoked: CancellationToken,
++    pub(super) receipt: Option<NativeRotationReceipt>,
+ }
+ 
+ impl DispatchLease {
+@@ -35,21 +33,33 @@
+ }
+ 
+ pub(super) struct RotationRequest {
++    target: RotationTarget,
+     generation: u64,
+     deadline: Instant,
+     reply: oneshot::Sender<Result<DispatchLease, DispatchError>>,
++}
++
++pub(super) enum RotationTarget {
++    #[cfg(test)]
++    DispatchOnly,
++    Native {
++        session: Weak<Session>,
++        turn_id: String,
++    },
+ }
+ 
+ impl RotationRequest {
+     pub(super) async fn request(
+         requests: Option<&Sender<Self>>,
+         generation: u64,
++        target: RotationTarget,
+     ) -> Result<DispatchLease, DispatchError> {
+         let requests = requests.ok_or(DispatchError::Unsupported)?;
+         let deadline = Instant::now() + MAX_RESERVATION;
+         let (reply, result) = oneshot::channel();
+         requests
+             .try_send(Self {
++                target,
+                 generation,
+                 deadline,
+                 reply,
+@@ -110,7 +120,10 @@
+         }
+     }
+ 
+-    async fn reserve(&mut self, request: RotationRequest) -> Option<Result<Submission, RecvError>> {
++    async fn reserve(
++        &mut self,
++        mut request: RotationRequest,
++    ) -> Option<Result<Submission, RecvError>> {
+         if request.reply.is_closed() {
+             return None;
+         }
+@@ -123,6 +136,41 @@
+             return None;
+         };
+         if self.receiver.is_closed() || !self.receiver.is_empty() {
++            let _ = request.reply.send(Err(DispatchError::Busy));
++            return None;
++        }
++        let native = match request.target {
++            #[cfg(test)]
++            RotationTarget::DispatchOnly => None,
++            RotationTarget::Native {
++                ref session,
++                ref turn_id,
++            } => {
++                let Some(session) = session.upgrade() else {
++                    let _ = request.reply.send(Err(DispatchError::Closed));
++                    return None;
++                };
++                if !self.admission.same_instance(&session.activity_admission) {
++                    let _ = request.reply.send(Err(DispatchError::Unsupported));
++                    return None;
++                }
++                let result = tokio::select! {
++                    biased;
++                    _ = request.reply.closed() => return None,
++                    _ = reservation.invalidated() => Err(DispatchError::Busy),
++                    _ = tokio::time::sleep_until(request.deadline) => Err(DispatchError::Expired),
++                    result = PreparedSession::prepare(&session, turn_id, request.generation) => result,
++                };
++                match result {
++                    Ok(prepared) => Some(prepared),
++                    Err(error) => {
++                        let _ = request.reply.send(Err(error));
++                        return None;
++                    }
++                }
++            }
++        };
++        if !reservation.is_current() {
+             let _ = request.reply.send(Err(DispatchError::Busy));
+             return None;
+         }
+@@ -133,6 +181,7 @@
+         let lease = DispatchLease {
+             _release: release,
+             revoked,
++            receipt: native.as_ref().map(|prepared| prepared.receipt.clone()),
+         };
+         if request.reply.send(Ok(lease)).is_err() {
+             return None;
+@@ -140,6 +189,10 @@
+         tokio::select! {
+             biased;
+             _ = reservation.invalidated() => None,
++            _ = async { match &native {
++                Some(prepared) => prepared.manager.invalidated().await,
++                None => std::future::pending::<()>().await,
++            }} => None,
+             _ = tokio::time::sleep_until(request.deadline) => None,
+             _ = released => None,
+             // Detect final sender drop without holding an extra sender alive.
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -0,0 +1,216 @@
++//! Native preparation only. The receipt does not authorize a capsule write,
++//! frontend draft replacement, writer shutdown, clear or restore.
++use super::activity_admission::ActivityReservation;
++use super::rotation_dispatch::DispatchLease;
++use super::session::Session;
++use codex_protocol::ThreadId;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++
++#[derive(Debug, thiserror::Error, PartialEq, Eq)]
++pub enum NativeRotationError {
++    #[error("native session is busy or its admission changed")]
++    Busy,
++    #[error("native session has closed or changed owner")]
++    Closed,
++    #[error("native reservation expired")]
++    Expired,
++    #[error("native rotation preparation is unsupported for this session")]
++    Unsupported,
++    #[error("the expected successfully completed native turn is no longer current")]
++    TurnChanged,
++    #[error("native persistence failed: {0}")]
++    Persistence(String),
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct NativeRotationReceipt {
++    pub runtime_id: uuid::Uuid,
++    pub thread_id: ThreadId,
++    pub turn_id: String,
++    pub rollout_path: PathBuf,
++    pub admission_generation: u64,
++}
++
++/// Keeps native dispatch paused for its bounded lease; dropping it releases work.
++/// A receipt alone is not authority to clear the session.
++pub struct NativeRotationReservation {
++    lease: DispatchLease,
++}
++
++impl NativeRotationReservation {
++    pub(crate) fn new(lease: DispatchLease) -> Result<Self, NativeRotationError> {
++        if lease.receipt.is_none() {
++            return Err(NativeRotationError::Unsupported);
++        }
++        Ok(Self { lease })
++    }
++
++    pub fn receipt(&self) -> &NativeRotationReceipt {
++        self.lease
++            .receipt
++            .as_ref()
++            .expect("native receipt checked on construction")
++    }
++
++    pub async fn revoked(&self) {
++        self.lease.revoked().await;
++    }
++}
++
++pub(crate) struct NativeRotationState {
++    runtime_id: uuid::Uuid,
++    completed: Mutex<Option<String>>,
++    persistence_failed: AtomicBool,
++}
++
++impl Default for NativeRotationState {
++    fn default() -> Self {
++        Self {
++            runtime_id: uuid::Uuid::new_v4(),
++            completed: Mutex::new(None),
++            persistence_failed: AtomicBool::new(false),
++        }
++    }
++}
++
++impl NativeRotationState {
++    pub(crate) fn started(&self) {
++        *self
++            .completed
++            .lock()
++            .expect("native rotation state poisoned") = None;
++    }
++
++    pub(crate) fn completed(&self, turn_id: &str) {
++        *self
++            .completed
++            .lock()
++            .expect("native rotation state poisoned") = Some(turn_id.to_owned());
++    }
++
++    pub(crate) fn persistence_failed(&self) {
++        self.persistence_failed.store(true, Ordering::Release);
++    }
++
++    fn matches(&self, turn_id: &str) -> bool {
++        !self.persistence_failed.load(Ordering::Acquire)
++            && self
++                .completed
++                .lock()
++                .expect("native rotation state poisoned")
++                .as_deref()
++                == Some(turn_id)
++    }
++}
++
++pub(super) struct PreparedSession {
++    pub(super) receipt: NativeRotationReceipt,
++    pub(super) manager: ActivityReservation,
++}
++
++impl PreparedSession {
++    pub(super) async fn prepare(
++        session: &Arc<Session>,
++        expected_turn: &str,
++        generation: u64,
++    ) -> Result<Self, NativeRotationError> {
++        use NativeRotationError as Error;
++        let manager = session
++            .services
++            .local_agent_runtime
++            .rotation_manager()
++            .map_err(|_| Error::Unsupported)?;
++        let admission = manager
++            .local_rotation_admission()
++            .ok_or(Error::Unsupported)?;
++        let manager_guard = admission
++            .try_reserve(admission.generation().ok_or(Error::Unsupported)?)
++            .ok_or(Error::Busy)?;
++        let registered = manager
++            .get_thread(session.thread_id)
++            .await
++            .map_err(|_| Error::Closed)?;
++        if !Arc::ptr_eq(&registered.session, session) || !registered.is_running() {
++            return Err(Error::Closed);
++        }
++        drop(registered);
++        if session
++            .native_rotation
++            .persistence_failed
++            .load(Ordering::Acquire)
++        {
++            return Err(Error::Persistence(
++                "an earlier transcript write failed".to_string(),
++            ));
++        }
++        {
++            let state = session.state.lock().await;
++            if state
++                .session_configuration
++                .session_source
++                .is_non_root_agent()
++                || state.session_configuration.parent_thread_id.is_some()
++            {
++                return Err(Error::Unsupported);
++            }
++            if state.shutting_down
++                || state
++                    .shell_snapshot_prewarm
++                    .as_ref()
++                    .is_some_and(|task| !task.is_finished())
++            {
++                return Err(Error::Busy);
++            }
++            if state.last_started_turn_id.as_deref() != Some(expected_turn)
++                || !session.native_rotation.matches(expected_turn)
++            {
++                return Err(Error::TurnChanged);
++            }
++        }
++        if session.active_turn.lock().await.is_some()
++            || session.input_queue.has_pending_mailbox_items().await
++            || !session.async_hook_results.is_empty()
++            || session.hooks().has_pending_async_work()
++            || session.conversation.running_state().await.is_some()
++            || !session.list_background_terminals().await.is_empty()
++        {
++            return Err(Error::Busy);
++        }
++        let live = session
++            .live_thread_for_persistence("prepare native rotation")
++            .map_err(|_| Error::Unsupported)?;
++        let rollout_path = live
++            .local_rollout_path()
++            .await
++            .map_err(|error| Error::Persistence(error.to_string()))?
++            .ok_or(Error::Unsupported)?;
++        live.flush().await.map_err(|error| {
++            session.native_rotation.persistence_failed();
++            Error::Persistence(error.to_string())
++        })?;
++        if !manager_guard.is_current() {
++            return Err(Error::Busy);
++        }
++        if !session.native_rotation.matches(expected_turn) {
++            return Err(Error::TurnChanged);
++        }
++        Ok(Self {
++            receipt: NativeRotationReceipt {
++                runtime_id: session.native_rotation.runtime_id,
++                thread_id: session.thread_id,
++                turn_id: expected_turn.to_owned(),
++                rollout_path,
++                admission_generation: generation,
++            },
++            manager: manager_guard,
++        })
++    }
++}
++
++#[cfg(test)]
++#[path = "native_rotation_tests.rs"]
++mod tests;
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -248,6 +248,7 @@
+ mod mcp_refresh;
+ mod mcp_runtime;
+ pub(crate) mod multi_agents;
++pub(crate) mod native_rotation;
+ mod plugin_selection;
+ mod realtime_history;
+ mod retained_context;
+@@ -4567,9 +4568,13 @@
+ 
+     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
+     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
++        let Some(_admission) = self.activity_admission.enter().await else {
++            return false;
++        };
+         if let Some(live_thread) = self.live_thread()
+             && let Err(e) = live_thread.append_items(items).await
+         {
++            self.native_rotation.persistence_failed();
+             error!("failed to record rollout items: {e:#}");
+             return false;
+         }
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -91,6 +91,7 @@
+     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
+     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+     pub(crate) activity_admission: super::activity_admission::ActivityAdmission,
++    pub(crate) native_rotation: super::native_rotation::NativeRotationState,
+     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
+     pub(crate) input_queue: InputQueue,
+     pub(crate) services: SessionServices,
+@@ -1803,6 +1804,7 @@
+                 .then(|| Mutex::new(Default::default())),
+                 active_turn: Mutex::new(None),
+                 activity_admission: super::activity_admission::ActivityAdmission::default(),
++                native_rotation: Default::default(),
+                 async_hook_results,
+                 input_queue: InputQueue::new(),
+                 services,
+--- a/codex-rs/core/src/session/turn_input.rs
++++ b/codex-rs/core/src/session/turn_input.rs
+@@ -561,6 +561,7 @@
+ impl Session {
+     /// Called under the active-turn lock before running any task or lifecycle callback.
+     pub(crate) async fn record_started_turn(&self, turn_id: &str) {
++        self.native_rotation.started();
+         self.state.lock().await.last_started_turn_id = Some(turn_id.to_string());
+     }
+ 
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -644,6 +644,7 @@
+         turn_context: Arc<TurnContext>,
+         task_result: SessionTaskResult,
+     ) {
++        let rotation_task_succeeded = task_result.is_ok();
+         let (last_agent_message, abort_reason) = match task_result {
+             Ok(last_agent_message) => (last_agent_message, None),
+             Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
+@@ -864,6 +865,8 @@
+                 time_to_first_token_ms,
+             })
+         };
++        let rotation_completed = rotation_task_succeeded
++            && matches!(&event, EventMsg::TurnComplete(complete) if complete.error.is_none());
+         let saved_guardian_completion =
+             matches!(event, EventMsg::TurnComplete(_)) && self.is_private_guardian_reviewer().await;
+         if !saved_guardian_completion {
+@@ -891,8 +894,17 @@
+         }
+         // Private reviewers already flushed the terminal event before delivering it.
+         // Other buffering writers still need a barrier for the terminal event.
+-        if !saved_guardian_completion && let Err(err) = self.flush_rollout().await {
+-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
++        if !saved_guardian_completion {
++            match self.flush_rollout().await {
++                Ok(()) if rotation_completed && cleared_active_turn => {
++                    self.native_rotation.completed(&turn_context.sub_id);
++                }
++                Ok(()) => {}
++                Err(err) => {
++                    self.native_rotation.persistence_failed();
++                    warn!("failed to flush rollout after emitting terminal turn event: {err}");
++                }
++            }
+         }
+         if cleared_active_turn {
+             self.maybe_start_turn_for_pending_work().await;
+--- a/codex-rs/core/src/agent/control/runtime_context.rs
++++ b/codex-rs/core/src/agent/control/runtime_context.rs
+@@ -12,6 +12,10 @@
+ use std::sync::Arc;
+ 
+ impl LocalAgentRuntime {
++    pub(crate) fn rotation_manager(&self) -> CodexResult<Arc<ThreadManagerState>> {
++        self.upgrade()
++    }
++
+     pub(crate) fn register_session_root(
+         &self,
+         current_thread_id: ThreadId,
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -341,6 +341,18 @@
+     }
+ 
+     #[doc(hidden)]
++    /// Prepare an unchanged, successfully completed native turn for host rotation.
++    /// This returns a bounded flush receipt; it never clears or shuts down the thread.
++    pub async fn prepare_context_rotation(
++        &self,
++        expected_turn_id: String,
++    ) -> Result<crate::NativeRotationReservation, crate::NativeRotationError> {
++        self.io
++            .tx_sub
++            .prepare_native_rotation(&self.session, expected_turn_id)
++            .await
++    }
++
+     pub async fn flush_rollout(&self) -> std::io::Result<()> {
+         self.session.flush_rollout().await
+     }
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -246,3 +246,7 @@
+ // Captured environment bindings can be passed back to ThreadManager by internal reviewers.
+ pub use environment_selection::TurnEnvironmentSnapshot;
+ pub use environment_selection::validate_environment_ids_and_cwds;
++
++pub use session::native_rotation::NativeRotationError;
++pub use session::native_rotation::NativeRotationReceipt;
++pub use session::native_rotation::NativeRotationReservation;
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -1344,6 +1344,12 @@
+         &self,
+         thread_id: &ThreadId,
+     ) -> CodexResult<Option<Arc<CodexThread>>> {
++        let _admission = self
++            .state
++            .rotation_admission
++            .enter()
++            .await
++            .ok_or_else(|| CodexErr::Fatal("thread admission is closed".to_string()))?;
+         let mut threads = self.state.threads.write().await;
+         if threads
+             .get(thread_id)
+@@ -1365,6 +1371,7 @@
+         thread_id: &ThreadId,
+         expected: &Arc<CodexThread>,
+     ) -> Option<Arc<CodexThread>> {
++        let _admission = self.state.rotation_admission.enter().await?;
+         let mut threads = self.state.threads.write().await;
+         if threads
+             .get(thread_id)
+@@ -1744,6 +1751,7 @@
+ 
+     /// Remove a thread from the manager by ID, returning it when present.
+     pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
++        let _admission = self.rotation_admission.enter().await?;
+         self.threads.write().await.remove(thread_id)
+     }
+ 
+@@ -2700,3 +2708,7 @@
+ #[cfg(test)]
+ #[path = "thread_manager_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "thread_manager/native_rotation_tests.rs"]
++mod native_rotation_tests;
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation_tests.rs
+@@ -0,0 +1,27 @@
++use super::NativeRotationState;
++
++#[test]
++fn a_new_turn_invalidates_completion_without_reusing_an_old_identity() {
++    let state = NativeRotationState::default();
++    let runtime_id = state.runtime_id;
++    assert_ne!(runtime_id, NativeRotationState::default().runtime_id);
++    state.completed("first");
++    assert!(state.matches("first"));
++    state.started();
++    assert!(!state.matches("first"));
++    state.completed("second");
++    assert!(!state.matches("first"));
++    assert!(state.matches("second"));
++    assert_eq!(state.runtime_id, runtime_id);
++}
++
++#[test]
++fn persistence_failure_remains_disqualifying_after_later_completion() {
++    let state = NativeRotationState::default();
++    state.completed("first");
++    state.persistence_failed();
++    assert!(!state.matches("first"));
++    state.started();
++    state.completed("second");
++    assert!(!state.matches("second"));
++}
+--- /dev/null
++++ b/codex-rs/core/src/thread_manager/native_rotation_tests.rs
+@@ -0,0 +1,300 @@
++//! Native public preparation API, using a synthetic task and a local rollout.
++//! Providers are loopback-only with dummy auth; no model turn is submitted.
++use super::NewThread;
++use super::StartThreadOptions;
++use super::ThreadManager;
++use crate::NativeRotationError;
++use crate::config::test_config;
++use crate::session::TurnInput;
++use crate::session::session::Session;
++use crate::session::tests::make_session_and_context;
++use crate::session::turn_context::TurnContext;
++use crate::state::ActiveTurn;
++use crate::state::TaskKind;
++use crate::tasks::SessionTask;
++use crate::tasks::SessionTaskResult;
++use codex_login::CodexAuth;
++use codex_protocol::protocol::Op;
++use core_test_support::PathBufExt;
++use core_test_support::PathExt;
++use pretty_assertions::assert_eq;
++use std::sync::Arc;
++use tempfile::TempDir;
++use tokio::sync::Notify;
++use tokio_util::sync::CancellationToken;
++use wiremock::MockServer;
++
++#[derive(Clone, Copy)]
++enum Outcome {
++    Success,
++    Failure,
++}
++
++struct SyntheticTask(Arc<Notify>, Outcome);
++
++impl SessionTask for SyntheticTask {
++    fn kind(&self) -> TaskKind {
++        TaskKind::Regular
++    }
++    fn span_name(&self) -> &'static str {
++        "session_task.native_rotation_test"
++    }
++    async fn run(
++        self: Arc<Self>,
++        _session: Arc<Session>,
++        _turn: Arc<TurnContext>,
++        _input: Vec<TurnInput>,
++        cancellation: CancellationToken,
++    ) -> SessionTaskResult {
++        tokio::select! {
++            _ = cancellation.cancelled() => {},
++            _ = self.0.notified() => {},
++        }
++        match self.1 {
++            Outcome::Success => Ok(None),
++            Outcome::Failure => Err(codex_protocol::error::CodexErr::new(
++                codex_protocol::error::CodexErrorDetails::Fatal(
++                    "synthetic task failure".to_string(),
++                ),
++            )),
++        }
++    }
++}
++
++struct Fixture {
++    manager: ThreadManager,
++    root: NewThread,
++    server: MockServer,
++    _home: TempDir,
++    turn: String,
++}
++
++impl Fixture {
++    async fn completed() -> Self {
++        Self::finished(Outcome::Success).await
++    }
++
++    async fn finished(outcome: Outcome) -> Self {
++        let server = MockServer::start().await;
++        let home = tempfile::tempdir().unwrap();
++        let mut config = test_config().await;
++        config.codex_home = home.path().join("codex-home").abs();
++        config.cwd = home.path().abs();
++        std::fs::create_dir_all(&config.codex_home).unwrap();
++        config.ephemeral = false;
++        config
++            .features
++            .set_enabled(codex_features::Feature::ShellSnapshot, false)
++            .unwrap();
++        config.model_provider.base_url = Some(server.uri());
++        config.model_provider.supports_websockets = false;
++        let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
++            CodexAuth::from_api_key("dummy"),
++            config.model_provider.clone(),
++            config.codex_home.to_path_buf(),
++            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
++        );
++        Arc::get_mut(&mut manager.state).unwrap().thread_store =
++            super::thread_store_from_config(&config, /*state_db*/ None);
++        let root = manager
++            .start_thread(StartThreadOptions {
++                environments: Some(Vec::new()),
++                ..StartThreadOptions::new(config)
++            })
++            .await
++            .unwrap();
++        root.thread.session.stop_mcp_prewarm_worker().await;
++        let (_template, context) = make_session_and_context().await;
++        let turn = context.sub_id.clone();
++        let finish = Arc::new(Notify::new());
++        root.thread
++            .session
++            .start_task(
++                Arc::new(context),
++                Vec::new(),
++                SyntheticTask(Arc::clone(&finish), outcome),
++            )
++            .await;
++        let done = {
++            let active = root.thread.session.active_turn.lock().await;
++            Arc::clone(&active.as_ref().unwrap().task.as_ref().unwrap().done)
++        };
++        let completed = done.notified();
++        tokio::pin!(completed);
++        completed.as_mut().enable();
++        finish.notify_one();
++        completed.await;
++        Self {
++            manager,
++            root,
++            server,
++            _home: home,
++            turn,
++        }
++    }
++
++    async fn close(self) {
++        self.root.thread.shutdown_and_wait().await.unwrap();
++        assert!(
++            self.server
++                .received_requests()
++                .await
++                .unwrap()
++                .iter()
++                .all(|request| request.url.path().ends_with("/models"))
++        );
++    }
++}
++
++#[tokio::test]
++async fn native_preparation_flushes_the_exact_successfully_completed_turn() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let receipt = reservation.receipt();
++    assert_eq!(
++        (receipt.thread_id, &receipt.turn_id),
++        (fixture.root.thread_id, &fixture.turn)
++    );
++    let content = tokio::fs::read_to_string(&receipt.rollout_path)
++        .await
++        .unwrap();
++    let terminal = content
++        .lines()
++        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
++        .find(|line| {
++            line["type"] == "event_msg"
++                && (line["payload"]["type"] == "task_complete"
++                    || line["payload"]["type"] == "turn_complete")
++                && line["payload"]["turn_id"] == fixture.turn
++        });
++    assert!(
++        terminal.is_some(),
++        "receipt follows a durable native terminal event"
++    );
++    drop(reservation);
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_preparation_rejects_wrong_turn_and_active_placeholder() {
++    let fixture = Fixture::completed().await;
++    assert_eq!(
++        fixture
++            .root
++            .thread
++            .prepare_context_rotation("wrong".to_owned())
++            .await
++            .err(),
++        Some(NativeRotationError::TurnChanged)
++    );
++    *fixture.root.thread.session.active_turn.lock().await = Some(ActiveTurn::default());
++    assert_eq!(
++        fixture
++            .root
++            .thread
++            .prepare_context_rotation(fixture.turn.clone())
++            .await
++            .err(),
++        Some(NativeRotationError::Busy)
++    );
++    *fixture.root.thread.session.active_turn.lock().await = None;
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_input_revokes_preparation_and_is_accepted() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    fixture.root.thread.submit(Op::Interrupt).await.unwrap();
++    reservation.revoked().await;
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_manager_removal_revokes_before_ownership_changes() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let removed = fixture
++        .manager
++        .remove_thread_if_matches(&fixture.root.thread_id, &fixture.root.thread)
++        .await;
++    reservation.revoked().await;
++    assert!(removed.is_some());
++    assert_eq!(
++        fixture
++            .root
++            .thread
++            .prepare_context_rotation(fixture.turn.clone())
++            .await
++            .err(),
++        Some(NativeRotationError::Closed)
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_failed_flush_is_not_a_preparation_receipt() {
++    let fixture = Fixture::completed().await;
++    fixture
++        .root
++        .thread
++        .session
++        .live_thread()
++        .unwrap()
++        .shutdown()
++        .await
++        .unwrap();
++    let error = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .err()
++        .unwrap();
++    assert!(matches!(error, NativeRotationError::Persistence(_)));
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn background_history_write_revokes_preparation_before_appending() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    assert!(fixture.root.thread.session.persist_rollout_items(&[]).await);
++    reservation.revoked().await;
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn unsuccessful_task_cannot_claim_successful_completion() {
++    let fixture = Fixture::finished(Outcome::Failure).await;
++    assert_eq!(
++        fixture
++            .root
++            .thread
++            .prepare_context_rotation(fixture.turn.clone())
++            .await
++            .err(),
++        Some(NativeRotationError::TurnChanged),
++    );
++    fixture.close().await;
++}
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -6760,6 +6760,7 @@
+         realtime_history: None,
+         active_turn: Mutex::new(None),
+         activity_admission: Default::default(),
++        native_rotation: Default::default(),
+         async_hook_results,
+         input_queue: super::input_queue::InputQueue::new(),
+         services,
+@@ -9045,6 +9046,7 @@
+         realtime_history: None,
+         active_turn: Mutex::new(None),
+         activity_admission: Default::default(),
++        native_rotation: Default::default(),
+         async_hook_results,
+         input_queue: super::input_queue::InputQueue::new(),
+         services,
+--- a/codex-rs/hooks/src/engine/command_runner.rs
++++ b/codex-rs/hooks/src/engine/command_runner.rs
+@@ -183,6 +183,12 @@
+             };
+             task.await;
+         });
++    }
++
++    pub(crate) fn has_pending_async_work(&self) -> bool {
++        let mut state = self.lock_state();
++        while state.tasks.try_join_next().is_some() {}
++        !state.tasks.is_empty()
+     }
+ 
+     pub(crate) async fn shutdown(&self) {
+--- a/codex-rs/hooks/src/registry.rs
++++ b/codex-rs/hooks/src/registry.rs
+@@ -149,6 +149,12 @@
+         }
+     }
+ 
++    /// Observe unfinished asynchronous hooks after reaping completed work.
++    /// Callers must separately prevent new hook dispatch while relying on this snapshot.
++    pub fn has_pending_async_work(&self) -> bool {
++        self.engine.command_runtime.has_pending_async_work()
++    }
++
+     /// Abort and join outstanding async hooks during session shutdown.
+     pub async fn shutdown(&self) {
+         self.engine.command_runtime.shutdown().await;
+--- a/codex-rs/core/src/session/mcp.rs
++++ b/codex-rs/core/src/session/mcp.rs
+@@ -349,7 +349,9 @@
+     }
+ 
+     pub(super) fn mark_mcp_runtime_dirty(&self) {
+-        self.mcp_refresh.invalidate();
++        if self.activity_admission.invalidate() {
++            self.mcp_refresh.invalidate();
++        }
+     }
+ 
+     #[tracing::instrument(
+--- a/codex-rs/core/src/session/mcp_prewarm.rs
++++ b/codex-rs/core/src/session/mcp_prewarm.rs
+@@ -19,6 +19,9 @@
+ 
+ impl Session {
+     pub(crate) fn request_mcp_runtime_refresh(&self) {
++        if !self.activity_admission.invalidate() {
++            return;
++        }
+         // Plugin changes can reuse connections but still change their skill resources.
+         self.services.mcp_runtime.invalidate_resource_caches();
+         self.request_mcp_runtime_reprojection();
+@@ -75,6 +78,16 @@
+                         recovery_delay = Duration::from_secs(30);
+                         continue;
+                     }
++                }
++                let admission = tokio::select! {
++                    biased;
++                    _ = shutdown.cancelled() => break,
++                    permit = session.activity_admission.enter() => permit,
++                };
++                let Some(_admission) = admission else {
++                    break;
++                };
++                if recovery_check {
+                     // Reconcile the latest policy. The manager reuses healthy
+                     // exact clients and replaces failed clients; do not force
+                     // reconnect all servers or submit a model turn.
+@@ -102,7 +115,7 @@
+         let _ = self.mcp_prewarm_tx.try_send(());
+     }
+ 
+-    pub(super) async fn stop_mcp_prewarm_worker(&self) {
++    pub(crate) async fn stop_mcp_prewarm_worker(&self) {
+         self.mcp_prewarm_shutdown.cancel();
+         let worker = self
+             .mcp_prewarm_task
+--- a/codex-rs/hooks/src/engine/command_runner_tests.rs
++++ b/codex-rs/hooks/src/engine/command_runner_tests.rs
+@@ -950,3 +950,29 @@
+         assert!(!root.path().join("ran").exists());
+     }
+ }
++
++#[tokio::test]
++async fn pending_async_work_is_shared_by_reconfigured_hooks_and_reaped_after_completion() {
++    let (sender, _receiver) = async_channel::unbounded();
++    let runtime = CommandHookRuntime::new(
++        CommandShell {
++            program: String::new(),
++            args: Vec::new(),
++        },
++        Arc::new(Vec::new()),
++        codex_protocol::ThreadId::new(),
++        sender,
++    );
++    let reconfigured = runtime.reconfigured(CommandShell {
++        program: String::new(),
++        args: Vec::new(),
++    });
++    let (release, released) = tokio::sync::oneshot::channel::<()>();
++    runtime.schedule_async_task(async move {
++        let _ = released.await;
++    });
++    assert!(reconfigured.has_pending_async_work());
++    release.send(()).unwrap();
++    tokio::task::yield_now().await;
++    assert!(!runtime.has_pending_async_work());
++}

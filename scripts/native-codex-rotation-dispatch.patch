@@ -1,0 +1,589 @@
+--- a/codex-rs/core/src/session/activity_admission.rs
++++ b/codex-rs/core/src/session/activity_admission.rs
+@@ -3,6 +3,7 @@
+ //! behind a queued exclusive waiter.
+ use std::sync::Arc;
+ use std::sync::Mutex;
++use tokio::sync::Notify;
+ use tokio::sync::OwnedRwLockReadGuard;
+ use tokio::sync::OwnedRwLockWriteGuard;
+ use tokio::sync::RwLock;
+@@ -10,6 +11,7 @@
+ #[derive(Clone)]
+ pub(crate) struct ActivityAdmission {
+     activity: Arc<RwLock<()>>,
++    changed: Arc<Notify>,
+     state: Arc<Mutex<AdmissionState>>,
+ }
+ 
+@@ -27,6 +29,7 @@
+ pub(crate) struct ActivityReservation {
+     state: Arc<Mutex<AdmissionState>>,
+     generation: u64,
++    changed: Arc<Notify>,
+     _activity: OwnedRwLockWriteGuard<()>,
+ }
+ 
+@@ -34,6 +37,7 @@
+     fn default() -> Self {
+         Self {
+             activity: Arc::new(RwLock::new(())),
++            changed: Arc::new(Notify::new()),
+             state: Arc::new(Mutex::new(AdmissionState {
+                 generation: Some(0),
+                 waiting: 0,
+@@ -60,6 +64,7 @@
+         }
+         state.generation = state.generation.and_then(|value| value.checked_add(1));
+         state.waiting += 1;
++        self.changed.notify_waiters();
+         Some(AdmissionAttempt {
+             state: Arc::clone(&self.state),
+         })
+@@ -97,12 +102,25 @@
+         Some(ActivityReservation {
+             state: Arc::clone(&self.state),
+             generation: expected,
++            changed: Arc::clone(&self.changed),
+             _activity: activity,
+         })
+     }
+ }
+ 
+ impl ActivityReservation {
++    pub(crate) async fn invalidated(&self) {
++        loop {
++            let changed = self.changed.notified();
++            tokio::pin!(changed);
++            changed.as_mut().enable();
++            if !self.is_current() {
++                return;
++            }
++            changed.await;
++        }
++    }
++
+     pub(crate) fn is_current(&self) -> bool {
+         let state = self.state.lock().expect("activity admission poisoned");
+         !state.closed && state.waiting == 0 && state.generation == Some(self.generation)
+--- a/codex-rs/core/src/session/submission_admission.rs
++++ b/codex-rs/core/src/session/submission_admission.rs
+@@ -6,6 +6,11 @@
+ use super::Submission;
+ use super::activity_admission::ActivityAdmission;
+ use super::activity_admission::ActivityReservation;
++use super::rotation_dispatch::DispatchError;
++use super::rotation_dispatch::DispatchLease;
++use super::rotation_dispatch::RotationRequest;
++use super::rotation_dispatch::SubmissionDispatch;
++use async_channel::Receiver;
+ use async_channel::SendError;
+ use async_channel::Sender;
+ 
+@@ -13,6 +18,7 @@
+ pub(crate) struct SubmissionSender {
+     sender: Sender<Submission>,
+     admission: ActivityAdmission,
++    rotation: Option<Sender<RotationRequest>>,
+ }
+ 
+ /// Holds channel and task admission until dropped; waiting input stays owned.
+@@ -29,7 +35,28 @@
+ 
+ impl SubmissionSender {
+     pub(crate) fn new(sender: Sender<Submission>, admission: ActivityAdmission) -> Self {
+-        Self { sender, admission }
++        Self {
++            sender,
++            admission,
++            rotation: None,
++        }
++    }
++
++    pub(super) fn with_dispatch(
++        mut self,
++        receiver: Receiver<Submission>,
++    ) -> (Self, SubmissionDispatch) {
++        let (requests, dispatch) = SubmissionDispatch::new(receiver, self.admission.clone());
++        self.rotation = Some(requests);
++        (self, dispatch)
++    }
++
++    /// Reserves only dispatch and shared activity, not full session quiescence.
++    pub(crate) async fn reserve_dispatch(
++        &self,
++        expected_generation: u64,
++    ) -> Result<DispatchLease, DispatchError> {
++        RotationRequest::request(self.rotation.as_ref(), expected_generation).await
+     }
+ 
+     pub(crate) async fn send(&self, submission: Submission) -> Result<(), SendError<Submission>> {
+@@ -49,6 +76,7 @@
+ 
+     /// Call only from the receiver's ordered dispatch loop. Fails immediately
+     /// for queued input, active or starting tasks, pending attempts or stale evidence.
++    #[cfg(test)]
+     pub(crate) fn try_reserve(&self, expected_generation: u64) -> Option<SubmissionReservation> {
+         let activity = self.admission.try_reserve(expected_generation)?;
+         if self.sender.is_closed() || !self.sender.is_empty() {
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -253,6 +253,7 @@
+ mod review;
+ mod rollout_budget;
+ mod rollout_reconstruction;
++mod rotation_dispatch;
+ #[allow(clippy::module_inception)]
+ pub(crate) mod session;
+ pub(crate) mod startup_prewarm;
+@@ -929,8 +930,9 @@
+                 .await;
+         }
+         let thread_id = session.thread_id;
+-        let tx_sub =
+-            submission_admission::SubmissionSender::new(tx_sub, session.activity_admission.clone());
++        let (tx_sub, rx_sub) =
++            submission_admission::SubmissionSender::new(tx_sub, session.activity_admission.clone())
++                .with_dispatch(rx_sub);
+         #[cfg(unix)]
+         let relay_inbox = if std::env::var("RELAY_NATIVE_MESSAGES").as_deref() == Ok("1") {
+             match crate::relay_native_inbox::start(
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -4,7 +4,6 @@
+ use crate::realtime_conversation::handle_speech as handle_realtime_conversation_speech;
+ use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
+ use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
+-use async_channel::Receiver;
+ use codex_otel::set_parent_from_w3c_trace_context;
+ use tracing::Instrument;
+ use tracing::debug_span;
+@@ -420,7 +419,7 @@
+ pub(super) async fn submission_loop(
+     sess: Arc<Session>,
+     config: Arc<Config>,
+-    rx_sub: Receiver<Submission>,
++    mut rx_sub: super::rotation_dispatch::SubmissionDispatch,
+ ) {
+     // To break out of this loop, send Op::Shutdown.
+     let mut shutdown_received = false;
+--- /dev/null
++++ b/codex-rs/core/src/session/rotation_dispatch.rs
+@@ -0,0 +1,154 @@
++//! Bounded reservations owned by the ordered submission receiver.
++//! A lease proves only dispatch/activity exclusion. It is not a flush, idle,
++//! descendant, frontend-input, shutdown or clear receipt.
++use super::Submission;
++use super::activity_admission::ActivityAdmission;
++use async_channel::Receiver;
++use async_channel::RecvError;
++use async_channel::Sender;
++use std::time::Duration;
++use tokio::sync::oneshot;
++use tokio::time::Instant;
++use tokio_util::sync::CancellationToken;
++
++const MAX_RESERVATION: Duration = Duration::from_secs(5);
++
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum DispatchError {
++    Busy,
++    Closed,
++    Expired,
++    Unsupported,
++}
++
++/// Dropping the lease releases dispatch; invalidation and expiry revoke it.
++/// A future commit command must be checked by the receiver owner atomically.
++pub(crate) struct DispatchLease {
++    _release: oneshot::Sender<()>,
++    revoked: CancellationToken,
++}
++
++impl DispatchLease {
++    pub(crate) async fn revoked(&self) {
++        self.revoked.cancelled().await;
++    }
++}
++
++pub(super) struct RotationRequest {
++    generation: u64,
++    deadline: Instant,
++    reply: oneshot::Sender<Result<DispatchLease, DispatchError>>,
++}
++
++impl RotationRequest {
++    pub(super) async fn request(
++        requests: Option<&Sender<Self>>,
++        generation: u64,
++    ) -> Result<DispatchLease, DispatchError> {
++        let requests = requests.ok_or(DispatchError::Unsupported)?;
++        let deadline = Instant::now() + MAX_RESERVATION;
++        let (reply, result) = oneshot::channel();
++        requests
++            .try_send(Self {
++                generation,
++                deadline,
++                reply,
++            })
++            .map_err(|error| {
++                if error.is_closed() {
++                    DispatchError::Closed
++                } else {
++                    DispatchError::Busy
++                }
++            })?;
++        match tokio::time::timeout_at(deadline, result).await {
++            Ok(Ok(result)) => result,
++            Ok(Err(_)) => Err(DispatchError::Closed),
++            Err(_) => Err(DispatchError::Expired),
++        }
++    }
++}
++
++/// The only owner allowed to dequeue normal submissions and acquire reservations.
++/// Deliberately not Clone; recv requires exclusive access.
++pub(super) struct SubmissionDispatch {
++    receiver: Receiver<Submission>,
++    requests: Receiver<RotationRequest>,
++    admission: ActivityAdmission,
++}
++
++impl SubmissionDispatch {
++    pub(super) fn new(
++        receiver: Receiver<Submission>,
++        admission: ActivityAdmission,
++    ) -> (Sender<RotationRequest>, Self) {
++        let (requests, rx_requests) = async_channel::bounded(1);
++        (
++            requests,
++            Self {
++                receiver,
++                requests: rx_requests,
++                admission,
++            },
++        )
++    }
++
++    pub(super) async fn recv(&mut self) -> Result<Submission, RecvError> {
++        loop {
++            tokio::select! {
++                biased;
++                submission = self.receiver.recv() => return submission,
++                request = self.requests.recv() => {
++                    let Ok(request) = request else {
++                        return self.receiver.recv().await;
++                    };
++                    if let Some(submission) = self.reserve(request).await {
++                        return submission;
++                    }
++                }
++            }
++        }
++    }
++
++    async fn reserve(&mut self, request: RotationRequest) -> Option<Result<Submission, RecvError>> {
++        if request.reply.is_closed() {
++            return None;
++        }
++        if Instant::now() >= request.deadline {
++            let _ = request.reply.send(Err(DispatchError::Expired));
++            return None;
++        }
++        let Some(reservation) = self.admission.try_reserve(request.generation) else {
++            let _ = request.reply.send(Err(DispatchError::Busy));
++            return None;
++        };
++        if self.receiver.is_closed() || !self.receiver.is_empty() {
++            let _ = request.reply.send(Err(DispatchError::Busy));
++            return None;
++        }
++        let (release, released) = oneshot::channel();
++        let revoked = CancellationToken::new();
++        // Revocation is observable even if the dispatch task is cancelled.
++        let _revoke_on_drop = revoked.clone().drop_guard();
++        let lease = DispatchLease {
++            _release: release,
++            revoked,
++        };
++        if request.reply.send(Ok(lease)).is_err() {
++            return None;
++        }
++        tokio::select! {
++            biased;
++            _ = reservation.invalidated() => None,
++            _ = tokio::time::sleep_until(request.deadline) => None,
++            _ = released => None,
++            // Detect final sender drop without holding an extra sender alive.
++            // Preserve any received submission if a raw sender exists in a fixture.
++            submission = self.receiver.recv() => Some(submission),
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "rotation_dispatch_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/core/src/session/rotation_dispatch_tests.rs
+@@ -0,0 +1,212 @@
++use super::DispatchError;
++use super::MAX_RESERVATION;
++use super::SubmissionDispatch;
++use crate::session::Submission;
++use crate::session::activity_admission::ActivityAdmission;
++use crate::session::submission_admission::SubmissionSender;
++use codex_protocol::protocol::Op;
++use futures::poll;
++use pretty_assertions::assert_eq;
++use std::task::Poll;
++
++fn channel() -> (SubmissionSender, SubmissionDispatch, ActivityAdmission) {
++    let (sender, receiver) = async_channel::bounded(4);
++    let admission = ActivityAdmission::default();
++    let (sender, dispatch) =
++        SubmissionSender::new(sender, admission.clone()).with_dispatch(receiver);
++    (sender, dispatch, admission)
++}
++
++fn submission(id: &str) -> Submission {
++    Submission {
++        id: id.to_owned(),
++        op: Op::Shutdown,
++        trace: None,
++        parent_turn_id: None,
++        root_turn_id: None,
++        residency_guard: None,
++    }
++}
++
++#[tokio::test]
++async fn reservation_waits_for_receiver_owner_and_input_revokes_without_loss() {
++    let (sender, mut dispatch, _) = channel();
++    let request = sender.reserve_dispatch(0);
++    tokio::pin!(request);
++    assert!(matches!(poll!(&mut request), Poll::Pending));
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    let lease = request.await.unwrap();
++    assert!(matches!(poll!(Box::pin(lease.revoked())), Poll::Pending));
++    let input = sender.send(submission("human"));
++    tokio::pin!(input);
++    assert!(matches!(poll!(&mut input), Poll::Pending));
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    lease.revoked().await;
++    input.await.unwrap();
++    assert_eq!(receive.await.unwrap().id, "human");
++}
++
++#[tokio::test]
++async fn queued_input_is_dispatched_before_reservation_and_old_generation_is_refused() {
++    let (sender, mut dispatch, _) = channel();
++    sender.send(submission("first")).await.unwrap();
++    let request = sender.reserve_dispatch(0);
++    tokio::pin!(request);
++    assert!(matches!(poll!(&mut request), Poll::Pending));
++    assert_eq!(dispatch.recv().await.unwrap().id, "first");
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    assert_eq!(request.await.err(), Some(DispatchError::Busy));
++}
++
++#[tokio::test]
++async fn active_activity_refuses_reservation_immediately() {
++    let (sender, mut dispatch, admission) = channel();
++    let _activity = admission.enter().await.unwrap();
++    let request = sender.reserve_dispatch(1);
++    tokio::pin!(request);
++    assert!(matches!(poll!(&mut request), Poll::Pending));
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    assert_eq!(request.await.err(), Some(DispatchError::Busy));
++}
++
++#[tokio::test]
++async fn dropping_caller_before_dispatch_leaves_no_reservation() {
++    let (sender, mut dispatch, admission) = channel();
++    {
++        let request = sender.reserve_dispatch(0);
++        tokio::pin!(request);
++        assert!(matches!(poll!(&mut request), Poll::Pending));
++    }
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    assert!(admission.try_reserve(0).is_some());
++    sender.send(submission("next")).await.unwrap();
++    assert_eq!(receive.await.unwrap().id, "next");
++}
++
++#[tokio::test]
++async fn dropping_lease_releases_admission_without_closing_session() {
++    let (sender, mut dispatch, admission) = channel();
++    let request = sender.reserve_dispatch(0);
++    tokio::pin!(request);
++    assert!(matches!(poll!(&mut request), Poll::Pending));
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    let lease = request.await.unwrap();
++    assert!(admission.try_reserve(0).is_none());
++    drop(lease);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    assert!(admission.try_reserve(0).is_some());
++    assert!(!sender.is_closed());
++}
++
++#[tokio::test(start_paused = true)]
++async fn reservation_expires_even_if_caller_keeps_lease() {
++    let (sender, mut dispatch, admission) = channel();
++    let request = sender.reserve_dispatch(0);
++    tokio::pin!(request);
++    assert!(matches!(poll!(&mut request), Poll::Pending));
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    let lease = request.await.unwrap();
++    tokio::time::advance(MAX_RESERVATION).await;
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    lease.revoked().await;
++    assert!(admission.try_reserve(0).is_some());
++}
++
++#[tokio::test(start_paused = true)]
++async fn request_deadline_includes_waiting_for_dispatch() {
++    let (sender, mut dispatch, admission) = channel();
++    let request = sender.reserve_dispatch(0);
++    tokio::pin!(request);
++    assert!(matches!(poll!(&mut request), Poll::Pending));
++    tokio::time::advance(MAX_RESERVATION).await;
++    assert_eq!(request.await.err(), Some(DispatchError::Expired));
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    assert!(admission.try_reserve(0).is_some());
++}
++
++#[tokio::test]
++async fn final_sender_drop_closes_dispatch_with_reservation_outstanding() {
++    let (sender, mut dispatch, _) = channel();
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    let lease = {
++        let request = sender.reserve_dispatch(0);
++        tokio::pin!(request);
++        assert!(matches!(poll!(&mut request), Poll::Pending));
++        assert!(matches!(poll!(&mut receive), Poll::Pending));
++        request.await.unwrap()
++    };
++    drop(sender);
++    assert!(receive.await.is_err());
++    lease.revoked().await;
++}
++
++#[tokio::test]
++async fn dispatch_cancellation_revokes_lease_and_releases_admission() {
++    let (sender, mut dispatch, admission) = channel();
++    let lease = {
++        let request = sender.reserve_dispatch(0);
++        tokio::pin!(request);
++        assert!(matches!(poll!(&mut request), Poll::Pending));
++        let receive = dispatch.recv();
++        tokio::pin!(receive);
++        assert!(matches!(poll!(&mut receive), Poll::Pending));
++        request.await.unwrap()
++    };
++    lease.revoked().await;
++    assert!(admission.try_reserve(0).is_some());
++}
++
++#[tokio::test]
++async fn request_queue_is_bounded() {
++    let (sender, _dispatch, _) = channel();
++    let first = sender.reserve_dispatch(0);
++    tokio::pin!(first);
++    assert!(matches!(poll!(&mut first), Poll::Pending));
++    assert_eq!(
++        sender.reserve_dispatch(0).await.err(),
++        Some(DispatchError::Busy)
++    );
++}
++
++#[tokio::test]
++async fn attempted_task_start_revokes_and_then_resumes() {
++    let (sender, mut dispatch, admission) = channel();
++    let request = sender.reserve_dispatch(0);
++    tokio::pin!(request);
++    assert!(matches!(poll!(&mut request), Poll::Pending));
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    let lease = request.await.unwrap();
++    let start = admission.enter();
++    tokio::pin!(start);
++    assert!(matches!(poll!(&mut start), Poll::Pending));
++    assert!(matches!(poll!(&mut receive), Poll::Pending));
++    lease.revoked().await;
++    assert!(start.await.is_some());
++}
++
++#[tokio::test]
++async fn invalidation_before_waiter_is_polled_is_observed() {
++    let admission = ActivityAdmission::default();
++    let reservation = admission.try_reserve(0).unwrap();
++    let start = admission.enter();
++    tokio::pin!(start);
++    assert!(matches!(poll!(&mut start), Poll::Pending));
++    reservation.invalidated().await;
++}
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5913,6 +5913,10 @@
+         })
+         .await
+         .expect("submit settings");
++    let (_rotation_requests, rx_sub) = super::rotation_dispatch::SubmissionDispatch::new(
++        rx_sub,
++        session.activity_admission.clone(),
++    );
+     let mut submissions = Box::pin(tokio::task::unconstrained(submission_loop(
+         Arc::clone(&session),
+         turn_context.config,
+@@ -8587,6 +8591,10 @@
+     let (tx_sub, rx_sub) = async_channel::bounded(1);
+     drop(tx_sub);
+     let session = Arc::new(session);
++    let (_rotation_requests, rx_sub) = super::rotation_dispatch::SubmissionDispatch::new(
++        rx_sub,
++        session.activity_admission.clone(),
++    );
+     submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
+ 
+     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
+@@ -8672,6 +8680,10 @@
+ 
+     let (tx_sub, rx_sub) = async_channel::bounded(1);
+     drop(tx_sub);
++    let (_rotation_requests, rx_sub) = super::rotation_dispatch::SubmissionDispatch::new(
++        rx_sub,
++        session.activity_admission.clone(),
++    );
+     submission_loop(Arc::clone(&session), session.get_config().await, rx_sub).await;
+ 
+     assert_eq!(
+--- a/codex-rs/core/src/session/step_activation_tests.rs
++++ b/codex-rs/core/src/session/step_activation_tests.rs
+@@ -560,6 +560,10 @@
+     let expected_destination = with_config_overrides(expected_destination, &model_manager_config);
+     let desired = desired_step_settings(&session).await;
+     let (submissions, receiver) = async_channel::unbounded();
++    let (_rotation_requests, receiver) = crate::session::rotation_dispatch::SubmissionDispatch::new(
++        receiver,
++        session.activity_admission.clone(),
++    );
+     let loop_task = tokio::spawn(submission_loop(
+         Arc::clone(&session),
+         session.get_config().await,

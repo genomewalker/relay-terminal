@@ -1,0 +1,66 @@
+--- a/codex-rs/tui/src/relay_rotation_bridge.rs
++++ b/codex-rs/tui/src/relay_rotation_bridge.rs
+@@ -288,7 +288,16 @@
+                             reason: None,
+                         }
+                     }
+-                    _ => Reply::status(request.id, "refused"),
++                    Ok(_) => {
++                        let mut reply = Reply::status(request.id, "refused");
++                        reply.reason = Some("native preparation expired before transfer".into());
++                        reply
++                    }
++                    Err(reason) => {
++                        let mut reply = Reply::status(request.id, "refused");
++                        reply.reason = Some(reason.to_string().chars().take(512).collect());
++                        reply
++                    }
+                 }
+             }
+             Operation::Release
+--- a/codex-rs/tui/src/relay_rotation_bridge_tests.rs
++++ b/codex-rs/tui/src/relay_rotation_bridge_tests.rs
+@@ -81,7 +81,7 @@
+         .expect("reply");
+     assert_eq!(
+         serde_json::from_slice::<serde_json::Value>(&response).expect("JSON"),
+-        serde_json::json!({"v":1,"id":"0123456789abcdef0123456789abcdef","state":"refused"})
++        serde_json::json!({"v":1,"id":"0123456789abcdef0123456789abcdef","state":"refused","reason":"foreground context rotation owner closed"})
+     );
+     client_write.shutdown().await.expect("disconnect");
+     task.await.expect("bridge task").expect("bridge close");
+@@ -171,3 +171,34 @@
+     client_write.shutdown().await.unwrap();
+     task.await.unwrap().unwrap();
+ }
++
++#[tokio::test]
++async fn native_rotation_bridge_prepare_preserves_bounded_refusal_reason() {
++    let (client, server) = tokio::io::duplex(32768);
++    let (client_read, mut client_write) = tokio::io::split(client);
++    let (server_read, server_write) = tokio::io::split(server);
++    let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
++    let task = tokio::spawn(serve(
++        BufReader::new(server_read),
++        server_write,
++        AppEventSender::new(events),
++    ));
++    client_write.write_all(PREPARE).await.expect("request");
++    let Some(AppEvent::PrepareContextRotation(request)) = receiver.recv().await else {
++        panic!("foreground request");
++    };
++    let reason = "β".repeat(700);
++    request.refuse(reason.clone());
++    let response = read_wire_line(&mut BufReader::new(client_read))
++        .await
++        .expect("reply");
++    assert_eq!(
++        serde_json::from_slice::<serde_json::Value>(&response).expect("JSON"),
++        serde_json::json!({
++            "v":1, "id":"0123456789abcdef0123456789abcdef", "state":"refused",
++            "reason": reason.chars().take(512).collect::<String>()
++        })
++    );
++    client_write.shutdown().await.expect("disconnect");
++    task.await.expect("bridge task").expect("bridge close");
++}

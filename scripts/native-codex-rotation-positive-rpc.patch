@@ -1,0 +1,154 @@
+--- a/codex-rs/app-server/tests/suite/v2/context_rotation.rs
++++ b/codex-rs/app-server/tests/suite/v2/context_rotation.rs
+@@ -63,3 +63,151 @@
+     );
+     Ok(())
+ }
++
++#[tokio::test]
++async fn context_rotation_wire_api_prepares_and_releases_completed_shell_turn_without_model_requests()
++-> Result<()> {
++    use app_test_support::create_mock_responses_server_sequence;
++    use codex_app_server_protocol::ThreadContextRotationPrepareResponse;
++    use codex_app_server_protocol::ThreadHistoryMode;
++    use codex_app_server_protocol::ThreadShellCommandParams;
++    use codex_app_server_protocol::ThreadShellCommandResponse;
++    use codex_app_server_protocol::TurnCompletedNotification;
++    use codex_app_server_protocol::TurnStatus;
++
++    let provider = create_mock_responses_server_sequence(vec![]).await;
++    let home = TempDir::new()?;
++    MockResponsesConfig::new(&provider.uri()).write(home.path())?;
++    let mut server = TestAppServer::builder()
++        .with_codex_home(home.path())
++        // Shell commands execute on the app-server host, without a remote exec fixture.
++        .without_auto_env()
++        .build_initialized()
++        .await?;
++    let started: codex_app_server_protocol::ThreadStartResponse = server
++        .request(|request_id| ClientRequest::ThreadStart {
++            request_id,
++            params: ThreadStartParams {
++                model: Some("mock-model".to_owned()),
++                history_mode: Some(ThreadHistoryMode::Legacy),
++                ..Default::default()
++            },
++        })
++        .await?;
++    let _: ThreadShellCommandResponse = server
++        .request(|request_id| ClientRequest::ThreadShellCommand {
++            request_id,
++            params: ThreadShellCommandParams {
++                thread_id: started.thread.id.clone(),
++                command: "echo rotation-boundary".to_owned(),
++                timeout_ms: Some(5000),
++            },
++        })
++        .await?;
++    let completed: TurnCompletedNotification = tokio::time::timeout(
++        std::time::Duration::from_secs(10),
++        server.read_notification("turn/completed"),
++    )
++    .await??;
++    assert_eq!(completed.turn.status, TurnStatus::Completed);
++    // The public terminal event precedes the final flush and task-permit release.
++    // Retry only an explicit Busy refusal: no reservation was granted. Transport
++    // uncertainty and every other error remain fatal; successful requests are not replayed.
++    let receipt: ThreadContextRotationPrepareResponse = tokio::time::timeout(
++        std::time::Duration::from_secs(10),
++        async {
++            let mut retry_delay = std::time::Duration::from_millis(50);
++            loop {
++                let request_id = codex_app_server_protocol::RequestId::Integer(
++                    server
++                        .send_request(
++                            "thread/contextRotation/prepare",
++                            Some(serde_json::to_value(ThreadContextRotationPrepareParams {
++                                thread_id: started.thread.id.clone(),
++                                turn_id: completed.turn.id.clone(),
++                            })?),
++                        )
++                        .await?,
++                );
++                loop {
++                    use codex_app_server_protocol::JSONRPCMessage;
++                    match server.read_next_message().await? {
++                        JSONRPCMessage::Response(response) if response.id == request_id => {
++                            return Ok::<_, anyhow::Error>(serde_json::from_value(response.result)?);
++                        }
++                        JSONRPCMessage::Error(error) if error.id == request_id => {
++                            anyhow::ensure!(
++                                error.error.code == -32000
++                                    && error.error.message
++                                        == "native preparation refused: native session is busy or its admission changed",
++                                "unexpected native preparation refusal: {:?}",
++                                error.error
++                            );
++                            break;
++                        }
++                        JSONRPCMessage::Notification(_) => {}
++                        other => anyhow::bail!("unexpected preparation message: {other:?}"),
++                    }
++                }
++                tokio::time::sleep(retry_delay).await;
++                retry_delay = (retry_delay * 2).min(std::time::Duration::from_millis(250));
++            }
++        },
++    )
++    .await??;
++    assert_eq!(
++        (&receipt.thread_id, &receipt.turn_id),
++        (&started.thread.id, &completed.turn.id)
++    );
++    assert!(uuid::Uuid::parse_str(&receipt.reservation_id).is_ok());
++    assert!(uuid::Uuid::parse_str(&receipt.runtime_id).is_ok());
++    assert!(receipt.admission_generation.parse::<u64>().is_ok());
++    assert!((1..=5000).contains(&receipt.expires_in_ms));
++    let rollout = tokio::fs::read_to_string(&receipt.rollout_path).await?;
++    assert!(
++        rollout.lines().any(|line| {
++            let event: serde_json::Value = serde_json::from_str(line).expect("valid rollout event");
++            event["type"] == "event_msg"
++                && matches!(
++                    event["payload"]["type"].as_str(),
++                    Some("task_complete" | "turn_complete")
++                )
++                && event["payload"]["turn_id"] == completed.turn.id
++        }),
++        "preparation must follow the durable terminal event for this exact turn"
++    );
++    let released: ThreadContextRotationReleaseResponse = server
++        .request(|request_id| ClientRequest::ThreadContextRotationRelease {
++            request_id,
++            params: ThreadContextRotationReleaseParams {
++                thread_id: receipt.thread_id.clone(),
++                reservation_id: receipt.reservation_id.clone(),
++            },
++        })
++        .await?;
++    assert_eq!(
++        released,
++        ThreadContextRotationReleaseResponse { released: true }
++    );
++    let released_again: ThreadContextRotationReleaseResponse = server
++        .request(|request_id| ClientRequest::ThreadContextRotationRelease {
++            request_id,
++            params: ThreadContextRotationReleaseParams {
++                thread_id: receipt.thread_id.clone(),
++                reservation_id: receipt.reservation_id.clone(),
++            },
++        })
++        .await?;
++    assert_eq!(
++        released_again,
++        ThreadContextRotationReleaseResponse { released: false }
++    );
++    assert!(
++        provider
++            .received_requests()
++            .await
++            .expect("mock request log")
++            .is_empty()
++    );
++    Ok(())
++}

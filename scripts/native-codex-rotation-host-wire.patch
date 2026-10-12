@@ -1,0 +1,808 @@
+--- a/codex-rs/tui/src/app/rotation_commit.rs
++++ b/codex-rs/tui/src/app/rotation_commit.rs
+@@ -185,7 +185,7 @@
+         let Some(owner) = self
+             .owner
+             .as_mut()
+-            .filter(|owner| owner.operation_id == request.operation_id)
++            .filter(|owner| owner.native.identity() == request.identity)
+         else {
+             request.refuse("operation is not retained by this foreground owner");
+             return;
+@@ -424,7 +424,10 @@
+         let operation_id = uuid::Uuid::new_v4();
+         let (reply, receive) = tokio::sync::oneshot::channel();
+         ContextRotationReconcileRequest {
+-            operation_id,
++            identity: ContextRotationIdentity {
++                operation_id,
++                host_claim_id: uuid::Uuid::new_v4(),
++            },
+             reply,
+         }
+         .refuse("unknown operation");
+--- a/codex-rs/tui/src/app_event_sender.rs
++++ b/codex-rs/tui/src/app_event_sender.rs
+@@ -80,17 +80,17 @@
+ 
+     pub(crate) async fn reconcile_context_rotation(
+         &self,
+-        operation_id: uuid::Uuid,
++        identity: crate::app_server_session::context_rotation::ContextRotationIdentity,
+     ) -> crate::app_server_session::context_rotation::ContextRotationStatus {
+         let (reply, receive) = tokio::sync::oneshot::channel();
+         self.send(AppEvent::ReconcileContextRotation(
+             crate::app_server_session::context_rotation::ContextRotationReconcileRequest {
+-                operation_id,
++                identity,
+                 reply,
+             },
+         ));
+         crate::app_server_session::context_rotation::await_context_rotation_reply(
+-            operation_id,
++            identity.operation_id,
+             receive,
+         )
+         .await
+--- a/codex-rs/tui/src/app_server_session/context_rotation.rs
++++ b/codex-rs/tui/src/app_server_session/context_rotation.rs
+@@ -22,6 +22,10 @@
+ }
+ 
+ impl PreparedContextRotation {
++    pub(crate) fn supports_native_commit(&self) -> bool {
++        self.handle.supports_native_context_rotation_commit()
++    }
++
+     /// Structural binding only. The host must verify durable intent before submitting.
+     pub(crate) fn bound_commit_request(
+         &self,
+@@ -443,14 +447,14 @@
+ 
+ #[derive(Debug)]
+ pub(crate) struct ContextRotationReconcileRequest {
+-    pub(crate) operation_id: Uuid,
++    pub(crate) identity: ContextRotationIdentity,
+     pub(crate) reply: tokio::sync::oneshot::Sender<ContextRotationStatus>,
+ }
+ 
+ impl ContextRotationReconcileRequest {
+     pub(crate) fn refuse(self, reason: impl Into<String>) {
+         let _ = self.reply.send(ContextRotationStatus::Refused {
+-            operation_id: self.operation_id,
++            operation_id: self.identity.operation_id,
+             reason: reason.into(),
+         });
+     }
+--- a/codex-rs/tui/src/relay_rotation_bridge.rs
++++ b/codex-rs/tui/src/relay_rotation_bridge.rs
+@@ -1,10 +1,9 @@
+ //! Private pipe connection from the native foreground owner to its Relay host worker.
+-//! It offers bounded preparation/release only; no terminal input or model messages.
++//! Commit handoffs move the actual paired preparation to the foreground owner.
+ use crate::app_event_sender::AppEventSender;
+ use crate::app_server_session::context_rotation::PreparedContextRotation;
+ use codex_app_server_protocol::ThreadContextRotationPrepareResponse;
+ use codex_protocol::ThreadId;
+-use serde::Deserialize;
+ use serde::Serialize;
+ use std::io;
+ use std::path::PathBuf;
+@@ -21,7 +20,15 @@
+ use tokio::task::JoinHandle;
+ use tokio_util::sync::CancellationToken;
+ 
+-const WIRE_LIMIT: usize = 16384;
++#[path = "relay_rotation_bridge_protocol.rs"]
++mod protocol;
++use crate::app_server_session::context_rotation::ContextRotationAcknowledgeStatus;
++use crate::app_server_session::context_rotation::ContextRotationIdentity;
++use crate::app_server_session::context_rotation::ContextRotationStatus;
++use protocol::FrontendReceipt;
++use protocol::Operation;
++use protocol::Request;
++use protocol::WIRE_LIMIT;
+ 
+ pub(crate) struct HostRotationBridge {
+     task: JoinHandle<()>,
+@@ -33,63 +40,6 @@
+     }
+ }
+ 
+-#[derive(Debug, Deserialize)]
+-#[serde(rename_all = "snake_case")]
+-enum Operation {
+-    Prepare,
+-    Release,
+-}
+-
+-#[derive(Debug, Deserialize)]
+-#[serde(deny_unknown_fields)]
+-struct Request {
+-    v: u8,
+-    id: String,
+-    operation: Operation,
+-    thread_id: String,
+-    #[serde(default)]
+-    turn_id: String,
+-    #[serde(default)]
+-    reservation_id: String,
+-}
+-
+-impl Request {
+-    fn parse(line: &[u8]) -> io::Result<Self> {
+-        let request: Self = serde_json::from_slice(line)?;
+-        if request.v != 1
+-            || request.id.len() != 32
+-            || !request
+-                .id
+-                .bytes()
+-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+-            || ThreadId::from_string(&request.thread_id).is_err()
+-        {
+-            return Err(io::Error::other("invalid rotation request identity"));
+-        }
+-        let valid = match request.operation {
+-            Operation::Prepare => {
+-                !request.turn_id.is_empty()
+-                    && request.turn_id.len() <= 256
+-                    && !request.turn_id.contains('\0')
+-                    && request.reservation_id.is_empty()
+-            }
+-            Operation::Release => {
+-                request.turn_id.is_empty() && uuid::Uuid::parse_str(&request.reservation_id).is_ok()
+-            }
+-        };
+-        if !valid {
+-            return Err(io::Error::other("invalid rotation request"));
+-        }
+-        Ok(request)
+-    }
+-}
+-
+-#[derive(Serialize)]
+-struct FrontendReceipt {
+-    runtime_id: String,
+-    generation: String,
+-}
+-
+ #[derive(Serialize)]
+ struct Reply {
+     v: u8,
+@@ -102,9 +52,68 @@
+     native: Option<ThreadContextRotationPrepareResponse>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     frontend: Option<FrontendReceipt>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    commit_supported: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    operation_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    host_claim_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    completion: Option<serde_json::Value>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    source: Option<codex_app_server_client::NativeRotationReceipt>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    reason: Option<String>,
+ }
+ 
+ impl Reply {
++    fn operation_status(
++        id: String,
++        identity: ContextRotationIdentity,
++        state: &'static str,
++    ) -> Self {
++        let mut reply = Self::status(id, state);
++        reply.operation_id = Some(identity.operation_id.to_string());
++        reply.host_claim_id = Some(identity.host_claim_id.to_string());
++        reply
++    }
++
++    fn context_status(
++        id: String,
++        identity: ContextRotationIdentity,
++        status: ContextRotationStatus,
++    ) -> io::Result<Self> {
++        let mut reply = Self::operation_status(id, identity, "pending");
++        match status {
++            ContextRotationStatus::Restored {
++                operation_id,
++                outcome,
++            } if operation_id == identity.operation_id => {
++                if let codex_app_server_client::NativeRotationCommitOutcome::Restored(owned) =
++                    outcome.as_ref()
++                    && owned.receipt().operation_id == identity.operation_id
++                    && owned.receipt().host_claim_id == identity.host_claim_id
++                {
++                    reply.state = "restored";
++                    reply.completion = Some(serde_json::to_value(owned.receipt())?);
++                }
++            }
++            ContextRotationStatus::SourceRetained {
++                operation_id,
++                source,
++            } if operation_id == identity.operation_id => {
++                reply.state = "source_retained";
++                reply.source = Some(source);
++            }
++            ContextRotationStatus::Pending { reason, .. }
++            | ContextRotationStatus::Refused { reason, .. } => {
++                reply.reason = Some(reason.chars().take(512).collect());
++            }
++            _ => {}
++        }
++        Ok(reply)
++    }
++
+     fn status(id: String, state: &'static str) -> Self {
+         Self {
+             v: 1,
+@@ -113,6 +122,12 @@
+             reservation_id: None,
+             native: None,
+             frontend: None,
++            commit_supported: None,
++            operation_id: None,
++            host_claim_id: None,
++            completion: None,
++            source: None,
++            reason: None,
+         }
+     }
+ }
+@@ -225,8 +240,10 @@
+                 let lease = held.take().expect("held reservation");
+                 let id = lease.native.reservation_id.clone();
+                 drop(lease);
+-                write_reply(&mut writer, Reply { v: 1, id: None, state: "revoked",
+-                    reservation_id: Some(id), native: None, frontend: None }).await?;
++                let mut reply = Reply::status(String::new(), "revoked");
++                reply.id = None;
++                reply.reservation_id = Some(id);
++                write_reply(&mut writer, reply).await?;
+                 continue;
+             }
+             request = receive.recv() => match request { Some(request) => request, None => return Ok(()) },
+@@ -248,6 +265,7 @@
+                             runtime_id: lease.frontend.runtime_id.to_string(),
+                             generation: lease.frontend.generation.to_string(),
+                         };
++                        let commit_supported = Some(lease.supports_native_commit());
+                         held = Some(lease);
+                         Reply {
+                             v: 1,
+@@ -256,6 +274,12 @@
+                             reservation_id: None,
+                             native: Some(native),
+                             frontend: Some(frontend),
++                            commit_supported,
++                            operation_id: None,
++                            host_claim_id: None,
++                            completion: None,
++                            source: None,
++                            reason: None,
+                         }
+                     }
+                     _ => Reply::status(request.id, "refused"),
+@@ -282,6 +306,56 @@
+                     },
+                 )
+             }
++
++            Operation::Commit => {
++                let envelope = request.commit.as_ref().expect("validated commit envelope");
++                let identity = envelope.identity()?;
++                if held
++                    .as_ref()
++                    .is_some_and(|lease| envelope.matches_prepared(lease))
++                {
++                    let capsule = envelope.capsule()?;
++                    let lease = held.take().expect("matching actual paired preparation");
++                    // The authenticated host verifies durable intent before this envelope.
++                    // Await the queue handoff even after a pipe disconnect; the foreground
++                    // retains both actual owners across a lost reply.
++                    match sender
++                        .commit_context_rotation(
++                            lease,
++                            identity.operation_id,
++                            identity.host_claim_id,
++                            envelope.capsule_sha256.clone(),
++                            capsule,
++                        )
++                        .await
++                    {
++                        Ok(status) => Reply::context_status(request.id, identity, status)?,
++                        Err(_) => Reply::operation_status(request.id, identity, "pending"),
++                    }
++                } else {
++                    Reply::operation_status(request.id, identity, "pending")
++                }
++            }
++            Operation::Reconcile => {
++                let identity = request.identity()?;
++                let status = sender.reconcile_context_rotation(identity).await;
++                Reply::context_status(request.id, identity, status)?
++            }
++            Operation::Acknowledge => {
++                let identity = request.identity()?;
++                let status = sender.acknowledge_context_rotation(identity).await;
++                let acknowledged = matches!(status, ContextRotationAcknowledgeStatus::Acknowledged { identity: observed } if observed == identity);
++                Reply::operation_status(
++                    request.id,
++                    identity,
++                    if acknowledged {
++                        "acknowledged"
++                    } else {
++                        "pending"
++                    },
++                )
++            }
++
+             _ => Reply::status(request.id, "refused"),
+         };
+         write_reply(&mut writer, reply).await?;
+--- /dev/null
++++ b/codex-rs/tui/src/relay_rotation_bridge_protocol.rs
+@@ -0,0 +1,271 @@
++//! Bounded private Relay wire data. Records cannot recreate a live reservation.
++use crate::app_server_session::context_rotation::ContextRotationIdentity;
++use crate::app_server_session::context_rotation::PreparedContextRotation;
++use base64::Engine;
++use base64::engine::general_purpose::STANDARD;
++use serde::Deserialize;
++use serde::Serialize;
++use sha2::Digest;
++use sha2::Sha256;
++use std::io;
++use std::path::Path;
++
++pub(super) const WIRE_LIMIT: usize = 64 * 1024;
++const CAPSULE_LIMIT: usize = 16 * 1024;
++
++#[derive(Debug, Clone, Copy, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub(super) enum Operation {
++    Prepare,
++    Release,
++    Commit,
++    Reconcile,
++    Acknowledge,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct Request {
++    pub(super) v: u8,
++    pub(super) id: String,
++    pub(super) operation: Operation,
++    pub(super) thread_id: String,
++    #[serde(default)]
++    pub(super) turn_id: String,
++    #[serde(default)]
++    pub(super) reservation_id: String,
++    #[serde(default)]
++    pub(super) operation_id: String,
++    #[serde(default)]
++    pub(super) host_claim_id: String,
++    #[serde(default)]
++    pub(super) commit: Option<Box<HostCommitEnvelope>>,
++}
++fn valid_uuid(value: &str) -> bool {
++    uuid::Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
++}
++fn valid_hash(value: &str) -> bool {
++    value.len() == 64
++        && value
++            .bytes()
++            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
++}
++fn valid_generation(value: &str) -> bool {
++    value
++        .parse::<u64>()
++        .is_ok_and(|number| number.to_string() == value)
++}
++fn valid_turn(value: &str) -> bool {
++    !value.is_empty() && value.len() <= 256 && !value.contains('\0')
++}
++fn identity(operation: &str, host: &str) -> io::Result<ContextRotationIdentity> {
++    if !valid_uuid(operation) || !valid_uuid(host) || operation == host {
++        return Err(io::Error::other("invalid native operation identity"));
++    }
++    Ok(ContextRotationIdentity {
++        operation_id: uuid::Uuid::parse_str(operation).map_err(io::Error::other)?,
++        host_claim_id: uuid::Uuid::parse_str(host).map_err(io::Error::other)?,
++    })
++}
++impl Request {
++    pub(super) fn identity(&self) -> io::Result<ContextRotationIdentity> {
++        identity(&self.operation_id, &self.host_claim_id)
++    }
++    pub(super) fn parse(line: &[u8]) -> io::Result<Self> {
++        if line.len() > WIRE_LIMIT {
++            return Err(io::Error::other("rotation request exceeds limit"));
++        }
++        let request: Self = serde_json::from_slice(line)?;
++        if request.v != 1
++            || request.id.len() != 32
++            || !request
++                .id
++                .bytes()
++                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
++            || !valid_uuid(&request.thread_id)
++        {
++            return Err(io::Error::other("invalid rotation request identity"));
++        }
++        let no_identity = request.operation_id.is_empty() && request.host_claim_id.is_empty();
++        let valid = match request.operation {
++            Operation::Prepare => {
++                valid_turn(&request.turn_id)
++                    && request.reservation_id.is_empty()
++                    && request.commit.is_none()
++                    && no_identity
++            }
++            Operation::Release => {
++                request.turn_id.is_empty()
++                    && valid_uuid(&request.reservation_id)
++                    && request.commit.is_none()
++                    && no_identity
++            }
++            Operation::Commit => {
++                request.turn_id.is_empty()
++                    && valid_uuid(&request.reservation_id)
++                    && no_identity
++                    && request.commit.as_ref().is_some_and(|commit| {
++                        commit.validate().is_ok()
++                            && commit.thread_id == request.thread_id
++                            && commit.reservation.native.reservation_id == request.reservation_id
++                    })
++            }
++            Operation::Reconcile | Operation::Acknowledge => {
++                request.turn_id.is_empty()
++                    && request.reservation_id.is_empty()
++                    && request.commit.is_none()
++                    && request.identity().is_ok()
++            }
++        };
++        if !valid {
++            return Err(io::Error::other("invalid rotation request"));
++        }
++        Ok(request)
++    }
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct NativeReceipt {
++    reservation_id: String,
++    runtime_id: String,
++    thread_id: String,
++    turn_id: String,
++    rollout_path: String,
++    admission_generation: String,
++    expires_in_ms: u32,
++}
++#[derive(Debug, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct FrontendReceipt {
++    pub(super) runtime_id: String,
++    pub(super) generation: String,
++}
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ReservationPair {
++    native: NativeReceipt,
++    frontend: FrontendReceipt,
++}
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct HostIntent {
++    v: u8,
++    mode: String,
++    session_id: String,
++    epoch: String,
++    operation_id: String,
++    host_claim_id: String,
++    claim_id: String,
++    token: u64,
++    intent_id: String,
++    request_sha256: String,
++    seq: u64,
++    state: String,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct HostCommitEnvelope {
++    v: u8,
++    operation_id: String,
++    host_claim_id: String,
++    thread_id: String,
++    turn_id: String,
++    reservation: ReservationPair,
++    intent: HostIntent,
++    pub(super) capsule_sha256: String,
++    capsule_base64: String,
++}
++impl std::fmt::Debug for HostCommitEnvelope {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("HostCommitEnvelope")
++            .field("operation_id", &self.operation_id)
++            .field("host_claim_id", &self.host_claim_id)
++            .finish_non_exhaustive()
++    }
++}
++impl HostCommitEnvelope {
++    pub(super) fn identity(&self) -> io::Result<ContextRotationIdentity> {
++        identity(&self.operation_id, &self.host_claim_id)
++    }
++    pub(super) fn capsule(&self) -> io::Result<String> {
++        if self.capsule_base64.len() > CAPSULE_LIMIT.div_ceil(3) * 4 {
++            return Err(io::Error::other("capsule exceeds limit"));
++        }
++        let bytes = STANDARD
++            .decode(&self.capsule_base64)
++            .map_err(io::Error::other)?;
++        if bytes.len() > CAPSULE_LIMIT
++            || STANDARD.encode(&bytes) != self.capsule_base64
++            || format!("{:x}", Sha256::digest(&bytes)) != self.capsule_sha256
++        {
++            return Err(io::Error::other("capsule encoding or digest changed"));
++        }
++        let capsule = String::from_utf8(bytes).map_err(io::Error::other)?;
++        if capsule.trim().is_empty() || capsule.contains('\0') {
++            return Err(io::Error::other("capsule is empty or contains NUL"));
++        }
++        Ok(capsule)
++    }
++    fn validate(&self) -> io::Result<()> {
++        self.identity()?;
++        let n = &self.reservation.native;
++        let f = &self.reservation.frontend;
++        let intent = &self.intent;
++        if self.v != 1
++            || !valid_uuid(&self.thread_id)
++            || !valid_turn(&self.turn_id)
++            || !valid_hash(&self.capsule_sha256)
++            || !valid_uuid(&n.reservation_id)
++            || !valid_uuid(&n.runtime_id)
++            || n.thread_id != self.thread_id
++            || n.turn_id != self.turn_id
++            || !Path::new(&n.rollout_path).is_absolute()
++            || n.rollout_path.len() > 4096
++            || n.rollout_path.contains('\0')
++            || !valid_generation(&n.admission_generation)
++            || n.expires_in_ms == 0
++            || n.expires_in_ms > 5000
++            || !valid_uuid(&f.runtime_id)
++            || !valid_generation(&f.generation)
++            || intent.v != 1
++            || intent.mode != "native_v1"
++            || intent.state != "commit_requested"
++            || intent.session_id != self.thread_id
++            || intent.epoch != self.operation_id
++            || intent.operation_id != self.operation_id
++            || intent.intent_id != self.operation_id
++            || intent.host_claim_id != self.host_claim_id
++            || intent.claim_id.is_empty()
++            || intent.claim_id.len() > 256
++            || intent.claim_id.contains('\0')
++            || intent.token == 0
++            || intent.seq == 0
++            || !valid_hash(&intent.request_sha256)
++        {
++            return Err(io::Error::other(
++                "host intent or reservation binding changed",
++            ));
++        }
++        self.capsule()?;
++        Ok(())
++    }
++    /// The envelope is descriptive; the actual paired lease is mandatory.
++    pub(super) fn matches_prepared(&self, prepared: &PreparedContextRotation) -> bool {
++        let n = &self.reservation.native;
++        let actual = &prepared.native;
++        prepared.supports_native_commit()
++            && !prepared.remaining_lifetime().is_zero()
++            && n.reservation_id == actual.reservation_id
++            && n.runtime_id == actual.runtime_id
++            && n.thread_id == actual.thread_id
++            && n.turn_id == actual.turn_id
++            && n.rollout_path == actual.rollout_path
++            && n.admission_generation == actual.admission_generation
++            && self.reservation.frontend.runtime_id == prepared.frontend.runtime_id.to_string()
++            && self.reservation.frontend.generation == prepared.frontend.generation.to_string()
++    }
++}
++#[cfg(test)]
++#[path = "relay_rotation_bridge_protocol_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/tui/src/relay_rotation_bridge_protocol_tests.rs
+@@ -0,0 +1,96 @@
++use super::*;
++use serde_json::json;
++
++fn commit() -> serde_json::Value {
++    let thread = "00000000-0000-0000-0000-000000000701";
++    let operation = "00000000-0000-0000-0000-000000000702";
++    let host = "00000000-0000-0000-0000-000000000703";
++    let reservation = "00000000-0000-0000-0000-000000000704";
++    json!({
++        "v":1,"id":"0123456789abcdef0123456789abcdef","operation":"commit",
++        "thread_id":thread,"reservation_id":reservation,
++        "commit":{
++            "v":1,"operation_id":operation,"host_claim_id":host,"thread_id":thread,"turn_id":"turn-1",
++            "reservation":{
++                "native":{"reservationId":reservation,"runtimeId":"00000000-0000-0000-0000-000000000705",
++                    "threadId":thread,"turnId":"turn-1","rolloutPath":"/offline/source.jsonl",
++                    "admissionGeneration":"18446744073709551615","expiresInMs":5000},
++                "frontend":{"runtime_id":"00000000-0000-0000-0000-000000000706","generation":"18446744073709551615"}
++            },
++            "intent":{"v":1,"mode":"native_v1","session_id":thread,"epoch":operation,"operation_id":operation,
++                "host_claim_id":host,"claim_id":"ledger-claim","token":u64::MAX,"intent_id":operation,
++                "request_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++                "seq":u64::MAX,"state":"commit_requested"},
++            "capsule_sha256":"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
++            "capsule_base64":"YQ=="
++        }
++    })
++}
++#[test]
++fn native_rotation_bridge_commit_binds_separate_identity_and_exact_capsule() {
++    let request = Request::parse(&serde_json::to_vec(&commit()).unwrap()).unwrap();
++    let envelope = request.commit.unwrap();
++    assert_eq!(envelope.capsule().unwrap(), "a");
++    assert_ne!(
++        envelope.identity().unwrap().operation_id,
++        envelope.identity().unwrap().host_claim_id
++    );
++    assert_eq!(envelope.intent.token, u64::MAX);
++    assert_eq!(envelope.intent.seq, u64::MAX);
++    assert!(!format!("{envelope:?}").contains("YQ=="));
++}
++#[test]
++fn native_rotation_bridge_commit_rejects_misbinding_and_unknown_fields() {
++    for pointer in [
++        "/commit/operation_id",
++        "/commit/host_claim_id",
++        "/commit/intent/operation_id",
++        "/commit/intent/host_claim_id",
++        "/commit/intent/session_id",
++        "/commit/intent/request_sha256",
++        "/commit/reservation/native/reservationId",
++        "/commit/reservation/native/threadId",
++        "/commit/reservation/native/admissionGeneration",
++        "/commit/reservation/frontend/generation",
++    ] {
++        let mut value = commit();
++        *value.pointer_mut(pointer).unwrap() = json!("changed");
++        assert!(
++            Request::parse(&serde_json::to_vec(&value).unwrap()).is_err(),
++            "{pointer}"
++        );
++    }
++    let mut value = commit();
++    value["commit"]["intent"]["unknown"] = json!(true);
++    assert!(Request::parse(&serde_json::to_vec(&value).unwrap()).is_err());
++    let mut value = commit();
++    value["commit"]["host_claim_id"] = value["commit"]["operation_id"].clone();
++    assert!(Request::parse(&serde_json::to_vec(&value).unwrap()).is_err());
++}
++#[test]
++fn native_rotation_bridge_commit_capsule_is_bounded_canonical_utf8_and_hashed() {
++    for bytes in [
++        vec![0xff],
++        vec![0],
++        vec![b' '; 2],
++        vec![b'x'; CAPSULE_LIMIT + 1],
++    ] {
++        let mut value = commit();
++        value["commit"]["capsule_sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
++        value["commit"]["capsule_base64"] = json!(STANDARD.encode(bytes));
++        assert!(Request::parse(&serde_json::to_vec(&value).unwrap()).is_err());
++    }
++    for invalid in ["YQ", "YQ==\n", "Yg==", "YR=="] {
++        let mut value = commit();
++        value["commit"]["capsule_base64"] = json!(invalid);
++        assert!(
++            Request::parse(&serde_json::to_vec(&value).unwrap()).is_err(),
++            "{invalid}"
++        );
++    }
++    let mut value = commit();
++    let bytes = vec![b'x'; CAPSULE_LIMIT];
++    value["commit"]["capsule_sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
++    value["commit"]["capsule_base64"] = json!(STANDARD.encode(bytes));
++    assert!(Request::parse(&serde_json::to_vec(&value).unwrap()).is_ok());
++}
+--- a/codex-rs/tui/src/relay_rotation_bridge_tests.rs
++++ b/codex-rs/tui/src/relay_rotation_bridge_tests.rs
+@@ -86,3 +86,88 @@
+     client_write.shutdown().await.expect("disconnect");
+     task.await.expect("bridge task").expect("bridge close");
+ }
++
++#[tokio::test]
++async fn native_rotation_bridge_reconcile_refusal_stays_pending_on_same_identity() {
++    let (client, server) = tokio::io::duplex(32768);
++    let (client_read, mut client_write) = tokio::io::split(client);
++    let (server_read, server_write) = tokio::io::split(server);
++    let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
++    let task = tokio::spawn(serve(
++        BufReader::new(server_read),
++        server_write,
++        AppEventSender::new(events),
++    ));
++    let identity = ContextRotationIdentity {
++        operation_id: uuid::Uuid::new_v4(),
++        host_claim_id: uuid::Uuid::new_v4(),
++    };
++    let mut request = serde_json::to_vec(&serde_json::json!({
++        "v":1,"id":"0123456789abcdef0123456789abcdef","operation":"reconcile",
++        "thread_id":"00000000-0000-0000-0000-000000000701",
++        "operation_id":identity.operation_id,"host_claim_id":identity.host_claim_id
++    }))
++    .unwrap();
++    request.push(b'\n');
++    client_write.write_all(&request).await.unwrap();
++    let Some(AppEvent::ReconcileContextRotation(request)) = receiver.recv().await else {
++        panic!("reconcile event");
++    };
++    assert_eq!(request.identity, identity);
++    request.refuse("unknown operation is not a retained source");
++    let response = read_wire_line(&mut BufReader::new(client_read))
++        .await
++        .unwrap();
++    let value: serde_json::Value = serde_json::from_slice(&response).unwrap();
++    assert_eq!(value["state"], "pending");
++    assert_eq!(value["operation_id"], identity.operation_id.to_string());
++    assert_eq!(value["host_claim_id"], identity.host_claim_id.to_string());
++    assert!(value.get("source").is_none());
++    client_write.shutdown().await.unwrap();
++    task.await.unwrap().unwrap();
++}
++
++#[tokio::test]
++async fn native_rotation_bridge_acknowledgment_rejects_a_different_reply_identity() {
++    let (client, server) = tokio::io::duplex(32768);
++    let (client_read, mut client_write) = tokio::io::split(client);
++    let (server_read, server_write) = tokio::io::split(server);
++    let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
++    let task = tokio::spawn(serve(
++        BufReader::new(server_read),
++        server_write,
++        AppEventSender::new(events),
++    ));
++    let identity = ContextRotationIdentity {
++        operation_id: uuid::Uuid::new_v4(),
++        host_claim_id: uuid::Uuid::new_v4(),
++    };
++    let mut request = serde_json::to_vec(&serde_json::json!({
++        "v":1,"id":"0123456789abcdef0123456789abcdef","operation":"acknowledge",
++        "thread_id":"00000000-0000-0000-0000-000000000701",
++        "operation_id":identity.operation_id,"host_claim_id":identity.host_claim_id
++    }))
++    .unwrap();
++    request.push(b'\n');
++    client_write.write_all(&request).await.unwrap();
++    let Some(AppEvent::AcknowledgeContextRotation(request)) = receiver.recv().await else {
++        panic!("acknowledge event");
++    };
++    assert_eq!(request.identity, identity);
++    request
++        .reply
++        .send(ContextRotationAcknowledgeStatus::Acknowledged {
++            identity: ContextRotationIdentity {
++                host_claim_id: uuid::Uuid::new_v4(),
++                ..identity
++            },
++        })
++        .unwrap();
++    let response = read_wire_line(&mut BufReader::new(client_read))
++        .await
++        .unwrap();
++    let value: serde_json::Value = serde_json::from_slice(&response).unwrap();
++    assert_eq!(value["state"], "pending");
++    client_write.shutdown().await.unwrap();
++    task.await.unwrap().unwrap();
++}

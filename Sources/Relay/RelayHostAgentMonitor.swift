@@ -1,5 +1,19 @@
 import Foundation
 
+enum RelayAgentObserverHello {
+    static func payload(sessionID: String, lastEventSequence: UInt64) -> [String: Any] {
+        [
+            "version": 1,
+            "session_id": sessionID,
+            "cols": RelayViewport.default.columns,
+            "rows": RelayViewport.default.rows,
+            "last_seq": 0,
+            "last_event_seq": lastEventSequence,
+            "observe_events": true,
+        ]
+    }
+}
+
 @MainActor
 final class RelayHostAgentMonitorToken {
     private let hostKey: String
@@ -26,6 +40,7 @@ final class RelayHostAgentMonitor {
         let sessionID: String
         let onEvent: (Data) -> Void
         let onAttached: () -> Void
+        let onHarness: ((AgentHarnessIdentity) -> Void)?
     }
 
     // Access is confined to RelayHostAgentMonitor's main-actor methods. The
@@ -37,6 +52,7 @@ final class RelayHostAgentMonitor {
         var eventCursors: [String: UInt64] = [:]
         var transport: RelayHostAgentTransport?
         var restartTask: Task<Void, Never>?
+        var harnessTask: Task<Void, Never>?
 
         init(profile: ConnectionProfile) { self.profile = profile }
     }
@@ -48,14 +64,15 @@ final class RelayHostAgentMonitor {
         sessionID: String,
         lastEventSequence: UInt64,
         onEvent: @escaping (Data) -> Void,
-        onAttached: @escaping () -> Void
+        onAttached: @escaping () -> Void,
+        onHarness: ((AgentHarnessIdentity) -> Void)? = nil
     ) -> RelayHostAgentMonitorToken {
         let key = hostKey(profile)
         let entry = hosts[key] ?? HostEntry(profile: profile)
         hosts[key] = entry
         let subscriptionID = UUID()
         entry.subscriptions[subscriptionID] = Subscription(
-            sessionID: sessionID, onEvent: onEvent, onAttached: onAttached
+            sessionID: sessionID, onEvent: onEvent, onAttached: onAttached, onHarness: onHarness
         )
         entry.eventCursors[sessionID] = max(entry.eventCursors[sessionID] ?? 0, lastEventSequence)
         scheduleRestart(key: key, entry: entry)
@@ -69,6 +86,7 @@ final class RelayHostAgentMonitor {
         entry.eventCursors = entry.eventCursors.filter { retainedSessions.contains($0.key) }
         if entry.subscriptions.isEmpty {
             entry.restartTask?.cancel()
+            entry.harnessTask?.cancel()
             entry.transport?.stop()
             hosts.removeValue(forKey: hostKey)
         } else {
@@ -81,6 +99,7 @@ final class RelayHostAgentMonitor {
         entry.restartTask = Task { [weak self, weak entry] in
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled, let self, let entry, self.hosts[key] === entry else { return }
+            self.startHarnessIdentification(key: key, entry: entry)
             entry.transport?.stop()
             let transport = RelayHostAgentTransport()
             entry.transport = transport
@@ -106,6 +125,47 @@ final class RelayHostAgentMonitor {
 
     private func hostKey(_ profile: ConnectionProfile) -> String {
         ([profile.host] + profile.sshConnectionArguments).joined(separator: "\u{0}")
+    }
+
+    // One host batch covers the subscribed panes, including old live workers.
+    // Run the installed helper through Relay's existing host transport so a
+    // stale event journal cannot turn a running CLI into a shell.
+    private func startHarnessIdentification(key: String, entry: HostEntry) {
+        guard entry.harnessTask == nil else { return }
+        entry.harnessTask = Task { [weak self, weak entry] in
+            var retryDelay: Double = 3
+            while !Task.isCancelled {
+                guard let self, let entry, self.hosts[key] === entry else { return }
+                let panes = Array(Set(entry.subscriptions.values.filter { $0.onHarness != nil }.map(\.sessionID))).sorted()
+                if !panes.isEmpty {
+                    do {
+                        try Task.checkCancellation()
+                        let command = RelayHostExecution.daemonCommand(profile: entry.profile,
+                            arguments: ["agent-harnesses"] + panes)
+                        let output = try await RelayHostExecution.capture(profile: entry.profile, command: command,
+                            timeout: 8, maximumBytes: 256 << 10)
+                        try Task.checkCancellation()
+                        guard self.hosts[key] === entry else { return }
+                        if output.exitCode == 0 {
+                            let report = try JSONDecoder().decode(AgentHarnessReport.self, from: output.stdout)
+                            if report.version == 1 {
+                                retryDelay = 3
+                                for identity in report.panes where panes.contains(identity.paneID.uuidString.lowercased()) {
+                                    for subscription in entry.subscriptions.values where subscription.sessionID == identity.paneID.uuidString.lowercased() {
+                                        subscription.onHarness?(identity)
+                                    }
+                                }
+                            }
+                        } else {
+                            retryDelay = min(60, retryDelay * 2)
+                        }
+                    } catch is CancellationError { return }
+                    catch { retryDelay = min(60, retryDelay * 2) }
+                }
+                do { try await Task.sleep(for: .seconds(RelayApplicationActivityState.allowsContinuousUpdates ? retryDelay : max(15, retryDelay))) }
+                catch { return }
+            }
+        }
     }
 
     private static func eventSequence(in payload: Data) -> UInt64? {
@@ -187,16 +247,12 @@ private final class RelayHostAgentTransport: @unchecked Sendable {
                     )
                     return
                 }
-                let hello: [String: Any] = [
-                    "version": 1,
-                    "session_id": sessionID,
-                    "cols": RelayViewport.default.columns,
-                    "rows": RelayViewport.default.rows,
-                    "last_seq": 0,
-                    "last_event_seq": eventCursor.value,
-                    "observe_events": true,
-                    "event_only": true,
-                ]
+                // event_only is the publisher role, not an observer modifier.
+                // Older workers dispatch publishers first and would wait for
+                // input forever if both flags were sent.
+                let hello = RelayAgentObserverHello.payload(
+                    sessionID: sessionID, lastEventSequence: eventCursor.value
+                )
                 guard let payload = try? JSONSerialization.data(withJSONObject: hello) else { return }
                 channel.writeAsync(type: .hello, payload: payload)
             },
@@ -312,6 +368,11 @@ private final class RelayLegacyHostAgentTransport: @unchecked Sendable {
             "~/.local/bin/relayd", "observe-many", "--sessions", sessionList,
         ]
         ssh.standardInput = input
+        if profile.kind == .local {
+            LocalRelayProcess.configure(ssh)
+            ssh.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/relayd")
+            ssh.arguments = ["observe-many", "--sessions", sessionList]
+        }
         ssh.standardOutput = output
         ssh.standardError = FileHandle.nullDevice
         ssh.terminationHandler = { [weak self] ended in self?.didEnd(ended) }

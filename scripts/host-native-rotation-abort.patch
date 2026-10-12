@@ -1,0 +1,743 @@
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_native_abort.go
+@@ -0,0 +1,333 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"reflect"
++)
++
++type hostNativeAbortRequest struct {
++	hostNativeIntentRequest
++	Receipt hostNativeRefusalRecord `json:"receipt"`
++}
++type hostNativeAbortReceipt struct {
++	Version            int                     `json:"v"`
++	Mode               string                  `json:"mode"`
++	SessionID          string                  `json:"session_id"`
++	Epoch              string                  `json:"epoch"`
++	OperationID        string                  `json:"operation_id"`
++	HostClaimID        string                  `json:"host_claim_id"`
++	ClaimID            string                  `json:"claim_id"`
++	Token              uint64                  `json:"token"`
++	RequestSHA256      string                  `json:"request_sha256"`
++	Seq                uint64                  `json:"seq"`
++	LifecyclePerformed bool                    `json:"lifecycle_performed"`
++	NativeReceipt      hostNativeRefusalRecord `json:"native_receipt"`
++}
++type hostNativeAbortPhase struct {
++	Version               int                     `json:"v"`
++	State                 string                  `json:"state"`
++	RefusalSnapshotSHA256 string                  `json:"refusal_snapshot_sha256"`
++	Refusal               hostNativeRefusalProof  `json:"refusal"`
++	Request               hostNativeAbortRequest  `json:"request"`
++	Abort                 *hostNativeAbortReceipt `json:"abort"`
++}
++type hostNativeAbortInput struct {
++	completion  *hostNativeCompletionInput
++	refusal     hostNativeRefusalProof
++	fingerprint string
++}
++type hostNativeAbortDependencies struct {
++	owner  func(hostRotationEnrollment, hostNativeRefusalRecord) error
++	ledger func(context.Context, string, any) (json.RawMessage, error)
++}
++
++func readHostNativeAbortInputAt(root *os.File, directory, sessionID string) (*hostNativeAbortInput, error) {
++	c, err := readHostNativeCompletionInputAt(root, directory, sessionID)
++	if err != nil {
++		return nil, err
++	}
++	if err := checkHostNativeRefusalConflictsAt(root, c.request.Epoch); err != nil {
++		return nil, err
++	}
++	raw, err := readHostNativeClaimFile(root, c.request.Epoch+".native_refused_verified.json")
++	var p hostNativeRefusalProof
++	if err != nil || decodeHostNativeRecord(raw, &p) != nil || !hostNativeRegistrationExactShape(raw, p) ||
++		p.Version != 1 || p.State != "native_refused_verified" || p.RequestSHA256 != c.journal.requestSHA256 ||
++		p.HostSnapshotSHA256 != c.fingerprint || !nativeWireHash(p.JournalSHA256) ||
++		!validHostNativeRefusal(p.Receipt, c.request) || p.JournalDirectory == "" {
++		return nil, errors.New("native abort lacks exact durable refusal")
++	}
++	hashes, _ := json.Marshal(map[string]string{"host": c.fingerprint, "refusal": hostRotationCapsuleHash(raw)})
++	return &hostNativeAbortInput{c, p, hostRotationCapsuleHash(hashes)}, nil
++}
++func readHostNativeAbortInput(directory, sessionID string) (*hostNativeAbortInput, error) {
++	if !validHostNativeUUID(sessionID) {
++		return nil, errors.New("invalid native abort source")
++	}
++	root, lock, err := lockHostNativeClaimRoot(directory, false)
++	if err != nil {
++		return nil, err
++	}
++	defer root.Close()
++	defer lock.Close()
++	return readHostNativeAbortInputAt(root, directory, sessionID)
++}
++func hostNativeAbortRequestFor(input *hostNativeAbortInput) hostNativeAbortRequest {
++	c := input.completion
++	return hostNativeAbortRequest{hostNativeIntentRequest{1, c.request.SessionID, c.request.Epoch,
++		c.claim.ClaimID, c.claim.Token, c.request.HostClaimID, c.journal.requestSHA256}, input.refusal.Receipt}
++}
++func decodeHostNativeAbort(raw []byte, q hostNativeAbortRequest, intentSeq uint64) (hostNativeAbortReceipt, error) {
++	var a hostNativeAbortReceipt
++	if decodeHostNativeRecord(raw, &a) != nil || !hostNativeRegistrationExactShape(raw, a) ||
++		a.Version != 1 || a.Mode != "native_v1" || a.SessionID != q.SessionID || a.Epoch != q.Epoch ||
++		a.OperationID != q.Epoch || a.HostClaimID != q.HostClaimID || a.ClaimID != q.ClaimID || a.Token != q.Token ||
++		a.RequestSHA256 != q.RequestSHA256 || a.Seq <= intentSeq || a.LifecyclePerformed || a.NativeReceipt != q.Receipt {
++		return hostNativeAbortReceipt{}, errors.New("native ledger abort identity mismatch")
++	}
++	return a, nil
++}
++
++// Observe the explicit historical epoch, including the atomic closed-claim and
++// aborted-intent revision. A timeout, expired lease or closed flag is insufficient.
++func readHostNativeAbortStatus(ctx context.Context, deps hostNativeAbortDependencies, input *hostNativeAbortInput) (*hostNativeAbortReceipt, error) {
++	q := hostNativeAbortRequestFor(input)
++	raw, err := deps.ledger(ctx, "rotation_status", map[string]any{"session_id": q.SessionID, "epoch": q.Epoch})
++	if err != nil {
++		return nil, err
++	}
++	var s struct {
++		Version            int             `json:"v"`
++		SessionID          string          `json:"session_id"`
++		Epoch              string          `json:"epoch"`
++		Client             string          `json:"client"`
++		CWD                string          `json:"cwd"`
++		Owner              string          `json:"owner"`
++		Live               *bool           `json:"live"`
++		LifecyclePerformed *bool           `json:"lifecycle_performed"`
++		NewSessionID       json.RawMessage `json:"new_session_id"`
++		Claim              json.RawMessage `json:"claim"`
++		Intent             json.RawMessage `json:"intent"`
++		Registration       json.RawMessage `json:"registration"`
++		Ack                json.RawMessage `json:"ack"`
++		Abort              json.RawMessage `json:"abort"`
++	}
++	fail := func() (*hostNativeAbortReceipt, error) { return nil, errors.New("native ledger abort status mismatch") }
++	null := func(r json.RawMessage) bool { return len(r) == 0 || string(r) == "null" }
++	if len(raw) > 262144 || !rotationSourceJSONUnambiguous(raw) || json.Unmarshal(raw, &s) != nil ||
++		s.Version != 1 || s.SessionID != q.SessionID || s.Epoch != q.Epoch || s.Client != "codex" ||
++		s.CWD != input.completion.request.Source.Enrollment.CWD || s.Owner != "relay" ||
++		s.Live == nil || s.LifecyclePerformed == nil || *s.LifecyclePerformed ||
++		string(s.NewSessionID) != "null" || string(s.Ack) != "null" || !null(s.Registration) {
++		return fail()
++	}
++	if null(s.Abort) {
++		var c hostNativeClaimReceipt
++		var i hostNativeIntentReceipt
++		if decodeHostNativeRecord(s.Claim, &c) != nil || !hostNativeRegistrationExactShape(s.Claim, c) ||
++			decodeHostNativeRecord(s.Intent, &i) != nil || !hostNativeRegistrationExactShape(s.Intent, i) ||
++			c != input.completion.claim || c.Closed || i != input.completion.intent || i.State != "commit_requested" {
++			return fail()
++		}
++		return nil, ctx.Err()
++	}
++	a, err := decodeHostNativeAbort(s.Abort, q, input.completion.intent.Seq)
++	if err != nil {
++		return nil, err
++	}
++	var c struct {
++		hostNativeClaimReceipt
++		AbortSeq uint64 `json:"abort_seq"`
++	}
++	var i struct {
++		hostNativeIntentReceipt
++		AbortSeq uint64 `json:"abort_seq"`
++	}
++	wantC, wantI := input.completion.claim, input.completion.intent
++	wantC.Closed = true
++	wantI.State = "aborted"
++	if *s.Live || decodeHostNativeRecord(s.Claim, &c) != nil || !hostNativeRegistrationExactShape(s.Claim, c) ||
++		decodeHostNativeRecord(s.Intent, &i) != nil || !hostNativeRegistrationExactShape(s.Intent, i) ||
++		c.hostNativeClaimReceipt != wantC || i.hostNativeIntentReceipt != wantI || c.AbortSeq != a.Seq || i.AbortSeq != a.Seq {
++		return fail()
++	}
++	return &a, ctx.Err()
++}
++func reconcileHostNativeAbort(ctx context.Context, deps hostNativeAbortDependencies, input *hostNativeAbortInput) (*hostNativeAbortReceipt, error) {
++	before, err := readHostNativeAbortStatus(ctx, deps, input)
++	if err != nil {
++		return nil, err
++	}
++	after, err := readHostNativeAbortStatus(ctx, deps, input)
++	if err != nil || !reflect.DeepEqual(before, after) {
++		return nil, errors.New("native ledger abort changed during observation")
++	}
++	return before, ctx.Err()
++}
++func verifyHostNativeAbortEvidence(ctx context.Context, deps hostNativeAbortDependencies, input *hostNativeAbortInput) error {
++	c := input.completion
++	p, err := verifyAndRecordHostNativeRefusal(ctx, c.journal.workerDirectory, c.request.SessionID, input.refusal.JournalDirectory, deps.owner)
++	if err != nil {
++		return err
++	}
++	if !reflect.DeepEqual(*p, input.refusal) {
++		return errors.New("native abort refusal evidence changed")
++	}
++	return ctx.Err()
++}
++func recordHostNativeAbortPhase(input *hostNativeAbortInput, phase hostNativeAbortPhase, begin, allowNew bool) (bool, error) {
++	c := input.completion
++	root, lock, err := lockHostNativeClaimRoot(c.journal.workerDirectory, false)
++	if err != nil {
++		return false, err
++	}
++	defer root.Close()
++	defer lock.Close()
++	current, err := readHostNativeAbortInputAt(root, c.journal.workerDirectory, c.request.SessionID)
++	if err != nil || current.fingerprint != input.fingerprint {
++		return false, errors.New("native abort host refusal changed")
++	}
++	want := phase
++	want.State = "ledger_abort_requested"
++	want.Abort = nil
++	name := c.request.Epoch + ".ledger_abort_requested.json"
++	raw, err := readHostNativeClaimFile(root, name)
++	if err == nil {
++		if !hostNativeRegistrationExactShape(raw, want) {
++			return false, errors.New("native abort request changed")
++		}
++	} else {
++		if !errors.Is(err, os.ErrNotExist) || !begin || !allowNew {
++			return false, errors.New("native abort durable request unavailable")
++		}
++		if _, err := readHostNativeClaimFile(root, c.request.Epoch+".ledger_abort_received.json"); !errors.Is(err, os.ErrNotExist) {
++			return false, errors.New("native abort receipt lacks durable request")
++		}
++		raw, err := json.Marshal(want)
++		if err != nil {
++			return false, err
++		}
++		return true, writeHostNativeClaimFile(root, name, raw, false)
++	}
++	if begin {
++		raw, err := readHostNativeClaimFile(root, c.request.Epoch+".ledger_abort_received.json")
++		if errors.Is(err, os.ErrNotExist) {
++			return false, nil
++		}
++		var saved hostNativeAbortPhase
++		if err != nil || decodeHostNativeRecord(raw, &saved) != nil || !hostNativeRegistrationExactShape(raw, saved) || saved.Abort == nil {
++			return false, errors.New("native abort receipt malformed")
++		}
++		a, err := decodeHostNativeAbort(mustMarshalHostNativeAbort(saved.Abort), want.Request, c.intent.Seq)
++		saved.Abort = nil
++		saved.State = "ledger_abort_requested"
++		if err != nil || !reflect.DeepEqual(saved, want) || a.Seq == 0 {
++			return false, errors.New("native abort receipt changed")
++		}
++		return false, nil
++	}
++	raw, err = json.Marshal(phase)
++	if err != nil {
++		return false, err
++	}
++	return false, writeHostNativeClaimFile(root, c.request.Epoch+".ledger_abort_received.json", raw, true)
++}
++func mustMarshalHostNativeAbort(value any) []byte { raw, _ := json.Marshal(value); return raw }
++
++// Exact ledger retry is bounded to one call per invocation and requires two
++// matching pending observations plus the immutable request and native evidence.
++// No native command is submitted here. The active source fence remains present.
++func abortHostNativeRefusal(ctx context.Context, directory, sessionID string, deps hostNativeAbortDependencies) (*hostNativeAbortReceipt, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if deps.owner == nil || deps.ledger == nil {
++		return nil, errors.New("native abort dependencies unavailable")
++	}
++	input, err := readHostNativeAbortInput(directory, sessionID)
++	if err != nil {
++		return nil, err
++	}
++	check := func() error { return verifyHostNativeAbortEvidence(ctx, deps, input) }
++	if err := check(); err != nil {
++		return nil, err
++	}
++	observed, err := reconcileHostNativeAbort(ctx, deps, input)
++	if err != nil {
++		return nil, err
++	}
++	q := hostNativeAbortRequestFor(input)
++	phase := hostNativeAbortPhase{1, "ledger_abort_requested", input.fingerprint, input.refusal, q, nil}
++	submit, err := recordHostNativeAbortPhase(input, phase, true, observed == nil)
++	if err != nil {
++		return nil, err
++	}
++	var reply *hostNativeAbortReceipt
++	if observed == nil {
++		if err := check(); err != nil {
++			return nil, err
++		}
++		if !submit {
++			if err := authorizeHostNativeLedgerRetry(directory, q.Epoch, "ledger_abort_requested", "ledger_abort_received", phase, func(root *os.File) error {
++				current, err := readHostNativeAbortInputAt(root, directory, sessionID)
++				if err != nil || current.fingerprint != input.fingerprint {
++					return errors.New("native abort retry refusal changed")
++				}
++				return nil
++			}); err != nil {
++				return nil, err
++			}
++		}
++		raw, callErr := deps.ledger(ctx, "rotation_native_abort", q)
++		if callErr == nil {
++			a, err := decodeHostNativeAbort(raw, q, input.completion.intent.Seq)
++			if err != nil {
++				return nil, err
++			}
++			reply = &a
++		}
++		observed, err = reconcileHostNativeAbort(ctx, deps, input)
++		if err != nil {
++			return nil, err
++		}
++	}
++	if observed == nil {
++		return nil, errors.New("native ledger abort remains pending")
++	}
++	if reply != nil && !reflect.DeepEqual(reply, observed) {
++		return nil, errors.New("native ledger abort reply differs from durable history")
++	}
++	if err := check(); err != nil {
++		return nil, err
++	}
++	phase.State = "ledger_abort_received"
++	phase.Abort = observed
++	if _, err := recordHostNativeAbortPhase(input, phase, false, false); err != nil {
++		return nil, err
++	}
++	return observed, nil
++}
++
++func readHostNativeDriverRefusal(directory string, input *hostNativeCompletionInput) (*hostNativeRefusalProof, error) {
++	root, lock, err := lockHostNativeClaimRoot(directory, false)
++	if err != nil {
++		return nil, err
++	}
++	defer root.Close()
++	defer lock.Close()
++	_, err = readHostNativeClaimFile(root, input.request.Epoch+".native_refused_verified.json")
++	if errors.Is(err, os.ErrNotExist) {
++		return nil, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	current, err := readHostNativeAbortInputAt(root, directory, input.request.SessionID)
++	if err != nil || current.completion.fingerprint != input.fingerprint {
++		return nil, errors.New("native recovery refusal changed")
++	}
++	return &current.refusal, nil
++}
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_native_abort_test.go
+@@ -0,0 +1,355 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++)
++
++type nativeAbortHarness struct {
++	*nativeRefusalHarness
++	t        *testing.T
++	deps     hostNativeAbortDependencies
++	aborted  *hostNativeAbortReceipt
++	calls    int
++	lost     bool
++	unsent   bool
++	mutation string
++}
++
++func nativeAbortFixture(t *testing.T) *nativeAbortHarness {
++	t.Helper()
++	h := &nativeAbortHarness{nativeRefusalHarness: nativeRefusalFixture(t), t: t}
++	if _, err := h.record(context.Background(), h.owner); err != nil {
++		t.Fatal(err)
++	}
++	h.deps = hostNativeAbortDependencies{owner: h.owner}
++	h.deps.ledger = func(ctx context.Context, op string, args any) (json.RawMessage, error) {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		switch op {
++		case "rotation_native_abort":
++			h.calls++
++			raw, err := os.ReadFile(h.phase("ledger_abort_requested"))
++			var p hostNativeAbortPhase
++			if err != nil || decodeHostNativeRecord(raw, &p) != nil || !reflect.DeepEqual(p.Request, args) {
++				t.Fatal("abort preceded exact durable request", err)
++			}
++			q := args.(hostNativeAbortRequest)
++			a := &hostNativeAbortReceipt{Version: 1, Mode: "native_v1", SessionID: q.SessionID, Epoch: q.Epoch, OperationID: q.Epoch,
++				HostClaimID: q.HostClaimID, ClaimID: q.ClaimID, Token: q.Token, RequestSHA256: q.RequestSHA256,
++				Seq: h.claim.intent.Seq + 1, NativeReceipt: q.Receipt}
++			if !h.unsent {
++				h.aborted = a
++			}
++			switch h.mutation {
++			case "native_changed":
++				writeNativeCompletionJSON(t, filepath.Join(h.path, "refused.json"), map[string]any{})
++			case "host_changed":
++				writeNativeCompletionJSON(t, h.proofPath(), map[string]any{})
++			case "wrong_reply":
++				copy := *a
++				copy.Seq++
++				return json.Marshal(copy)
++			}
++			if h.lost || h.unsent {
++				return nil, errors.New("transport lost")
++			}
++			return json.Marshal(a)
++		case "rotation_status":
++			want := map[string]any{"session_id": h.claim.request.SessionID, "epoch": h.claim.request.Epoch}
++			if !reflect.DeepEqual(args, want) {
++				t.Fatal("status did not request exact historical epoch")
++			}
++			if h.mutation == "lost_status" && h.aborted != nil {
++				return nil, errors.New("status lost")
++			}
++			c := h.rawMap(h.claim.receipt)
++			i := h.rawMap(h.claim.intent)
++			s := map[string]any{"v": 1, "session_id": h.claim.request.SessionID, "epoch": h.claim.request.Epoch,
++				"client": "codex", "cwd": h.host.source.Enrollment.CWD, "owner": "relay", "live": false,
++				"lifecycle_performed": false, "new_session_id": nil, "claim": c, "intent": i, "ack": nil}
++			if h.aborted != nil {
++				c["closed"] = json.RawMessage("true")
++				c["abort_seq"] = h.raw(h.aborted.Seq)
++				i["state"] = h.raw("aborted")
++				i["abort_seq"] = h.raw(h.aborted.Seq)
++				a := h.rawMap(h.aborted)
++				s["abort"] = a
++				switch h.mutation {
++				case "claim_open":
++					c["closed"] = json.RawMessage("false")
++				case "claim_sequence":
++					c["abort_seq"] = h.raw(h.aborted.Seq + 1)
++				case "intent_pending":
++					i["state"] = h.raw("commit_requested")
++				case "intent_sequence":
++					i["abort_seq"] = h.raw(h.aborted.Seq + 1)
++				case "still_live":
++					s["live"] = true
++				case "registration":
++					s["registration"] = map[string]any{}
++				case "ack":
++					s["ack"] = map[string]any{}
++				case "receipt_identity":
++					a["host_claim_id"] = h.raw(h.claim.request.Epoch)
++				case "receipt_sequence":
++					a["seq"] = h.raw(h.claim.intent.Seq)
++				case "receipt_extra":
++					a["foreign"] = h.raw(1)
++				case "receipt_missing":
++					delete(a, "lifecycle_performed")
++				case "receipt_lifecycle":
++					a["lifecycle_performed"] = h.raw(true)
++				}
++			}
++			switch h.mutation {
++			case "owner":
++				s["owner"] = "desktop"
++			case "cwd":
++				s["cwd"] = "/foreign"
++			case "missing_live":
++				delete(s, "live")
++			case "missing_lifecycle":
++				delete(s, "lifecycle_performed")
++			case "lifecycle":
++				s["lifecycle_performed"] = true
++			case "destination":
++				s["new_session_id"] = h.claim.request.SessionID
++			case "missing_ack":
++				delete(s, "ack")
++			case "foreign_epoch":
++				s["epoch"] = h.claim.request.HostClaimID
++			case "duplicate":
++				return json.RawMessage(`{"v":1,"v":1}`), nil
++			}
++			return json.Marshal(s)
++		default:
++			t.Fatal("unexpected abort ledger operation", op)
++		}
++		return nil, errors.New("unexpected operation")
++	}
++	return h
++}
++func (h *nativeAbortHarness) raw(v any) json.RawMessage {
++	h.t.Helper()
++	raw, err := json.Marshal(v)
++	if err != nil {
++		h.t.Fatal(err)
++	}
++	return raw
++}
++func (h *nativeAbortHarness) rawMap(v any) map[string]json.RawMessage {
++	h.t.Helper()
++	var m map[string]json.RawMessage
++	if err := json.Unmarshal(h.raw(v), &m); err != nil {
++		h.t.Fatal(err)
++	}
++	return m
++}
++func (h *nativeAbortHarness) phase(state string) string {
++	return filepath.Join(h.host.dir, hostNativeClaimDirectory, h.claim.request.Epoch+"."+state+".json")
++}
++func (h *nativeAbortHarness) run() (*hostNativeAbortReceipt, error) {
++	return abortHostNativeRefusal(context.Background(), h.host.dir, h.claim.request.SessionID, h.deps)
++}
++func (h *nativeAbortHarness) noReceived() {
++	h.t.Helper()
++	if _, err := os.Stat(h.phase("ledger_abort_received")); !errors.Is(err, os.ErrNotExist) {
++		h.t.Fatal("unexpected durable abort", err)
++	}
++	h.unchanged(h.t)
++}
++
++func TestHostNativeAbortDurableLostReplyAndIdempotent(t *testing.T) {
++	for _, lost := range []bool{false, true} {
++		t.Run(map[bool]string{false: "reply", true: "lost"}[lost], func(t *testing.T) {
++			h := nativeAbortFixture(t)
++			h.lost = lost
++			first, err := h.run()
++			if err != nil || first == nil {
++				t.Fatal(err)
++			}
++			info, err := os.Stat(h.phase("ledger_abort_received"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			again, err := h.run()
++			if err != nil || !reflect.DeepEqual(first, again) || h.calls != 1 {
++				t.Fatal("abort repeated or changed", err)
++			}
++			after, err := os.Stat(h.phase("ledger_abort_received"))
++			if err != nil || !os.SameFile(info, after) {
++				t.Fatal("abort receipt replaced", err)
++			}
++			if first.LifecyclePerformed || first.NativeReceipt != h.receipt {
++				t.Fatal("abort performed lifecycle work")
++			}
++			h.unchanged(t)
++		})
++	}
++}
++func TestHostNativeAbortRetriesOnlyExactPendingRequest(t *testing.T) {
++	h := nativeAbortFixture(t)
++	h.unsent = true
++	if r, err := h.run(); err == nil || r != nil || h.calls != 1 {
++		t.Fatal("unsent abort completed")
++	}
++	h.noReceived()
++	h.unsent = false
++	if _, err := h.run(); err != nil || h.calls != 2 {
++		t.Fatal("exact unsent retry failed", err)
++	}
++	h.unchanged(t)
++}
++func TestHostNativeAbortLostStatusRecoversWithoutResubmission(t *testing.T) {
++	h := nativeAbortFixture(t)
++	h.mutation = "lost_status"
++	if _, err := h.run(); err == nil || h.calls != 1 {
++		t.Fatal("unobserved abort completed")
++	}
++	h.noReceived()
++	h.mutation = ""
++	if _, err := h.run(); err != nil || h.calls != 1 {
++		t.Fatal("recovery resubmitted abort", err)
++	}
++	h.unchanged(t)
++}
++func TestHostNativeAbortRejectsConflictingLedgerHistory(t *testing.T) {
++	for _, name := range []string{"claim_open", "claim_sequence", "intent_pending", "intent_sequence", "still_live", "registration", "ack",
++		"receipt_identity", "receipt_sequence", "receipt_extra", "receipt_missing", "receipt_lifecycle", "owner", "cwd", "missing_live",
++		"missing_lifecycle", "lifecycle", "destination", "missing_ack", "foreign_epoch", "duplicate", "wrong_reply"} {
++		t.Run(name, func(t *testing.T) {
++			h := nativeAbortFixture(t)
++			h.mutation = name
++			if r, err := h.run(); err == nil || r != nil || h.calls > 1 {
++				t.Fatal("accepted conflicting abort", err)
++			}
++			h.noReceived()
++		})
++	}
++}
++func TestHostNativeAbortRequiresImmutableRefusalAndRequest(t *testing.T) {
++	for _, name := range []string{"missing_proof", "partial_proof", "partial_request", "orphan_receipt", "restoration", "unsafe_native", "owner", "cancelled"} {
++		t.Run(name, func(t *testing.T) {
++			h := nativeAbortFixture(t)
++			ctx := context.Background()
++			switch name {
++			case "missing_proof":
++				if err := os.Remove(h.proofPath()); err != nil {
++					t.Fatal(err)
++				}
++			case "partial_proof":
++				if err := os.WriteFile(h.proofPath(), []byte("{"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "partial_request":
++				if err := os.WriteFile(h.phase("ledger_abort_requested"), []byte("{"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "orphan_receipt":
++				if err := os.WriteFile(h.phase("ledger_abort_received"), []byte("{"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "restoration":
++				if err := os.WriteFile(h.phase("native_restored_verified"), []byte("{}"), 0600); err != nil {
++					t.Fatal(err)
++				}
++			case "unsafe_native":
++				if err := os.Chmod(filepath.Join(h.path, "refused.json"), 0644); err != nil {
++					t.Fatal(err)
++				}
++			case "owner":
++				h.deps.owner = func(hostRotationEnrollment, hostNativeRefusalRecord) error { return errors.New("owner changed") }
++			case "cancelled":
++				var cancel context.CancelFunc
++				ctx, cancel = context.WithCancel(ctx)
++				cancel()
++			}
++			if r, err := abortHostNativeRefusal(ctx, h.host.dir, h.claim.request.SessionID, h.deps); err == nil || r != nil || h.calls != 0 {
++				t.Fatal("unproven abort submitted", err)
++			}
++			if name != "orphan_receipt" {
++				h.noReceived()
++			} else {
++				h.unchanged(t)
++			}
++		})
++	}
++}
++func TestHostNativeAbortRechecksEvidenceAfterLedger(t *testing.T) {
++	for _, name := range []string{"native_changed", "host_changed", "owner_changed", "cancelled"} {
++		t.Run(name, func(t *testing.T) {
++			h := nativeAbortFixture(t)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			if name == "owner_changed" {
++				h.deps.owner = func(e hostRotationEnrollment, r hostNativeRefusalRecord) error {
++					if h.aborted != nil {
++						return errors.New("owner changed")
++					}
++					return h.owner(e, r)
++				}
++			} else if name == "cancelled" {
++				base := h.deps.ledger
++				h.deps.ledger = func(ctx context.Context, op string, args any) (json.RawMessage, error) {
++					raw, err := base(ctx, op, args)
++					if op == "rotation_native_abort" {
++						cancel()
++					}
++					return raw, err
++				}
++			} else {
++				h.mutation = name
++			}
++			if r, err := abortHostNativeRefusal(ctx, h.host.dir, h.claim.request.SessionID, h.deps); err == nil || r != nil || h.calls != 1 {
++				t.Fatal("changed abort evidence accepted", err)
++			}
++			h.noReceived()
++		})
++	}
++}
++func TestHostNativeAbortNeverRecreatesMissingRetryMarker(t *testing.T) {
++	h := nativeAbortFixture(t)
++	h.unsent = true
++	if _, err := h.run(); err == nil {
++		t.Fatal("fixture did not remain pending")
++	}
++	// Once the original marker disappears, no retry path may manufacture it.
++	input, err := readHostNativeAbortInput(h.host.dir, h.claim.request.SessionID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := hostNativeAbortPhase{1, "ledger_abort_requested", input.fingerprint, input.refusal, hostNativeAbortRequestFor(input), nil}
++	if err := os.Remove(h.phase("ledger_abort_requested")); err != nil {
++		t.Fatal(err)
++	}
++	if err := authorizeHostNativeLedgerRetry(h.host.dir, h.claim.request.Epoch, "ledger_abort_requested", "ledger_abort_received", p, func(*os.File) error { return nil }); err == nil {
++		t.Fatal("missing marker authorized retry")
++	}
++	h.noReceived()
++}
++func TestHostNativeAbortRecoveryUsesDurableRefusal(t *testing.T) {
++	h := nativeAbortFixture(t)
++	input, err := readHostNativeCompletionInput(h.host.dir, h.claim.request.SessionID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p, err := readHostNativeDriverRefusal(h.host.dir, input)
++	if err != nil || p == nil || p.Receipt != h.receipt {
++		t.Fatal("durable refusal unavailable", err)
++	}
++	if _, err := h.run(); err != nil {
++		t.Fatal(err)
++	}
++	p, err = readHostNativeDriverRefusal(h.host.dir, input)
++	if err != nil || p == nil {
++		t.Fatal("abort lost durable refusal", err)
++	}
++	h.unchanged(t)
++}
+--- a/remote/relayd/internal/daemon/host_rotation_native_driver.go
++++ b/remote/relayd/internal/daemon/host_rotation_native_driver.go
+@@ -119,7 +119,7 @@
+ 		if _, err := verifyAndRecordHostNativeRefusal(ctx, d.directory, e.SessionID, observed.JournalDirectory, d.deps.refusalOwner); err != nil {
+ 			return hostNativeDriverPending("native_refusal_verification_pending", err)
+ 		}
+-		return hostNativeDriverPending("native_abort_pending", nil)
++		return d.abortRefusal(ctx, e)
+ 	case "restored":
+ 	default:
+ 		return hostNativeDriverPending("native_completion_unavailable", errors.New("native restoration unavailable"))
+@@ -212,6 +212,13 @@
+ 	if err != nil || input.request != before.request || input.journal.requestSHA256 != before.journal.requestSHA256 {
+ 		return hostNativeDriverPending("native_handoff_pending", errors.New("native durable handoff unavailable"))
+ 	}
++	refusal, err := readHostNativeDriverRefusal(d.directory, input)
++	if err != nil {
++		return hostNativeDriverPending("native_refusal_verification_pending", err)
++	}
++	if refusal != nil {
++		return d.abortRefusal(ctx, e)
++	}
+ 	receipt, err := readHostNativeDriverReceipt(d.directory, input)
+ 	if err != nil {
+ 		return hostNativeDriverPending("native_completion_unavailable", err)
+@@ -264,3 +271,12 @@
+ 	}
+ 	return bridge.observeNativeCommit(ctx, e.SessionID, operationID, hostClaimID)
+ }
++
++func (d *hostNativeTransactionDriver) abortRefusal(ctx context.Context, e hostRotationEnrollment) (hostNativeDriverResult, error) {
++	if _, err := abortHostNativeRefusal(ctx, d.directory, e.SessionID, hostNativeAbortDependencies{
++		owner: d.deps.refusalOwner, ledger: d.deps.ledger,
++	}); err != nil {
++		return hostNativeDriverPending("native_abort_pending", err)
++	}
++	return hostNativeDriverPending("native_abort_retirement_pending", nil)
++}
+--- a/remote/relayd/internal/daemon/host_rotation_native_claim.go
++++ b/remote/relayd/internal/daemon/host_rotation_native_claim.go
+@@ -96,7 +96,7 @@
+ }
+ func callHostNativeLedger(ctx context.Context, operation string, args any) (json.RawMessage, error) {
+ 	switch operation {
+-	case "rotation_native_claim", "rotation_native_release", "rotation_native_intent", "rotation_native_register", "rotation_native_ack", "rotation_status", "session_get":
++	case "rotation_native_claim", "rotation_native_release", "rotation_native_intent", "rotation_native_register", "rotation_native_ack", "rotation_native_abort", "rotation_status", "session_get":
+ 	default:
+ 		return nil, errors.New("unsupported native ledger operation")
+ 	}

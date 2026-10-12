@@ -9,6 +9,39 @@ import (
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
+func TestReconnectCatalogSkipsCursorOnlyWritesButPersistsMetadata(t *testing.T) {
+	server := NewServer()
+	server.stateDir = filepath.Join(t.TempDir(), "workers")
+	manifest := workerManifest{SessionID: "pane-cache", WorkerPID: 123, LastSequence: 10}
+	hello := protocol.HelloPayload{SessionID: manifest.SessionID, WorkspaceID: "workspace-1", TabID: "tab-1", PaneTitle: "Original"}
+	if err := server.recordCatalogEntry(hello, manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.LastSequence = 20
+	manifest.UpdatedAt = time.Now()
+	if err := server.recordCatalogEntry(hello, manifest); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := loadStoredCatalog(server.catalogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog.Revision != 1 {
+		t.Fatalf("unchanged reconnect rewrote catalog: revision %d", catalog.Revision)
+	}
+	hello.PaneTitle = "Renamed"
+	if err := server.recordCatalogEntry(hello, manifest); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err = loadStoredCatalog(server.catalogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog.Revision != 2 || catalog.Panes[manifest.SessionID].Title != "Renamed" {
+		t.Fatal("metadata change was not persisted")
+	}
+}
+
 func TestCatalogDiscoversOldWorkerAndAddsHierarchyWithoutChangingManifest(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "workers")
 	server := &Server{stateDir: stateDir}

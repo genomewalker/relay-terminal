@@ -123,11 +123,12 @@ func TestHostEventRoundTrip(t *testing.T) {
 
 func TestHelloRepaintPulseRoundTrip(t *testing.T) {
 	want := HelloPayload{
-		Version:      1,
-		SessionID:    "pane-123",
-		Cols:         135,
-		Rows:         24,
-		RepaintPulse: true,
+		Version:               1,
+		SessionID:             "pane-123",
+		Cols:                  135,
+		Rows:                  24,
+		RepaintPulse:          true,
+		RequireExistingWorker: true,
 	}
 	payload, err := json.Marshal(want)
 	if err != nil {
@@ -137,7 +138,7 @@ func TestHelloRepaintPulseRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(payload, &got); err != nil {
 		t.Fatal(err)
 	}
-	if !got.RepaintPulse || got.Cols != want.Cols || got.Rows != want.Rows {
+	if !got.RepaintPulse || !got.RequireExistingWorker || got.Cols != want.Cols || got.Rows != want.Rows {
 		t.Fatalf("repaint hello did not round trip: %#v", got)
 	}
 }

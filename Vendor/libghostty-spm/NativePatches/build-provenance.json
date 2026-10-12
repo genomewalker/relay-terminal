@@ -1,0 +1,29 @@
+{
+  "upstream": "https://github.com/ghostty-org/ghostty",
+  "upstream_commit": "332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28",
+  "zig_version": "0.15.2",
+  "optimization": "ReleaseSafe",
+  "targets": ["aarch64-macos.14.0", "x86_64-macos.14.0"],
+  "patch": "relay-host-managed-input.patch",
+  "patch_sha256": "54c98b756f03a2b1be9eb2c091caa2810ad81011585593af8842c56b7985d7b5",
+  "library_sha256": "8a8f015f00d97e03767799e8b887925c35dd173ea47c15cc8fd74aa02d5469e7",
+  "header_sha256": "3d26615e5f6f05b5a2debad04a74443c491da6fe363a978061dd801d4ef5a3a4",
+  "build_options": {
+    "jobs": 2,
+    "app-runtime": "none",
+    "emit-exe": false,
+    "emit-xcframework": false,
+    "emit-macos-app": false,
+    "emit-docs": false,
+    "sentry": false
+  },
+  "build_environment": {
+    "sdk": "isolated MacOSX27.0 SDK overlay",
+    "metal_toolchain": "27A266a",
+    "zig_libcxx_fix": "numeric_limits<_RealT>::infinity() replaces unavailable INFINITY macro"
+  },
+  "preserved_host_apis": ["ghostty_surface_write_buffer_replay", "ghostty_surface_reset_selection"],
+  "added_host_apis": ["ghostty_surface_input_capture_begin", "ghostty_surface_input_capture_end", "ghostty_surface_input_capture_cancel"],
+  "input_capture_limit_bytes": 131072,
+  "capture_failure": "No bytes dispatched on overflow, allocation failure, changed terminal modes, readonly surface, stale token or retired owner."
+}

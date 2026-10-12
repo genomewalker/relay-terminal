@@ -17,6 +17,7 @@ actor OnDeviceIntelligenceScheduler {
 
     private let now: @Sendable () -> Date
     private var modelInFlight = false
+    private var queued: [(UUID, CheckedContinuation<Void, any Error>)] = []
     private var lastStarted: [OnDeviceIntelligencePriority: Date] = [:]
 
     init(now: @escaping @Sendable () -> Date = { Date() }) {
@@ -44,7 +45,46 @@ actor OnDeviceIntelligenceScheduler {
 
         modelInFlight = true
         lastStarted[priority] = startedAt
-        defer { modelInFlight = false }
+        defer { releaseModelSlot() }
         return await operation()
+    }
+
+    /// Accepted assistant requests wait for the current model call to finish;
+    /// background ranking may still be skipped by perform above.
+    func performQueued<T: Sendable>(priority: OnDeviceIntelligencePriority,
+        minimumInterval: TimeInterval, operation: @escaping @Sendable () async -> T) async throws -> T {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await acquireModelSlot(id)
+            defer { releaseModelSlot() }
+            try Task.checkCancellation()
+            let floor = priority == .interactive ? Self.interactiveIntervalFloor : Self.backgroundIntervalFloor
+            let interval = max(floor, minimumInterval)
+            if let previous = lastStarted[priority] {
+                let remaining = interval - now().timeIntervalSince(previous)
+                if remaining > 0 { try await Task.sleep(for: .seconds(remaining)) }
+            }
+            try Task.checkCancellation()
+            lastStarted[priority] = now()
+            return await operation()
+        } onCancel: {
+            Task { await self.cancelQueued(id) }
+        }
+    }
+
+    private func acquireModelSlot(_ id: UUID) async throws {
+        if !modelInFlight { modelInFlight = true; return }
+        guard queued.count < 16 else { throw CancellationError() }
+        try await withCheckedThrowingContinuation { queued.append((id, $0)) }
+    }
+
+    private func cancelQueued(_ id: UUID) {
+        guard let index = queued.firstIndex(where: { $0.0 == id }) else { return }
+        queued.remove(at: index).1.resume(throwing: CancellationError())
+    }
+
+    private func releaseModelSlot() {
+        if queued.isEmpty { modelInFlight = false }
+        else { queued.removeFirst().1.resume() }
     }
 }

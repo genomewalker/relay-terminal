@@ -25,7 +25,10 @@ type legacyRepaintObserver struct {
 	sequence   uint64
 }
 
-func openLegacyRepaintObserver(manifest workerManifest) (*legacyRepaintObserver, error) {
+func openLegacyRepaintObserver(manifest workerManifest, clientID string) (*legacyRepaintObserver, error) {
+	if clientID == "" {
+		return nil, errors.New("legacy repaint requires the requesting client identity")
+	}
 	connection, err := net.DialTimeout("unix", manifest.SocketPath, time.Second)
 	if err != nil {
 		return nil, err
@@ -39,7 +42,9 @@ func openLegacyRepaintObserver(manifest workerManifest) (*legacyRepaintObserver,
 		Version: workerProtocolVersion, SessionID: manifest.SessionID,
 		LastSeq: manifest.LastSequence, TerminalOnly: true,
 		WorkerToken: manifest.Token,
-		ClientID:    "relay-repaint-" + strconv.Itoa(os.Getpid()),
+		// Old workers retain the input lease after Detach. Use the requesting
+		// terminal's identity so this short-lived helper cannot lock it out.
+		ClientID: clientID,
 	})
 	if err := observer.writer.Write(hello); err != nil {
 		connection.Close()
@@ -74,7 +79,20 @@ func openLegacyRepaintObserver(manifest workerManifest) (*legacyRepaintObserver,
 
 func (observer *legacyRepaintObserver) close() {
 	_ = observer.connection.SetDeadline(time.Time{})
-	_ = observer.writer.Write(protocol.Frame{Type: protocol.Detach})
+	if observer.writer.Write(protocol.Frame{Type: protocol.Detach}) == nil {
+		// The worker releases its input lease before closing the socket. Wait
+		// briefly for EOF so a handoff to another viewer cannot race that
+		// release; a stalled old worker remains bounded by this deadline.
+		if unix, ok := observer.connection.(*net.UnixConn); ok {
+			_ = unix.CloseWrite()
+		}
+		_ = observer.connection.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+		for {
+			if _, err := protocol.ReadFrame(observer.connection); err != nil {
+				break
+			}
+		}
+	}
 	_ = observer.connection.Close()
 }
 
@@ -132,54 +150,21 @@ func openLegacyTerminal(manifest workerManifest) (*os.File, error) {
 	)
 }
 
-// pulseLegacyWorkerViewport forces a full primary-screen TUI repaint for a
-// worker created before attach_repaint_v1. The probe and target are separated
-// by observed worker output, so a slow TUI cannot race its following attach.
-func pulseLegacyWorkerViewport(manifest workerManifest, cols, rows uint16) error {
-	if cols == 0 || rows == 0 {
-		return fmt.Errorf("invalid repaint viewport %dx%d", cols, rows)
-	}
-	observer, err := openLegacyRepaintObserver(manifest)
-	if err != nil {
-		return err
-	}
-	defer observer.close()
-	terminal, err := openLegacyTerminal(manifest)
-	if err != nil {
-		return err
-	}
-	defer terminal.Close()
-	steps := attachResizeSteps(cols, rows, cols, rows, true)
-	target := &pty.Winsize{Cols: cols, Rows: rows}
-	sequence := observer.sequence
-	for index, step := range steps {
-		if err := pty.Setsize(terminal, &pty.Winsize{Cols: step.cols, Rows: step.rows}); err != nil {
-			if index > 0 || len(steps) == 1 {
-				return err
-			}
-			_ = pty.Setsize(terminal, target)
-			return err
-		}
-		sequence, err = observer.waitForOutput(sequence)
-		if err != nil {
-			// A failed probe must never strand the durable worker at the
-			// temporary grid. Restore the requested viewport before returning.
-			if index < len(steps)-1 {
-				_ = pty.Setsize(terminal, target)
-			}
-			return err
-		}
-	}
-	return nil
+// A retained worker must repaint on the renderer's actual grid. The same
+// validated terminal and input-lease fence used by viewport commits can signal
+// an unchanged grid without emitting output for a temporary row count.
+func pulseLegacyWorkerViewport(manifest workerManifest, cols, rows uint16, clientID string) error {
+	_, err := commitLegacyWorkerViewport(manifest, cols, rows, clientID)
+	return err
 }
 
 // commitLegacyWorkerViewport applies a final grid to a durable worker that
 // predates viewport_commit_v2 and returns the sequence of its observed redraw.
-func commitLegacyWorkerViewport(manifest workerManifest, cols, rows uint16) (uint64, error) {
+func commitLegacyWorkerViewport(manifest workerManifest, cols, rows uint16, clientID string) (uint64, error) {
 	if cols == 0 || rows == 0 {
 		return 0, fmt.Errorf("invalid legacy viewport %dx%d", cols, rows)
 	}
-	observer, err := openLegacyRepaintObserver(manifest)
+	observer, err := openLegacyRepaintObserver(manifest, clientID)
 	if err != nil {
 		return 0, err
 	}

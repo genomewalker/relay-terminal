@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import SwiftUI
 
-enum RelaydHostState: String, Equatable, Sendable {
+enum RelaydHostState: String, Codable, Equatable, Sendable {
     case unknown
     case checking
     case missing
@@ -13,7 +13,7 @@ enum RelaydHostState: String, Equatable, Sendable {
     case failed
 }
 
-struct RelaydHostReport: Equatable, Sendable {
+struct RelaydHostReport: Codable, Equatable, Sendable {
     var state: RelaydHostState = .unknown
     var architecture = "—"
     var version: String?
@@ -240,15 +240,17 @@ enum RelaydRemoteClient {
     static func check(profile: ConnectionProfile) async throws -> RelaydHostReport {
         try await Task.detached(priority: .userInitiated) {
             let expectedPayloadHashes = bundledPayloadHashes()
-            let result = try runSSH(profile: profile, script: statusScript, timeout: 15)
-            guard result.status == 0 else {
-                let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
+            let result = try await RelayHostExecution.capture(profile: profile,
+                command: statusScript, timeout: 15, maximumBytes: 2 << 20, directory: "/")
+            guard result.exitCode == 0 else {
+                let message = String(decoding: result.stderr, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 throw RelaydManagementError.commandFailed(
                     message.isEmpty ? "Could not check relayd on \(profile.name)." : message
                 )
             }
             return try RelaydStatusParser.parse(
-                result.output,
+                result.stdout,
                 expectedVersion: expectedVersion,
                 expectedPayloadHashes: expectedPayloadHashes
             )
@@ -520,8 +522,17 @@ final class RelaydManager: ObservableObject {
         selectedHostKey = profile.connectionKey
     }
 
+    func checkForRequest(_ profile: ConnectionProfile) async -> RelaydHostReport? {
+        let key = profile.connectionKey
+        guard operations[key] == nil else { return nil }
+        check(profile, allowAutomaticUpdate: false)
+        if let operation = operations[key] { await operation.value }
+        return reports[key]
+    }
+
     func check(_ profile: ConnectionProfile, allowAutomaticUpdate: Bool = true) {
         let key = profile.connectionKey
+        RelayHostRegistry.shared.register(profile, origin: "Relay installation manager")
         guard operations[key] == nil else { return }
         var checking = report(for: profile)
         checking.state = .checking
@@ -539,6 +550,7 @@ final class RelaydManager: ObservableObject {
             do {
                 let report = try await RelaydRemoteClient.check(profile: profile)
                 self?.reports[key] = report
+                RelayHostRegistry.shared.observe(report, profile: profile)
                 self?.append(
                     report.state == .missing ? "relayd is not installed" : "Status received from relayd \(report.version ?? "")",
                     kind: report.state, for: profile
@@ -552,9 +564,11 @@ final class RelaydManager: ObservableObject {
                 let message = error.localizedDescription
                 let failure = SSHConnectionFailure.diagnose(message)
                 let state: RelaydHostState = failure.kind == .networkRoute ? .unreachable : .failed
-                self?.reports[key] = RelaydHostReport(
+                let report = RelaydHostReport(
                     state: state, message: message, checkedAt: Date()
                 )
+                self?.reports[key] = report
+                RelayHostRegistry.shared.observeFailedCheck(report, profile: profile)
                 self?.append(message, kind: state, for: profile)
             }
         }
@@ -566,6 +580,7 @@ final class RelaydManager: ObservableObject {
         retrying: Bool = false
     ) {
         let key = profile.connectionKey
+        RelayHostRegistry.shared.register(profile, origin: "Relay installation manager")
         guard operations[key] == nil else { return }
         let current = report(for: profile)
         guard current.state == .missing || current.state == .outdated
@@ -597,6 +612,7 @@ final class RelaydManager: ObservableObject {
                 report.message = error.localizedDescription
                 report.checkedAt = Date()
                 self?.reports[key] = report
+                RelayHostRegistry.shared.observe(report, profile: profile)
                 self?.append(error.localizedDescription, kind: .failed, for: profile)
             }
         }
@@ -613,7 +629,7 @@ final class RelaydManager: ObservableObject {
     }
 
     private func persistTrust() {
-        UserDefaults.standard.set(Array(trustedHostKeys).sorted(), forKey: trustedDefaultsKey)
+        RelayStateProfile.defaults.set(Array(trustedHostKeys).sorted(), forKey: trustedDefaultsKey)
     }
 
     private func append(_ message: String, kind: RelaydHostState, for profile: ConnectionProfile) {
@@ -667,28 +683,28 @@ struct RelaydFirstRunView: View {
     let continueWithoutReview: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: 16) {
+        VStack(spacing: RelayTheme.spacing(0)) {
+            HStack(alignment: .top, spacing: RelayTheme.spacing(16)) {
                 Image(systemName: "point.3.connected.trianglepath.dotted")
-                    .font(.system(size: 25, weight: .medium))
+                    .font(RelayTheme.font(size: 25, weight: .medium))
                     .foregroundStyle(RelayTheme.mint)
                     .frame(width: 48, height: 48)
-                    .background(RelayTheme.mint.opacity(0.1), in: RoundedRectangle(cornerRadius: 13))
-                VStack(alignment: .leading, spacing: 5) {
+                    .background(RelayTheme.mint.opacity(0.1), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(13)))
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(5)) {
                     Text("Remote sessions use relayd")
-                        .font(.system(size: 19, weight: .semibold))
+                        .font(RelayTheme.font(size: 19, weight: .semibold))
                     Text("A small helper keeps shells running on each remote host while Relay draws the interface on this Mac.")
-                        .font(.system(size: 12))
+                        .font(RelayTheme.font(size: 12))
                         .foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
             }
-            .padding(22)
+            .padding(RelayTheme.spacing(22))
 
             Divider().overlay(RelayTheme.line.opacity(0.45))
 
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(16)) {
                 firstRunRow(
                     symbol: "lock.shield",
                     title: "You authorize installation",
@@ -710,40 +726,40 @@ struct RelaydFirstRunView: View {
                     detail: "Normal shells use xterm-relay only after the host can resolve it, with xterm-256color as a safe fallback. Sudo compatibility is shown in Settings and never requests elevation silently."
                 )
             }
-            .padding(22)
+            .padding(RelayTheme.spacing(22))
 
             Divider().overlay(RelayTheme.line.opacity(0.45))
 
             HStack {
                 Text("SSH keys, agents, ProxyJump and known_hosts remain the authorization layer.")
-                    .font(.system(size: 10.5))
+                    .font(RelayTheme.font(size: 10.5))
                     .foregroundStyle(RelayTheme.textMuted)
                 Spacer()
                 Button("Not now", action: continueWithoutReview)
                 Button("Review remote hosts", action: reviewHosts)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(RelayPrimaryButtonStyle())
                     .tint(RelayTheme.accent)
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(18)
+            .padding(RelayTheme.spacing(18))
         }
         .frame(width: 590)
         .foregroundStyle(RelayTheme.text)
         .background(RelayTheme.sidebar)
-        .preferredColorScheme(.dark)
+        .relaySurface()
     }
 
     private func firstRunRow(symbol: String, title: String, detail: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .top, spacing: RelayTheme.spacing(12)) {
             Image(systemName: symbol)
-                .font(.system(size: 13, weight: .semibold))
+                .font(RelayTheme.font(size: 13, weight: .semibold))
                 .foregroundStyle(RelayTheme.blue)
                 .frame(width: 25, height: 25)
-                .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 7))
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.system(size: 12, weight: .semibold))
+                .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7)))
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
+                Text(title).font(RelayTheme.font(size: 12, weight: .semibold))
                 Text(detail)
-                    .font(.system(size: 10.5))
+                    .font(RelayTheme.font(size: 10.5))
                     .foregroundStyle(RelayTheme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -769,7 +785,7 @@ struct RelaydManagerView: View {
     }
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: RelayTheme.spacing(0)) {
             hostRail
                 .frame(width: 220)
             Divider().overlay(RelayTheme.line.opacity(0.5))
@@ -779,7 +795,7 @@ struct RelaydManagerView: View {
         .frame(width: 860, height: 610)
         .foregroundStyle(RelayTheme.text)
         .background(RelayTheme.canvas)
-        .preferredColorScheme(.dark)
+        .relaySurface()
         .onAppear {
             profileStore.refreshSSHConfig()
             if let preferredProfile { manager.select(preferredProfile) }
@@ -789,64 +805,64 @@ struct RelaydManagerView: View {
     }
 
     private var hostRail: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
                 Text("Remote helpers")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(RelayTheme.font(size: 15, weight: .semibold))
                 Text("One shared binary · one supervisor per node")
-                    .font(.system(size: 10.5))
+                    .font(RelayTheme.font(size: 10.5))
                     .foregroundStyle(RelayTheme.textMuted)
             }
-            .padding(18)
+            .padding(RelayTheme.spacing(18))
 
             Divider().overlay(RelayTheme.line.opacity(0.4))
 
             if profiles.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(8)) {
                     Image(systemName: "server.rack")
-                        .font(.system(size: 18))
+                        .font(RelayTheme.font(size: 18))
                         .foregroundStyle(RelayTheme.textFaint)
                     Text("No SSH hosts found")
-                        .font(.system(size: 11.5, weight: .semibold))
+                        .font(RelayTheme.font(size: 11.5, weight: .semibold))
                     Text("Add a host to ~/.ssh/config or save one from Connect.")
-                        .font(.system(size: 10.5))
+                        .font(RelayTheme.font(size: 10.5))
                         .foregroundStyle(RelayTheme.textMuted)
                 }
-                .padding(18)
+                .padding(RelayTheme.spacing(18))
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 4) {
+                    LazyVStack(spacing: RelayTheme.spacing(4)) {
                         ForEach(profiles) { profile in
                             let report = manager.report(for: profile)
                             Button {
                                 manager.select(profile)
                                 manager.check(profile)
                             } label: {
-                                HStack(spacing: 9) {
+                                HStack(spacing: RelayTheme.spacing(9)) {
                                     Circle().fill(report.state.color).frame(width: 6, height: 6)
-                                    VStack(alignment: .leading, spacing: 2) {
+                                    VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
                                         Text(profile.name)
-                                            .font(.system(size: 11.5, weight: .medium))
+                                            .font(RelayTheme.font(size: 11.5, weight: .medium))
                                             .lineLimit(1)
                                         Text(report.state.label)
-                                            .font(.system(size: 9.5))
+                                            .font(RelayTheme.font(size: 9.5))
                                             .foregroundStyle(RelayTheme.textMuted)
                                     }
                                     Spacer()
                                 }
-                                .padding(.horizontal, 10)
+                                .padding(.horizontal, RelayTheme.spacing(10))
                                 .frame(height: 44)
                                 .contentShape(Rectangle())
                                 .background(
                                     manager.selectedHostKey == profile.connectionKey
                                         ? RelayTheme.elevated : Color.clear,
-                                    in: RoundedRectangle(cornerRadius: 9)
+                                    in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9))
                                 )
                             }
                             .buttonStyle(.plain)
                         }
                     }
-                    .padding(8)
+                    .padding(RelayTheme.spacing(8))
                 }
             }
             Spacer(minLength: 0)
@@ -859,12 +875,12 @@ struct RelaydManagerView: View {
         if let profile = selectedProfile {
             hostDetail(profile)
         } else {
-            VStack(spacing: 9) {
+            VStack(spacing: RelayTheme.spacing(9)) {
                 Image(systemName: "server.rack")
-                    .font(.system(size: 23))
+                    .font(RelayTheme.font(size: 23))
                     .foregroundStyle(RelayTheme.textFaint)
                 Text("Select an SSH host")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(RelayTheme.font(size: 13, weight: .semibold))
             }
         }
     }
@@ -872,18 +888,18 @@ struct RelaydManagerView: View {
     private func hostDetail(_ profile: ConnectionProfile) -> some View {
         let report = manager.report(for: profile)
         let timeline = manager.timeline(for: profile)
-        return VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 7) {
+        return VStack(spacing: RelayTheme.spacing(0)) {
+            HStack(spacing: RelayTheme.spacing(12)) {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
+                    HStack(spacing: RelayTheme.spacing(7)) {
                         Text(profile.name)
-                            .font(.system(size: 17, weight: .semibold))
+                            .font(RelayTheme.font(size: 17, weight: .semibold))
                         Label(report.state.label, systemImage: report.state.symbol)
-                            .font(.system(size: 9.5, weight: .semibold))
+                            .font(RelayTheme.font(size: 9.5, weight: .semibold))
                             .foregroundStyle(report.state.color)
                     }
                     Text(profile.subtitle)
-                        .font(.system(size: 10.5))
+                        .font(RelayTheme.font(size: 10.5))
                         .foregroundStyle(RelayTheme.textMuted)
                 }
                 Spacer()
@@ -892,70 +908,70 @@ struct RelaydManagerView: View {
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, RelayTheme.spacing(20))
             .frame(height: 70)
 
             Divider().overlay(RelayTheme.line.opacity(0.45))
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(16)) {
                     if let message = report.message {
                         Label(message, systemImage: report.state.symbol)
-                            .font(.system(size: 10.5, weight: .medium))
+                            .font(RelayTheme.font(size: 10.5, weight: .medium))
                             .foregroundStyle(report.state.color)
-                            .padding(.horizontal, 11)
+                            .padding(.horizontal, RelayTheme.spacing(11))
                             .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
-                            .background(report.state.color.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+                            .background(report.state.color.opacity(0.08), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9)))
                     }
 
                     metrics(report)
 
-                    HStack(spacing: 9) {
+                    HStack(spacing: RelayTheme.spacing(9)) {
                         Image(systemName: manager.isTrusted(profile) ? "checkmark.shield" : "shield")
                             .foregroundStyle(manager.isTrusted(profile) ? RelayTheme.mint : RelayTheme.textMuted)
-                        VStack(alignment: .leading, spacing: 2) {
+                        VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
                             Text(manager.isTrusted(profile) ? "Updates approved from this host" : "Installation not yet approved")
-                                .font(.system(size: 10.5, weight: .semibold))
+                                .font(RelayTheme.font(size: 10.5, weight: .semibold))
                             Text("Automatic updates apply only after one explicit installation approval.")
-                                .font(.system(size: 9.5))
+                                .font(RelayTheme.font(size: 9.5))
                                 .foregroundStyle(RelayTheme.textMuted)
                         }
                         Spacer()
                         if manager.isTrusted(profile) {
                             Button("Forget approval") { manager.forgetTrust(profile) }
                                 .buttonStyle(.borderless)
-                                .font(.system(size: 10.5))
+                                .font(RelayTheme.font(size: 10.5))
                         }
                         Toggle("Automatic updates", isOn: $preferences.automaticallyUpdateRelayd)
                             .toggleStyle(.switch)
                             .controlSize(.small)
-                            .font(.system(size: 10.5))
+                            .font(RelayTheme.font(size: 10.5))
                     }
-                    .padding(.horizontal, 12)
+                    .padding(.horizontal, RelayTheme.spacing(12))
                     .frame(minHeight: 44)
-                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 10))
+                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
 
                     if report.state == .missing || report.state == .outdated
                         || (report.state == .failed && report.architecture != "—") {
                         installationCard(profile: profile, report: report)
                     }
 
-                    VStack(alignment: .leading, spacing: 9) {
+                    VStack(alignment: .leading, spacing: RelayTheme.spacing(9)) {
                         sectionLabel("Connection timeline")
                         if timeline.isEmpty {
                             Text("Checks and installation steps appear here.")
-                                .font(.system(size: 10.5))
+                                .font(RelayTheme.font(size: 10.5))
                                 .foregroundStyle(RelayTheme.textMuted)
                         } else {
                             ForEach(timeline.suffix(8)) { event in
-                                HStack(alignment: .top, spacing: 9) {
-                                    Circle().fill(event.kind.color).frame(width: 6, height: 6).padding(.top, 4)
+                                HStack(alignment: .top, spacing: RelayTheme.spacing(9)) {
+                                    Circle().fill(event.kind.color).frame(width: 6, height: 6).padding(.top, RelayTheme.spacing(4))
                                     Text(event.occurredAt, style: .time)
-                                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                                        .font(RelayTheme.font(size: 9.5, weight: .medium, design: .monospaced))
                                         .foregroundStyle(RelayTheme.textFaint)
                                         .frame(width: 54, alignment: .leading)
                                     Text(event.message)
-                                        .font(.system(size: 10.5))
+                                        .font(RelayTheme.font(size: 10.5))
                                         .foregroundStyle(RelayTheme.textMuted)
                                         .textSelection(.enabled)
                                     Spacer()
@@ -963,35 +979,35 @@ struct RelaydManagerView: View {
                             }
                         }
                     }
-                    .padding(13)
-                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 11))
+                    .padding(RelayTheme.spacing(13))
+                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(11)))
 
-                    VStack(alignment: .leading, spacing: 9) {
+                    VStack(alignment: .leading, spacing: RelayTheme.spacing(9)) {
                         HStack {
                             sectionLabel("relayd log")
                             Spacer()
                             Text("last 80 lines")
-                                .font(.system(size: 9, design: .monospaced))
+                                .font(RelayTheme.font(size: 9, design: .monospaced))
                                 .foregroundStyle(RelayTheme.textFaint)
                         }
                         ScrollView(.horizontal) {
                             Text(report.logLines.isEmpty ? "No supervisor log output." : report.logLines.joined(separator: "\n"))
-                                .font(.system(size: 10, design: .monospaced))
+                                .font(RelayTheme.font(size: 10, design: .monospaced))
                                 .foregroundStyle(RelayTheme.textMuted)
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
                         }
                     }
-                    .padding(13)
-                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 11))
+                    .padding(RelayTheme.spacing(13))
+                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(11)))
                 }
-                .padding(20)
+                .padding(RelayTheme.spacing(20))
             }
         }
     }
 
     private func metrics(_ report: RelaydHostReport) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: RelayTheme.spacing(8)) {
             metric("Version", report.version ?? "—")
             metric(
                 "Supervisor",
@@ -1003,33 +1019,33 @@ struct RelaydManagerView: View {
     }
 
     private func metric(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
             Text(label.uppercased())
-                .font(.system(size: 8.5, weight: .semibold))
+                .font(RelayTheme.font(size: 8.5, weight: .semibold))
                 .tracking(0.5)
                 .foregroundStyle(RelayTheme.textFaint)
             Text(value)
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .font(RelayTheme.font(size: 12, weight: .medium, design: .monospaced))
                 .foregroundStyle(RelayTheme.text)
                 .lineLimit(1)
         }
-        .padding(11)
+        .padding(RelayTheme.spacing(11))
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 10))
+        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
     }
 
     private func installationCard(profile: ConnectionProfile, report: RelaydHostReport) -> some View {
-        VStack(alignment: .leading, spacing: 11) {
-            HStack(alignment: .top, spacing: 11) {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(11)) {
+            HStack(alignment: .top, spacing: RelayTheme.spacing(11)) {
                 Image(systemName: "lock.shield")
                     .foregroundStyle(RelayTheme.blue)
                     .frame(width: 28, height: 28)
-                    .background(RelayTheme.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 8))
-                VStack(alignment: .leading, spacing: 3) {
+                    .background(RelayTheme.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)))
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
                     Text(installationTitle(for: report))
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(RelayTheme.font(size: 12, weight: .semibold))
                     Text("Installs an architecture-selecting launcher, this node’s signed payload, and Relay-owned Claude/Codex shims. An existing rcode command is preserved. No sudo, service, or network port.")
-                        .font(.system(size: 10.5))
+                        .font(RelayTheme.font(size: 10.5))
                         .foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1037,24 +1053,24 @@ struct RelaydManagerView: View {
             }
             HStack {
                 Text("Linux \(report.architecture)  ·  relayd \(RelaydRemoteClient.expectedVersion)  ·  SHA-256 verified")
-                    .font(.system(size: 9.5, design: .monospaced))
+                    .font(RelayTheme.font(size: 9.5, design: .monospaced))
                     .foregroundStyle(RelayTheme.textFaint)
                 Spacer()
                 Button(installationButtonTitle(for: report)) {
                     manager.install(profile, explicitlyAuthorized: true, retrying: report.state == .failed)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(RelayPrimaryButtonStyle())
                 .tint(RelayTheme.accent)
             }
         }
-        .padding(14)
-        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 12))
-        .overlay { RoundedRectangle(cornerRadius: 12).stroke(RelayTheme.blue.opacity(0.25)) }
+        .padding(RelayTheme.spacing(14))
+        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(12)))
+        .overlay { RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(12)).stroke(RelayTheme.blue.opacity(0.25)) }
     }
 
     private func sectionLabel(_ title: String) -> some View {
         Text(title)
-            .font(.system(size: 10.5, weight: .semibold))
+            .font(RelayTheme.font(size: 10.5, weight: .semibold))
             .foregroundStyle(RelayTheme.text)
     }
 

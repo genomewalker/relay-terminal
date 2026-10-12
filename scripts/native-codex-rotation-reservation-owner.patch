@@ -1,0 +1,712 @@
+--- a/codex-rs/app-server/src/request_processors/context_rotation.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation.rs
+@@ -5,84 +5,15 @@
+ use codex_app_server_protocol::ThreadContextRotationPrepareResponse;
+ use codex_app_server_protocol::ThreadContextRotationReleaseParams;
+ use codex_app_server_protocol::ThreadContextRotationReleaseResponse;
+-use tokio_util::sync::CancellationToken;
+-
+-#[derive(Clone)]
+-struct ReservationKey {
+-    owner: ConnectionId,
+-    thread: ThreadId,
+-    id: uuid::Uuid,
+-    cancelled: CancellationToken,
+-}
+-
+-#[derive(Default)]
+-pub(super) struct RotationReservations {
+-    active: Mutex<Option<ReservationKey>>,
+-}
++#[path = "context_rotation_owner.rs"]
++mod owner;
++pub(super) use owner::RotationReservations;
+ 
+ fn rotation_error(message: impl Into<String>) -> JSONRPCErrorError {
+     JSONRPCErrorError {
+         code: -32000,
+         message: message.into(),
+         data: None,
+-    }
+-}
+-
+-impl RotationReservations {
+-    async fn claim(
+-        &self,
+-        owner: ConnectionId,
+-        thread: ThreadId,
+-    ) -> Result<ReservationKey, JSONRPCErrorError> {
+-        let mut active = self.active.lock().await;
+-        if active
+-            .as_ref()
+-            .is_some_and(|entry| !entry.cancelled.is_cancelled())
+-        {
+-            return Err(rotation_error(
+-                "a context rotation reservation is already pending",
+-            ));
+-        }
+-        let key = ReservationKey {
+-            owner,
+-            thread,
+-            id: uuid::Uuid::new_v4(),
+-            cancelled: CancellationToken::new(),
+-        };
+-        *active = Some(key.clone());
+-        Ok(key)
+-    }
+-
+-    async fn release(&self, owner: ConnectionId, thread: ThreadId, id: uuid::Uuid) -> bool {
+-        let mut active = self.active.lock().await;
+-        if active
+-            .as_ref()
+-            .is_some_and(|entry| entry.owner == owner && entry.thread == thread && entry.id == id)
+-        {
+-            if let Some(entry) = active.take() {
+-                entry.cancelled.cancel();
+-            }
+-            true
+-        } else {
+-            false
+-        }
+-    }
+-
+-    pub(super) async fn disconnect(&self, owner: ConnectionId) {
+-        let mut active = self.active.lock().await;
+-        if active.as_ref().is_some_and(|entry| entry.owner == owner)
+-            && let Some(entry) = active.take()
+-        {
+-            entry.cancelled.cancel();
+-        }
+-    }
+-}
+-
+-impl Drop for RotationReservations {
+-    fn drop(&mut self) {
+-        if let Some(entry) = self.active.get_mut().take() {
+-            entry.cancelled.cancel();
+-        }
+     }
+ }
+ 
+@@ -109,7 +40,7 @@
+         }
+         let key = self
+             .rotation_reservations
+-            .claim(request.connection_id, thread_id)
++            .claim(request.connection_id, thread_id, deadline)
+             .await?;
+         let failure_guard = key.cancelled.clone().drop_guard();
+         // Never implicitly load or resume a cold thread for maintenance.
+@@ -155,15 +86,11 @@
+             admission_generation: receipt.admission_generation.to_string(),
+             expires_in_ms,
+         };
+-        self.background_tasks.spawn(async move {
+-            let _finished = key.cancelled.clone().drop_guard();
+-            tokio::select! {
+-                biased;
+-                _ = key.cancelled.cancelled() => {},
+-                _ = lease.revoked() => {},
+-            }
+-            drop(lease);
+-        });
++        // The registry owns the real capability; the observer owns no lease.
++        let revoked = lease.revoked();
++        self.rotation_reservations.retain(&key, lease).await?;
++        self.background_tasks
++            .spawn(self.rotation_reservations.monitor(key, revoked));
+         failure_guard.disarm();
+         Ok(Some(response.into()))
+     }
+@@ -186,7 +113,3 @@
+         ))
+     }
+ }
+-
+-#[cfg(test)]
+-#[path = "context_rotation_tests.rs"]
+-mod tests;
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/context_rotation_owner.rs
+@@ -0,0 +1,246 @@
++//! Connection-bound ownership of actual native leases, with one-shot transfer.
++//! No serialized receipt can populate a held slot or recreate its capability.
++use super::ConnectionId;
++use super::JSONRPCErrorError;
++use super::ThreadId;
++use super::rotation_error;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::Weak;
++use tokio::time::Instant;
++use tokio_util::sync::CancellationToken;
++
++#[derive(Clone)]
++pub(super) struct ReservationKey {
++    pub(super) owner: ConnectionId,
++    pub(super) thread: ThreadId,
++    pub(super) id: uuid::Uuid,
++    pub(super) cancelled: CancellationToken,
++    deadline: Instant,
++}
++
++enum ReservationPhase<L> {
++    Preparing,
++    Held(L),
++    // A transferred capability may already be executing. Expiry/disconnect
++    // must not free this slot or authorize a second transaction.
++    Transferred,
++}
++struct ReservationEntry<L> {
++    key: ReservationKey,
++    phase: ReservationPhase<L>,
++}
++impl<L> ReservationEntry<L> {
++    fn matches(&self, owner: ConnectionId, thread: ThreadId, id: uuid::Uuid) -> bool {
++        self.key.owner == owner && self.key.thread == thread && self.key.id == id
++    }
++    fn transferred(&self) -> bool {
++        matches!(self.phase, ReservationPhase::Transferred)
++    }
++}
++pub(in crate::request_processors) struct RotationReservations<
++    L = codex_core::NativeRotationReservation,
++> {
++    active: Arc<Mutex<Option<ReservationEntry<L>>>>,
++}
++impl<L> Default for RotationReservations<L> {
++    fn default() -> Self {
++        Self {
++            active: Arc::new(Mutex::new(None)),
++        }
++    }
++}
++
++impl<L> RotationReservations<L> {
++    pub(super) async fn claim(
++        &self,
++        owner: ConnectionId,
++        thread: ThreadId,
++        deadline: Instant,
++    ) -> Result<ReservationKey, JSONRPCErrorError> {
++        let mut active = self
++            .active
++            .lock()
++            .map_err(|_| rotation_error("rotation owner unavailable"))?;
++        if Instant::now() >= deadline {
++            return Err(rotation_error("native preparation expired"));
++        }
++        if active.as_ref().is_some_and(|entry| {
++            entry.transferred()
++                || (!entry.key.cancelled.is_cancelled() && Instant::now() < entry.key.deadline)
++        }) {
++            return Err(rotation_error(
++                "a context rotation reservation is already pending",
++            ));
++        }
++        if let Some(previous) = active.take() {
++            previous.key.cancelled.cancel();
++        }
++        let key = ReservationKey {
++            owner,
++            thread,
++            id: uuid::Uuid::new_v4(),
++            cancelled: CancellationToken::new(),
++            deadline,
++        };
++        *active = Some(ReservationEntry {
++            key: key.clone(),
++            phase: ReservationPhase::Preparing,
++        });
++        Ok(key)
++    }
++
++    pub(super) async fn retain(
++        &self,
++        key: &ReservationKey,
++        lease: L,
++    ) -> Result<(), JSONRPCErrorError> {
++        let mut active = self
++            .active
++            .lock()
++            .map_err(|_| rotation_error("rotation owner unavailable"))?;
++        let entry = active
++            .as_mut()
++            .filter(|entry| entry.matches(key.owner, key.thread, key.id))
++            .ok_or_else(|| rotation_error("native preparation owner changed"))?;
++        if entry.key.cancelled.is_cancelled()
++            || Instant::now() >= entry.key.deadline
++            || !matches!(entry.phase, ReservationPhase::Preparing)
++        {
++            return Err(rotation_error("native preparation is no longer eligible"));
++        }
++        entry.phase = ReservationPhase::Held(lease);
++        Ok(())
++    }
++
++    // Internal only. The future foreground commit route must revalidate its own
++    // capability and the sole subscription before consuming this lease. Core
++    // still performs its atomic admission/seal checks after transfer.
++    pub(super) async fn take(
++        &self,
++        owner: ConnectionId,
++        thread: ThreadId,
++        id: uuid::Uuid,
++    ) -> Result<L, JSONRPCErrorError> {
++        let mut active = self
++            .active
++            .lock()
++            .map_err(|_| rotation_error("rotation owner unavailable"))?;
++        let entry = active
++            .as_mut()
++            .filter(|entry| entry.matches(owner, thread, id))
++            .ok_or_else(|| rotation_error("native reservation owner mismatch"))?;
++        if entry.key.cancelled.is_cancelled()
++            || Instant::now() >= entry.key.deadline
++            || !matches!(entry.phase, ReservationPhase::Held(_))
++        {
++            return Err(rotation_error("native reservation is unavailable"));
++        }
++        let ReservationPhase::Held(lease) =
++            std::mem::replace(&mut entry.phase, ReservationPhase::Transferred)
++        else {
++            unreachable!("held reservation checked under owner lock")
++        };
++        Ok(lease)
++    }
++
++    pub(super) fn monitor<F>(
++        &self,
++        key: ReservationKey,
++        revoked: F,
++    ) -> impl Future<Output = ()> + Send + 'static + use<L, F>
++    where
++        L: Send + 'static,
++        F: Future<Output = ()> + Send + 'static,
++    {
++        let guard = ReservationMonitor {
++            active: Arc::downgrade(&self.active),
++            key,
++        };
++        async move {
++            let _guard = guard;
++            tokio::select! {
++                biased;
++                _ = _guard.key.cancelled.cancelled() => {},
++                _ = tokio::time::sleep_until(_guard.key.deadline) => {},
++                _ = revoked => {},
++            }
++        }
++    }
++
++    pub(super) async fn release(
++        &self,
++        owner: ConnectionId,
++        thread: ThreadId,
++        id: uuid::Uuid,
++    ) -> bool {
++        let Ok(mut active) = self.active.lock() else {
++            return false;
++        };
++        if active
++            .as_ref()
++            .is_some_and(|entry| entry.matches(owner, thread, id) && !entry.transferred())
++        {
++            if let Some(entry) = active.take() {
++                entry.key.cancelled.cancel();
++            }
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(in crate::request_processors) async fn disconnect(&self, owner: ConnectionId) {
++        let Ok(mut active) = self.active.lock() else {
++            return;
++        };
++        if active
++            .as_ref()
++            .is_some_and(|entry| entry.key.owner == owner && !entry.transferred())
++            && let Some(entry) = active.take()
++        {
++            entry.key.cancelled.cancel();
++        }
++    }
++}
++
++impl<L> Drop for RotationReservations<L> {
++    fn drop(&mut self) {
++        let mut active = self
++            .active
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if let Some(entry) = active.take() {
++            entry.key.cancelled.cancel();
++        }
++    }
++}
++
++// Synchronous cleanup also runs if a background task is cancelled before its
++// first poll. A weak reference cannot prolong registry/process ownership.
++struct ReservationMonitor<L> {
++    active: Weak<Mutex<Option<ReservationEntry<L>>>>,
++    key: ReservationKey,
++}
++impl<L> Drop for ReservationMonitor<L> {
++    fn drop(&mut self) {
++        if let Some(active) = self.active.upgrade() {
++            let mut active = active
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            if let Some(entry) = active.as_ref()
++                && entry.matches(self.key.owner, self.key.thread, self.key.id)
++            {
++                if entry.transferred() {
++                    return;
++                }
++                active.take();
++            }
++        }
++        self.key.cancelled.cancel();
++    }
++}
++
++#[cfg(test)]
++#[path = "context_rotation_tests.rs"]
++mod tests;
+--- a/codex-rs/app-server/src/request_processors/context_rotation_tests.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation_tests.rs
+@@ -3,10 +3,18 @@
+ 
+ #[tokio::test]
+ async fn context_rotation_reservation_binds_connection_thread_and_token() {
+-    let registry = RotationReservations::default();
++    let registry = RotationReservations::<()>::default();
+     let thread = ThreadId::new();
+-    let key = registry.claim(ConnectionId(1), thread).await.unwrap();
+-    assert!(registry.claim(ConnectionId(2), thread).await.is_err());
++    let key = registry
++        .claim(ConnectionId(1), thread, deadline())
++        .await
++        .unwrap();
++    assert!(
++        registry
++            .claim(ConnectionId(2), thread, deadline())
++            .await
++            .is_err()
++    );
+     assert!(!registry.release(ConnectionId(2), thread, key.id).await);
+     assert!(
+         !registry
+@@ -26,9 +34,9 @@
+ 
+ #[tokio::test]
+ async fn context_rotation_disconnect_cancels_pending_owner_only() {
+-    let registry = RotationReservations::default();
+-    let key = registry
+-        .claim(ConnectionId(1), ThreadId::new())
++    let registry = RotationReservations::<()>::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
+         .await
+         .unwrap();
+     registry.disconnect(ConnectionId(2)).await;
+@@ -36,7 +44,7 @@
+     registry.disconnect(ConnectionId(1)).await;
+     key.cancelled.cancelled().await;
+     let next = registry
+-        .claim(ConnectionId(2), ThreadId::new())
++        .claim(ConnectionId(2), ThreadId::new(), deadline())
+         .await
+         .unwrap();
+     assert_ne!(next.id, key.id);
+@@ -45,14 +53,17 @@
+ 
+ #[tokio::test]
+ async fn context_rotation_failed_or_revoked_preparation_releases_capacity() {
+-    let registry = RotationReservations::default();
+-    let key = registry
+-        .claim(ConnectionId(1), ThreadId::new())
++    let registry = RotationReservations::<()>::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
+         .await
+         .unwrap();
+     let guard = key.cancelled.clone().drop_guard();
+     drop(guard);
+-    let next = registry.claim(ConnectionId(1), key.thread).await.unwrap();
++    let next = registry
++        .claim(ConnectionId(1), key.thread, deadline())
++        .await
++        .unwrap();
+     assert_ne!(next.id, key.id);
+     assert!(!next.cancelled.is_cancelled());
+     assert!(!registry.release(key.owner, key.thread, key.id).await);
+@@ -61,11 +72,221 @@
+ 
+ #[tokio::test]
+ async fn context_rotation_registry_drop_revokes_its_retained_lease() {
+-    let registry = RotationReservations::default();
+-    let key = registry
+-        .claim(ConnectionId(1), ThreadId::new())
++    let registry = RotationReservations::<()>::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
+         .await
+         .unwrap();
+     drop(registry);
+     key.cancelled.cancelled().await;
+ }
++
++fn deadline() -> Instant {
++    Instant::now() + std::time::Duration::from_secs(5)
++}
++
++#[derive(Debug)]
++struct LeaseProbe {
++    id: usize,
++    drops: Arc<std::sync::atomic::AtomicUsize>,
++}
++impl Drop for LeaseProbe {
++    fn drop(&mut self) {
++        self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++    }
++}
++fn probe(id: usize) -> (LeaseProbe, Arc<std::sync::atomic::AtomicUsize>) {
++    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    (
++        LeaseProbe {
++            id,
++            drops: Arc::clone(&drops),
++        },
++        drops,
++    )
++}
++fn drop_count(value: &std::sync::atomic::AtomicUsize) -> usize {
++    value.load(std::sync::atomic::Ordering::SeqCst)
++}
++
++#[tokio::test]
++async fn context_rotation_retains_real_lease_until_matching_release() {
++    let registry = RotationReservations::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
++        .await
++        .unwrap();
++    let (lease, drops) = probe(7);
++    registry.retain(&key, lease).await.unwrap();
++    assert_eq!(drop_count(&drops), 0);
++    assert!(!registry.release(ConnectionId(2), key.thread, key.id).await);
++    assert_eq!(drop_count(&drops), 0);
++    assert!(registry.release(key.owner, key.thread, key.id).await);
++    assert_eq!(drop_count(&drops), 1);
++}
++
++#[tokio::test]
++async fn context_rotation_duplicate_and_stale_retention_drop_only_rejected_lease() {
++    let registry = RotationReservations::default();
++    let old = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
++        .await
++        .unwrap();
++    registry.disconnect(old.owner).await;
++    let key = registry
++        .claim(ConnectionId(1), old.thread, deadline())
++        .await
++        .unwrap();
++    let (stale, stale_drops) = probe(1);
++    assert!(registry.retain(&old, stale).await.is_err());
++    assert_eq!(drop_count(&stale_drops), 1);
++    let (held, held_drops) = probe(2);
++    registry.retain(&key, held).await.unwrap();
++    let (duplicate, duplicate_drops) = probe(3);
++    assert!(registry.retain(&key, duplicate).await.is_err());
++    assert_eq!(drop_count(&duplicate_drops), 1);
++    assert_eq!(drop_count(&held_drops), 0);
++    drop(registry);
++    assert_eq!(drop_count(&held_drops), 1);
++}
++
++#[tokio::test]
++async fn context_rotation_observer_revocation_and_unpolled_drop_release_real_lease() {
++    for poll in [false, true] {
++        let registry = RotationReservations::default();
++        let key = registry
++            .claim(ConnectionId(1), ThreadId::new(), deadline())
++            .await
++            .unwrap();
++        let (lease, drops) = probe(1);
++        registry.retain(&key, lease).await.unwrap();
++        let revoked = CancellationToken::new();
++        let monitor = registry.monitor(key.clone(), revoked.clone().cancelled_owned());
++        if poll {
++            revoked.cancel();
++            monitor.await;
++        } else {
++            drop(monitor);
++        }
++        assert_eq!(drop_count(&drops), 1);
++        assert!(key.cancelled.is_cancelled());
++        assert!(
++            registry
++                .claim(ConnectionId(2), key.thread, deadline())
++                .await
++                .is_ok()
++        );
++    }
++}
++
++#[tokio::test]
++async fn context_rotation_old_monitor_cannot_drop_replacement() {
++    let registry = RotationReservations::default();
++    let old = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
++        .await
++        .unwrap();
++    let monitor = registry.monitor(old.clone(), std::future::pending());
++    registry.disconnect(old.owner).await;
++    let key = registry
++        .claim(ConnectionId(2), old.thread, deadline())
++        .await
++        .unwrap();
++    let (lease, drops) = probe(2);
++    registry.retain(&key, lease).await.unwrap();
++    drop(monitor);
++    assert_eq!(drop_count(&drops), 0);
++    assert!(!key.cancelled.is_cancelled());
++    assert!(registry.release(key.owner, key.thread, key.id).await);
++    assert_eq!(drop_count(&drops), 1);
++}
++
++#[tokio::test(start_paused = true)]
++async fn context_rotation_transfer_is_exact_once_and_survives_disconnect_or_expiry() {
++    let registry = RotationReservations::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
++        .await
++        .unwrap();
++    let (lease, drops) = probe(42);
++    registry.retain(&key, lease).await.unwrap();
++    let revoked = CancellationToken::new();
++    let monitor = registry.monitor(key.clone(), revoked.clone().cancelled_owned());
++    assert!(
++        registry
++            .take(ConnectionId(2), key.thread, key.id)
++            .await
++            .is_err()
++    );
++    assert!(
++        registry
++            .take(key.owner, ThreadId::new(), key.id)
++            .await
++            .is_err()
++    );
++    assert!(
++        registry
++            .take(key.owner, key.thread, uuid::Uuid::new_v4())
++            .await
++            .is_err()
++    );
++    let held = registry.take(key.owner, key.thread, key.id).await.unwrap();
++    assert_eq!(held.id, 42);
++    assert!(registry.take(key.owner, key.thread, key.id).await.is_err());
++    assert!(!registry.release(key.owner, key.thread, key.id).await);
++    registry.disconnect(key.owner).await;
++    tokio::time::advance(std::time::Duration::from_secs(6)).await;
++    revoked.cancel();
++    monitor.await;
++    assert!(!key.cancelled.is_cancelled());
++    assert_eq!(drop_count(&drops), 0);
++    assert!(
++        registry
++            .claim(ConnectionId(2), key.thread, deadline())
++            .await
++            .is_err()
++    );
++    drop(held);
++    assert_eq!(drop_count(&drops), 1);
++    // Unknown submission outcome cannot be reset merely because caller dropped.
++    assert!(
++        registry
++            .claim(ConnectionId(2), key.thread, deadline())
++            .await
++            .is_err()
++    );
++}
++
++#[tokio::test(start_paused = true)]
++async fn context_rotation_expiry_refuses_transfer_and_drops_held_lease() {
++    let registry = RotationReservations::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
++        .await
++        .unwrap();
++    assert!(registry.take(key.owner, key.thread, key.id).await.is_err());
++    let (lease, drops) = probe(5);
++    registry.retain(&key, lease).await.unwrap();
++    let monitor = registry.monitor(key.clone(), std::future::pending());
++    tokio::time::advance(std::time::Duration::from_secs(5)).await;
++    assert!(registry.take(key.owner, key.thread, key.id).await.is_err());
++    monitor.await;
++    assert_eq!(drop_count(&drops), 1);
++    assert!(key.cancelled.is_cancelled());
++}
++
++#[tokio::test]
++async fn context_rotation_monitor_does_not_keep_registry_or_lease_alive() {
++    let registry = RotationReservations::default();
++    let key = registry
++        .claim(ConnectionId(1), ThreadId::new(), deadline())
++        .await
++        .unwrap();
++    let (lease, drops) = probe(3);
++    registry.retain(&key, lease).await.unwrap();
++    let monitor = registry.monitor(key.clone(), std::future::pending());
++    drop(registry);
++    assert_eq!(drop_count(&drops), 1);
++    assert!(key.cancelled.is_cancelled());
++    monitor.await;
++}
+--- a/codex-rs/core/src/session/native_rotation.rs
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -62,8 +62,9 @@
+             .expect("native receipt checked on construction")
+     }
+ 
+-    pub async fn revoked(&self) {
+-        self.lease.revoked().await;
++    /// An owned observation that does not retain or recreate the reservation.
++    pub fn revoked(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
++        self.lease.revoked()
+     }
+ 
+     /// Internal transaction step only. Before exposing this across the app-server
+--- a/codex-rs/core/src/session/rotation_dispatch.rs
++++ b/codex-rs/core/src/session/rotation_dispatch.rs
+@@ -31,8 +31,9 @@
+ }
+ 
+ impl DispatchLease {
+-    pub(crate) async fn revoked(&self) {
+-        self.revoked.cancelled().await;
++    pub(crate) fn revoked(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
++        let revoked = self.revoked.clone();
++        async move { revoked.cancelled().await }
+     }
+ 
+     pub(super) async fn close_for_rotation(
+--- a/codex-rs/core/src/session/rotation_dispatch_tests.rs
++++ b/codex-rs/core/src/session/rotation_dispatch_tests.rs
+@@ -102,9 +102,11 @@
+     assert!(matches!(poll!(&mut receive), Poll::Pending));
+     let lease = request.await.unwrap();
+     assert!(admission.try_reserve(0).is_none());
++    let revoked = tokio::spawn(lease.revoked());
+     drop(lease);
+     assert!(matches!(poll!(&mut receive), Poll::Pending));
+     assert!(admission.try_reserve(0).is_some());
++    revoked.await.unwrap();
+     assert!(!sender.is_closed());
+ }
+ 

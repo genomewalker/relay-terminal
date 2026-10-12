@@ -35,6 +35,14 @@ func processStartTime(pid int) (uint64, error) {
 	return strconv.ParseUint(fields[19], 10, 64)
 }
 
+func processStartIdentity(pid int) (string, error) {
+	start, err := processStartTime(pid)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatUint(start, 10), nil
+}
+
 func processWorkingDirectory(pid int) (string, error) {
 	return os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
 }

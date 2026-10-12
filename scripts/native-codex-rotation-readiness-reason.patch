@@ -1,0 +1,316 @@
+diff --git a/codex-rs/tui/src/app/rotation.rs b/codex-rs/tui/src/app/rotation.rs
+--- a/codex-rs/tui/src/app/rotation.rs
++++ b/codex-rs/tui/src/app/rotation.rs
+@@ -16,7 +16,12 @@
+         }
+         if !self.frontend_rotation_ready(events, request.thread_id, &request.turn_id) {
+             tui.invalidate_context_rotation();
+-            request.refuse("frontend is not ready for context rotation");
++            let reason = self
++                .frontend_rotation_blocker(events, request.thread_id, &request.turn_id)
++                .unwrap_or("unspecified readiness state");
++            request.refuse(format!(
++                "frontend is not ready for context rotation: {reason}"
++            ));
+             return;
+         }
+         let frontend = match tui.reserve_context_rotation(
+@@ -96,6 +101,54 @@
+             && self.pending_managed_worktree_attach.is_none()
+             && self.chat_widget.rotation_input_ready(turn_id)
+     }
++
++    pub(super) fn frontend_rotation_blocker(
++        &self,
++        events: &mpsc::UnboundedReceiver<AppEvent>,
++        thread_id: ThreadId,
++        turn_id: &str,
++    ) -> Option<&'static str> {
++        [
++            (!events.is_closed(), "app: !events.is_closed()"),
++            (events.is_empty(), "app: events.is_empty()"),
++            (self.active_thread_id == Some(thread_id), "app: active_thread_id == Some(thread_id)"),
++            (self.primary_thread_id == Some(thread_id), "app: primary_thread_id == Some(thread_id)"),
++            (self.chat_widget.thread_id() == Some(thread_id), "app: chat_widget.thread_id() == Some(thread_id)"),
++            (!self.reconnect.offline, "app: !reconnect.offline"),
++            (self.overlay.is_none(), "app: overlay.is_none()"),
++            (self.pending_right_click_paste.is_none(), "app: pending_right_click_paste.is_none()"),
++            (self
++                .active_thread_rx
++                .as_ref()
++                .is_some_and(|receiver| !receiver.is_closed() && receiver.is_empty()), "app: self .active_thread_rx .as_ref() .is_some_and(|receiver| !receiver.is_closed() && receiver.is_empty())"),
++            (self.pending_primary_events.is_empty(), "app: pending_primary_events.is_empty()"),
++            (self.initial_history_replay_buffer.is_none(), "app: initial_history_replay_buffer.is_none()"),
++            (self.pending_app_server_requests.is_empty(), "app: pending_app_server_requests.is_empty()"),
++            (self.pending_plugin_enabled_writes.is_empty(), "app: pending_plugin_enabled_writes.is_empty()"),
++            (self.pending_hook_enabled_writes.is_empty(), "app: pending_hook_enabled_writes.is_empty()"),
++            (self.pending_server_profiles.is_empty(), "app: pending_server_profiles.is_empty()"),
++            (self.side_threads.is_empty(), "app: side_threads.is_empty()"),
++            (self.background_voice.is_none(), "app: background_voice.is_none()"),
++            (self.temporary_structured_requests.is_empty(), "app: temporary_structured_requests.is_empty()"),
++            (self.dynamic_tool_tasks.is_empty(), "app: dynamic_tool_tasks.is_empty()"),
++            (self.pending_thread_titles.is_empty(), "app: pending_thread_titles.is_empty()"),
++            (self.pending_shutdown_exit_thread_id.is_none(), "app: pending_shutdown_exit_thread_id.is_none()"),
++            (self.pending_thread_switch_resets == 0, "app: pending_thread_switch_resets == 0"),
++            (!self.pending_startup_thread_start, "app: !pending_startup_thread_start"),
++            (!self.startup_protected_input_boundary, "app: !startup_protected_input_boundary"),
++            (!self.startup_pending_protected_request, "app: !startup_pending_protected_request"),
++            (!self.pending_open_resume_picker, "app: !pending_open_resume_picker"),
++            (self.pending_working_directory_change.is_none(), "app: pending_working_directory_change.is_none()"),
++            (self.pending_start_managed_worktree.is_none(), "app: pending_start_managed_worktree.is_none()"),
++            (!self.pending_managed_worktree_creation, "app: !pending_managed_worktree_creation"),
++            (self.pending_managed_worktree_created.is_none(), "app: pending_managed_worktree_created.is_none()"),
++            (self.pending_managed_worktree_transition.is_none(), "app: pending_managed_worktree_transition.is_none()"),
++            (self.pending_managed_worktree_attach.is_none(), "app: pending_managed_worktree_attach.is_none()"),
++        ]
++        .into_iter()
++        .find_map(|(ready, reason)| (!ready).then_some(reason))
++        .or_else(|| self.chat_widget.rotation_input_blocker(turn_id))
++    }
+ }
+ 
+ /// Events from the installed widget stay separate from unrelated foreground work.
+diff --git a/codex-rs/tui/src/chatwidget/rotation.rs b/codex-rs/tui/src/chatwidget/rotation.rs
+--- a/codex-rs/tui/src/chatwidget/rotation.rs
++++ b/codex-rs/tui/src/chatwidget/rotation.rs
+@@ -25,4 +25,82 @@
+             && !self.input_queue.rate_limit_recovery_pending
+             && self.bottom_pane.rotation_input_ready()
+     }
++
++    pub(crate) fn rotation_input_blocker(&self, turn_id: &str) -> Option<&'static str> {
++        [
++            (
++                self.turn_lifecycle.last_turn_id.as_deref() == Some(turn_id),
++                "widget: turn_lifecycle.last_turn_id.as_deref() == Some(turn_id)",
++            ),
++            (
++                !self.turn_lifecycle.agent_turn_running,
++                "widget: !turn_lifecycle.agent_turn_running",
++            ),
++            (
++                self.initial_user_message.is_none(),
++                "widget: initial_user_message.is_none()",
++            ),
++            (
++                self.pending_image_submission.is_none(),
++                "widget: pending_image_submission.is_none()",
++            ),
++            (
++                self.safety_buffering_prompt.is_none(),
++                "widget: safety_buffering_prompt.is_none()",
++            ),
++            (
++                self.input_queue.startup_submission.is_none(),
++                "widget: input_queue.startup_submission.is_none()",
++            ),
++            (
++                self.input_queue.queued_user_messages.is_empty(),
++                "widget: input_queue.queued_user_messages.is_empty()",
++            ),
++            (
++                self.input_queue
++                    .queued_user_message_history_records
++                    .is_empty(),
++                "widget: self .input_queue .queued_user_message_history_records .is_empty()",
++            ),
++            (
++                self.input_queue.rejected_steers_queue.is_empty(),
++                "widget: input_queue.rejected_steers_queue.is_empty()",
++            ),
++            (
++                self.input_queue.rejected_steer_sources.is_empty(),
++                "widget: input_queue.rejected_steer_sources.is_empty()",
++            ),
++            (
++                self.input_queue.rejected_steer_history_records.is_empty(),
++                "widget: input_queue.rejected_steer_history_records.is_empty()",
++            ),
++            (
++                self.input_queue.pending_steers.is_empty(),
++                "widget: input_queue.pending_steers.is_empty()",
++            ),
++            (
++                !self.input_queue.user_turn_pending_start,
++                "widget: !input_queue.user_turn_pending_start",
++            ),
++            (
++                self.input_queue.pending_user_message_client_id.is_none(),
++                "widget: input_queue.pending_user_message_client_id.is_none()",
++            ),
++            (
++                !self.input_queue.submit_pending_steers_after_interrupt,
++                "widget: !input_queue.submit_pending_steers_after_interrupt",
++            ),
++            (
++                !self.input_queue.recovered_queue,
++                "widget: !input_queue.recovered_queue",
++            ),
++            (
++                !self.input_queue.rate_limit_recovery_pending,
++                "widget: !input_queue.rate_limit_recovery_pending",
++            ),
++        ]
++        .into_iter()
++        .find_map(|(ready, reason)| (!ready).then_some(reason))
++        .or_else(|| self.bottom_pane.rotation_input_blocker())
++    }
+ }
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -1690,6 +1690,30 @@
+             && !self.is_task_running
+     }
+ 
++    pub(crate) fn rotation_input_blocker(&self) -> Option<&'static str> {
++        if let Some(reason) = self.composer.rotation_input_blocker() {
++            return Some(reason);
++        }
++        [
++            (
++                self.view_stack.is_empty(),
++                "bottom pane: view_stack.is_empty()",
++            ),
++            (
++                self.warnings_view.is_none(),
++                "bottom pane: warnings_view.is_none()",
++            ),
++            (self.questions.is_none(), "bottom pane: questions.is_none()"),
++            (
++                self.delayed_approval_requests.is_empty(),
++                "bottom pane: delayed_approval_requests.is_empty()",
++            ),
++            (!self.is_task_running, "bottom pane: !is_task_running"),
++        ]
++        .into_iter()
++        .find_map(|(ready, reason)| (!ready).then_some(reason))
++    }
++
+     pub(crate) fn composer_is_empty(&self) -> bool {
+         self.composer.is_empty()
+     }
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/rotation.rs b/codex-rs/tui/src/bottom_pane/chat_composer/rotation.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/rotation.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/rotation.rs
+@@ -15,6 +15,49 @@
+             && self.history_search.is_none()
+             && self.voice_strip.is_none()
+     }
++
++    pub(crate) fn rotation_input_blocker(&self) -> Option<&'static str> {
++        [
++            (self.is_empty(), "composer: is_empty()"),
++            (!self.popups.active(), "composer: !popups.active()"),
++            (self.draft.input_enabled, "composer: draft.input_enabled"),
++            (
++                self.draft.pending_pastes.is_empty(),
++                "composer: draft.pending_pastes.is_empty()",
++            ),
++            (
++                self.draft.mention_bindings.is_empty(),
++                "composer: draft.mention_bindings.is_empty()",
++            ),
++            (
++                self.draft.recent_submission_mention_bindings.is_empty(),
++                "composer: draft.recent_submission_mention_bindings.is_empty()",
++            ),
++            (
++                self.draft.textarea.text_elements().is_empty(),
++                "composer: draft.textarea.text_elements().is_empty()",
++            ),
++            (
++                !self.draft.paste_burst.is_active(),
++                "composer: !draft.paste_burst.is_active()",
++            ),
++            (!self.blocks_direct_input, "composer: !blocks_direct_input"),
++            (
++                self.pending_slash_command_history.is_none(),
++                "composer: pending_slash_command_history.is_none()",
++            ),
++            (
++                self.history_search.is_none(),
++                "composer: history_search.is_none()",
++            ),
++            (
++                self.voice_strip.is_none(),
++                "composer: voice_strip.is_none()",
++            ),
++        ]
++        .into_iter()
++        .find_map(|(ready, reason)| (!ready).then_some(reason))
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/tui/src/app/tests/rotation.rs b/codex-rs/tui/src/app/tests/rotation.rs
+--- a/codex-rs/tui/src/app/tests/rotation.rs
++++ b/codex-rs/tui/src/app/tests/rotation.rs
+@@ -98,3 +98,38 @@
+     );
+     Ok(())
+ }
++
++#[tokio::test]
++async fn frontend_rotation_diagnostics_match_readiness_without_mutation() {
++    let (mut app, mut events, active, id) = ready_app().await;
++    assert_eq!(
++        app.frontend_rotation_blocker(&events, id, "completed"),
++        None
++    );
++    assert_eq!(
++        app.frontend_rotation_blocker(&events, id, "other"),
++        Some("widget: turn_lifecycle.last_turn_id.as_deref() == Some(turn_id)")
++    );
++    app.app_event_tx.send(AppEvent::OpenDaemonMenu);
++    assert_eq!(
++        app.frontend_rotation_blocker(&events, id, "completed"),
++        Some("app: events.is_empty()")
++    );
++    assert!(matches!(
++        events.try_recv().unwrap(),
++        AppEvent::OpenDaemonMenu
++    ));
++    app.pending_thread_switch_resets = 1;
++    assert_eq!(
++        app.frontend_rotation_blocker(&events, id, "completed"),
++        Some("app: pending_thread_switch_resets == 0")
++    );
++    assert!(!app.frontend_rotation_ready(&events, id, "completed"));
++    app.pending_thread_switch_resets = 0;
++    drop(active);
++    assert!(
++        app.frontend_rotation_blocker(&events, id, "completed")
++            .is_some()
++    );
++    assert!(!app.frontend_rotation_ready(&events, id, "completed"));
++}
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/rotation_tests.rs b/codex-rs/tui/src/bottom_pane/chat_composer/rotation_tests.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/rotation_tests.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/rotation_tests.rs
+@@ -47,3 +47,25 @@
+     composer.popups.active = super::super::popup_state::ActivePopup::None;
+     assert!(composer.rotation_input_ready());
+ }
++
++#[test]
++fn frontend_rotation_diagnostics_retain_hidden_paste_and_disabled_input() {
++    let (mut composer, _rx) = new_test_composer();
++    assert_eq!(composer.rotation_input_blocker(), None);
++    composer
++        .draft
++        .paste_burst
++        .on_plain_char('x', std::time::Instant::now());
++    assert_eq!(
++        composer.rotation_input_blocker(),
++        Some("composer: !draft.paste_burst.is_active()")
++    );
++    assert!(composer.draft.paste_burst.is_active());
++    assert_eq!(composer.draft.textarea.text(), "");
++    composer.draft.input_enabled = false;
++    assert_eq!(
++        composer.rotation_input_blocker(),
++        Some("composer: draft.input_enabled")
++    );
++    assert!(!composer.rotation_input_ready());
++}

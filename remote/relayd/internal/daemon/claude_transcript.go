@@ -4,16 +4,15 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
 type claudeTranscriptReader struct {
 	rootPID             int
+	rootStart           uint64
 	path                string
 	offset              int64
 	known               map[string]bool
@@ -23,20 +22,26 @@ type claudeTranscriptReader struct {
 }
 
 func (reader *claudeTranscriptReader) poll(frames chan<- protocol.Frame, stopped <-chan struct{}) bool {
-	path := reader.path
-	if path == "" {
-		path = claudeRootTranscript(reader.rootPID)
+	path := claudeRootTranscript(reader.rootPID)
+	if path != reader.path {
+		reader.path = path
+		reader.offset = 0
+		reader.identity = [2]uint64{}
+		reader.discardingOversized = false
+		reader.known = make(map[string]bool)
+		reader.active = make(map[string]bool)
 	}
 	if path == "" {
 		return true
 	}
-	if path != reader.path {
-		reader.path = path
-		reader.offset = 0
-	}
 	cancelled := false
 	readTranscriptLines(path, &reader.offset, &reader.discardingOversized, &reader.identity, func(line []byte) {
 		if cancelled {
+			return
+		}
+		// Do not emit buffered activity after the producer exited or PID reuse.
+		start, err := processStartTime(reader.rootPID)
+		if err != nil || start != reader.rootStart {
 			return
 		}
 		for _, event := range claudeTranscriptEvents(line) {
@@ -256,55 +261,10 @@ func xmlLikeValue(text, tag string) string {
 	return strings.TrimSpace(remainder[:end])
 }
 
+// Only an unambiguous transcript held open by this process is eligible.
+// A directory or modification time is never a provider-session identity.
 func claudeRootTranscript(pid int) string {
-	if entries, err := os.ReadDir(filepath.Join("/proc", strconv.Itoa(pid), "fd")); err == nil {
-		type openCandidate struct {
-			path    string
-			updated time.Time
-		}
-		candidates := make([]openCandidate, 0)
-		seen := make(map[string]bool)
-		for _, entry := range entries {
-			target, readErr := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "fd", entry.Name()))
-			if readErr != nil || seen[target] || !strings.HasSuffix(target, ".jsonl") ||
-				!strings.Contains(target, string(filepath.Separator)+".claude"+string(filepath.Separator)+"projects"+string(filepath.Separator)) {
-				continue
-			}
-			seen[target] = true
-			if info, statErr := os.Stat(target); statErr == nil {
-				candidates = append(candidates, openCandidate{path: target, updated: info.ModTime()})
-			}
-		}
-		sort.Slice(candidates, func(left, right int) bool { return candidates[left].updated.After(candidates[right].updated) })
-		if len(candidates) > 0 {
-			return candidates[0].path
-		}
-	}
-	cwd, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
-	if err != nil || cwd == "" {
-		return ""
-	}
-	home := processEnvironmentValue(pid, "HOME")
-	if home == "" {
-		home, _ = os.UserHomeDir()
-	}
-	projectDirectory := filepath.Join(home, ".claude", "projects", strings.ReplaceAll(cwd, string(filepath.Separator), "-"))
-	paths, _ := filepath.Glob(filepath.Join(projectDirectory, "*.jsonl"))
-	sort.Slice(paths, func(left, right int) bool {
-		leftInfo, leftErr := os.Stat(paths[left])
-		rightInfo, rightErr := os.Stat(paths[right])
-		if leftErr != nil {
-			return false
-		}
-		if rightErr != nil {
-			return true
-		}
-		return leftInfo.ModTime().After(rightInfo.ModTime())
-	})
-	if len(paths) == 0 {
-		return ""
-	}
-	return paths[0]
+	return uniqueOpenProviderTranscript(pid, ".claude", "projects", false)
 }
 
 func processEnvironmentValue(pid int, name string) string {

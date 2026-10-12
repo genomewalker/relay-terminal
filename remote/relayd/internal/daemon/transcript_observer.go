@@ -33,12 +33,18 @@ func observeAgentTranscripts(source agentProcessSource) (<-chan protocol.Frame, 
 			changed = nextChanged
 			activity := false
 			for pid, agent := range processes {
+				start, startErr := processStartTime(pid)
+				if startErr != nil || start == 0 {
+					delete(codexReaders, pid)
+					delete(claudeReaders, pid)
+					continue
+				}
 				switch agent {
 				case "codex":
 					reader := codexReaders[pid]
-					if reader == nil {
+					if reader == nil || reader.rootStart != start {
 						reader = &codexTranscriptReader{
-							rootPID: pid, known: make(map[string]bool), active: make(map[string]bool),
+							rootPID: pid, rootStart: start, known: make(map[string]bool), active: make(map[string]bool),
 						}
 						codexReaders[pid] = reader
 						activity = true
@@ -50,9 +56,9 @@ func observeAgentTranscripts(source agentProcessSource) (<-chan protocol.Frame, 
 					activity = activity || reader.path != beforePath || reader.offset != beforeOffset
 				case "claude":
 					reader := claudeReaders[pid]
-					if reader == nil {
+					if reader == nil || reader.rootStart != start {
 						reader = &claudeTranscriptReader{
-							rootPID: pid, known: make(map[string]bool), active: make(map[string]bool),
+							rootPID: pid, rootStart: start, known: make(map[string]bool), active: make(map[string]bool),
 						}
 						claudeReaders[pid] = reader
 						activity = true

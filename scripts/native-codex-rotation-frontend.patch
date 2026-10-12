@@ -1,0 +1,910 @@
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -232,6 +232,7 @@
+ mod misalignment_policy;
+ mod model_defaults;
+ mod new_session;
++mod rotation;
+ mod turn_tips;
+ pub(crate) use new_session::has_launch_setting;
+ mod clipboard;
+@@ -834,6 +835,9 @@
+         app_server: &mut AppServerSession,
+         event: TuiEvent,
+     ) -> Result<AppRunControl> {
++        if !matches!(&event, TuiEvent::Draw) {
++            tui.invalidate_context_rotation();
++        }
+         tui.link_hover.observe(&event);
+         self.refresh_link_hover(tui)?;
+         self.invalidate_right_click_paste(&event);
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -31,6 +31,7 @@
+         app_server: &mut AppServerSession,
+         event: AppEvent,
+     ) -> Result<AppRunControl> {
++        tui.invalidate_context_rotation();
+         // Release the shortcut's input guard even when a fork is rejected below.
+         if matches!(event, AppEvent::ForkCurrentSession { .. }) {
+             self.chat_widget.fork_in_progress = false;
+@@ -121,6 +122,10 @@
+             event => (event, None),
+         };
+         match event {
++            AppEvent::PrepareFrontendRotation(request) => {
++                // Only the foreground loop can prove its input queues are drained.
++                let _ = request.reply.send(Err(crate::tui::rotation::FrontendRotationError::Unavailable));
++            }
+             AppEvent::OpenDaemonMenu => self.open_daemon_menu(),
+             AppEvent::ConfirmDaemonUpdate(source) => self.confirm_daemon_update(source),
+             AppEvent::RunDaemonUpdate(source) => {
+--- /dev/null
++++ b/codex-rs/tui/src/app/rotation.rs
+@@ -0,0 +1,68 @@
++//! Frontend preparation runs only on the foreground loop that owns both editor and queues.
++use super::*;
++use crate::tui::rotation::FrontendRotationError;
++use crate::tui::rotation::FrontendRotationRequest;
++
++impl App {
++    pub(super) fn prepare_frontend_rotation(
++        &self,
++        tui: &mut tui::Tui,
++        events: &mpsc::UnboundedReceiver<AppEvent>,
++        request: FrontendRotationRequest,
++    ) {
++        if request.reply.is_closed() {
++            return;
++        }
++        let ready = self.frontend_rotation_ready(events, request.thread_id, &request.turn_id);
++        let result = if ready {
++            tui.reserve_context_rotation(request.thread_id, request.turn_id, request.deadline)
++        } else {
++            tui.invalidate_context_rotation();
++            Err(FrontendRotationError::Busy)
++        };
++        let _ = request.reply.send(result);
++    }
++    pub(super) fn frontend_rotation_ready(
++        &self,
++        events: &mpsc::UnboundedReceiver<AppEvent>,
++        thread_id: ThreadId,
++        turn_id: &str,
++    ) -> bool {
++        !events.is_closed()
++            && events.is_empty()
++            && self.active_thread_id == Some(thread_id)
++            && self.primary_thread_id == Some(thread_id)
++            && self.chat_widget.thread_id() == Some(thread_id)
++            && !self.reconnect.offline
++            && self.overlay.is_none()
++            && self.pending_right_click_paste.is_none()
++            && self
++                .active_thread_rx
++                .as_ref()
++                .is_some_and(|receiver| !receiver.is_closed() && receiver.is_empty())
++            && self.pending_primary_events.is_empty()
++            && self.initial_history_replay_buffer.is_none()
++            && self.pending_app_server_requests.is_empty()
++            && self.pending_plugin_enabled_writes.is_empty()
++            && self.pending_hook_enabled_writes.is_empty()
++            && self.pending_server_profiles.is_empty()
++            && self.side_threads.is_empty()
++            && self.background_voice.is_none()
++            && self.temporary_structured_requests.is_empty()
++            && self.dynamic_tool_tasks.is_empty()
++            && self.pending_thread_titles.is_empty()
++            && self.pending_shutdown_exit_thread_id.is_none()
++            && self.pending_thread_switch_resets == 0
++            && !self.pending_startup_thread_start
++            && !self.startup_protected_input_boundary
++            && !self.startup_pending_protected_request
++            && !self.pending_open_resume_picker
++            && self.pending_working_directory_change.is_none()
++            && self.pending_start_managed_worktree.is_none()
++            && !self.pending_managed_worktree_creation
++            && self.pending_managed_worktree_created.is_none()
++            && self.pending_managed_worktree_transition.is_none()
++            && self.pending_managed_worktree_attach.is_none()
++            && self.chat_widget.rotation_input_ready(turn_id)
++    }
++}
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -1148,6 +1148,13 @@
+                     .and_then(|interval| app.rate_limit_refresh_state.poll_deadline(interval));
+                 let control = select! {
+                     Some(event) = app_event_rx.recv() => {
++                        let event = match event {
++                            AppEvent::PrepareFrontendRotation(request) => {
++                                app.prepare_frontend_rotation(tui, &app_event_rx, request);
++                                continue;
++                            }
++                            event => event,
++                        };
+                         let is_initial_session_header = matches!(
+                             &event,
+                             AppEvent::InsertHistoryCell(cell)
+@@ -1182,6 +1189,7 @@
+                         waiting_for_initial_session_configured,
+                         app.active_thread_rx.is_some()
+                     ) && !has_pending_app_events && !app.reconnect.offline => {
++                        tui.invalidate_context_rotation();
+                         if let Some(event) = active {
+                             if let Err(err) = app.handle_active_thread_event(tui, &mut app_server, event).await {
+                                 break Err(err);
+@@ -1226,6 +1234,7 @@
+                     }
+                     app_server_event = app_server.next_event(), if listen_for_app_server_events && !app.reconnect.offline
+                         && (matches!(app.app_server_target, AppServerTarget::Embedded) || !has_pending_app_events) => {
++                        tui.invalidate_context_rotation();
+                         match app_server_event {
+                             Some(event) => app.handle_app_server_event(&app_server, event).await,
+                             None => {
+@@ -1237,6 +1246,7 @@
+                         AppRunControl::Continue
+                     }
+                     result = async { match reconnect.as_mut() { Some(future) => future.await, None => std::future::pending().await } }, if reconnect.is_some() && !has_pending_app_events => {
++                        tui.invalidate_context_rotation();
+                         reconnect = None;
+                         match result {
+                             Ok(connected) => {
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -278,6 +278,7 @@
+ #[allow(clippy::large_enum_variant)]
+ #[derive(Debug, IntoStaticStr)]
+ pub(crate) enum AppEvent {
++    PrepareFrontendRotation(crate::tui::rotation::FrontendRotationRequest),
+     SecuritySetupLoaded {
+         request_id: uuid::Uuid,
+         identity: crate::security_setup::Identity,
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -1,4 +1,7 @@
+ //! The chat composer is the bottom-pane text input state machine.
++//!
++//! Rotation readiness also checks buffered paste characters, attachments, mention bindings,
++//! disabled input and history previews without capturing or modifying the draft.
+ //!
+ //! It edits [`TextArea`] and attachments, routes popup keys, makes completed slash commands atomic,
+ //! and handles Enter/newlines. It shows Luna Reserve's yellow arrow and detects unbracketed paste
+@@ -385,6 +388,7 @@
+ mod paste_input;
+ mod popup_state;
+ mod reconnect;
++mod rotation;
+ pub(crate) use reconnect::RestrictedInputMode;
+ mod slash_input;
+ mod sparkle;
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/rotation.rs
+@@ -0,0 +1,22 @@
++use super::*;
++
++impl ChatComposer {
++    pub(crate) fn rotation_input_ready(&self) -> bool {
++        self.is_empty()
++            && !self.popups.active()
++            && self.draft.input_enabled
++            && self.draft.pending_pastes.is_empty()
++            && self.draft.mention_bindings.is_empty()
++            && self.draft.recent_submission_mention_bindings.is_empty()
++            && self.draft.textarea.text_elements().is_empty()
++            && !self.draft.paste_burst.is_active()
++            && !self.blocks_direct_input
++            && self.pending_slash_command_history.is_none()
++            && self.history_search.is_none()
++            && self.voice_strip.is_none()
++    }
++}
++
++#[cfg(test)]
++#[path = "rotation_tests.rs"]
++mod tests;
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -1681,6 +1681,15 @@
+         }
+     }
+ 
++    pub(crate) fn rotation_input_ready(&self) -> bool {
++        self.composer.rotation_input_ready()
++            && self.view_stack.is_empty()
++            && self.warnings_view.is_none()
++            && self.questions.is_none()
++            && self.delayed_approval_requests.is_empty()
++            && !self.is_task_running
++    }
++
+     pub(crate) fn composer_is_empty(&self) -> bool {
+         self.composer.is_empty()
+     }
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -281,6 +281,7 @@
+ use self::ide_context::IdeContextState;
+ mod input_queue;
+ mod reconnect;
++mod rotation;
+ use self::input_queue::InputQueueState;
+ mod image_submission;
+ mod input_flow;
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/rotation.rs
+@@ -0,0 +1,28 @@
++//! Readiness inspection must not capture a draft: capture cancels image work and previews.
++use super::*;
++
++impl ChatWidget {
++    pub(crate) fn rotation_input_ready(&self, turn_id: &str) -> bool {
++        self.turn_lifecycle.last_turn_id.as_deref() == Some(turn_id)
++            && !self.turn_lifecycle.agent_turn_running
++            && self.initial_user_message.is_none()
++            && self.pending_image_submission.is_none()
++            && self.safety_buffering_prompt.is_none()
++            && self.input_queue.startup_submission.is_none()
++            && self.input_queue.queued_user_messages.is_empty()
++            && self
++                .input_queue
++                .queued_user_message_history_records
++                .is_empty()
++            && self.input_queue.rejected_steers_queue.is_empty()
++            && self.input_queue.rejected_steer_sources.is_empty()
++            && self.input_queue.rejected_steer_history_records.is_empty()
++            && self.input_queue.pending_steers.is_empty()
++            && !self.input_queue.user_turn_pending_start
++            && self.input_queue.pending_user_message_client_id.is_none()
++            && !self.input_queue.submit_pending_steers_after_interrupt
++            && !self.input_queue.recovered_queue
++            && !self.input_queue.rate_limit_recovery_pending
++            && self.bottom_pane.rotation_input_ready()
++    }
++}
+--- a/codex-rs/tui/src/tui.rs
++++ b/codex-rs/tui/src/tui.rs
+@@ -77,6 +77,7 @@
+ #[cfg(all(test, unix))]
+ #[path = "tui_panic_tests.rs"]
+ mod panic_tests;
++pub(crate) mod rotation;
+ mod screen_size;
+ mod scrollback;
+ mod selection_clipboard;
+@@ -120,6 +121,7 @@
+ 
+ impl Drop for Tui {
+     fn drop(&mut self) {
++        self.invalidate_context_rotation();
+         if let Err(err) = self.clear_ambient_pet_image() {
+             tracing::debug!(error = %err, "failed to clear ambient pet image on TUI drop");
+         }
+--- a/codex-rs/tui/src/tui/event_stream.rs
++++ b/codex-rs/tui/src/tui/event_stream.rs
+@@ -52,6 +52,9 @@
+ /// This intermediate layer enables dropping/recreating the underlying EventStream (pause/resume) without rebuilding consumers.
+ pub struct EventBroker<S: EventSource = CrosstermEventSource> {
+     state: Mutex<EventBrokerState<S>>,
++    buffered_input: Mutex<Option<EventResult>>,
++    input_closed: AtomicBool,
++    pub(super) rotation: super::rotation::FrontendRotationAdmission,
+     resume_events_tx: watch::Sender<()>,
+     pub(super) size_monitor: Option<SizeMonitor>,
+ }
+@@ -85,6 +88,9 @@
+         let (resume_events_tx, _resume_events_rx) = watch::channel(());
+         Self {
+             state: Mutex::new(EventBrokerState::Start),
++            buffered_input: Mutex::new(None),
++            input_closed: AtomicBool::new(false),
++            rotation: super::rotation::FrontendRotationAdmission::default(),
+             resume_events_tx,
+             size_monitor: None,
+         }
+@@ -92,6 +98,7 @@
+ 
+     /// Drop the underlying event source
+     pub fn pause_events(&self) {
++        self.rotation.invalidate();
+         if let Some(monitor) = &self.size_monitor {
+             monitor.set_active(/*active*/ false);
+         }
+@@ -104,6 +111,7 @@
+ 
+     /// Create a new instance of the underlying event source
+     pub fn resume_events(&self) {
++        self.rotation.invalidate();
+         if let Some(monitor) = &self.size_monitor {
+             monitor.set_active(/*active*/ true);
+         }
+@@ -203,6 +211,9 @@
+         // Some crossterm events map to None (e.g. mouse); loop so we keep polling
+         // until we return a mapped event, hit Pending, or see EOF/error.
+         loop {
++            if self.broker.input_closed.load(Ordering::Acquire) {
++                return Poll::Ready(None);
++            }
+             let poll_result = {
+                 let mut state = self
+                     .broker
+@@ -221,7 +232,20 @@
+                         }
+                     }
+                 };
+-                match Pin::new(events).poll_next(cx) {
++                let buffered = self
++                    .broker
++                    .buffered_input
++                    .lock()
++                    .unwrap_or_else(std::sync::PoisonError::into_inner)
++                    .take();
++                let polled = buffered.map_or_else(
++                    || Pin::new(events).poll_next(cx),
++                    |event| Poll::Ready(Some(event)),
++                );
++                if polled.is_ready() {
++                    self.broker.rotation.invalidate();
++                }
++                match polled {
+                     Poll::Ready(Some(Ok(event))) => Some(event),
+                     Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                         *state = EventBrokerState::Start;
+@@ -265,6 +289,7 @@
+ 
+     /// Map a crossterm event to a [`TuiEvent`], preserving mouse coordinates and modifiers.
+     fn map_crossterm_event(&mut self, event: Event) -> Option<TuiEvent> {
++        self.broker.rotation.invalidate();
+         match event {
+             Event::Key(key_event) => {
+                 #[cfg(unix)]
+@@ -635,3 +660,57 @@
+         }
+     }
+ }
++
++impl<S: EventSource + Default + Unpin> EventBroker<S> {
++    /// Probe the real input source without dropping a queued key, paste, error or EOF.
++    pub(super) fn reserve_rotation(
++        &self,
++        thread_id: codex_protocol::ThreadId,
++        turn_id: String,
++        deadline: tokio::time::Instant,
++    ) -> Result<super::rotation::FrontendRotationReservation, super::rotation::FrontendRotationError>
++    {
++        use super::rotation::FrontendRotationError;
++        if self.input_closed.load(Ordering::Acquire) {
++            return Err(FrontendRotationError::Unavailable);
++        }
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| FrontendRotationError::Unavailable)?;
++        let mut buffered = self
++            .buffered_input
++            .lock()
++            .map_err(|_| FrontendRotationError::Unavailable)?;
++        if buffered.is_some() {
++            return Err(FrontendRotationError::Busy);
++        }
++        let events = state
++            .active_event_source_mut()
++            .ok_or(FrontendRotationError::Unavailable)?;
++        let mut cx = Context::from_waker(std::task::Waker::noop());
++        match Pin::new(events).poll_next(&mut cx) {
++            Poll::Ready(Some(event)) => {
++                *buffered = Some(event);
++                self.rotation.invalidate();
++                Err(FrontendRotationError::Busy)
++            }
++            Poll::Ready(None) => {
++                self.input_closed.store(true, Ordering::Release);
++                self.rotation.invalidate();
++                Err(FrontendRotationError::Unavailable)
++            }
++            Poll::Pending => self.rotation.reserve(thread_id, turn_id, deadline),
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "rotation_input_tests.rs"]
++mod rotation_input_tests;
++
++impl<S: EventSource> Drop for EventBroker<S> {
++    fn drop(&mut self) {
++        self.rotation.invalidate();
++    }
++}
+--- /dev/null
++++ b/codex-rs/tui/src/tui/rotation.rs
+@@ -0,0 +1,150 @@
++//! Revocable frontend ownership. A lease is preparation evidence, never clear authority.
++//! The event-loop owner must drain queues and revalidate it again before committing.
++use codex_protocol::ThreadId;
++use std::sync::Mutex;
++use tokio::sync::oneshot;
++use tokio::time::Instant;
++use tokio_util::sync::CancellationToken;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum FrontendRotationError {
++    Busy,
++    Unavailable,
++    Expired,
++}
++
++#[derive(Debug)]
++pub(crate) struct FrontendRotationRequest {
++    pub(crate) thread_id: ThreadId,
++    pub(crate) turn_id: String,
++    pub(crate) deadline: Instant,
++    pub(crate) reply: oneshot::Sender<Result<FrontendRotationReservation, FrontendRotationError>>,
++}
++
++impl FrontendRotationRequest {
++    pub(crate) fn new(
++        thread_id: ThreadId,
++        turn_id: String,
++        reply: oneshot::Sender<Result<FrontendRotationReservation, FrontendRotationError>>,
++    ) -> Self {
++        Self {
++            thread_id,
++            turn_id,
++            deadline: Instant::now() + std::time::Duration::from_secs(5),
++            reply,
++        }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct FrontendRotationReservation {
++    pub(crate) runtime_id: uuid::Uuid,
++    pub(crate) thread_id: ThreadId,
++    pub(crate) turn_id: String,
++    pub(crate) generation: u64,
++    deadline: Instant,
++    cancelled: CancellationToken,
++}
++
++impl FrontendRotationReservation {
++    pub(crate) fn is_revoked(&self) -> bool {
++        self.cancelled.is_cancelled() || Instant::now() >= self.deadline
++    }
++
++    pub(crate) async fn revoked(&self) {
++        tokio::select! {
++            _ = self.cancelled.cancelled() => {},
++            _ = tokio::time::sleep_until(self.deadline) => {},
++        }
++    }
++}
++
++impl Drop for FrontendRotationReservation {
++    fn drop(&mut self) {
++        self.cancelled.cancel();
++    }
++}
++
++pub(super) struct FrontendRotationAdmission {
++    runtime_id: uuid::Uuid,
++    state: Mutex<AdmissionState>,
++}
++
++#[derive(Default)]
++struct AdmissionState {
++    generation: u64,
++    active: Option<(CancellationToken, Instant)>,
++}
++
++impl Default for FrontendRotationAdmission {
++    fn default() -> Self {
++        Self {
++            runtime_id: uuid::Uuid::new_v4(),
++            state: Mutex::new(AdmissionState::default()),
++        }
++    }
++}
++
++impl FrontendRotationAdmission {
++    pub(super) fn invalidate(&self) {
++        let mut state = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        state.generation = state.generation.saturating_add(1);
++        if let Some((cancelled, _)) = state.active.take() {
++            cancelled.cancel();
++        }
++    }
++
++    pub(super) fn reserve(
++        &self,
++        thread_id: ThreadId,
++        turn_id: String,
++        deadline: Instant,
++    ) -> Result<FrontendRotationReservation, FrontendRotationError> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| FrontendRotationError::Unavailable)?;
++        if Instant::now() >= deadline {
++            return Err(FrontendRotationError::Expired);
++        }
++        if state.generation == u64::MAX {
++            return Err(FrontendRotationError::Unavailable);
++        }
++        if state.active.as_ref().is_some_and(|(cancelled, expires)| {
++            !cancelled.is_cancelled() && Instant::now() < *expires
++        }) {
++            return Err(FrontendRotationError::Busy);
++        }
++        state.generation += 1;
++        let deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(5));
++        let cancelled = CancellationToken::new();
++        state.active = Some((cancelled.clone(), deadline));
++        Ok(FrontendRotationReservation {
++            runtime_id: self.runtime_id,
++            thread_id,
++            turn_id,
++            generation: state.generation,
++            deadline,
++            cancelled,
++        })
++    }
++}
++
++impl super::Tui {
++    pub(crate) fn invalidate_context_rotation(&self) {
++        self.event_broker.rotation.invalidate();
++    }
++
++    pub(crate) fn reserve_context_rotation(
++        &mut self,
++        thread_id: ThreadId,
++        turn_id: String,
++        deadline: Instant,
++    ) -> Result<FrontendRotationReservation, FrontendRotationError> {
++        self.event_broker
++            .reserve_rotation(thread_id, turn_id, deadline)
++    }
++}
+--- /dev/null
++++ b/codex-rs/tui/src/tui/rotation_input_tests.rs
+@@ -0,0 +1,140 @@
++use super::super::rotation::FrontendRotationError;
++use super::*;
++use codex_protocol::ThreadId;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyModifiers;
++use pretty_assertions::assert_eq;
++use tokio::sync::mpsc;
++use tokio_stream::StreamExt;
++
++struct Source {
++    rx: mpsc::UnboundedReceiver<EventResult>,
++}
++impl Default for Source {
++    fn default() -> Self {
++        let (_, rx) = mpsc::unbounded_channel();
++        Self { rx }
++    }
++}
++impl EventSource for Source {
++    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>> {
++        Pin::new(&mut self.get_mut().rx).poll_recv(cx)
++    }
++}
++fn setup() -> (
++    Arc<EventBroker<Source>>,
++    mpsc::UnboundedSender<EventResult>,
++    TuiEventStream<Source>,
++    broadcast::Sender<()>,
++) {
++    let (tx, rx) = mpsc::unbounded_channel();
++    let broker = Arc::new(EventBroker::new());
++    *broker.state.lock().unwrap() = EventBrokerState::Running(Source { rx });
++    let (draw_tx, draw_rx) = broadcast::channel(1);
++    let stream = TuiEventStream::new(
++        broker.clone(),
++        draw_rx,
++        Arc::new(AtomicBool::new(true)),
++        #[cfg(unix)]
++        crate::tui::job_control::SuspendContext::new(),
++        #[cfg(unix)]
++        Arc::new(AtomicBool::new(false)),
++    );
++    (broker, tx, stream, draw_tx)
++}
++fn reserve(
++    broker: &EventBroker<Source>,
++) -> Result<super::super::rotation::FrontendRotationReservation, FrontendRotationError> {
++    broker.reserve_rotation(
++        ThreadId::new(),
++        "turn".into(),
++        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
++    )
++}
++
++#[tokio::test]
++async fn frontend_rotation_queued_paste_refuses_and_preserves_order() {
++    let (broker, tx, mut stream, _draw) = setup();
++    tx.send(Ok(Event::Paste("keep draft".into()))).unwrap();
++    let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
++    tx.send(Ok(Event::Key(key))).unwrap();
++    assert_eq!(reserve(&broker).unwrap_err(), FrontendRotationError::Busy);
++    assert_eq!(reserve(&broker).unwrap_err(), FrontendRotationError::Busy);
++    assert!(matches!(stream.next().await, Some(TuiEvent::Paste(text)) if text == "keep draft"));
++    assert!(matches!(stream.next().await, Some(TuiEvent::Key(actual)) if actual == key));
++    assert!(!reserve(&broker).unwrap().is_revoked());
++}
++
++#[tokio::test]
++async fn frontend_rotation_input_revokes_before_delivery() {
++    let (broker, tx, mut stream, _draw) = setup();
++    let lease = reserve(&broker).unwrap();
++    tx.send(Ok(Event::Paste("human".into()))).unwrap();
++    assert!(matches!(stream.next().await, Some(TuiEvent::Paste(text)) if text == "human"));
++    assert!(lease.is_revoked());
++    lease.revoked().await;
++}
++
++#[tokio::test]
++async fn frontend_rotation_drop_releases_and_does_not_reuse_generation() {
++    let (broker, _tx, _stream, _draw) = setup();
++    let lease = reserve(&broker).unwrap();
++    let generation = lease.generation;
++    assert_eq!(reserve(&broker).unwrap_err(), FrontendRotationError::Busy);
++    drop(lease);
++    assert!(reserve(&broker).unwrap().generation > generation);
++}
++
++#[tokio::test(start_paused = true)]
++async fn frontend_rotation_deadline_and_expired_request() {
++    let (broker, _tx, _stream, _draw) = setup();
++    let lease = reserve(&broker).unwrap();
++    tokio::time::advance(std::time::Duration::from_secs(5)).await;
++    assert!(lease.is_revoked());
++    lease.revoked().await;
++    assert_eq!(
++        broker
++            .reserve_rotation(ThreadId::new(), "turn".into(), tokio::time::Instant::now())
++            .unwrap_err(),
++        FrontendRotationError::Expired
++    );
++    assert!(!reserve(&broker).unwrap().is_revoked());
++}
++
++#[tokio::test]
++async fn frontend_rotation_pause_and_owner_drop_revoke() {
++    let (broker, _tx, stream, _draw) = setup();
++    let lease = reserve(&broker).unwrap();
++    broker.pause_events();
++    assert!(lease.is_revoked());
++    assert_eq!(
++        reserve(&broker).unwrap_err(),
++        FrontendRotationError::Unavailable
++    );
++    drop(stream);
++    drop(broker);
++    assert!(lease.is_revoked());
++    let (broker, _tx, stream, _draw) = setup();
++    let lease = reserve(&broker).unwrap();
++    drop(stream);
++    drop(broker);
++    assert!(lease.is_revoked());
++}
++
++#[tokio::test]
++async fn frontend_rotation_eof_and_errors_are_preserved() {
++    let (broker, tx, mut stream, _draw) = setup();
++    let lease = reserve(&broker).unwrap();
++    tx.send(Err(std::io::Error::other("input failed"))).unwrap();
++    assert_eq!(reserve(&broker).unwrap_err(), FrontendRotationError::Busy);
++    assert!(lease.is_revoked());
++    assert!(stream.next().await.is_none());
++    let (broker, tx, mut stream, _draw) = setup();
++    drop(tx);
++    assert_eq!(
++        reserve(&broker).unwrap_err(),
++        FrontendRotationError::Unavailable
++    );
++    assert!(stream.next().await.is_none());
++}
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/rotation_tests.rs
+@@ -0,0 +1,49 @@
++use super::super::tests::new_test_composer;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn frontend_rotation_rejects_hidden_paste_without_capturing_draft() {
++    let (mut composer, _rx) = new_test_composer();
++    assert!(composer.rotation_input_ready());
++    composer
++        .draft
++        .paste_burst
++        .on_plain_char('x', std::time::Instant::now());
++    assert!(composer.is_empty());
++    assert!(!composer.rotation_input_ready());
++    assert!(composer.draft.paste_burst.is_active());
++    assert_eq!(composer.draft.textarea.text(), "");
++}
++
++#[test]
++fn frontend_rotation_rejects_pending_paste_and_disabled_input() {
++    let (mut composer, _rx) = new_test_composer();
++    composer
++        .draft
++        .pending_pastes
++        .push(("[paste]".into(), "retain me".into()));
++    assert!(!composer.rotation_input_ready());
++    assert_eq!(
++        composer.draft.pending_pastes,
++        vec![("[paste]".to_string(), "retain me".to_string())]
++    );
++    composer.draft.pending_pastes.clear();
++    composer.draft.input_enabled = false;
++    assert!(!composer.rotation_input_ready());
++    composer.draft.input_enabled = true;
++    composer.draft.textarea.insert_str(" ");
++    assert!(!composer.rotation_input_ready());
++    assert_eq!(composer.draft.textarea.text(), " ");
++}
++
++#[test]
++fn frontend_rotation_rejects_popup_even_when_text_is_empty() {
++    let (mut composer, _rx) = new_test_composer();
++    composer.handle_paste("/".into());
++    assert!(composer.popups.active());
++    composer.draft.textarea.set_text_clearing_elements("");
++    assert!(composer.is_empty());
++    assert!(!composer.rotation_input_ready());
++    composer.popups.active = super::super::popup_state::ActivePopup::None;
++    assert!(composer.rotation_input_ready());
++}
+--- a/codex-rs/tui/src/app/app_server_requests.rs
++++ b/codex-rs/tui/src/app/app_server_requests.rs
+@@ -81,6 +81,15 @@
+ }
+ 
+ impl PendingAppServerRequests {
++    pub(super) fn is_empty(&self) -> bool {
++        self.exec_approvals.is_empty()
++            && self.file_change_approvals.is_empty()
++            && self.permissions_approvals.is_empty()
++            && self.user_inputs.is_empty()
++            && self.mcp_requests.is_empty()
++            && self.user_verification.is_empty()
++    }
++
+     fn canonical_thread_id(thread_id: &str) -> String {
+         codex_protocol::ThreadId::from_string(thread_id)
+             .map(|thread_id| thread_id.to_string())
+--- a/codex-rs/tui/src/app/user_verification_requests.rs
++++ b/codex-rs/tui/src/app/user_verification_requests.rs
+@@ -35,6 +35,10 @@
+ }
+ 
+ impl UserVerificationRequests {
++    pub(super) fn is_empty(&self) -> bool {
++        self.pending.is_empty()
++    }
++
+     pub(super) fn note_request(
+         &mut self,
+         request_id: &RequestId,
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -1,4 +1,7 @@
+ //! App-level orchestration tests for the TUI.
++
++#[path = "tests/rotation.rs"]
++mod rotation;
+ 
+ #[path = "tests/daybreak_tests.rs"]
+ mod daybreak_tests;
+--- /dev/null
++++ b/codex-rs/tui/src/app/tests/rotation.rs
+@@ -0,0 +1,100 @@
++use super::*;
++use crate::tui::rotation::FrontendRotationError;
++use crate::tui::rotation::FrontendRotationRequest;
++use pretty_assertions::assert_eq;
++use tokio::sync::oneshot;
++
++async fn ready_app() -> (
++    Box<App>,
++    mpsc::UnboundedReceiver<AppEvent>,
++    mpsc::Sender<ThreadBufferedEvent>,
++    ThreadId,
++) {
++    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
++    let id = ThreadId::new();
++    app.chat_widget
++        .handle_thread_session_quiet(test_thread_session(id, app.config.cwd.to_path_buf()));
++    app.chat_widget
++        .handle_server_notification(turn_started_notification(id, "completed"), None);
++    app.chat_widget.handle_server_notification(
++        turn_completed_notification(id, "completed", TurnStatus::Completed),
++        None,
++    );
++    app.active_thread_id = Some(id);
++    app.primary_thread_id = Some(id);
++    let (active, receiver) = mpsc::channel(4);
++    app.active_thread_rx = Some(receiver);
++    while events.try_recv().is_ok() {}
++    assert!(app.frontend_rotation_ready(&events, id, "completed"));
++    (app, events, active, id)
++}
++
++#[tokio::test]
++async fn frontend_rotation_requires_exact_frontend_identity_and_turn() {
++    let (mut app, events, _active, id) = ready_app().await;
++    assert!(!app.frontend_rotation_ready(&events, ThreadId::new(), "completed"));
++    assert!(!app.frontend_rotation_ready(&events, id, "other"));
++    app.active_thread_id = Some(ThreadId::new());
++    assert!(!app.frontend_rotation_ready(&events, id, "completed"));
++    app.active_thread_id = Some(id);
++    app.reconnect.offline = true;
++    assert!(!app.frontend_rotation_ready(&events, id, "completed"));
++}
++
++#[tokio::test]
++async fn frontend_rotation_refuses_pending_foreground_and_closed_backend() {
++    let (app, mut events, active, id) = ready_app().await;
++    app.app_event_tx.send(AppEvent::OpenDaemonMenu);
++    assert!(!app.frontend_rotation_ready(&events, id, "completed"));
++    assert!(matches!(
++        events.try_recv().unwrap(),
++        AppEvent::OpenDaemonMenu
++    ));
++    assert!(app.frontend_rotation_ready(&events, id, "completed"));
++    drop(active);
++    assert!(!app.frontend_rotation_ready(&events, id, "completed"));
++}
++
++#[tokio::test]
++async fn frontend_rotation_request_rejects_busy_editor_without_changing_input() -> Result<()> {
++    let (mut app, events, _active, id) = ready_app().await;
++    let mut server = start_config_write_test_app_server(&app).await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Paste("human draft".into()))
++        .await?;
++    let (reply, result) = oneshot::channel();
++    app.prepare_frontend_rotation(
++        &mut tui,
++        &events,
++        FrontendRotationRequest::new(id, "completed".into(), reply),
++    );
++    assert_eq!(
++        result.await.unwrap().unwrap_err(),
++        FrontendRotationError::Busy
++    );
++    assert_eq!(app.chat_widget.composer_text_with_pending(), "human draft");
++    Ok(())
++}
++
++#[tokio::test]
++async fn frontend_rotation_request_outside_receiver_owner_is_refused() -> Result<()> {
++    let (mut app, _events, _active, id) = ready_app().await;
++    let mut server = start_config_write_test_app_server(&app).await?;
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    let (reply, result) = oneshot::channel();
++    app.handle_event(
++        &mut tui,
++        &mut server,
++        AppEvent::PrepareFrontendRotation(FrontendRotationRequest::new(
++            id,
++            "completed".into(),
++            reply,
++        )),
++    )
++    .await?;
++    assert_eq!(
++        result.await.unwrap().unwrap_err(),
++        FrontendRotationError::Unavailable
++    );
++    Ok(())
++}

@@ -1,0 +1,1394 @@
+--- a/codex-rs/config/src/constraint.rs
++++ b/codex-rs/config/src/constraint.rs
+@@ -6,6 +6,9 @@
+ 
+ #[derive(Debug, Error, PartialEq, Eq)]
+ pub enum ConstraintError {
++    #[error("session is closed to further settings changes")]
++    SessionClosed,
++
+     #[error(
+         "invalid value for `{field_name}`: `{candidate}` is not in the allowed set {allowed} (set by {requirement_source})"
+     )]
+--- a/codex-rs/core/src/session/activity_admission.rs
++++ b/codex-rs/core/src/session/activity_admission.rs
+@@ -135,6 +135,13 @@
+         !state.closed && state.waiting == 0 && state.generation == Some(self.generation)
+     }
+ 
++    /// Validate another held reservation without sealing this admission. The
++    /// manager must remain available to create the replacement root.
++    pub(crate) fn perform_if_current(&self, action: impl FnOnce() -> bool) -> bool {
++        let state = self.state.lock().expect("activity admission poisoned");
++        !state.closed && state.waiting == 0 && state.generation == Some(self.generation) && action()
++    }
++
+     /// The synchronous action runs under the attempt-registration lock.
+     /// Failed actions leave admission open. Successful actions seal future work.
+     pub(crate) fn seal_if_current(&self, seal: impl FnOnce() -> bool) -> bool {
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -284,6 +284,13 @@
+ }
+ 
+ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
++    if let Err(error) = shutdown_session_runtime_strict(sess).await {
++        warn!("session runtime shutdown was incomplete: {error}");
++    }
++}
++
++pub(super) async fn shutdown_session_runtime_strict(sess: &Arc<Session>) -> Result<(), String> {
++    let mut failures = Vec::new();
+     let startup_prewarm = {
+         let mut state = sess.state.lock().await;
+         // Stop admission and take the current warmup together so resume cannot replace it.
+@@ -293,7 +300,9 @@
+     if let Some(startup_prewarm) = startup_prewarm {
+         startup_prewarm.abort().await;
+     }
+-    let _ = sess.conversation.shutdown().await;
++    if sess.conversation.shutdown().await.is_err() {
++        failures.push("realtime shutdown failed");
++    }
+     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+     let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
+     if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
+@@ -309,6 +318,7 @@
+         .await;
+     if let Err(err) = sess.services.code_mode_service.shutdown().await {
+         warn!("failed to shutdown code mode session: {err}");
++        failures.push("code mode shutdown failed");
+     }
+     sess.stop_mcp_prewarm_worker().await;
+     {
+@@ -321,6 +331,11 @@
+ 
+     crate::hook_runtime::run_session_end_hooks(sess).await;
+     emit_thread_stop_lifecycle(sess).await;
++    if failures.is_empty() {
++        Ok(())
++    } else {
++        Err(failures.join("; "))
++    }
+ }
+ 
+ async fn emit_thread_stop_lifecycle(sess: &Session) {
+@@ -365,6 +380,11 @@
+         sess.send_event_raw(event).await;
+     }
+ 
++    emit_shutdown_complete(sess, sub_id).await;
++    true
++}
++
++pub(super) async fn emit_shutdown_complete(sess: &Session, sub_id: String) {
+     let event = Event {
+         id: sub_id,
+         msg: EventMsg::ShutdownComplete,
+@@ -376,7 +396,6 @@
+     sess.services
+         .rollout_thread_trace
+         .record_ended(codex_rollout_trace::RolloutStatus::Completed);
+-    true
+ }
+ 
+ pub async fn review(
+@@ -647,7 +666,7 @@
+     }
+     // If the submission loop exits because the channel closed without an
+     // explicit shutdown op, still run session teardown.
+-    if !shutdown_received {
++    if !shutdown_received && !rx_sub.native_teardown_owned() {
+         shutdown_session_runtime(&sess).await;
+         if let Some(live_thread) = sess.live_thread()
+             && let Err(err) = live_thread.shutdown().await
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1431,11 +1431,15 @@
+     /// Flush rollout writes and return the final durability-barrier result.
+     #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
+     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
+-        if let Some(live_thread) = self.live_thread() {
++        let result = if let Some(live_thread) = self.live_thread() {
+             live_thread.flush().await.map_err(std::io::Error::other)
+         } else {
+             Ok(())
+-        }
++        };
++        if result.is_err() {
++            self.native_rotation.persistence_failed();
++        }
++        result
+     }
+ 
+     pub(crate) async fn try_ensure_rollout_materialized(
+@@ -1899,6 +1903,11 @@
+         updates: SessionSettingsUpdate,
+         should_commit: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
+     ) -> ConstraintResult<Option<SessionSettingsCommit>> {
++        let _admission = self
++            .activity_admission
++            .enter()
++            .await
++            .ok_or(crate::config::ConstraintError::SessionClosed)?;
+         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
+         let (commit, previous_config, new_config, permission_profile_changed, mcp_inputs_changed) = {
+             let mut state = self.state.lock().await;
+@@ -2080,6 +2089,9 @@
+     }
+ 
+     async fn refresh_runtime_config_inner(&self, next_config: Config, refresh_recording: bool) {
++        let Some(_admission) = self.activity_admission.enter().await else {
++            return;
++        };
+         // Refresh only the user layer from the incoming snapshot. Preserve thread-local
+         // layers such as request/session overrides that were present when this session
+         // was created.
+@@ -2144,6 +2156,9 @@
+     }
+ 
+     pub(crate) async fn refresh_hooks(&self, config: Arc<Config>) {
++        let Some(_admission) = self.activity_admission.enter().await else {
++            return;
++        };
+         let disabled_plugin_ids = self.state.lock().await.active_disabled_plugin_ids.clone();
+         let environments = self.services.turn_environments.snapshot().await;
+         let hooks_config = build_hooks_config(
+@@ -2168,6 +2183,9 @@
+     }
+ 
+     pub(crate) async fn refresh_mcp_config(&self, next_config: Config) {
++        let Some(_admission) = self.activity_admission.enter().await else {
++            return;
++        };
+         let mut state = self.state.lock().await;
+         let mut config = (*state.session_configuration.original_config_do_not_use).clone();
+         config.config_layer_stack = next_config
+@@ -4568,8 +4586,17 @@
+ 
+     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
+     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
+-        let Some(_admission) = self.activity_admission.enter().await else {
+-            return false;
++        // Only the sealed session's owning teardown task receives this scoped
++        // authority. It is not inherited by spawned tasks or other sessions.
++        let _admission = if native_rotation::close::shutdown_write_authorized(&self.native_rotation)
++        {
++            None
++        } else {
++            let Some(permit) = self.activity_admission.enter().await else {
++                self.native_rotation.persistence_failed();
++                return false;
++            };
++            Some(permit)
+         };
+         if let Some(live_thread) = self.live_thread()
+             && let Err(e) = live_thread.append_items(items).await
+--- a/codex-rs/core/src/session/native_rotation.rs
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -14,6 +14,10 @@
+ pub enum NativeRotationError {
+     #[error("native session is busy or its admission changed")]
+     Busy,
++    #[error("native rotation close request is invalid")]
++    InvalidRequest,
++    #[error("native close could not be confirmed: {0}")]
++    CloseFailed(String),
+     #[error("native session has closed or changed owner")]
+     Closed,
+     #[error("native reservation expired")]
+@@ -26,7 +30,7 @@
+     Persistence(String),
+ }
+ 
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub struct NativeRotationReceipt {
+     pub runtime_id: uuid::Uuid,
+     pub thread_id: ThreadId,
+@@ -58,6 +62,16 @@
+ 
+     pub async fn revoked(&self) {
+         self.lease.revoked().await;
++    }
++
++    /// Internal transaction step only. Before exposing this across the app-server
++    /// boundary, the caller must supply a verified durable capsule claim and own
++    /// the foreground commit. A claimed digest alone is not authorization.
++    pub(crate) async fn close_for_rotation(
++        self,
++        request: close::NativeCloseRequest,
++    ) -> Result<close::NativeClosedSession, NativeRotationError> {
++        self.lease.close_for_rotation(request).await
+     }
+ }
+ 
+@@ -110,6 +124,8 @@
+ pub(super) struct PreparedSession {
+     pub(super) receipt: NativeRotationReceipt,
+     pub(super) manager: ActivityReservation,
++    pub(super) manager_owner: Arc<crate::thread_manager::ThreadManagerState>,
++    pub(super) session: Arc<Session>,
+ }
+ 
+ impl PreparedSession {
+@@ -207,9 +223,16 @@
+                 admission_generation: generation,
+             },
+             manager: manager_guard,
++            manager_owner: manager,
++            session: Arc::clone(session),
+         })
+     }
+ }
++
++#[path = "native_rotation_close.rs"]
++pub(crate) mod close;
++#[path = "native_rotation_journal.rs"]
++mod journal;
+ 
+ #[cfg(test)]
+ #[path = "native_rotation_tests.rs"]
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation_close.rs
+@@ -0,0 +1,244 @@
++//! Strict close owned by the native receiver, with no external RPC yet.
++//! Host capsule verification and foreground commit ownership must precede any
++//! future wire exposure. Structural request validation is not that authorization.
++use super::NativeRotationError;
++use super::NativeRotationReceipt;
++use super::NativeRotationState;
++use super::PreparedSession;
++use super::journal::NativeCloseJournal;
++use crate::session::activity_admission::ActivityReservation;
++use crate::session::handlers;
++use crate::session::session::Session;
++use crate::session::session::SessionConfiguration;
++use crate::thread_manager::ThreadManagerState;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::atomic::Ordering;
++use tokio::sync::oneshot;
++use tokio::time::Instant;
++
++tokio::task_local! {
++    // Private to the owner path below. Spawned tasks do not inherit authority.
++    static SHUTDOWN_WRITER: uuid::Uuid;
++}
++
++pub(in crate::session) fn shutdown_write_authorized(state: &NativeRotationState) -> bool {
++    SHUTDOWN_WRITER
++        .try_with(|runtime| *runtime == state.runtime_id)
++        .unwrap_or(false)
++}
++
++pub(crate) struct NativeCloseRequest {
++    pub(crate) operation_id: uuid::Uuid,
++    pub(crate) claim_id: uuid::Uuid,
++    pub(crate) capsule_sha256: String,
++    #[cfg(test)]
++    pub(crate) test_after_seal: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
++}
++
++impl NativeCloseRequest {
++    pub(crate) fn new(
++        operation_id: uuid::Uuid,
++        claim_id: uuid::Uuid,
++        capsule_sha256: String,
++    ) -> Self {
++        Self {
++            operation_id,
++            claim_id,
++            capsule_sha256,
++            #[cfg(test)]
++            test_after_seal: None,
++        }
++    }
++
++    fn validate(&self) -> Result<(), NativeRotationError> {
++        if self.operation_id.is_nil()
++            || self.claim_id.is_nil()
++            || self.capsule_sha256.len() != 64
++            || !self
++                .capsule_sha256
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++        {
++            return Err(NativeRotationError::InvalidRequest);
++        }
++        Ok(())
++    }
++}
++
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
++pub(crate) struct NativeCloseReceipt {
++    pub(crate) operation_id: uuid::Uuid,
++    pub(crate) claim_id: uuid::Uuid,
++    pub(crate) capsule_sha256: String,
++    pub(crate) source: NativeRotationReceipt,
++    pub(crate) journal_directory: PathBuf,
++}
++
++/// The actual live configuration and services survive until replacement creation.
++/// No reload from configuration files or default settings can substitute for them.
++pub(crate) struct NativeClosedSession {
++    pub(crate) receipt: NativeCloseReceipt,
++    pub(crate) configuration: SessionConfiguration,
++    pub(crate) source: Arc<Session>,
++    pub(crate) manager: Arc<ThreadManagerState>,
++}
++
++impl std::fmt::Debug for NativeClosedSession {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter
++            .debug_struct("NativeClosedSession")
++            .field("receipt", &self.receipt)
++            .finish_non_exhaustive()
++    }
++}
++
++pub(in crate::session) struct NativeCloseCommand {
++    pub(in crate::session) request: NativeCloseRequest,
++    pub(in crate::session) reply: oneshot::Sender<Result<NativeClosedSession, NativeRotationError>>,
++}
++
++/// Once sealed, this future belongs to the submission-loop owner and must not be
++/// selected against caller cancellation, lease expiry or ordinary input.
++pub(in crate::session) async fn execute(
++    prepared: PreparedSession,
++    reservation: ActivityReservation,
++    deadline: Instant,
++    request: NativeCloseRequest,
++    reply: &oneshot::Sender<Result<NativeClosedSession, NativeRotationError>>,
++) -> (bool, Result<NativeClosedSession, NativeRotationError>) {
++    let refused = |error| (false, Err(error));
++    if let Err(error) = request.validate() {
++        return refused(error);
++    }
++    if reply.is_closed() {
++        return refused(NativeRotationError::Closed);
++    }
++    if Instant::now() >= deadline {
++        return refused(NativeRotationError::Expired);
++    }
++    if !reservation.is_current() || !prepared.manager.is_current() {
++        return refused(NativeRotationError::Busy);
++    }
++    let PreparedSession {
++        receipt,
++        manager,
++        manager_owner,
++        session,
++    } = prepared;
++    let home = session
++        .state
++        .lock()
++        .await
++        .session_configuration
++        .codex_home
++        .to_path_buf();
++    let journal = match NativeCloseJournal::begin(home, receipt.clone(), &request).await {
++        Ok(journal) => journal,
++        Err(error) => return refused(error),
++    };
++    let configuration = {
++        // Manager registration and the session's live settings are rechecked
++        // under their own locks. Attempt-registration locks establish one seal
++        // point; the manager admission itself is never permanently closed.
++        let mut registered = manager_owner.threads.write().await;
++        let mut state = session.state.lock().await;
++        let eligible = !reply.is_closed()
++            && Instant::now() < deadline
++            && !state.shutting_down
++            && state.last_started_turn_id.as_deref() == Some(receipt.turn_id.as_str())
++            && session.native_rotation.matches(&receipt.turn_id)
++            && registered.get(&receipt.thread_id).is_some_and(|thread| {
++                Arc::ptr_eq(&thread.session, &session) && thread.is_running()
++            });
++        if eligible
++            && manager.perform_if_current(|| {
++                reservation.seal_if_current(|| {
++                    if !manager_owner.fence_native_rotation(receipt.thread_id, receipt.runtime_id) {
++                        return false;
++                    }
++                    state.shutting_down = true;
++                    registered.remove(&receipt.thread_id);
++                    true
++                })
++            })
++        {
++            Some(state.session_configuration.clone())
++        } else {
++            None
++        }
++    };
++    // Neither normal teardown persistence nor replacement creation may run
++    // while a global manager writer is held.
++    drop(manager);
++    drop(reservation);
++    let Some(configuration) = configuration else {
++        let result = journal.record("aborted").await;
++        return refused(result.err().unwrap_or(NativeRotationError::Busy));
++    };
++    let sealed_record = journal.record("sealed").await;
++    #[cfg(test)]
++    if let Some((entered, proceed)) = request.test_after_seal.as_ref() {
++        let ready = proceed.notified();
++        tokio::pin!(ready);
++        ready.as_mut().enable();
++        entered.notify_one();
++        ready.await;
++    }
++    let teardown = SHUTDOWN_WRITER
++        .scope(session.native_rotation.runtime_id, async {
++            handlers::shutdown_session_runtime_strict(&session).await
++        })
++        .await;
++    // Always attempt the writer close even if runtime teardown reported failure.
++    let persistence = match session.live_thread_for_persistence("close native rotation") {
++        Ok(live) => live.shutdown().await.map_err(|error| error.to_string()),
++        Err(error) => Err(error.to_string()),
++    };
++    let failed = sealed_record.is_err()
++        || teardown.is_err()
++        || persistence.is_err()
++        || session
++            .native_rotation
++            .persistence_failed
++            .load(Ordering::Acquire);
++    if failed {
++        let _ = journal.record("failed").await;
++        return (true, Err(NativeRotationError::CloseFailed(
++            "runtime, transcript or operation journal did not confirm close; reconcile the operation".into(),
++        )));
++    }
++    if let Err(error) = journal.record("closed").await {
++        return (true, Err(error));
++    }
++    // The old writer has closed and the immutable close record is durable.
++    // A later deliberate resume may create a distinct runtime for this ID.
++    if !manager_owner.finish_native_rotation_fence(receipt.thread_id, receipt.runtime_id) {
++        return (
++            true,
++            Err(NativeRotationError::CloseFailed(
++                "source runtime ownership fence changed during close".into(),
++            )),
++        );
++    }
++    let closed = NativeClosedSession {
++        receipt: NativeCloseReceipt {
++            operation_id: request.operation_id,
++            claim_id: request.claim_id,
++            capsule_sha256: request.capsule_sha256,
++            source: receipt,
++            journal_directory: journal.directory().to_path_buf(),
++        },
++        configuration,
++        source: Arc::clone(&session),
++        manager: manager_owner,
++    };
++    // Unlike ordinary shutdown, this notification follows both a successful
++    // writer close and its durable operation receipt.
++    handlers::emit_shutdown_complete(&session, request.operation_id.to_string()).await;
++    (true, Ok(closed))
++}
++
++#[cfg(test)]
++#[path = "native_rotation_close_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation_close_tests.rs
+@@ -0,0 +1,43 @@
++use super::SHUTDOWN_WRITER;
++use super::shutdown_write_authorized;
++use crate::session::native_rotation::NativeRotationState;
++use std::sync::Arc;
++
++#[tokio::test]
++async fn native_close_write_authority_is_scoped_to_one_runtime_and_task() {
++    let first = Arc::new(NativeRotationState::default());
++    let second = NativeRotationState::default();
++    assert!(!shutdown_write_authorized(&first));
++    SHUTDOWN_WRITER
++        .scope(first.runtime_id, async {
++            assert!(shutdown_write_authorized(&first));
++            assert!(!shutdown_write_authorized(&second));
++            let spawned = Arc::clone(&first);
++            assert!(
++                !tokio::spawn(async move { shutdown_write_authorized(&spawned) })
++                    .await
++                    .unwrap()
++            );
++        })
++        .await;
++    assert!(!shutdown_write_authorized(&first));
++}
++
++#[tokio::test]
++async fn native_close_teardown_can_persist_after_seal_but_normal_callers_cannot() {
++    let (session, _turn) = crate::session::tests::make_session_and_context().await;
++    let reservation = session
++        .activity_admission
++        .try_reserve(session.activity_admission.generation().unwrap())
++        .unwrap();
++    assert!(reservation.seal_if_current(|| true));
++    drop(reservation);
++    assert!(
++        SHUTDOWN_WRITER
++            .scope(session.native_rotation.runtime_id, async {
++                session.persist_rollout_items(&[]).await
++            })
++            .await
++    );
++    assert!(!session.persist_rollout_items(&[]).await);
++}
+--- /dev/null
++++ b/codex-rs/core/src/session/native_rotation_journal.rs
+@@ -0,0 +1,130 @@
++//! Immutable operation records. An incomplete or existing operation is never replayed.
++use super::NativeRotationError;
++use super::NativeRotationReceipt;
++use super::close::NativeCloseRequest;
++use serde::Serialize;
++use std::fs;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++
++#[derive(Clone, Serialize)]
++struct Record {
++    v: u8,
++    state: String,
++    operation_id: uuid::Uuid,
++    claim_id: uuid::Uuid,
++    capsule_sha256: String,
++    source: NativeRotationReceipt,
++}
++
++pub(super) struct NativeCloseJournal {
++    directory: PathBuf,
++    record: Record,
++}
++
++impl NativeCloseJournal {
++    pub(super) async fn begin(
++        home: PathBuf,
++        source: NativeRotationReceipt,
++        request: &NativeCloseRequest,
++    ) -> Result<Self, NativeRotationError> {
++        let record = Record {
++            v: 1,
++            state: "intent".into(),
++            operation_id: request.operation_id,
++            claim_id: request.claim_id,
++            capsule_sha256: request.capsule_sha256.clone(),
++            source,
++        };
++        tokio::task::spawn_blocking(move || {
++            let root = home.join("relay-context-rotation");
++            create_private_root(&root)?;
++            sync_directory(&home)?;
++            let directory = root.join(record.operation_id.to_string());
++            // Existing intent, partial write or old receipt all require explicit
++            // reconciliation. A second caller may not reuse this operation ID.
++            create_private_directory(&directory)?;
++            sync_directory(&root)?;
++            write_record(&directory, &record)?;
++            Ok::<_, std::io::Error>(Self { directory, record })
++        })
++        .await
++        .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++        .map_err(|error| NativeRotationError::Persistence(error.to_string()))
++    }
++
++    pub(super) fn directory(&self) -> &Path {
++        &self.directory
++    }
++
++    pub(super) async fn record(&self, state: &'static str) -> Result<(), NativeRotationError> {
++        assert!(matches!(state, "aborted" | "sealed" | "closed" | "failed"));
++        let directory = self.directory.clone();
++        let mut record = self.record.clone();
++        record.state = state.into();
++        tokio::task::spawn_blocking(move || write_record(&directory, &record))
++            .await
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))?
++            .map_err(|error| NativeRotationError::Persistence(error.to_string()))
++    }
++}
++
++#[cfg(unix)]
++fn create_private_directory(path: &Path) -> std::io::Result<()> {
++    use std::os::unix::fs::DirBuilderExt;
++    fs::DirBuilder::new().mode(0o700).create(path)
++}
++
++#[cfg(not(unix))]
++fn create_private_directory(_path: &Path) -> std::io::Result<()> {
++    Err(std::io::Error::new(
++        std::io::ErrorKind::Unsupported,
++        "durable native rotation is currently supported on Unix hosts",
++    ))
++}
++
++fn create_private_root(path: &Path) -> std::io::Result<()> {
++    match create_private_directory(path) {
++        Ok(()) => Ok(()),
++        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
++            let metadata = fs::symlink_metadata(path)?;
++            if !metadata.is_dir() || metadata.file_type().is_symlink() {
++                return Err(std::io::Error::other(
++                    "rotation journal root is not a private directory",
++                ));
++            }
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::PermissionsExt;
++                if metadata.permissions().mode() & 0o077 != 0 {
++                    return Err(std::io::Error::other(
++                        "rotation journal directory is not private",
++                    ));
++                }
++            }
++            Ok(())
++        }
++        Err(error) => Err(error),
++    }
++}
++
++fn sync_directory(path: &Path) -> std::io::Result<()> {
++    fs::File::open(path)?.sync_all()
++}
++
++fn write_record(directory: &Path, record: &Record) -> std::io::Result<()> {
++    let mut options = fs::OpenOptions::new();
++    options.write(true).create_new(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    let mut file = options.open(directory.join(format!("{}.json", record.state)))?;
++    let mut data = serde_json::to_vec(record).map_err(std::io::Error::other)?;
++    data.push(b'\n');
++    file.write_all(&data)?;
++    file.sync_all()?;
++    sync_directory(directory)
++}
+--- a/codex-rs/core/src/session/rotation_dispatch.rs
++++ b/codex-rs/core/src/session/rotation_dispatch.rs
+@@ -6,6 +6,9 @@
+ pub(crate) use super::native_rotation::NativeRotationError as DispatchError;
+ use super::native_rotation::NativeRotationReceipt;
+ use super::native_rotation::PreparedSession;
++use super::native_rotation::close::NativeCloseCommand;
++use super::native_rotation::close::NativeCloseRequest;
++use super::native_rotation::close::NativeClosedSession;
+ use super::session::Session;
+ use async_channel::Receiver;
+ use async_channel::RecvError;
+@@ -22,6 +25,7 @@
+ /// A future commit command must be checked by the receiver owner atomically.
+ pub(crate) struct DispatchLease {
+     _release: oneshot::Sender<()>,
++    close: oneshot::Sender<NativeCloseCommand>,
+     revoked: CancellationToken,
+     pub(super) receipt: Option<NativeRotationReceipt>,
+ }
+@@ -29,6 +33,24 @@
+ impl DispatchLease {
+     pub(crate) async fn revoked(&self) {
+         self.revoked.cancelled().await;
++    }
++
++    pub(super) async fn close_for_rotation(
++        self,
++        request: NativeCloseRequest,
++    ) -> Result<NativeClosedSession, DispatchError> {
++        let Self {
++            _release, close, ..
++        } = self;
++        let (reply, result) = oneshot::channel();
++        close
++            .send(NativeCloseCommand { request, reply })
++            .map_err(|_| DispatchError::Closed)?;
++        // Keep release alive while awaiting the owner. A lost caller cancels
++        // before sealing; the receiver owns completion after sealing.
++        let result = result.await.map_err(|_| DispatchError::Closed)?;
++        drop(_release);
++        result
+     }
+ }
+ 
+@@ -85,6 +107,7 @@
+     receiver: Receiver<Submission>,
+     requests: Receiver<RotationRequest>,
+     admission: ActivityAdmission,
++    native_teardown_owned: bool,
+ }
+ 
+ impl SubmissionDispatch {
+@@ -99,8 +122,13 @@
+                 receiver,
+                 requests: rx_requests,
+                 admission,
++                native_teardown_owned: false,
+             },
+         )
++    }
++
++    pub(super) fn native_teardown_owned(&self) -> bool {
++        self.native_teardown_owned
+     }
+ 
+     pub(super) async fn recv(&mut self) -> Result<Submission, RecvError> {
+@@ -175,29 +203,64 @@
+             return None;
+         }
+         let (release, released) = oneshot::channel();
++        let (close, close_request) = oneshot::channel();
+         let revoked = CancellationToken::new();
+         // Revocation is observable even if the dispatch task is cancelled.
+         let _revoke_on_drop = revoked.clone().drop_guard();
+         let lease = DispatchLease {
+             _release: release,
++            close,
+             revoked,
+             receipt: native.as_ref().map(|prepared| prepared.receipt.clone()),
+         };
+         if request.reply.send(Ok(lease)).is_err() {
+             return None;
+         }
+-        tokio::select! {
++        enum End {
++            Released,
++            Submission(Result<Submission, RecvError>),
++            Close(Result<NativeCloseCommand, oneshot::error::RecvError>),
++        }
++        let end = tokio::select! {
+             biased;
+-            _ = reservation.invalidated() => None,
++            _ = reservation.invalidated() => End::Released,
+             _ = async { match &native {
+                 Some(prepared) => prepared.manager.invalidated().await,
+                 None => std::future::pending::<()>().await,
+-            }} => None,
+-            _ = tokio::time::sleep_until(request.deadline) => None,
+-            _ = released => None,
+-            // Detect final sender drop without holding an extra sender alive.
+-            // Preserve any received submission if a raw sender exists in a fixture.
+-            submission = self.receiver.recv() => Some(submission),
++            }} => End::Released,
++            _ = tokio::time::sleep_until(request.deadline) => End::Released,
++            _ = released => End::Released,
++            submission = self.receiver.recv() => End::Submission(submission),
++            command = close_request => End::Close(command),
++        };
++        match end {
++            End::Released | End::Close(Err(_)) => None,
++            End::Submission(submission) => Some(submission),
++            End::Close(Ok(command)) => {
++                let Some(prepared) = native else {
++                    let _ = command.reply.send(Err(DispatchError::Unsupported));
++                    return None;
++                };
++                let (sealed, result) = super::native_rotation::close::execute(
++                    prepared,
++                    reservation,
++                    request.deadline,
++                    command.request,
++                    &command.reply,
++                )
++                .await;
++                let _ = command.reply.send(result);
++                if sealed {
++                    // The owner already attempted teardown exactly once. No
++                    // ordinary shutdown may replay it after a partial failure.
++                    self.native_teardown_owned = true;
++                    self.receiver.close();
++                    self.requests.close();
++                    Some(Err(RecvError))
++                } else {
++                    None
++                }
++            }
+         }
+     }
+ }
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -402,6 +402,7 @@
+ /// function to require an `Arc<&Self>`.
+ pub(crate) struct ThreadManagerState {
+     pub(crate) rotation_admission: crate::session::ActivityAdmission,
++    native_rotation_fences: std::sync::Mutex<HashMap<ThreadId, uuid::Uuid>>,
+     // Eviction updates this registry and residency together, locking the registry first.
+     pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+     shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
+@@ -567,6 +568,7 @@
+         Self {
+             state: Arc::new(ThreadManagerState {
+                 rotation_admission: crate::session::ActivityAdmission::default(),
++                native_rotation_fences: std::sync::Mutex::new(HashMap::new()),
+                 threads: Arc::new(RwLock::new(HashMap::new())),
+                 shared_thread_instructions: Default::default(),
+                 thread_created_tx,
+@@ -740,6 +742,7 @@
+         Self {
+             state: Arc::new(ThreadManagerState {
+                 rotation_admission: crate::session::ActivityAdmission::default(),
++                native_rotation_fences: std::sync::Mutex::new(HashMap::new()),
+                 threads: Arc::new(RwLock::new(HashMap::new())),
+                 shared_thread_instructions: Default::default(),
+                 thread_created_tx,
+@@ -2139,6 +2142,32 @@
+         if reserved_thread_id.is_some() && matches!(&initial_history, InitialHistory::Resumed(_)) {
+             return Err(CodexErr::InvalidRequest(
+                 "reserved thread ID cannot be used when resuming a thread".to_string(),
++            ));
++        }
++        // Reserve the same ID source that Session::spawn would use, then fence
++        // before either the live-resume fast path or any writer construction.
++        let rotation_target = match &initial_history {
++            InitialHistory::Resumed(resumed) => resumed.conversation_id,
++            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
++                *reserved_thread_id.get_or_insert_with(|| match &agent_control {
++                    AgentControlInit::Local(local) => local.runtime.generate_thread_id(),
++                    AgentControlInit::Provided { runtime, .. } => runtime.generate_thread_id(),
++                })
++            }
++        };
++        let rotation_parent = parent_thread_id
++            .or_else(|| initial_history.get_resumed_parent_thread_id())
++            .or(match &session_source {
++                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                    parent_thread_id, ..
++                }) => Some(*parent_thread_id),
++                _ => None,
++            });
++        if self.native_rotation_is_fenced(rotation_target)
++            || rotation_parent.is_some_and(|parent| self.native_rotation_is_fenced(parent))
++        {
++            return Err(CodexErr::InvalidRequest(
++                "thread writer is fenced by an unfinished native rotation; reconcile that operation".into(),
+             ));
+         }
+         if let InitialHistory::Resumed(resumed) = &initial_history {
+--- a/codex-rs/core/src/thread_manager/native_rotation_tests.rs
++++ b/codex-rs/core/src/thread_manager/native_rotation_tests.rs
+@@ -298,3 +298,463 @@
+     );
+     fixture.close().await;
+ }
++
++fn native_close_request() -> crate::session::native_rotation::close::NativeCloseRequest {
++    crate::session::native_rotation::close::NativeCloseRequest::new(
++        uuid::Uuid::new_v4(),
++        uuid::Uuid::new_v4(),
++        "a".repeat(64),
++    )
++}
++
++fn native_close_directory(fixture: &Fixture, operation: uuid::Uuid) -> std::path::PathBuf {
++    fixture
++        ._home
++        .path()
++        .join("codex-home")
++        .join("relay-context-rotation")
++        .join(operation.to_string())
++}
++
++async fn native_close_fixture_finished(fixture: Fixture) {
++    tokio::time::timeout(
++        std::time::Duration::from_secs(5),
++        fixture.root.thread.wait_until_terminated(),
++    )
++    .await
++    .unwrap();
++    assert!(
++        fixture
++            .server
++            .received_requests()
++            .await
++            .unwrap()
++            .iter()
++            .all(|request| request.url.path().ends_with("/models"))
++    );
++}
++
++#[tokio::test]
++async fn native_close_has_a_durable_receipt_and_removes_only_its_source() {
++    let fixture = Fixture::completed().await;
++    let before = fixture.root.thread.config_snapshot().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let request = native_close_request();
++    let operation = request.operation_id;
++    let closed = reservation.close_for_rotation(request).await.unwrap();
++    assert_eq!(closed.receipt.operation_id, operation);
++    assert_eq!(closed.receipt.source.thread_id, fixture.root.thread_id);
++    assert_eq!(closed.receipt.source.turn_id, fixture.turn);
++    let after = closed.source.thread_config_snapshot().await;
++    assert_eq!(before.model, after.model);
++    assert_eq!(before.approval_policy, after.approval_policy);
++    assert_eq!(before.permission_profile, after.permission_profile);
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_err()
++    );
++    assert!(
++        fixture
++            .root
++            .thread
++            .session
++            .live_thread()
++            .unwrap()
++            .flush()
++            .await
++            .is_err()
++    );
++    let saved: serde_json::Value = serde_json::from_slice(
++        &std::fs::read(closed.receipt.journal_directory.join("closed.json")).unwrap(),
++    )
++    .unwrap();
++    assert_eq!(saved["state"], "closed");
++    assert_eq!(saved["source"]["turn_id"], fixture.turn);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        let mode = std::fs::metadata(closed.receipt.journal_directory.join("closed.json"))
++            .unwrap()
++            .permissions()
++            .mode();
++        assert_eq!(mode & 0o777, 0o600);
++    }
++    drop(closed);
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_close_rejects_an_invalid_capsule_binding_before_any_close() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request = native_close_request();
++    request.capsule_sha256 = "unverified".into();
++    let operation = request.operation_id;
++    assert_eq!(
++        reservation.close_for_rotation(request).await.err(),
++        Some(NativeRotationError::InvalidRequest)
++    );
++    assert!(!native_close_directory(&fixture, operation).exists());
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_ok()
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_close_journal_failure_leaves_the_source_open() {
++    let fixture = Fixture::completed().await;
++    let root = fixture
++        ._home
++        .path()
++        .join("codex-home")
++        .join("relay-context-rotation");
++    std::fs::write(root, "occupied").unwrap();
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    assert!(matches!(
++        reservation.close_for_rotation(native_close_request()).await,
++        Err(NativeRotationError::Persistence(_))
++    ));
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_ok()
++    );
++    fixture.root.thread.flush_rollout().await.unwrap();
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_close_does_not_replay_an_existing_operation() {
++    let fixture = Fixture::completed().await;
++    let request = native_close_request();
++    let directory = native_close_directory(&fixture, request.operation_id);
++    std::fs::create_dir_all(&directory).unwrap();
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::set_permissions(
++            directory.parent().unwrap(),
++            std::fs::Permissions::from_mode(0o700),
++        )
++        .unwrap();
++    }
++    std::fs::write(directory.join("intent.json"), "prior uncertain intent").unwrap();
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    assert!(matches!(
++        reservation.close_for_rotation(request).await,
++        Err(NativeRotationError::Persistence(_))
++    ));
++    assert_eq!(
++        std::fs::read_to_string(directory.join("intent.json")).unwrap(),
++        "prior uncertain intent"
++    );
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_ok()
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_close_writer_failure_never_produces_a_closed_receipt() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let request = native_close_request();
++    let directory = native_close_directory(&fixture, request.operation_id);
++    // Inject a writer failure after preparation without changing the reservation.
++    fixture
++        .root
++        .thread
++        .session
++        .live_thread()
++        .unwrap()
++        .shutdown()
++        .await
++        .unwrap();
++    assert!(matches!(
++        reservation.close_for_rotation(request).await,
++        Err(NativeRotationError::CloseFailed(_))
++    ));
++    assert!(directory.join("sealed.json").is_file());
++    assert!(directory.join("failed.json").is_file());
++    assert!(
++        fixture
++            .manager
++            .state
++            .native_rotation_is_fenced(fixture.root.thread_id)
++    );
++    assert!(!directory.join("closed.json").exists());
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_close_owner_finishes_after_an_accepted_caller_disconnects() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request = native_close_request();
++    let directory = native_close_directory(&fixture, request.operation_id);
++    let entered = Arc::new(Notify::new());
++    let proceed = Arc::new(Notify::new());
++    request.test_after_seal = Some((Arc::clone(&entered), Arc::clone(&proceed)));
++    let accepted = entered.notified();
++    tokio::pin!(accepted);
++    accepted.as_mut().enable();
++    let caller = tokio::spawn(reservation.close_for_rotation(request));
++    accepted.await;
++    caller.abort();
++    assert!(caller.await.unwrap_err().is_cancelled());
++    proceed.notify_one();
++    tokio::time::timeout(
++        std::time::Duration::from_secs(5),
++        fixture.root.thread.wait_until_terminated(),
++    )
++    .await
++    .unwrap();
++    assert!(directory.join("closed.json").is_file());
++    assert!(!directory.join("failed.json").exists());
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_close_refuses_a_reservation_invalidated_by_input() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    fixture.root.thread.submit(Op::Interrupt).await.unwrap();
++    reservation.revoked().await;
++    assert!(
++        reservation
++            .close_for_rotation(native_close_request())
++            .await
++            .is_err()
++    );
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_ok()
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_close_settings_changes_revoke_preparation_before_mutation() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let session = Arc::clone(&fixture.root.thread.session);
++    let updated =
++        session.set_app_server_client_info(Some("rotation-test-client".into()), None, false);
++    tokio::pin!(updated);
++    assert!(matches!(
++        futures::poll!(&mut updated),
++        std::task::Poll::Pending
++    ));
++    reservation.revoked().await;
++    updated.await.unwrap();
++    assert!(
++        reservation
++            .close_for_rotation(native_close_request())
++            .await
++            .is_err()
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_close_fences_source_resume_and_reserved_ids_while_other_roots_remain_available() {
++    let fixture = Fixture::completed().await;
++    let source_id = fixture.root.thread_id;
++    let config = (*fixture.root.thread.session.get_config().await).clone();
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request = native_close_request();
++    let entered = Arc::new(Notify::new());
++    let proceed = Arc::new(Notify::new());
++    request.test_after_seal = Some((Arc::clone(&entered), Arc::clone(&proceed)));
++    let accepted = entered.notified();
++    tokio::pin!(accepted);
++    accepted.as_mut().enable();
++    let close = tokio::spawn(reservation.close_for_rotation(request));
++    accepted.await;
++    assert!(fixture.manager.state.native_rotation_is_fenced(source_id));
++    fixture
++        .root
++        .thread
++        .session
++        .live_thread()
++        .unwrap()
++        .flush()
++        .await
++        .unwrap();
++
++    let resume = StartThreadOptions {
++        initial_history: super::InitialHistory::Resumed(super::ResumedHistory {
++            conversation_id: source_id,
++            history: Arc::new(Vec::new()),
++            rollout_path: fixture.root.thread.rollout_path(),
++        }),
++        environments: Some(Vec::new()),
++        ..StartThreadOptions::new(config.clone())
++    };
++    let error = tokio::time::timeout(
++        std::time::Duration::from_secs(5),
++        fixture.manager.start_thread(resume),
++    )
++    .await
++    .unwrap()
++    .err()
++    .expect("resume must be fenced");
++    assert!(error.to_string().contains("native rotation"), "{error}");
++    let reserved = StartThreadOptions {
++        reserved_thread_id: Some(source_id),
++        environments: Some(Vec::new()),
++        ..StartThreadOptions::new(config.clone())
++    };
++    let error = fixture
++        .manager
++        .start_thread(reserved)
++        .await
++        .err()
++        .expect("reserved source ID must be fenced");
++    assert!(error.to_string().contains("native rotation"), "{error}");
++    let unrelated = tokio::time::timeout(
++        std::time::Duration::from_secs(5),
++        fixture.manager.start_thread(StartThreadOptions {
++            environments: Some(Vec::new()),
++            ..StartThreadOptions::new(config)
++        }),
++    )
++    .await
++    .unwrap()
++    .unwrap();
++    assert_ne!(unrelated.thread_id, source_id);
++    unrelated.thread.shutdown_and_wait().await.unwrap();
++    fixture
++        .root
++        .thread
++        .session
++        .live_thread()
++        .unwrap()
++        .flush()
++        .await
++        .unwrap();
++    proceed.notify_one();
++    let closed = close.await.unwrap().unwrap();
++    assert!(!fixture.manager.state.native_rotation_is_fenced(source_id));
++    drop(closed);
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_close_fences_a_child_with_a_parent_captured_before_commit() {
++    let fixture = Fixture::completed().await;
++    let config = (*fixture.root.thread.session.get_config().await).clone();
++    let parent = super::InternalSessionParent {
++        thread_id: fixture.root.thread_id,
++        auth_manager: Arc::clone(&fixture.root.thread.session.services.auth_manager),
++        agent_control: super::AgentControlInit::Provided {
++            control: Arc::clone(&fixture.root.thread.session.services.agent_control),
++            runtime: fixture
++                .root
++                .thread
++                .session
++                .services
++                .local_agent_runtime
++                .clone(),
++        },
++        originator: fixture.root.thread.config_snapshot().await.originator,
++        inherited_instructions: None,
++    };
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request = native_close_request();
++    let entered = Arc::new(Notify::new());
++    let proceed = Arc::new(Notify::new());
++    request.test_after_seal = Some((Arc::clone(&entered), Arc::clone(&proceed)));
++    let accepted = entered.notified();
++    tokio::pin!(accepted);
++    accepted.as_mut().enable();
++    let close = tokio::spawn(reservation.close_for_rotation(request));
++    accepted.await;
++    let child = StartThreadOptions {
++        internal_parent: Some(parent),
++        session_source: Some(super::SessionSource::Internal(
++            super::InternalSessionSource::Guardian,
++        )),
++        environments: Some(Vec::new()),
++        ..StartThreadOptions::new(config)
++    };
++    let error = tokio::time::timeout(
++        std::time::Duration::from_secs(5),
++        fixture.manager.start_thread(child),
++    )
++    .await
++    .unwrap()
++    .err()
++    .expect("captured parent must be fenced");
++    assert!(error.to_string().contains("native rotation"), "{error}");
++    proceed.notify_one();
++    drop(close.await.unwrap().unwrap());
++    native_close_fixture_finished(fixture).await;
++}
+--- a/codex-rs/core/src/thread_manager/rotation_admission.rs
++++ b/codex-rs/core/src/thread_manager/rotation_admission.rs
+@@ -13,6 +13,49 @@
+ }
+ 
+ impl ThreadManagerState {
++    pub(crate) fn native_rotation_is_fenced(&self, thread_id: codex_protocol::ThreadId) -> bool {
++        self.native_rotation_fences
++            .lock()
++            .expect("native rotation fences poisoned")
++            .contains_key(&thread_id)
++    }
++
++    /// Caller owns the manager reservation and seals the session in the same action.
++    pub(crate) fn fence_native_rotation(
++        &self,
++        thread_id: codex_protocol::ThreadId,
++        runtime_id: uuid::Uuid,
++    ) -> bool {
++        let mut fences = self
++            .native_rotation_fences
++            .lock()
++            .expect("native rotation fences poisoned");
++        if let std::collections::hash_map::Entry::Vacant(entry) = fences.entry(thread_id) {
++            entry.insert(runtime_id);
++            true
++        } else {
++            false
++        }
++    }
++
++    /// Only a confirmed closed writer may release its exact old runtime fence.
++    pub(crate) fn finish_native_rotation_fence(
++        &self,
++        thread_id: codex_protocol::ThreadId,
++        runtime_id: uuid::Uuid,
++    ) -> bool {
++        let mut fences = self
++            .native_rotation_fences
++            .lock()
++            .expect("native rotation fences poisoned");
++        if fences.get(&thread_id) == Some(&runtime_id) {
++            fences.remove(&thread_id);
++            true
++        } else {
++            false
++        }
++    }
++
+     pub(crate) fn local_rotation_admission(&self) -> Option<ActivityAdmission> {
+         self.agent_control_factory
+             .is_none()

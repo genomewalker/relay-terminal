@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 2,
+  "id": "relay.agent-activity",
+  "name": "Agent activity",
+  "version": "0.1.0",
+  "repository": "genomewalker/relay-plugin-agent-activity",
+  "permissions": [
+    {
+      "kind": "agentMetadata",
+      "reason": "Inspect the selected pane’s existing agent, subagent and recent activity events."
+    },
+    {
+      "kind": "agentContent",
+      "reason": "Inspect the selected pane’s existing agent, subagent and recent activity events."
+    }
+  ],
+  "contributions": [
+    {
+      "id": "main",
+      "kind": "tool",
+      "title": "Agent activity",
+      "text": "Inspect the selected pane’s existing agent, subagent and recent activity events.",
+      "operation": "agentActivity"
+    }
+  ]
+}

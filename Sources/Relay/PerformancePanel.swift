@@ -2,6 +2,9 @@ import Darwin
 import SwiftUI
 
 struct RelayLivePerformanceSnapshot: Equatable, Sendable {
+    var wakeupsPerSecond = 0.0
+    var idleWakeupsPerSecond = 0.0
+    var wakeupsAvailable = false
     var cpuPercent = 0.0
     var memoryBytes: UInt64 = 0
     var outputBytesPerSecond = 0.0
@@ -24,10 +27,16 @@ struct RelayLivePerformanceSnapshot: Equatable, Sendable {
     var activeHost = "This Mac"
     var activeSession = "Local"
     var activeConnectionState = "Connected"
+    var supervisorWarningCount = 0
+    var supervisorHighestStage = RelaySupervisorStage.observe
+    var supervisorActionPaneID: UUID?
 }
 
 private struct RelayProcessUsageSample {
     let cpuSeconds: Double
+    let interruptWakeups: UInt64
+    let idleWakeups: UInt64
+    let wakeupsAvailable: Bool
     let residentBytes: UInt64
 }
 
@@ -47,8 +56,18 @@ private enum RelayProcessUsage {
                 task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
             }
         }
+        var power = task_power_info_data_t()
+        var powerCount = mach_msg_type_number_t(MemoryLayout<task_power_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let powerResult = withUnsafeMutablePointer(to: &power) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(powerCount)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_POWER_INFO), $0, &powerCount)
+            }
+        }
         return RelayProcessUsageSample(
             cpuSeconds: user + system,
+            interruptWakeups: power.task_interrupt_wakeups,
+            idleWakeups: power.task_platform_idle_wakeups,
+            wakeupsAvailable: powerResult == KERN_SUCCESS,
             residentBytes: result == KERN_SUCCESS ? info.phys_footprint : 0
         )
     }
@@ -59,6 +78,11 @@ private enum RelayProcessUsage {
 @MainActor
 final class RelayPerformancePanelMonitor: ObservableObject {
     @Published private(set) var current = RelayLivePerformanceSnapshot()
+    @Published private(set) var energyPeaks: [RelayEnergyPeak] = []
+    @Published private(set) var recentEvents: [RelayDiagnosticEvent] = []
+    @Published private(set) var peakCPU = 0.0
+    @Published private(set) var activity = "Waiting for a sample"
+    private var lastPeakDate = Date.distantPast
     @Published private(set) var cpuHistory: [Double] = []
     @Published private(set) var throughputHistory: [Double] = []
 
@@ -96,7 +120,9 @@ final class RelayPerformancePanelMonitor: ObservableObject {
         guard let workspace else { return }
         let counters = RelayPerformance.shared.snapshot()
         let process = RelayProcessUsage.sample()
-        let diagnostics = RelayDiagnostics.shared.snapshot().health.values
+        let diagnosticSnapshot = RelayDiagnostics.shared.snapshot()
+        let diagnostics = diagnosticSnapshot.health.values
+        recentEvents = Array(diagnosticSnapshot.events.suffix(8).reversed())
         let remotePanes = workspace.panes.values.filter {
             $0.profile.kind == .ssh && $0.profile.backend == .relay
         }
@@ -105,6 +131,11 @@ final class RelayPerformancePanelMonitor: ObservableObject {
         if let previousCounters, let previousProcess {
             let elapsedNanoseconds = counters.capturedAtNanoseconds &- previousCounters.capturedAtNanoseconds
             let elapsed = max(0.001, Double(elapsedNanoseconds) / 1_000_000_000)
+            next.wakeupsAvailable = process.wakeupsAvailable && previousProcess.wakeupsAvailable
+            if next.wakeupsAvailable {
+                next.wakeupsPerSecond = Double(process.interruptWakeups &- previousProcess.interruptWakeups) / elapsed
+                next.idleWakeupsPerSecond = Double(process.idleWakeups &- previousProcess.idleWakeups) / elapsed
+            }
             next.cpuPercent = max(0, (process.cpuSeconds - previousProcess.cpuSeconds) / elapsed * 100)
             next.outputBytesPerSecond = Double(counters.terminalOutputBytes &- previousCounters.terminalOutputBytes) / elapsed
             next.inputBytesPerSecond = Double(counters.terminalInputBytes &- previousCounters.terminalInputBytes) / elapsed
@@ -150,9 +181,30 @@ final class RelayPerformancePanelMonitor: ObservableObject {
             next.activeSession = pane.profile.kind == .ssh
                 ? String(pane.id.uuidString.lowercased().prefix(8))
                 : "Local"
-            next.activeConnectionState = pane.connectionState.label
+            next.activeConnectionState = pane.connectionStatusLabel
         }
+        let recommendations = workspace.supervisorRecommendations.values
+        next.supervisorWarningCount = recommendations.count { $0.stage > .observe }
+        next.supervisorHighestStage = recommendations.map(\.stage).max() ?? .observe
+        next.supervisorActionPaneID = recommendations
+            .filter { $0.stage.changesRuntimeState }
+            .max { $0.stage < $1.stage }?.identity.paneID
 
+        var observed: [String] = []
+        if next.outputBytesPerSecond > 0 { observed.append("Receiving terminal output") }
+        if next.inputBytesPerSecond > 0 { observed.append("Sending terminal input") }
+        if next.recoveringPaneCount > 0 { observed.append("Reconnecting sessions") }
+        if let event = recentEvents.first, Date().timeIntervalSince(event.timestamp) < 2 {
+            observed.append(event.category + " · " + event.name)
+        }
+        activity = observed.isEmpty ? "No terminal traffic or recent diagnostic event" : observed.joined(separator: " · ")
+        peakCPU = max(peakCPU, next.cpuPercent)
+        if next.cpuPercent >= 20, Date().timeIntervalSince(lastPeakDate) >= 5 {
+            lastPeakDate = Date()
+            energyPeaks.insert(RelayEnergyPeak(date: lastPeakDate, cpu: next.cpuPercent,
+                wakeups: next.wakeupsPerSecond, activity: activity), at: 0)
+            if energyPeaks.count > 60 { energyPeaks.removeLast() }
+        }
         previousCounters = counters
         previousProcess = process
         current = next
@@ -166,85 +218,205 @@ final class RelayPerformancePanelMonitor: ObservableObject {
     }
 }
 
+struct RelayEnergyPeak: Identifiable {
+    let id = UUID()
+    let date: Date
+    let cpu: Double
+    let wakeups: Double
+    let activity: String
+}
+
 struct RelayPerformancePanel: View {
     let close: () -> Void
     @StateObject private var monitor: RelayPerformancePanelMonitor
+    @ObservedObject private var workspace: WorkspaceModel
     @State private var settledOffset: CGSize = .zero
     @State private var collapsed = false
+    @State private var reviewReceipt: RelaySupervisorActionReceipt?
+    @State private var section = "Performance"
+    @StateObject private var activityPresentation = PluginToolPresentation()
+    @StateObject private var activityChrome = WorkspaceChrome()
 
     init(workspace: WorkspaceModel, close: @escaping () -> Void) {
         self.close = close
         _monitor = StateObject(wrappedValue: RelayPerformancePanelMonitor(workspace: workspace))
+        _workspace = ObservedObject(wrappedValue: workspace)
     }
 
     var body: some View {
         SmoothFloatingPanelDrag(settledOffset: $settledOffset, headerHeight: 42) {
-            VStack(spacing: 0) {
+            VStack(spacing: RelayTheme.spacing(0)) {
                 titleBar
+                    .fixedSize(horizontal: false, vertical: true)
+                    .layoutPriority(1)
                 if !collapsed {
                     Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(height: 1)
-                    content
+                    Picker("Monitoring", selection: $section) {
+                        Text("Performance").tag("Performance")
+                        Text("Energy").tag("Energy")
+                        Text("Processes").tag("Processes")
+                        Text("Agents").tag("Agents")
+                        Text("Hosts").tag("Hosts")
+                    }.pickerStyle(.segmented).padding(RelayTheme.spacing(12))
+                    ScrollView(.vertical) {
+                        switch section {
+                        case "Energy": energyContent
+                        case "Processes": RelayProcessMonitor(workspace: workspace)
+                        case "Agents": agentContent
+                        case "Hosts": RelayHostsMonitor(workspace: workspace)
+                        default: content
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            .frame(width: 440, height: collapsed ? 42 : 425)
-            .background(RelayTheme.sidebar)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .frame(width: section == "Performance" || section == "Energy" ? 560 : 760, height: collapsed ? 42 : 560)
+            .background(RelayTheme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous)
                     .stroke(RelayTheme.line.opacity(0.85), lineWidth: 1)
                     .allowsHitTesting(false)
             }
             .shadow(color: .black.opacity(0.34), radius: 22, y: 10)
         }
-        .onAppear { monitor.start() }
+        .onAppear { section = workspace.energyMonitorMode ? "Energy" : "Performance"; monitor.start() }
         .onDisappear { monitor.stop() }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Relay performance")
+        .accessibilityLabel("Relay monitoring")
+        .alert(
+            "Supervisor recommendation",
+            isPresented: Binding(
+                get: { reviewReceipt != nil },
+                set: { if !$0 { reviewReceipt = nil } }
+            ),
+            presenting: reviewReceipt
+        ) { receipt in
+            Button("Approve action") {
+                _ = workspace.approveAndExecuteSupervisorAction(receiptID: receipt.id)
+                reviewReceipt = nil
+            }
+            Button("Not now", role: .cancel) {
+                _ = workspace.resolveSupervisorAction(receiptID: receipt.id, approve: false)
+                reviewReceipt = nil
+            }
+        } message: { receipt in
+            Text("Relay will recheck the exact live session and execute \(Self.supervisorLabel(receipt.stage)) only when this build exposes that specific capability. Offline, replaced, expired, or unsupported targets fail closed.")
+        }
+    }
+
+    @ViewBuilder private var agentContent: some View {
+        if let pane = workspace.activePane {
+            RelayPluginToolsView(workspace: workspace, presentation: activityPresentation,
+                chrome: activityChrome, presentationStyle: .floating)
+                .onAppear {
+                    let context = workspace.executionContext()
+                    activityPresentation.captureOnce(id: pane.id, profile: context?.profile ?? pane.profile,
+                        directory: context?.directory ?? pane.directory)
+                    activityPresentation.selection = "relay.agent-activity:main"
+                }
+        } else {
+            Text("Select a terminal to inspect agent activity.").padding(RelayTheme.spacing(14))
+        }
     }
 
     private var titleBar: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: RelayTheme.spacing(9)) {
             Image(systemName: "waveform.path.ecg.rectangle")
-                .font(.system(size: 11, weight: .semibold))
+                .font(RelayTheme.font(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.accent)
-            Text("Performance")
-                .font(.system(size: 11.5, weight: .semibold))
+            Text("Monitoring")
+                .font(RelayTheme.font(size: 11.5, weight: .medium))
                 .foregroundStyle(RelayTheme.text)
-            Text("live")
-                .font(.system(size: 9.5, weight: .medium))
+            Text("Live")
+                .font(RelayTheme.font(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textFaint)
             Spacer()
             Button { collapsed.toggle() } label: {
                 Image(systemName: collapsed ? "chevron.down" : "chevron.up")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(RelayTheme.font(size: 9, weight: .medium))
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .focusEffectDisabled()
-            .help(collapsed ? "Expand performance" : "Collapse performance")
-            .accessibilityLabel(collapsed ? "Expand performance" : "Collapse performance")
+            .help(collapsed ? "Expand monitoring" : "Collapse monitoring")
+            .accessibilityLabel(collapsed ? "Expand monitoring" : "Collapse monitoring")
             Button(action: close) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(RelayTheme.font(size: 9, weight: .medium))
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .focusEffectDisabled()
-            .help("Close performance")
-            .accessibilityLabel("Close performance")
+            .help("Close monitoring")
+            .accessibilityLabel("Close monitoring")
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, RelayTheme.spacing(12))
         .frame(height: 42)
         .background(RelayTheme.surface.opacity(0.7))
         .contentShape(Rectangle())
     }
 
+    private var energyContent: some View {
+        let value = monitor.current
+        return VStack(alignment: .leading, spacing: RelayTheme.spacing(12)) {
+            HStack(spacing: RelayTheme.spacing(10)) {
+                PerformanceMetricCard(label: "CPU", value: String(format: "%.1f%%", value.cpuPercent),
+                    detail: String(format: "peak %.1f%%", monitor.peakCPU), history: monitor.cpuHistory, color: RelayTheme.accent)
+                PerformanceMetricCard(label: "Wakeups / sec", value: value.wakeupsAvailable ? String(format: "%.1f", value.wakeupsPerSecond) : "Unavailable",
+                    detail: String(format: "%.1f idle wakeups", value.idleWakeupsPerSecond), history: [], color: RelayTheme.blue)
+            }
+            Text("Memory \(Self.bytes(value.memoryBytes)) · Traffic \(Self.rate(value.outputBytesPerSecond + value.inputBytesPerSecond))")
+                .font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
+            Text("Observed activity").font(RelayTheme.font(size: 12, weight: .semibold))
+            Text(monitor.activity).font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
+            Text("Recent peaks · CPU ≥ 20%").font(RelayTheme.font(size: 12, weight: .semibold))
+            if monitor.energyPeaks.isEmpty {
+                Text("No peaks recorded yet").font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textFaint)
+            }
+            ForEach(monitor.energyPeaks.prefix(8)) { peak in
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
+                    Text("\(peak.date.formatted(date: .omitted, time: .standard)) · \(String(format: "%.1f%% CPU · %.1f wakeups/s", peak.cpu, peak.wakeups))")
+                        .font(RelayTheme.font(size: 11, weight: .medium))
+                    Text(peak.activity).font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.textMuted)
+                }
+            }
+            Text("Recent Relay events").font(RelayTheme.font(size: 12, weight: .semibold))
+            ForEach(Array(monitor.recentEvents.enumerated()), id: \.offset) { _, event in
+                Text("\(event.timestamp.formatted(date: .omitted, time: .standard)) · \(event.category) · \(event.name)")
+                    .font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.textMuted)
+                if event.category == "terminal-input" || event.category == "terminal-clipboard" {
+                    // Only expose renderer state and counts; never prompt text.
+                    let keys: Set<String> = [
+                        "pane_id", "kind", "remote", "reason", "shell_prompt",
+                        "agent_prompt", "semantic_editing", "viewport_live",
+                        "row", "column", "columns", "linefeeds", "carriage_returns",
+                        "row_characters", "prefix", "characters", "cursor",
+                        "shell_prefix_-1", "shell_prefix_0", "shell_prefix_1",
+                        "agent_prefix_-1", "agent_prefix_0", "agent_prefix_1",
+                        "source", "bytes", "succeeded", "first_responder", "window_key"
+                    ]
+                    let summary = event.details.keys.filter { keys.contains($0) }.sorted()
+                        .map { "\($0)=\(event.details[$0] ?? "")" }.joined(separator: " · ")
+                    if !summary.isEmpty {
+                        Text(summary)
+                            .font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.textMuted)
+                            .textSelection(.enabled)
+                            .accessibilityIdentifier("relay.monitoring.input-diagnostic")
+                    }
+                }
+            }
+            Text("Samples once per second while this panel is open. Activity is context, not proof of a spike’s cause. CPU and wakeups are energy indicators, not watts or macOS Energy Impact. Relay’s helpers are excluded.")
+                .font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.textFaint)
+        }.padding(RelayTheme.spacing(14))
+    }
+
     private var content: some View {
         let value = monitor.current
-        return VStack(spacing: 12) {
-            HStack(spacing: 10) {
+        return VStack(spacing: RelayTheme.spacing(12)) {
+            HStack(spacing: RelayTheme.spacing(10)) {
                 PerformanceMetricCard(
                     label: "CPU",
                     value: String(format: "%.1f%%", value.cpuPercent),
@@ -268,12 +440,27 @@ struct RelayPerformancePanel: View {
                 )
             }
 
-            VStack(spacing: 0) {
+            VStack(spacing: RelayTheme.spacing(0)) {
                 PerformanceStatusRow(
                     symbol: "network",
                     label: "Transport",
                     value: "\(value.sshNodeCount) SSH · \(value.remotePaneCount) panes"
                 )
+                if let paneID = value.supervisorActionPaneID {
+                    divider
+                    Button {
+                        reviewReceipt = workspace.proposeSupervisorAction(paneID: paneID)
+                    } label: {
+                        Label("Review supervisor recommendation", systemImage: "checkmark.shield")
+                            .font(RelayTheme.font(size: 10.5, weight: .medium))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, RelayTheme.spacing(11))
+                            .frame(height: 34)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(RelayTheme.accent)
+                    .accessibilityIdentifier("relay.supervisor.review")
+                }
                 divider
                 PerformanceStatusRow(
                     symbol: "point.3.connected.trianglepath.dotted",
@@ -314,10 +501,18 @@ struct RelayPerformancePanel: View {
                             value.maximumKeyDispatchMilliseconds
                         )
                 )
+                divider
+                PerformanceStatusRow(
+                    symbol: "shield.lefthalf.filled",
+                    label: "Supervisor",
+                    value: value.supervisorWarningCount == 0
+                        ? "observing · no findings"
+                        : "\(value.supervisorWarningCount) findings · \(Self.supervisorLabel(value.supervisorHighestStage))"
+                )
             }
-            .background(RelayTheme.surface.opacity(0.62), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .background(RelayTheme.surface.opacity(0.62), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
 
-            HStack(spacing: 8) {
+            HStack(spacing: RelayTheme.spacing(8)) {
                 Circle()
                     .fill(value.activeConnectionState == "Connected" ? RelayTheme.mint : RelayTheme.coral)
                     .frame(width: 6, height: 6)
@@ -334,14 +529,14 @@ struct RelayPerformancePanel: View {
                         .foregroundStyle(RelayTheme.textFaint)
                 }
             }
-            .font(.system(size: 10.5, weight: .medium))
+            .font(RelayTheme.font(size: 10.5, weight: .medium))
 
             Text("Sampling stops when this panel closes.")
-                .font(.system(size: 9.5))
+                .font(RelayTheme.font(size: 11))
                 .foregroundStyle(RelayTheme.textFaint)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(14)
+        .padding(RelayTheme.spacing(14))
     }
 
     private var divider: some View {
@@ -358,6 +553,17 @@ struct RelayPerformancePanel: View {
     private static func rate(_ value: Double) -> String {
         bytes(value.isFinite ? UInt64(max(0, value)) : 0) + "/s"
     }
+
+    private static func supervisorLabel(_ stage: RelaySupervisorStage) -> String {
+        switch stage {
+        case .observe: "observe"
+        case .warn: "warn"
+        case .stopNewWork: "stop new work"
+        case .requestCheckpoint: "checkpoint"
+        case .gracefulInterrupt: "interrupt proposed"
+        case .terminateOrRestart: "restart proposed"
+        }
+    }
 }
 
 private struct PerformanceStatusRow: View {
@@ -366,20 +572,20 @@ private struct PerformanceStatusRow: View {
     let value: String
 
     var body: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: RelayTheme.spacing(9)) {
             Image(systemName: symbol)
-                .font(.system(size: 10.5, weight: .medium))
+                .font(RelayTheme.font(size: 10.5, weight: .medium))
                 .foregroundStyle(RelayTheme.textFaint)
                 .frame(width: 16)
             Text(label)
-                .font(.system(size: 10.5, weight: .medium))
+                .font(RelayTheme.font(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textMuted)
             Spacer()
             Text(value)
-                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(RelayTheme.text)
         }
-        .padding(.horizontal, 11)
+        .padding(.horizontal, RelayTheme.spacing(11))
         .frame(height: 34)
     }
 }
@@ -392,27 +598,27 @@ private struct PerformanceMetricCard: View {
     let color: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(5)) {
             Text(label)
-                .font(.system(size: 9.5, weight: .medium))
+                .font(RelayTheme.font(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textFaint)
             Text(value)
-                .font(.system(size: 17, weight: .semibold, design: .rounded))
+                .font(RelayTheme.font(size: 17, weight: .medium, design: .default))
                 .foregroundStyle(RelayTheme.text)
             if history.count > 1 {
                 PerformanceSparkline(values: history, color: color)
                     .frame(height: 20)
             } else {
-                Rectangle().fill(color.opacity(0.18)).frame(height: 1).padding(.vertical, 9.5)
+                Rectangle().fill(color.opacity(0.18)).frame(height: 1).padding(.vertical, RelayTheme.spacing(9.5))
             }
             Text(detail)
-                .font(.system(size: 9))
+                .font(RelayTheme.font(size: 11))
                 .foregroundStyle(RelayTheme.textFaint)
                 .lineLimit(1)
         }
-        .padding(10)
+        .padding(RelayTheme.spacing(10))
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RelayTheme.surface.opacity(0.68), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .background(Color.clear)
     }
 }
 

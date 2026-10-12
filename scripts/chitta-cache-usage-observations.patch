@@ -1,0 +1,412 @@
+diff --git a/chitta/include/chitta/task_rotation.hpp b/chitta/include/chitta/task_rotation.hpp
+--- a/chitta/include/chitta/task_rotation.hpp
++++ b/chitta/include/chitta/task_rotation.hpp
+@@ -45,7 +45,7 @@
+ }
+ // Contract usage contains only bounded identifiers and nonnegative numeric telemetry.
+ inline void validate_usage(const json& u) {
+-    require(u.is_object() && (u.size() == 5 || u.size() == 19), "invalid usage fields");
++    require(u.is_object() && (u.size() == 5 || u.size() == 19 || u.size() == 23), "invalid usage fields");
+     for (const auto* k : {"turn", "session", "context_tokens", "context_window", "model"})
+         require(u.contains(k), "missing usage field");
+     auto number = [](const json& v) {
+@@ -102,7 +102,24 @@
+                     v.at("status") == "complete", "invalid capsule status");
+         } else require(number(v), "invalid numeric observation");
+     }
+-
++    // Cache scheduling observations are an all-or-none schema extension.
++    // Unknown observations stay absent; the policy separately checks ordering,
++    // model/session binding and whether a TTL estimate is useful.
++    if (u.size() == 23) {
++        for (const auto* k : {"last_user_message_ms", "last_model_request_ms",
++                             "last_model_response_ms", "cache_ttl_ms"}) {
++            require(u.contains(k), "missing cache usage observation");
++            const auto& o = u.at(k);
++            require(o.is_object() && o.size() == 2 && o.contains("value") && o.contains("provenance"),
++                    "invalid cache usage observation");
++            const auto& v = o.at("value");
++            const auto& p = o.at("provenance");
++            const auto source = std::string(k) == "cache_ttl_ms" ? "hook" : "transcript";
++            require(v.is_null() ? p == "absent" : p == source, "invalid cache observation provenance");
++            require(v.is_null() || (number(v) && v.get<uint64_t>() < (uint64_t(1) << 53)),
++                    "invalid cache numeric observation");
++        }
++    }
+ }
+ // Native reservation records bind evidence; a JSON record is never authority
+ // to close a session. The host must retain and revalidate the actual native and
+@@ -364,7 +381,9 @@
+             if (a.contains("usage")) {
+                 validate_usage(a.at("usage"));
+                 if (turns[turn].contains("usage")) {
+-                    if (turns[turn]["usage"].size() == 5 && a.at("usage").size() == 19) {
++                    const auto saved_size = turns[turn]["usage"].size(), incoming_size = a.at("usage").size();
++                    if ((saved_size == 5 && (incoming_size == 19 || incoming_size == 23)) ||
++                        (saved_size == 19 && incoming_size == 23)) {
+                         for (auto it = a.at("usage").begin(); it != a.at("usage").end(); ++it)
+                             if (!turns[turn]["usage"].contains(it.key()))
+                                 turns[turn]["usage"][it.key()] = {{"value", nullptr}, {"provenance", "absent"}};
+diff --git a/chitta/src/rotation_contract.schema.json b/chitta/src/rotation_contract.schema.json
+--- a/chitta/src/rotation_contract.schema.json
++++ b/chitta/src/rotation_contract.schema.json
+@@ -2293,7 +2293,7 @@
+     },
+     "usage": {
+       "additionalProperties": false,
+-      "maxProperties": 19,
++      "maxProperties": 23,
+       "minProperties": 5,
+       "oneOf": [
+         {
+@@ -2315,6 +2315,29 @@
+             "owner",
+             "client",
+             "progress_marker"
++          ],
++          "maxProperties": 19
++        },
++        {
++          "required": [
++            "wall_ms",
++            "idle_ms",
++            "tool_errors",
++            "consecutive_tool_errors",
++            "retries",
++            "in_flight_tool",
++            "turn_id_fresh",
++            "transcript_bytes_at_stop",
++            "transcript_mtime_ms_at_stop",
++            "flush_verified_next_turn",
++            "capsule",
++            "owner",
++            "client",
++            "progress_marker",
++            "last_user_message_ms",
++            "last_model_request_ms",
++            "last_model_response_ms",
++            "cache_ttl_ms"
+           ]
+         }
+       ],
+@@ -2874,6 +2897,158 @@
+               "type": "object"
+             }
+           ]
++        },
++        "last_user_message_ms": {
++          "oneOf": [
++            {
++              "additionalProperties": false,
++              "properties": {
++                "provenance": {
++                  "const": "absent"
++                },
++                "value": {
++                  "type": "null"
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            },
++            {
++              "additionalProperties": false,
++              "properties": {
++                "provenance": {
++                  "const": "transcript"
++                },
++                "value": {
++                  "minimum": 0,
++                  "maximum": 9007199254740991,
++                  "type": "integer"
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            }
++          ]
++        },
++        "last_model_request_ms": {
++          "oneOf": [
++            {
++              "additionalProperties": false,
++              "properties": {
++                "provenance": {
++                  "const": "absent"
++                },
++                "value": {
++                  "type": "null"
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            },
++            {
++              "additionalProperties": false,
++              "properties": {
++                "provenance": {
++                  "const": "transcript"
++                },
++                "value": {
++                  "minimum": 0,
++                  "maximum": 9007199254740991,
++                  "type": "integer"
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            }
++          ]
++        },
++        "last_model_response_ms": {
++          "oneOf": [
++            {
++              "additionalProperties": false,
++              "properties": {
++                "provenance": {
++                  "const": "absent"
++                },
++                "value": {
++                  "type": "null"
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            },
++            {
++              "additionalProperties": false,
++              "properties": {
++                "provenance": {
++                  "const": "transcript"
++                },
++                "value": {
++                  "minimum": 0,
++                  "maximum": 9007199254740991,
++                  "type": "integer"
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            }
++          ]
++        },
++        "cache_ttl_ms": {
++          "oneOf": [
++            {
++              "additionalProperties": false,
++              "properties": {
++                "provenance": {
++                  "const": "absent"
++                },
++                "value": {
++                  "type": "null"
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            },
++            {
++              "additionalProperties": false,
++              "properties": {
++                "provenance": {
++                  "const": "hook"
++                },
++                "value": {
++                  "minimum": 0,
++                  "maximum": 9007199254740991,
++                  "type": "integer"
++                }
++              },
++              "required": [
++                "value",
++                "provenance"
++              ],
++              "type": "object"
++            }
++          ]
+         }
+       },
+       "required": [
+diff --git a/chitta/CMakeLists.txt b/chitta/CMakeLists.txt
+--- a/chitta/CMakeLists.txt
++++ b/chitta/CMakeLists.txt
+@@ -864,6 +864,9 @@
+         endif()
+ 
+     endif()
++    add_executable(task_usage_cache_test src/task_usage_cache_test.cpp)
++    target_link_libraries(task_usage_cache_test PRIVATE chitta)
++    add_test(NAME task_usage_cache_test COMMAND task_usage_cache_test)
+     add_executable(task_ledger_test src/task_ledger_test.cpp)
+     target_link_libraries(task_ledger_test PRIVATE chitta)
+     add_test(NAME task_ledger_test COMMAND task_ledger_test)
+diff --git a/chitta/src/task_usage_cache_test.cpp b/chitta/src/task_usage_cache_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/chitta/src/task_usage_cache_test.cpp
+@@ -0,0 +1,144 @@
++#include <chitta/task_ledger.hpp>
++#include <cassert>
++#include <iostream>
++#include <fstream>
++#include <stdexcept>
++#include <vector>
++
++using json = nlohmann::json;
++static size_t checks = 0;
++static void check(bool condition) {
++    ++checks;
++    if (!condition) throw std::runtime_error("cache usage contract check failed");
++}
++static json usage(const char* client, bool cache) {
++    json counters = {{"input", 10}, {"cached_input", 4}, {"uncached_input", 6},
++        {"output", 2}, {"reasoning", 1}, {"responses", 1}, {"tool_calls", 0}};
++    json value = {{"turn", counters}, {"session", counters}, {"context_tokens", 12},
++        {"context_window", 100000}, {"model", "fixture-model"}};
++    value["session"]["turns"] = 1;
++    for (auto k : {"wall_ms", "idle_ms", "tool_errors", "consecutive_tool_errors", "retries",
++            "in_flight_tool", "turn_id_fresh", "transcript_bytes_at_stop", "transcript_mtime_ms_at_stop",
++            "flush_verified_next_turn", "capsule", "owner", "client", "progress_marker"})
++        value[k] = {{"value", nullptr}, {"provenance", "absent"}};
++    value["client"] = {{"value", client}, {"provenance", "hook"}};
++    value["in_flight_tool"] = {{"value", false}, {"provenance", "transcript"}};
++    value["turn_id_fresh"] = {{"value", true}, {"provenance", "transcript"}};
++    if (cache) {
++        value["last_user_message_ms"] = {{"value", 100000}, {"provenance", "transcript"}};
++        value["last_model_request_ms"] = {{"value", 100001}, {"provenance", "transcript"}};
++        value["last_model_response_ms"] = {{"value", 100050}, {"provenance", "transcript"}};
++        value["cache_ttl_ms"] = {{"value", 300000}, {"provenance", "hook"}};
++    }
++    return value;
++}
++int main(int argc, char** argv) {
++    json cases = json::array();
++    auto validate = [&](std::string name, const json& value, bool expected) {
++        bool valid = true;
++        try { chitta::rotation::validate_usage(value); }
++        catch (const std::exception&) { valid = false; }
++        check(valid == expected);
++        cases.push_back({{"name", name}, {"usage", value}, {"valid", expected}});
++    };
++    for (auto client : {"claude", "codex"}) {
++        auto observed = usage(client, true), prior = usage(client, false), legacy = prior;
++        for (auto it = legacy.begin(); it != legacy.end();) {
++            if (it.key() != "turn" && it.key() != "session" && it.key() != "context_tokens" &&
++                it.key() != "context_window" && it.key() != "model") it = legacy.erase(it);
++            else ++it;
++        }
++        const std::string prefix(client);
++        validate(prefix + ":legacy", legacy, true);
++        validate(prefix + ":observed19", prior, true);
++        validate(prefix + ":cache23", observed, true);
++        auto absent = observed;
++        for (auto k : {"last_user_message_ms", "last_model_request_ms", "last_model_response_ms", "cache_ttl_ms"})
++            absent[k] = {{"value", nullptr}, {"provenance", "absent"}};
++        validate(prefix + ":absent", absent, true);
++        for (auto k : {"last_user_message_ms", "last_model_request_ms", "last_model_response_ms", "cache_ttl_ms"}) {
++            const std::string key(k);
++            for (auto bad : {json(-1), json(1.5), json(true), json("1000"), json(uint64_t(1) << 53)}) {
++                auto invalid = observed; invalid[k]["value"] = bad;
++                validate(prefix + ":" + key + ":bad_value:" + bad.dump(), invalid, false);
++            }
++            auto invalid = observed; invalid.erase(k);
++            validate(prefix + ":" + key + ":missing", invalid, false);
++            invalid = observed; invalid[k]["provenance"] = "ledger";
++            validate(prefix + ":" + key + ":foreign_provenance", invalid, false);
++            invalid = observed; invalid[k]["value"] = nullptr;
++            validate(prefix + ":" + key + ":null_with_non_absent", invalid, false);
++            invalid = absent; invalid[k]["value"] = 1;
++            validate(prefix + ":" + key + ":number_with_absent", invalid, false);
++            invalid = observed; invalid[k]["extra"] = 0;
++            validate(prefix + ":" + key + ":extra_observation_key", invalid, false);
++            auto maximum = observed; maximum[k]["value"] = (uint64_t(1) << 53) - 1;
++            validate(prefix + ":" + key + ":max_safe_integer", maximum, true);
++            auto zero = observed; zero[k]["value"] = 0;
++            validate(prefix + ":" + key + ":zero", zero, true);
++        }
++        auto invalid = observed; invalid["unknown"] = 0;
++        validate(prefix + ":extra_usage_field", invalid, false);
++        auto mixed = prior; mixed["cache_ttl_ms"] = observed["cache_ttl_ms"];
++        validate(prefix + ":partial_extension", mixed, false);
++        chitta::TaskLedger ledger;
++        std::vector<json> wal;
++        auto append = [&](const json& batch) { wal.push_back(batch); };
++        auto run = [&](const std::string& op, json args) {
++            args["session_id"] = prefix; return ledger.run(op, args, append);
++        };
++        run("session_bind", {{"client", client}, {"owner", "relay"}});
++        auto first = run("turn_complete", {{"turn_id", "current"}, {"usage", observed}});
++        auto status = run("rotation_status", {});
++        for (auto k : {"last_user_message_ms", "last_model_request_ms", "last_model_response_ms", "cache_ttl_ms"})
++            check(status["usage"][k] == observed[k]);
++        const auto persisted = wal.size();
++        auto changed = observed;
++        changed["turn"]["input"] = 100; changed["turn"]["uncached_input"] = 96;
++        changed["last_model_request_ms"]["value"] = 200000;
++        changed["cache_ttl_ms"]["value"] = 1;
++        auto duplicate = run("turn_complete", {{"turn_id", "current"}, {"usage", changed}});
++        check(duplicate == first && wal.size() == persisted);
++        auto downgraded = run("turn_complete", {{"turn_id", "current"}, {"usage", prior}});
++        check(downgraded == first && wal.size() == persisted);
++        chitta::TaskLedger recovered;
++        for (const auto& batch : wal) recovered.replay(batch);
++        check(recovered.run("rotation_status", {{"session_id", prefix}}, append) == status);
++        for (const auto& item : cases) {
++            if (item["valid"] == true) continue;
++            const auto before = run("rotation_status", {});
++            const auto length = wal.size();
++            bool refused = false;
++            try { run("turn_complete", {{"turn_id", "invalid"}, {"usage", item["usage"]}}); }
++            catch (const std::exception&) { refused = true; }
++            check(refused && wal.size() == length && run("rotation_status", {}) == before);
++        }
++        bool failed = false;
++        try { ledger.run("turn_complete", {{"session_id", prefix}, {"turn_id", "wal-failure"}, {"usage", observed}},
++                [](const json&) { throw std::runtime_error("owned WAL failure"); }); }
++        catch (const std::exception&) { failed = true; }
++        check(failed && run("rotation_status", {}) == status);
++        for (const auto& old : {legacy, prior}) {
++            chitta::TaskLedger migrating;
++            std::vector<json> migration_wal;
++            auto persist = [&](const json& batch) { migration_wal.push_back(batch); };
++            migrating.run("session_bind", {{"session_id", prefix}, {"client", client}, {"owner", "relay"}}, persist);
++            auto initial = migrating.run("turn_complete", {{"session_id", prefix}, {"turn_id", "same"}, {"usage", old}}, persist);
++            auto upgraded = migrating.run("turn_complete", {{"session_id", prefix}, {"turn_id", "same"}, {"usage", observed}}, persist);
++            check(initial["seq"] == upgraded["seq"] && upgraded["usage"].size() == 23);
++            for (auto k : {"turn", "session", "context_tokens", "context_window", "model"})
++                check(initial["usage"][k] == upgraded["usage"][k]);
++            for (auto k : {"last_user_message_ms", "last_model_request_ms", "last_model_response_ms", "cache_ttl_ms"})
++                check(upgraded["usage"][k] == json({{"value", nullptr}, {"provenance", "absent"}}));
++            chitta::TaskLedger restored;
++            for (const auto& batch : migration_wal) restored.replay(batch);
++            check(restored.run("rotation_status", {{"session_id", prefix}}, persist) ==
++                migrating.run("rotation_status", {{"session_id", prefix}}, persist));
++        }
++    }
++    if (argc == 2) {
++        std::ofstream out(argv[1]); out << cases.dump(2) << "\n";
++        check(bool(out));
++    }
++    std::cout << json({{"checks", checks}, {"schema_cases", cases.size()}, {"state", "passed"}}).dump() << "\n";
++}

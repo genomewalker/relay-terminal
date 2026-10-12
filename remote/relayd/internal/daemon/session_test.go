@@ -30,6 +30,20 @@ func TestClassifyAgentProcess(t *testing.T) {
 	}
 }
 
+func TestSessionDefaultsToHomeDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/sh")
+	session, err := startSession("home-default-test", "true", "", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.pty.Close()
+	if session.process.Dir != home {
+		t.Fatalf("working directory = %q, want home %q", session.process.Dir, home)
+	}
+}
+
 func TestAcknowledgedInputIsAppliedOnceAcrossRetry(t *testing.T) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
@@ -337,6 +351,13 @@ func TestReplayStartUsesLatestFullScreenRedrawOnlyForFreshRenderer(t *testing.T)
 	recordIndex, byteOffset = replayStart(replay, 1)
 	if recordIndex != 0 || byteOffset != 0 {
 		t.Fatalf("incremental replay must remain exact, got (%d, %d)", recordIndex, byteOffset)
+	}
+}
+
+func TestReplayStartRetainsVisibleCellsBeforeScrollbackErase(t *testing.T) {
+	stream := []byte("visible transcript\x1b[3J\x1b[Hpartial update")
+	if got := safePrimaryScreenReplayStart(stream); got != -1 {
+		t.Fatalf("scrollback erase discarded visible cell history at %d", got)
 	}
 }
 
@@ -677,6 +698,52 @@ func TestBashIntegrationKeepsRelayShimsAheadOfUserPathChanges(t *testing.T) {
 	}
 }
 
+func TestBashSessionPreservesProfileFunctions(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	home := t.TempDir()
+	profile := "relay_profile_function() { printf PROFILE_FUNCTION_OK; }\nexport PROMPT_COMMAND=relay_profile_function\n"
+	if err := os.WriteFile(filepath.Join(home, ".bash_profile"), []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command, err := sessionCommand(bash, "", home, filepath.Join(home, "shims"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Args = append(command.Args, "-c", "relay_profile_function")
+	command.Env = append(os.Environ(), "HOME="+home)
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "PROFILE_FUNCTION_OK") {
+		t.Fatalf("profile function lost: %v: %s", err, output)
+	}
+}
+
+func TestBashSessionSourcesUserBashrcOnce(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".bash_profile"), []byte(". \"$HOME/.bashrc\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".bashrc"), []byte("RELAY_RC_COUNT=$(( ${RELAY_RC_COUNT:-0} + 1 ))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command, err := sessionCommand(bash, "", home, filepath.Join(home, "shims"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Args = append(command.Args, "-c", "printf '%s' \"$RELAY_RC_COUNT\"")
+	command.Env = append(os.Environ(), "HOME="+home)
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.HasSuffix(strings.TrimSpace(string(output)), "1") {
+		t.Fatalf("bashrc should run once: %v: %s", err, output)
+	}
+}
+
 func TestShellIntegrationsEnableSemanticPrompts(t *testing.T) {
 	home := t.TempDir()
 	shimDirectory := filepath.Join(home, "shims")
@@ -722,12 +789,19 @@ func TestShellIntegrationsEnableSemanticPrompts(t *testing.T) {
 }
 
 func TestExitedSessionIsReplacedOnNextAttach(t *testing.T) {
-	first, err := startSession("restart-test", "exit 0", "", 80, 24)
+	// Replacement behavior must not depend on the caller's login-shell startup.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SHELL", "/bin/sh")
+	first, err := startSession("restart-test", "", "", 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Login-shell startup can include user initialization and is measurably
-	// slower on loaded CI/HPC nodes. This tests replacement, not startup latency.
+	defer first.pty.Close()
+	defer first.signal(15)
+	// Startup commands return to the retained shell. Exit that shell itself.
+	if _, err := first.pty.Write([]byte("exit 0\n")); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for !first.hasExited() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -787,9 +861,9 @@ func TestAgentProcessSnapshotBroadcastsOnlyRealChanges(t *testing.T) {
 	}
 }
 
-func TestAttachResizePulsesUnchangedGridForFullRepaint(t *testing.T) {
+func TestAttachRepaintNeverIntroducesAnotherGrid(t *testing.T) {
 	unchanged := attachResizeSteps(120, 38, 120, 38, true)
-	if len(unchanged) != 2 || unchanged[0] != (terminalGridSize{cols: 120, rows: 37}) || unchanged[1] != (terminalGridSize{cols: 120, rows: 38}) {
+	if len(unchanged) != 1 || unchanged[0] != (terminalGridSize{cols: 120, rows: 38}) {
 		t.Fatalf("unchanged attach resize = %#v", unchanged)
 	}
 	changed := attachResizeSteps(80, 24, 120, 38, true)
@@ -813,35 +887,42 @@ func TestViewportResizeSignalsExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestReconnectRepaintBarrierRejectsOrdinaryAndPartialOutput(t *testing.T) {
-	background := []protocol.Frame{protocol.OutputFrame(11, bytes.Repeat([]byte("build output "), 40))}
-	if reconnectRepaintNeedsBarrier(background, 10, 38) {
-		t.Fatal("ordinary streaming output was classified as a screen repaint")
+func TestStartupCommandReturnsToInteractiveShell(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
 	}
-
-	partial := append(bytes.Repeat([]byte("x"), 300), []byte("\x1b[36;3Hspinner\x1b[36;4H57")...)
-	if reconnectRepaintNeedsBarrier([]protocol.Frame{protocol.OutputFrame(11, partial)}, 10, 38) {
-		t.Fatal("single-row TUI activity was classified as a full repaint")
-	}
-
-	oldRepaint := append(bytes.Repeat([]byte("x"), 300), []byte("\x1b[1;1Hone\x1b[10;1Htwo\x1b[20;1Hthree")...)
-	frames := []protocol.Frame{
-		protocol.OutputFrame(10, oldRepaint),
-		protocol.OutputFrame(11, []byte("new background line")),
-	}
-	if reconnectRepaintNeedsBarrier(frames, 10, 38) {
-		t.Fatal("pre-resize repaint bytes influenced reconnect classification")
+	for _, startup := range []string{"printf AGENT_FINISHED", "exec printf AGENT_FINISHED", "exit 7"} {
+		t.Run(startup, func(t *testing.T) {
+			home := t.TempDir()
+			cmd, err := sessionCommand(bash, startup, home, filepath.Join(home, "shims"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd.Env = append(os.Environ(), "HOME="+home)
+			cmd.Stdin = strings.NewReader("printf SHELL_RETURNED\\n\nexit\n")
+			output, err := cmd.CombinedOutput()
+			if err != nil || !strings.Contains(string(output), "SHELL_RETURNED") {
+				t.Fatalf("startup consumed the pane shell: %v: %s", err, output)
+			}
+		})
 	}
 }
 
-func TestReconnectRepaintBarrierRecognizesFullCursorAddressedRepaint(t *testing.T) {
-	full := append(bytes.Repeat([]byte("x"), 300), []byte("\x1b[1;1Hone\x1b[10;1Htwo\x1b[20;1Hthree")...)
-	if !reconnectRepaintNeedsBarrier([]protocol.Frame{protocol.OutputFrame(11, full)}, 10, 38) {
-		t.Fatal("full cursor-addressed TUI repaint did not request a presentation barrier")
+func TestPromptEditorLaunchSettingDefaultsOnlyNewShellEnvironment(t *testing.T) {
+	cases := []struct {
+		environment []string
+		want        string
+	}{
+		{nil, "1"},
+		{[]string{"UNCHANGED=yes"}, "1"},
+		{[]string{"RELAY_PROMPT_EDITOR_ENABLE=0"}, "0"},
+		{[]string{"RELAY_PROMPT_EDITOR_ENABLE="}, ""},
+		{[]string{"RELAY_PROMPT_EDITOR_ENABLE=1"}, "1"},
 	}
-
-	selfClearing := append([]byte("\x1b[2J\x1b[H"), full...)
-	if reconnectRepaintNeedsBarrier([]protocol.Frame{protocol.OutputFrame(11, selfClearing)}, 10, 38) {
-		t.Fatal("self-clearing repaint requested a redundant presentation barrier")
+	for _, test := range cases {
+		if got := promptEditorLaunchSetting(test.environment); got != test.want {
+			t.Fatalf("launch setting for %v = %q, want %q", test.environment, got, test.want)
+		}
 	}
 }

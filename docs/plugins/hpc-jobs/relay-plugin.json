@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 3,
+  "id": "relay.hpc-jobs",
+  "name": "HPC jobs",
+  "version": "0.2.0",
+  "repository": "genomewalker/relay-plugin-hpc-jobs",
+  "permissions": [
+    {
+      "kind": "remoteOperation",
+      "reason": "Query your Slurm jobs and owned-job details on demand."
+    },
+    {
+      "kind": "projectRead",
+      "reason": "Preview up to 64 KiB from scheduler-reported stdout/stderr inside an owned job's directory."
+    },
+    {
+      "kind": "jobSubmit",
+      "reason": "Submit only a batch script you review and explicitly confirm for this host and directory."
+    },
+    {
+      "kind": "jobCancel",
+      "reason": "Cancel only one owned non-array job after you confirm its exact ID."
+    }
+  ],
+  "contributions": [
+    {
+      "id": "main",
+      "kind": "tool",
+      "title": "HPC jobs",
+      "text": "List your Slurm jobs on demand, including state, runtime, node count and pending reason.",
+      "operation": "hpcJobs"
+    },
+    {
+      "id": "details",
+      "kind": "tool",
+      "title": "HPC job details",
+      "text": "Inspect one owned job or array task. Requires Slurm JSON support.",
+      "operation": "hpcDetails"
+    },
+    {
+      "id": "logs",
+      "kind": "tool",
+      "title": "HPC job logs",
+      "text": "Read a bounded stdout/stderr tail on demand.",
+      "operation": "hpcLogs"
+    },
+    {
+      "id": "submit",
+      "kind": "tool",
+      "title": "Submit HPC job",
+      "text": "Review a complete script and explicitly confirm submission. No automatic retry.",
+      "operation": "hpcSubmit"
+    },
+    {
+      "id": "cancel",
+      "kind": "tool",
+      "title": "Cancel HPC job",
+      "text": "Confirm one exact owned job ID. Array cancellation is not supported.",
+      "operation": "hpcCancel"
+    },
+    {
+      "id": "accounting",
+      "kind": "tool",
+      "title": "HPC accounting",
+      "text": "Owned job and step statistics from sacct, past seven days.",
+      "operation": "hpcAccounting"
+    }
+  ]
+}

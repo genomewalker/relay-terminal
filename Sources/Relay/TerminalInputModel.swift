@@ -4,6 +4,28 @@ enum TerminalPastePayload {
     private static let begin = "\u{001B}[200~"
     private static let end = "\u{001B}[201~"
 
+    /// The native paste encoding, assembled synchronously for an already
+    /// authorized prompt transaction. Native key translation still supplies
+    /// movement/deletion/caret bytes; text must not escape via the IO mailbox.
+    static func encodedPayload(for text: String, bracketed: Bool) -> Data? {
+        guard !text.isEmpty, text.utf8.count <= 65_536 else { return nil }
+        var result = Data()
+        if bracketed { result.append(contentsOf: begin.utf8) }
+        for byte in text.utf8 {
+            switch byte {
+            case 0x00, 0x08, 0x05, 0x04, 0x1B, 0x7F, 0x03, 0x1C,
+                 0x15, 0x1A, 0x11, 0x13, 0x17, 0x16, 0x12, 0x0F:
+                result.append(0x20)
+            case 0x0A where !bracketed:
+                result.append(0x0D)
+            default:
+                result.append(byte)
+            }
+        }
+        if bracketed { result.append(contentsOf: end.utf8) }
+        return result
+    }
+
     /// Captured clipboard text is sent directly so clipboard managers cannot
     /// change it between Relay's read and Ghostty's asynchronous callback.
     /// Multi-line text is only sent directly when bracketed paste is active;
@@ -12,6 +34,13 @@ enum TerminalPastePayload {
         guard !text.isEmpty else { return nil }
         if bracketed { return begin + text + end }
         guard !text.contains(where: \Character.isNewline) else { return nil }
+        return text
+    }
+
+    /// ghostty_surface_text treats its argument as a paste and supplies mode
+    /// 2004 framing itself. Only direct PTY writers use directPayload above.
+    static func rendererPayload(for text: String, bracketed: Bool) -> String? {
+        guard !text.isEmpty, bracketed || !text.contains(where: \Character.isNewline) else { return nil }
         return text
     }
 }
@@ -152,19 +181,30 @@ struct TerminalPromptBuffer: Equatable, Sendable {
             invalidate()
             return
         }
-        let incoming = Array(text)
-        guard !incoming.isEmpty, characters.count + incoming.count <= 4_096 else {
-            if !incoming.isEmpty { invalidate() }
+        guard !text.isEmpty else { return }
+        // String insertion can join a new combining mark, emoji modifier or
+        // regional indicator to the preceding grapheme. Re-segment the actual
+        // resulting bytes rather than retaining separate Character entries.
+        let beforeCaret = String(characters.prefix(cursor)) + text
+        let combined = beforeCaret + String(characters.dropFirst(cursor))
+        let revised = Array(combined)
+        let revisedCursor = beforeCaret.count
+        guard revised.count <= 4_096, revisedCursor <= revised.count,
+              String(revised.prefix(revisedCursor)).utf8.elementsEqual(beforeCaret.utf8) else {
+            // This model cannot authorize a caret inside a newly joined
+            // grapheme; refuse that snapshot instead of moving the caret.
+            invalidate()
             return
         }
-        characters.insert(contentsOf: incoming, at: cursor)
-        cursor += incoming.count
+        characters = revised
+        cursor = revisedCursor
     }
 
     mutating func restore(_ snapshot: Snapshot) {
         guard snapshot.characters.count <= 4_096,
               snapshot.cursor >= 0,
-              snapshot.cursor <= snapshot.characters.count else {
+              snapshot.cursor <= snapshot.characters.count,
+              Array(snapshot.text) == snapshot.characters else {
             invalidate()
             return
         }
@@ -190,24 +230,22 @@ struct TerminalPromptBuffer: Equatable, Sendable {
 
     mutating func backspace() {
         guard isReliable, cursor > 0 else { return }
-        characters.remove(at: cursor - 1)
-        cursor -= 1
+        _ = removePromptRange((cursor - 1)..<cursor)
     }
 
     mutating func deleteForward() {
         guard isReliable, cursor < characters.count else { return }
-        characters.remove(at: cursor)
+        _ = removePromptRange(cursor..<(cursor + 1))
     }
 
     mutating func deleteToStart() {
         guard isReliable, cursor > 0 else { return }
-        characters.removeSubrange(0..<cursor)
-        cursor = 0
+        _ = removePromptRange(0..<cursor)
     }
 
     mutating func deleteToEnd() {
         guard isReliable, cursor < characters.count else { return }
-        characters.removeSubrange(cursor..<characters.count)
+        _ = removePromptRange(cursor..<characters.count)
     }
 
     mutating func deletePreviousWord() {
@@ -215,8 +253,7 @@ struct TerminalPromptBuffer: Equatable, Sendable {
         var start = cursor
         while start > 0, characters[start - 1].isWhitespace { start -= 1 }
         while start > 0, !characters[start - 1].isWhitespace { start -= 1 }
-        characters.removeSubrange(start..<cursor)
-        cursor = start
+        _ = removePromptRange(start..<cursor)
     }
 
     @discardableResult
@@ -227,9 +264,7 @@ struct TerminalPromptBuffer: Equatable, Sendable {
         let lower = min(cursor, otherEnd)
         let upper = max(cursor, otherEnd)
         guard lower < upper else { return false }
-        characters.removeSubrange(lower..<upper)
-        cursor = lower
-        return true
+        return removePromptRange(lower..<upper)
     }
 
     /// Removes the characters between two cursor-relative offsets and leaves
@@ -243,9 +278,34 @@ struct TerminalPromptBuffer: Equatable, Sendable {
         let upper = cursor + max(lowerOffset, upperOffset)
         guard lower >= 0, upper <= characters.count, lower < upper,
               upper - lower <= 4_096 else { return false }
-        characters.removeSubrange(lower..<upper)
-        cursor = lower
+        return removePromptRange(lower..<upper)
+    }
+
+    /// Removing a separator can join the remaining scalars into a grapheme.
+    /// Preserve the byte position of the editor's caret; never round it to a
+    /// different boundary when this character-based mirror cannot represent it.
+    private mutating func removePromptRange(_ range: Range<Int>) -> Bool {
+        let beforeCaret = String(characters.prefix(range.lowerBound))
+        let combined = beforeCaret + String(characters.dropFirst(range.upperBound))
+        let revised = Array(combined)
+        let revisedCursor = beforeCaret.count
+        guard revisedCursor <= revised.count,
+              String(revised.prefix(revisedCursor)).utf8.elementsEqual(beforeCaret.utf8) else {
+            invalidate()
+            return false
+        }
+        characters = revised
+        cursor = revisedCursor
         return true
+    }
+
+    /// Validate a selection edit without changing the mirror or sending keys.
+    func plannedDeletionSnapshot(characterCount: Int, movementOffset: Int) -> Snapshot? {
+        guard characterCount > 0, characterCount <= 4_096,
+              movementOffset >= -4_096, movementOffset <= 4_096 else { return nil }
+        var planned = self
+        guard planned.deleteRange(relativeToCursor: movementOffset - characterCount, movementOffset) else { return nil }
+        return planned.snapshot
     }
 
     mutating func submit() -> String? {

@@ -1,0 +1,108 @@
+--- a/codex-rs/app-server/src/in_process/native_rotation_attachment.rs
++++ b/codex-rs/app-server/src/in_process/native_rotation_attachment.rs
+@@ -55,9 +55,14 @@
+     pub(crate) outcome: Arc<NativeRotationCommitOutcome>,
+     pub(crate) thread: Arc<CodexThread>,
+     pub(crate) receipt: NativeRotationReceipt,
++    pub(crate) journal_directory: std::path::PathBuf,
+ }
+ 
+ impl NativeRotationRetainedSource {
++    pub fn journal_directory(&self) -> &std::path::Path {
++        &self.journal_directory
++    }
++
+     pub fn thread(&self) -> &Arc<CodexThread> {
+         &self.thread
+     }
+--- a/codex-rs/app-server/src/request_processors/context_rotation.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation.rs
+@@ -123,7 +123,12 @@
+                     &thread,
+                 )
+                 .await?;
+-                let home = thread.config().await.codex_home.to_path_buf();
++                let home = tokio::fs::canonicalize(thread.config().await.codex_home.to_path_buf())
++                    .await
++                    .map_err(|_| rotation_error("native refusal home is no longer available"))?;
++                let journal_directory = home
++                    .join("relay-context-rotation")
++                    .join(request.operation_id().to_string());
+                 self.rotation_reservations
+                     .publish_refusal(connection_id, reservation_id, &outcome, home)
+                     .await?;
+@@ -140,6 +145,7 @@
+                         outcome,
+                         thread,
+                         receipt,
++                        journal_directory,
+                     },
+                 )))
+             }
+--- a/codex-rs/tui/src/app/rotation_commit.rs
++++ b/codex-rs/tui/src/app/rotation_commit.rs
+@@ -216,6 +216,7 @@
+                 Some(ContextRotationStatus::SourceRetained {
+                     operation_id,
+                     source,
++                    ..
+                 }),
+                 Some(retained),
+             ) => {
+@@ -322,6 +323,7 @@
+                 ContextRotationStatus::SourceRetained {
+                     operation_id: self.operation_id,
+                     source: source.receipt().clone(),
++                    journal_directory: source.journal_directory().to_path_buf(),
+                 }
+             }
+         };
+--- a/codex-rs/tui/src/app_server_session/context_rotation.rs
++++ b/codex-rs/tui/src/app_server_session/context_rotation.rs
+@@ -487,6 +487,7 @@
+     SourceRetained {
+         operation_id: Uuid,
+         source: NativeRotationReceipt,
++        journal_directory: std::path::PathBuf,
+     },
+ }
+ 
+--- a/codex-rs/tui/src/relay_rotation_bridge.rs
++++ b/codex-rs/tui/src/relay_rotation_bridge.rs
+@@ -64,6 +64,8 @@
+     source: Option<codex_app_server_client::NativeRotationReceipt>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     reason: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    journal_directory: Option<std::path::PathBuf>,
+ }
+ 
+ impl Reply {
+@@ -101,9 +103,11 @@
+             ContextRotationStatus::SourceRetained {
+                 operation_id,
+                 source,
++                journal_directory,
+             } if operation_id == identity.operation_id => {
+                 reply.state = "source_retained";
+                 reply.source = Some(source);
++                reply.journal_directory = Some(journal_directory);
+             }
+             ContextRotationStatus::Pending { reason, .. }
+             | ContextRotationStatus::Refused { reason, .. } => {
+@@ -127,6 +131,7 @@
+             host_claim_id: None,
+             completion: None,
+             source: None,
++            journal_directory: None,
+             reason: None,
+         }
+     }
+@@ -279,6 +284,7 @@
+                             host_claim_id: None,
+                             completion: None,
+                             source: None,
++                            journal_directory: None,
+                             reason: None,
+                         }
+                     }

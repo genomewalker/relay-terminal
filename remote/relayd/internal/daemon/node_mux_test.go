@@ -131,6 +131,65 @@ func TestMultiplexedSessionBackpressureIsRouteLocal(t *testing.T) {
 	}
 }
 
+func TestLegacyViewportAppliesOnlyNewestArrivalAcrossRoutes(t *testing.T) {
+	server := NewServer()
+	workerID := "durable-pane"
+	first := server.legacyViewportTicket(workerID).Add(1)
+	lock := server.workerLock(workerID)
+	lock.Lock()
+	type result struct {
+		applied bool
+		err     error
+	}
+	older := make(chan result, 1)
+	go func() {
+		_, applied, err := server.applyLatestLegacyViewport(workerID, first, func() (uint64, error) {
+			t.Error("superseded viewport reached the PTY")
+			return 1, nil
+		})
+		older <- result{applied, err}
+	}()
+	// The newer request may come from a replacement virtual route with a
+	// restarted client generation. Arrival tickets are worker-scoped instead.
+	second := server.legacyViewportTicket(workerID).Add(1)
+	lock.Unlock()
+	if got := <-older; got.applied || got.err != nil {
+		t.Fatalf("older commit was applied: %+v", got)
+	}
+	writes := 0
+	sequence, applied, err := server.applyLatestLegacyViewport(workerID, second, func() (uint64, error) {
+		writes++
+		return 42, nil
+	})
+	if err != nil || !applied || sequence != 42 || writes != 1 {
+		t.Fatalf("newest commit = (%d, %v, %v), writes=%d", sequence, applied, err, writes)
+	}
+}
+
+func TestLegacyViewportQueueKeepsOnlyLatestPendingResize(t *testing.T) {
+	queue := &latestViewportQueue{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan int, 2)
+	queue.submit(func() {
+		close(started)
+		<-release
+		finished <- 0
+	})
+	<-started
+	for index := 1; index <= 100; index++ {
+		value := index
+		queue.submit(func() { finished <- value })
+	}
+	close(release)
+	if got := <-finished; got != 0 {
+		t.Fatalf("active resize did not finish first: %d", got)
+	}
+	if got := <-finished; got != 100 {
+		t.Fatalf("pending resize was not latest: %d", got)
+	}
+}
+
 func TestWorkerStartupLocksArePerSession(t *testing.T) {
 	server := NewServer()
 	if server.workerLock("pane-a") != server.workerLock("pane-a") {

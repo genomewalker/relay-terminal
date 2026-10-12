@@ -1,0 +1,417 @@
+--- a/remote/relayd/internal/daemon/host_rotation_text.go
++++ b/remote/relayd/internal/daemon/host_rotation_text.go
+@@ -1,13 +1,16 @@
+ package daemon
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	_ "embed"
+ 	"encoding/json"
+ 	"errors"
++	"io"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++	"syscall"
+ 	"time"
+ )
+ 
+@@ -40,7 +43,7 @@
+ 	if err != nil {
+ 		return nil, errors.New("text service Python unavailable")
+ 	}
+-	result, err := hostRotationCommand(ctx, python, []string{"-I", "-S", "-c", string(hostRotationText),
++	result, err := hostRotationTextCommand(ctx, python, []string{"-I", "-S", "-c", string(hostRotationText),
+ 		"--state-dir", root, "--operation", operation}, data)
+ 	if err != nil {
+ 		// Raw command/provider diagnostics must not cross the RPC boundary.
+@@ -87,3 +90,19 @@
+ 	}
+ 	return "", errors.New("Python 3.11 or newer with TLS and SQLite is required")
+ }
++
++// A draft may own a CLI child. Let the journaled adapter stop and reap that
++// child on cancellation before the bounded fallback kills the adapter.
++func hostRotationTextCommand(ctx context.Context, binary string, args []string, input []byte) ([]byte, error) {
++	command := exec.CommandContext(ctx, binary, args...)
++	command.Cancel = func() error { return command.Process.Signal(syscall.SIGTERM) }
++	command.WaitDelay = 3 * time.Second
++	command.Stdin = bytes.NewReader(input)
++	var output rotationBoundedOutput
++	command.Stdout = &output
++	command.Stderr = io.Discard
++	if err := command.Run(); err != nil {
++		return nil, err
++	}
++	return output.Bytes(), nil
++}
+--- a/remote/relayd/internal/daemon/host_rotation_text.py
++++ b/remote/relayd/internal/daemon/host_rotation_text.py
+@@ -13,6 +13,7 @@
+ import os
+ import re
+ import selectors
++import signal
+ import shutil
+ import socket
+ import sqlite3
+@@ -24,6 +25,9 @@
+ import time
+ import threading
+ from pathlib import Path
++
++_cli_starting = False
++_cancel_pending = False
+ 
+ PROVIDERS = ("anthropic_api", "claude_account", "codex_account")
+ MAX_SOURCE = 65536
+@@ -128,15 +132,24 @@
+ 
+ def run_cli(argv, prompt, cwd, timeout, environment):
+     """Bound output and elapsed time; only stop the subprocess we just created."""
++    global _cli_starting
++    process = None
++    # The handler defers its exception while Popen acquires the child handle.
++    # This avoids inheriting a blocked SIGTERM mask into the CLI.
+     try:
+-        process = subprocess.Popen(argv, cwd=cwd, env=environment,
+-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+-                                   stderr=subprocess.DEVNULL, close_fds=True)
+-    except OSError:
+-        raise DraftError("cli_start_failed", unavailable=True) from None
+-    deadline = time.monotonic() + timeout
+-    data, sent = bytearray(), 0
+-    try:
++        _cli_starting = True
++        try:
++            process = subprocess.Popen(argv, cwd=cwd, env=environment,
++                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                       stderr=subprocess.DEVNULL, close_fds=True)
++        except OSError:
++            raise DraftError("cli_start_failed", unavailable=True) from None
++        finally:
++            _cli_starting = False
++        if _cancel_pending:
++            raise DraftError("request_outcome_unknown")
++        deadline = time.monotonic() + timeout
++        data, sent = bytearray(), 0
+         with selectors.DefaultSelector() as selector:
+             os.set_blocking(process.stdin.fileno(), False)
+             os.set_blocking(process.stdout.fileno(), False)
+@@ -171,12 +184,13 @@
+             raise DraftError("cli_request_failed")
+         return bytes(data)
+     finally:
+-        if process.poll() is None:
+-            process.kill()
+-        process.wait()
+-        for stream in (process.stdin, process.stdout):
+-            if stream and not stream.closed:
+-                stream.close()
++        if process is not None:
++            if process.poll() is None:
++                process.kill()
++            process.wait()
++            for stream in (process.stdin, process.stdout):
++                if stream and not stream.closed:
++                    stream.close()
+ 
+ 
+ def redact_evidence(evidence):
+@@ -671,7 +685,18 @@
+         raise DraftError("invalid_operation_id")
+ 
+ 
++def _cancel_request(_signum, _frame):
++    global _cancel_pending
++    # A second termination must not interrupt owned-child cleanup or journaling.
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++    if _cli_starting:
++        _cancel_pending = True
++        return
++    raise DraftError("request_outcome_unknown")
++
++
+ def main():
++    signal.signal(signal.SIGTERM, _cancel_request)
+     journal = None
+     try:
+         parser = argparse.ArgumentParser()
+--- a/Sources/Relay/Resources/Rotation/text_backend.py
++++ b/Sources/Relay/Resources/Rotation/text_backend.py
+@@ -13,6 +13,7 @@
+ import os
+ import re
+ import selectors
++import signal
+ import shutil
+ import socket
+ import sqlite3
+@@ -24,6 +25,9 @@
+ import time
+ import threading
+ from pathlib import Path
++
++_cli_starting = False
++_cancel_pending = False
+ 
+ PROVIDERS = ("anthropic_api", "claude_account", "codex_account")
+ MAX_SOURCE = 65536
+@@ -128,15 +132,24 @@
+ 
+ def run_cli(argv, prompt, cwd, timeout, environment):
+     """Bound output and elapsed time; only stop the subprocess we just created."""
++    global _cli_starting
++    process = None
++    # The handler defers its exception while Popen acquires the child handle.
++    # This avoids inheriting a blocked SIGTERM mask into the CLI.
+     try:
+-        process = subprocess.Popen(argv, cwd=cwd, env=environment,
+-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+-                                   stderr=subprocess.DEVNULL, close_fds=True)
+-    except OSError:
+-        raise DraftError("cli_start_failed", unavailable=True) from None
+-    deadline = time.monotonic() + timeout
+-    data, sent = bytearray(), 0
+-    try:
++        _cli_starting = True
++        try:
++            process = subprocess.Popen(argv, cwd=cwd, env=environment,
++                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                       stderr=subprocess.DEVNULL, close_fds=True)
++        except OSError:
++            raise DraftError("cli_start_failed", unavailable=True) from None
++        finally:
++            _cli_starting = False
++        if _cancel_pending:
++            raise DraftError("request_outcome_unknown")
++        deadline = time.monotonic() + timeout
++        data, sent = bytearray(), 0
+         with selectors.DefaultSelector() as selector:
+             os.set_blocking(process.stdin.fileno(), False)
+             os.set_blocking(process.stdout.fileno(), False)
+@@ -171,12 +184,13 @@
+             raise DraftError("cli_request_failed")
+         return bytes(data)
+     finally:
+-        if process.poll() is None:
+-            process.kill()
+-        process.wait()
+-        for stream in (process.stdin, process.stdout):
+-            if stream and not stream.closed:
+-                stream.close()
++        if process is not None:
++            if process.poll() is None:
++                process.kill()
++            process.wait()
++            for stream in (process.stdin, process.stdout):
++                if stream and not stream.closed:
++                    stream.close()
+ 
+ 
+ def redact_evidence(evidence):
+@@ -671,7 +685,18 @@
+         raise DraftError("invalid_operation_id")
+ 
+ 
++def _cancel_request(_signum, _frame):
++    global _cancel_pending
++    # A second termination must not interrupt owned-child cleanup or journaling.
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++    if _cli_starting:
++        _cancel_pending = True
++        return
++    raise DraftError("request_outcome_unknown")
++
++
+ def main():
++    signal.signal(signal.SIGTERM, _cancel_request)
+     journal = None
+     try:
+         parser = argparse.ArgumentParser()
+--- a/scripts/verify-rotation-text-backend.py
++++ b/scripts/verify-rotation-text-backend.py
+@@ -6,6 +6,8 @@
+ import os
+ from pathlib import Path
+ import sqlite3
++import selectors
++import signal
+ import subprocess
+ import sys
+ import tempfile
+@@ -250,6 +252,95 @@
+         with patch.object(text.http.client, "HTTPSConnection", Connection):
+             self.assertCode("api_http_302", lambda: text.api_post(b"{}", "never-log-this-key"))
+ 
++
++    def test_sigterm_reaps_started_cli_and_preserves_uncertain_operation(self):
++        ready = Path(self.temp.name) / "ready"
++        os.mkfifo(ready, 0o600)
++        executable = Path(self.temp.name) / "model"
++        executable.write_text("#!" + sys.executable + "\n" +
++            "import os,sys,json,signal\n" +
++            "sys.stdin.read()\n" +
++            "blocked = signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, [])\n" +
++            "with open(" + repr(str(ready)) + ", 'w') as f: "
++            "f.write(json.dumps({'pid':os.getpid(),'term_blocked':blocked})+'\\n'); f.flush()\n" +
++            "signal.pause()\n")
++        executable.chmod(0o700)
++        settings = dict(SETTINGS, providers=["codex_account"], codex_model="fixture",
++                        codex_path=str(executable))
++        journal = text.TextJournal(self.root)
++        journal.configure("a" * 32, settings)
++        journal.close()
++        environment = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL") if k in os.environ}
++        command = None
++        child = None
++        fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
++        try:
++            command = subprocess.Popen([sys.executable, "-I", "-S", str(SOURCE),
++                "--state-dir", str(self.root), "--operation", "submit"],
++                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                env=environment)
++            command.stdin.write(json.dumps(request()).encode())
++            command.stdin.close()
++            command.stdin = None
++            with selectors.DefaultSelector() as selector:
++                selector.register(fd, selectors.EVENT_READ)
++                self.assertTrue(selector.select(15), "fixture CLI never started")
++                record = json.loads(os.read(fd, 4096))
++            child = record["pid"]
++            self.assertFalse(record["term_blocked"], "CLI inherited blocked cancellation")
++            command.terminate()
++            output, diagnostics = command.communicate(timeout=10)
++            self.assertEqual(command.returncode, 0, diagnostics.decode())
++            result = json.loads(output)
++            self.assertEqual(result["status"], "uncertain")
++            self.assertEqual(result["result"]["code"], "request_outcome_unknown")
++            with self.assertRaises(ProcessLookupError):
++                os.kill(child, 0)
++            def no_replay(_):
++                self.fail("cancelled operation invoked the model again")
++            journal = text.TextJournal(self.root, execute=no_replay)
++            try:
++                self.assertEqual(journal.submit(request()), result)
++                self.assertEqual(journal.status()["requests_today"], 1)
++                self.assertCode("reconciliation_required", lambda: journal.submit(request(2)))
++            finally:
++                journal.close()
++        finally:
++            os.close(fd)
++            if command is not None and command.poll() is None:
++                command.kill()
++                command.wait(timeout=5)
++            if child is not None:
++                try:
++                    os.kill(child, signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++
++    def test_cancellation_during_cli_start_reaps_acquired_child(self):
++        original = text.subprocess.Popen
++        started = []
++        previous = signal.getsignal(signal.SIGTERM)
++        def start(*args, **kwargs):
++            process = original(*args, **kwargs)
++            started.append(process)
++            text._cancel_request(signal.SIGTERM, None)
++            return process
++        try:
++            with patch.object(text.subprocess, "Popen", start):
++                self.assertCode("request_outcome_unknown", lambda: text.run_cli(
++                    [sys.executable, "-c", "import signal; signal.pause()"],
++                    b"fixture", self.temp.name, 10, {}))
++            self.assertEqual(len(started), 1)
++            self.assertIsNotNone(started[0].returncode)
++            self.assertFalse(text._cli_starting)
++        finally:
++            signal.signal(signal.SIGTERM, previous)
++            text._cancel_pending = False
++            for process in started:
++                if process.poll() is None:
++                    process.kill()
++                    process.wait(timeout=5)
++
+     def test_source_and_embedded_security_policy_match(self):
+         embedded = ROOT / "remote/relayd/internal/daemon/host_rotation_text.py"
+         if embedded.exists():
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_text_cancel_test.go
+@@ -0,0 +1,75 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func TestHostRotationTextCommandCancellation(t *testing.T) {
++	python, err := hostRotationTextPython(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, mode := range []string{"graceful", "bounded_kill"} {
++		t.Run(mode, func(t *testing.T) {
++			root := t.TempDir()
++			ready := filepath.Join(root, "ready.sock")
++			marker := filepath.Join(root, "term")
++			listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: ready, Net: "unix"})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer listener.Close()
++			listener.SetDeadline(time.Now().Add(10 * time.Second))
++			script := "import signal,socket,sys\ndef terminate(*_):\n open(sys.argv[2], 'w').write('terminated')\n raise SystemExit(0)\nsignal.signal(signal.SIGTERM, terminate if sys.argv[3]=='graceful' else signal.SIG_IGN)\ns=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.close()\nsignal.pause()\n"
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			done := make(chan error, 1)
++			go func() {
++				_, err := hostRotationTextCommand(ctx, python, []string{"-I", "-S", "-c", script, ready, marker, mode}, nil)
++				done <- err
++			}()
++			connection, err := listener.AcceptUnix()
++			if err != nil {
++				cancel()
++				t.Fatal(err)
++			}
++			connection.Close()
++			began := time.Now()
++			cancel()
++			select {
++			case err := <-done:
++				if err == nil {
++					t.Fatal("cancelled command succeeded")
++				}
++				if mode == "graceful" && !errors.Is(err, context.Canceled) {
++					t.Fatal("graceful cancellation did not report context cancellation", err)
++				}
++			case <-time.After(8 * time.Second):
++				t.Fatal("text cancellation exceeded bounded cleanup")
++			}
++			elapsed := time.Since(began)
++			if mode == "graceful" {
++				data, err := os.ReadFile(marker)
++				if err != nil || string(data) != "terminated" {
++					t.Fatal("SIGTERM cleanup was not delivered", err)
++				}
++				if elapsed >= 3*time.Second {
++					t.Fatal("graceful process reached forced-kill deadline")
++				}
++			} else {
++				if elapsed < 2800*time.Millisecond || elapsed > 6*time.Second {
++					t.Fatal("forced termination bound changed", elapsed)
++				}
++				if _, err := os.Stat(marker); !os.IsNotExist(err) {
++					t.Fatal("ignored SIGTERM executed cleanup")
++				}
++			}
++		})
++	}
++}

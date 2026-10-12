@@ -1,0 +1,718 @@
+--- a/codex-rs/app-server-client/src/lib.rs
++++ b/codex-rs/app-server-client/src/lib.rs
+@@ -312,6 +312,11 @@
+         response_tx: oneshot::Sender<std::io::Result<()>>,
+     },
+     CommitContextRotation {
++        reservation_id: NativeRotationReservationId,
++        request: NativeRotationCommitRequest,
++        response_tx: oneshot::Sender<NativeRotationCommitResult>,
++    },
++    CancelContextRotation {
+         reservation_id: NativeRotationReservationId,
+         request: NativeRotationCommitRequest,
+         response_tx: oneshot::Sender<NativeRotationCommitResult>,
+@@ -435,6 +440,13 @@
+                                 let request_sender = request_sender.clone();
+                                 tokio::spawn(async move {
+                                     let result = request_sender.commit_context_rotation(reservation_id, request).await;
++                                    let _ = response_tx.send(result);
++                                });
++                            }
++                            Some(ClientCommand::CancelContextRotation { reservation_id, request, response_tx }) => {
++                                let request_sender = request_sender.clone();
++                                tokio::spawn(async move {
++                                    let result = request_sender.cancel_context_rotation(reservation_id, request).await;
+                                     let _ = response_tx.send(result);
+                                 });
+                             }
+@@ -757,6 +769,34 @@
+         })?
+     }
+ 
++    /// Cancels before transfer or observes the retained outcome; errors remain fenced.
++    pub async fn cancel_context_rotation(
++        &self,
++        reservation_id: NativeRotationReservationId,
++        request: NativeRotationCommitRequest,
++    ) -> NativeRotationCommitResult {
++        let (response_tx, response_rx) = oneshot::channel();
++        self.command_tx
++            .send(ClientCommand::CancelContextRotation {
++                reservation_id,
++                request,
++                response_tx,
++            })
++            .await
++            .map_err(|_| {
++                IoError::new(
++                    ErrorKind::BrokenPipe,
++                    "native cancellation worker is closed",
++                )
++            })?;
++        response_rx.await.map_err(|_| {
++            IoError::new(
++                ErrorKind::BrokenPipe,
++                "native cancellation response lost; reconciliation required",
++            )
++        })?
++    }
++
+     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
+         let (response_tx, response_rx) = oneshot::channel();
+         self.command_tx
+@@ -845,6 +885,25 @@
+             Self::Remote(_) => Err(IoError::new(
+                 ErrorKind::Unsupported,
+                 "native context rotation commit requires an in-process owner",
++            )),
++        }
++    }
++
++    /// Cancels before transfer or observes the retained outcome; errors remain fenced.
++    pub async fn cancel_context_rotation(
++        &self,
++        reservation_id: NativeRotationReservationId,
++        request: NativeRotationCommitRequest,
++    ) -> NativeRotationCommitResult {
++        match self {
++            Self::InProcess(handle) => {
++                handle
++                    .cancel_context_rotation(reservation_id, request)
++                    .await
++            }
++            Self::Remote(_) => Err(IoError::new(
++                ErrorKind::Unsupported,
++                "native context rotation cancellation requires an in-process owner",
+             )),
+         }
+     }
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -220,6 +220,11 @@
+         request: NativeRotationCommitRequest,
+         response_tx: oneshot::Sender<NativeRotationCommitResult>,
+     },
++    CancelContextRotation {
++        reservation_id: NativeRotationReservationId,
++        request: NativeRotationCommitRequest,
++        response_tx: oneshot::Sender<NativeRotationCommitResult>,
++    },
+     Request {
+         request: Box<ClientRequest>,
+         response_tx: oneshot::Sender<PendingClientRequestResponse>,
+@@ -257,6 +262,11 @@
+         request: NativeRotationCommitRequest,
+         response_tx: oneshot::Sender<NativeRotationCommitResult>,
+     },
++    CancelContextRotation {
++        reservation_id: NativeRotationReservationId,
++        request: NativeRotationCommitRequest,
++        response_tx: oneshot::Sender<NativeRotationCommitResult>,
++    },
+     Request(Box<ClientRequest>, tokio_util::sync::CancellationToken),
+     Notification(ClientNotification),
+ }
+@@ -322,6 +332,27 @@
+             IoError::new(
+                 ErrorKind::BrokenPipe,
+                 "native commit response lost; reconciliation required",
++            )
++        })?
++    }
++
++    /// Cancels before transfer or observes the exact retained commit outcome.
++    /// A lost reply or missing reservation keeps the foreground fenced.
++    pub async fn cancel_context_rotation(
++        &self,
++        reservation_id: NativeRotationReservationId,
++        request: NativeRotationCommitRequest,
++    ) -> NativeRotationCommitResult {
++        let (response_tx, response_rx) = oneshot::channel();
++        self.try_send_client_message(InProcessClientMessage::CancelContextRotation {
++            reservation_id,
++            request,
++            response_tx,
++        })?;
++        response_rx.await.map_err(|_| {
++            IoError::new(
++                ErrorKind::BrokenPipe,
++                "native cancellation response lost; reconciliation required",
+             )
+         })?
+     }
+@@ -694,6 +725,17 @@
+                                     )));
+                                 }
+                             }
++                            Some(ProcessorCommand::CancelContextRotation { reservation_id, request, response_tx }) => {
++                                if session.initialized() {
++                                    processor.cancel_context_rotation_in_process(
++                                        IN_PROCESS_CONNECTION_ID, reservation_id, request, response_tx,
++                                    );
++                                } else {
++                                    let _ = response_tx.send(Err(IoError::new(
++                                        ErrorKind::NotConnected, "native cancellation requires initialized in-process owner",
++                                    )));
++                                }
++                            }
+                             Some(ProcessorCommand::Notification(notification)) => {
+                                 processor.process_client_notification(notification).await;
+                             }
+@@ -830,6 +872,23 @@
+                                     ),
+                                 };
+                                 if let ProcessorCommand::CommitContextRotation { response_tx, .. } = command {
++                                    let _ = response_tx.send(Err(IoError::new(kind, message)));
++                                }
++                            }
++                        }
++                        Some(InProcessClientMessage::CancelContextRotation { reservation_id, request, response_tx }) => {
++                            if let Err(error) = processor_tx.try_send(ProcessorCommand::CancelContextRotation {
++                                reservation_id, request, response_tx,
++                            }) {
++                                let (kind, message, command) = match error {
++                                    mpsc::error::TrySendError::Full(command) => (
++                                        ErrorKind::WouldBlock, "native cancellation processor queue is full", command,
++                                    ),
++                                    mpsc::error::TrySendError::Closed(command) => (
++                                        ErrorKind::BrokenPipe, "native cancellation processor is closed", command,
++                                    ),
++                                };
++                                if let ProcessorCommand::CancelContextRotation { response_tx, .. } = command {
+                                     let _ = response_tx.send(Err(IoError::new(kind, message)));
+                                 }
+                             }
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -733,6 +733,23 @@
+         );
+     }
+ 
++    pub(crate) fn cancel_context_rotation_in_process(
++        &self,
++        connection_id: ConnectionId,
++        reservation_id: uuid::Uuid,
++        request: codex_core::NativeRotationCommitRequest,
++        response_tx: tokio::sync::oneshot::Sender<
++            std::io::Result<Arc<codex_core::NativeRotationCommitOutcome>>,
++        >,
++    ) {
++        self.thread_processor.cancel_context_rotation_in_process(
++            connection_id,
++            reservation_id,
++            request,
++            response_tx,
++        );
++    }
++
+     pub(crate) async fn process_client_request(
+         self: &Arc<Self>,
+         connection_id: ConnectionId,
+--- a/codex-rs/app-server/src/request_processors/context_rotation.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation.rs
+@@ -209,6 +209,32 @@
+         Ok(())
+     }
+ 
++    /// Establish the cancellation barrier before spawning any response waiter.
++    /// This in-memory result is not a durable host-ledger abort receipt.
++    pub(crate) fn cancel_context_rotation_in_process(
++        &self,
++        connection_id: ConnectionId,
++        reservation_id: uuid::Uuid,
++        request: codex_core::NativeRotationCommitRequest,
++        response_tx: tokio::sync::oneshot::Sender<
++            std::io::Result<Arc<codex_core::NativeRotationCommitOutcome>>,
++        >,
++    ) {
++        match self
++            .rotation_reservations
++            .cancel_commit(connection_id, reservation_id, request)
++        {
++            Ok(observer) => {
++                self.background_tasks.spawn(async move {
++                    let _ = response_tx.send(Ok(owner::await_commit(observer).await));
++                });
++            }
++            Err(error) => {
++                let _ = response_tx.send(Err(std::io::Error::other(error.message)));
++            }
++        }
++    }
++
+     // Rust embedding only: callers must retain their sealed frontend owner and
+     // verified durable host intent. Transport errors never authorize input release.
+     pub(crate) fn commit_context_rotation_in_process(
+--- a/codex-rs/app-server/src/request_processors/context_rotation_commit_tests.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation_commit_tests.rs
+@@ -530,3 +530,335 @@
+     drop(outcome);
+     assert!(weak.upgrade().is_none());
+ }
++
++#[tokio::test]
++async fn context_rotation_cancellation_blocks_delayed_commit_and_retains_exact_outcome() {
++    let registry = RotationReservations::default();
++    let key = registry
++        .claim(
++            ConnectionId(1),
++            ThreadId::new(),
++            Instant::now() + Duration::from_secs(5),
++        )
++        .await
++        .unwrap();
++    let (lease, drops) = cancel_probe();
++    registry.retain(&key, lease).await.unwrap();
++    let request = request(key.thread);
++    let monitor = registry.monitor(key.clone(), std::future::pending());
++    let observer = registry
++        .cancel_commit_using(key.owner, key.id, request.clone(), |_| true)
++        .unwrap();
++    let outcome = await_commit(observer).await;
++    assert!(matches!(
++        &*outcome,
++        NativeRotationCommitOutcome::Refused(NativeRotationError::Cancelled)
++    ));
++    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
++    assert!(key.cancelled.is_cancelled());
++    registry.disconnect(key.owner).await;
++    monitor.await;
++    assert!(!registry.release(key.owner, key.thread, key.id).await);
++    assert!(
++        registry
++            .claim(
++                key.owner,
++                key.thread,
++                Instant::now() + Duration::from_secs(5)
++            )
++            .await
++            .is_err()
++    );
++    // This is the delayed worker that had already passed observe_commit.
++    let late = registry
++        .begin_commit_using(key.owner, key.id, request.clone(), |_| {
++            panic!("cancelled lease cannot transfer")
++        })
++        .unwrap();
++    assert!(late.transaction.is_none());
++    assert!(Arc::ptr_eq(&outcome, &await_commit(late.observer).await));
++    let duplicate = registry
++        .cancel_commit_using(key.owner, key.id, request.clone(), |_| {
++            panic!("retry cannot inspect a released lease")
++        })
++        .unwrap();
++    assert!(Arc::ptr_eq(&outcome, &await_commit(duplicate).await));
++    assert!(
++        registry
++            .retained_request_for_attachment(key.owner, key.id, &outcome)
++            .unwrap()
++            == request
++    );
++    registry.retire_commit(key.owner, key.id, &outcome).unwrap();
++    assert!(
++        registry
++            .begin_commit_using(key.owner, key.id, request.clone(), |_| true)
++            .is_err()
++    );
++    assert!(
++        registry
++            .cancel_commit_using(key.owner, key.id, request, |_| true)
++            .is_err()
++    );
++}
++
++#[tokio::test]
++async fn context_rotation_cancellation_after_transfer_observes_without_overwriting() {
++    let registry = RotationReservations::<usize>::default();
++    let key = registry
++        .claim(
++            ConnectionId(1),
++            ThreadId::new(),
++            Instant::now() + Duration::from_secs(5),
++        )
++        .await
++        .unwrap();
++    registry.retain(&key, 23).await.unwrap();
++    let request = request(key.thread);
++    let started = registry
++        .begin_commit_using(key.owner, key.id, request.clone(), |_| true)
++        .unwrap();
++    let observer = registry
++        .cancel_commit_using(key.owner, key.id, request.clone(), |_| {
++            panic!("transfer already won")
++        })
++        .unwrap();
++    assert!(observer.borrow().is_none());
++    assert!(!key.cancelled.is_cancelled());
++    let (lease, completion) = started.transaction.unwrap();
++    assert_eq!(lease, 23);
++    completion.finish(NativeRotationCommitOutcome::Refused(
++        NativeRotationError::Busy,
++    ));
++    let outcome = await_commit(observer).await;
++    assert!(matches!(
++        &*outcome,
++        NativeRotationCommitOutcome::Refused(NativeRotationError::Busy)
++    ));
++    assert!(Arc::ptr_eq(&outcome, &await_commit(started.observer).await));
++    let observed = registry
++        .cancel_commit_using(key.owner, key.id, request, |_| false)
++        .unwrap();
++    assert!(Arc::ptr_eq(&outcome, &await_commit(observed).await));
++}
++
++#[tokio::test]
++async fn context_rotation_cancellation_rejects_mismatches_without_consuming_lease() {
++    let registry = RotationReservations::<usize>::default();
++    let key = registry
++        .claim(
++            ConnectionId(1),
++            ThreadId::new(),
++            Instant::now() + Duration::from_secs(5),
++        )
++        .await
++        .unwrap();
++    let original = request(key.thread);
++    assert!(
++        registry
++            .cancel_commit_using(key.owner, key.id, original.clone(), |_| true)
++            .is_err()
++    );
++    registry.retain(&key, 31).await.unwrap();
++    assert!(
++        registry
++            .cancel_commit_using(ConnectionId(2), key.id, original.clone(), |_| true)
++            .is_err()
++    );
++    assert!(
++        registry
++            .cancel_commit_using(key.owner, uuid::Uuid::new_v4(), original.clone(), |_| true)
++            .is_err()
++    );
++    assert!(
++        registry
++            .cancel_commit_using(key.owner, key.id, request(ThreadId::new()), |_| true)
++            .is_err()
++    );
++    assert!(
++        registry
++            .cancel_commit_using(key.owner, key.id, original.clone(), |_| false)
++            .is_err()
++    );
++    assert!(
++        registry
++            .observe_commit(key.owner, key.id, &original)
++            .unwrap()
++            .is_none()
++    );
++    assert!(!key.cancelled.is_cancelled());
++    let outcome = await_commit(
++        registry
++            .cancel_commit_using(key.owner, key.id, original.clone(), |lease| *lease == 31)
++            .unwrap(),
++    )
++    .await;
++    // Same source but different operation/claim is not an idempotent retry.
++    let conflicting = NativeRotationCommitRequest::new(
++        uuid::Uuid::new_v4(),
++        uuid::Uuid::new_v4(),
++        original.source().clone(),
++        "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".into(),
++        "a".into(),
++    )
++    .unwrap();
++    assert!(
++        registry
++            .cancel_commit_using(key.owner, key.id, conflicting.clone(), |_| true)
++            .is_err()
++    );
++    assert!(
++        registry
++            .begin_commit_using(key.owner, key.id, conflicting, |_| true)
++            .is_err()
++    );
++    assert!(Arc::ptr_eq(
++        &outcome,
++        &await_commit(
++            registry
++                .observe_commit(key.owner, key.id, &original)
++                .unwrap()
++                .unwrap()
++        )
++        .await
++    ));
++}
++
++#[tokio::test(start_paused = true)]
++async fn context_rotation_cancellation_accepts_expired_held_but_never_missing_owner() {
++    for remove in [false, true] {
++        let registry = RotationReservations::<usize>::default();
++        let key = registry
++            .claim(
++                ConnectionId(1),
++                ThreadId::new(),
++                Instant::now() + Duration::from_secs(5),
++            )
++            .await
++            .unwrap();
++        registry.retain(&key, 41).await.unwrap();
++        tokio::time::advance(Duration::from_secs(6)).await;
++        key.cancelled.cancel();
++        if remove {
++            assert!(registry.release(key.owner, key.thread, key.id).await);
++            assert!(
++                registry
++                    .cancel_commit_using(key.owner, key.id, request(key.thread), |_| true)
++                    .is_err()
++            );
++        } else {
++            let result = registry
++                .cancel_commit_using(key.owner, key.id, request(key.thread), |_| true)
++                .unwrap();
++            assert!(matches!(
++                &*await_commit(result).await,
++                NativeRotationCommitOutcome::Refused(NativeRotationError::Cancelled)
++            ));
++        }
++    }
++}
++
++#[tokio::test]
++async fn context_rotation_cancellation_lost_observer_and_failed_commit_stay_retained() {
++    for transfer in [false, true] {
++        let registry = RotationReservations::<usize>::default();
++        let key = registry
++            .claim(
++                ConnectionId(1),
++                ThreadId::new(),
++                Instant::now() + Duration::from_secs(5),
++            )
++            .await
++            .unwrap();
++        registry.retain(&key, 51).await.unwrap();
++        let request = request(key.thread);
++        if transfer {
++            let started = registry
++                .begin_commit_using(key.owner, key.id, request.clone(), |_| true)
++                .unwrap();
++            drop(started.transaction);
++        }
++        drop(
++            registry
++                .cancel_commit_using(key.owner, key.id, request.clone(), |_| true)
++                .unwrap(),
++        );
++        let outcome = await_commit(
++            registry
++                .cancel_commit_using(key.owner, key.id, request, |_| true)
++                .unwrap(),
++        )
++        .await;
++        if transfer {
++            assert!(matches!(
++                &*outcome,
++                NativeRotationCommitOutcome::ReconciliationRequired(_)
++            ));
++            assert!(registry.retire_commit(key.owner, key.id, &outcome).is_err());
++        } else {
++            assert!(matches!(
++                &*outcome,
++                NativeRotationCommitOutcome::Refused(NativeRotationError::Cancelled)
++            ));
++        }
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn context_rotation_cancellation_and_commit_share_one_linearization_point() {
++    for _ in 0..64 {
++        let registry = Arc::new(RotationReservations::<usize>::default());
++        let key = registry
++            .claim(
++                ConnectionId(1),
++                ThreadId::new(),
++                Instant::now() + Duration::from_secs(5),
++            )
++            .await
++            .unwrap();
++        registry.retain(&key, 61).await.unwrap();
++        let request = request(key.thread);
++        let barrier = Arc::new(tokio::sync::Barrier::new(2));
++        let worker_registry = Arc::clone(&registry);
++        let worker_barrier = Arc::clone(&barrier);
++        let worker_request = request.clone();
++        let owner = key.owner;
++        let id = key.id;
++        let worker = tokio::spawn(async move {
++            worker_barrier.wait().await;
++            worker_registry
++                .begin_commit_using(owner, id, worker_request, |_| true)
++                .unwrap()
++        });
++        barrier.wait().await;
++        let cancellation = registry
++            .cancel_commit_using(key.owner, key.id, request, |_| true)
++            .unwrap();
++        let started = worker.await.unwrap();
++        let transferred = started.transaction.is_some();
++        if let Some((lease, completion)) = started.transaction {
++            assert_eq!(lease, 61);
++            completion.finish(NativeRotationCommitOutcome::Refused(
++                NativeRotationError::Busy,
++            ));
++        }
++        let outcome = await_commit(cancellation).await;
++        assert!(Arc::ptr_eq(&outcome, &await_commit(started.observer).await));
++        match (&*outcome, transferred) {
++            (NativeRotationCommitOutcome::Refused(NativeRotationError::Busy), true)
++            | (NativeRotationCommitOutcome::Refused(NativeRotationError::Cancelled), false) => {}
++            _ => panic!("cancellation and transfer both won"),
++        }
++    }
++}
++
++struct CancelProbe(Arc<std::sync::atomic::AtomicUsize>);
++impl Drop for CancelProbe {
++    fn drop(&mut self) {
++        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++    }
++}
++fn cancel_probe() -> (CancelProbe, Arc<std::sync::atomic::AtomicUsize>) {
++    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    (CancelProbe(Arc::clone(&drops)), drops)
++}
+--- a/codex-rs/app-server/src/request_processors/context_rotation_owner.rs
++++ b/codex-rs/app-server/src/request_processors/context_rotation_owner.rs
+@@ -421,6 +421,59 @@
+         Ok(Some(state.result.subscribe()))
+     }
+ 
++    /// Linearizes cancellation with the lease transfer. An accepted cancellation
++    /// retains the exact request/result, so a delayed worker can only observe it.
++    /// Missing/retired ownership is an error, never evidence of cancellation.
++    fn cancel_commit_using(
++        &self,
++        owner: ConnectionId,
++        id: uuid::Uuid,
++        request: NativeRotationCommitRequest,
++        matches_lease: impl FnOnce(&L) -> bool,
++    ) -> Result<CommitObserver, JSONRPCErrorError> {
++        let mut active = self
++            .active
++            .lock()
++            .map_err(|_| rotation_error("rotation owner unavailable"))?;
++        let entry = active
++            .as_mut()
++            .filter(|entry| entry.matches(owner, request.source().thread_id, id))
++            .ok_or_else(|| rotation_error("native cancellation owner mismatch"))?;
++        if let Some(state) = entry.commit.as_ref() {
++            if state.request != request {
++                return Err(rotation_error(
++                    "native cancellation request does not match the retained transaction",
++                ));
++            }
++            // Transfer won the race, or cancellation already completed. Neither
++            // case permits replacing the retained result or acquiring a lease.
++            return Ok(state.result.subscribe());
++        }
++        let ReservationPhase::Held(lease) = &entry.phase else {
++            return Err(rotation_error(
++                "native cancellation has no held reservation",
++            ));
++        };
++        if !matches_lease(lease) {
++            return Err(rotation_error(
++                "native cancellation source does not match the held lease",
++            ));
++        }
++        // Expiry/revocation may prevent a commit, but cannot prevent this owner
++        // from relinquishing a lease still held under this lock.
++        let outcome = Arc::new(NativeRotationCommitOutcome::Refused(
++            NativeRotationError::Cancelled,
++        ));
++        let (result, observer) = watch::channel(Some(outcome));
++        entry.commit = Some(Arc::new(RotationCommitState { request, result }));
++        // The terminal slot uses the same retention rules as a transferred
++        // commit: monitor, release, disconnect and a new claim cannot erase it.
++        let held = std::mem::replace(&mut entry.phase, ReservationPhase::Transferred);
++        entry.key.cancelled.cancel();
++        drop(held);
++        Ok(observer)
++    }
++
+     fn begin_commit_using(
+         &self,
+         owner: ConnectionId,
+@@ -476,6 +529,16 @@
+     }
+ }
+ impl RotationReservations {
++    pub(super) fn cancel_commit(
++        &self,
++        owner: ConnectionId,
++        id: uuid::Uuid,
++        request: NativeRotationCommitRequest,
++    ) -> Result<CommitObserver, JSONRPCErrorError> {
++        let source = request.source().clone();
++        self.cancel_commit_using(owner, id, request, |lease| lease.receipt() == &source)
++    }
++
+     pub(super) fn begin_commit(
+         &self,
+         owner: ConnectionId,
+--- a/codex-rs/core/src/session/native_rotation.rs
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -24,6 +24,8 @@
+     Closed,
+     #[error("native reservation expired")]
+     Expired,
++    #[error("native rotation cancelled before commit transfer")]
++    Cancelled,
+     #[error("native rotation preparation is unsupported for this session")]
+     Unsupported,
+     #[error("the expected successfully completed native turn is no longer current")]
+--- a/codex-rs/tui/src/app_server_session/context_rotation.rs
++++ b/codex-rs/tui/src/app_server_session/context_rotation.rs
+@@ -77,6 +77,7 @@
+             frontend_runtime_id: frontend.runtime_id,
+             frontend_generation: frontend.generation,
+             outcome: None,
++            submission_attempted: false,
+         };
+         Ok((frontend, commit))
+     }
+@@ -188,6 +189,7 @@
+     frontend_runtime_id: Uuid,
+     frontend_generation: u64,
+     outcome: Option<std::sync::Arc<NativeRotationCommitOutcome>>,
++    submission_attempted: bool,
+ }
+ 
+ impl NativeContextRotationCommit {
+@@ -245,13 +247,19 @@
+         if let Some(outcome) = &self.outcome {
+             return Ok(std::sync::Arc::clone(outcome));
+         }
+-        // Once submission is possible, cancellation or a lost reply is uncertainty.
+-        // The exact request can observe its retained result without another transfer.
++        // Set before the first await: dropping this future cannot allow a retry
++        // to submit another commit. Reconciliation cancels an untransferred
++        // lease or observes the exact result retained by the broker.
+         self.release_on_drop.armed = false;
+-        let outcome = self
+-            .handle
+-            .commit_context_rotation(self.reservation_id, self.request.clone())
+-            .await?;
++        let outcome = if std::mem::replace(&mut self.submission_attempted, true) {
++            self.handle
++                .cancel_context_rotation(self.reservation_id, self.request.clone())
++                .await?
++        } else {
++            self.handle
++                .commit_context_rotation(self.reservation_id, self.request.clone())
++                .await?
++        };
+         self.outcome = Some(std::sync::Arc::clone(&outcome));
+         Ok(outcome)
+     }

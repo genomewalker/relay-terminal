@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "example.project-guide",
+  "name": "Project guide",
+  "version": "1.0.0",
+  "repository": "example/project-guide",
+  "permissions": [],
+  "contributions": [
+    {
+      "id": "getting-started",
+      "kind": "information",
+      "title": "Project guide",
+      "text": "Replace this text with project-specific guidance. This package does not run commands or read your files."
+    }
+  ]
+}

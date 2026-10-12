@@ -1,0 +1,436 @@
+--- a/codex-rs/core/src/session/native_rotation.rs
++++ b/codex-rs/core/src/session/native_rotation.rs
+@@ -74,6 +74,18 @@
+         self,
+         request: close::NativeCloseRequest,
+     ) -> Result<close::NativeClosedSession, NativeRotationError> {
++        match self.close_for_rotation_outcome(request).await {
++            close::NativeCloseOutcome::Completed(closed) => Ok(*closed),
++            close::NativeCloseOutcome::Refused(error)
++            | close::NativeCloseOutcome::ReconciliationRequired(error) => Err(error),
++        }
++    }
++
++    /// Transaction owners must retain the outcome phase through foreground attachment.
++    pub(crate) async fn close_for_rotation_outcome(
++        self,
++        request: close::NativeCloseRequest,
++    ) -> close::NativeCloseOutcome {
+         self.lease.close_for_rotation(request).await
+     }
+ }
+--- a/codex-rs/core/src/session/native_rotation_close.rs
++++ b/codex-rs/core/src/session/native_rotation_close.rs
+@@ -110,9 +110,21 @@
+     }
+ }
+ 
++/// The native owner reports whether this transaction crossed its seal.
++/// An ordinary error or a lost reply must never be interpreted as a refusal.
++#[derive(Debug)]
++pub(crate) enum NativeCloseOutcome {
++    /// This transaction did not seal. Revalidate source identity before resuming input.
++    Refused(NativeRotationError),
++    /// Carries the actual target and verified receipts, never a reconstructed receipt.
++    Completed(Box<NativeClosedSession>),
++    /// A post-seal failure or lost owner reply requires journal/owner reconciliation.
++    ReconciliationRequired(NativeRotationError),
++}
++
+ pub(in crate::session) struct NativeCloseCommand {
+     pub(in crate::session) request: NativeCloseRequest,
+-    pub(in crate::session) reply: oneshot::Sender<Result<NativeClosedSession, NativeRotationError>>,
++    pub(in crate::session) reply: oneshot::Sender<NativeCloseOutcome>,
+ }
+ 
+ /// Once sealed, this future belongs to the submission-loop owner and must not be
+@@ -122,9 +134,9 @@
+     reservation: ActivityReservation,
+     deadline: Instant,
+     request: NativeCloseRequest,
+-    reply: &oneshot::Sender<Result<NativeClosedSession, NativeRotationError>>,
+-) -> (bool, Result<NativeClosedSession, NativeRotationError>) {
+-    let refused = |error| (false, Err(error));
++    reply: &oneshot::Sender<NativeCloseOutcome>,
++) -> NativeCloseOutcome {
++    let refused = NativeCloseOutcome::Refused;
+     if let Err(error) = request.validate() {
+         return refused(error);
+     }
+@@ -249,12 +261,12 @@
+             .load(Ordering::Acquire);
+     if failed {
+         let _ = journal.record("failed").await;
+-        return (true, Err(NativeRotationError::CloseFailed(
++        return NativeCloseOutcome::ReconciliationRequired(NativeRotationError::CloseFailed(
+             "runtime, transcript or operation journal did not confirm close; reconcile the operation".into(),
+-        )));
++        ));
+     }
+     if let Err(error) = journal.record("closed").await {
+-        return (true, Err(error));
++        return NativeCloseOutcome::ReconciliationRequired(error);
+     }
+     let (restored, restore_receipt) = if let Some(restore) = &restore {
+         let result = manager_owner
+@@ -264,9 +276,8 @@
+             Ok(thread) => thread,
+             Err(error) => {
+                 let _ = journal.record("restore_failed").await;
+-                return (
+-                    true,
+-                    Err(NativeRotationError::RestoreFailed(error.to_string())),
++                return NativeCloseOutcome::ReconciliationRequired(
++                    NativeRotationError::RestoreFailed(error.to_string()),
+                 );
+             }
+         };
+@@ -284,14 +295,14 @@
+                 restore.abort();
+                 let _ = thread.thread.shutdown_and_wait().await;
+                 let _ = journal.record("restore_failed").await;
+-                return (true, Err(error));
++                return NativeCloseOutcome::ReconciliationRequired(error);
+             }
+         };
+         if let Err(error) = journal.restored(verified.clone()).await {
+             restore.abort();
+             let _ = thread.thread.shutdown_and_wait().await;
+             let _ = journal.record("restore_failed").await;
+-            return (true, Err(error));
++            return NativeCloseOutcome::ReconciliationRequired(error);
+         }
+         (Some(thread), Some(verified))
+     } else {
+@@ -323,13 +334,9 @@
+                 "failed"
+             })
+             .await;
+-        return (
+-            true,
+-            Err(NativeRotationError::CloseFailed(
+-                "runtime ownership changed before native publication; reconcile the operation"
+-                    .into(),
+-            )),
+-        );
++        return NativeCloseOutcome::ReconciliationRequired(NativeRotationError::CloseFailed(
++            "runtime ownership changed before native publication; reconcile the operation".into(),
++        ));
+     }
+     if let Some(restore) = &restore {
+         restore.commit();
+@@ -355,7 +362,7 @@
+     // Unlike ordinary shutdown, this notification follows both a successful
+     // writer close and its durable operation receipt.
+     handlers::emit_shutdown_complete(&session, request.operation_id.to_string()).await;
+-    (true, Ok(closed))
++    NativeCloseOutcome::Completed(Box::new(closed))
+ }
+ 
+ #[cfg(test)]
+--- a/codex-rs/core/src/session/rotation_dispatch.rs
++++ b/codex-rs/core/src/session/rotation_dispatch.rs
+@@ -7,8 +7,8 @@
+ use super::native_rotation::NativeRotationReceipt;
+ use super::native_rotation::PreparedSession;
+ use super::native_rotation::close::NativeCloseCommand;
++use super::native_rotation::close::NativeCloseOutcome;
+ use super::native_rotation::close::NativeCloseRequest;
+-use super::native_rotation::close::NativeClosedSession;
+ use super::session::Session;
+ use async_channel::Receiver;
+ use async_channel::RecvError;
+@@ -39,17 +39,20 @@
+     pub(super) async fn close_for_rotation(
+         self,
+         request: NativeCloseRequest,
+-    ) -> Result<NativeClosedSession, DispatchError> {
++    ) -> NativeCloseOutcome {
+         let Self {
+             _release, close, ..
+         } = self;
+         let (reply, result) = oneshot::channel();
+-        close
+-            .send(NativeCloseCommand { request, reply })
+-            .map_err(|_| DispatchError::Closed)?;
++        if close.send(NativeCloseCommand { request, reply }).is_err() {
++            // The command was never delivered to its native owner.
++            return NativeCloseOutcome::Refused(DispatchError::Closed);
++        }
+         // Keep release alive while awaiting the owner. A lost caller cancels
+         // before sealing; the receiver owns completion after sealing.
+-        let result = result.await.map_err(|_| DispatchError::Closed)?;
++        let result = result
++            .await
++            .unwrap_or_else(|_| NativeCloseOutcome::ReconciliationRequired(DispatchError::Closed));
+         drop(_release);
+         result
+     }
+@@ -239,10 +242,12 @@
+             End::Submission(submission) => Some(submission),
+             End::Close(Ok(command)) => {
+                 let Some(prepared) = native else {
+-                    let _ = command.reply.send(Err(DispatchError::Unsupported));
++                    let _ = command
++                        .reply
++                        .send(NativeCloseOutcome::Refused(DispatchError::Unsupported));
+                     return None;
+                 };
+-                let (sealed, result) = super::native_rotation::close::execute(
++                let result = super::native_rotation::close::execute(
+                     prepared,
+                     reservation,
+                     request.deadline,
+@@ -250,6 +255,7 @@
+                     &command.reply,
+                 )
+                 .await;
++                let sealed = !matches!(result, NativeCloseOutcome::Refused(_));
+                 let _ = command.reply.send(result);
+                 if sealed {
+                     // The owner already attempted teardown exactly once. No
+--- a/codex-rs/core/src/session/rotation_dispatch_tests.rs
++++ b/codex-rs/core/src/session/rotation_dispatch_tests.rs
+@@ -212,3 +212,73 @@
+     assert!(matches!(poll!(&mut start), Poll::Pending));
+     reservation.invalidated().await;
+ }
++
++fn outcome_transport() -> (
++    super::DispatchLease,
++    tokio::sync::oneshot::Receiver<super::NativeCloseCommand>,
++    tokio::sync::oneshot::Receiver<()>,
++) {
++    let (_release, released) = tokio::sync::oneshot::channel();
++    let (close, request) = tokio::sync::oneshot::channel();
++    (
++        super::DispatchLease {
++            _release,
++            close,
++            revoked: tokio_util::sync::CancellationToken::new(),
++            receipt: None,
++        },
++        request,
++        released,
++    )
++}
++
++fn outcome_request() -> super::NativeCloseRequest {
++    super::NativeCloseRequest::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "a".repeat(64))
++}
++
++#[tokio::test]
++async fn native_close_outcome_undelivered_command_is_a_refusal() {
++    let (lease, request, _released) = outcome_transport();
++    drop(request);
++    assert!(matches!(
++        lease.close_for_rotation(outcome_request()).await,
++        super::NativeCloseOutcome::Refused(DispatchError::Closed)
++    ));
++}
++
++#[tokio::test]
++async fn native_close_outcome_lost_reply_requires_reconciliation() {
++    let (lease, request, _released) = outcome_transport();
++    let completion = lease.close_for_rotation(outcome_request());
++    tokio::pin!(completion);
++    assert!(poll!(&mut completion).is_pending());
++    let command = request.await.unwrap();
++    drop(command.reply);
++    assert!(matches!(
++        completion.await,
++        super::NativeCloseOutcome::ReconciliationRequired(DispatchError::Closed)
++    ));
++}
++
++#[tokio::test]
++async fn native_close_outcome_owner_refusal_reopens_dispatch() {
++    let (sender, mut dispatch, _) = channel();
++    let request = sender.reserve_dispatch(0);
++    tokio::pin!(request);
++    assert!(poll!(&mut request).is_pending());
++    let receive = dispatch.recv();
++    tokio::pin!(receive);
++    assert!(poll!(&mut receive).is_pending());
++    let lease = request.await.unwrap();
++    let completion = lease.close_for_rotation(outcome_request());
++    tokio::pin!(completion);
++    assert!(poll!(&mut completion).is_pending());
++    assert!(poll!(&mut receive).is_pending());
++    assert!(matches!(
++        completion.await,
++        super::NativeCloseOutcome::Refused(DispatchError::Unsupported)
++    ));
++    assert!(!sender.is_closed());
++    sender.send(submission("after refusal")).await.unwrap();
++    assert_eq!(receive.await.unwrap().id, "after refusal");
++}
+--- /dev/null
++++ b/codex-rs/core/src/thread_manager/native_rotation_outcome_tests.rs
+@@ -0,0 +1,157 @@
++//! The same persistence error has different authority before and after the native seal.
++use super::Fixture;
++use super::native_close_directory;
++use super::native_close_fixture_finished;
++use super::native_close_request;
++use super::native_restore_request;
++use crate::NativeRotationError;
++use crate::session::native_rotation::close::NativeCloseOutcome;
++use pretty_assertions::assert_eq;
++use std::sync::Arc;
++use tokio::sync::Notify;
++
++#[tokio::test]
++async fn native_close_outcome_invalid_request_does_not_seal() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request = native_close_request();
++    request.capsule_sha256 = "invalid".into();
++    let directory = native_close_directory(&fixture, request.operation_id);
++    assert!(matches!(
++        reservation.close_for_rotation_outcome(request).await,
++        NativeCloseOutcome::Refused(NativeRotationError::InvalidRequest)
++    ));
++    assert!(!directory.exists());
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_ok()
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_close_outcome_preseal_persistence_failure_is_a_refusal() {
++    let fixture = Fixture::completed().await;
++    std::fs::write(
++        fixture
++            ._home
++            .path()
++            .join("codex-home")
++            .join("relay-context-rotation"),
++        "occupied",
++    )
++    .unwrap();
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    assert!(matches!(
++        reservation
++            .close_for_rotation_outcome(native_close_request())
++            .await,
++        NativeCloseOutcome::Refused(NativeRotationError::Persistence(_))
++    ));
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_ok()
++    );
++    fixture.close().await;
++}
++
++#[tokio::test]
++async fn native_close_outcome_postseal_persistence_failure_requires_reconciliation() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let mut request = native_close_request();
++    let directory = native_close_directory(&fixture, request.operation_id);
++    let entered = Arc::new(Notify::new());
++    let proceed = Arc::new(Notify::new());
++    request.test_after_seal = Some((Arc::clone(&entered), Arc::clone(&proceed)));
++    let accepted = entered.notified();
++    tokio::pin!(accepted);
++    accepted.as_mut().enable();
++    let completion = tokio::spawn(reservation.close_for_rotation_outcome(request));
++    tokio::time::timeout(std::time::Duration::from_secs(5), accepted)
++        .await
++        .unwrap();
++    std::fs::create_dir(directory.join("closed.json")).unwrap();
++    proceed.notify_one();
++    assert!(matches!(
++        completion.await.unwrap(),
++        NativeCloseOutcome::ReconciliationRequired(NativeRotationError::Persistence(_))
++    ));
++    assert!(directory.join("sealed.json").is_file());
++    assert!(
++        fixture
++            .manager
++            .get_thread(fixture.root.thread_id)
++            .await
++            .is_err()
++    );
++    assert!(
++        fixture
++            .manager
++            .state
++            .native_rotation_is_fenced(fixture.root.thread_id)
++    );
++    native_close_fixture_finished(fixture).await;
++}
++
++#[tokio::test]
++async fn native_close_outcome_completion_carries_the_actual_restored_target() {
++    let fixture = Fixture::completed().await;
++    let reservation = fixture
++        .root
++        .thread
++        .prepare_context_rotation(fixture.turn.clone())
++        .await
++        .unwrap();
++    let source = reservation.receipt().clone();
++    let request = native_restore_request("exact restored capsule");
++    let operation = request.operation_id;
++    let outcome = reservation.close_for_rotation_outcome(request).await;
++    let NativeCloseOutcome::Completed(mut closed) = outcome else {
++        panic!("native restoration did not complete: {outcome:?}");
++    };
++    assert_eq!(closed.receipt.source, source);
++    assert_eq!(closed.receipt.operation_id, operation);
++    let restored = closed.restored.take().unwrap();
++    assert_eq!(
++        closed.restore_receipt.as_ref().unwrap().thread_id,
++        restored.thread_id
++    );
++    let registered = fixture
++        .manager
++        .get_thread(restored.thread_id)
++        .await
++        .unwrap();
++    assert!(Arc::ptr_eq(&registered, &restored.thread));
++    assert!(
++        closed
++            .receipt
++            .journal_directory
++            .join("restored.json")
++            .is_file()
++    );
++    restored.thread.shutdown_and_wait().await.unwrap();
++    drop(closed);
++    native_close_fixture_finished(fixture).await;
++}
+--- a/codex-rs/core/src/thread_manager/native_rotation_tests.rs
++++ b/codex-rs/core/src/thread_manager/native_rotation_tests.rs
+@@ -1496,3 +1496,6 @@
+         fixture.close().await;
+     }
+ }
++
++#[path = "native_rotation_outcome_tests.rs"]
++mod outcome_tests;

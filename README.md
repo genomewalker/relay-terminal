@@ -16,6 +16,28 @@ From a Relay-managed remote shell, `rcode file.py` opens the file in a floating 
 
 Shells and agents run on the selected remote node. Tabs, splits, mouse interaction, context menus, and rendering are handled by the Mac application.
 
+## Plugins and plugin development
+
+Relay's experimental plugin system uses versioned JSON packages from public
+GitHub releases. Packages can provide information, HTTPS links, and native tools
+implemented by Relay. They do not execute downloaded code or run VS Code extensions.
+
+See the **[Plugin development guide](docs/PLUGIN-DEVELOPMENT.md)** for a starter
+manifest, API versions, permissions, local testing, publishing, installation and
+how to contribute new operations to Relay. The [architecture and roadmap](docs/PLUGIN-SYSTEM.md)
+and [current validation status](docs/plugins/CURRENT-ACCEPTANCE.md) distinguish
+working-copy features from installed or released builds. A published plugin may
+require a newer compatible Relay app and `relayd` than the public DMG.
+
+Development packages: [HPC jobs](docs/plugins/hpc-jobs/README.md),
+[artifacts](docs/plugins/artifacts/README.md),
+[agent activity](docs/plugins/agent-activity/README.md),
+[Git review](docs/plugins/git-review/README.md),
+[transfers](docs/plugins/transfers/README.md),
+[project actions](docs/plugins/project-actions/README.md), and
+[Radian](docs/plugins/radian/README.md). These pages describe working-copy
+features and limits; manual installed-app acceptance is still pending.
+
 ## Current architecture
 
 ```text
@@ -148,6 +170,10 @@ The package script emits a drag-to-Applications DMG, a ZIP for automated deploym
 
 Install a release by opening `Relay-<version>-macOS.dmg` and dragging Relay to Applications. macOS updates replace only the local application; remote workers and workspace state remain on their nodes and reattach on launch.
 
+### Claude prompt editor bridge
+
+New Relay shells enable the private Claude editor bridge at launch. Claude still runs its official CLI; the bridge captures the editor file for read-only prompt inspection. Set `RELAY_PROMPT_EDITOR_ENABLE=0` before launching a shell or Claude to disable it. Existing provider processes keep their launch environment. Cmd+A uses the viewport fallback when the running provider lacks a verified bridge; an uncertain editor transaction preserves input for recovery.
+
 ## Keyboard
 
 Press `⌘Q` twice within two seconds to quit Relay. Holding the keys does not count as a second press, and remote sessions remain running.
@@ -187,3 +213,40 @@ Drag a pane by its connection header and drop it near another pane's left, right
 ## License
 
 No project license has been selected. Public source visibility does not grant redistribution rights. Third-party packages retain their own licenses.
+
+### Configure the running app without UI automation
+
+The authenticated settings API exposes all main terminal, workspace, artifact,
+AI, remote-update preferences and keyboard bindings. Changes apply immediately
+through the same native model as Settings. Credentials and MCP grants are not
+writable settings. Plugin installation and host management remain separate operations.
+
+```bash
+./scripts/relay-settings.py get
+./scripts/relay-settings.py schema
+./scripts/relay-settings.py get intelligence_enabled
+./scripts/relay-settings.py set intelligence_enabled true
+./scripts/relay-settings.py set font_size 13.5
+./scripts/relay-settings.py update --file preferences.json
+```
+
+MCP clients can use `relay_get_settings` and `relay_update_settings`. Updates
+require the current instance, expected revision, stable request UUID and typed
+`changes` object. Existing workspace configuration permission is required.
+Invalid values, unknown keys, shortcut conflicts and stale revisions are rejected
+before any write. Reuse the same request UUID and payload after an uncertain
+response; do not create a new request automatically. An empty `key_bindings`
+object resets all shortcuts; otherwise supply the complete override map.
+
+For a graceful restart or signed update:
+
+```bash
+./scripts/restart-relay.py
+./scripts/restart-relay.py --candidate /path/to/Relay.app
+```
+
+### Native agent rendering
+
+The conversation view renders the provider transcript belonging to the verified Claude Code or Codex process in the same pane. The official CLI keeps ownership of the agent loop, tools, permissions, configuration, authentication, and session history. Relay does not launch a replacement SDK worker or app-server session for this view.
+
+Activity notifications refresh the native timeline. Native prompt submission uses the original terminal transport only after checking the exact session binding, authenticated idle state, and empty prompt. When these checks are unavailable, use the Terminal button for provider controls. Persistent remote panes use the same verified binding, idle-state, and empty-prompt checks as local panes. Direct SSH falls back to terminal controls when those checks are unavailable.

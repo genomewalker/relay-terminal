@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 2,
+  "id": "relay.artifacts",
+  "name": "Artifacts",
+  "version": "0.1.0",
+  "repository": "genomewalker/relay-plugin-artifacts",
+  "permissions": [
+    {
+      "kind": "projectRead",
+      "reason": "List files, preview images or plain text, and save a verified copy to the Mac."
+    }
+  ],
+  "contributions": [
+    {
+      "id": "main",
+      "kind": "tool",
+      "title": "Artifacts",
+      "text": "List files, preview images or plain text, and save a verified copy to the Mac.",
+      "operation": "artifacts"
+    }
+  ]
+}

@@ -1,0 +1,484 @@
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -131,6 +131,7 @@
+ mod markdown_copy;
+ mod permission_discovery;
+ mod pets;
++mod relay_rotation_bridge;
+ mod security_setup;
+ mod worktree_browser;
+ pub use custom_terminal::Terminal;
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -959,6 +959,7 @@
+                 history_cell::new_server_version_warning(notice.clone()),
+             )));
+         }
++        let _relay_rotation_bridge = crate::relay_rotation_bridge::start(app.app_event_tx.clone());
+         let initial_session_ms = initial_session_started_at.elapsed().as_millis();
+ 
+         if let Err(err) = startup_draft.flush_pending_events(tui).await {
+--- a/codex-rs/tui/src/tui/rotation.rs
++++ b/codex-rs/tui/src/tui/rotation.rs
+@@ -47,6 +47,14 @@
+ }
+ 
+ impl FrontendRotationReservation {
++    pub(crate) fn remaining_lifetime(&self) -> std::time::Duration {
++        if self.is_revoked() {
++            std::time::Duration::ZERO
++        } else {
++            self.deadline.saturating_duration_since(Instant::now())
++        }
++    }
++
+     pub(crate) fn is_revoked(&self) -> bool {
+         self.cancelled.is_cancelled() || Instant::now() >= self.deadline
+     }
+--- a/codex-rs/tui/src/app_server_session/context_rotation.rs
++++ b/codex-rs/tui/src/app_server_session/context_rotation.rs
+@@ -12,9 +12,39 @@
+     pub(crate) native: ThreadContextRotationPrepareResponse,
+     handle: AppServerRequestHandle,
+     deadline: tokio::time::Instant,
++    release_on_drop: bool,
+ }
+ 
+ impl PreparedContextRotation {
++    pub(crate) fn remaining_lifetime(&self) -> Duration {
++        self.deadline
++            .saturating_duration_since(tokio::time::Instant::now())
++            .min(self.frontend.remaining_lifetime())
++    }
++
++    pub(crate) async fn release(mut self) -> Result<()> {
++        tokio::time::timeout(
++            Duration::from_secs(5),
++            self.handle
++                .request_typed::<ThreadContextRotationReleaseResponse>(
++                    ClientRequest::ThreadContextRotationRelease {
++                        request_id: RequestId::String(format!(
++                            "relay-rotation-release-{}",
++                            Uuid::new_v4()
++                        )),
++                        params: ThreadContextRotationReleaseParams {
++                            thread_id: self.native.thread_id.clone(),
++                            reservation_id: self.native.reservation_id.clone(),
++                        },
++                    },
++                ),
++        )
++        .await
++        .map_err(|_| color_eyre::eyre::eyre!("native release timed out"))??;
++        self.release_on_drop = false;
++        Ok(())
++    }
++
+     pub(crate) async fn revoked(&self) {
+         tokio::select! {
+             _ = self.frontend.revoked() => {},
+@@ -25,6 +55,9 @@
+ 
+ impl Drop for PreparedContextRotation {
+     fn drop(&mut self) {
++        if !self.release_on_drop {
++            return;
++        }
+         let handle = self.handle.clone();
+         let params = ThreadContextRotationReleaseParams {
+             thread_id: self.native.thread_id.clone(),
+@@ -80,6 +113,7 @@
+                 native,
+                 handle,
+                 deadline,
++                release_on_drop: true,
+             };
+             if prepared.frontend.is_revoked()
+                 || tokio::time::Instant::now() >= deadline
+--- /dev/null
++++ b/codex-rs/tui/src/relay_rotation_bridge.rs
+@@ -0,0 +1,293 @@
++//! Private pipe connection from the native foreground owner to its Relay host worker.
++//! It offers bounded preparation/release only; no terminal input or model messages.
++use crate::app_event_sender::AppEventSender;
++use crate::app_server_session::context_rotation::PreparedContextRotation;
++use codex_app_server_protocol::ThreadContextRotationPrepareResponse;
++use codex_protocol::ThreadId;
++use serde::Deserialize;
++use serde::Serialize;
++use std::io;
++use std::path::PathBuf;
++use std::process::Stdio;
++use std::time::Duration;
++use tokio::io::AsyncBufRead;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncWrite;
++use tokio::io::AsyncWriteExt;
++use tokio::io::BufReader;
++use tokio::process::Command;
++use tokio::sync::mpsc;
++use tokio::task::JoinHandle;
++use tokio_util::sync::CancellationToken;
++
++const WIRE_LIMIT: usize = 16384;
++
++pub(crate) struct HostRotationBridge {
++    task: JoinHandle<()>,
++}
++
++impl Drop for HostRotationBridge {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "snake_case")]
++enum Operation {
++    Prepare,
++    Release,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Request {
++    v: u8,
++    id: String,
++    operation: Operation,
++    thread_id: String,
++    #[serde(default)]
++    turn_id: String,
++    #[serde(default)]
++    reservation_id: String,
++}
++
++impl Request {
++    fn parse(line: &[u8]) -> io::Result<Self> {
++        let request: Self = serde_json::from_slice(line)?;
++        if request.v != 1
++            || request.id.len() != 32
++            || !request
++                .id
++                .bytes()
++                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
++            || ThreadId::from_string(&request.thread_id).is_err()
++        {
++            return Err(io::Error::other("invalid rotation request identity"));
++        }
++        let valid = match request.operation {
++            Operation::Prepare => {
++                !request.turn_id.is_empty()
++                    && request.turn_id.len() <= 256
++                    && !request.turn_id.contains('\0')
++                    && request.reservation_id.is_empty()
++            }
++            Operation::Release => {
++                request.turn_id.is_empty() && uuid::Uuid::parse_str(&request.reservation_id).is_ok()
++            }
++        };
++        if !valid {
++            return Err(io::Error::other("invalid rotation request"));
++        }
++        Ok(request)
++    }
++}
++
++#[derive(Serialize)]
++struct FrontendReceipt {
++    runtime_id: String,
++    generation: String,
++}
++
++#[derive(Serialize)]
++struct Reply {
++    v: u8,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    id: Option<String>,
++    state: &'static str,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    reservation_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    native: Option<ThreadContextRotationPrepareResponse>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    frontend: Option<FrontendReceipt>,
++}
++
++impl Reply {
++    fn status(id: String, state: &'static str) -> Self {
++        Self {
++            v: 1,
++            id: Some(id),
++            state,
++            reservation_id: None,
++            native: None,
++            frontend: None,
++        }
++    }
++}
++
++pub(crate) fn start(sender: AppEventSender) -> Option<HostRotationBridge> {
++    let helper = PathBuf::from(std::env::var_os("RELAY_NATIVE_ROTATION_HELPER")?);
++    let pane = std::env::var("RELAY_SESSION").ok()?;
++    if !helper.is_absolute() || uuid::Uuid::parse_str(&pane).is_err() {
++        return None;
++    }
++    Some(HostRotationBridge {
++        task: tokio::spawn(async move {
++            loop {
++                let _ = connect(&helper, &pane, sender.clone()).await;
++                // Reconnect only the idle channel. A submitted operation is never replayed.
++                tokio::time::sleep(Duration::from_secs(5)).await;
++            }
++        }),
++    })
++}
++
++async fn connect(helper: &PathBuf, pane: &str, sender: AppEventSender) -> io::Result<()> {
++    let mut child = Command::new(helper)
++        .arg("rotation-native-bridge")
++        .arg(pane)
++        // The pinned executable can have been reached through the Codex shim.
++        .env("RELAY_INVOKED_AS", "relayd")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .kill_on_drop(true)
++        .spawn()?;
++    let input = child
++        .stdin
++        .take()
++        .ok_or_else(|| io::Error::other("rotation input missing"))?;
++    let mut output = BufReader::new(
++        child
++            .stdout
++            .take()
++            .ok_or_else(|| io::Error::other("rotation output missing"))?,
++    );
++    let ready = tokio::time::timeout(Duration::from_secs(5), read_wire_line(&mut output))
++        .await
++        .map_err(|_| io::Error::other("rotation handshake expired"))??;
++    let ready: serde_json::Value = serde_json::from_slice(&ready)?;
++    if ready["v"] != 1 || ready["ready"] != true {
++        return Err(io::Error::other("rotation worker unavailable"));
++    }
++    serve(output, input, sender).await
++}
++
++async fn read_wire_line(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Vec<u8>> {
++    let mut line = Vec::new();
++    (&mut *reader)
++        .take((WIRE_LIMIT + 1) as u64)
++        .read_until(b'\n', &mut line)
++        .await?;
++    if line.is_empty() || line.len() > WIRE_LIMIT || !line.ends_with(b"\n") {
++        return Err(io::Error::other(
++            "rotation stream ended or exceeded its limit",
++        ));
++    }
++    Ok(line)
++}
++
++async fn write_reply(writer: &mut (impl AsyncWrite + Unpin), reply: Reply) -> io::Result<()> {
++    let mut bytes = serde_json::to_vec(&reply)?;
++    bytes.push(b'\n');
++    if bytes.len() > WIRE_LIMIT {
++        return Err(io::Error::other("rotation response exceeds limit"));
++    }
++    tokio::time::timeout(Duration::from_secs(5), writer.write_all(&bytes))
++        .await
++        .map_err(|_| io::Error::other("rotation response expired"))?
++}
++
++async fn serve(
++    mut reader: impl AsyncBufRead + Unpin + Send + 'static,
++    mut writer: impl AsyncWrite + Unpin,
++    sender: AppEventSender,
++) -> io::Result<()> {
++    let closed = CancellationToken::new();
++    let disconnected = closed.clone();
++    let (send, mut receive) = mpsc::channel(1);
++    let _reader = HostRotationBridge {
++        task: tokio::spawn(async move {
++            let _disconnected = disconnected.drop_guard();
++            while let Ok(line) = read_wire_line(&mut reader).await {
++                let Ok(request) = Request::parse(&line) else {
++                    break;
++                };
++                if send.send(request).await.is_err() {
++                    break;
++                }
++            }
++        }),
++    };
++    let mut held: Option<PreparedContextRotation> = None;
++    loop {
++        let request = tokio::select! {
++            biased;
++            _ = closed.cancelled() => return Ok(()),
++            _ = async {
++                match &held {
++                    Some(lease) => lease.revoked().await,
++                    None => std::future::pending().await,
++                }
++            } => {
++                let lease = held.take().expect("held reservation");
++                let id = lease.native.reservation_id.clone();
++                drop(lease);
++                write_reply(&mut writer, Reply { v: 1, id: None, state: "revoked",
++                    reservation_id: Some(id), native: None, frontend: None }).await?;
++                continue;
++            }
++            request = receive.recv() => match request { Some(request) => request, None => return Ok(()) },
++        };
++        let reply = match request.operation {
++            Operation::Prepare if held.is_none() => {
++                let thread = ThreadId::from_string(&request.thread_id).map_err(io::Error::other)?;
++                let prepared = tokio::select! {
++                    biased;
++                    _ = closed.cancelled() => return Ok(()),
++                    prepared = sender.prepare_context_rotation(thread, request.turn_id) => prepared,
++                };
++                match prepared {
++                    Ok(lease) if !lease.remaining_lifetime().is_zero() => {
++                        let mut native = lease.native.clone();
++                        native.expires_in_ms =
++                            lease.remaining_lifetime().as_millis().min(5000) as u32;
++                        let frontend = FrontendReceipt {
++                            runtime_id: lease.frontend.runtime_id.to_string(),
++                            generation: lease.frontend.generation.to_string(),
++                        };
++                        held = Some(lease);
++                        Reply {
++                            v: 1,
++                            id: Some(request.id),
++                            state: "prepared",
++                            reservation_id: None,
++                            native: Some(native),
++                            frontend: Some(frontend),
++                        }
++                    }
++                    _ => Reply::status(request.id, "refused"),
++                }
++            }
++            Operation::Release
++                if held.as_ref().is_some_and(|lease| {
++                    lease.native.thread_id == request.thread_id
++                        && lease.native.reservation_id == request.reservation_id
++                }) =>
++            {
++                let lease = held.take().expect("matching reservation");
++                let released = tokio::select! {
++                    biased;
++                    _ = closed.cancelled() => return Ok(()),
++                    result = lease.release() => result,
++                };
++                Reply::status(
++                    request.id,
++                    if released.is_ok() {
++                        "released"
++                    } else {
++                        "refused"
++                    },
++                )
++            }
++            _ => Reply::status(request.id, "refused"),
++        };
++        write_reply(&mut writer, reply).await?;
++    }
++}
++
++#[cfg(test)]
++#[path = "relay_rotation_bridge_tests.rs"]
++mod tests;
+--- /dev/null
++++ b/codex-rs/tui/src/relay_rotation_bridge_tests.rs
+@@ -0,0 +1,88 @@
++use super::*;
++use crate::app_event::AppEvent;
++use pretty_assertions::assert_eq;
++
++const PREPARE: &[u8] = b"{\"v\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"operation\":\"prepare\",\"thread_id\":\"00000000-0000-0000-0000-000000000701\",\"turn_id\":\"turn-1\"}\n";
++
++#[test]
++fn native_rotation_bridge_parser_requires_bounded_exact_identity() {
++    assert!(Request::parse(PREPARE).is_ok());
++    let text = String::from_utf8(PREPARE.to_vec()).expect("text");
++    assert!(Request::parse(text.replace("\"prepare\"", "\"commit\"").as_bytes()).is_err());
++    assert!(Request::parse(text.replace("turn-1", "").as_bytes()).is_err());
++    assert!(Request::parse(text.replace("\"v\":1", "\"v\":1,\"v\":1").as_bytes()).is_err());
++    assert!(
++        Request::parse(
++            text.replace("\"v\":1", "\"v\":1,\"input\":\"hello\"")
++                .as_bytes()
++        )
++        .is_err()
++    );
++}
++
++#[tokio::test]
++async fn native_rotation_bridge_wire_reader_rejects_oversized_or_partial_frames() {
++    let bytes = vec![b'x'; WIRE_LIMIT + 2];
++    assert!(
++        read_wire_line(&mut BufReader::new(bytes.as_slice()))
++            .await
++            .is_err()
++    );
++    assert!(
++        read_wire_line(&mut BufReader::new(&b"{}"[..]))
++            .await
++            .is_err()
++    );
++    assert_eq!(
++        read_wire_line(&mut BufReader::new(PREPARE))
++            .await
++            .expect("line"),
++        PREPARE
++    );
++}
++
++#[tokio::test]
++async fn native_rotation_bridge_disconnect_cancels_foreground_request() {
++    let (client, server) = tokio::io::duplex(32768);
++    let (_client_read, mut client_write) = tokio::io::split(client);
++    let (server_read, server_write) = tokio::io::split(server);
++    let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
++    let task = tokio::spawn(serve(
++        BufReader::new(server_read),
++        server_write,
++        AppEventSender::new(events),
++    ));
++    client_write.write_all(PREPARE).await.expect("request");
++    let Some(AppEvent::PrepareContextRotation(mut request)) = receiver.recv().await else {
++        panic!("foreground request");
++    };
++    client_write.shutdown().await.expect("disconnect");
++    tokio::time::timeout(Duration::from_secs(1), request.reply.closed())
++        .await
++        .expect("request cancelled");
++    task.await.expect("bridge task").expect("bridge close");
++}
++
++#[tokio::test]
++async fn native_rotation_bridge_refusal_returns_on_the_same_request() {
++    let (client, server) = tokio::io::duplex(32768);
++    let (client_read, mut client_write) = tokio::io::split(client);
++    let (server_read, server_write) = tokio::io::split(server);
++    let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
++    drop(receiver);
++    let task = tokio::spawn(serve(
++        BufReader::new(server_read),
++        server_write,
++        AppEventSender::new(events),
++    ));
++    client_write.write_all(PREPARE).await.expect("request");
++    let response = read_wire_line(&mut BufReader::new(client_read))
++        .await
++        .expect("reply");
++    assert_eq!(
++        serde_json::from_slice::<serde_json::Value>(&response).expect("JSON"),
++        serde_json::json!({"v":1,"id":"0123456789abcdef0123456789abcdef","state":"refused"})
++    );
++    client_write.shutdown().await.expect("disconnect");
++    task.await.expect("bridge task").expect("bridge close");
++}

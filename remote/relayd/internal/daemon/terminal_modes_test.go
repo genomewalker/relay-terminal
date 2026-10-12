@@ -72,3 +72,31 @@ func parseLastOutput(frames []protocol.Frame) (uint64, []byte, error) {
 	}
 	return 0, nil, errors.New("no output frame")
 }
+
+func TestTerminalModeStateClearsCrashedCommandAtShellPrompt(t *testing.T) {
+	for _, marker := range []string{"A", "B", "P;k=i"} {
+		for _, terminator := range []string{"\x07", "\x1b\\"} {
+			state := newTerminalModeState()
+			stream := "\x1b]133;C\x07\x1b[>1u\x1b[?1003h\x1b[?1006h\x1b[?2004h" + "\x1b]133;" + marker + terminator
+			for _, value := range []byte(stream) {
+				state.ingest([]byte{value})
+			}
+			prelude := state.presentationPrelude()
+			if bytes.Contains(prelude, []byte("\x1b[>1u")) || bytes.Contains(prelude, []byte("\x1b[?1003h")) || bytes.Contains(prelude, []byte("\x1b[?1006h")) {
+				t.Fatalf("stale command protocols after %s: %q", marker, prelude)
+			}
+			if !bytes.Contains(prelude, []byte("\x1b[?2004h")) {
+				t.Fatalf("shell paste was disabled: %q", prelude)
+			}
+		}
+	}
+}
+func TestTerminalModeStatePreservesActiveCommandAndSecondaryPrompt(t *testing.T) {
+	state := newTerminalModeState()
+	state.ingest([]byte("\x1b]133;C\x07\x1b[>7u\x1b[?1003h"))
+	state.ingest([]byte("\x1b]133;P;k=s\x07\x1b]133;ABC\x07output"))
+	prelude := state.presentationPrelude()
+	if !bytes.Contains(prelude, []byte("\x1b[>7u")) || !bytes.Contains(prelude, []byte("\x1b[?1003h")) {
+		t.Fatalf("active command protocols were changed: %q", prelude)
+	}
+}

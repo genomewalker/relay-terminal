@@ -1,0 +1,1014 @@
+diff --git a/chitta/CMakeLists.txt b/chitta/CMakeLists.txt
+index f7f458b..21f564c 100644
+--- a/chitta/CMakeLists.txt
++++ b/chitta/CMakeLists.txt
+@@ -865,6 +865,9 @@ if(CHITTA_BUILD_TESTS)
+     add_executable(task_native_rotation_test src/task_native_rotation_test.cpp)
+     target_link_libraries(task_native_rotation_test PRIVATE chitta)
+     add_test(NAME task_native_rotation_test COMMAND task_native_rotation_test)
++    add_executable(task_native_transaction_test src/task_native_transaction_test.cpp)
++    target_link_libraries(task_native_transaction_test PRIVATE chitta)
++    add_test(NAME task_native_transaction_test COMMAND task_native_transaction_test)
+     add_executable(rpc_publication_test src/rpc_publication_test.cpp src/code_navigation.cpp)
+     target_include_directories(rpc_publication_test PRIVATE "${CHITTA_FIELD_INCLUDE}")
+     target_link_libraries(rpc_publication_test PRIVATE chitta-code-intel chitta OpenSSL::Crypto)
+@@ -1081,6 +1084,7 @@ if(CHITTA_BUILD_TESTS)
+         visibility_footer_test
+         task_ledger_test
+         task_native_rotation_test
++        task_native_transaction_test
+         thread_pool_test llm_probe_test callsite_extract_test
+         value_fact_extract_test prefilter_keep_test recall_pool_cap_test
+         hit_line_test tool_spec_test rpc_work_policy_test recall_lanes_test
+diff --git a/chitta/include/chitta/task_ledger.hpp b/chitta/include/chitta/task_ledger.hpp
+index 14b6ba7..454f09b 100644
+--- a/chitta/include/chitta/task_ledger.hpp
++++ b/chitta/include/chitta/task_ledger.hpp
+@@ -280,6 +280,26 @@ public:
+             auto metadata = json::parse(row.at("metadata_json").get<std::string>());
+             const auto original = metadata;
+             auto result = rotation::apply(op, a, metadata, row, revision + 1, static_cast<int64_t>(ts * 1000));
++            if (metadata != original && op == "rotation_native_ack") {
++                const auto target_id = result.at("new_session_id").get<std::string>();
++                const auto target = tables.at("thread_sessions").get(target_id);
++                if (target.is_null()) throw rotation::Error("unknown_session", "native destination session is not registered");
++                const auto target_metadata = json::parse(target.at("metadata_json").get<std::string>());
++                if (target.value("client", "") != "codex" ||
++                    target.value("project_dir", "") != row.value("project_dir", "") ||
++                    target_metadata.value("owner", "desktop") != "relay" ||
++                    target.value("transcript_path", "") != a.at("receipt").at("restored").at("rollout_path") ||
++                    target.value("thread_id", json()) != row.value("thread_id", json()))
++                    throw rotation::Error("native_owner_mismatch", "native destination registration mismatch");
++                for (const auto& other : tables.at("thread_sessions").select(json::object())) {
++                    const auto other_metadata = json::parse(other.at("metadata_json").get<std::string>());
++                    for (const auto& previous : other_metadata.value("rotation", json::object()).value("epochs", json::object())) {
++                        const auto previous_ack = previous.value("ack", json());
++                        if (previous_ack.is_object() && previous_ack.value("new_session_id", "") == target_id)
++                            throw rotation::Error("binding_conflict", "native destination already acknowledged");
++                    }
++                }
++            }
+             if (metadata != original) {
+                 row["metadata_json"] = metadata.dump();
+                 change("thread_sessions", id, row);
+@@ -295,6 +315,18 @@ public:
+                        {"project_dir", ""},    {"transcript_path", ""}, {"status", "active"},
+                        {"started_at", ts},     {"last_active_at", ts},  {"ended_at", nullptr},
+                        {"metadata_json", "{}"}};
++            if (!row.is_null()) {
++                const auto existing = json::parse(row.at("metadata_json").get<std::string>());
++                if (rotation::has_native_pending(existing)) {
++                    for (auto key : {"client", "project_dir", "transcript_path"})
++                        if (!a.value(key, "").empty() && a.at(key) != row.at(key))
++                            throw rotation::Error("native_intent_pending", "native source identity is fenced");
++                    if ((!a.value("cwd", "").empty() && a.at("cwd") != row.at("project_dir")) ||
++                        (a.contains("owner") && a.at("owner") != existing.value("owner", "desktop")) ||
++                        (a.contains("thread_id") && !a.at("thread_id").is_null() && a.at("thread_id") != row.at("thread_id")))
++                        throw rotation::Error("native_intent_pending", "native source ownership is fenced");
++                }
++            }
+             for (auto key : {"client", "project_dir", "transcript_path"})
+                 if (!a.value(key, "").empty()) row[key] = a[key];
+             if (a.contains("thread_id") && !a["thread_id"].is_null()) {
+diff --git a/chitta/include/chitta/task_rotation.hpp b/chitta/include/chitta/task_rotation.hpp
+index dcc3433..e6b784a 100644
+--- a/chitta/include/chitta/task_rotation.hpp
++++ b/chitta/include/chitta/task_rotation.hpp
+@@ -23,9 +23,19 @@ inline std::string text(const json& a, const char* key) {
+ inline bool live(const json& claim, int64_t now) {
+     return claim.is_object() && !claim.value("closed", false) && claim.value("expires_at_ms", int64_t(0)) > now;
+ }
++inline bool native_pending(const json& epoch) {
++    const auto claim = epoch.value("claim", json());
++    return claim.is_object() && claim.value("mode", "") == "native_v1" &&
++           !epoch.value("intent", json()).is_null() && epoch.value("ack", json()).is_null();
++}
++inline bool has_native_pending(const json& metadata) {
++    for (const auto& epoch : metadata.value("rotation", json::object()).value("epochs", json::object()))
++        if (native_pending(epoch)) return true;
++    return false;
++}
+ inline bool has_open_claim(const json& metadata, int64_t now) {
+     for (const auto& epoch : metadata.value("rotation", json::object()).value("epochs", json::object()))
+-        if (live(epoch.value("claim", json()), now)) return true;
++        if (live(epoch.value("claim", json()), now) || native_pending(epoch)) return true;
+     return false;
+ }
+ inline bool has_live_claim(const json& metadata, int64_t now) {
+@@ -195,13 +205,53 @@ inline void validate_native_claim(const json& a, const json& state, const json&
+             native_generation(f.at("generation")), "invalid foreground reservation binding");
+ }
+ 
++
++// This is the actual immutable native journal's restored record. Ledger matching
++// is descriptive: the host must read/verify the real private owner record and
++// runtime/process incarnation before calling ACK. JSON cannot authorize close.
++inline void validate_native_restoration(const json& receipt, const json& claim) {
++    require(native_keys(receipt, {"v", "state", "operation_id", "claim_id", "capsule_sha256",
++            "source", "destination_thread_id", "settings_sha256", "restored"}) &&
++            receipt.at("v").is_number_integer() && receipt.at("v") == 1 && receipt.at("state") == "restored" &&
++            receipt.at("operation_id") == claim.at("operation_id") &&
++            receipt.at("claim_id") == claim.at("host_claim_id") &&
++            receipt.at("capsule_sha256") == claim.at("native").at("capsule").at("sha256"),
++            "native restoration identity mismatch", "native_receipt_mismatch");
++    const auto& source = receipt.at("source");
++    const auto& prepared = claim.at("native").at("reservation").at("native");
++    require(native_keys(source, {"runtime_id", "thread_id", "turn_id", "rollout_path", "admission_generation"}) &&
++            source.at("runtime_id") == prepared.at("runtimeId") &&
++            source.at("thread_id") == prepared.at("threadId") &&
++            source.at("turn_id") == prepared.at("turnId") &&
++            source.at("rollout_path") == prepared.at("rolloutPath"),
++            "native restoration source mismatch", "native_receipt_mismatch");
++    const auto& generation = source.at("admission_generation");
++    require((generation.is_number_unsigned() ||
++             (generation.is_number_integer() && generation.get<int64_t>() >= 0)) &&
++            std::to_string(generation.get<uint64_t>()) == prepared.at("admissionGeneration"),
++            "native source generation mismatch", "native_receipt_mismatch");
++    const auto& target = receipt.at("restored");
++    require(native_uuid(receipt.at("destination_thread_id")) &&
++            receipt.at("destination_thread_id") != claim.at("session_id") &&
++            native_hex(receipt.at("settings_sha256"), 64) &&
++            native_keys(target, {"thread_id", "runtime_id", "rollout_path", "capsule_sha256", "settings_sha256", "process_id"}) &&
++            target.at("thread_id") == receipt.at("destination_thread_id") &&
++            native_uuid(target.at("runtime_id")) && target.at("runtime_id") != source.at("runtime_id") &&
++            native_absolute_path(target.at("rollout_path")) && target.at("rollout_path") != source.at("rollout_path") &&
++            target.at("capsule_sha256") == receipt.at("capsule_sha256") &&
++            target.at("settings_sha256") == receipt.at("settings_sha256") &&
++            native_uint(target.at("process_id"), INT32_MAX),
++            "native restoration destination mismatch", "native_receipt_mismatch");
++}
++
+ // Called only inside TaskLedger's durable transaction. All edits are to a local copy.
+ inline json apply(const std::string& op, const json& a, json& metadata,
+                   const json& row, uint64_t seq, int64_t now) {
+     require(op == "rotation_status" || op == "turn_complete" || op == "rotation_signal" ||
+             op == "rotation_claim" || op == "rotation_release" || op == "rotation_intent" ||
+             op == "rotation_abandon_intent" || op == "rotation_bind" || op == "rotation_ack" ||
+-            op == "capsule_save" || op == "rotation_native_claim" || op == "rotation_native_release", "unknown rotation operation", "unknown_operation");
++            op == "capsule_save" || op == "rotation_native_claim" || op == "rotation_native_release" ||
++            op == "rotation_native_intent" || op == "rotation_native_ack", "unknown rotation operation", "unknown_operation");
+     require(a.value("v", 1) == 1, "unsupported rotation version", "unsupported_version");
+     const auto sid = text(a, "session_id");
+     auto state = metadata.value("rotation", json::object());
+@@ -214,8 +264,16 @@ inline json apply(const std::string& op, const json& a, json& metadata,
+         if (!a.contains("epoch")) {
+             for (auto it = epochs.begin(); it != epochs.end(); ++it)
+                 if (live(it.value().value("claim", json()), now)) { epoch = it.value(); epoch_id = it.key(); }
++            for (auto it = epochs.begin(); it != epochs.end(); ++it)
++                if (native_pending(it.value())) { epoch = it.value(); epoch_id = it.key(); }
+             for (auto it = epochs.begin(); it != epochs.end(); ++it)
+                 if (it.value().contains("ack")) { epoch = it.value(); epoch_id = it.key(); }
++            // The default view reports availability after an exact native release.
++            // Explicit epoch lookup above preserves the complete historical claim.
++            const auto resolved = epoch.value("claim", json());
++            if (epoch.size() == 1 && resolved.is_object() &&
++                resolved.value("mode", "") == "native_v1" && resolved.value("closed", false) &&
++                resolved.contains("release_seq")) { epoch = json::object(); epoch_id = ""; }
+         }
+         auto ack = epoch.value("ack", json());
+         auto claim = epoch.value("claim", json());
+@@ -305,13 +363,18 @@ inline json apply(const std::string& op, const json& a, json& metadata,
+         };
+         // A legacy operation cannot consume, renew or release a native claim.
+         require(op == "rotation_native_claim" || op == "rotation_native_release" ||
++                op == "rotation_native_intent" || op == "rotation_native_ack" ||
+                 !claim.is_object() || claim.value("mode", "") != "native_v1",
+                 "native claim requires native operations", "native_operation_required");
+         if (op == "rotation_native_claim") {
+             validate_native_claim(a, state, metadata, row, sid);
+             require(epoch.empty(), "native operation ID already exists", "native_operation_exists");
+-            for (const auto& previous : epochs)
++            for (const auto& previous : epochs) {
+                 require(!previous.contains("ack"), "rotation already acknowledged", "already_acknowledged");
++                const auto prior_intent = previous.value("intent", json());
++                require(prior_intent.is_null() || prior_intent.value("state", "") == "abandoned",
++                        "existing intent requires reconciliation", "intent_unresolved");
++            }
+             require(!has_live_claim(metadata, now), "rotation claim already live", "claim_live");
+             const auto expected = a.at("source").at("turn_seq");
+             claim = {{"v", 1}, {"mode", "native_v1"}, {"session_id", sid}, {"epoch", epoch_id},
+@@ -338,6 +401,68 @@ inline json apply(const std::string& op, const json& a, json& metadata,
+             claim["release_seq"] = seq;
+             epoch["claim"] = claim;
+             result = claim;
++        } else if (op == "rotation_native_intent" || op == "rotation_native_ack") {
++            const bool committing = op == "rotation_native_intent";
++            require(committing ?
++                    native_keys(a, {"v", "session_id", "epoch", "claim_id", "token", "host_claim_id", "request_sha256"}) :
++                    native_keys(a, {"v", "session_id", "epoch", "claim_id", "token", "host_claim_id", "request_sha256", "receipt"}),
++                    "invalid native transaction fields");
++            require(claim.is_object() && claim.value("mode", "") == "native_v1" &&
++                    a.at("claim_id") == claim.at("claim_id") && a.at("token") == claim.at("token") &&
++                    a.at("host_claim_id") == claim.at("host_claim_id") && native_hex(a.at("request_sha256"), 64) &&
++                    a.at("v").is_number_integer() && a.at("v") == 1 && native_uint(a.at("token")),
++                    "stale native transaction identity", "stale_token");
++            if (committing) {
++                if (!intent.is_null()) {
++                    require(intent.value("mode", "") == "native_v1" &&
++                            intent.at("request_sha256") == a.at("request_sha256"),
++                            "native intent already exists", "native_intent_pending");
++                    return intent; // descriptive idempotence; does not resubmit native work
++                }
++                require(live(claim, now), "native reservation expired", "claim_expired");
++                require(metadata.value("owner", "desktop") == "relay" && row.value("client", "") == "codex" &&
++                        row.value("project_dir", "") == claim.at("native").at("source").at("enrollment").at("cwd"),
++                        "native source owner changed", "native_owner_mismatch");
++                // Revalidate the complete completed-turn binding at the intent boundary.
++                validate_native_claim({{"v",1},{"session_id",sid},{"epoch",epoch_id},
++                    {"claimant",claim.at("claimant")},{"host_claim_id",claim.at("host_claim_id")},{"lease_ms",1},
++                    {"source",claim.at("native").at("source")},{"capsule",claim.at("native").at("capsule")},
++                    {"reservation",claim.at("native").at("reservation")}}, state, metadata, row, sid);
++                intent = {{"v",1},{"mode","native_v1"},{"session_id",sid},{"epoch",epoch_id},
++                    {"operation_id",epoch_id},{"host_claim_id",claim.at("host_claim_id")},
++                    {"claim_id",claim.at("claim_id")},{"token",claim.at("token")},{"intent_id",epoch_id},
++                    {"request_sha256",a.at("request_sha256")},{"seq",seq},{"state","commit_requested"}};
++                epoch["intent"] = intent;
++                result = intent;
++            } else {
++                require(intent.is_object() && intent.value("mode", "") == "native_v1" &&
++                        intent.at("request_sha256") == a.at("request_sha256"),
++                        "native acknowledgement lacks exact intent", "native_intent_pending");
++                validate_native_restoration(a.at("receipt"), claim);
++                if (!ack.is_null()) {
++                    require(ack.at("native_receipt") == a.at("receipt") &&
++                            ack.at("request_sha256") == a.at("request_sha256"),
++                            "native acknowledgement conflict", "ack_conflict");
++                    return ack;
++                }
++                require(intent.at("state") == "commit_requested" && !claim.value("closed", false),
++                        "native intent is not pending", "native_intent_pending");
++                // Acceptance is sticky: actual restoration can be acknowledged after
++                // the preparation lease expires. No new turn or model receipt is needed.
++                ack = {{"v",1},{"mode","native_v1"},{"session_id",sid},{"epoch",epoch_id},
++                    {"operation_id",epoch_id},{"host_claim_id",claim.at("host_claim_id")},
++                    {"claim_id",claim.at("claim_id")},{"token",claim.at("token")},{"intent_id",epoch_id},
++                    {"request_sha256",a.at("request_sha256")},{"seq",seq},{"lifecycle_performed",true},
++                    {"new_session_id",a.at("receipt").at("destination_thread_id")},{"native_receipt",a.at("receipt")}};
++                claim["closed"] = true;
++                claim["ack_seq"] = seq;
++                intent["state"] = "acknowledged";
++                intent["ack_seq"] = seq;
++                epoch["claim"] = claim;
++                epoch["intent"] = intent;
++                epoch["ack"] = ack;
++                result = ack;
++            }
+         } else if (op == "rotation_signal") {
+             const auto action = text(a, "action");
+             require(action == "prepare" || action == "rotate", "unknown rotation action", "unknown_action");
+@@ -350,6 +475,7 @@ inline json apply(const std::string& op, const json& a, json& metadata,
+             epoch["signals"] = signals;
+             state["signal"] = result;
+         } else if (op == "rotation_claim") {
++            require(!has_native_pending(metadata), "native intent requires reconciliation", "native_intent_pending");
+             for (const auto& previous : epochs)
+                 require(!previous.contains("ack"), "rotation already acknowledged", "already_acknowledged");
+             auto expected = a.at("expected_seq").get<uint64_t>();
+diff --git a/chitta/src/rotation_contract.schema.json b/chitta/src/rotation_contract.schema.json
+index 1e17b8b..3593765 100644
+--- a/chitta/src/rotation_contract.schema.json
++++ b/chitta/src/rotation_contract.schema.json
+@@ -991,6 +991,9 @@
+             },
+             {
+               "type": "null"
++            },
++            {
++              "$ref": "#/$defs/native_ack"
+             }
+           ]
+         },
+@@ -1030,6 +1033,9 @@
+             },
+             {
+               "type": "null"
++            },
++            {
++              "$ref": "#/$defs/native_intent"
+             }
+           ]
+         },
+@@ -2159,6 +2165,10 @@
+         },
+         "native": {
+           "$ref": "#/$defs/native_claim_binding"
++        },
++        "ack_seq": {
++          "type": "integer",
++          "minimum": 1
+         }
+       },
+       "required": [
+@@ -2304,6 +2314,459 @@
+           }
+         }
+       ]
++    },
++    "native_core_source_receipt": {
++      "type": "object",
++      "properties": {
++        "runtime_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "thread_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "turn_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 256,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "rollout_path": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 4096,
++          "pattern": "^/[^\\u0000]*$"
++        },
++        "admission_generation": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 18446744073709551615
++        }
++      },
++      "required": [
++        "runtime_id",
++        "thread_id",
++        "turn_id",
++        "rollout_path",
++        "admission_generation"
++      ],
++      "additionalProperties": false
++    },
++    "native_restore_receipt": {
++      "type": "object",
++      "properties": {
++        "thread_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "runtime_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "rollout_path": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 4096,
++          "pattern": "^/[^\\u0000]*$"
++        },
++        "capsule_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "settings_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "process_id": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 2147483647
++        }
++      },
++      "required": [
++        "thread_id",
++        "runtime_id",
++        "rollout_path",
++        "capsule_sha256",
++        "settings_sha256",
++        "process_id"
++      ],
++      "additionalProperties": false
++    },
++    "native_restored_record": {
++      "type": "object",
++      "properties": {
++        "v": {
++          "const": 1,
++          "type": "integer"
++        },
++        "state": {
++          "const": "restored"
++        },
++        "operation_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "claim_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "capsule_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "source": {
++          "$ref": "#/$defs/native_core_source_receipt"
++        },
++        "destination_thread_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "settings_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "restored": {
++          "$ref": "#/$defs/native_restore_receipt"
++        }
++      },
++      "required": [
++        "v",
++        "state",
++        "operation_id",
++        "claim_id",
++        "capsule_sha256",
++        "source",
++        "destination_thread_id",
++        "settings_sha256",
++        "restored"
++      ],
++      "additionalProperties": false
++    },
++    "native_intent": {
++      "type": "object",
++      "properties": {
++        "v": {
++          "const": 1,
++          "type": "integer"
++        },
++        "mode": {
++          "const": "native_v1"
++        },
++        "session_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "epoch": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "operation_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "host_claim_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "claim_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 160,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "token": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "intent_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "request_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "seq": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "state": {
++          "enum": [
++            "commit_requested",
++            "acknowledged"
++          ]
++        },
++        "ack_seq": {
++          "type": "integer",
++          "minimum": 1
++        }
++      },
++      "required": [
++        "v",
++        "mode",
++        "session_id",
++        "epoch",
++        "operation_id",
++        "host_claim_id",
++        "claim_id",
++        "token",
++        "intent_id",
++        "request_sha256",
++        "seq",
++        "state"
++      ],
++      "additionalProperties": false
++    },
++    "native_ack": {
++      "type": "object",
++      "properties": {
++        "v": {
++          "const": 1,
++          "type": "integer"
++        },
++        "mode": {
++          "const": "native_v1"
++        },
++        "session_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "epoch": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "operation_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "host_claim_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "claim_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 160,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "token": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "intent_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "request_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "seq": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "lifecycle_performed": {
++          "const": true
++        },
++        "new_session_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "native_receipt": {
++          "$ref": "#/$defs/native_restored_record"
++        }
++      },
++      "required": [
++        "v",
++        "mode",
++        "session_id",
++        "epoch",
++        "operation_id",
++        "host_claim_id",
++        "claim_id",
++        "token",
++        "intent_id",
++        "request_sha256",
++        "seq",
++        "lifecycle_performed",
++        "new_session_id",
++        "native_receipt"
++      ],
++      "additionalProperties": false
++    },
++    "rotation_native_intent.request": {
++      "type": "object",
++      "properties": {
++        "v": {
++          "const": 1,
++          "type": "integer"
++        },
++        "session_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "epoch": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "claim_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 160,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "token": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "host_claim_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "request_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        }
++      },
++      "required": [
++        "v",
++        "session_id",
++        "epoch",
++        "claim_id",
++        "token",
++        "host_claim_id",
++        "request_sha256"
++      ],
++      "additionalProperties": false
++    },
++    "rotation_native_intent.response": {
++      "$ref": "#/$defs/native_intent"
++    },
++    "rotation_native_ack.request": {
++      "type": "object",
++      "properties": {
++        "v": {
++          "const": 1,
++          "type": "integer"
++        },
++        "session_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "epoch": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "claim_id": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 160,
++          "pattern": "^[^\\u0000]+$"
++        },
++        "token": {
++          "type": "integer",
++          "minimum": 1
++        },
++        "host_claim_id": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
++          "not": {
++            "const": "00000000-0000-0000-0000-000000000000"
++          }
++        },
++        "request_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "receipt": {
++          "$ref": "#/$defs/native_restored_record"
++        }
++      },
++      "required": [
++        "v",
++        "session_id",
++        "epoch",
++        "claim_id",
++        "token",
++        "host_claim_id",
++        "request_sha256",
++        "receipt"
++      ],
++      "additionalProperties": false
++    },
++    "rotation_native_ack.response": {
++      "$ref": "#/$defs/native_ack"
+     }
+   },
+   "$id": "urn:chitta:rotation:1",
+diff --git a/chitta/src/task_native_transaction_test.cpp b/chitta/src/task_native_transaction_test.cpp
+new file mode 100644
+index 0000000..9f1adee
+--- /dev/null
++++ b/chitta/src/task_native_transaction_test.cpp
+@@ -0,0 +1,214 @@
++#include <chitta/task_ledger.hpp>
++#include <cassert>
++#include <atomic>
++#include <iostream>
++#include <thread>
++using json = nlohmann::json;
++static unsigned checks = 0;
++static void check_at(bool ok,int line) { ++checks; if(!ok) std::cerr<<"failed check "<<checks<<" at line "<<line<<"\n"; assert(ok); }
++#define check(ok) check_at((ok),__LINE__)
++static const std::string sid = "11111111-1111-4111-8111-111111111111";
++static const std::string opid = "22222222-2222-4222-8222-222222222222";
++static json usage() {
++    json c = {{"input",10},{"cached_input",4},{"uncached_input",6},{"output",2},{"reasoning",1},{"responses",1},{"tool_calls",0}};
++    json u = {{"turn",c},{"session",c},{"context_tokens",10},{"context_window",64000},{"model","fixture"}};
++    u["session"]["turns"] = 1;
++    for (auto k : {"wall_ms","idle_ms","tool_errors","consecutive_tool_errors","retries","in_flight_tool",
++         "turn_id_fresh","transcript_bytes_at_stop","transcript_mtime_ms_at_stop","flush_verified_next_turn",
++         "capsule","owner","client","progress_marker"}) u[k] = {{"value",nullptr},{"provenance","absent"}};
++    u["client"] = {{"value","codex"},{"provenance","hook"}};
++    u["in_flight_tool"] = {{"value",false},{"provenance","transcript"}};
++    u["turn_id_fresh"] = {{"value",true},{"provenance","transcript"}};
++    u["transcript_bytes_at_stop"] = {{"value",100},{"provenance","hook"}};
++    u["transcript_mtime_ms_at_stop"] = {{"value",1000},{"provenance","hook"}};
++    return u;
++}
++struct Fixture {
++    chitta::TaskLedger ledger;
++    std::vector<json> wal;
++    json turn;
++    Fixture() {
++        run("session_bind", {{"client","codex"},{"owner","relay"},{"cwd","/repo"}});
++        turn = run("turn_complete", {{"turn_id","completed"},{"usage",usage()}});
++    }
++    json run(const std::string& op, json a = json::object()) {
++        a["v"] = 1; a["session_id"] = sid;
++        return ledger.run(op,a,[&](const json& b){wal.push_back(b);});
++    }
++    json args() {
++        json owner = {{"session_id",sid},{"client","codex"},{"cwd","/repo"},{"pane_id","pane"},
++            {"agent_pid",101},{"agent_start",102},{"worker_pid",201},{"worker_start",202},{"node_boot_id","boot"}};
++        json source = {{"enrollment",owner},{"turn_id","completed"},{"turn_seq",turn.at("seq")},
++            {"transcript_mtime_ms",1000},{"transcript_bytes",100},{"source_sha256",std::string(64,'a')},
++            {"evidence_sha256",std::string(64,'b')},{"binding_revision","binding"},{"source_chunks",1}};
++        json n = {{"reservationId","44444444-4444-4444-8444-444444444444"},
++            {"runtimeId","55555555-5555-4555-8555-555555555555"},{"threadId",sid},{"turnId","completed"},
++            {"rolloutPath","/private/sessions/source.jsonl"},{"admissionGeneration","18446744073709551615"},{"expiresInMs",5000}};
++        return {{"v",1},{"session_id",sid},{"epoch",opid},{"claimant","relay"},
++            {"host_claim_id","33333333-3333-4333-8333-333333333333"},{"lease_ms",5000},{"source",source},
++            {"capsule",{{"artifact_id",std::string(64,'c')},{"sha256",std::string(64,'d')},{"bytes",1024}}},
++            {"reservation",{{"native",n},{"frontend",{{"runtime_id","66666666-6666-4666-8666-666666666666"},{"generation","0"}}}}}};
++    }
++};
++static json release_args(const json& c) {
++    return {{"v",1},{"session_id",sid},{"epoch",c.at("epoch")},{"claim_id",c.at("claim_id")},
++        {"token",c.at("token")},{"host_claim_id",c.value("host_claim_id",opid)}};
++}
++template <typename F> static void refused_at(F f,int line) {
++    bool rejected = false; try { f(); } catch (const std::exception&) { rejected = true; } check_at(rejected,line);
++}
++#define refused(f) refused_at((f),__LINE__)
++
++static const std::string target_id = "77777777-7777-4777-8777-777777777777";
++static json transaction_args(const json& claim) {
++    auto args=release_args(claim); args["request_sha256"]=std::string(64,'e'); return args;
++}
++static json native_receipt(const json& claim) {
++    const auto n=claim.at("native").at("reservation").at("native");
++    const auto digest=claim.at("native").at("capsule").at("sha256");
++    json source={{"runtime_id",n.at("runtimeId")},{"thread_id",n.at("threadId")},{"turn_id",n.at("turnId")},
++        {"rollout_path",n.at("rolloutPath")},{"admission_generation",std::stoull(n.at("admissionGeneration").get<std::string>())}};
++    json target={{"thread_id",target_id},{"runtime_id","88888888-8888-4888-8888-888888888888"},
++        {"rollout_path","/private/sessions/target.jsonl"},{"capsule_sha256",digest},
++        {"settings_sha256",std::string(64,'f')},{"process_id",303}};
++    return {{"v",1},{"state","restored"},{"operation_id",claim.at("operation_id")},
++        {"claim_id",claim.at("host_claim_id")},{"capsule_sha256",digest},{"source",source},
++        {"destination_thread_id",target_id},{"settings_sha256",std::string(64,'f')},{"restored",target}};
++}
++static void bind_target(Fixture& f,const std::string& cwd="/repo") {
++    f.ledger.run("session_bind",{{"session_id",target_id},{"client","codex"},{"owner","relay"},{"cwd",cwd},
++        {"transcript_path","/private/sessions/target.jsonl"}},[&](const json& b){f.wal.push_back(b);});
++}
++int main() {
++    {
++        Fixture f; const auto claim=f.run("rotation_native_claim",f.args());
++        const auto closed=f.run("rotation_native_release",release_args(claim));
++        const auto available=f.run("rotation_status");
++        check(available.at("claim").is_null() && available.at("epoch")=="" && available.at("live")==false);
++        check(f.run("rotation_status",{{"epoch",opid}}).at("claim")==closed);
++        auto next=f.args();next["epoch"]="99999999-9999-4999-8999-999999999999";
++        check(f.run("rotation_native_claim",next).at("token").get<uint64_t>()>claim.at("token").get<uint64_t>());
++    }
++    {
++        Fixture g;
++        g.run("rotation_signal",{{"epoch","legacy"},{"action","rotate"},{"reason","fixture"},{"usage",json::object()}});
++        g.turn=g.run("turn_complete",{{"turn_id","next"},{"usage",usage()}});
++        const auto legacy=g.run("rotation_claim",{{"epoch","legacy"},{"claimant","legacy"},{"lease_ms",5000},{"expected_seq",g.turn.at("seq")}});
++        g.run("rotation_intent",{{"epoch","legacy"},{"claim_id",legacy.at("claim_id")},{"token",legacy.at("token")},{"intent_id","legacy-intent"}});
++        auto row=g.run("session_get");auto metadata=json::parse(row.at("metadata_json").get<std::string>());
++        auto native=g.args();native["source"]["turn_id"]="next";native["reservation"]["native"]["turnId"]="next";
++        const auto later=legacy.at("expires_at_ms").get<int64_t>()+1;
++        refused([&]{chitta::rotation::apply("rotation_native_claim",native,metadata,row,100,later);});
++        metadata["rotation"]["epochs"]["legacy"]["intent"]["state"]="abandoned";
++        check(chitta::rotation::apply("rotation_native_claim",native,metadata,row,100,later).at("mode")=="native_v1");
++    }
++    Fixture f;const auto claim=f.run("rotation_native_claim",f.args());const auto request=transaction_args(claim);
++    const auto before=f.run("rotation_status");
++    refused([&]{f.ledger.run("rotation_native_intent",request,[](const json&){throw std::runtime_error("WAL failure");});});
++    check(f.run("rotation_status")==before);
++    const auto intent=f.run("rotation_native_intent",request);
++    check(intent.at("state")=="commit_requested" && intent.at("operation_id")==opid && intent.at("intent_id")==opid);
++    const auto status=f.run("rotation_status");
++    auto wal_size=f.wal.size();
++    check(f.run("rotation_native_intent",request)==intent && f.wal.size()==wal_size);
++    auto conflicting=request;conflicting["request_sha256"]=std::string(64,'a');
++    refused([&]{f.run("rotation_native_intent",conflicting);});
++    refused([&]{f.run("rotation_native_release",release_args(claim));});
++    auto another=f.args();another["epoch"]="99999999-9999-4999-8999-999999999999";
++    refused([&]{f.run("rotation_native_claim",another);});
++    for(const auto& changes:std::vector<json>{{{"owner","desktop"}},{{"client","claude"}},{{"cwd","/elsewhere"}},
++        {{"project_dir","/elsewhere"}},{{"transcript_path","/other"}},{{"metadata",{{"handoff",json::object()}}}}}) {
++        refused([&]{f.run("session_bind",changes);});check(f.run("rotation_status")==status);
++    }
++    chitta::TaskLedger recovered;for(const auto& batch:f.wal) recovered.replay(batch);
++    check(recovered.run("rotation_status",{{"session_id",sid}},[](const json&){})==status);
++    for(const auto& change:std::vector<std::pair<std::string,json>>{{"/request_sha256","bad"},{"/token",0},
++        {"/token",claim.at("token").get<double>()},{"/v",1.0},{"/host_claim_id",opid},{"/unknown",true}}) {
++        auto bad=request;bad[json::json_pointer(change.first)]=change.second;
++        refused([&]{f.ledger.run("rotation_native_intent",bad,[&](const json& batch){f.wal.push_back(batch);});});check(f.run("rotation_status")==status);
++    }
++    {
++        Fixture g;auto row=g.run("session_get");auto metadata=json::parse(row.at("metadata_json").get<std::string>());
++        const auto c=chitta::rotation::apply("rotation_native_claim",g.args(),metadata,row,20,1000);
++        const auto i=chitta::rotation::apply("rotation_native_intent",transaction_args(c),metadata,row,21,1001);
++        check(chitta::rotation::has_open_claim(metadata,7000) && chitta::rotation::has_native_pending(metadata));
++        check(chitta::rotation::apply("rotation_native_intent",transaction_args(c),metadata,row,22,7000)==i);
++        refused([&]{chitta::rotation::apply("rotation_native_release",release_args(c),metadata,row,22,7000);});
++        auto next=g.args();next["epoch"]="99999999-9999-4999-8999-999999999999";
++        refused([&]{chitta::rotation::apply("rotation_native_claim",next,metadata,row,22,7000);});
++        chitta::rotation::apply("rotation_signal",{{"v",1},{"session_id",sid},{"epoch","other"},{"action","rotate"},{"reason","fixture"},{"usage",json::object()}},metadata,row,22,7000);
++        const auto pending=chitta::rotation::apply("rotation_status",{{"session_id",sid}},metadata,row,23,7000);
++        check(pending.at("epoch")==opid && pending.at("intent")==i && pending.at("live")==false);
++        refused([&]{chitta::rotation::apply("rotation_claim",{{"v",1},{"session_id",sid},{"epoch","other"}},metadata,row,23,7000);});
++        auto ack=transaction_args(c);ack["receipt"]=native_receipt(c);
++        const auto done=chitta::rotation::apply("rotation_native_ack",ack,metadata,row,23,7000);
++        check(done.at("lifecycle_performed")==true && !chitta::rotation::has_native_pending(metadata));
++        check(chitta::rotation::apply("rotation_status",{{"session_id",sid}},metadata,row,24,9000).at("ack")==done);
++    }
++    {
++        Fixture g;auto c=g.run("rotation_native_claim",g.args());
++        auto ack=transaction_args(c);ack["receipt"]=native_receipt(c);
++        bind_target(g);
++        refused([&]{g.run("rotation_native_ack",ack);});
++        g.run("rotation_native_release",release_args(c));
++        refused([&]{g.run("rotation_native_intent",transaction_args(c));});
++    }
++    {
++        Fixture g;const auto request=g.args();
++        auto row=g.run("session_get");auto metadata=json::parse(row.at("metadata_json").get<std::string>());
++        auto c=chitta::rotation::apply("rotation_native_claim",request,metadata,row,20,1000);
++        refused([&]{chitta::rotation::apply("rotation_native_intent",transaction_args(c),metadata,row,21,6000);});
++    }
++    {
++        Fixture g;const auto c=g.run("rotation_native_claim",g.args());
++        g.run("turn_complete",{{"turn_id","newer"},{"usage",usage()}});
++        refused([&]{g.run("rotation_native_intent",transaction_args(c));});
++    }
++    auto ack_request=request;ack_request["receipt"]=native_receipt(claim);
++    refused([&]{f.run("rotation_native_ack",ack_request);});check(f.run("rotation_status")==status);
++    bind_target(f,"/elsewhere");
++    refused([&]{f.run("rotation_native_ack",ack_request);});check(f.run("rotation_status")==status);
++    bind_target(f);
++    const std::vector<std::pair<std::string,json>> invalid={
++        {"/v",1.0},{"/state","closed"},{"/operation_id",target_id},{"/claim_id",opid},
++        {"/capsule_sha256",std::string(64,'a')},{"/source/runtime_id",target_id},{"/source/thread_id",target_id},
++        {"/source/turn_id","other"},{"/source/rollout_path","/other"},{"/source/admission_generation",0},
++        {"/source/admission_generation",1.5},{"/source/extra",true},{"/destination_thread_id",sid},
++        {"/settings_sha256","bad"},{"/restored/thread_id",sid},{"/restored/runtime_id","55555555-5555-4555-8555-555555555555"},
++        {"/restored/runtime_id","00000000-0000-0000-0000-000000000000"},{"/restored/rollout_path","relative"},
++        {"/restored/rollout_path","/private/sessions/source.jsonl"},{"/restored/capsule_sha256",std::string(64,'a')},
++        {"/restored/settings_sha256",std::string(64,'a')},{"/restored/process_id",0},{"/restored/process_id",1.5},
++        {"/restored/process_id",2147483648ULL},{"/restored/extra",true},{"/unknown",true}};
++    for(const auto& [path,value]:invalid) {
++        auto bad=ack_request;bad["receipt"][json::json_pointer(path)]=value;
++        refused([&]{f.run("rotation_native_ack",bad);});check(f.run("rotation_status")==status);
++    }
++    refused([&]{f.ledger.run("rotation_native_ack",ack_request,[](const json&){throw std::runtime_error("WAL failure");});});
++    check(f.run("rotation_status")==status);
++    const auto ack=f.run("rotation_native_ack",ack_request);
++    const auto done=f.run("rotation_status");
++    check(ack.at("new_session_id")==target_id && ack.at("native_receipt")==ack_request.at("receipt"));
++    check(done.at("claim").at("closed")==true && done.at("intent").at("state")=="acknowledged" && done.at("ack")==ack);
++    wal_size=f.wal.size();check(f.run("rotation_native_ack",ack_request)==ack && f.wal.size()==wal_size);
++    auto bad_ack=ack_request;bad_ack["receipt"]["settings_sha256"]=std::string(64,'a');bad_ack["receipt"]["restored"]["settings_sha256"]=std::string(64,'a');
++    refused([&]{f.run("rotation_native_ack",bad_ack);});
++    refused([&]{f.run("rotation_native_claim",another);});
++    refused([&]{f.run("rotation_native_release",release_args(claim));});
++    f.run("rotation_signal",{{"epoch","later"},{"action","rotate"},{"reason","fixture"},{"usage",json::object()}});
++    check(f.run("rotation_status").at("ack")==ack);
++    chitta::TaskLedger replay;for(const auto& batch:f.wal)replay.replay(batch);
++    check(replay.run("rotation_status",{{"session_id",sid}},[](const json&){})==f.run("rotation_status"));
++    {
++        const std::string second="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
++        auto run=[&](const std::string& op,json args){args["session_id"]=second;args["v"]=1;return f.ledger.run(op,args,[&](const json& b){f.wal.push_back(b);});};
++        run("session_bind",{{"client","codex"},{"owner","relay"},{"cwd","/repo"}});
++        const auto turn=run("turn_complete",{{"turn_id","completed"},{"usage",usage()}});
++        auto req=f.args();req["session_id"]=second;req["epoch"]="99999999-9999-4999-8999-999999999999";
++        req["source"]["enrollment"]["session_id"]=second;req["source"]["turn_seq"]=turn.at("seq");req["reservation"]["native"]["threadId"]=second;
++        const auto c=run("rotation_native_claim",req);auto i=transaction_args(c);i["session_id"]=second;run("rotation_native_intent",i);
++        i["receipt"]=native_receipt(c);const auto pending=run("rotation_status",json::object());
++        refused([&]{run("rotation_native_ack",i);});check(run("rotation_status",json::object())==pending);
++    }
++    std::cout<<json({{"checks",checks},{"intent_request",request},{"intent",intent},{"pending_status",status},
++        {"ack_request",ack_request},{"ack",ack},{"completed_status",done}}).dump()<<"\n";
++}
+diff --git a/docs/NATIVE-ROTATION-TRANSACTION.md b/docs/NATIVE-ROTATION-TRANSACTION.md
+new file mode 100644
+index 0000000..11e0ec1
+--- /dev/null
++++ b/docs/NATIVE-ROTATION-TRANSACTION.md
+@@ -0,0 +1,27 @@
++# Native commit intent and restoration acknowledgement
++
++This source extension adds `rotation_native_intent` and `rotation_native_ack` to the existing `native_v1` reservation contract. It does not expose a native close route, submit a model turn, or make a serialized claim authoritative.
++
++## Commit intent
++
++The request contains v, session_id, epoch, claim_id, token, host_claim_id and request_sha256. The digest binds the host's immutable claim-request bytes. All issued identities must match the native claim. The first intent requires an unexpired claim, unchanged Relay-owned Codex enrollment and the exact current completed-turn evidence. The ledger persists one immutable commit-requested intent. Exact repeated requests return its current descriptive state; they never replay owner work.
++
++An unresolved native intent excludes another legacy or native claim even after reservation expiry. It also fences source identity changes through session_bind and keeps capsule metadata under the existing fencing rule. Telemetry remains recordable. The default status view prioritizes unresolved native intent and then retirement ACK, regardless of later signals.
++
++## Restoration acknowledgement
++
++The host must first obtain and verify the actual private native owner's synchronized restored journal record, including runtime/process incarnation and original capsule bytes. The ledger validates the record's structural binding; it cannot inspect a native process or turn caller JSON into owner authority.
++
++The ACK request adds receipt to the same intent identity and request digest. Receipt uses the native journal's exact fields: v, state, operation_id, claim_id, capsule_sha256, source, destination_thread_id, settings_sha256 and restored. The source receipt is the core's snake_case receipt with an unsigned numeric admission_generation; it is matched explicitly against the earlier app-server receipt with camelCase fields and a decimal generation string. It is not the app-server reservation wrapper.
++
++Operation and host-claim UUIDs, capsule digest, source thread/runtime/turn/rollout/generation, distinct destination thread/runtime/rollout and restored capsule/settings digests must match. Process ID must be a positive bounded integer; its actual incarnation is verified by the host's owner route, since CLI and app-server processes need not have the same PID.
++
++ACK needs no new model turn and may complete after the preparation lease expires. Within the same TaskLedger transaction, the destination must already be registered as Relay-owned Codex in the same cwd/logical task with its exact restored transcript path. No other source may have acknowledged that destination. Registration is separate host work after native proof; ACK does not fabricate a destination registration.
++
++The ledger atomically records the exact native receipt and destination, closes the source claim and marks the intent acknowledged. Exact duplicate ACK is descriptive/idempotent; conflicting receipt or destination is refused. WAL failure preserves all previous in-memory state.
++
++## Release and recovery
++
++A fully released native reservation with no intent/ACK disappears only from the default availability view. Explicit epoch status retains the complete released claim. An expired but unreleased claim remains visible. This lets existing policy/preparation checks evaluate after a genuine release without weakening their null-claim rule.
++
++This extension provides no expiry-based abort or abandonment of native intent. A lost or uncertain commit remains fenced until actual restoration evidence is acknowledged or a future owner-verified terminal refusal/cancellation protocol proves the old request cannot seal. Absence of a journal file is insufficient. The foreground commit route and that terminal refusal protocol remain required before automatic execution is enabled.

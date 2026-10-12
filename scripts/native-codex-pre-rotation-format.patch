@@ -1,0 +1,25 @@
+--- a/codex-rs/core/src/relay_native_inbox.rs
++++ b/codex-rs/core/src/relay_native_inbox.rs
+@@ -3,11 +3,18 @@
+ use crate::session::Submission;
+ use async_channel::Sender;
+ use codex_protocol::AgentPath;
+-use codex_protocol::protocol::{InterAgentCommunication, Op};
++use codex_protocol::protocol::InterAgentCommunication;
++use codex_protocol::protocol::Op;
+ use serde_json::Value;
+-use std::{io, path::PathBuf, process::Stdio, time::Duration};
+-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+-use tokio::process::{Child, Command};
++use std::io;
++use std::path::PathBuf;
++use std::process::Stdio;
++use std::time::Duration;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncReadExt;
++use tokio::io::BufReader;
++use tokio::process::Child;
++use tokio::process::Command;
+ use uuid::Uuid;
+ 
+ pub(crate) struct Inbox {

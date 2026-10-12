@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 2,
+  "id": "relay.radian",
+  "name": "Radian",
+  "version": "0.2.0",
+  "repository": "genomewalker/relay-plugin-radian",
+  "permissions": [
+    {"kind": "projectRead", "reason": "Browse R results and preview PNG plots and CSV tables in the selected pane's project."}
+  ],
+  "contributions": [
+    {"id": "workspace", "kind": "tool", "title": "Activate R workspace in this tab", "text": "Dock an editor above the selected local or Relay SSH R console. Reuses its existing editor, preserves other panes, and never starts R or executes code. Local consoles must report a working directory. Use Results in the editor for saved plots, tables and environment snapshots.", "operation": "rWorkspace"},
+    {"id": "results", "kind": "tool", "title": "R plots and tables", "text": "Browse result folders in this pane's project. Open PNG plots and bounded CSV table previews produced by the Relay R companion.", "operation": "artifacts"},
+    {"id": "setup", "kind": "information", "title": "R companion setup", "text": "In the R editor, use R setup to request approval to load the bundled companion into the existing idle R console. Refresh R session before running code. Every execution needs native approval; Results shows saved completion receipts, plots, tables and environment names. Requires jsonlite and PNG graphics support. Loading the plugin never starts R or installs packages. Installed-app acceptance remains pending."}
+  ]
+}

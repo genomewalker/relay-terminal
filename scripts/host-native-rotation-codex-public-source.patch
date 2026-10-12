@@ -1,0 +1,974 @@
+diff --git a/remote/relayd/internal/daemon/native_codex_open_darwin.go b/remote/relayd/internal/daemon/native_codex_open_darwin.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/native_codex_open_darwin.go
+@@ -0,0 +1,203 @@
++//go:build darwin
++
++package daemon
++
++import (
++	"bufio"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"strconv"
++	"strings"
++	"syscall"
++	"time"
++)
++
++type darwinNativeTranscriptDescriptor struct {
++	descriptor int
++	path       string
++	device     uint64
++	inode      uint64
++}
++
++// Read the machine-readable inventory for one exact process. Path text alone
++// never establishes ownership: an eligible regular descriptor must also carry
++// the kernel device and inode of the object opened below.
++func darwinNativeTranscriptDescriptors(raw string, pid int) ([]darwinNativeTranscriptDescriptor, error) {
++	if len(raw) > 1<<20 {
++		return nil, errors.New("native descriptor inventory exceeds limit")
++	}
++	result := []darwinNativeTranscriptDescriptor{}
++	currentPID := 0
++	descriptor := -1
++	values := map[byte]string{}
++	flush := func() error {
++		if descriptor < 0 || values['t'] != "REG" || !strings.HasSuffix(values['n'], ".jsonl") {
++			return nil
++		}
++		device, e1 := strconv.ParseUint(values['D'], 0, 64)
++		inode, e2 := strconv.ParseUint(values['i'], 10, 64)
++		if currentPID != pid || e1 != nil || e2 != nil || inode == 0 || len(values['n']) > 4096 || !strings.HasPrefix(values['n'], "/") {
++			return errors.New("native transcript descriptor identity unavailable")
++		}
++		result = append(result, darwinNativeTranscriptDescriptor{descriptor, values['n'], device, inode})
++		return nil
++	}
++	files := 0
++	for _, line := range strings.Split(raw, "\n") {
++		if line == "" {
++			continue
++		}
++		key, value := line[0], line[1:]
++		switch key {
++		case 'p':
++			if err := flush(); err != nil {
++				return nil, err
++			}
++			actual, err := strconv.Atoi(value)
++			if err != nil || actual != pid || currentPID != 0 {
++				return nil, errors.New("native descriptor process changed")
++			}
++			currentPID = actual
++			descriptor = -1
++			values = map[byte]string{}
++		case 'f':
++			if currentPID != pid {
++				return nil, errors.New("native descriptor process missing")
++			}
++			if err := flush(); err != nil {
++				return nil, err
++			}
++			files++
++			if files > 4096 {
++				return nil, errors.New("native descriptor inventory exceeds limit")
++			}
++			descriptor = -1
++			values = map[byte]string{}
++			number := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(value, "u"), "w"), "r")
++			if v, err := strconv.ParseUint(number, 10, 16); err == nil && v <= 4095 {
++				descriptor = int(v)
++			}
++		case 't', 'D', 'i', 'n':
++			if currentPID != pid || files == 0 {
++				return nil, errors.New("native descriptor record missing")
++			}
++			if _, exists := values[key]; exists {
++				return nil, errors.New("ambiguous native descriptor field")
++			}
++			values[key] = value
++		default:
++			return nil, errors.New("unsupported native descriptor field")
++		}
++	}
++	if err := flush(); err != nil {
++		return nil, err
++	}
++	if currentPID != pid {
++		return nil, errors.New("native descriptor process missing")
++	}
++	return result, nil
++}
++
++func darwinOpenCodexTranscript(ctx context.Context, pid int) (string, string, string, error) {
++	raw, err := nativeLsof(ctx, "-a", "-p", strconv.Itoa(pid), "-FnftDi")
++	if err != nil {
++		return "", "", "", err
++	}
++	descriptors, err := darwinNativeTranscriptDescriptors(raw, pid)
++	if err != nil {
++		return "", "", "", err
++	}
++	type candidate struct{ path, session, identity string }
++	candidates := map[string]candidate{}
++	for _, descriptor := range descriptors {
++		path, err := rotationSourcePath(descriptor.path, "codex")
++		if err != nil {
++			continue
++		}
++		fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
++		if err != nil {
++			continue
++		}
++		file := os.NewFile(uintptr(fd), path)
++		opened, statErr := file.Stat()
++		named, nameErr := os.Lstat(path)
++		stat, ok := openedSyscallStat(opened)
++		if statErr != nil || nameErr != nil || !ok || !os.SameFile(opened, named) ||
++			uint64(stat.Dev) != descriptor.device || stat.Ino != descriptor.inode ||
++			int(stat.Uid) != os.Getuid() || !opened.Mode().IsRegular() {
++			file.Close()
++			continue
++		}
++		row, readErr := bufio.NewReader(io.LimitReader(file, 1048577)).ReadBytes('\n')
++		file.Close()
++		if (readErr != nil && readErr != io.EOF) || len(row) > 1048576 || !rotationSourceJSONUnambiguous(row) {
++			continue
++		}
++		var metadata struct {
++			Type    string `json:"type"`
++			Payload struct {
++				ID string `json:"id"`
++			} `json:"payload"`
++		}
++		if json.Unmarshal(row, &metadata) != nil || metadata.Type != "session_meta" || !validSessionID.MatchString(metadata.Payload.ID) {
++			continue
++		}
++		current, currentErr := os.Lstat(path)
++		if currentErr != nil || !os.SameFile(opened, current) {
++			continue
++		}
++		identity := fmt.Sprintf("%d:%d", stat.Dev, stat.Ino)
++		candidates[path] = candidate{path, metadata.Payload.ID, identity}
++	}
++	if len(candidates) != 1 {
++		return "", "", "", errors.New("no unique open native Codex transcript")
++	}
++	for _, value := range candidates {
++		return value.path, value.session, value.identity, nil
++	}
++	return "", "", "", errors.New("open native Codex transcript unavailable")
++}
++
++func openedSyscallStat(info os.FileInfo) (*syscall.Stat_t, bool) {
++	if info == nil {
++		return nil, false
++	}
++	stat, ok := info.Sys().(*syscall.Stat_t)
++	return stat, ok
++}
++
++func nativeCodexOpenTranscriptBinding(pane string, pid int, start uint64) (AgentBindingRecord, error) {
++	var empty AgentBindingRecord
++	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
++	defer cancel()
++	path, session, identity, err := darwinOpenCodexTranscript(ctx, pid)
++	if err != nil {
++		return empty, err
++	}
++	afterPath, afterSession, afterIdentity, err := darwinOpenCodexTranscript(ctx, pid)
++	if err != nil || path != afterPath || session != afterSession || identity != afterIdentity {
++		return empty, errors.New("open native transcript changed")
++	}
++	current, err := NativeAgentIncarnation(pane, pid, "codex")
++	if err != nil || current != start {
++		return empty, errors.New("native transcript producer changed")
++	}
++	server := NewServer()
++	manifest, err := loadManifest(server.manifestPath(pane))
++	if err != nil || validateWorkerIdentity(manifest) != nil {
++		return empty, errors.New("native transcript worker changed")
++	}
++	provider, currentPID := nativeBindingFrontend(manifest.ShellPID)
++	if provider != "codex" || currentPID != pid {
++		return empty, errors.New("native transcript frontend changed")
++	}
++	data, _ := json.Marshal([]any{pane, pid, start, path, session, identity})
++	sum := sha256.Sum256(data)
++	return AgentBindingRecord{Version: 1, Producer: agentProducer{PaneID: pane, Provider: "codex", ProcessID: pid, ProcessStart: start}, SessionID: session, TranscriptPath: path, ObservedAt: time.Now().UTC(), Lifecycle: "unknown", Revision: hex.EncodeToString(sum[:]), Source: "kernel_open_transcript"}, nil
++}
+diff --git a/remote/relayd/internal/daemon/native_codex_open_other.go b/remote/relayd/internal/daemon/native_codex_open_other.go
+--- a/remote/relayd/internal/daemon/native_codex_open_other.go
++++ b/remote/relayd/internal/daemon/native_codex_open_other.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !darwin
+ 
+ package daemon
+ 
+diff --git a/remote/relayd/internal/daemon/host_rotation_source.go b/remote/relayd/internal/daemon/host_rotation_source.go
+--- a/remote/relayd/internal/daemon/host_rotation_source.go
++++ b/remote/relayd/internal/daemon/host_rotation_source.go
+@@ -107,17 +107,28 @@
+ }
+ 
+ // Resolve the actual provider namespace, then reject links below it. This also
+-// supports a deliberately relocated HOME without accepting arbitrary paths
++// supports the host's explicit CODEX_HOME without accepting arbitrary paths
+ // merely because they contain a ".claude" or ".codex" component.
+ func rotationSourcePath(path, provider string) (string, error) {
+ 	if provider != "claude" && provider != "codex" {
+ 		return "", errors.New("unsupported source provider")
+ 	}
+-	home, err := os.UserHomeDir()
+-	if err != nil {
+-		return "", errors.New("source home unavailable")
+-	}
+-	root, err := filepath.EvalSymlinks(filepath.Join(home, "."+provider))
++	logicalRoot := ""
++	if provider == "codex" {
++		logicalRoot = os.Getenv("CODEX_HOME")
++	}
++	if logicalRoot == "" {
++		home, err := os.UserHomeDir()
++		if err != nil {
++			return "", errors.New("source home unavailable")
++		}
++		logicalRoot = filepath.Join(home, "."+provider)
++	}
++	if !filepath.IsAbs(logicalRoot) || filepath.Clean(logicalRoot) != logicalRoot ||
++		len(logicalRoot) > 4096 || strings.ContainsRune(logicalRoot, 0) {
++		return "", errors.New("invalid source namespace")
++	}
++	root, err := filepath.EvalSymlinks(logicalRoot)
+ 	if err != nil {
+ 		return "", errors.New("source namespace unavailable")
+ 	}
+@@ -125,7 +136,6 @@
+ 		return "", errors.New("invalid source path")
+ 	}
+ 	// Canonicalize only the known home prefix. Child links are never followed.
+-	logicalRoot := filepath.Join(home, "."+provider)
+ 	relative, err := filepath.Rel(logicalRoot, path)
+ 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+ 		relative, err = filepath.Rel(root, path)
+@@ -230,6 +240,7 @@
+ 	last := ""
+ 	identified := false
+ 	textBytes, records := 0, 0
++	codex := rotationCodexPublicSource{session: session}
+ 	for scanner.Scan() {
+ 		if ctx.Err() != nil {
+ 			return nil, ctx.Err()
+@@ -261,45 +272,17 @@
+ 					return nil, errors.New("source session identity mismatch")
+ 				}
+ 				identified = true
++				codex.identified = true
+ 			case "response_item":
+ 				if !identified {
+ 					return nil, errors.New("source identity must precede messages")
+ 				}
+-				var message struct {
+-					Type    string          `json:"type"`
+-					Role    string          `json:"role"`
+-					Channel string          `json:"channel"`
+-					Content json.RawMessage `json:"content"`
+-				}
+-				if json.Unmarshal(row.Payload, &message) != nil {
+-					return nil, errors.New("invalid public message")
+-				}
+-				if message.Type != "message" || (message.Role != "user" && message.Role != "assistant") {
+-					continue
+-				}
+-				if message.Role == "assistant" && message.Channel != "final" && message.Channel != "commentary" {
+-					continue
+-				}
+-				if message.Role == "user" && message.Channel != "" {
+-					continue
+-				}
+-				text, err := rotationPublicText(message.Content, message.Role, false)
+-				if err != nil {
++				if err := codex.response(row.Payload); err != nil {
+ 					return nil, err
+ 				}
+-				if text != "" {
+-					messages = append(messages, rotationSourceMessage{message.Role, text})
+-					textBytes += len(text)
+-				}
+ 			case "event_msg":
+-				var event struct {
+-					Type string `json:"type"`
+-				}
+-				if json.Unmarshal(row.Payload, &event) != nil {
+-					return nil, errors.New("invalid source event")
+-				}
+-				if event.Type == "thread_rolled_back" {
+-					return nil, errors.New("source rollback requires explicit branch reconstruction")
++				if err := codex.event(row.Payload); err != nil {
++					return nil, err
+ 				}
+ 			case "compacted":
+ 				// Historical public messages remain evidence; replacement_history
+@@ -349,6 +332,9 @@
+ 	}
+ 	if scanner.Err() != nil {
+ 		return nil, errors.New("source line limit or read failure")
++	}
++	if provider == "codex" {
++		messages = codex.messages()
+ 	}
+ 	if provider == "claude" {
+ 		seen := map[string]bool{}
+diff --git a/remote/relayd/internal/daemon/agent_producer.go b/remote/relayd/internal/daemon/agent_producer.go
+--- a/remote/relayd/internal/daemon/agent_producer.go
++++ b/remote/relayd/internal/daemon/agent_producer.go
+@@ -279,6 +279,10 @@
+ 		if !ok || int(stat.Uid) != os.Getuid() {
+ 			return errors.New("transcript owner mismatch")
+ 		}
++		if provider == "codex" && os.Getenv("CODEX_HOME") != "" {
++			_, err := rotationSourcePath(transcript, provider)
++			return err
++		}
+ 		marker := string(filepath.Separator) + "." + provider + string(filepath.Separator)
+ 		if !strings.Contains(filepath.Clean(transcript), marker) {
+ 			return errors.New("transcript provider mismatch")
+diff --git a/remote/relayd/internal/daemon/native_codex_open_darwin_test.go b/remote/relayd/internal/daemon/native_codex_open_darwin_test.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/native_codex_open_darwin_test.go
+@@ -0,0 +1,121 @@
++//go:build darwin
++
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestDarwinNativeTranscriptDescriptorFields(t *testing.T) {
++	path := "/private/tmp/fixture sessions/rollout α.jsonl"
++	raw := "p42\nf12w\ntREG\nD0x1000014\ni98765\nn" + path + "\nf13u\ntIPv4\nn127.0.0.1:80\n"
++	got, err := darwinNativeTranscriptDescriptors(raw, 42)
++	if err != nil || len(got) != 1 || got[0] != (darwinNativeTranscriptDescriptor{12, path, 0x1000014, 98765}) {
++		t.Fatalf("descriptor identity lost: %#v %v", got, err)
++	}
++	for name, value := range map[string]string{
++		"missing_process":      strings.TrimPrefix(raw, "p42\n"),
++		"other_process":        strings.Replace(raw, "p42", "p43", 1),
++		"repeated_process":     raw + "p42\n",
++		"duplicate_path":       strings.Replace(raw, "n"+path+"\n", "n"+path+"\nn"+path+"\n", 1),
++		"invalid_inode":        strings.Replace(raw, "i98765", "iNaN", 1),
++		"invalid_device":       strings.Replace(raw, "D0x1000014", "Dunknown", 1),
++		"zero_inode":           strings.Replace(raw, "i98765", "i0", 1),
++		"relative_path":        strings.Replace(raw, "n"+path, "nrelative.jsonl", 1),
++		"unknown_field":        raw + "zunknown\n",
++		"large_inventory":      strings.Repeat("x", 1<<20+1),
++		"too_many_descriptors": "p42\n" + strings.Repeat("f1w\ntREG\nD0x1000014\ni98765\nn"+path+"\n", 4097),
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := darwinNativeTranscriptDescriptors(value, 42); err == nil {
++				t.Fatal("ambiguous native descriptor accepted")
++			}
++		})
++	}
++	if records, err := darwinNativeTranscriptDescriptors("p42\nfmem\ntREG\nD0x1000014\ni98765\nn"+path+"\n", 42); err != nil || len(records) != 0 {
++		t.Fatal("non-descriptor mapping accepted", records, err)
++	}
++}
++
++func TestDarwinOpenCodexTranscriptKernelIdentityAndAmbiguity(t *testing.T) {
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("CODEX_HOME", root)
++	directory := filepath.Join(root, "sessions")
++	if err := os.MkdirAll(directory, 0700); err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(directory, "rollout.jsonl")
++	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer file.Close()
++	row := `{"type":"session_meta","payload":{"id":"01a10251-94a1-7d91-acc4-34493b16342b"}}` + "\n"
++	if _, err := file.WriteString(row); err != nil {
++		t.Fatal(err)
++	}
++	observe := func() (string, string, string, error) {
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		return darwinOpenCodexTranscript(ctx, os.Getpid())
++	}
++	actual, sid, identity, err := observe()
++	if err != nil || actual != path || sid != "01a10251-94a1-7d91-acc4-34493b16342b" || identity == "" {
++		t.Fatalf("actual descriptor not observed: %q %q %q %v", actual, sid, identity, err)
++	}
++	if _, err := file.WriteString(`{"type":"event_msg"}` + "\n"); err != nil {
++		t.Fatal(err)
++	}
++	_, _, after, err := observe()
++	if err != nil || identity != after {
++		t.Fatalf("append changed identity: %q %q %v", identity, after, err)
++	}
++	second, err := os.OpenFile(filepath.Join(directory, "second.jsonl"), os.O_CREATE|os.O_RDWR, 0600)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := second.WriteString(row); err != nil {
++		second.Close()
++		t.Fatal(err)
++	}
++	if _, _, _, err := observe(); err == nil {
++		second.Close()
++		t.Fatal("multiple live transcripts accepted")
++	}
++	second.Close()
++	if _, _, _, err := observe(); err != nil {
++		t.Fatal("single descriptor not restored", err)
++	}
++	if err := os.Rename(path, filepath.Join(directory, "retired")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, []byte(row), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, _, err := observe(); err == nil {
++		t.Fatal("replacement named file recreated ownership")
++	}
++	if err := file.Close(); err != nil {
++		t.Fatal(err)
++	}
++	malformed, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0600)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer malformed.Close()
++	if _, err := fmt.Fprintln(malformed, `{"type":"session_meta","payload":{"id":"01a10251-94a1-7d91-acc4-34493b16342b","id":"01a10251-94a1-7d91-acc4-34493b16342b"}}`); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, _, err := observe(); err == nil {
++		t.Fatal("duplicate metadata field accepted")
++	}
++}
+diff --git a/remote/relayd/internal/daemon/host_rotation_namespace_test.go b/remote/relayd/internal/daemon/host_rotation_namespace_test.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_namespace_test.go
+@@ -0,0 +1,81 @@
++package daemon
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestCodexConfiguredSourceNamespace(t *testing.T) {
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("CODEX_HOME", root)
++	directory := filepath.Join(root, "sessions", "2026")
++	if err := os.MkdirAll(directory, 0700); err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(directory, "rollout.jsonl")
++	if err := os.WriteFile(path, []byte("{}\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if got, err := rotationSourcePath(path, "codex"); err != nil || got != path {
++		t.Fatalf("trusted CODEX_HOME unavailable: %q %v", got, err)
++	}
++	if err := validateBindingTranscript(path, "codex"); err != nil {
++		t.Fatal("binding lost explicitly configured namespace", err)
++	}
++	outside := filepath.Join(t.TempDir(), ".codex", "sessions", "outside.jsonl")
++	if err := os.MkdirAll(filepath.Dir(outside), 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(outside, []byte("{}\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := rotationSourcePath(outside, "codex"); err == nil {
++		t.Fatal("path marker bypassed configured root")
++	}
++	if err := validateBindingTranscript(outside, "codex"); err == nil {
++		t.Fatal("binding path marker bypassed configured root")
++	}
++	for name, mutation := range map[string]func(string) error{
++		"symlink":  func(p string) error { return os.Symlink(path, p) },
++		"hardlink": func(p string) error { return os.Link(path, p) },
++		"group_writable": func(p string) error {
++			if err := os.WriteFile(p, []byte("{}\n"), 0600); err != nil {
++				return err
++			}
++			return os.Chmod(p, 0660)
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			p := filepath.Join(directory, name+".jsonl")
++			if err := mutation(p); err != nil {
++				t.Fatal(err)
++			}
++			defer os.Remove(p)
++			if _, err := rotationSourcePath(p, "codex"); err == nil {
++				t.Fatal("unsafe configured source accepted")
++			}
++		})
++	}
++	for _, rootValue := range []string{"relative", "/private/tmp/../tmp"} {
++		t.Run("invalid_root_"+rootValue, func(t *testing.T) {
++			t.Setenv("CODEX_HOME", rootValue)
++			if _, err := rotationSourcePath(path, "codex"); err == nil {
++				t.Fatal("invalid configured root accepted")
++			}
++			if err := validateBindingTranscript(path, "codex"); err == nil {
++				t.Fatal("invalid binding namespace accepted")
++			}
++		})
++	}
++	wrong := filepath.Join(root, "arbitrary.jsonl")
++	if err := os.WriteFile(wrong, []byte("{}\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := rotationSourcePath(wrong, "codex"); err == nil {
++		t.Fatal("non-session source accepted")
++	}
++}
+diff --git a/remote/relayd/internal/daemon/host_rotation_codex_public.go b/remote/relayd/internal/daemon/host_rotation_codex_public.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_codex_public.go
+@@ -0,0 +1,260 @@
++package daemon
++
++import (
++	"crypto/sha256"
++	"encoding/json"
++	"errors"
++	"strings"
++)
++
++type rotationCodexMessage struct {
++	Type     string          `json:"type"`
++	ID       string          `json:"id"`
++	Role     string          `json:"role"`
++	Channel  string          `json:"channel"`
++	Content  json.RawMessage `json:"content"`
++	Metadata json.RawMessage `json:"internal_chat_message_metadata_passthrough"`
++}
++
++type rotationCodexMetadata struct {
++	TurnID string          `json:"turn_id"`
++	Kinds  json.RawMessage `json:"content_item_kinds"`
++}
++
++type rotationCodexMessageKey struct{ turn, id string }
++type rotationCodexPendingMessage struct {
++	slot   int
++	digest [32]byte
++}
++
++// The native public completion stream supplies evidence for modern Responses
++// messages whose raw schema has no channel. Keep response order, join on exact
++// thread/turn/message identity and text, and never promote an explicit hidden
++// channel. Completion events alone cannot contribute source text.
++type rotationCodexPublicSource struct {
++	session    string
++	identified bool
++	slots      []rotationSourceMessage
++	pending    map[rotationCodexMessageKey]rotationCodexPendingMessage
++	completed  map[rotationCodexMessageKey][32]byte
++	responses  map[rotationCodexMessageKey]bool
++	textBytes  int
++}
++
++func rotationCodexIdentity(value string) bool {
++	return value != "" && len(value) <= 256 && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n")
++}
++
++func rotationCodexReadMetadata(raw json.RawMessage) (rotationCodexMetadata, bool, error) {
++	var metadata rotationCodexMetadata
++	if len(raw) == 0 || string(raw) == "null" {
++		return metadata, false, nil
++	}
++	if json.Unmarshal(raw, &metadata) != nil {
++		return metadata, true, errors.New("invalid source message metadata")
++	}
++	if metadata.TurnID != "" && !rotationCodexIdentity(metadata.TurnID) {
++		return metadata, true, errors.New("invalid source message turn")
++	}
++	return metadata, true, nil
++}
++
++func rotationCodexUserText(raw json.RawMessage, metadata rotationCodexMetadata, present bool) (string, error) {
++	// Older transcripts have no classifications. Modern harness metadata is
++	// authoritative and aligned one-for-one with content entries.
++	if !present {
++		return rotationPublicText(raw, "user", false)
++	}
++	if len(metadata.Kinds) == 0 || string(metadata.Kinds) == "null" {
++		return "", nil
++	}
++	var kinds []string
++	var blocks []struct {
++		Type string `json:"type"`
++		Text string `json:"text"`
++	}
++	if json.Unmarshal(metadata.Kinds, &kinds) != nil || json.Unmarshal(raw, &blocks) != nil || len(kinds) != len(blocks) {
++		return "", errors.New("source content classifications mismatch")
++	}
++	text := []string{}
++	for i, block := range blocks {
++		if kinds[i] != "user.text" {
++			continue
++		}
++		if block.Type != "input_text" {
++			return "", errors.New("source user text classification mismatch")
++		}
++		if block.Text != "" {
++			text = append(text, block.Text)
++		}
++	}
++	return strings.Join(text, "\n"), nil
++}
++
++func (source *rotationCodexPublicSource) add(role, text string) (int, error) {
++	source.textBytes += len(text)
++	if source.textBytes > rotationSourceTextLimit {
++		return 0, errors.New("source text limit exceeded")
++	}
++	slot := len(source.slots)
++	source.slots = append(source.slots, rotationSourceMessage{role, text})
++	return slot, nil
++}
++
++func (source *rotationCodexPublicSource) response(raw json.RawMessage) error {
++	var message rotationCodexMessage
++	if json.Unmarshal(raw, &message) != nil {
++		return errors.New("invalid public message")
++	}
++	if message.Type != "message" || (message.Role != "user" && message.Role != "assistant") {
++		return nil
++	}
++	metadata, present, err := rotationCodexReadMetadata(message.Metadata)
++	if err != nil {
++		return err
++	}
++	if message.ID != "" && !rotationCodexIdentity(message.ID) {
++		return errors.New("invalid source message identity")
++	}
++	key := rotationCodexMessageKey{metadata.TurnID, message.ID}
++	identified := rotationCodexIdentity(key.turn) && rotationCodexIdentity(key.id)
++	if identified {
++		if source.responses == nil {
++			source.responses = map[rotationCodexMessageKey]bool{}
++		}
++		if source.responses[key] {
++			return errors.New("duplicate source message identity")
++		}
++		source.responses[key] = true
++	}
++	if message.Role == "user" && message.Channel != "" {
++		return nil
++	}
++	if message.Role == "assistant" && message.Channel != "" && message.Channel != "final" && message.Channel != "commentary" {
++		return nil
++	}
++	text := ""
++	if message.Role == "user" {
++		text, err = rotationCodexUserText(message.Content, metadata, present)
++	} else {
++		text, err = rotationPublicText(message.Content, "assistant", false)
++	}
++	if err != nil {
++		return err
++	}
++	if text == "" {
++		return nil
++	}
++	if message.Role == "assistant" && message.Channel == "" {
++		if !identified {
++			return nil
++		}
++		slot, err := source.add("", text)
++		if err != nil {
++			return err
++		}
++		digest := sha256.Sum256([]byte(text))
++		if completed, ok := source.completed[key]; ok {
++			if completed != digest {
++				return errors.New("source public completion text mismatch")
++			}
++			source.slots[slot].Role = "assistant"
++		} else {
++			if source.pending == nil {
++				source.pending = map[rotationCodexMessageKey]rotationCodexPendingMessage{}
++			}
++			source.pending[key] = rotationCodexPendingMessage{slot, digest}
++		}
++		return nil
++	}
++	slot, err := source.add(message.Role, text)
++	if err != nil {
++		return err
++	}
++	if message.Role == "assistant" && identified {
++		digest := sha256.Sum256([]byte(text))
++		if completed, ok := source.completed[key]; ok {
++			if completed != digest {
++				return errors.New("source public completion text mismatch")
++			}
++		} else {
++			if source.pending == nil {
++				source.pending = map[rotationCodexMessageKey]rotationCodexPendingMessage{}
++			}
++			source.pending[key] = rotationCodexPendingMessage{slot, digest}
++		}
++	}
++	return nil
++}
++
++func (source *rotationCodexPublicSource) event(raw json.RawMessage) error {
++	var event struct {
++		Type     string `json:"type"`
++		ThreadID string `json:"thread_id"`
++		TurnID   string `json:"turn_id"`
++		Item     struct {
++			Type    string          `json:"type"`
++			ID      string          `json:"id"`
++			Content json.RawMessage `json:"content"`
++		} `json:"item"`
++	}
++	if json.Unmarshal(raw, &event) != nil {
++		return errors.New("invalid source event")
++	}
++	if event.Type == "thread_rolled_back" {
++		return errors.New("source rollback requires explicit branch reconstruction")
++	}
++	if event.Type != "item_completed" || event.Item.Type != "AgentMessage" {
++		return nil
++	}
++	if !source.identified || event.ThreadID != source.session || !rotationCodexIdentity(event.TurnID) || !rotationCodexIdentity(event.Item.ID) {
++		return errors.New("source public completion identity mismatch")
++	}
++	var blocks []struct {
++		Type string `json:"type"`
++		Text string `json:"text"`
++	}
++	if json.Unmarshal(event.Item.Content, &blocks) != nil {
++		return errors.New("invalid source public completion")
++	}
++	parts := []string{}
++	for _, block := range blocks {
++		if block.Type != "Text" {
++			return errors.New("unsupported source public completion content")
++		}
++		if block.Text != "" {
++			parts = append(parts, block.Text)
++		}
++	}
++	text := strings.Join(parts, "\n")
++	if len(text) > rotationSourceTextLimit {
++		return errors.New("source text limit exceeded")
++	}
++	key := rotationCodexMessageKey{event.TurnID, event.Item.ID}
++	if source.completed == nil {
++		source.completed = map[rotationCodexMessageKey][32]byte{}
++	}
++	if _, exists := source.completed[key]; exists {
++		return errors.New("duplicate source public completion")
++	}
++	digest := sha256.Sum256([]byte(text))
++	source.completed[key] = digest
++	if pending, ok := source.pending[key]; ok {
++		if pending.digest != digest {
++			return errors.New("source public completion text mismatch")
++		}
++		source.slots[pending.slot].Role = "assistant"
++		delete(source.pending, key)
++	}
++	return nil
++}
++
++func (source *rotationCodexPublicSource) messages() []rotationSourceMessage {
++	messages := []rotationSourceMessage{}
++	for _, message := range source.slots {
++		if message.Role != "" {
++			messages = append(messages, message)
++		}
++	}
++	return messages
++}
+diff --git a/remote/relayd/internal/daemon/host_rotation_codex_public_test.go b/remote/relayd/internal/daemon/host_rotation_codex_public_test.go
+new file mode 100644
+--- /dev/null
++++ b/remote/relayd/internal/daemon/host_rotation_codex_public_test.go
+@@ -0,0 +1,147 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"reflect"
++	"strings"
++	"testing"
++)
++
++func rotationCodexPublicRow(kind string, payload any) string {
++	data, _ := json.Marshal(map[string]any{"type": kind, "payload": payload})
++	return string(data) + "\n"
++}
++
++func rotationCodexPublicResponse(role, id, turn, channel string, content []any, kinds any) string {
++	payload := map[string]any{"type": "message", "role": role, "id": id, "content": content}
++	if channel != "" {
++		payload["channel"] = channel
++	}
++	metadata := map[string]any{}
++	if turn != "" {
++		metadata["turn_id"] = turn
++	}
++	if kinds != nil {
++		metadata["content_item_kinds"] = kinds
++	}
++	if len(metadata) > 0 {
++		payload["internal_chat_message_metadata_passthrough"] = metadata
++	}
++	return rotationCodexPublicRow("response_item", payload)
++}
++func rotationCodexPublicAssistant(channel, text, id, turn string) string {
++	return rotationCodexPublicResponse("assistant", id, turn, channel, []any{map[string]any{"type": "output_text", "text": text}}, nil)
++}
++func rotationCodexPublicEvent(thread, turn, id, kind, text string) string {
++	return rotationCodexPublicRow("event_msg", map[string]any{"type": "item_completed", "thread_id": thread, "turn_id": turn, "item": map[string]any{"type": kind, "id": id, "content": []any{map[string]any{"type": "Text", "text": text}}}})
++}
++func rotationCodexPublicHeader() string {
++	return rotationCodexPublicRow("session_meta", map[string]any{"id": "fixture-session", "cwd": "/fixture", "source": "cli"})
++}
++func rotationCodexPublicUser() string {
++	return rotationCodexPublicResponse("user", "human", "turn-a", "", []any{map[string]any{"type": "input_text", "text": "Keep 🙂 the pane."}}, []string{"user.text"})
++}
++func rotationCodexParsePublic(source string) ([]rotationSourceMessage, error) {
++	return parseRotationSource(context.Background(), strings.NewReader(source), "codex", "fixture-session", "/fixture")
++}
++func TestHostRotationCodexPublicCompletionMatchesExactNativeEvidence(t *testing.T) {
++	response := rotationCodexPublicAssistant("", "Ready 漢字.", "a", "turn-a")
++	event := rotationCodexPublicEvent("fixture-session", "turn-a", "a", "AgentMessage", "Ready 漢字.")
++	header := rotationCodexPublicHeader() + rotationCodexPublicUser()
++	want := []rotationSourceMessage{{"user", "Keep 🙂 the pane."}, {"assistant", "Ready 漢字."}}
++	for name, source := range map[string]string{"response_first": header + response + event, "completion_first": header + event + response, "legacy_explicit_and_completed": header + rotationCodexPublicAssistant("final", "Ready 漢字.", "a", "turn-a") + event} {
++		t.Run(name, func(t *testing.T) {
++			messages, err := rotationCodexParsePublic(source)
++			if err != nil || !reflect.DeepEqual(messages, want) {
++				t.Fatalf("public evidence: %#v %v", messages, err)
++			}
++		})
++	}
++}
++func TestHostRotationCodexPublicCompletionRejectsUnmatchedOrHiddenEvidence(t *testing.T) {
++	header := rotationCodexPublicHeader() + rotationCodexPublicUser()
++	response := rotationCodexPublicAssistant("", "Public", "a", "turn-a")
++	event := rotationCodexPublicEvent("fixture-session", "turn-a", "a", "AgentMessage", "Public")
++	cases := map[string]string{
++		"missing_completion":          response,
++		"completion_without_response": event,
++		"wrong_id":                    response + rotationCodexPublicEvent("fixture-session", "turn-a", "other", "AgentMessage", "Public"),
++		"wrong_turn":                  response + rotationCodexPublicEvent("fixture-session", "turn-b", "a", "AgentMessage", "Public"),
++		"wrong_thread":                response + rotationCodexPublicEvent("other", "turn-a", "a", "AgentMessage", "Public"),
++		"wrong_text":                  response + rotationCodexPublicEvent("fixture-session", "turn-a", "a", "AgentMessage", "Different"),
++		"reasoning_item":              response + rotationCodexPublicEvent("fixture-session", "turn-a", "a", "Reasoning", "Public"),
++		"tool_item":                   response + rotationCodexPublicEvent("fixture-session", "turn-a", "a", "CommandExecution", "Public"),
++		"explicit_analysis":           rotationCodexPublicAssistant("analysis", "Public", "a", "turn-a") + event,
++		"unknown_channel":             rotationCodexPublicAssistant("unknown", "Public", "a", "turn-a") + event,
++		"missing_response_turn":       rotationCodexPublicAssistant("", "Public", "a", "") + event,
++		"missing_response_id":         rotationCodexPublicAssistant("", "Public", "", "turn-a") + event,
++		"empty_event_turn":            response + rotationCodexPublicEvent("fixture-session", "", "a", "AgentMessage", "Public"),
++		"empty_event_id":              response + rotationCodexPublicEvent("fixture-session", "turn-a", "", "AgentMessage", "Public"),
++		"long_event_id":               response + rotationCodexPublicEvent("fixture-session", "turn-a", strings.Repeat("x", 257), "AgentMessage", "Public"),
++		"duplicate_response":          response + event + response,
++		"duplicate_completion":        response + event + event,
++		"analysis_identity_reused":    rotationCodexPublicAssistant("analysis", "Public", "a", "turn-a") + response + event,
++		"ambiguous_channel":           strings.Replace(response, `"role":"assistant"`, `"channel":"analysis","channel":"final","role":"assistant"`, 1) + event,
++	}
++	for name, tail := range cases {
++		t.Run(name, func(t *testing.T) {
++			if _, err := rotationCodexParsePublic(header + tail); err == nil {
++				t.Fatal("accepted unmatched or hidden source")
++			}
++		})
++	}
++	if _, err := rotationCodexParsePublic(event + header + response); err == nil {
++		t.Fatal("accepted completion before session identity")
++	}
++}
++func TestHostRotationCodexPublicMetadataSelectsOnlyHumanText(t *testing.T) {
++	content := []any{
++		map[string]any{"type": "input_text", "text": "PRIVATE_ENV"},
++		map[string]any{"type": "input_text", "text": "Keep 🙂 the pane."},
++		map[string]any{"type": "input_text", "text": "PRIVATE_SYSTEM"},
++		map[string]any{"type": "input_image", "image_url": "PRIVATE_IMAGE"},
++		map[string]any{"type": "input_text", "text": "PRIVATE_UNKNOWN"},
++	}
++	source := rotationCodexPublicHeader() + rotationCodexPublicResponse("user", "mixed", "turn-a", "", content, []string{"environments.environment_context", "user.text", "system.instructions", "user.image", "unknown"}) +
++		rotationCodexPublicAssistant("final", "done", "a", "turn-a")
++	messages, err := rotationCodexParsePublic(source)
++	if err != nil || len(messages) != 2 || messages[0].Text != "Keep 🙂 the pane." {
++		t.Fatalf("human text: %#v %v", messages, err)
++	}
++	cases := map[string]string{
++		"environment":           rotationCodexPublicResponse("user", "u", "turn-a", "", content[:1], []string{"environments.environment_context"}),
++		"unknown":               rotationCodexPublicResponse("user", "u", "turn-a", "", content[:1], []string{"unknown"}),
++		"missing_kinds":         rotationCodexPublicResponse("user", "u", "turn-a", "", content[:1], nil),
++		"kind_length_mismatch":  rotationCodexPublicResponse("user", "u", "turn-a", "", content, []string{"user.text"}),
++		"kind_type_mismatch":    rotationCodexPublicResponse("user", "u", "turn-a", "", content, 42),
++		"kind_content_mismatch": rotationCodexPublicResponse("user", "u", "turn-a", "", content[3:4], []string{"user.text"}),
++		"invalid_turn":          rotationCodexPublicResponse("user", "u", "bad\nturn", "", content[1:2], []string{"user.text"}),
++	}
++	for name, row := range cases {
++		t.Run(name, func(t *testing.T) {
++			if _, err := rotationCodexParsePublic(rotationCodexPublicHeader() + row + rotationCodexPublicAssistant("final", "done", "a", "turn-a")); err == nil {
++				t.Fatal("accepted nonhuman or malformed source")
++			}
++		})
++	}
++}
++func TestHostRotationCodexPublicCompletionPreservesOrderAndBounds(t *testing.T) {
++	header := rotationCodexPublicHeader() + rotationCodexPublicUser()
++	source := header + rotationCodexPublicAssistant("", "first", "a", "turn-a") + rotationCodexPublicAssistant("commentary", "second", "b", "turn-a") +
++		rotationCodexPublicEvent("fixture-session", "turn-a", "a", "AgentMessage", "first") + rotationCodexPublicAssistant("final", "third", "c", "turn-a")
++	messages, err := rotationCodexParsePublic(source)
++	want := []rotationSourceMessage{{"user", "Keep 🙂 the pane."}, {"assistant", "first"}, {"assistant", "second"}, {"assistant", "third"}}
++	if err != nil || !reflect.DeepEqual(messages, want) {
++		t.Fatalf("source order: %#v %v", messages, err)
++	}
++	// Unmatched pending text is bounded as well as admitted public text.
++	block := strings.Repeat("x", rotationSourceTextLimit/3)
++	oversized := header
++	for _, id := range []string{"a", "b", "c", "d"} {
++		oversized += rotationCodexPublicAssistant("", block, id, "turn-a")
++	}
++	if _, err := rotationCodexParsePublic(oversized); err == nil {
++		t.Fatal("accepted unbounded pending evidence")
++	}
++}

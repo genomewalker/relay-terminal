@@ -1,0 +1,720 @@
+--- a/codex-rs/app-server-client/src/lib.rs
++++ b/codex-rs/app-server-client/src/lib.rs
+@@ -39,8 +39,10 @@
+ pub use codex_app_server::in_process::NativeRotationCommitOutcome;
+ pub use codex_app_server::in_process::NativeRotationCommitRequest;
+ pub use codex_app_server::in_process::NativeRotationCommitResult;
++pub use codex_app_server::in_process::NativeRotationReceipt;
+ pub use codex_app_server::in_process::NativeRotationReservationId;
+ pub use codex_app_server::in_process::NativeRotationRetainedSource;
++pub use codex_app_server::in_process::NativeRotationThreadSettings;
+ pub use codex_app_server::in_process::StateDbHandle;
+ use codex_app_server_protocol::ClientInfo;
+ use codex_app_server_protocol::ClientNotification;
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -200,6 +200,8 @@
+ pub type NativeRotationReservationId = uuid::Uuid;
+ pub use codex_core::NativeRotationCommitOutcome;
+ pub use codex_core::NativeRotationCommitRequest;
++pub use codex_core::NativeRotationReceipt;
++pub use codex_core::ThreadConfigSnapshot as NativeRotationThreadSettings;
+ pub type NativeRotationCommitResult = IoResult<Arc<NativeRotationCommitOutcome>>;
+ 
+ enum InProcessClientMessage {
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -8,6 +8,7 @@
+ pub(crate) mod fs;
+ mod history;
+ mod models;
++pub(crate) mod native_rotation_attachment;
+ pub(crate) mod provider_selection;
+ #[cfg(test)]
+ #[path = "app_server_session/provider_selection_tests.rs"]
+--- a/codex-rs/tui/src/app_server_session/context_rotation.rs
++++ b/codex-rs/tui/src/app_server_session/context_rotation.rs
+@@ -1,7 +1,13 @@
+ //! Combines the native receipt with the revocable foreground-editor reservation.
+ //! Drop requests native release; a lost response still expires on the server.
+ use super::*;
++use crate::tui::rotation::FrontendRotationCommit;
+ use crate::tui::rotation::FrontendRotationReservation;
++use codex_app_server_client::NativeRotationAttachment;
++use codex_app_server_client::NativeRotationCommitOutcome;
++use codex_app_server_client::NativeRotationCommitRequest;
++use codex_app_server_client::NativeRotationReceipt;
++use codex_app_server_client::NativeRotationReservationId;
+ use codex_app_server_protocol::ThreadContextRotationPrepareParams;
+ use codex_app_server_protocol::ThreadContextRotationPrepareResponse;
+ use codex_app_server_protocol::ThreadContextRotationReleaseParams;
+@@ -12,10 +18,65 @@
+     pub(crate) native: ThreadContextRotationPrepareResponse,
+     handle: AppServerRequestHandle,
+     deadline: tokio::time::Instant,
+-    release_on_drop: bool,
++    release_on_drop: NativeRotationReleaseGuard,
+ }
+ 
+ impl PreparedContextRotation {
++    /// Structural binding only. The host must verify durable intent before submitting.
++    pub(crate) fn bound_commit_request(
++        &self,
++        operation_id: Uuid,
++        host_claim_id: Uuid,
++        capsule_sha256: String,
++        capsule: String,
++    ) -> Result<NativeRotationCommitRequest> {
++        if !self.handle.supports_native_context_rotation_commit() {
++            return Err(color_eyre::eyre::eyre!(
++                "native commit requires an in-process owner"
++            ));
++        }
++        Ok(NativeRotationCommitRequest::new(
++            operation_id,
++            host_claim_id,
++            native_source_receipt(&self.native)?,
++            capsule_sha256,
++            capsule,
++        )?)
++    }
++
++    /// Moves both live reservations without releasing either during the handoff.
++    pub(crate) fn into_commit(
++        self,
++        request: NativeRotationCommitRequest,
++    ) -> Result<(FrontendRotationReservation, NativeContextRotationCommit)> {
++        if self.remaining_lifetime().is_zero()
++            || self.frontend.is_revoked()
++            || request.source() != &native_source_receipt(&self.native)?
++            || !self.handle.supports_native_context_rotation_commit()
++        {
++            return Err(color_eyre::eyre::eyre!(
++                "native commit preparation changed or expired"
++            ));
++        }
++        let reservation_id = NativeRotationReservationId::parse_str(&self.native.reservation_id)?;
++        let Self {
++            frontend,
++            handle,
++            release_on_drop,
++            ..
++        } = self;
++        let commit = NativeContextRotationCommit {
++            handle,
++            reservation_id,
++            request,
++            release_on_drop,
++            frontend_runtime_id: frontend.runtime_id,
++            frontend_generation: frontend.generation,
++            outcome: None,
++        };
++        Ok((frontend, commit))
++    }
++
+     pub(crate) fn remaining_lifetime(&self) -> Duration {
+         self.deadline
+             .saturating_duration_since(tokio::time::Instant::now())
+@@ -41,7 +102,7 @@
+         )
+         .await
+         .map_err(|_| color_eyre::eyre::eyre!("native release timed out"))??;
+-        self.release_on_drop = false;
++        self.release_on_drop.armed = false;
+         Ok(())
+     }
+ 
+@@ -53,15 +114,23 @@
+     }
+ }
+ 
+-impl Drop for PreparedContextRotation {
++/// Release remains owned while the frontend reservation moves to its queue owner.
++struct NativeRotationReleaseGuard {
++    handle: AppServerRequestHandle,
++    thread_id: String,
++    reservation_id: String,
++    armed: bool,
++}
++
++impl Drop for NativeRotationReleaseGuard {
+     fn drop(&mut self) {
+-        if !self.release_on_drop {
++        if !self.armed {
+             return;
+         }
+         let handle = self.handle.clone();
+         let params = ThreadContextRotationReleaseParams {
+-            thread_id: self.native.thread_id.clone(),
+-            reservation_id: self.native.reservation_id.clone(),
++            thread_id: self.thread_id.clone(),
++            reservation_id: self.reservation_id.clone(),
+         };
+         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+             runtime.spawn(async move {
+@@ -80,6 +149,85 @@
+                 .await;
+             });
+         }
++    }
++}
++
++fn native_source_receipt(
++    native: &ThreadContextRotationPrepareResponse,
++) -> Result<NativeRotationReceipt> {
++    let runtime_id = Uuid::parse_str(&native.runtime_id)?;
++    let rollout_path = PathBuf::from(&native.rollout_path);
++    if runtime_id.is_nil()
++        || native.turn_id.is_empty()
++        || native.turn_id.len() > 256
++        || !rollout_path.is_absolute()
++        || native.rollout_path.contains('\0')
++    {
++        return Err(color_eyre::eyre::eyre!("native source receipt is invalid"));
++    }
++    Ok(NativeRotationReceipt {
++        runtime_id,
++        thread_id: ThreadId::from_string(&native.thread_id)?,
++        turn_id: native.turn_id.clone(),
++        rollout_path,
++        admission_generation: native.admission_generation.parse()?,
++    })
++}
++
++/// The foreground retains this and the real broker commit through reconciliation.
++/// It is neither cloneable nor reconstructible from a receipt.
++pub(crate) struct NativeContextRotationCommit {
++    handle: AppServerRequestHandle,
++    reservation_id: NativeRotationReservationId,
++    request: NativeRotationCommitRequest,
++    release_on_drop: NativeRotationReleaseGuard,
++    frontend_runtime_id: Uuid,
++    frontend_generation: u64,
++    outcome: Option<std::sync::Arc<NativeRotationCommitOutcome>>,
++}
++
++impl NativeContextRotationCommit {
++    pub(crate) fn outcome(&self) -> Option<&std::sync::Arc<NativeRotationCommitOutcome>> {
++        self.outcome.as_ref()
++    }
++
++    pub(crate) async fn commit(
++        &mut self,
++        frontend: &FrontendRotationCommit,
++    ) -> Result<std::sync::Arc<NativeRotationCommitOutcome>> {
++        if !frontend.matches_reservation(
++            self.frontend_runtime_id,
++            self.frontend_generation,
++            self.request.source().thread_id,
++            &self.request.source().turn_id,
++        ) {
++            return Err(color_eyre::eyre::eyre!(
++                "native commit requires its actual sealed frontend owner"
++            ));
++        }
++        if let Some(outcome) = &self.outcome {
++            return Ok(std::sync::Arc::clone(outcome));
++        }
++        // Once submission is possible, cancellation or a lost reply is uncertainty.
++        // The exact request can observe its retained result without another transfer.
++        self.release_on_drop.armed = false;
++        let outcome = self
++            .handle
++            .commit_context_rotation(self.reservation_id, self.request.clone())
++            .await?;
++        self.outcome = Some(std::sync::Arc::clone(&outcome));
++        Ok(outcome)
++    }
++
++    pub(crate) async fn attach(
++        &mut self,
++        frontend: &FrontendRotationCommit,
++    ) -> Result<NativeRotationAttachment> {
++        let outcome = self.commit(frontend).await?;
++        Ok(self
++            .handle
++            .attach_context_rotation(self.reservation_id, outcome)
++            .await?)
+     }
+ }
+ 
+@@ -108,21 +256,25 @@
+             // Subtract the complete round trip conservatively from the advertised remaining life.
+             let deadline =
+                 started + Duration::from_millis(u64::from(native.expires_in_ms.min(5000)));
++            let release_on_drop = NativeRotationReleaseGuard {
++                handle: handle.clone(),
++                thread_id: native.thread_id.clone(),
++                reservation_id: native.reservation_id.clone(),
++                armed: true,
++            };
+             let prepared = PreparedContextRotation {
+                 frontend,
+                 native,
+                 handle,
+                 deadline,
+-                release_on_drop: true,
++                release_on_drop,
+             };
+             if prepared.frontend.is_revoked()
+                 || tokio::time::Instant::now() >= deadline
+                 || prepared.native.thread_id != prepared.frontend.thread_id.to_string()
+                 || prepared.native.turn_id != prepared.frontend.turn_id
+                 || Uuid::parse_str(&prepared.native.reservation_id).is_err()
+-                || Uuid::parse_str(&prepared.native.runtime_id).is_err()
+-                || prepared.native.admission_generation.parse::<u64>().is_err()
+-                || prepared.native.rollout_path.is_empty()
++                || native_source_receipt(&prepared.native).is_err()
+             {
+                 return Err(color_eyre::eyre::eyre!(
+                     "native preparation response is stale or mismatched"
+--- a/codex-rs/tui/src/app_server_session/context_rotation_tests.rs
++++ b/codex-rs/tui/src/app_server_session/context_rotation_tests.rs
+@@ -79,3 +79,53 @@
+             .is_err()
+     );
+ }
++
++fn native_response() -> ThreadContextRotationPrepareResponse {
++    ThreadContextRotationPrepareResponse {
++        reservation_id: Uuid::new_v4().to_string(),
++        runtime_id: Uuid::new_v4().to_string(),
++        thread_id: ThreadId::new().to_string(),
++        turn_id: "completed-turn".into(),
++        rollout_path: codex_utils_absolute_path::test_support::test_path_buf(
++            "/native/π-rollout.jsonl",
++        )
++        .to_str()
++        .unwrap()
++        .to_owned(),
++        admission_generation: u64::MAX.to_string(),
++        expires_in_ms: 5000,
++    }
++}
++
++#[test]
++fn context_rotation_native_receipt_preserves_exact_identity_without_numeric_loss() {
++    let native = native_response();
++    let receipt = native_source_receipt(&native).unwrap();
++    assert_eq!(receipt.runtime_id.to_string(), native.runtime_id);
++    assert_eq!(receipt.thread_id.to_string(), native.thread_id);
++    assert_eq!(receipt.turn_id, native.turn_id);
++    assert_eq!(receipt.rollout_path, PathBuf::from(native.rollout_path));
++    assert_eq!(receipt.admission_generation, u64::MAX);
++}
++
++#[test]
++fn context_rotation_native_receipt_refuses_malformed_evidence() {
++    for change in 0..8 {
++        let mut native = native_response();
++        match change {
++            0 => native.runtime_id = "invalid".into(),
++            1 => native.runtime_id = Uuid::nil().to_string(),
++            2 => native.thread_id = "invalid".into(),
++            3 => native.turn_id.clear(),
++            4 => native.turn_id = "x".repeat(257),
++            5 => native.rollout_path = "relative.jsonl".into(),
++            6 => native.rollout_path.push('\0'),
++            7 => native.admission_generation = "18446744073709551616".into(),
++            _ => unreachable!(),
++        }
++        assert!(
++            native_source_receipt(&native).is_err(),
++            "accepted malformed case {change}"
++        );
++    }
++}
+--- /dev/null
++++ b/codex-rs/tui/src/app_server_session/native_rotation_attachment.rs
+@@ -0,0 +1,215 @@
++//! Capture TUI state from the retained native target, preserving optional absence.
++use crate::session_state::MessageHistoryMetadata;
++use crate::session_state::SessionNetworkProxyRuntime;
++use crate::session_state::ThreadSessionState;
++use codex_app_server_client::NativeRotationAttachedTarget;
++use codex_app_server_client::NativeRotationThreadSettings;
++use codex_protocol::protocol::SessionConfiguredEvent;
++use codex_utils_path_uri::PathUri;
++
++pub(crate) async fn native_rotation_target_session(
++    attachment: &NativeRotationAttachedTarget,
++) -> ThreadSessionState {
++    let config = attachment.config();
++    let history =
++        codex_message_history::HistoryConfig::new(config.codex_home.clone(), &config.history);
++    let (log_id, entry_count) = codex_message_history::history_metadata(&history).await;
++    map_native_rotation_session(
++        attachment.settings(),
++        &attachment.target().session_configured,
++        attachment.instruction_sources().to_vec(),
++        Some(MessageHistoryMetadata {
++            log_id,
++            entry_count,
++        }),
++    )
++}
++
++fn map_native_rotation_session(
++    settings: &NativeRotationThreadSettings,
++    configured: &SessionConfiguredEvent,
++    instruction_source_paths: Vec<PathUri>,
++    message_history: Option<MessageHistoryMetadata>,
++) -> ThreadSessionState {
++    ThreadSessionState {
++        windows_sandbox_host: crate::windows_sandbox::host_from_environment_ids(
++            settings
++                .environment_selections()
++                .iter()
++                .map(|selection| selection.environment_id.as_str()),
++        ),
++        thread_id: configured.thread_id,
++        forked_from_id: settings.forked_from_thread_id,
++        fork_parent_title: None,
++        thread_name: configured.thread_name.clone(),
++        model: settings.model.clone(),
++        model_provider_id: settings.model_provider_id.clone(),
++        service_tier: settings.service_tier.clone(),
++        approval_policy: settings.approval_policy.into(),
++        approvals_reviewer: settings.approvals_reviewer,
++        permission_profile: settings.permission_profile.clone(),
++        active_permission_profile: settings.active_permission_profile.clone(),
++        cwd: settings.cwd().clone(),
++        runtime_workspace_roots: settings.workspace_roots.clone(),
++        instruction_source_paths,
++        reasoning_effort: settings.reasoning_effort.clone(),
++        collaboration_mode: Some(Box::new(settings.collaboration_mode.clone())),
++        personality: settings.personality,
++        message_history,
++        network_proxy: configured
++            .network_proxy
++            .as_ref()
++            .map(|proxy| SessionNetworkProxyRuntime {
++                http_addr: proxy.http_addr.clone(),
++                socks_addr: proxy.socks_addr.clone(),
++            }),
++        rollout_path: configured.rollout_path.clone(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_protocol::ThreadId;
++    use codex_protocol::models::PermissionProfile;
++    use codex_protocol::protocol::EnvironmentConfigState;
++    use codex_protocol::protocol::TurnEnvironmentSelection;
++    use codex_protocol::protocol::TurnEnvironmentSelections;
++    use codex_utils_absolute_path::test_support::PathBufExt;
++    use codex_utils_absolute_path::test_support::test_path_buf;
++    use pretty_assertions::assert_eq;
++
++    fn snapshot() -> NativeRotationThreadSettings {
++        let cwd = test_path_buf("/native-target").abs();
++        NativeRotationThreadSettings {
++            model: "target-model".into(),
++            model_provider_id: "target-provider".into(),
++            service_tier: None,
++            approval_policy: codex_protocol::protocol::AskForApproval::Never,
++            approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
++            permission_profile: PermissionProfile::read_only(),
++            full_access: false,
++            active_permission_profile: None,
++            environments: TurnEnvironmentSelections::new(cwd.clone(), vec![
++                TurnEnvironmentSelection {
++                    environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
++                    cwd: PathUri::from_abs_path(&cwd),
++                    workspace_roots: Vec::new(),
++                    config: EnvironmentConfigState::FromThread,
++                },
++                TurnEnvironmentSelection {
++                    environment_id: "remote-executor".into(),
++                    cwd: PathUri::from_abs_path(&cwd),
++                    workspace_roots: Vec::new(),
++                    config: EnvironmentConfigState::FromThread,
++                },
++            ]),
++            workspace_roots: vec![cwd, test_path_buf("/second-root").abs()],
++            profile_workspace_roots: Vec::new(),
++            ephemeral: false,
++            reasoning_effort: None,
++            reasoning_summary: None,
++            personality: None,
++            collaboration_mode: serde_json::from_value(serde_json::json!({
++                "mode": "default",
++                "settings": {"model": "target-model", "reasoning_effort": null, "developer_instructions": null}
++            })).unwrap(),
++            session_source: codex_protocol::protocol::SessionSource::Cli,
++            history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
++            forked_from_thread_id: Some(ThreadId::new()),
++            parent_thread_id: None,
++            thread_source: None,
++            originator: "native-test".into(),
++            disabled_plugin_ids: Vec::new(),
++        }
++    }
++
++    fn configured(settings: &NativeRotationThreadSettings) -> SessionConfiguredEvent {
++        let thread = ThreadId::new();
++        serde_json::from_value(serde_json::json!({
++            "session_id": thread.to_string(), "thread_id": thread.to_string(),
++            "forked_from_id": settings.forked_from_thread_id,
++            "thread_name": "retained target",
++            "model": "startup-model", "model_provider_id": "startup-provider",
++            "service_tier": "fast", "reasoning_effort": "high",
++            "approval_policy": "never", "permission_profile": settings.permission_profile,
++            "cwd": settings.cwd(),
++            "network_proxy": {"http_addr": "127.0.0.1:8100", "socks_addr": "127.0.0.1:8101"},
++            "rollout_path": test_path_buf("/native-target/rollout.jsonl"),
++        }))
++        .unwrap()
++    }
++
++    #[test]
++    fn context_rotation_mapping_preserves_absent_settings_and_actual_target_metadata() {
++        let settings = snapshot();
++        let configured = configured(&settings);
++        let instructions = vec![PathUri::from_abs_path(
++            &test_path_buf("/native-target/AGENTS.md").abs(),
++        )];
++        let history = Some(MessageHistoryMetadata {
++            log_id: 9,
++            entry_count: 3,
++        });
++        let session =
++            map_native_rotation_session(&settings, &configured, instructions.clone(), history);
++        assert_eq!(session.thread_id, configured.thread_id);
++        assert_eq!(session.forked_from_id, settings.forked_from_thread_id);
++        assert_eq!(session.thread_name, configured.thread_name);
++        assert_eq!(session.model, "target-model");
++        assert_eq!(session.model_provider_id, "target-provider");
++        assert_eq!(session.service_tier, None);
++        assert_eq!(session.reasoning_effort, None);
++        assert_eq!(session.personality, None);
++        assert_eq!(session.active_permission_profile, None);
++        assert_eq!(
++            session.collaboration_mode.as_deref(),
++            Some(&settings.collaboration_mode)
++        );
++        assert_eq!(&session.cwd, settings.cwd());
++        assert_eq!(session.runtime_workspace_roots, settings.workspace_roots);
++        assert_eq!(session.instruction_source_paths, instructions);
++        assert_eq!(session.permission_profile, settings.permission_profile);
++        assert_eq!(session.message_history, history);
++        assert_eq!(
++            session.network_proxy,
++            Some(SessionNetworkProxyRuntime {
++                http_addr: "127.0.0.1:8100".into(),
++                socks_addr: "127.0.0.1:8101".into(),
++            })
++        );
++        assert_eq!(session.rollout_path, configured.rollout_path);
++        assert_eq!(
++            session.windows_sandbox_host,
++            crate::app::WindowsSandboxHost::Mixed
++        );
++    }
++
++    #[test]
++    fn context_rotation_mapping_preserves_present_settings_without_metadata_defaults() {
++        let mut settings = snapshot();
++        settings.service_tier = Some("fast".into());
++        settings.reasoning_effort = Some(codex_protocol::openai_models::ReasoningEffort::High);
++        settings.personality = Some(codex_protocol::config_types::Personality::Pragmatic);
++        settings.active_permission_profile = Some(
++            codex_protocol::models::ActivePermissionProfile::new("read-only"),
++        );
++        let mut configured = configured(&settings);
++        configured.network_proxy = None;
++        configured.rollout_path = None;
++        configured.thread_name = None;
++        let session = map_native_rotation_session(&settings, &configured, Vec::new(), None);
++        assert_eq!(session.service_tier, settings.service_tier);
++        assert_eq!(session.reasoning_effort, settings.reasoning_effort);
++        assert_eq!(session.personality, settings.personality);
++        assert_eq!(
++            session.active_permission_profile,
++            settings.active_permission_profile
++        );
++        assert_eq!(session.network_proxy, None);
++        assert_eq!(session.rollout_path, None);
++        assert_eq!(session.thread_name, None);
++        assert_eq!(session.message_history, None);
++        assert!(session.instruction_source_paths.is_empty());
++    }
++}
+--- a/codex-rs/tui/src/tui/rotation.rs
++++ b/codex-rs/tui/src/tui/rotation.rs
+@@ -80,6 +80,24 @@
+ #[must_use = "a sealed rotation must be completed explicitly by its foreground owner"]
+ pub(crate) struct FrontendRotationCommit {
+     reservation: FrontendRotationReservation,
++    completed: std::sync::atomic::AtomicBool,
++}
++
++impl FrontendRotationCommit {
++    /// The actual sealed owner must match every identity captured before transfer.
++    pub(crate) fn matches_reservation(
++        &self,
++        runtime_id: uuid::Uuid,
++        generation: u64,
++        thread_id: ThreadId,
++        turn_id: &str,
++    ) -> bool {
++        !self.completed.load(std::sync::atomic::Ordering::Acquire)
++            && self.reservation.runtime_id == runtime_id
++            && self.reservation.generation == generation
++            && self.reservation.thread_id == thread_id
++            && self.reservation.turn_id == turn_id
++    }
+ }
+ 
+ pub(super) struct FrontendRotationAdmission {
+@@ -215,7 +233,10 @@
+         state.active = Some(ActiveAdmission::Committing {
+             reservation_id: reservation.reservation_id,
+         });
+-        Ok(FrontendRotationCommit { reservation })
++        Ok(FrontendRotationCommit {
++            reservation,
++            completed: std::sync::atomic::AtomicBool::new(false),
++        })
+     }
+ 
+     /// Only the foreground owner may call this after it verifies the native outcome
+@@ -239,11 +260,28 @@
+             return Err(FrontendRotationError::Unavailable);
+         }
+         state.active = None;
++        commit
++            .completed
++            .store(true, std::sync::atomic::Ordering::Release);
+         Ok(())
+     }
+ }
+ 
+ impl super::Tui {
++    pub(crate) fn seal_context_rotation(
++        &self,
++        reservation: FrontendRotationReservation,
++    ) -> Result<FrontendRotationCommit, FrontendRotationError> {
++        self.event_broker.seal_rotation(reservation)
++    }
++
++    pub(crate) fn complete_context_rotation(
++        &self,
++        commit: &FrontendRotationCommit,
++    ) -> Result<(), FrontendRotationError> {
++        self.event_broker.complete_rotation(commit)
++    }
++
+     pub(crate) fn invalidate_context_rotation(&self) {
+         self.event_broker.rotation.invalidate();
+     }
+@@ -258,3 +296,42 @@
+             .reserve_rotation(thread_id, turn_id, deadline)
+     }
+ }
++
++#[cfg(test)]
++mod native_context_rotation_owner_tests {
++    use super::*;
++
++    #[test]
++    fn native_context_rotation_commit_matches_only_its_uncompleted_owner() {
++        let admission = FrontendRotationAdmission::default();
++        let thread = ThreadId::new();
++        let reservation = admission
++            .reserve(
++                thread,
++                "completed-turn".into(),
++                Instant::now() + std::time::Duration::from_secs(5),
++            )
++            .unwrap();
++        let runtime = reservation.runtime_id;
++        let generation = reservation.generation;
++        let commit = admission.seal(reservation).unwrap();
++        assert!(commit.matches_reservation(runtime, generation, thread, "completed-turn"));
++        assert!(!commit.matches_reservation(
++            uuid::Uuid::new_v4(),
++            generation,
++            thread,
++            "completed-turn"
++        ));
++        assert!(!commit.matches_reservation(runtime, generation + 1, thread, "completed-turn"));
++        assert!(!commit.matches_reservation(
++            runtime,
++            generation,
++            ThreadId::new(),
++            "completed-turn"
++        ));
++        assert!(!commit.matches_reservation(runtime, generation, thread, "different-turn"));
++        admission.complete(&commit).unwrap();
++        assert!(!commit.matches_reservation(runtime, generation, thread, "completed-turn"));
++        assert!(admission.complete(&commit).is_err());
++    }
++}
+--- a/codex-rs/tui/src/windows_sandbox.rs
++++ b/codex-rs/tui/src/windows_sandbox.rs
+@@ -146,16 +146,28 @@
+ pub(crate) fn host_from_environments(
+     environments: Option<&[codex_app_server_protocol::ThreadEnvironment]>,
+ ) -> crate::app::WindowsSandboxHost {
++    host_from_environment_ids(
++        environments
++            .into_iter()
++            .flatten()
++            .map(|environment| environment.environment_id.as_str()),
++    )
++}
++
++/// Shared by wire session responses and the actual native runtime snapshot.
++pub(crate) fn host_from_environment_ids<'a>(
++    environment_ids: impl IntoIterator<Item = &'a str>,
++) -> crate::app::WindowsSandboxHost {
+     use crate::app::WindowsSandboxHost;
+-    let Some(environments) = environments.filter(|environments| !environments.is_empty()) else {
+-        return WindowsSandboxHost::Unknown;
+-    };
+-    let local = environments
+-        .iter()
+-        .any(|environment| environment.environment_id == codex_exec_server::LOCAL_ENVIRONMENT_ID);
+-    let remote = environments
+-        .iter()
+-        .any(|environment| environment.environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID);
++    let mut local = false;
++    let mut remote = false;
++    for id in environment_ids {
++        if id == codex_exec_server::LOCAL_ENVIRONMENT_ID {
++            local = true;
++        } else {
++            remote = true;
++        }
++    }
+     match (local, remote) {
+         (true, false) => WindowsSandboxHost::Local,
+         (true, true) => WindowsSandboxHost::Mixed,
+--- a/codex-rs/tui/src/windows_sandbox_tests.rs
++++ b/codex-rs/tui/src/windows_sandbox_tests.rs
+@@ -90,3 +90,22 @@
+     assert!(!unknown.allows(Elevated));
+     assert!(!unknown.allows(Unelevated));
+ }
++
++#[test]
++fn context_rotation_environment_host_uses_actual_selected_ids() {
++    use crate::app::WindowsSandboxHost;
++    let local = codex_exec_server::LOCAL_ENVIRONMENT_ID;
++    assert_eq!(host_from_environment_ids([]), WindowsSandboxHost::Unknown);
++    assert_eq!(
++        host_from_environment_ids([local]),
++        WindowsSandboxHost::Local
++    );
++    assert_eq!(
++        host_from_environment_ids(["remote-executor"]),
++        WindowsSandboxHost::Remote
++    );
++    assert_eq!(
++        host_from_environment_ids([local, "remote-executor"]),
++        WindowsSandboxHost::Mixed
++    );
++}

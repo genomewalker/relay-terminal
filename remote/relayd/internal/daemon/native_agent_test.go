@@ -6,6 +6,27 @@ import (
 	"testing"
 )
 
+func TestCanonicalCodexApprovalIdentity(t *testing.T) {
+	for _, raw := range []string{
+		`{"id":9007199254740993,"method":"item/commandExecution/requestApproval","params":{"threadId":"t","turnId":"v","itemId":"i","command":"private command"}}`,
+		`{"method":"serverRequest/resolved","params":{"threadId":"t","requestId":9007199254740993}}`,
+	} {
+		encoded, err := CanonicalAgentEnvelope("codex", []byte(raw), "codex-app-server")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope struct {
+			Event map[string]any `json:"event"`
+		}
+		if err := json.Unmarshal(encoded, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Event["approval_id"] != "9007199254740993" || strings.Contains(string(encoded), "private command") {
+			t.Fatalf("bad approval metadata: %s", encoded)
+		}
+	}
+}
+
 func TestCanonicalCodexNativeEventsRetainMetadataNotPrompts(t *testing.T) {
 	raw := []byte(`{"method":"item/started","params":{"threadId":"root","turnId":"turn-1","item":{"type":"collabAgentToolCall","id":"item-1","tool":"spawnAgent","status":"inProgress","senderThreadId":"root","receiverThreadIds":["root/worker"],"prompt":"private task text"}}}`)
 	encoded, err := CanonicalAgentEnvelope("codex", raw, "codex-app-server")

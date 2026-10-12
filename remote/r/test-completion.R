@@ -1,0 +1,26 @@
+source("remote/r/relay-r.R")
+root <- tempfile("relay-completion-test-")
+dir.create(root)
+makeActiveBinding("relay_active_test", function() stop("Active binding was forced"), .GlobalEnv)
+delayedAssign("relay_lazy_test", stop("Promise was forced"), assign.env = .GlobalEnv)
+relay_completion_frame <- data.frame(sample = 1:2, value = 3:4)
+relay_r_connect(root)
+read_snapshot <- function() jsonlite::read_json(file.path(root, "environment.json"))
+before <- read_snapshot()
+stopifnot(!any(vapply(before$completion_packages, function(x) x$name == "splines", logical(1))))
+library(splines)
+.relay_r_updates$publish()
+after <- read_snapshot()
+package <- Filter(function(x) x$name == "splines", after$completion_packages)[[1L]]
+stopifnot("splineDesign" %in% unlist(package$symbols))
+stopifnot("splines" %in% unlist(after$installed_packages))
+if (requireNamespace("rlang", quietly = TRUE)) {
+  frame <- Filter(function(x) x$name == "relay_completion_frame", after$previews)[[1L]]
+  stopifnot(identical(unlist(frame$columns), c("sample", "value")))
+}
+detach("package:splines")
+.relay_r_updates$publish()
+stopifnot(!any(vapply(read_snapshot()$completion_packages, function(x) x$name == "splines", logical(1))))
+removeTaskCallback(.relay_r_updates$callback)
+unlink(root, recursive = TRUE)
+cat("R completion snapshots: attach, detach, columns and lazy/active safety passed\n")

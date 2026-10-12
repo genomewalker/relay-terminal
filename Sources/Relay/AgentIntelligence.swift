@@ -261,19 +261,19 @@ private enum AgentVisibilityPreferences {
     enum Kind: String { case pinned, muted }
 
     static func ids(for paneID: UUID, kind: Kind) -> Set<String> {
-        Set(UserDefaults.standard.stringArray(forKey: key(paneID, kind)) ?? [])
+        Set(RelayStateProfile.defaults.stringArray(forKey: key(paneID, kind)) ?? [])
     }
 
     static func toggle(_ id: String, paneID: UUID, kind: Kind) {
         var values = ids(for: paneID, kind: kind)
         if !values.insert(id).inserted { values.remove(id) }
-        UserDefaults.standard.set(values.sorted(), forKey: key(paneID, kind))
+        RelayStateProfile.defaults.set(values.sorted(), forKey: key(paneID, kind))
     }
 
     static func remove(_ id: String, paneID: UUID, kind: Kind) {
         var values = ids(for: paneID, kind: kind)
         guard values.remove(id) != nil else { return }
-        UserDefaults.standard.set(values.sorted(), forKey: key(paneID, kind))
+        RelayStateProfile.defaults.set(values.sorted(), forKey: key(paneID, kind))
     }
 
     private static func key(_ paneID: UUID, _ kind: Kind) -> String {
