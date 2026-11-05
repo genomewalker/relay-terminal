@@ -19,6 +19,16 @@ import (
 
 func workFileFixture(t *testing.T) (string, func() []string) {
 	t.Helper()
+	outbox, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chmod(outbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldOutbox := workOutboxRoot
+	t.Cleanup(func() { workOutboxRoot = oldOutbox })
+	workOutboxRoot = func() (string, error) { return outbox, nil }
 	saveRoot := t.TempDir()
 	old := workFileRoot
 	t.Cleanup(func() { workFileRoot = old })
@@ -41,7 +51,12 @@ func workFileFixture(t *testing.T) (string, func() []string) {
 
 func writeWorkTestFile(t *testing.T, name string, content []byte) (string, string) {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), name)
+	root, _ := workOutboxRoot()
+	dir, err := os.MkdirTemp(root, "case-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, name)
 	if err := os.WriteFile(p, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -238,4 +253,57 @@ func TestWorkSendFileMaximumFitsPeerRequest(t *testing.T) {
 	if got, _ := os.ReadFile(filepath.Join(saveRoot, signedMessage, "max.bin")); !bytes.Equal(got, content) {
 		t.Fatal("maximum file differs")
 	}
+}
+
+// Only regular files inside the private per-host outbox can be sent.
+func TestWorkSendFileOnlyFromOutbox(t *testing.T) {
+	workFileFixture(t)
+	root, _ := workOutboxRoot()
+	inside, insideSum := writeWorkTestFile(t, "draft.txt", []byte("draft"))
+	if _, err := readWorkAttachment(inside, insideSum); err != nil {
+		t.Fatal("outbox file refused", err)
+	}
+	outsideDir, _ := filepath.EvalSymlinks(t.TempDir())
+	outside := filepath.Join(outsideDir, "notes.txt")
+	if err := os.WriteFile(outside, []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideSum := hex.EncodeToString(func() []byte { s := sha256.Sum256([]byte("private")); return s[:] }())
+	escape := filepath.Join(root, "escape")
+	if err := os.Symlink(outsideDir, escape); err != nil {
+		t.Fatal(err)
+	}
+	home, _ := os.UserHomeDir()
+	hidden, hiddenSum := writeWorkTestFile(t, ".env", []byte("A=1"))
+	hiddenDir := filepath.Join(filepath.Dir(inside), ".ssh")
+	_ = os.Mkdir(hiddenDir, 0o700)
+	hiddenFile := filepath.Join(hiddenDir, "config.txt")
+	_ = os.WriteFile(hiddenFile, []byte("draft"), 0o600)
+	keyFile, keySum := writeWorkTestFile(t, "id_ed25519", []byte("draft"))
+	tokenFile, tokenSum := writeWorkTestFile(t, "dandy-07-token.json", []byte("draft"))
+	cases := map[string][2]string{
+		"outside the outbox":           {outside, outsideSum},
+		"symlinked parent escaping":    {filepath.Join(escape, "notes.txt"), outsideSum},
+		"keychain path, not hidden":    {filepath.Join(home, "Library", "Keychains", "login.keychain-db"), outsideSum},
+		"system file":                  {"/etc/hosts", outsideSum},
+		"the outbox itself":            {root, outsideSum},
+		"hidden file inside outbox":    {hidden, hiddenSum},
+		"hidden directory inside":      {hiddenFile, insideSum},
+		"key name inside outbox":       {keyFile, keySum},
+		"credential name inside":       {tokenFile, tokenSum},
+		"dot-dot path into the outbox": {root + "/../" + filepath.Base(root) + "/" + filepath.Base(filepath.Dir(inside)) + "/draft.txt", insideSum},
+	}
+	for name, c := range cases {
+		if _, err := readWorkAttachment(c[0], c[1]); err == nil {
+			t.Fatal(name, "accepted")
+		}
+	}
+	// A shared (group/world-accessible) outbox is refused.
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readWorkAttachment(inside, insideSum); err == nil {
+		t.Fatal("non-private outbox accepted")
+	}
+	_ = os.Chmod(root, 0o700)
 }

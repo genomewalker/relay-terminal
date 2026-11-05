@@ -64,6 +64,9 @@ func readWorkAttachment(path, declared string) (*workAttachment, error) {
 	if !validWorkFileName(name) {
 		return nil, errors.New("file name is not transferable")
 	}
+	if err := workSendablePath(path); err != nil {
+		return nil, err
+	}
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, errors.New("file unavailable; no request submitted")
@@ -73,6 +76,9 @@ func readWorkAttachment(path, declared string) (*workAttachment, error) {
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, errors.New("only a regular file can be sent")
+	}
+	if current, e := os.Lstat(path); e != nil || !os.SameFile(current, info) {
+		return nil, errors.New("file changed while opening; no request submitted")
 	}
 	if info.Size() == 0 || info.Size() > workFileLimit {
 		return nil, fmt.Errorf("file must be 1-%d bytes", workFileLimit)
@@ -166,4 +172,67 @@ func workFileNotice(m workWire, saved string) string {
 
 func workDefaultFileText(a *workAttachment) string {
 	return "Sending file " + a.name + " (" + strconv.Itoa(len(a.content)) + " bytes, SHA-256 " + a.sha256 + ")."
+}
+
+// workOutboxRoot is the only directory a sender may send files from. Callers
+// copy a file there first; nothing else on the host is reachable this way.
+var workOutboxRoot = func() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "share", "relay", "work-outbox"), nil
+}
+
+// workSendablePath keeps credentials and tool state off the link. The caller
+// is an authenticated endpoint, but a provider agent can be steered by its
+// inputs, so the sender sends only regular files inside the per-host outbox:
+// the path must resolve, with no symlinked component, to itself under the
+// canonical outbox root. Inside the outbox, hidden components and key or
+// credential file names are refused as defence in depth.
+func workSendablePath(path string) error {
+	root, err := workOutboxRoot()
+	if err != nil {
+		return errors.New("Work outbox unavailable; no request submitted")
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return errors.New("Work outbox " + root + " does not exist; create it (mode 0700) and copy the file there; no request submitted")
+	}
+	if info, e := os.Stat(canonicalRoot); e != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("Work outbox " + root + " must be a private directory (mode 0700); no request submitted")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return errors.New("file unavailable; no request submitted")
+	}
+	if resolved != path {
+		return errors.New("file path must be canonical with no symlinked component; no request submitted")
+	}
+	rel, err := filepath.Rel(canonicalRoot, resolved)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
+		return errors.New("only files inside the Work outbox " + root + " are sent; copy the file there first; no request submitted")
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if strings.HasPrefix(part, ".") {
+			return errors.New("hidden files or directories are not sent; no request submitted")
+		}
+	}
+	lower := strings.ToLower(filepath.Base(path))
+	for _, prefix := range []string{"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credential", "authorized_keys", "known_hosts"} {
+		if strings.HasPrefix(lower, prefix) {
+			return errors.New("key or credential files are not sent; no request submitted")
+		}
+	}
+	for _, suffix := range []string{".pem", ".key", ".p12", ".pfx", ".kdbx", ".keychain", ".keychain-db", ".ppk", ".gpg", ".asc"} {
+		if strings.HasSuffix(lower, suffix) {
+			return errors.New("key or credential files are not sent; no request submitted")
+		}
+	}
+	for _, word := range []string{"secret", "token", "password", "passwd"} {
+		if strings.Contains(lower, word) {
+			return errors.New("key or credential files are not sent; no request submitted")
+		}
+	}
+	return nil
 }
