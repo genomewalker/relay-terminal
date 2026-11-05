@@ -505,6 +505,10 @@ func peerHandler(root, node string, hooks communicationGroupNative) http.Handler
 			return
 		}
 		data, err := io.ReadAll(io.LimitReader(r.Body, 128<<10+1))
+		if err == nil && len(data) <= 128<<10 && establishWireDetected(data) {
+			handleEstablishWire(w, root, node, peerFingerprint(r.TLS.PeerCertificates[0]), data, hooks)
+			return
+		}
 		if err == nil && len(data) <= 128<<10 && workWireVersion(data) {
 			handleWorkWire(w, r, root, node, peerFingerprint(r.TLS.PeerCertificates[0]), data)
 			return

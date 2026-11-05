@@ -50,6 +50,9 @@ func communicationRouteOperation(root, nodeID string, r CommunicationRequest) (m
 	if r.ClientToken != "" || r.ActorPaneID != "" {
 		return nil, errors.New("owner administration required")
 	}
+	if r.Operation == "route_scope_set" {
+		return communicationScopeSet(root, nodeID, r)
+	}
 	if strings.HasPrefix(r.Operation, "route_link_") {
 		return communicationRemoteLinkOperation(root, nodeID, r)
 	}

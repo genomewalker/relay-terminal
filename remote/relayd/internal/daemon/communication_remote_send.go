@@ -99,6 +99,7 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 	var receipt communicationRemoteOutbound
 	var link CommunicationRemoteLink
 	var caller string
+	var establish *establishPlan
 	existing := false
 	err := communicationFanoutLocked(root, func() error {
 		var err error
@@ -119,6 +120,14 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 			return nil
 		}
 		link, err = readRemoteLink(root, node, r.LinkID)
+		if errors.Is(err, os.ErrNotExist) {
+			// Only an exact pair in the owner-signed scope on this host may be
+			// established; every other missing link keeps the original error.
+			if plan, ok := communicationEstablishPrepare(root, node, r, caller); ok {
+				establish = plan
+				return nil
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -129,6 +138,15 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 	})
 	if err != nil {
 		return nil, err
+	}
+	if establish != nil {
+		// The peer re-checks its own scope copy; any refusal leaves nothing
+		// written here and no message claim exists, so no send is attempted.
+		established, err := communicationEstablishRun(root, node, r, establish, hooks)
+		if err != nil {
+			return nil, err
+		}
+		link, r.ExpectedRemoteLinkRevision = established, established.Revision
 	}
 	if r.Operation == "remote_receipt" && !existing {
 		return map[string]any{"status": "unknown", "replay_permitted": false, "authority": "relayd"}, nil

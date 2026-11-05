@@ -58,6 +58,7 @@ type CommunicationRequest struct {
 	AttestationID              string                     `json:"attestation_id,omitempty"`
 	SourceSignature            string                     `json:"source_signature,omitempty"`
 	TrustedNodes               []communicationTrustedNode `json:"trusted_nodes,omitempty"`
+	Scope                      *communicationScopeRecord  `json:"scope,omitempty"`
 	// Relay assistant sends: the approving assistant request, and the recipient
 	// endpoint the user saw on the Run card.
 	AssistantRequestID   string         `json:"assistant_request_id,omitempty"`

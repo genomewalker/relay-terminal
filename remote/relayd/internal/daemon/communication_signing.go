@@ -179,6 +179,8 @@ type communicationTrustedNode struct {
 	CertificatePEM    string `json:"certificate_pem"`
 	CertificateSHA256 string `json:"certificate_sha256"`
 	SignsMessages     bool   `json:"signs_messages,omitempty"`
+	// SignsScopes pins this certificate as an owner key for collaboration scopes.
+	SignsScopes bool `json:"signs_scopes,omitempty"`
 }
 
 type communicationTrustSet struct {
