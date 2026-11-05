@@ -69,10 +69,14 @@ func runCodexRotationExec(arguments []string) {
 	if err != nil {
 		fatal("Codex rotation claim refused")
 	}
+	if err := keepRotationAccount(snapshot); err != nil {
+		fatal("rotation account refused: " + err.Error())
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fatal("private home unavailable")
 	}
+	admitAccount(home, "codex", true)
 	newSnapshot, err := agentlaunch.Save(filepath.Join(home, ".local", "share", "relay", "agent-launches"),
 		"codex", snapshot.Executable, snapshot.CWD, *pane, agentlaunch.ProcessStart(), args, args)
 	if err != nil {

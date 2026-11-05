@@ -16,7 +16,7 @@ final class RelaySurfacePublication {
     private let registered: (String) -> Bool
     private let permitted: (String) -> Bool
     init(directory: URL? = nil,
-         registered: @escaping (String) -> Bool = { id in RelayCallerControl.shared.summaries.contains { $0.id == id } },
+         registered: @escaping (String) -> Bool = { RelayCallerControl.shared.isRegisteredPublisher($0) },
          permitted: @escaping (String) -> Bool = { RelayCallerControl.shared.permitted($0) }) {
         self.registered = registered
         self.permitted = permitted

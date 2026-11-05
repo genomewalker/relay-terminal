@@ -82,6 +82,33 @@ final class RelayHostRotationTextRPCTests: XCTestCase {
         XCTAssertThrowsError(try RelayHostRotationTextRPC.decodeAbandon(data(pending), operationID: id))
     }
 
+    func testAPIOnlyRequestCapCanBeDisabledWithoutDisablingSpendingLimits() {
+        var value = settings()
+        value.providers = ["anthropic_api"]
+        value.maxRequestsPerDay = 0
+        XCTAssertTrue(value.valid)
+        value.dailyLimitMicrousd = 999_999
+        XCTAssertFalse(value.valid)
+        value.dailyLimitMicrousd = 1_000_000
+        value.monthlyLimitMicrousd = 999_999
+        XCTAssertFalse(value.valid)
+        var account = RelayHostRotationTextRPC.Account()
+        account.enabled = true
+        account.credentialReference = operationID
+        account.billingGroup = "test"
+        account.dailyLimitMicrousd = 1_000_000
+        account.monthlyLimitMicrousd = 1_000_000
+        XCTAssertTrue(account.valid)
+        account.provider = "codex_account"
+        account.credentialReference = nil
+        account.billingGroup = nil
+        account.authDirectory = "/test/login"
+        account.model = "test-model"
+        XCTAssertFalse(account.valid)
+        account.maxRequestsPerDay = 10
+        XCTAssertTrue(account.valid)
+    }
+
     func testInvalidSettingsAndRequestShapesAreRefused() {
         var value = settings(); value.providers = ["anthropic_api", "anthropic_api"]; XCTAssertFalse(value.valid)
         value = settings(); value.dailyLimitMicrousd = 999_999; XCTAssertFalse(value.valid)

@@ -3,24 +3,120 @@ import CryptoKit
 import Foundation
 import ImageIO
 
-struct PaneArtifact: Identifiable {
+enum RelayFilePreviewKind: String, Sendable, Equatable {
+    case image, pdf, log
+    static let imageExtensions: Set = ["png", "jpg", "jpeg", "gif", "tiff", "tif", "bmp", "webp", "heic", "svg"]
+    static let logExtensions: Set = ["log", "txt", "out", "err", "tsv", "csv", "md", "json", "yaml", "yml", "stdout", "stderr"]
+
+    static func from(path: String) -> RelayFilePreviewKind? {
+        let ext = TerminalPathSyntax.pathExtension(path)
+        if ext == "pdf" { return .pdf }
+        if imageExtensions.contains(ext) { return .image }
+        return logExtensions.contains(ext) ? .log : nil
+    }
+
+    var symbol: String {
+        switch self { case .image: "photo"; case .pdf: "doc.richtext"; case .log: "doc.plaintext" }
+    }
+}
+
+/// The bounded tail of a text file. Only the final `maxBytes` are ever read.
+struct RelayLogTail: Sendable, Equatable {
+    static let defaultMaxBytes = 1 << 20
+    let text: String
+    let shownBytes: Int
+    let totalBytes: Int
+    var partial: Bool { shownBytes < totalBytes }
+    var label: String? { partial ? "Showing last \(shownBytes) of \(totalBytes) bytes" : nil }
+
+    init(bytes: Data, totalBytes: Int) {
+        // A tail that starts mid-character would otherwise begin with U+FFFD.
+        var start = bytes.startIndex
+        if bytes.count < totalBytes {
+            while start < bytes.endIndex, start - bytes.startIndex < 3, bytes[start] & 0xC0 == 0x80 { start += 1 }
+        }
+        text = String(decoding: bytes[start...], as: UTF8.self)
+        shownBytes = bytes.count
+        self.totalBytes = totalBytes
+    }
+
+    static func readLocal(path: String, maxBytes: Int = defaultMaxBytes) throws -> RelayLogTail {
+        let descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { throw ArtifactLoadError.failed(String(cString: strerror(errno)) + ": " + path) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+            throw ArtifactLoadError.failed("Refusing to preview a non-regular or symlinked file")
+        }
+        let size = Int(info.st_size)
+        try handle.seek(toOffset: UInt64(max(0, size - maxBytes)))
+        let bytes = try handle.read(upToCount: min(size, maxBytes)) ?? Data()
+        return RelayLogTail(bytes: bytes, totalBytes: max(size, bytes.count))
+    }
+}
+
+struct PaneArtifact: Identifiable, Sendable {
     let id = UUID()
     let remotePath: String
     let data: Data
     let contentIdentity: String
+    let kind: RelayFilePreviewKind
+    var log: RelayLogTail?
+    var failure: String?
+    /// Opened explicitly by the user: always shown floating, never recorded as dismissed.
+    var userRequested = false
 
     init(remotePath: String, data: Data) {
         self.remotePath = remotePath
         self.data = data
-        var hasher = SHA256()
-        hasher.update(data: Data(remotePath.utf8))
-        hasher.update(data: Data([0]))
-        hasher.update(data: data)
-        contentIdentity = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        kind = data.starts(with: Data("%PDF-".utf8)) ? .pdf : .image
+        contentIdentity = Self.identity(remotePath, data)
     }
 
+    init(remotePath: String, log: RelayLogTail) {
+        self.remotePath = remotePath
+        data = Data()
+        kind = .log
+        self.log = log
+        userRequested = true
+        contentIdentity = Self.identity(remotePath, Data(log.text.utf8))
+    }
+
+    init(remotePath: String, kind: RelayFilePreviewKind, failure: String) {
+        self.remotePath = remotePath
+        data = Data()
+        self.kind = kind
+        self.failure = failure
+        userRequested = true
+        contentIdentity = Self.identity(remotePath, Data(failure.utf8))
+    }
+
+    private static func identity(_ path: String, _ data: Data) -> String {
+        var hasher = SHA256()
+        hasher.update(data: Data(path.utf8))
+        hasher.update(data: Data([0]))
+        hasher.update(data: data)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    var text: String? { log?.text }
+    var totalBytes: Int { log?.totalBytes ?? data.count }
+    var partial: Bool { log?.partial ?? false }
     var filename: String { TerminalPathSyntax.lastComponent(remotePath) }
     var isPDF: Bool { data.starts(with: Data("%PDF-".utf8)) }
+    var imagePixelSize: CGSize? {
+        guard kind == .image, let image else { return nil }
+        let reps = image.representations.filter { $0.pixelsWide > 0 && $0.pixelsHigh > 0 }
+        if let rep = reps.max(by: { $0.pixelsWide < $1.pixelsWide }) { return CGSize(width: rep.pixelsWide, height: rep.pixelsHigh) }
+        return image.size.width > 0 ? image.size : nil
+    }
+
+    /// Zoom, relative to the fitted image, at which one image pixel occupies one backing pixel.
+    static func actualSizeZoom(pixelSize: CGSize, viewport: CGSize, displayScale: CGFloat) -> CGFloat {
+        guard pixelSize.width > 0, pixelSize.height > 0, viewport.width > 0, viewport.height > 0, displayScale > 0 else { return 1 }
+        let fitScale = min(viewport.width / pixelSize.width, viewport.height / pixelSize.height)
+        return 1 / (fitScale * displayScale)
+    }
     var image: NSImage? {
         if TerminalPathSyntax.pathExtension(remotePath) == "svg" {
             let source = String(decoding: data, as: UTF8.self).lowercased()
@@ -652,25 +748,96 @@ enum ArtifactLoadError: LocalizedError {
 enum RemoteArtifactLoader {
     static func load(path: String, profile: ConnectionProfile) async throws -> Data {
         try await Task.detached(priority: .utility) {
-            if profile.kind == .local {
-                let url = URL(fileURLWithPath: path)
-                // Auto-loading is triggered purely by text printed to the
-                // terminal, so refuse a symlink: a program could print a path
-                // that points at an unrelated user-readable file.
-                let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
-                guard values.isSymbolicLink != true, values.isRegularFile == true else {
-                    throw ArtifactLoadError.failed("Refusing to auto-open a non-regular or symlinked file")
-                }
-                let data = try Data(contentsOf: url, options: .mappedIfSafe)
-                guard data.count <= 25 << 20 else { throw ArtifactLoadError.tooLarge }
-                return data
-            }
+            if profile.kind == .local { return try loadLocal(path: path) }
 
             return try await RelayHostFiles.image(
                 context: RelayExecutionContext(profile: profile, directory: "/"), path: path,
                 preserveFormat: ["pdf", "svg"].contains(TerminalPathSyntax.pathExtension(path)))
 
         }.value
+    }
+
+    static func loadLocal(path: String) throws -> Data {
+        let url = URL(fileURLWithPath: path)
+        // Auto-loading is triggered purely by text printed to the
+        // terminal, so refuse a symlink: a program could print a path
+        // that points at an unrelated user-readable file.
+        let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+        guard values.isSymbolicLink != true, values.isRegularFile == true else {
+            throw ArtifactLoadError.failed("Refusing to open a non-regular or symlinked file")
+        }
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard data.count <= 25 << 20 else { throw ArtifactLoadError.tooLarge }
+        return data
+    }
+}
+
+/// Loads exactly the requested file for an in-place pane preview. Failures become an
+/// error card for that same path; another file is never substituted.
+enum RelayFilePreviewLoader {
+    static func load(path: String, profile: ConnectionProfile, kind: RelayFilePreviewKind? = nil) async -> PaneArtifact {
+        let kind = kind ?? RelayFilePreviewKind.from(path: path) ?? .image
+        return await artifact(path: path, kind: kind) {
+            if kind == .log {
+                return .log(profile.kind == .local
+                    ? try await Task.detached(priority: .utility) { try RelayLogTail.readLocal(path: path) }.value
+                    : try await RelayHostFiles.text(path: path, profile: profile))
+            }
+            return .data(try await RemoteArtifactLoader.load(path: path, profile: profile))
+        }
+    }
+
+    /// Previews the immutable, digest-verified attachment snapshot, never its mutable source.
+    static func load(snapshot: RelayAgentAttachmentSnapshot.Record, name: String, kind: RelayFilePreviewKind) async -> PaneArtifact {
+        await artifact(path: name, kind: kind) {
+            try await Task.detached(priority: .utility) {
+                if kind == .log {
+                    let tail = try snapshot.withVerifiedFile { fd in
+                        let size = Int(snapshot.bytes), maxBytes = RelayLogTail.defaultMaxBytes
+                        guard lseek(fd, off_t(max(0, size - maxBytes)), SEEK_SET) >= 0 else {
+                            throw RelayAgentAttachmentSnapshot.Failure.changed
+                        }
+                        let bytes = try FileHandle(fileDescriptor: fd, closeOnDealloc: false).read(upToCount: min(size, maxBytes)) ?? Data()
+                        return RelayLogTail(bytes: bytes, totalBytes: size)
+                    }
+                    return .log(tail)
+                }
+                guard snapshot.bytes <= 25 << 20 else { throw ArtifactLoadError.tooLarge }
+                return .data(try snapshot.verifiedData())
+            }.value
+        }
+    }
+
+    enum Content: Sendable { case data(Data), log(RelayLogTail) }
+
+    private static func artifact(path: String, kind: RelayFilePreviewKind,
+                                 _ read: @Sendable () async throws -> Content) async -> PaneArtifact {
+        do {
+            var artifact: PaneArtifact
+            switch try await read() {
+            case .log(let tail): artifact = PaneArtifact(remotePath: path, log: tail)
+            case .data(let data):
+                artifact = PaneArtifact(remotePath: path, data: data)
+                if kind == .pdf, !artifact.isPDF { throw ArtifactLoadError.failed("File is not a PDF document") }
+                if kind == .image, !artifact.isPDF, artifact.image == nil { throw ArtifactLoadError.failed("File is not a supported image") }
+            }
+            artifact.userRequested = true
+            return artifact
+        } catch {
+            return PaneArtifact(remotePath: path, kind: kind, failure: error.localizedDescription)
+        }
+    }
+}
+
+extension PaneModel {
+    /// Shows a file the user explicitly asked to preview in this pane's in-place overlay.
+    func openFilePreview(path: String, profile: ConnectionProfile? = nil, kind: RelayFilePreviewKind? = nil) {
+        let profile = profile ?? self.profile
+        openPreview { await RelayFilePreviewLoader.load(path: path, profile: profile, kind: kind) }
+    }
+
+    func openAttachmentPreview(snapshot: RelayAgentAttachmentSnapshot.Record, name: String, kind: RelayFilePreviewKind) {
+        openPreview { await RelayFilePreviewLoader.load(snapshot: snapshot, name: name, kind: kind) }
     }
 }
 

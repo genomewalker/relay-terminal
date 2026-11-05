@@ -10,14 +10,14 @@ identity-change frame latches Needs attention and requires rebinding. Sends are
 never retried automatically. Remote reply socket paths are stable per route;
 a private directory and exclusive lock prevent two workers owning that address.
 
-`relay-desktop-route.py remember --config <private-request.json>` installs a
+`relayd desktop-route remember --config <private-request.json>` installs a
 per-task launch service from an exact selection. The request uses the existing
 host, thread, remoteSession, remotePID, remoteStart, remoteName, localName and
 socket fields. The saved reply name is derived from the task/host/session tuple.
 Repeating the same request is idempotent; changing the saved binding is refused.
-The routing runtime and its Python environment must already be installed.
+The bundled native routing runtime must already be installed.
 In Relay: Network → Manage connections → Add connection → Desktop task to
-remote agent. Select an open desktop task, enter the authorized SSH alias,
+remote agent. Select an open desktop task, select the authorized Relay host,
 choose Find sessions, select a peer and choose Connect and remember. Task
 discovery reads loaded IDs only, not conversations, and never resumes a task.
 The installed sheet was manually verified against the existing Chitta-sync /
@@ -174,9 +174,14 @@ Private JSON status snapshots include connection state, last receipt and RTT.
 No durable dedup or disk queue yet. A registry's
 compatibility status is not a provider activity metric.
 
-Validation: `go test -race ./internal/peernet ./cmd/relay-peer-link`, `go vet`
-and `scripts/test-peer-link.py WORKER LINK` exercise 20 real-worker round trips,
-host attribution, disconnect cleanup, offline failure and invalid input rejection.
+Validation: from `remote/relayd`, run
+`go test -race ./internal/peernet ./cmd/relay-peer-link` and `go vet`.
+The native Go fixture tests exercise 20 bidirectional worker/link round trips,
+host attribution, disconnect cleanup and offline send failure. A disposable SSH
+substitute also tests a cut connection, a new remote process, bounded reconnect,
+200 ms without replay, bidirectional recovery and stopped status. Fuzz targets
+check frame bounds and fixture-envelope truncation and round trips. These replace
+the archived Python test and fixture scripts; they make no provider calls.
 Live dandy validation passed: desktop Codex sent to cc-soul-9f and received
 `RELAY_SSH_ACK_20260920_C` pushed through the native inbox. Claude requires
 32-hex-character peer tokens; the initial longer proxy token was incompatible

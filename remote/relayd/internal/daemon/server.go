@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -25,6 +26,10 @@ var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,96}$`)
 type Server struct {
 	hostJobs              sync.Map
 	hostJobsMu            sync.Mutex
+	tombstonesOnce        sync.Once
+	tombstones            *hostJobTombstoneIndex
+	hostJobPeerSockets    []string
+	peerListenersMu       sync.Mutex
 	hostUpgradeUntil      time.Time
 	mu                    sync.Mutex
 	workerLocks           sync.Map
@@ -36,6 +41,7 @@ type Server struct {
 	stateDir              string
 	runtimeDir            string
 	workspaceLeases       map[string]workspaceLease
+	hostHealth            *hostPaneHealthSupervisor
 }
 
 func NewServer() *Server {
@@ -109,9 +115,26 @@ func (server *Server) Serve(socketPath string) error {
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		return err
 	}
+	healthContext, stopHealth := context.WithCancel(context.Background())
+	defer stopHealth()
+	server.hostHealth = newHostPaneHealthSupervisor(server.stateDir, server.executable)
+	server.hostHealth.lifetime = healthContext
+	go server.hostHealth.run(healthContext)
 	// Startup-only retention avoids a polling goroutine and bounds cleanup
 	// work. Running panes are never eligible.
 	_, _ = server.CollectGarbage(30*24*time.Hour, false)
+	// Registered before accepting clients: archive cleanup deletes only with
+	// evidence that every daemon serving this state directory knows tombstones.
+	_ = server.registerHostJobServer(time.Now())
+	// Load the tombstone reservations off the accept path (about 1 s per 500k);
+	// a lookup meanwhile waits for the load. Then the hourly archive cleanup.
+	go func() {
+		_ = server.hostJobTombstones().Load()
+		server.runHostJobArchiveCleanup(healthContext)
+	}()
+	// Before accepting clients, so a racing client respawn of the same route
+	// is reserved as superseded by the resumed listener, never run beside it.
+	server.resumePeerListeners()
 	var acceptBackoff time.Duration
 	for {
 		connection, acceptErr := listener.Accept()
@@ -162,6 +185,12 @@ func (server *Server) serveConnection(connection net.Conn) {
 	if err := protocol.DecodeJSON(first, &hello); err != nil || hello.Version != workerProtocolVersion {
 		return
 	}
+	if hello.HostHealthController {
+		if hello.Probe && hello.SessionID == "host-health-controller" && server.hostHealth != nil {
+			server.hostHealth.serve(connection)
+		}
+		return
+	}
 	if hello.NodeMux {
 		server.serveNodeMultiplex(connection)
 		return
@@ -185,7 +214,7 @@ func (server *Server) serveConnection(connection net.Conn) {
 			UpgradePrepared: prepared,
 			State:           "ready", Version: server.buildVersion,
 			ProtocolVersion: server.protocolVersion, SupervisorPID: os.Getpid(),
-			Capabilities: []string{"agent_binding_v1"},
+			Capabilities: []string{"agent_binding_v1", HostJobTombstonesCapability},
 		})
 		_ = protocol.NewWriter(connection).Write(ready)
 		return
@@ -434,7 +463,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 	ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
 		State: "ready", Version: server.buildVersion,
 		ProtocolVersion: server.protocolVersion, SupervisorPID: os.Getpid(),
-		Capabilities: []string{"wire_fragments_v1", "node_scheduling_v1", "host_rpc_v1", "node_mux_v1", "node_mux_v2", "viewport_commit_compat_v1", "viewport_commit_compat_v2"},
+		Capabilities: []string{"wire_fragments_v1", "node_scheduling_v1", "host_rpc_v1", "node_mux_v1", "node_mux_v2", "viewport_commit_compat_v1", "viewport_commit_compat_v2", "host_pane_health_controller_v1", "agent_accounts_v1", "native_chat_v1", HostJobTombstonesCapability},
 	})
 	if writer.Write(ready) != nil {
 		return

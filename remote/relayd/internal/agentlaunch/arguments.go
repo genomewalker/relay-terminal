@@ -8,6 +8,13 @@ import (
 
 var sessionUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
+// Claude options by arity, shared by replay and Relay's launch preparation.
+const (
+	claudeValueOptions    = "--name -n --model --effort --permission-mode --settings --setting-sources --agent --agents --append-system-prompt --append-system-prompt-file --system-prompt --system-prompt-file --append-subagent-system-prompt --append-subagent-system-prompt-file --system-prompt-snapshot --output-format --input-format --json-schema --max-turns --max-budget-usd --fallback-model --debug-file --teammate-mode --autocompact"
+	claudePlainOptions    = "--print -p --verbose --include-partial-messages --replay-user-messages --strict-mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions --chrome --no-chrome --disable-slash-commands --include-hook-events --forward-subagent-text"
+	claudeVariadicOptions = "--tools --allowedTools --allowed-tools --disallowedTools --disallowed-tools --add-dir --mcp-config --plugin-dir --betas"
+)
+
 type Arguments struct {
 	Fresh    []string `json:"fresh_args,omitempty"`
 	Prompts  []string `json:"initial_prompts,omitempty"`
@@ -27,13 +34,13 @@ func FreshArguments(client string, argv []string) Arguments {
 	plain := map[string]bool{}
 	variadic := map[string]bool{}
 	if client == "claude" {
-		for _, flag := range strings.Fields("--name -n --model --effort --permission-mode --settings --setting-sources --agent --agents --append-system-prompt --append-system-prompt-file --system-prompt --system-prompt-file --append-subagent-system-prompt --append-subagent-system-prompt-file --system-prompt-snapshot --output-format --input-format --json-schema --max-turns --max-budget-usd --fallback-model --debug-file --teammate-mode --autocompact") {
+		for _, flag := range strings.Fields(claudeValueOptions) {
 			value[flag] = true
 		}
-		for _, flag := range strings.Fields("--print -p --verbose --include-partial-messages --replay-user-messages --strict-mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions --chrome --no-chrome --disable-slash-commands --include-hook-events --forward-subagent-text") {
+		for _, flag := range strings.Fields(claudePlainOptions) {
 			plain[flag] = true
 		}
-		for _, flag := range strings.Fields("--tools --allowedTools --allowed-tools --disallowedTools --disallowed-tools --add-dir --mcp-config --plugin-dir --betas") {
+		for _, flag := range strings.Fields(claudeVariadicOptions) {
 			variadic[flag] = true
 		}
 	} else {

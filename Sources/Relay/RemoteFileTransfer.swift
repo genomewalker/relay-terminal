@@ -11,7 +11,7 @@ enum RemoteFileTransferError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notAFile(let name): "\(name) is not a regular file"
-        case .tooLarge(let name): "\(name) exceeds the 64 MiB transfer limit"
+        case .tooLarge(let name): "\(name) has an invalid file length"
         case .failed(let message): message
         case .invalidResponse: "The remote file transfer returned an invalid response"
         case .recoveryAvailable: "A saved upload exists for these items. Resume uses the original destination and recovers completed files without uploading another copy. Forget cancels unfinished uploads and clears saved receipts; completed remote files are kept."
@@ -20,16 +20,18 @@ enum RemoteFileTransferError: LocalizedError {
 }
 
 enum RemoteFileTransfer {
-    static let maximumBytes: Int64 = 64 << 20
+    // The representable file-offset range, with no application byte cap.
+    static let maximumBytes: Int64 = .max
     private struct Capabilities: Decodable {
         let operations: [String]
+        let unbounded: Bool?
         let folderProtocol: Int?
         let folderLimits: FolderLimits?
-        enum CodingKeys: String,CodingKey { case operations;case folderProtocol = "folder_upload_protocol",folderLimits = "folder_upload_limits" }
+        enum CodingKeys: String,CodingKey { case operations; case unbounded = "file_upload_unbounded"; case folderProtocol = "folder_upload_protocol",folderLimits = "folder_upload_limits" }
     }
     private struct FolderLimits: Decodable {
-        let entries: Int, file: Int64, total: Int64, chunk: Int
-        enum CodingKeys: String,CodingKey { case entries = "max_entries",file = "max_file_bytes",total = "max_total_bytes",chunk = "max_chunk_bytes" }
+        let entries: Int, chunk: Int
+        enum CodingKeys: String,CodingKey { case entries = "max_entries", chunk = "max_chunk_bytes" }
     }
     private enum Session: Sendable {
         case file(RemoteUpload), folder(RemoteFolderUpload)
@@ -53,14 +55,13 @@ enum RemoteFileTransfer {
         let payload = try JSONSerialization.data(withJSONObject: ["request_id": "rpc-" + UUID().uuidString.lowercased(), "operation": "capabilities"])
         let capabilities = try await request(payload, profile: profile, as: Capabilities.self)
         let required = ["file_upload_begin", "file_upload_status", "file_upload_chunk", "file_upload_commit", "file_upload_cancel"]
-        guard required.allSatisfy(capabilities.operations.contains) else {
+        guard capabilities.unbounded == true, required.allSatisfy(capabilities.operations.contains) else {
             throw RemoteFileTransferError.failed("Update this host’s Relay helper to enable recoverable uploads")
         }
         if folders {
             let operations = ["destination","begin","status","chunk","file_commit","commit","cancel","cleanup"].map { "file_folder_" + $0 }
             guard capabilities.folderProtocol == 1, operations.allSatisfy(capabilities.operations.contains),
-                  let limits = capabilities.folderLimits, limits.entries >= 1024, limits.file >= maximumBytes,
-                  limits.total >= 1 << 30, limits.chunk >= 4 << 20 else {
+                  let limits = capabilities.folderLimits, limits.entries >= 1024, limits.chunk >= 4 << 20 else {
                 throw RemoteFileTransferError.failed("Update this host’s Relay helper to enable recoverable folder uploads")
             }
         }
@@ -96,7 +97,7 @@ enum RemoteFileTransfer {
             throw RemoteFileTransferError.failed("Upload \(upload.jobID) paused: \(error.localizedDescription). Drop the same file into this pane to resume or forget the saved upload.")
         }
     }
-    static func upload(_ urls: [URL], toPane paneID: String, profile: ConnectionProfile, resume: Bool = false) async throws -> [RemoteFileEntry] {
+    static func upload(_ urls: [URL], toPane paneID: String, profile: ConnectionProfile, resume: Bool = false, progress: RelayTransferProgressHandler? = nil) async throws -> [RemoteFileEntry] {
         try Task.checkCancellation()
         var sessions: [Session] = []
         for url in urls { sessions.append(try await session(source:url,pane:paneID,profile:profile)) }
@@ -106,15 +107,20 @@ enum RemoteFileTransfer {
                 if await session.hasCheckpoint() { throw RemoteFileTransferError.recoveryAvailable }
             }
         }
+        let itemCount = sessions.count
         var imported: [RemoteFileEntry] = []
-        for session in sessions {
+        for (index, session) in sessions.enumerated() {
             try Task.checkCancellation()
+            let report: RelayTransferProgressHandler = { update in
+                var update = update; update.itemIndex = index + 1; update.itemCount = itemCount
+                await progress?(update)
+            }
             switch session {
             case .file(let upload):
-                imported.append(try await upload.upload(resume:resume,fetch:{ try await fetch($0,profile:profile) }))
+                imported.append(try await upload.upload(resume:resume,progress:report,fetch:{ try await fetch($0,profile:profile) }))
             case .folder(let upload):
                 let destination = await upload.hasCheckpoint() ? nil : try await folderDestination(pane:paneID,profile:profile)
-                imported.append(try await upload.upload(resume:resume,destination:destination,fetch:{ try await fetch($0,profile:profile) }))
+                imported.append(try await upload.upload(resume:resume,destination:destination,progress:report,fetch:{ try await fetch($0,profile:profile) }))
             }
         }
         return imported

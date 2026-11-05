@@ -5,8 +5,7 @@ import Testing
 @Suite struct RelayRotationCacheScheduleTests {
     private func evaluate(now: Double = 100, model: String = "gpt-6.1-sol",
                           ttlProvenance: String = "hook", includeResponse: Bool = true) async throws -> [String: Any] {
-        let policy = try #require(RelayPinnedContextRotationPolicy.bundled(
-            pythonExecutable: URL(fileURLWithPath: "/usr/bin/python3")))
+        let policy = RelayNativeContextRotationPolicy()
         var usage: [String: Any] = [
             "session": ["input": 100, "cached_input": 90, "uncached_input": 10,
                         "output": 10, "responses": 8, "turns": 4],

@@ -50,6 +50,31 @@ func TestDarwinClaudeVersionExecutableRequiresExactInstall(t *testing.T) {
 	}
 }
 
+// The updater removes superseded versions while an old Claude keeps running.
+// The kernel path of that deleted image must still identify Claude.
+func TestDarwinDeletedClaudeVersionStillIdentifiesRunningClaude(t *testing.T) {
+	home := t.TempDir()
+	directory := filepath.Join(home, ".local", "share", "claude", "versions")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	deleted := filepath.Join(directory, "2.1.295")
+	if got := classifyDarwinAgentExecutable("2.1.295", deleted, home); got != "claude" {
+		t.Fatalf("deleted installed version not recognized: %q", got)
+	}
+	for _, row := range [][2]string{
+		{"2.1.296", deleted},                                // name must match the image
+		{"bash", filepath.Join(directory, "bash")},          // not a version name
+		{"2.1.295", filepath.Join(home, "2.1.295")},         // outside the install
+		{"2.1.295", filepath.Join(home, "gone", "2.1.295")}, // missing parent
+		{"2.1", filepath.Join(directory, "2.1")},            // not a full version
+	} {
+		if got := classifyDarwinAgentExecutable(row[0], row[1], home); got != "" {
+			t.Fatalf("accepted %v: %q", row, got)
+		}
+	}
+}
+
 func TestDarwinKernelExecutableReportsRunningImage(t *testing.T) {
 	got, err := darwinKernelExecutable(os.Getpid())
 	if err != nil {

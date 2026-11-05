@@ -8,6 +8,8 @@ import SwiftUI
         let accountScope: String?
         var quota: RelaySubscriptionQuota?
         var refreshFailed = false
+        var accountLabel: String? = nil
+        var configuredPlan: String? = nil
         var host: String { hosts.joined(separator: " · ") }
 
         struct Glance {
@@ -55,7 +57,8 @@ import SwiftUI
                 guard let previous = groups[key] else {
                     groups[key] = Entry(id: key, hosts: entry.hosts, provider: entry.provider,
                                         accountScope: entry.accountScope, quota: entry.quota,
-                                        refreshFailed: entry.refreshFailed)
+                                        refreshFailed: entry.refreshFailed,
+                                        accountLabel: entry.accountLabel, configuredPlan: entry.configuredPlan)
                     continue
                 }
                 let hosts = Array(Set(previous.hosts + entry.hosts)).sorted { left, right in
@@ -68,7 +71,9 @@ import SwiftUI
                 if let next = entry.quota { quota = .preferred(previous.quota, next) }
                 else { quota = previous.quota }
                 groups[key] = Entry(id: key, hosts: hosts, provider: entry.provider,
-                                    accountScope: entry.accountScope, quota: quota)
+                                    accountScope: entry.accountScope, quota: quota,
+                                    accountLabel: previous.accountLabel ?? entry.accountLabel,
+                                    configuredPlan: previous.configuredPlan ?? entry.configuredPlan)
             }
             return groups.values.sorted {
                 if $0.provider != $1.provider { return $0.provider.rawValue < $1.provider.rawValue }
@@ -108,8 +113,6 @@ import SwiftUI
             profiles[key]?.1.append(pane.id.uuidString.lowercased())
         }
         if profiles.isEmpty { profiles["local"] = (.local, []) }
-        guard let url = RelayResources.bundle?.url(forResource: "subscription_quota", withExtension: "py", subdirectory: "Rotation"),
-              let script = try? String(contentsOf: url, encoding: .utf8) else { return }
         var observations: [Entry] = []
         var history: [String: [Entry]] = [:]
         for key in profiles.keys.sorted() {
@@ -120,7 +123,7 @@ import SwiftUI
                 let readKey = (profile.kind == .local ? "local:" : "ssh:") + key +
                     "\u{0}" + panes.sorted().joined(separator: ",")
                 let snapshot = try await RelaySubscriptionQuotaReader.shared.read(key: readKey, force: force) {
-                    try await Self.read(profile: profile, script: script, panes: panes)
+                    try await Self.read(profile: profile, panes: panes)
                 }
                 let rows = try Self.entries(from: snapshot, key: key, host: host)
                 history[key] = rows
@@ -143,14 +146,18 @@ import SwiftUI
         guard let rows = try JSONSerialization.jsonObject(with: snapshot.data) as? [[String: Any]] else {
             throw RelaySubscriptionQuota.ParseError.invalidPayload
         }
-        return [RelaySubscriptionQuota.Provider.codex, .claude].map { provider in
+        return [RelaySubscriptionQuota.Provider.codex, .claude].flatMap { provider -> [Entry] in
+            let identities = rows.filter { $0["provider"] as? String == provider.rawValue && $0["identity_only"] as? Bool == true }
+            return (identities.isEmpty ? [[:]] : identities).enumerated().map { index, identity in
             var newest: RelaySubscriptionQuota?
-            let identity = rows.first { $0["provider"] as? String == provider.rawValue && $0["identity_only"] as? Bool == true }
-            let scope = (identity?["account_scope"] as? String).flatMap {
+            let label = Self.displayMetadata(identity["account_label"], limit: 24)
+            let plan = Self.displayMetadata(identity["configured_plan"], limit: 32)
+            let scope = (identity["account_scope"] as? String).flatMap {
                 $0.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil ? $0 : nil
             }
             for row in rows where row["provider"] as? String == provider.rawValue {
                 guard row["identity_only"] as? Bool != true,
+                      !(scope == nil && label != nil),
                       row["account_scope"] as? String == scope else { continue }
                 guard let observation = row["observation"] as? [String: Any],
                       let data = try? JSONSerialization.data(withJSONObject: observation) else { continue }
@@ -167,9 +174,17 @@ import SwiftUI
                     newest = .preferred(newest, quota)
                 }
             }
-            return Entry(id: key + provider.rawValue, hosts: [host], provider: provider,
-                         accountScope: scope, quota: newest)
+            return Entry(id: key + provider.rawValue + (scope.map { ":" + $0 } ?? (label.map { ":" + $0 } ?? "")),
+                         hosts: [host], provider: provider, accountScope: scope, quota: newest,
+                         accountLabel: label, configuredPlan: plan)
+            }
         }
+    }
+
+    private static func displayMetadata(_ value: Any?, limit: Int) -> String? {
+        guard let text = value as? String, !text.isEmpty, text.utf8.count <= limit,
+              text.utf8.allSatisfy({ $0 >= 32 && $0 < 127 }) else { return nil }
+        return text
     }
 
     private static func date(_ text: String) -> Date? {
@@ -180,18 +195,23 @@ import SwiftUI
         return parser.date(from: text)
     }
 
-    nonisolated private static func read(profile: ConnectionProfile, script: String, panes: [String]) async throws -> Data {
+    /// The exact native command, shared with focused command-construction tests.
+    /// Remote pane identifiers remain shell-quoted by the normal host helper.
+    nonisolated static func quotaReadInvocation(profile: ConnectionProfile, panes: [String]) -> (URL, [String]) {
+        if profile.kind == .local {
+            return (Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/relayd"), ["subscription-quota"] + panes)
+        }
+        let command = RelayHostExecution.daemonCommand(profile: profile, arguments: ["subscription-quota"] + panes)
+        return (URL(fileURLWithPath: "/usr/bin/ssh"),
+                ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] + profile.sshConnectionArguments + [command])
+    }
+
+    nonisolated private static func read(profile: ConnectionProfile, panes: [String]) async throws -> Data {
         try await Task.detached(priority: .utility) {
             let process = Process()
-            func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-            if profile.kind == .local {
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                process.arguments = ["python3", "-c", script] + panes
-            } else {
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-                process.arguments = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] + profile.sshConnectionArguments +
-                    ["python3 -c " + quote(script) + " " + panes.map(quote).joined(separator: " ")]
-            }
+            let (executable, arguments) = quotaReadInvocation(profile: profile, panes: panes)
+            process.executableURL = executable
+            process.arguments = arguments
             process.standardInput = FileHandle.nullDevice
             let output = Pipe(), errors = Pipe()
             process.standardOutput = output; process.standardError = errors
@@ -203,7 +223,7 @@ import SwiftUI
 }
 
 
-private struct RelaySubscriptionQuotaRow: View {
+struct RelaySubscriptionQuotaRow: View {
     let entry: RelaySubscriptionQuotaStore.Entry
     let now: Date
     @State private var expanded = false
@@ -219,12 +239,13 @@ private struct RelaySubscriptionQuotaRow: View {
             } label: {
                 HStack(spacing: RelayTheme.spacing(10)) {
                     VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
-                        HStack(spacing: RelayTheme.spacing(5)) {
-                            Text(entry.provider.rawValue.capitalized).fontWeight(.medium)
-                            if let plan = entry.quota?.planType {
-                                Text(plan.capitalized).foregroundStyle(.secondary)
-                            }
-                        }.font(.callout)
+                        Text(entry.provider.rawValue.capitalized + (entry.accountLabel.map { " · " + $0 } ?? ""))
+                            .font(.callout).fontWeight(.medium)
+                        if let plan = entry.quota?.planDisplayName {
+                            Text(plan).font(.caption).foregroundStyle(.secondary).lineLimit(1).help(plan)
+                        } else if let plan = entry.configuredPlan {
+                            Text("Configured plan: " + plan).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
                         Text(entry.host).font(.caption).foregroundStyle(.secondary)
                             .lineLimit(1).truncationMode(.middle).help(entry.host)
                     }.frame(maxWidth: .infinity, alignment: .leading)
@@ -245,10 +266,32 @@ private struct RelaySubscriptionQuotaRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(entry.provider.rawValue.capitalized) \(entry.quota?.planType?.capitalized ?? ""), \(entry.host), \(glance.value), \(glance.detail)")
+            .accessibilityLabel("\(entry.provider.rawValue.capitalized) \(entry.quota?.planDisplayName ?? ""), \(entry.host), \(glance.value), \(glance.detail)")
             .accessibilityValue(expanded ? "Expanded" : "Collapsed")
             .accessibilityHint(expanded ? "Hide account details" : "Show account details")
             .accessibilityIdentifier("relay.quota.account.\(entry.id)")
+            if let quota = entry.quota, !quota.windows.isEmpty {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(5)) {
+                    ForEach(quota.windows) { window in
+                        let current = !entry.refreshFailed && quota.isCurrent(window, now: now)
+                        HStack {
+                            Text(window.label)
+                            Spacer()
+                            Text(current ? "\(Int(window.remainingPercent))% left" : "Last known · \(Int(window.remainingPercent))% left")
+                                .monospacedDigit()
+                        }.font(.caption).foregroundStyle(current ? .primary : .secondary)
+                        if current {
+                            ProgressView(value: window.remainingPercent, total: 100)
+                                .tint(window.remainingPercent <= 10 ? Color.orange : Color.accentColor)
+                                .accessibilityLabel("\(window.label), \(Int(window.remainingPercent)) percent remaining")
+                        }
+                        if let reset = window.resetsAt {
+                            Text(reset > now ? "Resets \(reset.formatted(date: .abbreviated, time: .shortened))" : "Reset passed · refresh needed")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }.padding(.bottom, RelayTheme.spacing(10))
+            }
             if expanded {
                 VStack(alignment: .leading, spacing: RelayTheme.spacing(6)) {
         if entry.hosts.count > 1 {
@@ -260,15 +303,6 @@ private struct RelaySubscriptionQuotaRow: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
         if let quota = entry.quota, !quota.windows.isEmpty || !quota.credits.isEmpty || quota.availableResets != nil || quota.extraUsageEnabled != nil {
-            ForEach(quota.windows) { window in
-                let showValue = entry.refreshFailed || quota.isCurrent(window, now: now)
-                HStack {
-                    Text(window.label)
-                    Spacer()
-                    Text(showValue ? "\(Int(window.remainingPercent))% left" : "Stale").monospacedDigit()
-                }.font(.callout)
-                if let reset = window.resetsAt { Text("Resets \(reset.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary) }
-            }
             ForEach(quota.credits) { credit in
                 HStack {
                     Text(quota.credits.count > 1 ? "Credits · " + credit.label : "Credits left")

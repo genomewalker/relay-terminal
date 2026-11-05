@@ -129,7 +129,7 @@ func (s *Server) hostUploadRPC(r hostRequest) (any, error) {
 	if err == nil {
 		raw, readErr := io.ReadAll(io.LimitReader(checkpoint, 16385))
 		checkpoint.Close()
-		if readErr != nil || len(raw) > 16384 || json.Unmarshal(raw, &record) != nil || record.Format != 1 || record.ID != r.JobID || record.Offset < 0 || record.Offset > record.Size || record.Size < 0 || record.Size > maxImportedFileBytes || !filepath.IsAbs(record.Directory) || filepath.Dir(record.Stage) != record.Directory || !strings.HasPrefix(filepath.Base(record.Stage), ".relay-upload-") || len(record.Fingerprint) != 64 || len(record.SHA256) != 64 || len(record.PrefixSHA256) != 64 {
+		if readErr != nil || len(raw) > 16384 || json.Unmarshal(raw, &record) != nil || record.Format != 1 || record.ID != r.JobID || record.Offset < 0 || record.Offset > record.Size || record.Size < 0 || !filepath.IsAbs(record.Directory) || filepath.Dir(record.Stage) != record.Directory || !strings.HasPrefix(filepath.Base(record.Stage), ".relay-upload-") || len(record.Fingerprint) != 64 || len(record.SHA256) != 64 || len(record.PrefixSHA256) != 64 {
 			return nil, errors.New("invalid upload checkpoint")
 		}
 	} else if !os.IsNotExist(err) {
@@ -152,8 +152,8 @@ func (s *Server) hostUploadRPC(r hostRequest) (any, error) {
 	}
 
 	if r.Operation == "file_upload_begin" {
-		if r.UploadSize < 0 || r.UploadSize > maxImportedFileBytes || len(r.UploadSHA256) != 64 || r.UploadName == "" || len(r.UploadName) > 240 || r.UploadName == "." || r.UploadName == ".." || strings.ContainsAny(r.UploadName, "/\\\x00") || !validSessionID.MatchString(r.UploadPane) {
-			return nil, errors.New("bounded upload size, SHA256, name and pane required")
+		if r.UploadSize < 0 || len(r.UploadSHA256) != 64 || r.UploadName == "" || len(r.UploadName) > 240 || r.UploadName == "." || r.UploadName == ".." || strings.ContainsAny(r.UploadName, "/\\\x00") || !validSessionID.MatchString(r.UploadPane) {
+			return nil, errors.New("nonnegative upload size, SHA256, name and pane required")
 		}
 		decoded, decodeErr := hex.DecodeString(r.UploadSHA256)
 		if decodeErr != nil || len(decoded) != 32 {
@@ -232,8 +232,8 @@ func (s *Server) hostUploadRPC(r hostRequest) (any, error) {
 	if err != nil || uploadIdentity(info) != record.StageIdentity || info.Size() < record.Offset {
 		return nil, errors.New("upload staging identity changed")
 	}
-	digest, err := uploadDigest(stage, record.Offset)
-	if err != nil || digest != record.PrefixSHA256 {
+	hasher, err := validatedUploadHash(stage, record.Offset, record.PrefixSHA256, r.Operation != "file_upload_chunk")
+	if err != nil {
 		return nil, errors.New("upload checkpoint bytes changed")
 	}
 	// A crash after data fsync but before checkpoint publication leaves a tail.
@@ -294,8 +294,9 @@ func (s *Server) hostUploadRPC(r hostRequest) (any, error) {
 			return nil, err
 		}
 		record.Offset += int64(n)
-		record.PrefixSHA256, err = uploadDigest(stage, record.Offset)
-		if err != nil {
+		hasher.Write(r.Data[:n])
+		record.PrefixSHA256 = hex.EncodeToString(hasher.Sum(nil))
+		if err = rememberUploadHash(stage, record.Offset, hasher); err != nil {
 			return nil, err
 		}
 		if err = saveUpload(root, record); err != nil {

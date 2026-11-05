@@ -1,19 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/build-app-steps.sh"
 
 candidate_root="${RELAY_CANDIDATE_ROOT:-${TMPDIR:-/tmp}/relay-candidate-$(id -u)}"
 app="$candidate_root/Relay Candidate.app"
 executable="$app/Contents/MacOS/Relay"
 is_executable_running() {
-    /bin/ps -axo comm= | /usr/bin/perl -MCwd=realpath -e '
-        my $target = realpath(shift) // "";
-        while (my $path = <STDIN>) {
-            chomp $path;
-            my $resolved = realpath($path) // $path;
-            exit 0 if length($target) && $resolved eq $target;
-        }
-        exit 1;
-    ' -- "$1"
+    /bin/ps -axo comm= | relay_build_helper running "$1" 2>/dev/null
 }
 if [[ ! -x "$executable" ]]; then
     echo "Candidate is not built: $app" >&2

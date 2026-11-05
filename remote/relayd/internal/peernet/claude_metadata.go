@@ -35,12 +35,20 @@ func metadataText(s string, limit int) bool {
 // Team membership is descriptive metadata, never liveness or a messaging edge.
 // Decode only whitelisted fields: team configs can also contain private prompts.
 func discoverClaudeTeams(home string, records []Record) ([]ClaudeTeam, bool) {
+	result, truncated := []ClaudeTeam{}, false
+	for _, config := range claudeConfigs(home) {
+		teams, partial := discoverClaudeTeamsIn(filepath.Join(config, "teams"), records)
+		result, truncated = append(result, teams...), truncated || partial
+	}
+	return result, truncated
+}
+
+func discoverClaudeTeamsIn(dir string, records []Record) ([]ClaudeTeam, bool) {
 	result := []ClaudeTeam{}
 	live := map[string]int{}
 	for _, r := range records {
 		live[r.Session]++
 	}
-	dir := filepath.Join(home, ".claude", "teams")
 	f, err := os.Open(dir)
 	if err != nil {
 		return result, false

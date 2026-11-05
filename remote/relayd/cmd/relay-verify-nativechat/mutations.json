@@ -1,0 +1,501 @@
+[
+  {
+    "label": "snapshot-budget",
+    "repetitions": 1,
+    "test": "TestSnapshotFitsWireBudget",
+    "expected": "snapshot wire budget exceeded",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "if len(encoded)+1 > budget {",
+        "new": "if false && len(encoded)+1 > budget {"
+      }
+    ]
+  },
+  {
+    "label": "detail-budget",
+    "repetitions": 1,
+    "test": "TestSnapshotFitsWireBudget",
+    "expected": "snapshot wire budget exceeded|bounded error did not disclose truncation",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "if len(text) <= limit {",
+        "new": "if true {"
+      }
+    ]
+  },
+  {
+    "label": "rpc-empty-canonical",
+    "repetitions": 1,
+    "test": "FuzzRPCEnvelope",
+    "expected": "RPC round trip changed action",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "r.ImageData = nil",
+        "new": "r.ImageData = r.ImageData"
+      }
+    ]
+  },
+  {
+    "label": "json-byte-bound",
+    "repetitions": 1,
+    "test": "TestDecodeRejectsAmbiguityAndBounds",
+    "expected": "size bound ignored",
+    "patches": [
+      {
+        "file": "json.go",
+        "old": "len(data) > limit",
+        "new": "(len(data) > limit && false)"
+      }
+    ]
+  },
+  {
+    "label": "action-unknown-fields",
+    "repetitions": 1,
+    "test": "TestDecodeRejectsAmbiguityAndBounds",
+    "expected": "unknown action field accepted",
+    "patches": [
+      {
+        "file": "json.go",
+        "old": "decoder.DisallowUnknownFields()",
+        "new": "// unknown fields deliberately accepted"
+      }
+    ]
+  },
+  {
+    "label": "frame-byte-bound",
+    "repetitions": 1,
+    "test": "TestFrameRejectsTruncation",
+    "expected": "frame bound ignored",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "len(data)+len(part) > limit",
+        "new": "(len(data)+len(part) > limit && false)"
+      }
+    ]
+  },
+  {
+    "label": "owner",
+    "repetitions": 1,
+    "test": "TestActionsAreOwnedAndOnceOnly",
+    "expected": "stale owner admitted",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "a.Identity != s.View.Identity",
+        "new": "false"
+      }
+    ]
+  },
+  {
+    "label": "receipt-once",
+    "repetitions": 1,
+    "test": "TestActionsAreOwnedAndOnceOnly",
+    "expected": "same action executed twice",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "return old, false, nil",
+        "new": "return old, true, nil"
+      }
+    ]
+  },
+  {
+    "label": "receipt-digest",
+    "repetitions": 1,
+    "test": "TestActionsAreOwnedAndOnceOnly",
+    "expected": "action ID rebound",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "if old.Digest != digest {",
+        "new": "if false {"
+      }
+    ]
+  },
+  {
+    "label": "approval-once",
+    "repetitions": 1,
+    "test": "TestApprovalsPreserveTurnAndDecision|TestBoundedApprovalInterleavings",
+    "expected": "two replies to one request|more than one provider response admitted",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "s.View.Requests[index].Responding ||",
+        "new": "false ||"
+      }
+    ]
+  },
+  {
+    "label": "turn-fence",
+    "repetitions": 1,
+    "test": "TestInterruptTargetsActiveTurn",
+    "expected": "stale completion settled active turn",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "turn == \"\" || s.View.TurnID != turn",
+        "new": "turn == \"\""
+      }
+    ]
+  },
+  {
+    "label": "background-request",
+    "repetitions": 1,
+    "test": "TestBackgroundRequestOutlivesTopLevelResult",
+    "expected": "background approval lost",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "s.View.TurnID = \"\"\n\ts.Interrupting = \"\"",
+        "new": "s.View.Requests = nil\n\ts.View.TurnID = \"\"\n\ts.Interrupting = \"\""
+      }
+    ]
+  },
+  {
+    "label": "item-limit",
+    "repetitions": 1,
+    "test": "TestQuestionAndHistoryBounds",
+    "expected": "item bound not visible",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "if len(item.Text) > MaxItemBytes {",
+        "new": "if false {"
+      }
+    ]
+  },
+  {
+    "label": "unknown-tasks",
+    "repetitions": 1,
+    "test": "TestQuestionAndHistoryBounds",
+    "expected": "OS idleness invented scheduled-task safety",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "ScheduledTasks: \"unknown\"",
+        "new": "ScheduledTasks: \"none\""
+      }
+    ]
+  },
+  {
+    "label": "duplicate-json",
+    "repetitions": 1,
+    "test": "TestDecodeRejectsAmbiguityAndBounds",
+    "expected": "accepted",
+    "patches": [
+      {
+        "file": "json.go",
+        "old": "!ok || keys[key]",
+        "new": "!ok"
+      }
+    ]
+  },
+  {
+    "label": "json-depth",
+    "repetitions": 1,
+    "test": "TestJSONStructureBounds",
+    "expected": "JSON depth bound ignored",
+    "patches": [
+      {
+        "file": "json.go",
+        "old": "depth > 64 || nodes > 65536",
+        "new": "nodes > 65536"
+      }
+    ]
+  },
+  {
+    "label": "json-nodes",
+    "repetitions": 1,
+    "test": "TestJSONStructureBounds",
+    "expected": "JSON node bound ignored",
+    "patches": [
+      {
+        "file": "json.go",
+        "old": "depth > 64 || nodes > 65536",
+        "new": "depth > 64"
+      }
+    ]
+  },
+  {
+    "label": "rpc-owner",
+    "repetitions": 1,
+    "test": "TestRPCEnvelopeRejectsMixedOperations",
+    "expected": "mixed or foreign RPC envelope accepted",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "r.Action.Identity != r.Identity ||",
+        "new": "false ||"
+      }
+    ]
+  },
+  {
+    "label": "codex-native-id",
+    "repetitions": 1,
+    "test": "TestCodexNativeFixture",
+    "expected": "native approval ID or decision changed",
+    "patches": [
+      {
+        "file": "provider.go",
+        "old": "\"id\": r.NativeID, \"result\": map[string]string{\"decision\": decision}",
+        "new": "\"id\": 0, \"result\": map[string]string{\"decision\": decision}"
+      }
+    ]
+  },
+  {
+    "label": "claude-question",
+    "repetitions": 1,
+    "test": "TestClaudeNativeFixture",
+    "expected": "question answer semantics changed",
+    "patches": [
+      {
+        "file": "provider.go",
+        "old": "answers[q.Text] =",
+        "new": "answers[q.ID] ="
+      }
+    ]
+  },
+  {
+    "label": "claude-busy",
+    "repetitions": 1,
+    "test": "TestClaudeBusyStateDefersNextSend",
+    "expected": "result reopened composer while provider reports busy",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "&& !s.ProviderBusy",
+        "new": "&& true"
+      }
+    ]
+  },
+  {
+    "label": "uncertainty-hold",
+    "repetitions": 1,
+    "test": "TestUncertainCompletionCannotReopenInput",
+    "expected": "completion reopened input after uncertain outcome",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "if state == \"uncertain\" {",
+        "new": "if false {"
+      }
+    ]
+  },
+  {
+    "label": "receipt-limit",
+    "repetitions": 1,
+    "test": "TestReceiptStorageBound",
+    "expected": "receipt storage exceeded bound",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "if len(s.Receipts) >= MaxReceipts {",
+        "new": "if false {"
+      }
+    ]
+  },
+  {
+    "label": "provider-replay",
+    "repetitions": 3,
+    "test": "TestWorkerRoundtripReceiptAndOfflineHistory",
+    "expected": "provider got duplicate|replay changed receipt",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "if !fresh {",
+        "new": "if !fresh && false {"
+      }
+    ]
+  },
+  {
+    "label": "kernel-peer",
+    "repetitions": 3,
+    "test": "TestWorkerRoundtripReceiptAndOfflineHistory",
+    "expected": "wrong kernel peer accepted",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "uid != os.Getuid() || pid != d.PID",
+        "new": "uid != os.Getuid()"
+      }
+    ]
+  },
+  {
+    "label": "launch-claim",
+    "repetitions": 3,
+    "test": "TestLaunchClaimAcrossPanes",
+    "expected": "launch effects admitted|durable launch claim replayed",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "identity.Instance+\".json\"), os.O_CREATE|os.O_EXCL|os.O_WRONLY",
+        "new": "identity.Instance+\".json\"), os.O_CREATE|os.O_WRONLY"
+      }
+    ]
+  },
+  {
+    "label": "history-delta",
+    "repetitions": 3,
+    "test": "TestHistoryDeltaRoundTrip",
+    "expected": "history deltas",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": "ItemUpdate{record, delta}",
+        "new": "ItemUpdate{record, false}"
+      }
+    ]
+  },
+  {
+    "label": "image-digest",
+    "repetitions": 3,
+    "test": "TestImageStorageRejectsEscapesAndChanges",
+    "expected": "changed digest-named image accepted",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "filepath.Base(path) != stableID(\"image\", string(data)) ||",
+        "new": "false ||"
+      }
+    ]
+  },
+  {
+    "label": "resume-owner",
+    "repetitions": 3,
+    "test": "TestResumeRequiresGoneOwnersAccountAndSettledReceipts",
+    "expected": "live source provider admitted resume",
+    "patches": [
+      {
+        "file": "resume.go",
+        "old": "err != nil || !gone",
+        "new": "err != nil || (!gone && false)"
+      }
+    ]
+  },
+  {
+    "label": "resume-account",
+    "repetitions": 3,
+    "test": "TestResumeRequiresGoneOwnersAccountAndSettledReceipts",
+    "expected": "resume crossed account",
+    "patches": [
+      {
+        "file": "resume.go",
+        "old": "snapshot.AccountRoot != accountRoot ||",
+        "new": "false ||"
+      }
+    ]
+  },
+  {
+    "label": "resume-receipt",
+    "repetitions": 3,
+    "test": "TestResumeRequiresGoneOwnersAccountAndSettledReceipts",
+    "expected": "unresolved action admitted resume",
+    "patches": [
+      {
+        "file": "resume.go",
+        "old": "r.State != \"sent\" && r.State != \"rejected\"",
+        "new": "false && r.State != \"sent\" && r.State != \"rejected\""
+      }
+    ]
+  },
+  {
+    "label": "session-lease",
+    "repetitions": 3,
+    "test": "TestSessionLeaseExcludesSecondOwner",
+    "expected": "second session owner admitted",
+    "patches": [
+      {
+        "file": "resume.go",
+        "old": "unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)",
+        "new": "func() error { return nil }()"
+      }
+    ]
+  },
+  {
+    "label": "receipt-newline",
+    "repetitions": 3,
+    "test": "TestReceiptJournalRequiresCompleteLines|FuzzSettledReceipts",
+    "expected": "truncated receipt journal accepted|partial journal accepted",
+    "patches": [
+      {
+        "file": "resume.go",
+        "old": "len(data) > 0 && data[len(data)-1] != 10",
+        "new": "false && len(data) > 0 && data[len(data)-1] != 10"
+      }
+    ]
+  },
+  {
+    "label": "frame-truncation",
+    "repetitions": 1,
+    "test": "TestFrameRejectsTruncation|FuzzReadFrame",
+    "expected": "unterminated frame accepted|framer accepted truncation",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "if e != bufio.ErrBufferFull {\n\t\t\treturn nil, e",
+        "new": "if e != bufio.ErrBufferFull {\n\t\t\treturn data, nil"
+      }
+    ]
+  },
+  {
+    "label": "fuzz-json-roundtrip",
+    "repetitions": 1,
+    "test": "FuzzDecodeObject",
+    "expected": "round trip changed JSON",
+    "patches": [
+      {
+        "file": "json.go",
+        "old": "return object, nil",
+        "new": "delete(object, \"x\")\n\treturn object, nil"
+      }
+    ]
+  },
+  {
+    "label": "fuzz-rpc-roundtrip",
+    "repetitions": 1,
+    "test": "FuzzRPCEnvelope",
+    "expected": "RPC round trip changed action",
+    "patches": [
+      {
+        "file": "worker.go",
+        "old": "return r, nil\n}\nfunc (w *worker) signal",
+        "new": "r.AfterRevision++\n\treturn r, nil\n}\nfunc (w *worker) signal"
+      }
+    ]
+  },
+  {
+    "label": "fuzz-path",
+    "repetitions": 1,
+    "test": "FuzzIdentityRoot|TestIdentityCannotEscapeRoot",
+    "expected": "identity escaped root|unsafe path segment",
+    "patches": [
+      {
+        "file": "state.go",
+        "old": " || s == \".\" || s == \"..\"",
+        "new": ""
+      }
+    ]
+  },
+  {
+    "label": "fuzz-provider-owner",
+    "repetitions": 1,
+    "test": "FuzzProviderFrames|TestProviderRejectsWrongConversation",
+    "expected": "frame rebound conversation|wrong Claude session accepted",
+    "patches": [
+      {
+        "file": "provider.go",
+        "old": "session != \"\" && session != d.Options.Session",
+        "new": "session != \"\" && false"
+      },
+      {
+        "file": "state.go",
+        "old": "s.View.SessionID != \"\" && s.View.SessionID != session",
+        "new": "s.View.SessionID != \"\" && false"
+      }
+    ]
+  }
+]

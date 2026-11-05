@@ -55,6 +55,24 @@ import Testing
         #expect(pane.networkAgentRoots == ["claude:77:hook", "claude:88:other"])
     }
 
+    /// The 8e4b42ae journal from dandy-07 (2026-10-30): the conversation's
+    /// root stays alive while two 1 s roots of the same provider start and
+    /// end. Only the last root's exit may say the session ended.
+    @Test func shortLivedSecondRootDoesNotEndTheRunningConversation() throws {
+        let pane = PaneModel(profile: .sshConfigHost("owned-peer.invalid"))
+        try pane.receivedAgentEvent(payload("claude:821285:3684655", "SessionStart", 1))
+        try pane.receivedAgentEvent(payload("claude:3243653:4874836", "SessionStart", 6))
+        try pane.receivedAgentEvent(payload("claude:3243653:4874836", "SessionEnd", 7))
+        try pane.receivedAgentEvent(payload("claude:4069236:5281863", "SessionStart", 8))
+        try pane.receivedAgentEvent(payload("claude:4069236:5281863", "SessionEnd", 9))
+        #expect(pane.networkAgentRoots == ["claude:821285:3684655"])
+        #expect(pane.kind == .claude)
+        #expect(pane.activitySummary != "Claude session ended")
+        try pane.receivedAgentEvent(payload("claude:821285:3684655", "SessionEnd", 10))
+        #expect(pane.networkAgentRoots.isEmpty)
+        #expect(pane.activitySummary == "Claude session ended")
+    }
+
     @Test func emptySnapshotClearsStalePresentation() throws {
         let pane = PaneModel(profile: .sshConfigHost("owned-peer.invalid"))
         try pane.receivedAgentEvent(payload("claude:77:old", "SessionStart", 1))

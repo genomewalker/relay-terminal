@@ -82,20 +82,16 @@ private struct RelayConversationSnapshot: Decodable {
             }
         }
         do {
-            guard let root = RelayResources.bundle?.url(forResource: "Rotation", withExtension: nil) else { throw RemoteCatalogError.invalidResponse }
-            let script = try Data(contentsOf: root.appendingPathComponent("agent_conversation.py"))
-            guard script.count <= 64 << 10 else { throw RemoteCatalogError.invalidResponse }
             let paneID = pane.id.uuidString.lowercased()
             let rootPID = profile.kind == .local ? Int(pane.networkForegroundPID ?? 0) : 0
-            let daemonCommand = RelayHostExecution.daemonCommand(profile: profile, arguments: [])
             let inputRevision = pane.agentInputRevision
-            var command = "python3 - --binding-daemon " + daemonCommand + " --pane '" + paneID + "' --root-pid " + String(rootPID)
+            var arguments = ["agent-conversation", "--pane", paneID, "--root-pid", String(rootPID)]
             if let before, let historyBinding, let sourceIdentity = historyBinding.sourceIdentity {
-                func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }
-                command += " --before " + String(before) + " --source-identity " + quote(sourceIdentity) + " --session " + quote(historyBinding.sessionID)
+                arguments += ["--before", String(before), "--source-identity", sourceIdentity, "--session", historyBinding.sessionID]
             }
+            let command = RelayHostExecution.daemonCommand(profile: profile, arguments: arguments)
             let result = try await RelayHostExecution.capture(profile: profile, command: command,
-                input: script, timeout: 15, maximumBytes: 600 << 10)
+                timeout: 15, maximumBytes: 600 << 10)
             try Task.checkCancellation()
             guard token == generation, visible, self.pane === pane, pane.id == identity, pane.profile == profile else { return false }
             guard result.exitCode == 0 else { throw RemoteCatalogError.failed("The conversation reader could not complete on this host.") }
@@ -164,16 +160,11 @@ private struct RelayConversationSnapshot: Decodable {
 struct RelayAgentTimelineView: View {
     @ObservedObject var pane: PaneModel
     @StateObject private var store: RelayAgentTimelineStore
-    @State private var draft = ""
-    @StateObject private var attachmentQueue = RelayAgentAttachmentQueue()
-    @State private var draftRestored = false
-    @State private var submitting = false
-    @State private var submitted = false
-    @State private var nativeDeliveryHeld = false
-    @State private var stopRequested = false
-    @State private var submissionStatus: String?
+    @ObservedObject private var composerState: PaneComposerState
+    @ObservedObject private var attachmentQueue: RelayAgentAttachmentQueue
     @State private var atBottom = true
     @State private var unseen = false
+    @State private var showingHeldResolution = false
     @FocusState private var composerFocused: Bool
     // Search reads only the bound, already-loaded items. It never touches the draft.
     @State private var searching = false
@@ -184,6 +175,33 @@ struct RelayAgentTimelineView: View {
     @FocusState private var searchFocused: Bool
     init(pane: PaneModel) {
         self.pane = pane; _store = StateObject(wrappedValue: RelayAgentTimelineStore(pane: pane))
+        _composerState = ObservedObject(wrappedValue: pane.composerState)
+        _attachmentQueue = ObservedObject(wrappedValue: pane.composerState.attachmentQueue)
+    }
+    private var draft: String {
+        get { composerState.draft }
+        nonmutating set { composerState.draft = newValue }
+    }
+    private var draftRestored: Bool { composerState.restored }
+    private var submitting: Bool {
+        get { composerState.submitting }
+        nonmutating set { composerState.submitting = newValue }
+    }
+    private var submitted: Bool {
+        get { composerState.submitted }
+        nonmutating set { composerState.submitted = newValue }
+    }
+    private var nativeDeliveryHeld: Bool {
+        get { composerState.nativeDeliveryHeld }
+        nonmutating set { composerState.nativeDeliveryHeld = newValue }
+    }
+    private var stopRequested: Bool {
+        get { composerState.stopRequested }
+        nonmutating set { composerState.stopRequested = newValue }
+    }
+    private var submissionStatus: String? {
+        get { composerState.submissionStatus }
+        nonmutating set { composerState.submissionStatus = newValue }
     }
     var body: some View {
         VStack(spacing: RelayTheme.spacing(0)) {
@@ -208,20 +226,13 @@ struct RelayAgentTimelineView: View {
         }
         .background(RelayTheme.canvas)
         .task {
-            // Restore before reading the source; a stored draft never replaces text already typed.
-            if !draftRestored {
-                if draft.isEmpty, let saved = RelayAgentDraftStore.shared.loadDraft(hostID: draftHostID, paneID: pane.id) {
-                    draft = saved.text; attachmentQueue.restore(saved.attachments)
-                }
-                draftRestored = true
-            }
+            composerState.restoreIfNeeded(hostID: draftHostID, paneID: pane.id)
             store.visible = true; await store.refresh()
         }
         .onChange(of: composerFocused) { _, focused in pane.runtime.conversationComposerOwnsFocus = focused }
         .onDisappear {
             pane.runtime.conversationComposerOwnsFocus = false
             if !draft.isEmpty || !attachmentQueue.attachments.isEmpty { persistDraft(immediate: true) }
-            attachmentQueue.cancelUploads()
             store.stop()
         }
         .onChange(of: draft) { old, text in
@@ -571,18 +582,14 @@ struct RelayAgentTimelineView: View {
     }
 
     private func persistDraft(immediate: Bool = false) {
-        if immediate {
-            RelayAgentDraftStore.shared.saveNow(draft, hostID: draftHostID, paneID: pane.id, attachments: attachmentQueue.attachments)
-        } else {
-            RelayAgentDraftStore.shared.save(draft, hostID: draftHostID, paneID: pane.id, attachments: attachmentQueue.attachments)
-        }
+        composerState.persist(hostID: draftHostID, paneID: pane.id, immediate: immediate)
     }
 
     private var attachmentList: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(attachmentQueue.attachments) { item in
                 HStack(spacing: 8) {
-                    RelayAgentAttachmentPreview(attachment: item)
+                    RelayAgentAttachmentPreview(attachment: item, pane: pane)
                     VStack(alignment: .leading) {
                         Text(item.name).lineLimit(1)
                         if item.nativeImageSnapshot != nil {
@@ -593,7 +600,11 @@ struct RelayAgentTimelineView: View {
                         }
                     }
                     Spacer()
-                    if attachmentQueue.uploading.contains(item.id) { ProgressView().controlSize(.small) }
+                    if attachmentQueue.uploading.contains(item.id) {
+                        if let progress = attachmentQueue.progress[item.id] {
+                            RelayTransferProgressView(progress: progress).frame(width: 200)
+                        } else { ProgressView().controlSize(.small) }
+                    }
                     else if let binding = store.conversation.binding, !item.ready(for: binding) {
                         Button(attachmentQueue.failures[item.id] == nil ? "Prepare" : "Retry") {
                             prepareAttachment(item.id, resume: attachmentQueue.failures[item.id] != nil)
@@ -715,13 +726,20 @@ struct RelayAgentTimelineView: View {
     private var composer: some View {
         VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
             if !attachmentQueue.attachments.isEmpty { attachmentList }
+            if nativeDeliveryHeld {
+                Button("Resolve submission…") { showingHeldResolution = true }
+                    .buttonStyle(RelayAgentQuietButtonStyle())
+                    .padding(.horizontal, RelayTheme.spacing(10))
+                    .padding(.top, RelayTheme.spacing(8))
+                    .accessibilityIdentifier("relay.agent.resolve-held-submission")
+            }
             ZStack(alignment: .topLeading) {
                 if draft.isEmpty {
                     Text("Message the running agent")
                         .font(RelayAgentDesign.prose).foregroundStyle(RelayAgentDesign.tertiaryInk)
                         .padding(.horizontal, RelayTheme.spacing(5)).padding(.vertical, RelayTheme.spacing(1)).allowsHitTesting(false)
                 }
-                TextEditor(text: $draft)
+                TextEditor(text: $composerState.draft)
                     .font(RelayAgentDesign.prose)
                     .scrollContentBackground(.hidden)
                     .focused($composerFocused)
@@ -764,6 +782,15 @@ struct RelayAgentTimelineView: View {
             .padding(.horizontal, RelayTheme.spacing(10)).padding(.vertical, RelayTheme.spacing(8))
         }
         .onDrop(of: [UTType.fileURL.identifier, UTType.image.identifier], isTargeted: nil) { acceptAttachmentDrop($0) }
+        .confirmationDialog("Resolve the submission in the original terminal", isPresented: $showingHeldResolution, titleVisibility: .visible) {
+            Button("Enable Send and keep draft") {
+                nativeDeliveryHeld = false
+                submissionStatus = "Draft retained. Review it before sending again."
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Check whether the message was submitted, and clear any pending input. Enabling Send keeps this draft. Edit or clear it if the message was already sent.")
+        }
         .background(RelayAgentDesign.composerFill, in: RoundedRectangle(cornerRadius: RelayAgentDesign.radius))
         .overlay(RoundedRectangle(cornerRadius: RelayAgentDesign.radius)
             .strokeBorder(composerFocused ? Color.primary.opacity(0.20) : Color.primary.opacity(0.10)))

@@ -369,7 +369,9 @@ func TestLocalTokenAndMutationMetadata(t *testing.T) {
 		name := entry["name"].(string)
 		mutation := strings.HasPrefix(name, "relay_request_") || strings.HasPrefix(name, "relay_create_") || strings.HasPrefix(name, "relay_send_")
 		switch name {
-		case "relay_begin_terminal_control", "relay_select_pane", "relay_workspace_action", "relay_new_local_tab", "relay_recover_pane", "relay_terminate_managed_pane", "relay_call_tool", "relay_tab_action", "relay_exec", "relay_exec_cancel", "relay_host_request", "relay_workspace_request", "relay_bind_workspace_context", "relay_update_settings", "relay_check_host_installation", "relay_message_pane", "relay_link_panes", "relay_unlink_panes", "relay_check_intelligence", "relay_register_caller", "relay_control_caller", "relay_render_content", "relay_publish_surface":
+		case "relay_apply_installed_update", "relay_codex_resume_pane", "relay_terminal_edit", "relay_rename_pane", "relay_begin_terminal_control", "relay_select_pane", "relay_workspace_action", "relay_new_local_tab", "relay_recover_pane", "relay_terminate_managed_pane", "relay_call_tool", "relay_tab_action", "relay_stack_pane", "relay_new_stacked_pane", "relay_exec", "relay_exec_cancel", "relay_host_request", "relay_workspace_request", "relay_bind_workspace_context", "relay_update_settings", "relay_check_host_installation", "relay_message_pane", "relay_link_panes", "relay_unlink_panes", "relay_check_intelligence", "relay_register_caller", "relay_control_caller", "relay_render_content", "relay_publish_surface", "relay_configure_context_rotation", "relay_workspace_migration_stage_plan", "relay_workspace_migration_apply", "relay_workspace_migration_undo", "relay_bind_question_thread", "relay_unbind_question_thread", "relay_move_pane_account", "relay_upload_file", "relay_install_relayd", "relay_rollback_relayd",
+			"relay_miko_turn", "relay_miko_card", "relay_miko_set_instructions", "relay_miko_set_memory", "relay_miko_set_capabilities", "relay_miko_revert", "relay_ask_miko",
+			"relay_broadcast_message":
 			mutation = true
 		}
 		if entry["annotations"].(map[string]any)["readOnlyHint"] != !mutation {
@@ -462,5 +464,46 @@ func TestHostInstallationCheckMutationHintsAndExactPost(t *testing.T) {
 		if code != -32602 || hits != 1 {
 			t.Fatalf("invalid host was forwarded: code=%d hits=%d", code, hits)
 		}
+	}
+}
+
+func TestMovePaneAccountIsExactAndPostsOnce(t *testing.T) {
+	var bodies []map[string]string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.URL.Path != "/api/agent-accounts/move" {
+			t.Errorf("wrong move request: %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		bodies = append(bodies, body)
+		w.Write([]byte(`{"status":"moving"}`))
+	}))
+	defer ts.Close()
+	s := server{token: "test", endpoint: ts.URL, client: ts.Client()}
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	call := func(arguments map[string]any) int {
+		params, _ := json.Marshal(map[string]any{"name": "relay_move_pane_account", "arguments": arguments})
+		_, code, _ := s.handle(request{Method: "tools/call", Params: params})
+		return code
+	}
+	valid := map[string]any{"instance": id, "request_id": id, "pane_id": id, "account": "personal"}
+	if code := call(valid); code != 0 || len(bodies) != 1 || bodies[0]["account"] != "personal" || bodies[0]["paneID"] != id {
+		t.Fatalf("move: %d %v", code, bodies)
+	}
+	for _, bad := range []map[string]any{
+		{"instance": id, "request_id": id, "pane_id": id},
+		{"instance": id, "request_id": id, "pane_id": "here", "account": "personal"},
+		{"instance": id, "request_id": id, "pane_id": id, "account": "Personal Account"},
+		// relay_list_panes' accountDisplay text is display only, never a move target.
+		{"instance": id, "request_id": id, "pane_id": id, "account": "personal · default (~/.claude)"},
+		{"instance": id, "request_id": id, "pane_id": id, "account": "default (~/.claude)"},
+		{"instance": id, "request_id": id, "pane_id": id, "account": "personal", "config_dir": "/tmp/x"},
+	} {
+		if code := call(bad); code != -32602 {
+			t.Fatalf("invalid move accepted: %v -> %d", bad, code)
+		}
+	}
+	if len(bodies) != 1 {
+		t.Fatal("an invalid move reached Relay")
 	}
 }

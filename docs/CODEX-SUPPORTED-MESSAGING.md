@@ -9,9 +9,9 @@ The signed shared backend and sidebar browser passed simultaneous live use.
 The pan-barley Codex also returned `RELAY_REMOTE_REPLY_OK` through a temporary
 native mailbox -> SSH -> App Server tool-output path, without Chitta Bridge.
 
-`relay-desktop-route.py` replaces the temporary mailbox with a stable route name.
-`relay-desktop-remote.py` runs locally for a native peer on This Mac and over SSH
-for a peer on another host. It registers a private authenticated mailbox,
+`relayd desktop-route` replaces the temporary mailbox with a stable route name.
+`relayd desktop-remote` runs locally for a native peer on This Mac and through
+the authenticated Relay host channel for a peer on another host. It registers a private authenticated mailbox,
 refreshes it, checks the exact recipient PID/session/process start on each loop,
 and removes its registration on orderly disconnect. The route carries messages
 in both directions between the desktop task and native peer. The local supervisor
@@ -128,12 +128,14 @@ Rollback: `launchctl unsetenv CODEX_APP_SERVER_WS_URL`, then relaunch desktop.
 The manually started server is not yet a managed service; do not claim reboot
 persistence or automatic upgrade support.
 
-`scripts/test-codex-shared.py` passed against the official signed bundled binary:
+The historical `scripts/test-codex-shared.py` acceptance run passed against the official signed bundled binary:
 two independent Unix-WebSocket clients received both exact reply tokens and the
 completed notification for the same turn. The second client must subscribe with
 `thread/resume`; `turn/start` alone does not subscribe it. Establish a persisted
 initial turn before resume: a brand-new thread without a rollout cannot resume.
 Disable WebSocket compression negotiation for this server version.
+
+The maintained native replacement is `go run ./cmd/relay-test-codex-shared --live --binary /absolute/path/to/codex` from `remote/relayd`. It requires explicit `--live`, creates a private temporary session and auth symlink, and preserves the two-client same-turn, completed-status and both-token assertions. The original 5-second readiness loop, 20-second RPC receive timeout and 60-second collection timeout remain. Native fake-provider tests and parser fuzzing passed; this replacement has not itself run against a live provider. The old Python source is retained only in the external retirement evidence archive.
 
 The official `app-server proxy` is raw byte forwarding, not a JSONL-to-WebSocket
 adapter; it cannot directly replace desktop stdio against this listener.

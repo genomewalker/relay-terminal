@@ -88,7 +88,14 @@ struct RelayCallerManagementView: View {
             }.frame(minHeight: 120)
         }.padding(20).frame(width: 760, height: 650)
             .onDisappear { credential = ""; issuedID = "" }
-            .task { await refreshClients() }
+            .task {
+                // Server pause state is read only while this view is open:
+                // on appear, then every 30 s until it closes.
+                while !Task.isCancelled {
+                    await refreshClients()
+                    try? await Task.sleep(for: .seconds(30))
+                }
+            }
     }
     private func refreshClients() async {
         do { try await control.refreshDaemonPolicies() }

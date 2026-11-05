@@ -45,9 +45,9 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 [ -f "$work/results/httpgd.json" ] || { echo "httpgd descriptor was not published"; cat "$work/r.log"; exit 1; }
-if grep -q "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$work/results/httpgd.json")" "$work/r.log"; then
-    echo "token leaked into console output"; exit 1
-fi
+# Parse privately in Go: an absent/invalid token fails, and no token enters
+# shell argv, command output or a diagnostic.
+(cd "$project/remote/relayd" && go run ./cmd/relay-build check-httpgd-log "$work/results/httpgd.json" "$work/r.log")
 cd "$project"
 # Same build-system selection as scripts/build-app.sh.
 build_system=""

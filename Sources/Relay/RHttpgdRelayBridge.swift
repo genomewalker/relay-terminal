@@ -165,7 +165,7 @@ final class RHttpgdRelayBridge: @unchecked Sendable {
     }
 
     static func open(profile: ConnectionProfile, remotePort: Int, directory: String,
-                     rpc: RHttpgdProxyRPC? = nil) async throws -> RHttpgdRelayBridge {
+                     rpc: RHttpgdProxyRPC? = nil, localPort: UInt16? = nil) async throws -> RHttpgdRelayBridge {
         guard profile.kind == .ssh, (1...65535).contains(remotePort), directory.hasPrefix("/"),
               !directory.contains("\0") else { throw RHttpgdError.tunnel("Invalid native forwarding target") }
         let transport = rpc ?? { payload in
@@ -177,7 +177,7 @@ final class RHttpgdRelayBridge: @unchecked Sendable {
         let connectionLimit = try validatedConnectionLimit(await transport(capabilitiesRequest))
         try Task.checkCancellation()
         let parameters = NWParameters.tcp
-        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: localPort.flatMap(NWEndpoint.Port.init(rawValue:)) ?? .any)
         let listener = try NWListener(using: parameters)
         // Network requires a connection handler before listener.start. No
         // endpoint is published until the bridge installs its owning handler.
@@ -192,6 +192,9 @@ final class RHttpgdRelayBridge: @unchecked Sendable {
                         if let port = listener.port { startup.finish(.success(port.rawValue)) }
                         else { startup.finish(.failure(RHttpgdError.tunnel("Native loopback port unavailable"))) }
                     case .failed(let error): startup.finish(.failure(RHttpgdError.tunnel("Native loopback listener unavailable: " + error.localizedDescription)))
+                    case .waiting(let error) where localPort != nil:
+                        startup.finish(.failure(RHttpgdError.tunnel("Requested browser loopback port is unavailable: " + error.localizedDescription)))
+                        listener.cancel()
                     case .cancelled: startup.finish(.failure(CancellationError()))
                     default: break
                     }

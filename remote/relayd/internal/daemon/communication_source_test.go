@@ -127,7 +127,11 @@ func TestCommunicationVerificationCannotComeFromJSON(t *testing.T) {
 }
 
 func TestCommunicationActorOutsideAPaneIsNotVerified(t *testing.T) {
-	// This test process is not owned by any pane worker on this node.
+	// Isolate the catalog: go test may itself be launched from a real Relay pane.
+	// Personal worker publications must not turn this negative fixture into a
+	// legitimately authenticated sender.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	r := CommunicationRequest{Operation: "send", SourcePaneID: sourceFixturePane, ActorPaneID: sourceFixturePane, actorVerified: true}
 	got, err := ReconcileCommunicationActor(r, os.Getpid())
 	if err == nil || communicationSourceVerified(got) {

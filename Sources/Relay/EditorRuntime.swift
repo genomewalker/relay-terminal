@@ -64,7 +64,7 @@ private struct RemoteGitDiff: Decodable, Sendable {
     }
 }
 
-private enum RemoteFileError: LocalizedError {
+enum RemoteFileError: LocalizedError {
     case unavailable(String)
     case invalidResponse
     case missingResources
@@ -365,6 +365,10 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
                                          directory: pane.directory, operation: .artifacts)
     }
     private var started = false
+    /// Test seams for the start path: a stand-in for relayd's workspace lookup
+    /// and for the pause between its tries. Production leaves both alone.
+    var workspaceLookupOverride: (@Sendable () async throws -> String)?
+    var workspaceLookupSleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     private var generation = 0
     private var webReady = false
     private var currentModificationNS: Int64 = 0
@@ -637,17 +641,22 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         }
         isBusy = true
         status = "Finding remote workspace…"
+        let lookupOverride = workspaceLookupOverride
+        let lookupSleep = workspaceLookupSleep
         workTask = Task { [weak self] in
             do {
-                let workspace = try await Task.detached(priority: .userInitiated) {
-                    try await Self.remoteJSON(
-                        RemoteWorkspaceInfo.self,
-                        profile: profile,
-                        arguments: ["files", "workspace"] + (profile.kind == .local
-                            ? ["--path-b64", Self.pathArgument(initialDirectory!)]
-                            : (parentSessionID.map { ["--parent-session", $0] } ?? []))
-                    )
-                }.value
+                let workspace = try await Self.retryingWorkspaceLookup(sleep: lookupSleep) {
+                    if let lookupOverride { return RemoteWorkspaceInfo(path: try await lookupOverride()) }
+                    return try await Task.detached(priority: .userInitiated) {
+                        try await Self.remoteJSON(
+                            RemoteWorkspaceInfo.self,
+                            profile: profile,
+                            arguments: ["files", "workspace"] + (profile.kind == .local
+                                ? ["--path-b64", Self.pathArgument(initialDirectory!)]
+                                : (parentSessionID.map { ["--parent-session", $0] } ?? []))
+                        )
+                    }.value
+                }
                 guard let self, self.started, self.generation == currentGeneration else { return }
                 self.workspacePath = workspace.path
                 self.directoryPath = workspace.path
@@ -664,6 +673,47 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
                 self.pane?.disconnected(error.localizedDescription)
             }
         }
+    }
+
+    /// relayd's definite refusals for a workspace lookup. Anything else, such as
+    /// a transport interruption while the host reconnects after launch, may
+    /// succeed on a later attempt.
+    nonisolated static func workspaceLookupIsFinal(_ error: Error) -> Bool {
+        guard let error = error as? RemoteFileError else { return false }
+        switch error {
+        case .unavailable(let message):
+            return ["valid parent session required", "parent session is unavailable", "parent shell is unavailable",
+                    "parent shell identity changed", "parent working directory is unavailable"]
+                .contains { message.contains($0) }
+        case .invalidResponse, .missingResources:
+            return true
+        }
+    }
+
+    /// Three tries with 2 s and 6 s pauses between them: 8 s of waiting
+    /// plus each lookup's own time, not a fixed overall deadline.
+    static let workspaceLookupDelays: [Duration] = [.seconds(2), .seconds(6)]
+
+    static func retryingWorkspaceLookup<T>(
+        delays: [Duration] = workspaceLookupDelays,
+        sleep: (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        _ lookup: () async throws -> T
+    ) async throws -> T {
+        var remaining = delays[...]
+        while true {
+            do {
+                return try await lookup()
+            } catch {
+                guard !workspaceLookupIsFinal(error), let delay = remaining.popFirst() else { throw error }
+                try await sleep(delay)
+            }
+        }
+    }
+
+    /// Records that the editor has been drawn, so a later failure is reported
+    /// as a lost connection rather than an editor that never started.
+    func markShown() {
+        pane?.editorViewShown = true
     }
 
     func stop() {
@@ -1332,6 +1382,7 @@ struct MonacoEditorSurface: NSViewRepresentable {
     func makeNSView(context: Context) -> RelayEditorHostView {
         let view = RelayEditorHostView(editor: runtime.webView)
         view.attachEditor()
+        runtime.markShown()
         Task { @MainActor in
             await Task.yield()
             runtime.startIfNeeded()

@@ -62,7 +62,7 @@ func discoverTopology(home string, records []Record, now time.Time) []Discovered
 		if len(result) >= 1024 {
 			break
 		}
-		data, err := readPrivate(filepath.Join(home, ".claude", "sessions", fmt.Sprintf("%d.topology.json", source.PID)), 16384)
+		data, err := readPrivate(filepath.Join(claudeConfig(home, source.PID), "sessions", fmt.Sprintf("%d.topology.json", source.PID)), 16384)
 		if err != nil {
 			continue
 		}

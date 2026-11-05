@@ -5,6 +5,8 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,23 +57,8 @@ func runOwnedSessionRealTmux(t *testing.T, roundTrip bool) {
 
 	marker := "MUX-STATUS-EMITTED"
 	if roundTrip {
-		python, err := exec.LookPath("python3")
-		if err != nil {
-			t.Skip("python3 is not installed")
-		}
 		marker = "MUX-REPLY-EXACT"
-		signal := "[" + strconv.Quote(tmux) + ", '-S', " + strconv.Quote(socket) + ", 'wait-for', 'emit']"
-		hold := "[" + strconv.Quote(tmux) + ", '-S', " + strconv.Quote(socket) + ", 'wait-for', 'hold']"
-		program := "import os, tty, subprocess, select\nsubprocess.check_call(" + signal + ")\ntty.setraw(0)\n" +
-			"os.write(1, " + strconv.Quote(payload) + ".encode())\nreply=b''\n" +
-			"while len(reply)<10:\n reply+=os.read(0,10-len(reply))\n" +
-			"assert reply==" + strconv.Quote(programstatus.DetectionReply) + ".encode(),repr(reply)\n" +
-			"assert not select.select([0],[],[],0.15)[0], 'duplicate reply bytes'\nos.write(1,b'MUX-REPLY-EXACT')\nsubprocess.check_call(" + hold + ")\n"
-		producer := filepath.Join(dir, "producer.py")
-		if err := os.WriteFile(producer, []byte(program), 0600); err != nil {
-			t.Fatal(err)
-		}
-		command = quote(python) + " " + quote(producer)
+		command = tmuxReplyProducerCommand(tmux, socket, payload, programstatus.DetectionReply, true)
 	}
 	if err := run("new-session", "-d", "-s", "relay-probe", "-x", "80", "-y", "24", command); err != nil {
 		t.Fatal("private tmux session creation:", err)
@@ -158,4 +145,77 @@ func runOwnedSessionRealTmux(t *testing.T, roundTrip bool) {
 				len(session.programStatusSnapshot()), len(capture))
 		}
 	}
+}
+
+// tmuxReplyProducerEnv carries the round-trip producer's parameters. The
+// producer is this test binary, run as the program in the private tmux pane.
+const tmuxReplyProducerEnv = "RELAY_TMUX_REPLY_PRODUCER"
+
+func tmuxReplyProducerCommand(tmux, socket, payload, reply string, refuseDuplicate bool) string {
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
+	spec := strings.Join([]string{tmux, socket, hex.EncodeToString([]byte(payload)),
+		hex.EncodeToString([]byte(reply)), strconv.FormatBool(refuseDuplicate)}, "\n")
+	return tmuxReplyProducerEnv + "=" + quote(spec) + " exec " + quote(os.Args[0]) + " -test.run='^TestTmuxReplyProducer$'"
+}
+
+// TestTmuxReplyProducer is the program in the round-trip test's tmux pane. It
+// waits for the test, puts its terminal in raw mode, writes the payload, reads
+// exactly the expected reply (and, when asked, no second copy within 150ms),
+// then prints MUX-REPLY-EXACT and holds until the test releases it.
+func TestTmuxReplyProducer(t *testing.T) {
+	spec, ok := os.LookupEnv(tmuxReplyProducerEnv)
+	if !ok {
+		t.Skip("runs only inside the round-trip test's tmux pane")
+	}
+	os.Exit(runTmuxReplyProducer(spec))
+}
+
+func runTmuxReplyProducer(spec string) int {
+	fields := strings.Split(spec, "\n")
+	if len(fields) != 5 {
+		return 2
+	}
+	tmux, socket := fields[0], fields[1]
+	payload, payloadErr := hex.DecodeString(fields[2])
+	reply, replyErr := hex.DecodeString(fields[3])
+	if payloadErr != nil || replyErr != nil {
+		return 2
+	}
+	if exec.Command(tmux, "-S", socket, "wait-for", "emit").Run() != nil {
+		return 1
+	}
+	raw := exec.Command("stty", "raw", "-echo")
+	raw.Stdin = os.Stdin
+	if raw.Run() != nil {
+		return 1
+	}
+	if _, err := os.Stdout.Write(payload); err != nil {
+		return 1
+	}
+	got := make([]byte, len(reply))
+	if _, err := io.ReadFull(os.Stdin, got); err != nil || !bytes.Equal(got, reply) {
+		_, _ = os.Stdout.WriteString("MUX-REPLY-WRONG")
+		return 1
+	}
+	if fields[4] == "true" {
+		extra := make(chan bool, 1)
+		go func() {
+			b := make([]byte, 1)
+			n, _ := os.Stdin.Read(b)
+			extra <- n > 0
+		}()
+		select {
+		case more := <-extra:
+			if more {
+				_, _ = os.Stdout.WriteString("MUX-REPLY-DUPLICATE")
+				return 1
+			}
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	_, _ = os.Stdout.WriteString("MUX-REPLY-EXACT")
+	if exec.Command(tmux, "-S", socket, "wait-for", "hold").Run() != nil {
+		return 1
+	}
+	return 0
 }

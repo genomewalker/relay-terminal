@@ -8,6 +8,9 @@
 import Foundation
 import GhosttyKit
 import MSDisplayLink
+#if canImport(AppKit) && !canImport(UIKit)
+    import AppKit
+#endif
 
 /// Shared terminal state and logic used by both UIKit and AppKit views.
 ///
@@ -35,7 +38,18 @@ final class TerminalSurfaceCoordinator {
     }
 
     var surface: TerminalSurface?
-    let bridge = TerminalCallbackBridge()
+    /// The callback bridge of the current surface generation. Each surface
+    /// gets its own: a retired surface whose release is deferred keeps its
+    /// bridge (and that bridge's `rawSurface`) until it is freed, so its late
+    /// callbacks never route through, or drop the retention of, a replacement.
+    private(set) var bridge = TerminalCallbackBridge()
+
+    #if canImport(AppKit) && !canImport(UIKit)
+        /// The pasteboard every generation's bridge uses; nil means the general one.
+        var pasteboard: NSPasteboard? {
+            didSet { bridge.pasteboard = pasteboard }
+        }
+    #endif
 
     // MARK: - Platform Hooks
 
@@ -92,6 +106,15 @@ final class TerminalSurfaceCoordinator {
     private static let idleFramesBeforeRelease = 30
 
     init() {
+        connect(bridge)
+    }
+
+    /// Points a bridge's view-facing callbacks at this coordinator.
+    private func connect(_ bridge: TerminalCallbackBridge) {
+        bridge.delegate = delegate
+        #if canImport(AppKit) && !canImport(UIKit)
+            bridge.pasteboard = pasteboard
+        #endif
         bridge.onCellSizeChange = { [weak self] width, height in
             self?.handleCellSizeChange(width: width, height: height)
         }
@@ -605,6 +628,9 @@ final class TerminalSurfaceCoordinator {
         tearDownSurface(removingBridgeFrom: controller)
     }
 
+    /// Tests only: the bridge a surface generation was created with.
+    var bridgeForTesting: TerminalCallbackBridge { bridge }
+
     deinit {
         // `@MainActor` classes have a nonisolated deinit by default, but
         // `tearDownSurface` calls methods on other main-actor types (surface,
@@ -612,22 +638,48 @@ final class TerminalSurfaceCoordinator {
         // exclusive access; assume main-actor isolation so teardown can run
         // inline without crossing isolation.
         MainActor.assumeIsolated {
-            tearDownSurface(removingBridgeFrom: controller)
+            tearDownSurface(removingBridgeFrom: controller, replacingBridge: false)
         }
     }
 
-    private func tearDownSurface(removingBridgeFrom controller: TerminalController?) {
+    private func tearDownSurface(removingBridgeFrom controller: TerminalController?,
+                                 replacingBridge: Bool = true) {
         TerminalDebugLog.log(.lifecycle, "tear down surface")
         releaseDisplayLink()
+        let retiredSurface = surface
+        let retiredBridge = bridge
+        // In-memory output may still be inside a Ghostty call on this surface,
+        // blocked on the app mailbox that only this (main) thread drains, so
+        // teardown must not wait for it. The session frees the surface (and
+        // only then drops its callback bridge) after that call returns.
+        var releaseDeferredToSession = false
         if let session = configuration.inMemorySession {
             session.clearSurface(ifMatches: surface?.rawValue)
+            if let retiredSurface, let raw = retiredSurface.rawValue {
+                releaseDeferredToSession = true
+                let releasingController = controller
+                let release = TerminalSurfaceRelease { @MainActor in
+                    retiredSurface.setFocus(false)
+                    // Until here the retired bridge still names its own
+                    // surface, so a late clipboard completion reaches that
+                    // surface, which is alive, and never a replacement.
+                    retiredBridge.rawSurface = nil
+                    retiredSurface.free()
+                    releasingController?.remove(retiredBridge)
+                }
+                session.retireSurface(raw) { release.run() }
+            }
         }
         controller?.onWakeup = nil
         controller?.shouldProcessWakeup = nil
-        bridge.rawSurface = nil
+        if !releaseDeferredToSession {
+            retiredBridge.rawSurface = nil
+        }
         let hadSurface = surface != nil
-        surface?.setFocus(false)
-        surface?.free()
+        if !releaseDeferredToSession {
+            surface?.setFocus(false)
+            surface?.free()
+        }
         surface = nil
         inspectionWidthPixels = nil
         inspectionSuppressesRendering = false
@@ -642,7 +694,18 @@ final class TerminalSurfaceCoordinator {
         resizeSynchronizationPending = false
         pendingImmediateTick = true
         lastTickTimestamp = 0
-        controller?.remove(bridge)
+        if !releaseDeferredToSession {
+            controller?.remove(retiredBridge)
+        }
+        if hadSurface, replacingBridge {
+            // The retired generation no longer reaches the view; the next
+            // surface gets a bridge of its own.
+            retiredBridge.delegate = nil
+            retiredBridge.onCellSizeChange = nil
+            retiredBridge.onRenderRequest = nil
+            bridge = TerminalCallbackBridge()
+            connect(bridge)
+        }
         if hadSurface {
             (delegate as? any TerminalSurfaceLifecycleDelegate)?
                 .terminalDidDetachSurface()
@@ -855,6 +918,32 @@ extension TerminalSurfaceCoordinator: DisplayLinkDelegate {
     nonisolated func synchronization(context: DisplayLinkCallbackContext) {
         MainActor.assumeIsolated {
             tick(context: context)
+        }
+    }
+}
+
+/// The main-actor release of a retired surface, handed to the in-memory
+/// session, which runs it from whichever thread finished the surface's last
+/// operation (or inline when the surface was idle). It always runs on the
+/// main actor and at most once.
+final class TerminalSurfaceRelease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var body: (@MainActor () -> Void)?
+
+    init(_ body: @escaping @MainActor () -> Void) {
+        self.body = body
+    }
+
+    func run() {
+        lock.lock()
+        let body = self.body
+        self.body = nil
+        lock.unlock()
+        guard let body else { return }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { body() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { body() } }
         }
     }
 }

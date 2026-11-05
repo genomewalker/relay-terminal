@@ -5,6 +5,15 @@ import "testing"
 func TestHarnessEntrypointClassification(t *testing.T) {
 	tests := []struct{ command, arguments, want string }{
 		{"claude", "claude\x00--resume\x00id", "claude"},
+		{"2.1.301", "claude\x00--resume\x00id", "claude"},
+		{"2.1.301", "claude --resume id", "claude"},
+		{"2.1.301", "sleep\x00claude", ""},
+		{"2.1.301", "echo claude", ""},
+		{"2.1.301", "codex\x00resume", ""},
+		{"2.1.301-helper", "claude\x00--resume", ""},
+		{"2..301", "claude\x00", ""},
+		{"2.+1.301", "claude\x00", ""},
+		{"2.1.301", "", ""},
 		{"codex", "codex\x00resume\x00id", "codex"},
 		{"opencode", "opencode\x00", "opencode"},
 		{"gemini", "gemini\x00", "gemini"},

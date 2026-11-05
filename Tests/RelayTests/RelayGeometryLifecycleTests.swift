@@ -78,8 +78,8 @@ func geometryTransactionWithoutFrameChangeIsAbandoned() async {
 // The runtime is deliberately not started (no transport), so the view-level
 // begin path is inert and only the model-begun transaction is under test.
 @MainActor
-@Test("A geometry transaction followed by a frame change settles through resize")
-func geometryTransactionWithFrameChangeSettles() async {
+@Test("A geometry transaction followed by a frame change settles through resize", .timeLimit(.minutes(5)))
+func geometryTransactionWithFrameChangeSettles() async throws {
     _ = NSApplication.shared
     let pane = makeRelayPane()
     let runtime = pane.runtime
@@ -92,6 +92,7 @@ func geometryTransactionWithFrameChangeSettles() async {
         defer: false
     )
     window.contentView = view
+    defer { window.contentView = nil }
 
     runtime.beginExplicitGeometryTransition() // WorkspaceModel.toggleActivePaneZoom
     view.setFrameSize(NSSize(width: 800, height: 500)) // SwiftUI layout
@@ -102,10 +103,15 @@ func geometryTransactionWithFrameChangeSettles() async {
     #expect(runtime.isGeometryTransitionPending)
 
     // MainActor geometry and the ordered I/O queue commit independently.
-    // Wait for both completion signals, retaining the same deadline.
-    await waitUntil(.seconds(2)) { !runtime.isGeometryTransitionPending && !runtime.isBufferingViewportTransition }
+    // Wait for both completion signals. The settle is a chain of MainActor
+    // hops and timers, so a wall-clock deadline here also counts time spent
+    // queued behind other MainActor tests; the time limit bounds a hang, and
+    // the throwing sleep is what lets that limit end the wait.
+    while runtime.isGeometryTransitionPending || runtime.isBufferingViewportTransition {
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(5))
+    }
     #expect(!runtime.isGeometryTransitionPending)
     #expect(!runtime.isBufferingViewportTransition)
-    window.contentView = nil
 }
 #endif

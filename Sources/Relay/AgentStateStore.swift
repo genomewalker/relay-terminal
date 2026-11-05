@@ -4,6 +4,9 @@ struct PersistedAgentPaneState: Codable, Sendable {
     var plans: [AgentTaskPlan]? = nil
     var processRootIdentityVersion: Int? = nil
     var processRoots: [PersistedAgentProcessRoot]? = nil
+    /// The agent event that raised the current wait (`PaneModel.waitIdentity`),
+    /// so a restored wait keeps its identity when a reconnect replays it.
+    var waitIdentity: String? = nil
     let cursor: UInt64
     let kind: AgentKind
     let phase: AgentPhase
@@ -130,6 +133,7 @@ extension PersistedAgentPaneState {
             plans: AgentTaskPlan.bounded(plans ?? []),
             processRootIdentityVersion: (processRoots?.count ?? 0) <= 1_024 ? processRootIdentityVersion : nil,
             processRoots: (processRoots?.count ?? 0) <= 1_024 ? processRoots : nil,
+            waitIdentity: waitIdentity.map { String($0.prefix(128)) },
             cursor: cursor,
             kind: kind,
             phase: phase,

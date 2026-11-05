@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -14,24 +13,14 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/relay-terminal/relayd/internal/nativemsg"
 	"github.com/relay-terminal/relayd/internal/peernet"
 )
-
-// These are build copies of the canonical native provider adapters. Both
-// clients and the daemon use the same process/session/socket validation.
-//
-//go:embed communication_runtime/agent_conversation.py
-var communicationDiscovery []byte
-
-//go:embed communication_runtime/pane_messaging.py
-var communicationAdapter []byte
 
 type CommunicationRequest struct {
 	GroupMembers               []CommunicationGroupMember `json:"group_members,omitempty"`
@@ -50,16 +39,32 @@ type CommunicationRequest struct {
 	Operation                  string                     `json:"operation"`
 	SourcePaneID               string                     `json:"source_pane_id,omitempty"`
 	PaneID                     string                     `json:"pane_id,omitempty"`
+	TargetSessionID            string                     `json:"target_session_id,omitempty"`
 	MessageID                  string                     `json:"message_id,omitempty"`
 	Text                       string                     `json:"text,omitempty"`
 	ClientID                   string                     `json:"client_id,omitempty"`
 	ClientToken                string                     `json:"client_token,omitempty"`
 	ActorPaneID                string                     `json:"actor_pane_id,omitempty"`
+	ThreadID                   string                     `json:"thread_id,omitempty"`
+	Panes                      []string                   `json:"panes,omitempty"`
+	Outcome                    string                     `json:"outcome,omitempty"`
+	Realm                      string                     `json:"realm,omitempty"`
+	TTL                        string                     `json:"ttl,omitempty"`
 	CallerID                   string                     `json:"caller_id,omitempty"`
 	Paused                     *bool                      `json:"paused,omitempty"`
 	Policy                     *communicationPolicy       `json:"policy,omitempty"`
 	Cursor                     int64                      `json:"cursor,omitempty"`
 	LinkID                     string                     `json:"link_id,omitempty"`
+	AttestationID              string                     `json:"attestation_id,omitempty"`
+	SourceSignature            string                     `json:"source_signature,omitempty"`
+	TrustedNodes               []communicationTrustedNode `json:"trusted_nodes,omitempty"`
+	// Relay assistant sends: the approving assistant request, and the recipient
+	// endpoint the user saw on the Run card.
+	AssistantRequestID   string         `json:"assistant_request_id,omitempty"`
+	ShepherdReport       bool           `json:"shepherd_report,omitempty"`
+	ExpectedLinkRevision string         `json:"expected_link_revision,omitempty"`
+	ExpectedRecipient    map[string]any `json:"expected_recipient,omitempty"`
+	HereHost             string         `json:"here_host,omitempty"`
 	// Set only by ReconcileCommunicationActor after a kernel ancestry check of
 	// the calling process. Unexported, so no JSON packet or host RPC can set it.
 	actorVerified bool
@@ -82,6 +87,8 @@ type communicationLink struct {
 	NodeID           string                `json:"node_id"`
 	Members          []communicationMember `json:"members"`
 	UpdatedAt        time.Time             `json:"updated_at"`
+	LastActivityAt   *time.Time            `json:"last_activity_at,omitempty"`
+	InactiveSince    *time.Time            `json:"inactive_since,omitempty"`
 	Transport        string                `json:"transport"`
 	ResolutionErrors map[string]string     `json:"resolutionErrors,omitempty"`
 }
@@ -164,43 +171,119 @@ func communicationRead(path string, value any) error {
 	return json.Unmarshal(data, value)
 }
 
+var communicationAdapterTimeout = 30 * time.Second
+
+// communicationNativeRun is the native provider messaging adapter; tests
+// replace it.
+var communicationNativeRun = func(ctx context.Context, host nativemsg.Host, pane string, request []byte) map[string]any {
+	result, err := nativemsg.RunTarget(ctx, host, nativemsg.Target{Kind: "pane", PaneID: pane}, request, nil)
+	if err != nil {
+		return map[string]any{"status": "unavailable", "error": err.Error(), "replay_permitted": false}
+	}
+	return result
+}
+
+// communicationNativeHost gives the adapter this daemon's own readers of
+// `relayd agent-binding` and `relayd peer-inbound-class`.
+func communicationNativeHost() nativemsg.Host {
+	return nativemsg.Host{
+		Binding: func(pane, session string) ([]byte, error) {
+			read := ReadVerifiedAgentBinding
+			if session != "" {
+				read = func(pane string) (AgentBindingRecord, error) { return ReadNativeClaudePaneJobBinding(pane, session) }
+			}
+			record, err := read(pane)
+			if err != nil {
+				return nil, err
+			}
+			var output bytes.Buffer
+			if err := EncodeJSON(&output, record); err != nil {
+				return nil, err
+			}
+			return output.Bytes(), nil
+		},
+		InboundClass: ReadRecipientInboundClass,
+		NativeProcessStart: func(pane string, pid int64, provider string) (uint64, error) {
+			return NativeAgentIncarnation(pane, int(pid), provider)
+		},
+	}
+}
+
+// communicationUnverifiedEndpoint keeps the stable refusal text that clients
+// match on and names the pane that failed and why. A source needs only an
+// endpoint; a recipient also needs a usable transport.
+func communicationUnverifiedEndpoint(prefix string, source, recipient communicationMember) error {
+	failed := recipient
+	if source.PaneID != "" && source.Endpoint == nil {
+		failed = source
+	}
+	reason := failed.Unavailable
+	if reason == "" {
+		reason = "no endpoint was reported"
+	}
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	return fmt.Errorf("%s: pane %s: %s", prefix, failed.PaneID, reason)
+}
+
 func communicationNative(pane string, packet map[string]any) (map[string]any, error) {
 	if !validSessionID.MatchString(pane) {
 		return nil, errors.New("invalid native pane")
-	}
-	helper, err := os.Executable()
-	if err != nil {
-		return nil, err
 	}
 	packet["requireAuthenticatedBinding"] = true
 	data, err := json.Marshal(packet)
 	if err != nil {
 		return nil, err
 	}
-	source := "RELAY_DISCOVERY_SOURCE = '" + base64.StdEncoding.EncodeToString(communicationDiscovery) + "'\n" + string(communicationAdapter)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), communicationAdapterTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", "-", "--daemon", helper, "--pane", pane,
-		"--request", base64.StdEncoding.EncodeToString(data))
-	cmd.Stdin = strings.NewReader(source)
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("native communication adapter failed: %w", err)
+	// The adapter's sockets end at this deadline. A binding read cannot be
+	// cancelled, so a run past it is abandoned rather than awaited.
+	done := make(chan []byte, 1)
+	go func() { done <- nativemsg.Output(communicationNativeRun(ctx, communicationNativeHost(), pane, data)) }()
+	var output []byte
+	select {
+	case output = <-done:
+	case <-ctx.Done():
+		// Clients match the refusal the killed adapter process produced.
+		return nil, errors.New("native communication adapter failed: signal: killed")
 	}
-	if output.Len() > 128<<10 {
+	if len(output) > 128<<10 {
 		return nil, errors.New("native communication response exceeds limit")
 	}
 	var result map[string]any
-	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(output, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
+// communicationMessageFingerprint is a message's identity. Credentials and
+// administrative fields never define it; an explicit target session does, so
+// the same message ID cannot be re-aimed. Without a target it is unchanged.
+func communicationMessageFingerprint(source, pane, message, text, target string) string {
+	encoded, _ := json.Marshal(struct {
+		Source, Target, Message, Text string
+		Session                       string `json:",omitempty"`
+	}{source, pane, message, text, target})
+	hash := sha256.Sum256(encoded)
+	return hex.EncodeToString(hash[:])
+}
+
 func communicationObserve(pane string) communicationMember {
+	return communicationObserveTarget(pane, "")
+}
+
+// communicationObserveTarget observes one explicitly named background session
+// of the pane, or the pane's default conversation when target is empty.
+func communicationObserveTarget(pane, target string) communicationMember {
 	member := communicationMember{PaneID: pane}
-	result, err := communicationNative(pane, map[string]any{"operation": "discover"})
+	packet := map[string]any{"operation": "discover"}
+	if target != "" {
+		packet["targetSessionID"] = target
+	}
+	result, err := communicationNative(pane, packet)
 	if err != nil {
 		member.Unavailable = err.Error()
 		return member
@@ -233,6 +316,37 @@ var senderPermissionClass = func(pid int, session string) string {
 	return peernet.SenderPermissionClass(home, pid, session)
 }
 
+// communicationSenderClass attests the permission class of the process that
+// runs the sending conversation, observed on this node: a parked or addressed
+// background job's own process, otherwise the frontend. A request never
+// supplies it; unknown stays unasserted.
+func communicationSenderClass(source communicationMember) string {
+	pid := source.PID
+	switch source.Endpoint["bindingSource"] {
+	case "native_parked_job_kernel_owner", "native_pane_job_kernel_owner":
+		if socket, ok := source.Endpoint["socketPID"].(float64); ok && socket > 1 && socket == float64(int(socket)) {
+			pid = int(socket)
+		}
+	}
+	if mode := senderPermissionClass(pid, source.SessionID); mode == "bypass" || mode == "prompting" {
+		return mode
+	}
+	return ""
+}
+
+// ReadRecipientInboundClass predicts a live Claude recipient's inbound parity
+// class for the native messaging adapter, before it writes; "" is unknown.
+func ReadRecipientInboundClass(pid int, session string) (string, string) {
+	if pid <= 1 || !nativeClaudeSessionID.MatchString(session) {
+		return "", "invalid_recipient"
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "home_unavailable"
+	}
+	return peernet.RecipientInboundClass(home, pid, session)
+}
+
 // communicationSourcePacket describes the sender for native delivery. Only a
 // kernel-verified sender carries its provider, permission class and native
 // inbox; a claimed pane label stays routing metadata.
@@ -244,7 +358,7 @@ func communicationSourcePacket(r CommunicationRequest, nodeID string, source com
 	}
 	packet["authentication"] = "kernel_verified"
 	packet["provider"] = source.Provider
-	if mode := senderPermissionClass(source.PID, source.SessionID); mode == "bypass" || mode == "prompting" {
+	if mode := communicationSenderClass(source); mode != "" {
 		packet["permissionClass"] = mode
 	}
 	// A Claude sender's own inbox lets the recipient reply natively.
@@ -294,6 +408,9 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 	}
 	r.SourcePaneID, r.PaneID = strings.ToLower(r.SourcePaneID), strings.ToLower(r.PaneID)
 	r.MessageID, r.LinkID = strings.ToLower(r.MessageID), strings.ToLower(r.LinkID)
+	if strings.HasPrefix(r.Operation, "question_") {
+		return communicationQuestionRequest(communicationRoot(), r)
+	}
 	if r.Operation == "group_send" {
 		return communicationGroupSend(communicationRoot(), currentCommunicationNodeID(), r,
 			communicationGroupNative{observe: communicationObserve, send: communicationNative})
@@ -310,10 +427,10 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		return nil, err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := communicationLockExclusive(lock); err != nil {
 		return nil, err
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer communicationUnlock(lock)
 	if strings.HasPrefix(r.Operation, "caller_") {
 		return communicationPolicyAdmin(root, r)
 	}
@@ -342,6 +459,27 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		return communicationGroupOperation(root, nodeID, r, known)
 	}
 	switch r.Operation {
+	case "attest":
+		return communicationAttest(root, nodeID, r, defaultCommunicationAttestDeps)
+	case "attest_consume":
+		r.AttestationID = strings.ToLower(r.AttestationID)
+		return communicationAttestConsume(root, r, defaultCommunicationAttestDeps)
+	case "sign":
+		return communicationSign(root, nodeID, r, defaultCommunicationSigningDeps(root, nodeID))
+	case "deliver_signed":
+		return communicationDeliverSigned(root, nodeID, r, defaultCommunicationSigningDeps(root, nodeID))
+	case "node_identity":
+		return communicationNodeIdentity(root, nodeID, r)
+	case "node_trust_set":
+		return communicationNodeTrustSet(root, nodeID, r)
+	case "assistant_send":
+		return communicationAssistantSend(root, nodeID, r,
+			communicationGroupNative{observe: communicationObserve, send: communicationNative})
+	case "assistant_inbox":
+		return communicationAssistantInbox(root, r)
+	case "assistant_link_set":
+		return communicationAssistantLinkSet(root, nodeID, r,
+			communicationGroupNative{observe: communicationObserve, send: communicationNative})
 	case "unlink":
 		if len(r.LinkID) != 64 {
 			return nil, errors.New("invalid communication relationship identity")
@@ -397,12 +535,14 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		}
 		return map[string]any{"data": base64.StdEncoding.EncodeToString(data), "next_cursor": r.Cursor + int64(len(data)), "node_id": nodeID, "authority": "relayd"}, nil
 	case "list":
-		paths, err := filepath.Glob(filepath.Join(root, "link-*.json"))
-		if err != nil {
+		// Expiry is daemon maintenance after caller authorization. A failed or
+		// partial catalogue never makes a saved relationship eligible.
+		if err := communicationMaintainLinks(root, nodeID, time.Now().UTC(), NewServer().CatalogSnapshot); err != nil {
 			return nil, err
 		}
-		if len(paths) > 256 {
-			return nil, errors.New("communication membership limit exceeded")
+		paths, err := communicationLinkInventory(root, "", nil)
+		if err != nil {
+			return nil, err
 		}
 		links := []communicationLink{}
 		for _, path := range paths {
@@ -412,7 +552,12 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 			}
 			links = append(links, link)
 		}
-		return map[string]any{"node_id": nodeID, "links": links, "authority": "relayd", "process_revalidated": false, "desktop_required": false}, nil
+		result := map[string]any{"node_id": nodeID, "links": links, "authority": "relayd", "process_revalidated": false, "desktop_required": false}
+		encoded, err := json.Marshal(result)
+		if err != nil || len(encoded) > communicationLinkListBytes {
+			return nil, errors.New("saved links exceed the bounded response size")
+		}
+		return result, nil
 	case "discover":
 		return communicationNative(r.PaneID, map[string]any{"operation": "discover"})
 	case "receipt":
@@ -429,12 +574,19 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		}
 		return receipt.Result, nil
 	case "link", "send":
+		if r.Operation == "send" && strings.EqualFold(r.PaneID, communicationAssistantInboxID) {
+			return communicationAssistantReply(root, nodeID, r, identity,
+				communicationGroupNative{observe: communicationObserve, send: communicationNative})
+		}
 		id, ids, err := communicationPair(r.SourcePaneID, r.PaneID)
 		if err != nil {
 			return nil, err
 		}
 		path := filepath.Join(root, "link-"+id+".json")
 		if r.Operation == "link" {
+			if err := communicationMaintainLinks(root, nodeID, time.Now().UTC(), NewServer().CatalogSnapshot); err != nil {
+				return nil, err
+			}
 			catalog, err := NewServer().CatalogSnapshot()
 			if err != nil {
 				return nil, err
@@ -447,12 +599,6 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 			}
 			if !known[ids[0]] || !known[ids[1]] {
 				return nil, errors.New("both panes must belong to this daemon; remote peers require a server route")
-			}
-			if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-				paths, _ := filepath.Glob(filepath.Join(root, "link-*.json"))
-				if len(paths) >= 256 {
-					return nil, errors.New("communication membership limit reached")
-				}
 			}
 			hostHash := sha256.Sum256([]byte(nodeID))
 			hostID := fmt.Sprintf("%x-%x-%x-%x-%x", hostHash[:4], hostHash[4:6], hostHash[6:8], hostHash[8:10], hostHash[10:16])
@@ -467,6 +613,13 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 				}
 				link.Members = append(link.Members, member)
 			}
+			encoded, err := json.Marshal(link)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := communicationLinkInventory(root, path, encoded); err != nil {
+				return nil, err
+			}
 			if err := communicationAtomic(path, link); err != nil {
 				return nil, err
 			}
@@ -478,12 +631,11 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if !validSessionID.MatchString(r.MessageID) || len(r.Text) == 0 || len(r.Text) > 16384 || strings.TrimSpace(r.Text) == "" {
 			return nil, errors.New("a message UUID and 1-16384 bytes of text are required")
 		}
-		// Credentials and administrative fields never define message identity.
-		encoded, _ := json.Marshal(struct {
-			Source, Target, Message, Text string
-		}{r.SourcePaneID, r.PaneID, r.MessageID, r.Text})
-		hash := sha256.Sum256(encoded)
-		fingerprint := hex.EncodeToString(hash[:])
+		target := strings.ToLower(r.TargetSessionID)
+		if target != "" && !nativeClaudeSessionID.MatchString(target) {
+			return nil, errors.New("target_session_id must be a session UUID")
+		}
+		fingerprint := communicationMessageFingerprint(r.SourcePaneID, r.PaneID, r.MessageID, r.Text, target)
 		receiptPath := filepath.Join(root, "message-"+strings.ToLower(r.MessageID)+".json")
 		var receipt communicationReceipt
 		if err := communicationRead(receiptPath, &receipt); err == nil {
@@ -498,24 +650,45 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if err := communicationRead(path, &link); err != nil {
 			return nil, errors.New("save the communication pair on this daemon before sending")
 		}
-		source, target := communicationObserve(r.SourcePaneID), communicationObserve(r.PaneID)
-		if source.Endpoint == nil || target.Endpoint == nil || target.Unavailable != "" {
-			return nil, errors.New("a pane has no verified native communication endpoint")
+		source, recipient := communicationObserve(r.SourcePaneID), communicationObserveTarget(r.PaneID, target)
+		if source.Endpoint == nil || recipient.Endpoint == nil || recipient.Unavailable != "" {
+			if target != "" && recipient.Unavailable != "" {
+				return nil, errors.New("target session unavailable: " + recipient.Unavailable)
+			}
+			return nil, communicationUnverifiedEndpoint("a pane has no verified native communication endpoint", source, recipient)
 		}
 		for _, saved := range link.Members {
 			live := source
 			if saved.PaneID == r.PaneID {
-				live = target
+				live = recipient
+			}
+			// A named target is another conversation of the same pinned
+			// frontend: the pair pins that frontend process, not the session.
+			if target != "" && saved.PaneID == r.PaneID {
+				if saved.PID != 0 && (saved.PID != live.PID || saved.Start != live.Start || saved.Provider != live.Provider) {
+					return nil, errors.New("linked frontend changed; review the pair before sending")
+				}
+				continue
 			}
 			if saved.SessionID != "" && (saved.SessionID != live.SessionID || saved.Provider != live.Provider) {
 				return nil, errors.New("linked conversation changed; review the pair before sending")
 			}
 		}
 		sourcePacket := communicationSourcePacket(r, nodeID, source)
+		// A verified attempt counts as activity before the once-only message
+		// claim. Delivery uncertainty must never trigger an automatic replay.
+		activity := time.Now().UTC()
+		link = communicationLinkActivity(link, activity)
+		if err := communicationAtomic(path, link); err != nil {
+			return nil, err
+		}
 		receipt = communicationReceipt{Version: 1, Fingerprint: fingerprint, CreatedAt: time.Now().UTC(), Result: map[string]any{
 			"message_id": r.MessageID, "source_pane_id": r.SourcePaneID, "pane_id": r.PaneID, "status": "outcome_unknown", "replay_permitted": false,
 			"source_authentication": sourcePacket["authentication"], "submitting_client_id": identity,
 			"authority": "relayd", "desktop_required": false}}
+		if target != "" {
+			receipt.Result["target_session_id"] = target
+		}
 		// Persist the claim before the only native delivery. A lost client or
 		// daemon crash can never cause this message ID to be submitted again.
 		if err := communicationAtomic(receiptPath, receipt); err != nil {
@@ -524,13 +697,17 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if err := communicationEvent(root, nodeID, "message_claimed", []map[string]string{{"from": "pane:" + r.SourcePaneID, "to": "message:" + r.MessageID, "kind": "submitted"}, {"from": "message:" + r.MessageID, "to": "pane:" + r.PaneID, "kind": "addressed_to"}}); err != nil {
 			return receipt.Result, err
 		}
-		packet := map[string]any{"operation": "send", "expected": target.Endpoint, "messageID": r.MessageID,
+		packet := map[string]any{"operation": "send", "expected": recipient.Endpoint, "messageID": r.MessageID,
 			"targetPaneID": r.PaneID, "text": r.Text, "submittingClientID": r.ClientID,
 			"source": sourcePacket}
+		if target != "" {
+			packet["targetSessionID"] = target
+		}
 		result, err := communicationNative(r.PaneID, packet)
 		for key, value := range communicationNativeOutcome(result, err) {
 			receipt.Result[key] = value
 		}
+		markTurnStarted(receipt.Result)
 		if err := communicationAtomic(receiptPath, receipt); err != nil {
 			return nil, err
 		}

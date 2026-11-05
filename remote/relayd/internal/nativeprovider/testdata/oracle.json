@@ -1,0 +1,207 @@
+[
+  {
+    "mode": "build",
+    "scenario": "valid",
+    "ok": true,
+    "cargo": [
+      [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "codex-code-mode-host"
+      ]
+    ],
+    "fetches": 3
+  },
+  {
+    "mode": "build",
+    "scenario": "bundle",
+    "ok": true,
+    "cargo": [
+      [
+        "cargo",
+        "build",
+        "--release",
+        "--bin",
+        "codex",
+        "--bin",
+        "codex-peer-worker",
+        "--bin",
+        "codex-code-mode-host"
+      ]
+    ],
+    "fetches": 3
+  },
+  {
+    "mode": "build",
+    "scenario": "cached",
+    "ok": true,
+    "cargo": [
+      [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "codex-code-mode-host"
+      ]
+    ],
+    "fetches": 0
+  },
+  {
+    "mode": "build",
+    "scenario": "bad_manifest_hash",
+    "ok": false,
+    "cargo": [],
+    "fetches": 1
+  },
+  {
+    "mode": "build",
+    "scenario": "bad_asset_hash",
+    "ok": false,
+    "cargo": [],
+    "fetches": 2
+  },
+  {
+    "mode": "build",
+    "scenario": "extra_asset",
+    "ok": false,
+    "cargo": [],
+    "fetches": 4
+  },
+  {
+    "mode": "build",
+    "scenario": "path_asset",
+    "ok": false,
+    "cargo": [],
+    "fetches": 1
+  },
+  {
+    "mode": "build",
+    "scenario": "missing_trust",
+    "ok": false,
+    "cargo": [],
+    "fetches": 0
+  },
+  {
+    "mode": "install",
+    "scenario": "valid",
+    "ok": true,
+    "result": {
+      "activated": true,
+      "version": "codex-cli 0.160.0",
+      "running_agents_changed": false
+    }
+  },
+  {
+    "mode": "install",
+    "scenario": "stage",
+    "ok": true,
+    "result": {
+      "activated": false,
+      "version": "codex-cli 0.160.0",
+      "running_agents_changed": false
+    }
+  },
+  {
+    "mode": "install",
+    "scenario": "manifest",
+    "ok": true,
+    "result": {
+      "activated": true,
+      "version": "codex-cli 0.160.0",
+      "running_agents_changed": false
+    }
+  },
+  {
+    "mode": "install",
+    "scenario": "bad_manifest",
+    "ok": false
+  },
+  {
+    "mode": "install",
+    "scenario": "bad_version",
+    "ok": false
+  },
+  {
+    "mode": "install",
+    "scenario": "missing_worker",
+    "ok": false
+  },
+  {
+    "mode": "install",
+    "scenario": "unmanaged",
+    "ok": false
+  },
+  {
+    "mode": "install",
+    "scenario": "existing_link",
+    "ok": true,
+    "result": {
+      "activated": true,
+      "version": "codex-cli 0.160.0",
+      "running_agents_changed": false
+    }
+  },
+  {
+    "mode": "repair",
+    "scenario": "valid",
+    "ok": true,
+    "result": {
+      "added": "codex-code-mode-host",
+      "sha256": "f4c2a0617ae24433fd6901f3a58854b658296f575a6ca0a060bf41e144b156a6",
+      "existing_executables_unchanged": true
+    }
+  },
+  {
+    "mode": "repair",
+    "scenario": "already",
+    "ok": true,
+    "result": {
+      "added": "codex-code-mode-host",
+      "sha256": "f4c2a0617ae24433fd6901f3a58854b658296f575a6ca0a060bf41e144b156a6",
+      "already_repaired": true,
+      "existing_executables_unchanged": true
+    }
+  },
+  {
+    "mode": "repair",
+    "scenario": "wrong_version",
+    "ok": false
+  },
+  {
+    "mode": "repair",
+    "scenario": "bad_codex",
+    "ok": false
+  },
+  {
+    "mode": "repair",
+    "scenario": "missing_source",
+    "ok": false
+  },
+  {
+    "mode": "repair",
+    "scenario": "different_host",
+    "ok": false
+  },
+  {
+    "mode": "repair",
+    "scenario": "symlink_host",
+    "ok": false
+  },
+  {
+    "mode": "repair",
+    "scenario": "existing_backup",
+    "ok": false
+  },
+  {
+    "mode": "repair",
+    "scenario": "same_host",
+    "ok": true,
+    "result": {
+      "added": "codex-code-mode-host",
+      "sha256": "f4c2a0617ae24433fd6901f3a58854b658296f575a6ca0a060bf41e144b156a6",
+      "existing_executables_unchanged": true
+    }
+  }
+]

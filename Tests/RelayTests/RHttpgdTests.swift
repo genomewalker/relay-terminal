@@ -362,7 +362,7 @@ private final class FakeHttpgdAPI: RHttpgdAPI, @unchecked Sendable {
     func invalidate() {}
 }
 
-@Test("Renders are latest-only with debounced resizes and clamped dimensions")
+@Test("Renders are latest-only with debounced resizes and clamped dimensions", .timeLimit(.minutes(5)))
 @MainActor
 func httpgdRenderCoalescing() async throws {
     let api = FakeHttpgdAPI()
@@ -372,17 +372,23 @@ func httpgdRenderCoalescing() async throws {
     for _ in 0..<100 where connection.image == nil { try await Task.sleep(for: .milliseconds(20)) }
     let baseline = api.renders.count
     #expect(baseline == 1)
-    // A resize burst collapses into one render after the debounce.
+    // A resize burst collapses into one render after the debounce. Issue it
+    // within one MainActor turn: sleeping between steps lets a loaded main
+    // thread stretch a gap past the debounce and render an intermediate size.
     for step in 0..<30 {
         connection.setViewport(size: CGSize(width: 400 + step, height: 300 + step), scale: 2)
-        try await Task.sleep(for: .milliseconds(2))
     }
-    try await Task.sleep(for: .milliseconds(400))
+    // Only the last debounce task survives, so the first render is the only one.
+    // The time limit bounds each wait below; the throwing sleep lets it end one.
+    while api.renders.count == baseline { try await Task.sleep(for: .milliseconds(20)) }
     #expect(api.renders.count == baseline + 1)
     #expect(api.renders.last.map { $0.width == 858 && $0.height == 658 && $0.zoom == 2 } == true)
     // Selection changes while a render is in flight collapse to the newest state.
     connection.select(id: "0"); connection.select(id: "1"); connection.select(id: "0"); connection.select(id: "1"); connection.select(id: "0")
-    try await Task.sleep(for: .milliseconds(500))
+    // Wait for the outcome, not a fixed interval a loaded main thread can outlast.
+    while connection.rendering || connection.renderedKey?.id != "0" {
+        try await Task.sleep(for: .milliseconds(20))
+    }
     #expect(api.renders.count <= baseline + 3)
     #expect(connection.renderedKey?.id == "0" && connection.selectedID == "0" && !connection.followsNewest)
     // Same key again is served from the existing bitmap.
@@ -392,7 +398,7 @@ func httpgdRenderCoalescing() async throws {
     #expect(api.renders.count == before)
     // Oversized viewports never exceed the documented render bound.
     connection.setViewport(size: CGSize(width: 10_000, height: 9_000), scale: 3)
-    try await Task.sleep(for: .milliseconds(400))
+    while api.renders.count == before { try await Task.sleep(for: .milliseconds(20)) }
     #expect(api.renders.last.map { $0.width == 4000 && $0.height == 4000 && $0.zoom == 3 } == true)
     connection.disconnect()
 }
@@ -764,4 +770,31 @@ func httpgdVisibleInactivePresentationKeepsWatching() async throws {
     for _ in 0..<100 where connection.plotIDs.count != 4 || server.socketCount == 0 { try await Task.sleep(for: .milliseconds(20)) }
     #expect(connection.plotIDs.count == 4 && connection.selectedID == "3")
     #expect(server.socketCount == 1)
+}
+
+@Test("A closed httpgd client refuses new requests instead of ending the app")
+func httpgdClosedClientRefusesRequests() async throws {
+    let server = try MockHttpgdServer(token: sampleToken)
+    defer { server.stop() }
+    let client = RHttpgdClient(endpoint: RHttpgdEndpoint(port: server.port), token: sampleToken)
+    client.invalidate()
+    await #expect(throws: CancellationError.self) { try await client.state() }
+    await #expect(throws: CancellationError.self) { try await client.render(id: "1", width: 300, height: 200, zoom: 1) }
+    #expect(client.makeWebSocket() == nil)
+    client.invalidate()
+}
+
+@Test("Closing an httpgd client while a request is being admitted waits for it")
+func httpgdCloseDuringAdmissionWaits() async throws {
+    let server = try MockHttpgdServer(token: sampleToken)
+    defer { server.stop() }
+    let client = RHttpgdClient(endpoint: RHttpgdEndpoint(port: server.port), token: sampleToken)
+    // The connection's teardown runs on the main actor while a render has
+    // been admitted off it but has not yet asked the session for a task.
+    client.afterAdmission = { [weak client] in client?.invalidate() }
+    let state = try await client.state()
+    #expect(state == RHttpgdState(upid: 10, hsize: 2, active: true))
+    client.afterAdmission = nil
+    await #expect(throws: CancellationError.self) { try await client.plots(limit: 10) }
+    #expect(client.makeWebSocket() == nil)
 }

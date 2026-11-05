@@ -29,3 +29,21 @@ public struct InMemoryTerminalViewport: Sendable, Equatable {
         self.cellHeightPixels = cellHeightPixels
     }
 }
+
+/// See `InMemoryTerminalSession.screenState`.
+public struct InMemoryTerminalScreenState: Sendable, Equatable {
+    public var surfaceGeneration: UInt64
+    public var mutations: UInt64
+    public var mutationInFlight: Bool
+    public var columns: UInt16?
+    public var rows: UInt16?
+
+    public init(surfaceGeneration: UInt64, mutations: UInt64, mutationInFlight: Bool,
+                columns: UInt16? = nil, rows: UInt16? = nil) {
+        self.surfaceGeneration = surfaceGeneration
+        self.mutations = mutations
+        self.mutationInFlight = mutationInFlight
+        self.columns = columns
+        self.rows = rows
+    }
+}

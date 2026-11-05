@@ -1,0 +1,478 @@
+[
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": null}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": true}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": 0}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": \"bad\"}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": []}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": false,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": false}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": false,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": true}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": true,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": true,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": null}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": null,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": null,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": \"\"}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": "",
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": "",
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": []}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": [],
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": [],
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": {}}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": {},
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": {},
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"hooks\": null}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"hooks\": true}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"hooks\": 0}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"hooks\": \"å😀\"}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 2
+      },
+      "drift": false,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"hooks\": []}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": false,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"hooks\": {}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": false,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"hooks\": [\"user-hook\"]}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 1
+      },
+      "drift": false,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": null, \"promptSuggestionEnabled\": true}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": true,
+      "statusline": {
+        "managed": false,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": false, \"promptSuggestionEnabled\": true}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": true,
+      "statusline": {
+        "managed": false,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": 0, \"promptSuggestionEnabled\": true}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": true,
+      "statusline": {
+        "managed": false,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": \"\", \"promptSuggestionEnabled\": true}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": true,
+      "statusline": {
+        "managed": false,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": [], \"promptSuggestionEnabled\": true}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": true,
+      "statusline": {
+        "managed": false,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": true, \"promptSuggestionEnabled\": true}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": 1, \"promptSuggestionEnabled\": true}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": \"bad\", \"promptSuggestionEnabled\": true}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": [\"bad\"], \"promptSuggestionEnabled\": true}",
+    "accepted": false,
+    "report": null
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"text\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": false,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": false,
+      "statusline": {
+        "managed": false,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": 0}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": 0,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": 0,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": -0}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": 0,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": 0,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": 0.0}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": 0.0,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": 0.0,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": -0.0}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": -0.0,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": -0.0,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": 0e0}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": 0.0,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": 0.0,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": 0e99}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": 0.0,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": 0.0,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": 1e-999}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": 0.0,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": 0.0,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": 1}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": 1,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": true,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  },
+  {
+    "input_raw": "{\"statusLine\": {\"type\": \"command\", \"command\": \"bash \\\"$HOME/.config/relay/cc-status.sh\\\"\"}, \"promptSuggestionEnabled\": true, \"enabledPlugins\": {\"chitta@genomewalker-chitta\": -1}}",
+    "accepted": true,
+    "report": {
+      "hooks": {
+        "chitta_enabled": -1,
+        "failure_adapter_repaired": false,
+        "user_event_count": 0
+      },
+      "drift": true,
+      "statusline": {
+        "managed": true,
+        "quota_capture": false
+      }
+    }
+  }
+]

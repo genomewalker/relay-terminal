@@ -104,6 +104,55 @@ indirect enum PaneLayout: Codable, Equatable, Sendable {
     }
 }
 
+/// Panes stacked in one layout slot. Only `selected` occupies the tab's
+/// `layout`; the other members are hidden but keep their runtimes.
+struct PaneStack: Codable, Equatable, Identifiable, Sendable {
+    let id: UUID
+    var members: [UUID]
+    var selected: UUID
+
+    var isValid: Bool {
+        members.count >= 2 && Set(members).count == members.count && members.contains(selected)
+    }
+
+    /// Split IDs for the legacy projection: stable per stack and position, so
+    /// older readers keep their divider ratios and a projection compares exactly.
+    static func projectionSplitID(stack: UUID, index: Int) -> UUID {
+        var bytes = Array(SHA256.hash(data: Data("relay-stack-projection:\(stack.uuidString.lowercased()):\(index)".utf8)).prefix(16))
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+    }
+}
+
+extension PaneLayout {
+    func replacingPane(_ target: UUID, with node: PaneLayout) -> PaneLayout {
+        switch self {
+        case .pane(let id):
+            return id == target ? node : self
+        case .split(let id, let axis, let first, let second):
+            return .split(id: id, axis: axis, first: first.replacingPane(target, with: node),
+                          second: second.replacingPane(target, with: node))
+        }
+    }
+
+    /// Every pane tiled, each stack expanded into splits in member order.
+    /// Older Relay versions read this and show every stacked pane.
+    func legacyProjection(stacks: [PaneStack]) -> PaneLayout {
+        stacks.reduce(self) { layout, stack in
+            guard stack.isValid, layout.paneIDs.contains(stack.selected) else { return layout }
+            let hidden = stack.members.filter { $0 != stack.selected }
+            var node = PaneLayout.pane(stack.selected)
+            for (index, member) in hidden.enumerated() {
+                node = .split(id: PaneStack.projectionSplitID(stack: stack.id, index: index),
+                              axis: .horizontal, first: node, second: .pane(member))
+            }
+            return layout.replacingPane(stack.selected, with: node)
+        }
+    }
+}
+
 struct FloatingPanePlacement: Codable, Equatable, Identifiable, Sendable {
     let paneID: UUID
     var originX: Double
@@ -548,6 +597,11 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var title: String
     @Published var customName: String?
     @Published var directory: String?
+    /// A starting directory requested for a new worker. Not a claim about the
+    /// shell's real cwd: `directory` changes only from observed cwd reports.
+    let requestedStartDirectory: String?
+    @Published var uploadProgress: RelayTransferProgress?
+    var uploadProgressID: UUID?
     @Published var nativeConversationVisible = false
     @Published var lastCommandExitCode: Int?
     @Published var lastCommandDurationNanos: UInt64?
@@ -555,7 +609,27 @@ final class PaneModel: ObservableObject, Identifiable {
     private var programStatusAttention = RelayProgramStatusAttention()
     @Published var terminalProgressPercent: Int?
     @Published var terminalProgressState: String?
-    private(set) var detector = AgentSignalDetector()
+    private(set) var detector = AgentSignalDetector() {
+        didSet {
+            // A wait seen in terminal output; agent events name theirs in raiseWait.
+            guard agentEventInProgress == nil, detector.phase == .needsInput, oldValue.phase != .needsInput else { return }
+            terminalWaits &+= 1
+            waitIdentity = "terminal:\(terminalWaits)"
+        }
+    }
+    /// The latest wait, so a dismissed wait is told from a later one: the
+    /// agent event that asked for the user, which a snapshot replaying that
+    /// same event leaves unchanged, or a count of waits seen in terminal output.
+    private(set) var waitIdentity: String?
+    private var terminalWaits: UInt64 = 0
+    /// The agent event being applied, by its replay-stable digest.
+    private var agentEventInProgress: String?
+
+    /// An agent event asking for the user: each one is a new wait.
+    private func raiseWait(kind: AgentKind, excerpt: String) {
+        detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: excerpt)
+        if let event = agentEventInProgress { waitIdentity = "event:" + event }
+    }
     private(set) var harnessIdentity: AgentHarnessIdentity?
     private(set) var reportedHarnessName: String?
     private(set) var lastActivity = Date()
@@ -577,7 +651,9 @@ final class PaneModel: ObservableObject, Identifiable {
             switch connectionState {
             case .connecting, .reconnecting, .waitingForNetwork:
                 if case .connected = oldValue { supervisorReconnectSamples.append(Date()) }
-            case .connected, .disconnected:
+            case .connected:
+                RelayHostAccountSharing.shared.hostReady(profile)
+            case .disconnected:
                 break
             }
         }
@@ -594,6 +670,12 @@ final class PaneModel: ObservableObject, Identifiable {
     var richContentExplicit = false
     @Published var artifactError: String?
     private var dismissedArtifactIdentities: Set<String> = []
+    /// The provider account this pane's agent was started in and the account
+    /// the running agent reports. Part of the agent identity: restart, resume
+    /// and recovery keep it, and Relay never changes it to resolve a mismatch.
+    @Published private(set) var agentAccount: RelayPaneAgentAccountState?
+    private(set) var previewRequest = UUID()
+    private var previewTask: Task<Void, Never>?
     @Published var editorRequest: EditorOpenRequest?
     @Published var isRestoringTerminal = false
     @Published var hasTerminalSnapshot = false
@@ -613,6 +695,16 @@ final class PaneModel: ObservableObject, Identifiable {
     let remoteParentSessionID: String?
     private(set) var remoteWorkspaceSessionID: String?
     private(set) var remoteTabID: String?
+    private var composerStorage: PaneComposerState?
+    /// The agent composer lives with the pane, not its view, so moving,
+    /// stacking or regrouping never loses typed text or in-flight uploads.
+    var composerState: PaneComposerState {
+        if let composerStorage { return composerStorage }
+        let created = PaneComposerState()
+        composerStorage = created
+        return created
+    }
+    var composerStateIfCreated: PaneComposerState? { composerStorage }
     private var quietTask: Task<Void, Never>?
     private var supervisorOutputSamples: [(Date, Int)] = []
     private var supervisorReconnectSamples: [Date] = []
@@ -628,7 +720,9 @@ final class PaneModel: ObservableObject, Identifiable {
         remoteParentSessionID: String? = nil,
         editorRequest: EditorOpenRequest? = nil,
         customName: String? = nil,
-        directory: String? = nil
+        directory: String? = nil,
+        startDirectory: String? = nil,
+        savedAgentState: PersistedAgentPaneState? = nil
     ) {
         self.id = id
         self.profile = profile
@@ -638,14 +732,17 @@ final class PaneModel: ObservableObject, Identifiable {
         self.editorRequest = editorRequest
         self.customName = customName
         self.directory = directory
+        self.requestedStartDirectory = startDirectory
         self.title = contentKind == .editor ? "Editor" : profile.name
         self.remoteExitCode = nil
         self.connectionState = profile.backend == .relay
             ? .connecting
             : .connected
         dismissedArtifactIdentities = ArtifactDismissalStore.load(paneID: id)
-        if profile.backend == .relay,
-           let saved = AgentStateStore.shared.load(paneID: id) {
+        restoreAgentAccount(RelayPaneAccountStore.shared.load(paneID: id))
+        // An editor has no agent: a saved phase would read as "Working" before it starts.
+        if profile.backend == .relay, contentKind == .terminal,
+           let saved = savedAgentState ?? AgentStateStore.shared.load(paneID: id) {
             agentEventCursor = saved.replayCursor
             if saved.hasCurrentProcessRootState {
                 for root in saved.processRoots ?? [] where AgentKind.provider(root.observation.provider) == root.kind {
@@ -662,6 +759,10 @@ final class PaneModel: ObservableObject, Identifiable {
             agentProgressPercent = saved.progressPercent
             pendingAgentApprovals = saved.pendingApprovals
             detector.applyStructuredEvent(kind: saved.kind, phase: saved.phase, excerpt: saved.summary)
+            // Observers do not run during init: a restored wait takes its saved
+            // identity, so it lists, can be dismissed and stays dismissed when a
+            // reconnect replays its event; older saved state has none.
+            if detector.phase == .needsInput { waitIdentity = saved.waitIdentity ?? "restored" }
             structuredAgentRunning = saved.kind == .shell ? false : true
         }
     }
@@ -673,6 +774,7 @@ final class PaneModel: ObservableObject, Identifiable {
     /// Keep transport state intact for reconnect logic, but report the pane's
     /// lifecycle when an attached worker has exited or is still restoring.
     var connectionStatusLabel: String {
+        if let editorStartLabel { return editorStartLabel }
         guard contentKind == .terminal, profile.backend == .relay,
               connectionState == .connected else { return connectionState.label }
         if phase == .exited { return "Exited" }
@@ -681,9 +783,23 @@ final class PaneModel: ObservableObject, Identifiable {
         if isRestoringTerminal { return "Restoring" }
         return connectionState.label
     }
+    /// An editor is created "connecting" but asks to connect only when its
+    /// runtime starts; a start or reconnect in flight is reported as such.
+    private var editorStartLabel: String? {
+        guard contentKind == .editor else { return nil }
+        if connectionState == .connecting { return connectionRequested ? "Starting" : "Not started" }
+        // A start that failed before the editor was ever drawn did not lose a
+        // connection the user saw; its banner offers Retry.
+        if case .disconnected = connectionState, !editorViewShown { return "Not started" }
+        return nil
+    }
+    /// Set once the editor's view has been drawn.
+    var editorViewShown = false
+    private var connectionRequested = false
     var recentConversationContext: [String] { conversationContext.lines }
     var displayName: String { customName ?? title }
     var activitySummary: String {
+        if let editorStartLabel { return editorStartLabel }
         if let activity = agentActivities.last { return activity.label }
         return switch phase {
         case .connecting: "Starting"
@@ -731,20 +847,40 @@ final class PaneModel: ObservableObject, Identifiable {
         terminalProgressPercent = percent
     }
 
-    func startAgentMonitoring() {
-        guard !RelayLaunchMode.isRunningTests, agentMonitor == nil,
+    /// Whether this pane asked for agent events and kernel harness identity.
+    private(set) var agentMonitoringRequested = false
+    /// Whether this pane holds a live subscription to a host agent monitor.
+    var isAgentMonitored: Bool { agentMonitor != nil }
+    /// How often the host's agent event observer attached for this pane.
+    private(set) var agentObserverAttachments = 0
+
+    /// `monitor` defaults to the shared one, which tests never reach.
+    func startAgentMonitoring(monitor: RelayHostAgentMonitor? = nil) {
+        guard agentMonitor == nil,
               RelayAgentMonitoringAdmission.allows(profile: profile, contentKind: contentKind) else { return }
-        agentMonitor = RelayHostAgentMonitor.shared.subscribe(
+        agentMonitoringRequested = true
+        guard monitor != nil || !RelayLaunchMode.isRunningTests else { return }
+        agentMonitor = (monitor ?? RelayHostAgentMonitor.shared).subscribe(
             profile: profile,
             sessionID: id.uuidString.lowercased(),
             lastEventSequence: agentEventCursor,
             onEvent: { [weak self] data in self?.receivedAgentEvent(data) },
-            onAttached: { [weak self] in self?.connected() },
+            onObserverAttached: { [weak self] in self?.agentObserverAttached() },
             onHarness: { [weak self] identity in self?.receivedHarnessIdentity(identity) }
         )
     }
 
+    /// The host's agent event observer (re)attached. That is no evidence
+    /// about this pane's terminal route, so it leaves the exit code and the
+    /// connection state alone; only `connected()` from the terminal or editor
+    /// runtime changes them. Events may have been missed, so re-identify.
+    func agentObserverAttached() {
+        agentObserverAttachments += 1
+        agentMonitor?.expectHarnessChange()
+    }
+
     func stopAgentMonitoring() {
+        agentMonitoringRequested = false
         agentMonitor?.stop()
         agentMonitor = nil
     }
@@ -756,6 +892,7 @@ final class PaneModel: ObservableObject, Identifiable {
         agentUIRefreshTask = nil
         persistAgentStateNow()
         stopAgentMonitoring()
+        RelayAgentAccountDirectory.shared.untrackObservedPane(self)
         guard !RelayLaunchMode.isRunningTests else { return }
         switch contentKind {
         case .terminal: runtime.stop()
@@ -784,6 +921,9 @@ final class PaneModel: ObservableObject, Identifiable {
         pruneSupervisorSamples(now: lastActivity)
         if previousKind != detector.kind || previousPhase != detector.phase {
             objectWillChange.send()
+        }
+        if previousKind != detector.kind, agentMonitor != nil {
+            RelayHostAgentMonitor.shared.expectHarnessChange(profile: profile, sessionID: id.uuidString.lowercased())
         }
         // Shell TUIs can repaint many times per second. They do not need an
         // agent quiet timer, and repeatedly cancelling/creating one forces
@@ -858,11 +998,12 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func dismissArtifact(_ id: UUID) {
-        if let artifact = artifacts.first(where: { $0.id == id }) {
+        if let artifact = artifacts.first(where: { $0.id == id }), !artifact.userRequested {
             dismissedArtifactIdentities.insert(artifact.contentIdentity)
             ArtifactDismissalStore.record(artifact.contentIdentity, paneID: self.id)
         }
         artifacts.removeAll { $0.id == id }
+        invalidatePreviewRequest()
     }
 
     func receivedArtifact(path: String, data: Data) {
@@ -873,6 +1014,45 @@ final class PaneModel: ObservableObject, Identifiable {
         // The pane presents one generated asset at a time. Retaining an
         // invisible stack made Close reveal the previous image immediately,
         // which looked as if the button had failed.
+        artifacts = [artifact]
+        artifactError = nil
+    }
+
+    /// A preview the user asked for is shown even when automatic previews are off or the
+    /// same content was dismissed earlier, and closing it records no dismissal.
+    func presentRequestedArtifact(_ artifact: PaneArtifact) {
+        invalidatePreviewRequest()
+        show(requested: artifact)
+    }
+
+    /// Latest request wins: every explicit preview (and Close) supersedes earlier loads,
+    /// so a slow earlier file can never replace a later one when it finishes.
+    @discardableResult
+    func openPreview(_ load: @escaping @Sendable () async -> PaneArtifact) -> Task<Void, Never> {
+        invalidatePreviewRequest()
+        let request = previewRequest
+        let task = Task { @MainActor [weak self] in
+            let artifact = await load()
+            guard let self, !Task.isCancelled, self.previewRequest == request else { return }
+            if let failure = artifact.failure {
+                RelayDiagnostics.shared.record(category: "artifact", name: "open_failed", details: [
+                    "path": artifact.remotePath, "message": failure,
+                ])
+            }
+            self.show(requested: artifact)
+        }
+        previewTask = task
+        return task
+    }
+
+    private func invalidatePreviewRequest() {
+        previewTask?.cancel(); previewTask = nil
+        previewRequest = UUID()
+    }
+
+    private func show(requested artifact: PaneArtifact) {
+        var artifact = artifact
+        artifact.userRequested = true
         artifacts = [artifact]
         artifactError = nil
     }
@@ -888,6 +1068,7 @@ final class PaneModel: ObservableObject, Identifiable {
 
     func connected() {
         remoteExitCode = nil
+        RelayHostAgentMonitor.shared.expectHarnessChange(profile: profile, sessionID: id.uuidString.lowercased())
         if detector.phase == .connecting {
             detector.applyStructuredEvent(kind: detector.kind, phase: .active, excerpt: "Terminal connected")
         }
@@ -915,6 +1096,7 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func reconnecting() {
+        connectionRequested = true
         remoteExitCode = nil
         connectionState = .connecting
         detector = AgentSignalDetector()
@@ -948,8 +1130,10 @@ final class PaneModel: ObservableObject, Identifiable {
             agentEventCursor = max(agentEventCursor, cursor)
         }
         let incomingEventName = (event["hook_event_name"] as? String) ?? (event["type"] as? String)
+        let outerEvent = agentEventInProgress
         defer {
             reconcileHarnessKind()
+            agentEventInProgress = outerEvent
             if agentSnapshotReplayDepth == 0, incomingEventName != "RelayStateSnapshot",
                let through = legacyRootReplayThroughCursor,
                let sequence = (envelope["relay_event_seq"] as? NSNumber)?.uint64Value,
@@ -993,6 +1177,7 @@ final class PaneModel: ObservableObject, Identifiable {
             let digest = Data(SHA256.hash(data: normalized))
             let now = Date()
             if let previous = seenAgentEventHashes[digest], now.timeIntervalSince(previous) < 1 { return }
+            agentEventInProgress = digest.base64EncodedString()
             seenAgentEventHashes[digest] = now
             seenAgentEventOrder.append((digest, now))
             let expiry = now.addingTimeInterval(-1)
@@ -1063,24 +1248,25 @@ final class PaneModel: ObservableObject, Identifiable {
         switch eventName {
         case "PermissionRequest":
             pendingAgentApprovals += 1
-            detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Approval: \(tool ?? "permission requested")")
+            raiseWait(kind: kind, excerpt: "Approval: \(tool ?? "permission requested")")
             recordActivity("Approval needed for \(tool ?? "a tool")", phase: .needsInput)
             announceAgentAttention("Approval needed for \(tool ?? "an agent tool")")
             recordIntelligenceEvent(
                 provider: kind, agentID: subagentID ?? rootID, eventKind: .attention,
                 title: "Approval needed for \(tool ?? "an agent tool")",
                 detail: message ?? "The agent is waiting for permission before it can continue.",
-                occurredAt: occurredAt, sourceID: intelligenceSourceID
+                occurredAt: occurredAt, sourceID: intelligenceSourceID, alert: .needsInput
             )
         case "Notification" where notificationType == "permission_prompt" || notificationType == "idle_prompt":
-            detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: event["message"] as? String ?? "Needs input")
+            raiseWait(kind: kind, excerpt: event["message"] as? String ?? "Needs input")
             recordActivity(event["message"] as? String ?? "Needs input", phase: .needsInput)
             announceAgentAttention(event["message"] as? String ?? "Agent needs input")
             recordIntelligenceEvent(
                 provider: kind, agentID: subagentID ?? rootID, eventKind: .attention,
                 title: "\(kind.label) needs your input",
                 detail: message ?? "The agent is waiting for input.", occurredAt: occurredAt,
-                sourceID: intelligenceSourceID
+                // An idle prompt follows a finished turn, which already alerted.
+                sourceID: intelligenceSourceID, alert: notificationType == "permission_prompt" ? .needsInput : nil
             )
         case "SubagentStart":
             let identifier = subagentID ?? UUID().uuidString
@@ -1189,13 +1375,13 @@ final class PaneModel: ObservableObject, Identifiable {
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Finished \(tool ?? "tool")")
             recordActivity("Finished \(tool ?? "tool")", phase: .quiet)
         case "PostToolUseFailure":
-            detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: "Failed \(tool ?? "tool")")
+            raiseWait(kind: kind, excerpt: "Failed \(tool ?? "tool")")
             recordActivity("Failed \(tool ?? "tool")", phase: .needsInput)
             recordIntelligenceEvent(
                 provider: kind, agentID: subagentID ?? rootID, eventKind: .failure,
                 title: "\(tool ?? "Agent tool") failed",
                 detail: message ?? "The tool failed and may need attention.", occurredAt: occurredAt,
-                sourceID: intelligenceSourceID
+                sourceID: intelligenceSourceID, alert: .toolFailed
             )
         case "UserPromptSubmit", "turn/started":
             pendingAgentApprovals = 0
@@ -1220,7 +1406,7 @@ final class PaneModel: ObservableObject, Identifiable {
                 provider: kind, agentID: subagentID ?? rootID, eventKind: .completion,
                 title: "\(kind.label) completed a turn",
                 detail: message ?? "The agent finished and is ready.", occurredAt: occurredAt,
-                sourceID: intelligenceSourceID
+                sourceID: intelligenceSourceID, alert: .done
             )
         case "AgentProgress":
             agentProgressPercent = (event["progress_percent"] as? NSNumber)?.intValue
@@ -1279,7 +1465,13 @@ final class PaneModel: ObservableObject, Identifiable {
                 structuredAgentRunning = false
                 nativeConversationVisible = false
             }
-            recordActivity("\(kind.label) session ended", phase: .quiet)
+            // A second, short-lived root of the same provider (a version
+            // check, a hook's `claude -p`) must not label the pane's running
+            // conversation as ended: on dandy-07 (2026-10-30) a 1 s root left
+            // 20 live Claude panes reading "Claude session ended".
+            if activeAgentRoots.isEmpty {
+                recordActivity("\(kind.label) session ended", phase: .quiet)
+            }
             recordIntelligenceEvent(
                 provider: kind, agentID: rootID, eventKind: .session,
                 title: "\(kind.label) session ended",
@@ -1359,6 +1551,8 @@ final class PaneModel: ObservableObject, Identifiable {
                     guard let kind = activeAgentRoots[id], let observation = activeAgentRootObservations[id] else { return nil }
                     return PersistedAgentProcessRoot(id: id, kind: kind, observation: observation)
                 },
+                // Terminal waits are counted per run, so only an event's identity is kept.
+                waitIdentity: waitIdentity?.hasPrefix("event:") == true ? waitIdentity : nil,
                 cursor: agentEventCursor,
                 kind: kind,
                 phase: phase,
@@ -1431,7 +1625,8 @@ final class PaneModel: ObservableObject, Identifiable {
         occurredAt: Date,
         fromPeerID: String? = nil,
         toPeerID: String? = nil,
-        sourceID: String? = nil
+        sourceID: String? = nil,
+        alert: RelayAttentionAlert? = nil
     ) {
         AgentIntelligenceStore.shared.record(AgentInboxEvent(
             paneID: id,
@@ -1444,7 +1639,8 @@ final class PaneModel: ObservableObject, Identifiable {
             occurredAt: occurredAt,
             fromPeerID: fromPeerID,
             toPeerID: toPeerID,
-            sourceID: sourceID
+            sourceID: sourceID,
+            alert: alert
         ))
     }
 
@@ -1516,9 +1712,16 @@ final class TabModel: ObservableObject, Identifiable {
     let id: UUID
     let sessionID: UUID
     @Published var name: String
-    @Published var layout: PaneLayout
-    @Published var floatingPanes: [FloatingPanePlacement]
+    @Published var layout: PaneLayout {
+        didSet { notePanesLeft(oldValue.paneIDs + floatingPanes.map(\.paneID) + hiddenStackPaneIDs, via: "layout") }
+    }
+    @Published var floatingPanes: [FloatingPanePlacement] {
+        didSet { notePanesLeft(layout.paneIDs + oldValue.map(\.paneID) + hiddenStackPaneIDs, via: "floatingPanes") }
+    }
     @Published var splitRatios: [UUID: Double]
+    /// Told which panes left this tab, and through which property. A pane
+    /// can leave for a moment while it moves within the tab.
+    var onPanesLeft: ((_ paneIDs: [UUID], _ via: String) -> Void)?
     var canvasSize: CGSize = .zero
     var savedArrangement: PaneArrangementSnapshot?
     @Published var rLayoutEditorID: UUID?
@@ -1538,7 +1741,99 @@ final class TabModel: ObservableObject, Identifiable {
         self.splitRatios = [:]
     }
 
-    var allPaneIDs: [UUID] { layout.paneIDs + floatingPanes.map(\.paneID) }
+    /// Stacks whose selected member sits in `layout`. Hidden members appear
+    /// nowhere else in the tab, and are never stopped by a stack change.
+    @Published var stacks: [PaneStack] = [] {
+        didSet {
+            let hidden = oldValue.flatMap { stack in stack.members.filter { $0 != stack.selected } }
+            notePanesLeft(layout.paneIDs + floatingPanes.map(\.paneID) + hidden, via: "stacks")
+        }
+    }
+
+    private func notePanesLeft(_ previous: [UUID], via property: String) {
+        guard let onPanesLeft else { return }
+        let current = Set(allPaneIDs)
+        let left = previous.filter { !current.contains($0) }
+        if !left.isEmpty { onPanesLeft(left, property) }
+    }
+
+    var allPaneIDs: [UUID] { layout.paneIDs + floatingPanes.map(\.paneID) + hiddenStackPaneIDs }
+
+    var hiddenStackPaneIDs: [UUID] { stacks.flatMap { stack in stack.members.filter { $0 != stack.selected } } }
+
+    func stack(containing paneID: UUID) -> PaneStack? { stacks.first { $0.members.contains(paneID) } }
+
+    func stack(id: UUID) -> PaneStack? { stacks.first { $0.id == id } }
+
+    var legacyLayoutProjection: PaneLayout { layout.legacyProjection(stacks: stacks) }
+
+    static func legacyProjection(of layout: PaneLayout, stacks: [PaneStack]) -> PaneLayout {
+        layout.legacyProjection(stacks: stacks)
+    }
+
+    /// Accepts a saved stack table only if it reproduces the saved legacy
+    /// layout exactly. Otherwise an older writer rearranged the tab, and the
+    /// legacy layout (which still holds every pane) wins.
+    func restoreLayout(legacy: PaneLayout, visible: PaneLayout?, stacks saved: [PaneStack]?) {
+        if let visible, let saved, !saved.isEmpty, saved.allSatisfy(\.isValid),
+           Set(saved.map(\.id)).count == saved.count,
+           visible.legacyProjection(stacks: saved) == legacy {
+            layout = visible
+            stacks = saved
+        } else {
+            layout = legacy
+            stacks = []
+        }
+    }
+
+    /// Takes a pane out of this tab's tiled area or stack. A showing stack
+    /// member hands its slot to the next member rather than collapsing the
+    /// split. Returns false if the pane was not tiled or stacked here.
+    @discardableResult
+    func detachTiledPane(_ paneID: UUID) -> Bool {
+        if let index = stacks.firstIndex(where: { $0.members.contains(paneID) }) {
+            var stack = stacks[index]
+            let position = stack.members.firstIndex(of: paneID)!
+            stack.members.remove(at: position)
+            if stack.selected == paneID {
+                let next = stack.members[min(position, stack.members.count - 1)]
+                layout = layout.swapping(paneID, next)
+                stack.selected = next
+            }
+            if stack.members.count < 2 { stacks.remove(at: index) } else { stacks[index] = stack }
+            return true
+        }
+        guard layout.paneIDs.contains(paneID), let remaining = layout.removing(paneID) else { return false }
+        layout = remaining
+        return true
+    }
+
+    /// Keeps the stack table consistent after any direct `layout` assignment:
+    /// a stack whose showing member left the layout promotes another member
+    /// that is still there, or else re-tiles its hidden members so no pane is
+    /// ever dropped from the tab.
+    func reconcileStacks() {
+        var kept: [PaneStack] = []
+        var claimed = Set(floatingPanes.map(\.paneID))
+        for var stack in stacks {
+            stack.members = stack.members.filter { !claimed.contains($0) }
+            let tiled = Set(layout.paneIDs)
+            let showing = stack.members.filter { tiled.contains($0) }
+            if !showing.contains(stack.selected), let first = showing.first { stack.selected = first }
+            if !tiled.contains(stack.selected) {
+                for member in stack.members where !tiled.contains(member) {
+                    let anchor = layout.paneIDs.last!
+                    layout = layout.splitting(anchor, axis: .horizontal, with: member)
+                }
+                continue
+            }
+            // Members tiled elsewhere in the layout are no longer hidden here.
+            stack.members = stack.members.filter { $0 == stack.selected || !tiled.contains($0) }
+            claimed.formUnion(stack.members)
+            if stack.members.count >= 2 { kept.append(stack) }
+        }
+        if kept != stacks { stacks = kept }
+    }
 
     /// Initialize new dividers without rebalancing the user's other splits.
     func reconcileSplitRatios() {
@@ -1600,8 +1895,10 @@ final class ProfileStore: ObservableObject {
         refreshSSHConfig()
     }
 
-    func refreshSSHConfig() {
-        sshConfigHosts = SSHConfigDiscovery.hosts().map(ConnectionProfile.sshConfigHost)
+    /// Each refresh makes new profiles (new ids) for the same aliases; a
+    /// host choice that must survive it keys by `connectionKey`.
+    func refreshSSHConfig(configURL: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/config")) {
+        sshConfigHosts = SSHConfigDiscovery.hosts(configURL: configURL).map(ConnectionProfile.sshConfigHost)
     }
 
     var connectableHosts: [ConnectionProfile] {
@@ -1645,5 +1942,68 @@ final class ProfileStore: ObservableObject {
 extension ConnectionProfile {
     var connectionKey: String {
         usesSSHConfig ? "config:\(host)" : "ssh:\(destination):\(port)"
+    }
+}
+
+extension PaneModel {
+    /// The raw account label (list_panes "account"): recorded, else inferred.
+    var agentAccountLabel: String? { agentAccount?.label }
+
+    /// Display only (list_panes "accountDisplay"); see `displayLabel`. Never a
+    /// move target or an account comparison.
+    var agentAccountDisplay: String? { agentAccount?.displayLabel }
+
+    /// Records the account a launch selected. A pane keeps its recorded
+    /// account until a new agent is started in it.
+    func recordAgentAccount(_ account: RelayAgentAccount) {
+        guard account.isValid else { return }
+        var state = RelayPaneAgentAccountState(recorded: account)
+        if let current = agentAccount, current.observedProvider == account.provider {
+            state.observedProvider = current.observedProvider
+            state.observedDirectory = current.observedDirectory
+            state.observedLabel = current.observedLabel
+        }
+        agentAccount = state
+        RelayPaneAccountStore.shared.save(state, paneID: id)
+    }
+
+    /// A slot rename keeps the pane's account: only its label changes.
+    func relabelAgentAccount(provider: String, from old: String, to new: String) {
+        guard var state = agentAccount, let recorded = state.recorded, recorded.provider == provider, recorded.label == old
+        else { return }
+        state.recorded = RelayAgentAccount(provider: provider, label: new, dir: recorded.dir)
+        if state.observedProvider == provider, state.observedLabel == old { state.observedLabel = new }
+        agentAccount = state
+        RelayPaneAccountStore.shared.save(state, paneID: id)
+    }
+
+    /// Records what the running agent uses. A difference from the recorded
+    /// account is reported, never corrected.
+    /// Adopts the account saved for this pane. A saved inferred label is
+    /// re-derived now if the host registry is already read, and not shown
+    /// until it is: it may be a guess made before that registry arrived.
+    func restoreAgentAccount(_ saved: RelayPaneAgentAccountState?,
+                             accounts: RelayAgentAccountDirectory = .shared) {
+        agentAccount = saved
+        guard saved?.observedDirectory != nil else { return }
+        accounts.trackObservedPane(self)
+        let key = RelayAgentAccountDirectory.hostKey(profile)
+        let cached = accounts.statuses[key] != nil
+        agentAccount = saved?.restored(registryCached: cached)
+        if cached { accounts.relabelObservedPanes([self], hostKey: key) }
+    }
+
+    func observeAgentAccount(provider: String, directory: String, label: String?, matches: Bool? = nil) {
+        guard RelayAgentAccount.providers.contains(provider), RelayAgentAccount.validDirectory(directory) else { return }
+        RelayAgentAccountDirectory.shared.trackObservedPane(self)
+        var state = agentAccount ?? RelayPaneAgentAccountState()
+        guard state.observedProvider != provider || state.observedDirectory != directory || state.observedLabel != label ||
+              state.observedMatches != matches else { return }
+        state.observedProvider = provider
+        state.observedDirectory = directory
+        state.observedLabel = label
+        state.observedMatches = matches
+        agentAccount = state
+        RelayPaneAccountStore.shared.save(state, paneID: id)
     }
 }

@@ -84,7 +84,7 @@ func TestNativeClaudeSocketOwnershipAndTranscriptBounds(t *testing.T) {
 		t.Fatal("writable socket accepted")
 	}
 	home := t.TempDir()
-	if path, err := nativeClaudeTranscript(home, "1e292b09-1f1c-49eb-9b3a-85844d9b8cd7"); err != nil || path != "" {
+	if path, err := nativeClaudeTranscript(filepath.Join(home, ".claude"), "1e292b09-1f1c-49eb-9b3a-85844d9b8cd7"); err != nil || path != "" {
 		t.Fatal("missing initial transcript not supported")
 	}
 	for _, name := range []string{"one", "two"} {
@@ -96,7 +96,7 @@ func TestNativeClaudeSocketOwnershipAndTranscriptBounds(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := nativeClaudeTranscript(home, "1e292b09-1f1c-49eb-9b3a-85844d9b8cd7"); err == nil {
+	if _, err := nativeClaudeTranscript(filepath.Join(home, ".claude"), "1e292b09-1f1c-49eb-9b3a-85844d9b8cd7"); err == nil {
 		t.Fatal("ambiguous transcript accepted")
 	}
 }

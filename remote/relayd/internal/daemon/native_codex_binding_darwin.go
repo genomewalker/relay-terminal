@@ -30,11 +30,22 @@ func (b *nativeCommandBuffer) Write(data []byte) (int, error) {
 	}
 	return b.Buffer.Write(data)
 }
+
+var nativeLsofPath = "/usr/sbin/lsof"
+
 func nativeLsof(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "/usr/sbin/lsof", append([]string{"-nP"}, args...)...)
-	var output nativeCommandBuffer
+	cmd := exec.CommandContext(ctx, nativeLsofPath, append([]string{"-nP"}, args...)...)
+	var output, failure nativeCommandBuffer
 	cmd.Stdout = &output
+	cmd.Stderr = &failure
 	if err := cmd.Run(); err != nil {
+		// lsof exits 1 silently when no open file matched: an empty kernel
+		// inventory, which the callers' uniqueness checks then refuse. Any
+		// other status, diagnostic or partial output remains unavailable.
+		var exit *exec.ExitError
+		if ctx.Err() == nil && errors.As(err, &exit) && exit.ExitCode() == 1 && output.Len() == 0 && failure.Len() == 0 {
+			return "", nil
+		}
 		return "", errors.New("native kernel socket inventory unavailable")
 	}
 	return output.String(), nil

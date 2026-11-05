@@ -1,0 +1,378 @@
+{
+  "source_sha256": "4d5013c0d4f8faac8608e635c3fe48ab34f221898b1aae43948f9140688539ff",
+  "source_bytes": 814,
+  "cases": [
+    {
+      "desktop": {
+        "token": "remote-fixture-desktop",
+        "port": 47479
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "47479",
+          "RELAY_MCP_TOKEN": "remote-fixture-desktop"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "",
+        "port": 0
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "0",
+          "RELAY_MCP_TOKEN": ""
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "synthetic-æ😀",
+        "port": "47480"
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "47480",
+          "RELAY_MCP_TOKEN": "synthetic-æ😀"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture",
+        "port": true
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "True",
+          "RELAY_MCP_TOKEN": "fixture"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture",
+        "port": false
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "False",
+          "RELAY_MCP_TOKEN": "fixture"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture",
+        "port": null
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "None",
+          "RELAY_MCP_TOKEN": "fixture"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture",
+        "port": 1.5
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "1.5",
+          "RELAY_MCP_TOKEN": "fixture"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture",
+        "port": 1e+20
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "1e+20",
+          "RELAY_MCP_TOKEN": "fixture"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture",
+        "port": 1e-06
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "1e-06",
+          "RELAY_MCP_TOKEN": "fixture"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture",
+        "port": -7
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "-7",
+          "RELAY_MCP_TOKEN": "fixture"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture\nline",
+        "port": "leading space 47479"
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "leading space 47479",
+          "RELAY_MCP_TOKEN": "fixture\nline"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    },
+    {
+      "desktop": {
+        "token": "fixture",
+        "port": 900719925474099312345678901234567890
+      },
+      "incoming": [
+        "KEEP_REMOTE=untouched",
+        "RELAY_MCP_OWNER_PID=42",
+        "RELAY_MCP_TOKEN=stale",
+        "RELAY_MCP_PORT=stale",
+        "RELAY_MCP_CALLER_TOKEN=stale",
+        "RELAY_MCP_BACKEND=stale",
+        "RELAY_MCP_DAEMON=stale"
+      ],
+      "expected": {
+        "args": [
+          "/primary-home/.local/share/relay/bin/relay-mcp-communication"
+        ],
+        "environment": {
+          "KEEP_REMOTE": "untouched",
+          "RELAY_MCP_BACKEND": "daemon",
+          "RELAY_MCP_CALLER_TOKEN": "remote-fixture-caller",
+          "RELAY_MCP_DAEMON": "/primary-home/.local/share/relay/bin/relayd-communication",
+          "RELAY_MCP_OWNER_PID": "42",
+          "RELAY_MCP_PORT": "900719925474099312345678901234567890",
+          "RELAY_MCP_TOKEN": "fixture"
+        },
+        "pid": 0,
+        "parent_pid": 0
+      }
+    }
+  ]
+}

@@ -12,11 +12,15 @@ struct RelayHostAccountsService: Sendable {
         return try RelayHostRotationTextRPC.decode(
             await RelayHostRotationTextRPC.sendHost(request, profile: profile), request: request)
     }
-    @MainActor func configureHostRotationText(_ settings: RelayHostRotationTextRPC.Settings, expectedConfigurationID: String) async throws -> RelayHostRotationTextRPC.Status {
+    @MainActor func configureHostRotationText(_ settings: RelayHostRotationTextRPC.Settings, expectedConfigurationID: String,
+                                             operationID: String? = nil) async throws -> RelayHostRotationTextRPC.Status {
         let request = RelayHostRotationTextRPC.Request(operation: .configure,
-            id: RelayHostRotationRPC.newOperationID(), settings: settings)
-        return try RelayHostRotationTextRPC.decode(
+            id: operationID ?? RelayHostRotationRPC.newOperationID(), settings: settings)
+        let result = try RelayHostRotationTextRPC.decode(
             await RelayHostRotationTextRPC.sendHost(request, profile: profile, expectedConfigurationID: expectedConfigurationID), request: request)
+        RelayPaneHealthCoordinator.shared.accountConfigurationChanged(profile: profile)
+        if profile.kind == .local { RelayHostAccountSharing.shared.localAccountsChanged() }
+        return result
     }
     @MainActor func abandonHostRotationText(operationID: String) async throws -> RelayHostRotationTextRPC.Status {
         let request = RelayHostRotationTextRPC.Request(operation: .abandon, operationID: operationID)
@@ -44,5 +48,13 @@ struct RelayHostAccountsService: Sendable {
         let request = RelayHostRotationTextRPC.Request(operation: .credentialList)
         return try RelayHostRotationTextRPC.decodeCredentials(
             await RelayHostRotationTextRPC.sendHost(request, profile: profile))
+    }
+    @MainActor func unlockHostVault(secret: String) async throws {
+        let request = RelayHostRotationTextRPC.Request(operation: .vaultUnlock, credentialSecret: secret)
+        let raw = try await RelayHostRotationTextRPC.sendHost(request, profile: profile)
+        struct Receipt: Decodable { let v: Int; let status: String; let storage: String }
+        let result = try JSONDecoder().decode(Receipt.self, from: raw)
+        guard result.v == 1, result.status == "unlocked", result.storage == "linux_secret_service"
+        else { throw RelayHostAccountSharingError.vaultLocked }
     }
 }

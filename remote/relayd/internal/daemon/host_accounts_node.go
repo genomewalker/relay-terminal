@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -15,6 +16,15 @@ import (
 // input lease or supervisor upgrade is needed. Native session controls retain
 // their separate worker admission checks.
 func HandleNodeHostAccountsRequest(ctx context.Context, data []byte) ([]byte, error) {
+	if nodeCapacityEnvelope(data) {
+		return handleNodeCapacityRequest(ctx, data, defaultWorkerStateDir(), capacityNativeObserve, capacityNativeAccounts)
+	}
+	if nodePaneHealthEnvelope(data) {
+		return handleNodePaneHealthRequest(ctx, data, defaultWorkerStateDir(), hostRotationTextService)
+	}
+	if nodeAssistantEnvelope(data) {
+		return handleNodeAssistantRequest(ctx, data, defaultWorkerStateDir(), hostRotationTextService)
+	}
 	return handleNodeHostAccountsRequest(ctx, data, serveHostAccountSettings)
 }
 
@@ -49,7 +59,7 @@ func handleNodeHostAccountsRequest(ctx context.Context, data []byte,
 	} else if expected != nil {
 		return nil, errors.New("configuration identity is only valid for settings saves")
 	}
-	if request.Operation == "text_credential_save" {
+	if request.Operation == "text_credential_save" || request.Operation == "text_vault_unlock" {
 		if len(request.CredentialSecret) < 16 || len(request.CredentialSecret) > 512 {
 			return nil, errors.New("invalid API credential")
 		}
@@ -85,6 +95,9 @@ func serveHostAccountSettings(ctx context.Context, request hostRotationRequest, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
+	if request.Operation == "text_vault_unlock" {
+		return hostVaultUnlock(ctx, request.CredentialSecret)
+	}
 	if strings.HasPrefix(request.Operation, "text_credential_") {
 		operation := strings.TrimPrefix(request.Operation, "text_credential_")
 		return hostRotationCredentialIndexService(ctx, root, operation,
@@ -108,6 +121,9 @@ func serveHostAccountSettings(ctx context.Context, request hostRotationRequest, 
 			return nil, errors.New("invalid host account status")
 		}
 		status["credential_support"] = json.RawMessage(`"v1"`)
+		if runtime.GOOS == "linux" {
+			status["vault_unlock_support"] = json.RawMessage(`"gnome_secret_service_v1"`)
+		}
 		return json.Marshal(status)
 	}
 	return result, nil

@@ -1,8 +1,11 @@
 package daemon
 
 import (
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -109,5 +112,120 @@ func TestGarbageCollectionRemovesOnlyOrphanedOldWorkspaceState(t *testing.T) {
 	}
 	if _, err := os.Stat(server.workspaceStatePath("workspace-orphan")); !os.IsNotExist(err) {
 		t.Fatal("orphaned old workspace state was retained")
+	}
+}
+
+// startStandInWorker runs a real child process whose identity validates like
+// a pane worker's, and reports when it exits.
+func startStandInWorker(t *testing.T) (*exec.Cmd, <-chan struct{}) {
+	t.Helper()
+	child := exec.Command("sleep", "60")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = child.Wait(); close(exited) }()
+	t.Cleanup(func() { _ = child.Process.Kill(); <-exited })
+	return child, exited
+}
+
+func TestGarbageCollectionCollectsRetainedPaneOnlyWithProvenExitedShell(t *testing.T) {
+	server := NewServer()
+	server.stateDir = filepath.Join(t.TempDir(), "workers")
+	old := time.Now().UTC().Add(-45 * 24 * time.Hour)
+	recent := time.Now().UTC().Add(-time.Hour)
+	bootID, err := nodeBootID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workers := map[string]<-chan struct{}{}
+	manifest := func(id, state string, updated time.Time, pid int, start uint64) {
+		t.Helper()
+		// storeManifest stamps the current time; write the recorded one.
+		data, err := json.Marshal(workerManifest{
+			Version: workerProtocolVersion, SessionID: id, WorkerPID: pid, WorkerStartTime: start,
+			ShellPID: pid, NodeBootID: bootID, SocketPath: filepath.Join(t.TempDir(), id+".sock"),
+			Token: "test", State: state, CreatedAt: old, UpdatedAt: updated,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(server.stateDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(server.manifestPath(id), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := func(id, state string, updated time.Time) {
+		t.Helper()
+		child, exited := startStandInWorker(t)
+		start, err := processStartTime(child.Process.Pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest(id, state, updated, child.Process.Pid, start)
+		workers[id] = exited
+	}
+	live("retained-exited-old", "exited", old)
+	live("retained-exited-recent", "exited", recent)
+	live("retained-running-old", "running", old)
+	// A worker identity that no longer validates: the PID's start time differs.
+	manifest("retained-stale-old", "exited", old, os.Getpid(), 1)
+
+	panes := map[string]CatalogPane{"plain-missing-old": {PaneID: "plain-missing-old", State: "missing", UpdatedAt: old}}
+	for _, id := range []string{"retained-exited-old", "retained-exited-recent", "retained-running-old",
+		"retained-stale-old", "retained-missing-old"} {
+		panes[id] = CatalogPane{PaneID: id, State: "running", UpdatedAt: old, Retained: true}
+	}
+	if err := storeCatalog(server.catalogPath(), storedCatalog{Schema: catalogSchemaVersion, Panes: panes}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"plain-missing-old", "retained-exited-old"}
+	dryRun, err := server.CollectGarbage(30*24*time.Hour, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(dryRun, want) {
+		t.Fatalf("unexpected dry-run selection: %v", dryRun)
+	}
+	select {
+	case <-workers["retained-exited-old"]:
+		t.Fatal("dry run stopped a worker")
+	default:
+	}
+	removed, err := server.CollectGarbage(30*24*time.Hour, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(removed, want) {
+		t.Fatalf("unexpected removal: %v", removed)
+	}
+	select {
+	case <-workers["retained-exited-old"]:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leftover worker of the collected retained pane was not stopped")
+	}
+	for _, id := range []string{"retained-exited-recent", "retained-running-old"} {
+		select {
+		case <-workers[id]:
+			t.Fatalf("worker of protected pane %s was stopped", id)
+		default:
+		}
+	}
+	updated, err := loadStoredCatalog(server.catalogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range want {
+		if _, exists := updated.Panes[id]; exists {
+			t.Fatalf("%s was not collected", id)
+		}
+	}
+	for _, id := range []string{"retained-exited-recent", "retained-running-old", "retained-stale-old", "retained-missing-old"} {
+		if pane, exists := updated.Panes[id]; !exists || !pane.Retained {
+			t.Fatalf("protected retained pane %s was collected", id)
+		}
 	}
 }

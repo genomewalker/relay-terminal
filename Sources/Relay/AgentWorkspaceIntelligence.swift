@@ -39,7 +39,8 @@ enum AgentInboxEventKind: String, Codable, CaseIterable, Sendable {
 
     var color: Color {
         switch self {
-        case .attention, .failure: RelayTheme.coral
+        case .attention: RelayTheme.coral
+        case .failure: RelayTheme.red
         case .completion: RelayTheme.mint
         case .peer: RelayTheme.blue
         case .artifact, .session: RelayTheme.textMuted
@@ -67,6 +68,8 @@ struct AgentInboxItem: Identifiable, Codable, Equatable, Sendable {
     let fromPeerID: String?
     let toPeerID: String?
     var isProgramReported: Bool? = nil
+    /// Set when the event marks its pane and may raise a banner.
+    var alert: RelayAttentionAlert? = nil
 }
 
 struct AgentInboxEvent: Sendable {
@@ -82,6 +85,7 @@ struct AgentInboxEvent: Sendable {
     let occurredAt: Date
     let fromPeerID: String?
     let toPeerID: String?
+    let alert: RelayAttentionAlert?
 
     init(
         paneID: UUID,
@@ -95,8 +99,10 @@ struct AgentInboxEvent: Sendable {
         fromPeerID: String? = nil,
         toPeerID: String? = nil,
         sourceID: String? = nil,
-        isProgramReported: Bool = false
+        isProgramReported: Bool = false,
+        alert: RelayAttentionAlert? = nil
     ) {
+        self.alert = alert
         self.sourceID = sourceID
         self.isProgramReported = isProgramReported
         self.paneID = paneID
@@ -153,6 +159,13 @@ final class AgentIntelligenceStore: ObservableObject {
         var unread = 0
         var attention = 0
         var coordination = 0
+        /// Each pane's most urgent unread alert.
+        var markers: [UUID: RelayAttentionAlert] = [:]
+        /// Each pane's sidebar inbox row: its unread item that comes first in
+        /// inbox order, the newest by event time among equals. Independent
+        /// of the marker, so a pane waiting on the user is listed as waiting
+        /// even when an older error decides its marker.
+        var inboxItems: [UUID: AgentInboxItem] = [:]
     }
     private var cachedCounts: InboxCounts?
     @Published private var publicationRevision: UInt64 = 0
@@ -170,6 +183,28 @@ final class AgentIntelligenceStore: ObservableObject {
     /// Count unresolved agent conversations, not accumulated event rows.
     var attentionCount: Int { inboxCounts.attention }
     var coordinationCount: Int { inboxCounts.coordination }
+    /// Panes with an unread needs-input or reported-error alert.
+    var panesNeedingUser: Int { inboxCounts.markers.values.filter(\.needsUser).count }
+    /// The same, counting only panes `including` accepts.
+    func panesNeedingUser(including: (UUID) -> Bool) -> Int {
+        inboxCounts.markers.filter { $0.value.needsUser && including($0.key) }.count
+    }
+    func marker(for paneID: UUID) -> RelayAttentionAlert? { inboxCounts.markers[paneID] }
+    /// One row per pane with an unread alert for the sidebar inbox: panes
+    /// waiting on the user first, then errors, failed tools and finished
+    /// work; newest event first within each.
+    var attentionPanes: [AgentInboxItem] {
+        inboxCounts.inboxItems.values.sorted { a, b in
+            let rankA = a.alert?.inboxRank ?? .max, rankB = b.alert?.inboxRank ?? .max
+            return rankA != rankB ? rankA < rankB : a.occurredAt > b.occurredAt
+        }
+    }
+
+    /// Decides, once per new item, whether the user is already looking at its
+    /// pane (the item is then read) and raises any banner. Set by the notifier.
+    var onRecord: ((AgentInboxItem) -> Bool)?
+    /// Runs after each batched publication; the notifier updates the Dock badge.
+    var onPublish: (() -> Void)?
 
     // Workspace badges read these getters several times per view update.
     // Scan once after an item mutation, then reuse the counts until the next
@@ -182,6 +217,18 @@ final class AgentIntelligenceStore: ObservableObject {
             if item.kind == .peer { counts.coordination += 1 }
             guard !item.isRead else { continue }
             counts.unread += 1
+            if let alert = item.alert, counts.markers[item.paneID].map({ alert.rank < $0.rank }) ?? true {
+                counts.markers[item.paneID] = alert
+            }
+            if let alert = item.alert {
+                // Items arrive in delivery order, which a reconnect can make
+                // older than their events; compare event times.
+                let replaces = counts.inboxItems[item.paneID].map { current in
+                    let rank = current.alert?.inboxRank ?? .max
+                    return alert.inboxRank < rank || (alert.inboxRank == rank && item.occurredAt > current.occurredAt)
+                } ?? true
+                if replaces { counts.inboxItems[item.paneID] = item }
+            }
             if item.kind == .attention || item.kind == .failure {
                 attention.insert(AttentionIdentity(paneID: item.paneID, agentID: item.agentID ?? "pane"))
             }
@@ -213,7 +260,7 @@ final class AgentIntelligenceStore: ObservableObject {
     func record(_ event: AgentInboxEvent) -> String {
         let eventID = Self.identity(for: event)
         guard itemIDs.insert(eventID).inserted else { return eventID }
-        let item = AgentInboxItem(
+        var item = AgentInboxItem(
             id: eventID,
             paneID: event.paneID,
             host: Self.clean(event.host, limit: 120),
@@ -227,8 +274,10 @@ final class AgentIntelligenceStore: ObservableObject {
             summarySource: .exact,
             fromPeerID: event.fromPeerID.map { Self.clean($0, limit: 240) },
             toPeerID: event.toPeerID.map { Self.clean($0, limit: 240) },
-            isProgramReported: event.isProgramReported ? true : nil
+            isProgramReported: event.isProgramReported ? true : nil,
+            alert: event.alert
         )
+        if onRecord?(item) == true { item.isRead = true }
         items.insert(item, at: 0)
         prune()
         schedulePublication()
@@ -240,6 +289,14 @@ final class AgentIntelligenceStore: ObservableObject {
     func markRead(_ id: String) {
         guard let index = items.firstIndex(where: { $0.id == id }), !items[index].isRead else { return }
         items[index].isRead = true
+        schedulePublication()
+        schedulePersistence()
+    }
+
+    /// Looking at a pane reads its items, clearing its marker.
+    func markPaneRead(_ paneID: UUID) {
+        guard items.contains(where: { $0.paneID == paneID && !$0.isRead }) else { return }
+        for index in items.indices where items[index].paneID == paneID { items[index].isRead = true }
         schedulePublication()
         schedulePersistence()
     }
@@ -338,6 +395,7 @@ final class AgentIntelligenceStore: ObservableObject {
             guard let self, !Task.isCancelled else { return }
             self.publicationTask = nil
             self.publicationRevision &+= 1
+            self.onPublish?()
         }
     }
 

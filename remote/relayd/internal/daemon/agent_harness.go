@@ -153,6 +153,13 @@ func classifyHarnessProcess(command, arguments string) string {
 	if provider := harnessCommandName(command); provider != "" {
 		return provider
 	}
+	// The native Claude updater stores executables under their version name.
+	// An exact pinned exec then has comm=2.1.301 while argv[0] remains claude.
+	// This identifies a candidate only; the native binding still verifies its
+	// process incarnation, ancestry and provider conversation independently.
+	if versionNamedClaudeProcess(command, arguments) {
+		return "claude"
+	}
 	if !harnessInterpreter(command) {
 		return ""
 	}
@@ -209,4 +216,26 @@ func classifyHarnessProcess(command, arguments string) string {
 		return ""
 	}
 	return ""
+}
+
+func versionNamedClaudeProcess(command, arguments string) bool {
+	parts := strings.Split(command, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return false
+			}
+		}
+	}
+	if strings.Contains(arguments, "\x00") {
+		return strings.SplitN(arguments, "\x00", 2)[0] == "claude"
+	}
+	args := strings.Fields(arguments)
+	return len(args) > 0 && args[0] == "claude"
 }

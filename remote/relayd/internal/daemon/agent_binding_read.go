@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -57,7 +58,7 @@ func RetainedClaudeSession(pane string) (string, error) {
 		record.Version != 1 || record.Producer.PaneID != pane || record.Producer.Provider != "claude" ||
 		!validSessionID.MatchString(record.SessionID) || record.ObservedAt.IsZero() ||
 		record.ObservedAt.After(time.Now().Add(time.Minute)) ||
-		validateBindingTranscript(record.TranscriptPath, "claude") != nil {
+		validateAccountTranscript(record.TranscriptPath, "claude", record.Producer.ConfigDir) != nil {
 		return "", errors.New("invalid retained conversation")
 	}
 	return record.SessionID, nil
@@ -128,7 +129,7 @@ func readStoredVerifiedAgentBinding(pane string) (AgentBindingRecord, error) {
 		record.ObservedAt.IsZero() || record.ObservedAt.After(time.Now().Add(time.Minute)) {
 		return record, errors.New("invalid binding record")
 	}
-	if err := validateBindingTranscript(record.TranscriptPath, p.Provider); err != nil {
+	if err := validateAccountTranscript(record.TranscriptPath, p.Provider, p.ConfigDir); err != nil {
 		return record, err
 	}
 	if bootstrap, e := server.readPromptBootstrapOwner(pane); e == nil && bootstrap.Producer.ProcessID == p.ProcessID &&
@@ -208,10 +209,9 @@ func ReadVerifiedAgentBinding(pane string) (AgentBindingRecord, error) {
 		// The native Claude reader owns its bounded unavailability reason.
 		return AgentBindingRecord{}, claudeErr
 	}
-	if err != nil {
-		return AgentBindingRecord{}, nativeErr
-	}
-	return AgentBindingRecord{}, nativeErr
+	// Neither provider owns the pane: report both, not only the Codex probe,
+	// so a Claude pane is never described as a missing Codex frontend.
+	return AgentBindingRecord{}, fmt.Errorf("no verified agent frontend (codex: %v; claude: %v)", nativeErr, claudeErr)
 }
 
 // ReadNativeAgentBinding observes the original live frontend, bypassing stored

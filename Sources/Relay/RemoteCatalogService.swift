@@ -15,6 +15,9 @@ struct RemoteCatalogPane: Decodable, Identifiable, Sendable {
     let lastSequence: UInt64
     let recoverable: Bool
     let unfiled: Bool
+    /// Carried over by a relayd upgrade; relayd's own garbage collection skips it.
+    var retained: Bool? = nil
+    var updatedAt: String? = nil
 
     var id: String { paneID }
 
@@ -29,7 +32,8 @@ struct RemoteCatalogPane: Decodable, Identifiable, Sendable {
         case workerPID = "worker_pid"
         case shellPID = "shell_pid"
         case lastSequence = "last_sequence"
-        case recoverable, unfiled
+        case recoverable, unfiled, retained
+        case updatedAt = "updated_at"
     }
 }
 
@@ -128,6 +132,32 @@ enum RemotePaneControlService {
                 arguments: ["terminate", "--session", paneID.uuidString.lowercased(), "--forget"]))
         guard captured.exitCode == 0 else {
             throw RemoteCatalogError.failed(String(data: captured.stderr, encoding: .utf8) ?? "Could not terminate the remote pane")
+        }
+    }
+
+    /// Removes the record of a pane whose worker is no longer valid.
+    /// relayd refuses while the pane's worker is still alive.
+    static func forget(profile: ConnectionProfile, paneID: UUID) async throws {
+        let captured = try await RelayHostExecution.capture(profile: profile,
+            command: RelayHostExecution.daemonCommand(profile: profile,
+                arguments: ["forget", "--session", paneID.uuidString.lowercased()]))
+        guard captured.exitCode == 0 else {
+            throw RemoteCatalogError.failed(String(data: captured.stderr, encoding: .utf8) ?? "Could not remove the pane record")
+        }
+    }
+
+    /// Clears one dead pane by exact ID: stops a leftover worker relayd still
+    /// validates, then removes the record. Works for upgrade-retained panes.
+    static func clear(profile: ConnectionProfile, paneID: UUID, workerValid: Bool,
+                      pause: @Sendable () async -> Void = { try? await Task.sleep(for: .seconds(1)) }) async throws {
+        guard workerValid else { return try await forget(profile: profile, paneID: paneID) }
+        do {
+            try await terminate(profile: profile, paneID: paneID)
+        } catch RemoteCatalogError.failed {
+            // The worker may still be exiting after the signal, or may have
+            // exited before it. relayd's forget refuses while it is alive.
+            await pause()
+            try await forget(profile: profile, paneID: paneID)
         }
     }
 }

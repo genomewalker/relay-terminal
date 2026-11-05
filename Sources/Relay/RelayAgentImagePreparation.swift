@@ -8,11 +8,8 @@ actor RelayAgentImagePreparation {
     static let shared = RelayAgentImagePreparation()
 
     func prepare(_ snapshot: RelayAgentAttachmentSnapshot.Record, directory: URL) throws -> RelayAgentAttachmentSnapshot.Record? {
-        let bytes = try snapshot.verifiedData()
-        guard let source = CGImageSourceCreateWithData(bytes as CFData,
-                [kCGImageSourceShouldCache: false] as CFDictionary),
-              let identifier = CGImageSourceGetType(source),
-              let type = UTType(identifier as String) else {
+        return try RelayAttachmentImageSource.read(snapshot) { source in
+        guard let identifier = CGImageSourceGetType(source), let type = UTType(identifier as String) else {
             throw RemoteFileTransferError.failed("This image could not be decoded. Export it as PNG or JPEG and attach it again.")
         }
         if [UTType.png, .jpeg, .gif, .webP].contains(type) { return nil }
@@ -30,7 +27,7 @@ actor RelayAgentImagePreparation {
             throw RelayAgentAttachmentSnapshot.Failure.unsuitable
         }
         CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination), Int64(data.length) <= RemoteFileTransfer.maximumBytes else {
+        guard CGImageDestinationFinalize(destination) else {
             throw RelayAgentAttachmentSnapshot.Failure.tooLarge
         }
         try Task.checkCancellation()
@@ -39,5 +36,6 @@ actor RelayAgentImagePreparation {
         try (data as Data).write(to: temporary, options: [.atomic])
         SecureFiles.restrictToOwner(temporary)
         return try RelayAgentAttachmentSnapshot.capture(temporary, directory: directory)
+        }
     }
 }

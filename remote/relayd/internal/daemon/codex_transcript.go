@@ -295,9 +295,29 @@ func uniqueOpenProviderTranscript(pid int, provider, directory string, requireRo
 	seen := make(map[string]bool)
 	selected := ""
 	marker := string(filepath.Separator) + provider + string(filepath.Separator) + directory + string(filepath.Separator)
+	// A process on a non-default account (CLAUDE_CONFIG_DIR or CODEX_HOME)
+	// matches only below its own account directory, by logical or real path.
+	var prefixes []string
+	if override, err := agentConfigOverride(pid, strings.TrimPrefix(provider, ".")); err == nil && override != "" {
+		prefixes = append(prefixes, filepath.Join(override, directory)+string(filepath.Separator))
+		if real, err := filepath.EvalSymlinks(override); err == nil && real != override {
+			prefixes = append(prefixes, filepath.Join(real, directory)+string(filepath.Separator))
+		}
+	}
+	inNamespace := func(target string) bool {
+		if prefixes == nil {
+			return strings.Contains(target, marker)
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(target, prefix) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, entry := range entries {
 		target, readErr := os.Readlink(filepath.Join(fdDirectory, entry.Name()))
-		if readErr != nil || seen[target] || !strings.HasSuffix(target, ".jsonl") || !strings.Contains(target, marker) {
+		if readErr != nil || seen[target] || !strings.HasSuffix(target, ".jsonl") || !inNamespace(target) {
 			continue
 		}
 		seen[target] = true

@@ -1,0 +1,7390 @@
+[
+  {
+    "mask": 0,
+    "name": "0",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 1,
+    "name": "1",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "config/mcpServer/reload",
+        "params": {}
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": true,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 2,
+    "name": "2",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": [
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 3,
+    "name": "3",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 4,
+    "name": "4",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 5,
+    "name": "5",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 6,
+    "name": "6",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": [
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 7,
+    "name": "7",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 8,
+    "name": "8",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 2,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 9,
+    "name": "9",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 10,
+    "name": "10",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": [
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        },
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 11,
+    "name": "11",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 12,
+    "name": "12",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 2,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 13,
+    "name": "13",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 14,
+    "name": "14",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": [
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        },
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 15,
+    "name": "15",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 16,
+    "name": "16",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 17,
+    "name": "17",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 18,
+    "name": "18",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": [
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 19,
+    "name": "19",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 20,
+    "name": "20",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 21,
+    "name": "21",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 22,
+    "name": "22",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": [
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 23,
+    "name": "23",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 24,
+    "name": "24",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 2,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 25,
+    "name": "25",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 26,
+    "name": "26",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": [
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        },
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 27,
+    "name": "27",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 28,
+    "name": "28",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 2,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": "ready",
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 29,
+    "name": "29",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 30,
+    "name": "30",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": [
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        },
+        {
+          "id": "thread",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 31,
+    "name": "31",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 32,
+    "name": "32",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 33,
+    "name": "33",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 34,
+    "name": "34",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": [
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 35,
+    "name": "35",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 36,
+    "name": "36",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 37,
+    "name": "37",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 38,
+    "name": "38",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": [
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 39,
+    "name": "39",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 40,
+    "name": "40",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 41,
+    "name": "41",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 42,
+    "name": "42",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": [
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        },
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 43,
+    "name": "43",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 44,
+    "name": "44",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 45,
+    "name": "45",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 46,
+    "name": "46",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": [
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        },
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "idle"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 47,
+    "name": "47",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 48,
+    "name": "48",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 49,
+    "name": "49",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 50,
+    "name": "50",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": [
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 51,
+    "name": "51",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 52,
+    "name": "52",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 53,
+    "name": "53",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 54,
+    "name": "54",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": [
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 55,
+    "name": "55",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 56,
+    "name": "56",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 57,
+    "name": "57",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 58,
+    "name": "58",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": [
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        },
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 59,
+    "name": "59",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 60,
+    "name": "60",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 61,
+    "name": "61",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 62,
+    "name": "62",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": [
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        },
+        {
+          "id": "different",
+          "session_id": null,
+          "cwd": "/work",
+          "status": {
+            "type": "active"
+          },
+          "forked_from": null
+        }
+      ]
+    }
+  },
+  {
+    "mask": 63,
+    "name": "63",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 64,
+    "name": "64",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 65,
+    "name": "65",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 66,
+    "name": "66",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 67,
+    "name": "67",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 68,
+    "name": "68",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 69,
+    "name": "69",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 70,
+    "name": "70",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 71,
+    "name": "71",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 72,
+    "name": "72",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 73,
+    "name": "73",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 74,
+    "name": "74",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 75,
+    "name": "75",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 76,
+    "name": "76",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 77,
+    "name": "77",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 78,
+    "name": "78",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 79,
+    "name": "79",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 80,
+    "name": "80",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 81,
+    "name": "81",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 82,
+    "name": "82",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 83,
+    "name": "83",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 84,
+    "name": "84",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 85,
+    "name": "85",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 86,
+    "name": "86",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 87,
+    "name": "87",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 88,
+    "name": "88",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 89,
+    "name": "89",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 90,
+    "name": "90",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 91,
+    "name": "91",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 92,
+    "name": "92",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 93,
+    "name": "93",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 94,
+    "name": "94",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 95,
+    "name": "95",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 96,
+    "name": "96",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 97,
+    "name": "97",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 98,
+    "name": "98",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 99,
+    "name": "99",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 100,
+    "name": "100",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 101,
+    "name": "101",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 102,
+    "name": "102",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 103,
+    "name": "103",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 104,
+    "name": "104",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 105,
+    "name": "105",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 106,
+    "name": "106",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 107,
+    "name": "107",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 108,
+    "name": "108",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 109,
+    "name": "109",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 110,
+    "name": "110",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 111,
+    "name": "111",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 112,
+    "name": "112",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 113,
+    "name": "113",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 114,
+    "name": "114",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 115,
+    "name": "115",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 116,
+    "name": "116",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 117,
+    "name": "117",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 118,
+    "name": "118",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 1,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 119,
+    "name": "119",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 120,
+    "name": "120",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 121,
+    "name": "121",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 122,
+    "name": "122",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 123,
+    "name": "123",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 124,
+    "name": "124",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 125,
+    "name": "125",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 126,
+    "name": "126",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "other",
+          "includeTurns": false
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 2,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 127,
+    "name": "127",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 128,
+    "name": "128",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 129,
+    "name": "129",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 130,
+    "name": "130",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 131,
+    "name": "131",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 132,
+    "name": "132",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 133,
+    "name": "133",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 134,
+    "name": "134",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 135,
+    "name": "135",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 136,
+    "name": "136",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 137,
+    "name": "137",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 138,
+    "name": "138",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 139,
+    "name": "139",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 140,
+    "name": "140",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 141,
+    "name": "141",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 142,
+    "name": "142",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 143,
+    "name": "143",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 144,
+    "name": "144",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 145,
+    "name": "145",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 146,
+    "name": "146",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 147,
+    "name": "147",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 148,
+    "name": "148",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 149,
+    "name": "149",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 150,
+    "name": "150",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 151,
+    "name": "151",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 152,
+    "name": "152",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 153,
+    "name": "153",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 154,
+    "name": "154",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 155,
+    "name": "155",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 156,
+    "name": "156",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 157,
+    "name": "157",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 158,
+    "name": "158",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 159,
+    "name": "159",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 160,
+    "name": "160",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 161,
+    "name": "161",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 162,
+    "name": "162",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 163,
+    "name": "163",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 164,
+    "name": "164",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 165,
+    "name": "165",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 166,
+    "name": "166",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 167,
+    "name": "167",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 168,
+    "name": "168",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 169,
+    "name": "169",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 170,
+    "name": "170",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 171,
+    "name": "171",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 172,
+    "name": "172",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 173,
+    "name": "173",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 174,
+    "name": "174",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 175,
+    "name": "175",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 176,
+    "name": "176",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 177,
+    "name": "177",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 178,
+    "name": "178",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 179,
+    "name": "179",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 180,
+    "name": "180",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 181,
+    "name": "181",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 182,
+    "name": "182",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 183,
+    "name": "183",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 184,
+    "name": "184",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 185,
+    "name": "185",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 186,
+    "name": "186",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 187,
+    "name": "187",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 188,
+    "name": "188",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 189,
+    "name": "189",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 190,
+    "name": "190",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 191,
+    "name": "191",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 192,
+    "name": "192",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 193,
+    "name": "193",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 194,
+    "name": "194",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 195,
+    "name": "195",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 196,
+    "name": "196",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 197,
+    "name": "197",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 198,
+    "name": "198",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 199,
+    "name": "199",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 200,
+    "name": "200",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 201,
+    "name": "201",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 202,
+    "name": "202",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 203,
+    "name": "203",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 204,
+    "name": "204",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 205,
+    "name": "205",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 206,
+    "name": "206",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 207,
+    "name": "207",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 208,
+    "name": "208",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 209,
+    "name": "209",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 210,
+    "name": "210",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 211,
+    "name": "211",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 212,
+    "name": "212",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 213,
+    "name": "213",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 214,
+    "name": "214",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 215,
+    "name": "215",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 216,
+    "name": "216",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 217,
+    "name": "217",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 218,
+    "name": "218",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 219,
+    "name": "219",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 220,
+    "name": "220",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 221,
+    "name": "221",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 222,
+    "name": "222",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 223,
+    "name": "223",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 224,
+    "name": "224",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 225,
+    "name": "225",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 226,
+    "name": "226",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 227,
+    "name": "227",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 228,
+    "name": "228",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 229,
+    "name": "229",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 230,
+    "name": "230",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 231,
+    "name": "231",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 232,
+    "name": "232",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 233,
+    "name": "233",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 234,
+    "name": "234",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 235,
+    "name": "235",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 236,
+    "name": "236",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 237,
+    "name": "237",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 238,
+    "name": "238",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 239,
+    "name": "239",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 240,
+    "name": "240",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 241,
+    "name": "241",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 242,
+    "name": "242",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 243,
+    "name": "243",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 244,
+    "name": "244",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 245,
+    "name": "245",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 246,
+    "name": "246",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 247,
+    "name": "247",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 248,
+    "name": "248",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 249,
+    "name": "249",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 250,
+    "name": "250",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 251,
+    "name": "251",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 252,
+    "name": "252",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 253,
+    "name": "253",
+    "overrides": {},
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 254,
+    "name": "254",
+    "overrides": {},
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": {
+      "loaded_count": 0,
+      "matching_directory_threads": []
+    }
+  },
+  {
+    "mask": 255,
+    "name": "255",
+    "overrides": {},
+    "error": "SystemExit",
+    "calls": [],
+    "closed": false,
+    "result": null
+  },
+  {
+    "mask": 0,
+    "name": "loaded-null",
+    "overrides": {
+      "thread/loaded/list": {
+        "data": null
+      }
+    },
+    "error": "TypeError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 0,
+    "name": "status-null",
+    "overrides": {
+      "mcpServerStatus/list": {
+        "data": null
+      }
+    },
+    "error": "TypeError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 0,
+    "name": "tools-null",
+    "overrides": {
+      "mcpServerStatus/list": {
+        "data": [
+          {
+            "name": "relayDesktopR",
+            "tools": null
+          }
+        ]
+      }
+    },
+    "error": "TypeError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 0,
+    "name": "loaded-missing",
+    "overrides": {
+      "thread/loaded/list": {}
+    },
+    "error": "ValueError",
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      }
+    ],
+    "closed": true,
+    "result": null
+  },
+  {
+    "mask": 0,
+    "name": "status-missing",
+    "overrides": {
+      "mcpServerStatus/list": {}
+    },
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": false,
+      "servers": [],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 0,
+    "name": "tools-missing",
+    "overrides": {
+      "mcpServerStatus/list": {
+        "data": [
+          {
+            "name": "relayDesktopR"
+          }
+        ]
+      }
+    },
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": null,
+          "tool_count": 0,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 0,
+    "name": "tools-list",
+    "overrides": {
+      "mcpServerStatus/list": {
+        "data": [
+          {
+            "name": "relayDesktopR",
+            "tools": [
+              "one"
+            ]
+          }
+        ]
+      }
+    },
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": null,
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  {
+    "mask": 0,
+    "name": "tools-string",
+    "overrides": {
+      "mcpServerStatus/list": {
+        "data": [
+          {
+            "name": "relayDesktopR",
+            "tools": "\u00e6"
+          }
+        ]
+      }
+    },
+    "error": null,
+    "calls": [
+      {
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "relay_mcp_health",
+            "version": "0.1"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      {
+        "method": "thread/loaded/list",
+        "params": {}
+      },
+      {
+        "method": "thread/read",
+        "params": {
+          "threadId": "thread",
+          "includeTurns": false
+        }
+      },
+      {
+        "method": "mcpServerStatus/list",
+        "params": {
+          "threadId": "thread",
+          "serverName": "relayDesktopR",
+          "limit": 100,
+          "detail": "toolsAndAuthOnly"
+        }
+      }
+    ],
+    "closed": true,
+    "result": {
+      "thread": "thread",
+      "loaded_count": 1,
+      "refresh_requested": false,
+      "servers": [
+        {
+          "name": "relayDesktopR",
+          "runtime_status": null,
+          "tool_count": 1,
+          "tools_error": null,
+          "auth_status": null
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+]

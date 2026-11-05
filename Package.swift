@@ -21,6 +21,7 @@ let package = Package(
             path: "Sources/Relay",
             resources: [
                 .copy("Resources/Editor"),
+                .copy("Resources/Fonts"),
                 .copy("Resources/SidePanel"),
                 .copy("Resources/Terminfo"),
                 .copy("Resources/Rotation"),
@@ -39,7 +40,8 @@ let package = Package(
         .testTarget(
             name: "RelayTests",
             dependencies: ["Relay"],
-            path: "Tests/RelayTests"
+            path: "Tests/RelayTests",
+            resources: [.copy("ShepherdSeeds")]
         )
     ]
 )

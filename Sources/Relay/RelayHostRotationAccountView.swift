@@ -63,7 +63,7 @@ struct RelayHostRotationAccountEditor: View {
         if account.provider == "anthropic_api" && validKey && validated.credentialReference == nil {
             validated.credentialReference = account.id
         }
-        return validated.valid ? nil : "Complete the account name, limits and login settings. An account in use needs a positive request limit."
+        return validated.valid ? nil : "Complete the account name, limits and login settings. API accounts can use 0 for no daily request cap; saved CLI accounts need a positive cap."
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -110,9 +110,13 @@ struct RelayHostRotationAccountEditor: View {
                 field("Daily spending limit ($)", text: $daily)
                 field("Monthly spending limit ($)", text: $monthly)
             }
-            field("Maximum requests per day", text: $requests)
             DisclosureGroup("Advanced account options") {
                 VStack(alignment: .leading, spacing: 8) {
+                    field("Daily request cap", text: $requests)
+                    Text(account.provider == "anthropic_api"
+                         ? "0 disables the daily request cap. Spending budgets and rate limits still apply."
+                         : "Saved CLI accounts require a positive daily request cap when enabled.")
+                        .font(.caption).foregroundStyle(.secondary)
                     if account.provider == "anthropic_api" {
                         field("Shared organization budget group", text: optional(\.billingGroup))
                         Text("Use the same group for keys in one organization. This host combines their tracked usage.")

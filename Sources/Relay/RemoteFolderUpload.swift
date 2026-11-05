@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 struct RemoteFolderRequest: Encodable, Sendable {
     let operation: String
@@ -98,7 +99,7 @@ actor RemoteFolderUpload {
                   saved.fingerprint == nil || saved.fingerprint!.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil,
                   saved.state == "prepared" || saved.remotePath != nil && saved.fingerprint != nil,
                   !saved.cleaned || saved.state == "committed",
-                  saved.snapshot.entries.count <= 1024, saved.snapshot.totalBytes >= 0, saved.snapshot.totalBytes <= 1 << 30,
+                  saved.snapshot.entries.count <= 1024, saved.snapshot.totalBytes >= 0,
                   RemoteFolderSource.digest(RemoteFolderSource.canonicalManifest(saved.snapshot.entries)) == saved.snapshot.manifestSHA256,
                   ["prepared", "receiving", "committing", "committed"].contains(saved.state),
                   saved.children.count <= saved.snapshot.entries.count, saved.children.allSatisfy({ progress in
@@ -136,7 +137,7 @@ actor RemoteFolderUpload {
     }
 
     private func acceptChild(_ receipt: RemoteFolderReceipt, entry: RemoteFolderEntry, file: FileHandle,
-                             tree: RemoteFolderSource, saved: inout RemoteFolderCheckpoint) throws -> RemoteFolderChildReceipt {
+                             tree: RemoteFolderSource, prefix: RelayTransferChecksum, saved: inout RemoteFolderCheckpoint) throws -> RemoteFolderChildReceipt {
         guard let child = receipt.child, RemoteFolderSource.exact(child.path, entry.path), child.size == entry.size,
               child.sha256 == entry.sha256, child.offset >= 0, child.offset <= child.size,
               ["pending", "receiving", "publishing", "committed"].contains(child.state),
@@ -148,7 +149,7 @@ actor RemoteFolderUpload {
         }
         let old = saved.children.first { RemoteFolderSource.exact($0.path, entry.path) }
         guard child.offset >= (old?.offset ?? 0), old?.committed != true || child.state == "committed",
-              try RemoteFolderSource.hash(file, count: child.offset) == child.prefixSHA256 else { throw RemoteFileTransferError.invalidResponse }
+              prefix.offset == child.offset, prefix.digest == child.prefixSHA256 else { throw RemoteFileTransferError.invalidResponse }
         try tree.checkFile(file, entry: entry, snapshot: saved.snapshot)
         try accept(receipt, saved: &saved)
         let progress = RemoteFolderProgress(path: entry.path, offset: child.offset, prefixSHA256: child.prefixSHA256, committed: child.state == "committed")
@@ -158,12 +159,14 @@ actor RemoteFolderUpload {
         return child
     }
 
-    func upload(resume: Bool, destination: String?, fetch: Fetch) async throws -> RemoteFileEntry {
+    func upload(resume: Bool, destination: String?, progress: RelayTransferProgressHandler? = nil, fetch: Fetch) async throws -> RemoteFileEntry {
         guard !running, !poisoned else { throw RemoteFileTransferError.failed("Folder upload is busy or must be reopened") }
         if checkpoint != nil, !resume { throw RemoteFileTransferError.recoveryAvailable }
         running = true; defer { running = false }
         let accessing = source.startAccessingSecurityScopedResource()
         defer { if accessing { source.stopAccessingSecurityScopedResource() } }
+        let name = source.lastPathComponent
+        await progress?(.init(phase: .preparing, name: name))
         let tree = try RemoteFolderSource(source: source)
         let snapshot = try tree.snapshot()
         let existing = checkpoint != nil
@@ -189,25 +192,32 @@ actor RemoteFolderUpload {
                 let file = try tree.openFile(entry, snapshot: saved.snapshot)
                 defer { try? file.close() }
                 var response = try await fetch(RemoteFolderRequest(operation: "file_folder_status", jobID: saved.jobID, child: entry.path))
-                var child = try acceptChild(response, entry: entry, file: file, tree: tree, saved: &saved)
+                guard let initial = response.child, initial.offset >= 0, initial.offset <= (entry.size ?? -1) else { throw RemoteFileTransferError.invalidResponse }
+                var prefix = RelayTransferChecksum()
+                try await prefix.advance(file, to: initial.offset)
+                var child = try acceptChild(response, entry: entry, file: file, tree: tree, prefix: prefix, saved: &saved)
+                await progress?(.init(phase: .uploading, name: name, completedBytes: saved.children.reduce(0) { $0 + $1.offset }, totalBytes: snapshot.totalBytes))
                 while ["pending", "receiving"].contains(child.state), child.offset < child.size {
                     try Task.checkCancellation(); try tree.checkFile(file, entry: entry, snapshot: saved.snapshot)
                     try file.seek(toOffset: UInt64(child.offset))
                     guard let bytes = try file.read(upToCount: Int(min(4 << 20, child.size - child.offset))), !bytes.isEmpty else { throw RemoteFileTransferError.invalidResponse }
                     try tree.checkFile(file, entry: entry, snapshot: saved.snapshot)
                     let expectedOffset = child.offset + Int64(bytes.count)
+                    prefix.append(bytes)
                     response = try await fetch(RemoteFolderRequest(operation: "file_folder_chunk", jobID: saved.jobID, child: entry.path, offset: child.offset, data: bytes))
-                    child = try acceptChild(response, entry: entry, file: file, tree: tree, saved: &saved)
+                    child = try acceptChild(response, entry: entry, file: file, tree: tree, prefix: prefix, saved: &saved)
                     guard child.offset == expectedOffset else { throw RemoteFileTransferError.invalidResponse }
+                    await progress?(.init(phase: .uploading, name: name, completedBytes: saved.children.reduce(0) { $0 + $1.offset }, totalBytes: snapshot.totalBytes))
                 }
                 if child.state != "committed" {
                     try Task.checkCancellation(); try tree.checkFile(file, entry: entry, snapshot: saved.snapshot)
                     response = try await fetch(RemoteFolderRequest(operation: "file_folder_file_commit", jobID: saved.jobID, child: entry.path))
-                    child = try acceptChild(response, entry: entry, file: file, tree: tree, saved: &saved)
+                    child = try acceptChild(response, entry: entry, file: file, tree: tree, prefix: prefix, saved: &saved)
                 }
                 guard child.state == "committed" else { throw RemoteFileTransferError.invalidResponse }
             }
         }
+        await progress?(.init(phase: .verifying, name: name, completedBytes: snapshot.totalBytes, totalBytes: snapshot.totalBytes))
         let finalSnapshot = try tree.snapshot()
         guard finalSnapshot.sourceVersion == saved.snapshot.sourceVersion, finalSnapshot.manifestSHA256 == saved.snapshot.manifestSHA256 else {
             throw RemoteFileTransferError.failed("Folder source changed; forget the saved upload before starting again")
@@ -223,6 +233,7 @@ actor RemoteFolderUpload {
             try accept(cleanup, saved: &saved)
             saved.cleaned = true; try save(saved)
         }
+        await progress?(.init(phase: .complete, name: name, completedBytes: snapshot.totalBytes, totalBytes: snapshot.totalBytes))
         return RemoteFileEntry(name: saved.name, path: path, directory: true, symbolicLink: false, size: saved.snapshot.totalBytes, modificationNS: 0)
     }
 

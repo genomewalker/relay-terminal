@@ -69,7 +69,8 @@ enum ProcessCapture {
         input: Data? = nil,
         timeout: TimeInterval = 30,
         maximumBytesPerStream: Int = 64 << 20,
-        shouldCancel: (@Sendable () -> Bool)? = nil
+        shouldCancel: (@Sendable () -> Bool)? = nil,
+        readerQueue: DispatchQueue? = nil
     ) throws -> CapturedProcessOutput {
         precondition(maximumBytesPerStream > 0)
         let capturedOutput = LockedData()
@@ -77,6 +78,15 @@ enum ProcessCapture {
         let failure = CaptureFailure()
         let readers = DispatchGroup()
         try process.run()
+        let deadline = DispatchTime.now() + timeout
+        // Private descriptors for asking whether every writer has gone; the
+        // readers may close their handles while this thread still probes.
+        let outputProbe = dup(output.fileHandleForReading.fileDescriptor)
+        let errorsProbe = dup(errors.fileHandleForReading.fileDescriptor)
+        defer {
+            if outputProbe >= 0 { close(outputProbe) }
+            if errorsProbe >= 0 { close(errorsProbe) }
+        }
         let cancellationTimer = shouldCancel.map { check in
             let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
             timer.schedule(deadline: .now(), repeating: .milliseconds(100))
@@ -90,8 +100,16 @@ enum ProcessCapture {
             return timer
         }
         defer { cancellationTimer?.cancel() }
+        // The caller blocks until the readers finish, so they must not wait for
+        // a thread from the shared pool that blocked callers may have filled.
+        func startReader(_ body: @escaping @Sendable () -> Void) {
+            if let readerQueue { readerQueue.async(execute: body); return }
+            let thread = Thread(block: body)
+            thread.qualityOfService = .utility
+            thread.start()
+        }
         readers.enter()
-        DispatchQueue.global(qos: .utility).async {
+        startReader {
             read(
                 output.fileHandleForReading,
                 into: capturedOutput,
@@ -102,7 +120,7 @@ enum ProcessCapture {
             readers.leave()
         }
         readers.enter()
-        DispatchQueue.global(qos: .utility).async {
+        startReader {
             read(
                 errors.fileHandleForReading,
                 into: capturedErrors,
@@ -143,7 +161,12 @@ enum ProcessCapture {
         // their in-flight reads (FileHandle is not safe for concurrent
         // read/close, and a freed descriptor number could be reused). The
         // locked buffers remain safe if a reader finishes after this returns.
-        if readers.wait(timeout: .now() + .seconds(1)) == .timedOut {
+        // A reader that has not been scheduled yet is not stuck: once no
+        // writer holds either pipe, EOF is certain, so keep waiting for it
+        // within the command's own deadline.
+        if readers.wait(timeout: .now() + .seconds(1)) == .timedOut,
+           !(writersClosed(outputProbe) && writersClosed(errorsProbe)
+               && readers.wait(timeout: deadline) == .success) {
             failure.record(.readFailed("Timed out while draining subprocess output streams."))
         }
         if let failure = failure.value { throw failure }
@@ -151,6 +174,23 @@ enum ProcessCapture {
             standardOutput: capturedOutput.value,
             standardError: capturedErrors.value
         )
+    }
+
+    /// True when the pipe read through `descriptor` has no writer left, so a
+    /// reader is guaranteed to reach EOF after the buffered bytes.
+    private static func writersClosed(_ descriptor: Int32) -> Bool {
+        guard descriptor >= 0 else { return false }
+        let queue = kqueue()
+        guard queue >= 0 else { return false }
+        defer { close(queue) }
+        var change = kevent(
+            ident: UInt(descriptor), filter: Int16(EVFILT_READ),
+            flags: UInt16(EV_ADD | EV_ONESHOT), fflags: 0, data: 0, udata: nil
+        )
+        var event = kevent()
+        var immediately = timespec(tv_sec: 0, tv_nsec: 0)
+        guard kevent(queue, &change, 1, &event, 1, &immediately) == 1 else { return false }
+        return event.flags & UInt16(EV_EOF) != 0
     }
 
     private static func read(

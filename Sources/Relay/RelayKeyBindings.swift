@@ -6,6 +6,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
     case newTab
     case newLocalSession
     case findHost
+    case quickNavigate
     case connectHost
     case openEditor
     case zoomPane
@@ -24,6 +25,16 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
     case nextTab
     case toggleSidebar
     case agentActivity
+    case workspaceOverview
+    case workspaceBack
+    case workspaceForward
+    case workspaceUp
+    case stackPane
+    case unstackPane
+    case previousStackPane
+    case nextStackPane
+    case saveWorkspaceView
+    case openWorkspaceView
 
     var id: String { rawValue }
 
@@ -31,6 +42,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .newTab: "New tab in session"
         case .newLocalSession: "New local session"
+        case .quickNavigate: "Work overview"
         case .findHost: "Find SSH host"
         case .connectHost: "Connect to host"
         case .openEditor: "Open remote editor"
@@ -50,17 +62,30 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .nextTab: "Next tab"
         case .toggleSidebar: "Show or hide navigator"
         case .agentActivity: "Show or hide agent activity"
+        case .workspaceOverview: "All workspaces"
+        case .workspaceBack: "Back in workspace"
+        case .workspaceForward: "Forward in workspace"
+        case .workspaceUp: "Parent workspace"
+        case .stackPane: "Stack active pane with…"
+        case .unstackPane: "Unstack active pane"
+        case .previousStackPane: "Previous pane in stack"
+        case .nextStackPane: "Next pane in stack"
+        case .saveWorkspaceView: "Save current view"
+        case .openWorkspaceView: "Open saved view"
         }
     }
 
     var section: String {
         switch self {
-        case .newTab, .newLocalSession, .findHost, .connectHost: "Sessions"
+        case .newTab, .newLocalSession, .findHost, .quickNavigate, .connectHost: "Sessions"
         case .previousTab, .nextTab: "Tabs"
         case .openEditor, .zoomPane, .floatPane, .balancePanes, .splitRight,
              .splitDown, .newFloatingPane, .previousPane, .nextPane,
              .previousPrompt, .nextPrompt, .closePane, .reopenClosedPane: "Panes"
         case .toggleSidebar, .agentActivity: "Workspace"
+        case .workspaceOverview, .workspaceBack, .workspaceForward, .workspaceUp,
+             .saveWorkspaceView, .openWorkspaceView: "Workspace"
+        case .stackPane, .unstackPane, .previousStackPane, .nextStackPane: "Panes"
         }
     }
 
@@ -68,6 +93,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .newTab: .init("t", command: true)
         case .newLocalSession: .init("n", command: true, option: true)
+        case .quickNavigate: .init("p", command: true, shift: true)
         case .findHost: .init("k", command: true)
         case .connectHost: .init("n", command: true, shift: true)
         case .openEditor: .init("e", command: true, shift: true)
@@ -87,6 +113,16 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .nextTab: .init("]", command: true, shift: true)
         case .toggleSidebar: .init("s", command: true, control: true)
         case .agentActivity: .init("i", command: true, option: true)
+        case .workspaceOverview: .init("o", command: true, control: true)
+        case .workspaceBack: .init("left", command: true, control: true)
+        case .workspaceForward: .init("right", command: true, control: true)
+        case .workspaceUp: .init("up", command: true, control: true)
+        case .stackPane: .init("g", command: true, control: true)
+        case .unstackPane: .init("u", command: true, control: true)
+        case .previousStackPane: .init("[", command: true, control: true)
+        case .nextStackPane: .init("]", command: true, control: true)
+        case .saveWorkspaceView: .init("s", command: true, control: true, shift: true)
+        case .openWorkspaceView: .init("o", command: true, control: true, shift: true)
         }
     }
 }

@@ -175,10 +175,31 @@ func ObserveRuntime(ctx context.Context, connection net.Conn, origin string) (Ru
 			matches = append(matches, row)
 		}
 	}
-	if len(matches) != 1 || matches[0].Status != "connected" {
-		return empty, errors.New("native frontend has no unique connected runtime thread")
+	readPath := func(id string) (string, error) {
+		var read struct {
+			Thread struct {
+				ID   string `json:"id"`
+				Path string `json:"path"`
+			} `json:"thread"`
+		}
+		if err := rpc("thread/read", map[string]any{"threadId": id, "includeTurns": false}, &read); err != nil {
+			return "", err
+		}
+		if read.Thread.ID != id || read.Thread.Path == "" {
+			return "", errors.New("native thread transcript metadata unavailable")
+		}
+		return read.Thread.Path, nil
 	}
-	selected := matches[0].ThreadID
+	selected, err := selectPrimaryThread(matches, func(id string) (string, error) {
+		path, err := readPath(id)
+		if err != nil {
+			return "", err
+		}
+		return threadSpawnParent(path, id)
+	})
+	if err != nil {
+		return empty, err
+	}
 	var read struct {
 		Thread struct {
 			ID   string `json:"id"`

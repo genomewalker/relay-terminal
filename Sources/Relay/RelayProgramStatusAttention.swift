@@ -14,17 +14,18 @@ struct RelayProgramStatusAttention {
         func inboxEvent(paneID: UUID, host: String, paneName: String, occurredAt: Date) -> AgentInboxEvent {
             let kind: AgentInboxEventKind
             let label: String
+            let alert: RelayAttentionAlert
             switch record.state {
-            case "blocked": kind = .attention; label = "Waiting"
-            case "error": kind = .failure; label = "Failed"
-            default: kind = .completion; label = "Done"
+            case "blocked": kind = .attention; label = "Waiting"; alert = .needsInput
+            case "error": kind = .failure; label = "Failed"; alert = .error
+            default: kind = .completion; label = "Done"; alert = .done
             }
             let display = ["Reported by programs in " + paneName, record.title, record.message]
                 .compactMap { $0 }.joined(separator: "\n")
             return AgentInboxEvent(paneID: paneID, host: host, provider: .shell,
                 agentID: "program-status:" + (record.id ?? ""), kind: kind,
                 title: "Program reported " + label + " · " + paneName, detail: display,
-                occurredAt: occurredAt, sourceID: sourceID, isProgramReported: true)
+                occurredAt: occurredAt, sourceID: sourceID, isProgramReported: true, alert: alert)
         }
     }
 

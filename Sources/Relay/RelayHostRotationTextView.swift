@@ -3,6 +3,7 @@ import SwiftUI
 struct RelayHostAccountsPanel: View {
     private let service: RelayHostAccountsService
     init(profile: ConnectionProfile) { service = .init(profile: profile) }
+    @ObservedObject private var sharing = RelayHostAccountSharing.shared
     @State private var status: RelayHostRotationTextRPC.Status?
     @State private var settings = RelayHostRotationTextRPC.Settings()
     @State private var daily = "0"
@@ -42,12 +43,13 @@ struct RelayHostAccountsPanel: View {
             return "Choose the Codex model used by the saved account."
         }
         if pendingSettings == nil {
-            return "Choose at least one provider and a request cap up to 10,000. When enabled, the cap must be positive; Claude API also needs budgets of at least $1."
+            return "Choose at least one provider and a request cap up to 10,000. Use 0 for no daily request cap with API-only providers; saved CLI accounts need a positive cap. Claude API needs daily and monthly budgets of at least $1."
         }
         return nil
     }
     private var canChange: Bool {
-        !busy && !needsStatus && observedProfile == service.profile && status != nil && status?.isUnsupported != true && service.canManageAccounts
+        !busy && !needsStatus && observedProfile == service.profile && status != nil && status?.isUnsupported != true &&
+        service.canManageAccounts && !sharing.isEnabled(service.profile)
     }
 
     var body: some View {
@@ -58,6 +60,25 @@ struct RelayHostAccountsPanel: View {
                 if busy { ProgressView().controlSize(.small) }
             }
             if let status, !status.isUnsupported {
+                if service.profile.kind == .ssh, status.supportsCredentials {
+                    Toggle("Use API accounts from This Mac", isOn: Binding(
+                        get: { sharing.isEnabled(service.profile) },
+                        set: { value in Task { await sharing.setEnabled(value, for: service.profile) } }))
+                        .disabled(busy || !sharing.storeAvailable)
+                        .accessibilityIdentifier("relay.settings.share-local-api-accounts")
+                    Text("API keys are copied securely to this host. Local account changes sync when Relay is connected; usage limits are tracked separately on each host. Turning this off stops future sync and keeps the copied accounts on this host.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if sharing.isEnabled(service.profile) {
+                        HStack {
+                            Text(sharing.status(service.profile).message).font(.caption)
+                                .foregroundStyle(sharing.status(service.profile).phase == .needsReview ? Color.orange : Color.secondary)
+                            Spacer()
+                            Button("Sync now") { Task { await sharing.synchronize(service.profile) } }
+                                .disabled(busy || sharing.status(service.profile).phase == .synchronizing)
+                        }
+                    }
+                    Divider().padding(.vertical, 6)
+                }
                 if status.supportsCredentials { accounts.disabled(!canChange) }
                 Divider().padding(.vertical, 8)
                 Text("Handoff generation").font(.subheadline.weight(.semibold))
@@ -65,13 +86,15 @@ struct RelayHostAccountsPanel: View {
                     .accessibilityIdentifier("relay.context-management.text-enabled")
                 Text("Generation is " + (settings.enabled ? "on" : "off") + " for this host. Changes apply when you save.")
                     .font(.caption).foregroundStyle(.secondary)
-                DisclosureGroup("Provider order and host limits") {
-                providerOrder.disabled(!canChange)
                 HStack {
                     amountField("Daily budget ($)", text: $daily)
                     amountField("Monthly budget ($)", text: $monthly)
                 }.disabled(!canChange)
-                amountField("Maximum requests per day", text: $requests).disabled(!canChange)
+                DisclosureGroup("Provider order and optional request cap") {
+                    providerOrder.disabled(!canChange)
+                    amountField("Daily request cap", text: $requests).disabled(!canChange)
+                    Text("For API-only providers, 0 disables the daily request cap. Spending budgets and rate limits still apply.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if !status.supportsCredentials {
                     Text("Update Relay on this host to manage its saved accounts.")
@@ -137,6 +160,11 @@ struct RelayHostAccountsPanel: View {
             }
         }
         .task { await refresh(); await refreshCredentials() }
+        .onChange(of: sharing.revision) { _, _ in
+            if sharing.status(service.profile).phase == .synchronized {
+                Task { await refresh(); await refreshCredentials() }
+            }
+        }
         .onChange(of: service.profile) { _, _ in
             observedProfile = nil; status = nil; settings = .init(); credentials = []; savedMessage = nil
             editingAccount = nil; recoveringReference = nil
@@ -221,7 +249,7 @@ struct RelayHostAccountsPanel: View {
         account.provider = provider
         account.dailyLimitMicrousd = 1_000_000
         account.monthlyLimitMicrousd = 5_000_000
-        account.maxRequestsPerDay = 10
+        account.maxRequestsPerDay = provider == "anthropic_api" ? 0 : 10
         if provider == "anthropic_api" { account.billingGroup = "anthropic" }
         return account
     }

@@ -126,7 +126,7 @@ this pass. Do not publish these changes as accepted releases yet.
   `/tmp/relay-remaining-all-go.log`, `/tmp/relay-remaining-vet.log`.
 - Actual packaged helper: seven smoke checks passed on the Mac and dandy-07,
   using disposable projects only. The repeatable harness is
-  `scripts/test-plugin-helper.py`: listing, CSV integrity, empty-file integrity,
+  `scripts/test-plugin-helper.sh`: listing, CSV integrity, empty-file integrity,
   pnpm detection, Git attribution, parent traversal and absolute-path rejection.
   No real jobs, user files or active agents were modified.
 - Release app built and `/usr/bin/codesign --verify --deep --strict` passed.

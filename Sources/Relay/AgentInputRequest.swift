@@ -5,10 +5,23 @@ struct AgentInputProposal: Codable, Equatable, Sendable {
     let instance: UUID
     let requestID: UUID
     let text: String
+    /// Set by the Relay assistant: send only if the pane's input revision is
+    /// still this one and its prompt is provably empty. MCP clients omit it.
+    var expectedInputRevision: UInt64? = nil
     var isValid: Bool {
         !text.isEmpty && text.utf8.count <= 65536 &&
         !text.unicodeScalars.contains { $0.value < 32 && $0.value != 10 && $0.value != 9 }
     }
+}
+
+/// MCP request to enable or pause host context rotation for one exact pane.
+struct RelayContextRotationRequest: Codable, Equatable, Sendable {
+    let instance: UUID
+    let requestID: UUID
+    let enabled: Bool
+    /// Explicit user-requested resume; ordinary Enable never lifts takeover.
+    var resumeHumanTakeover: Bool? = nil
+    var permitsResumingHumanTakeover: Bool { enabled && resumeHumanTakeover == true }
 }
 
 struct AgentInputReceipt: Codable, Sendable {
@@ -82,5 +95,29 @@ final class AgentInputRequests {
             self.receipts[proposal.requestID]?.status = status
         }
         return receipt
+    }
+}
+
+/// The Relay assistant's draft fence for text typed into a pane.
+enum RelayAssistantInputFence {
+    struct Proof: Equatable, Sendable {
+        let empty: Bool
+        let inputRevision: UInt64
+        /// Positive evidence of typed text. Not empty and not a draft means
+        /// the prompt simply could not be verified (for example still drawing).
+        var draft: Bool = false
+    }
+    enum Outcome: String, Sendable {
+        case sent = "submitted_outcome_unknown"
+        case draftPresent = "draft_present"
+        case promptUnverified = "prompt_unverified"
+        case inputChanged = "input_changed"
+        case unavailable
+    }
+    /// Revision first: any input since the card was shown refuses, even if the
+    /// prompt is empty again. Then the prompt must be provably empty now.
+    static func admit(expected: UInt64, current: UInt64, empty: Bool, draft: Bool = true) -> Outcome {
+        guard expected == current else { return .inputChanged }
+        return empty ? .sent : draft ? .draftPresent : .promptUnverified
     }
 }

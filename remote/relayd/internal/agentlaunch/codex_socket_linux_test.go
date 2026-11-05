@@ -41,7 +41,15 @@ func TestCodexSocketCandidateUsesProcessEnvironmentOrExplicitRemote(t *testing.T
 }
 
 func TestCodexSocketRequiresPrivateOwnedUnixSocket(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "app-server-control")
+	// AF_UNIX limits the complete pathname, including Go's test-name prefix.
+	// Keep the real socket fixture short while retaining all ownership/mode
+	// assertions below; a long fixture fails before that policy is exercised.
+	root, err := os.MkdirTemp("/tmp", "rcs-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	directory := filepath.Join(root, "app-server-control")
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}

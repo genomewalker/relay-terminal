@@ -1,0 +1,1 @@
+{"enabled":true,"model":"claude-haiku-5-5","interval":30,"stallSeconds":600,"callsPerHour":60,"tokensPerHour":200000,"excludedPanes":[],"excludedHosts":[]}

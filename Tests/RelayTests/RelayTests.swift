@@ -637,7 +637,13 @@ func attachIndividualRemotePane() {
 @MainActor
 @Test("A closed remote pane can be reopened without creating a new remote session")
 func reopenClosedRemotePane() {
-    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    // The shared recovery store holds every other test's closed panes; a
+    // workspace loads them at init, so give this one its own store.
+    let recovery = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: recovery) }
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false,
+        recoveryStore: RelayRecoveryStore(directory: recovery))
     workspace.newTab(profile: .sshConfigHost("hpc-login"))
     let tabID = workspace.selectedTabID!
     let paneID = workspace.activePaneID!
@@ -1835,17 +1841,29 @@ func replayKeepsUserInputWritable() {
 }
 
 @Test("Packaged Ghostty resources resolve below the app resource directory")
-func packagedGhosttyResourcePathIsDeterministic() {
-    let resources = URL(fileURLWithPath: "/Applications/Relay.app/Contents/Resources")
+func packagedGhosttyResourcePathIsDeterministic() throws {
+    // directory(in:) probes the file system for the wrapped bundle layout, so
+    // never point it at the installed app: its layout is not the test's input.
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let resources = root.appendingPathComponent("Relay.app/Contents/Resources", isDirectory: true)
+    let bundle = resources.appendingPathComponent("GhosttyKit_GhosttyTerminal.bundle", isDirectory: true)
     #expect(
         RelayBundledGhosttyResources.directory(in: resources).path
-            == "/Applications/Relay.app/Contents/Resources/"
-                + "GhosttyKit_GhosttyTerminal.bundle/Ghostty"
+            == bundle.appendingPathComponent("Ghostty", isDirectory: true).path
+    )
+    let wrapped = bundle.appendingPathComponent("Contents/Resources", isDirectory: true)
+    try fileManager.createDirectory(at: wrapped, withIntermediateDirectories: true)
+    #expect(
+        RelayBundledGhosttyResources.directory(in: resources).path
+            == wrapped.appendingPathComponent("Ghostty", isDirectory: true).path
     )
 }
 
 @Test("Packaged Ghostty resources configure the runtime environment")
 func packagedGhosttyResourcesConfigureEnvironment() throws {
+    let previousResourcesDirectory = getenv("GHOSTTY_RESOURCES_DIR").map { String(cString: $0) }
     let fileManager = FileManager.default
     let root = fileManager.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1853,7 +1871,11 @@ func packagedGhosttyResourcesConfigureEnvironment() throws {
     try fileManager.createDirectory(at: ghostty, withIntermediateDirectories: true)
     defer {
         try? fileManager.removeItem(at: root)
-        unsetenv("GHOSTTY_RESOURCES_DIR")
+        if let previousResourcesDirectory {
+            setenv("GHOSTTY_RESOURCES_DIR", previousResourcesDirectory, 1)
+        } else {
+            unsetenv("GHOSTTY_RESOURCES_DIR")
+        }
     }
 
     #expect(RelayBundledGhosttyResources.configure(
@@ -1861,6 +1883,28 @@ func packagedGhosttyResourcesConfigureEnvironment() throws {
         fileManager: fileManager
     ))
     #expect(String(cString: getenv("GHOSTTY_RESOURCES_DIR")) == ghostty.path)
+}
+
+@Test("Packaged Ghostty resource fixture restores the previous environment")
+func packagedGhosttyResourceFixtureRestoresEnvironment() throws {
+    let previousResourcesDirectory = getenv("GHOSTTY_RESOURCES_DIR").map { String(cString: $0) }
+    defer {
+        if let previousResourcesDirectory {
+            setenv("GHOSTTY_RESOURCES_DIR", previousResourcesDirectory, 1)
+        } else {
+            unsetenv("GHOSTTY_RESOURCES_DIR")
+        }
+    }
+
+    // These process-environment fixtures run with --no-parallel.
+    let sentinel = "/relay-ghostty-fixture-sentinel-\(UUID().uuidString)"
+    #expect(setenv("GHOSTTY_RESOURCES_DIR", sentinel, 1) == 0)
+    try packagedGhosttyResourcesConfigureEnvironment()
+    #expect(getenv("GHOSTTY_RESOURCES_DIR").map { String(cString: $0) } == sentinel)
+
+    #expect(unsetenv("GHOSTTY_RESOURCES_DIR") == 0)
+    try packagedGhosttyResourcesConfigureEnvironment()
+    #expect(getenv("GHOSTTY_RESOURCES_DIR") == nil)
 }
 
 @Test("Diagnostics redact credentials before they are retained or exported")
@@ -2275,7 +2319,9 @@ func checkpointReconnectPreservesRetainedAgentScreen() {
     #expect(TerminalReconnectReplayPolicy.isPresentationClear(clear, remoteSequence: 0))
     #expect(!TerminalReconnectReplayPolicy.isPresentationClear(clear, remoteSequence: 42))
     #expect(!TerminalReconnectReplayPolicy.isPresentationClear(Data("\u{001B}[H".utf8), remoteSequence: 0))
-    #expect(TerminalReconnectReplayPolicy.extendsCachedScreenAfterOutputReset(
+    // A replay gap discards the merge base even over an exact checkpoint:
+    // the bounded suffix cannot be applied as a delta to a saved screen.
+    #expect(!TerminalReconnectReplayPolicy.extendsCachedScreenAfterOutputReset(
         hasExactSnapshot: true
     ))
     #expect(!TerminalReconnectReplayPolicy.extendsCachedScreenAfterOutputReset(
@@ -2945,6 +2991,32 @@ struct ProcessCaptureTests {
             output: output,
             errors: errors,
             maximumBytesPerStream: 1_024
+        )
+        #expect(String(decoding: captured.standardOutput, as: UTF8.self) == "relay")
+        #expect(String(decoding: captured.standardError, as: UTF8.self) == "warning")
+    }
+
+    @Test("Subprocess capture waits for readers that start after the drain grace")
+    func processCaptureWaitsForStarvedReaders() throws {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "printf relay; printf warning >&2"]
+        process.standardOutput = output
+        process.standardError = errors
+        // Stands in for a loaded machine: the readers are not scheduled until
+        // well after the child exits and the one-second drain grace ends.
+        let starved = DispatchQueue(label: "relay.tests.capture.starved", attributes: .concurrent)
+        starved.suspend()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { starved.resume() }
+
+        let captured = try ProcessCapture.run(
+            process,
+            output: output,
+            errors: errors,
+            maximumBytesPerStream: 1_024,
+            readerQueue: starved
         )
         #expect(String(decoding: captured.standardOutput, as: UTF8.self) == "relay")
         #expect(String(decoding: captured.standardError, as: UTF8.self) == "warning")

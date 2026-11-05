@@ -1,0 +1,28 @@
+{
+  "database_header_uint16": 1,
+  "files": [
+    {
+      "bytes": 786432,
+      "encoded_sha256": "ac624feee98939a19b58d2744db1bd53c9e696f32ff66869088dc0aec4f2c147",
+      "name": "journal.sqlite3",
+      "sha256": "8b6bb9dc6b3ad24858a3d0575dc090bb7b56becbc0d9cf998285fef7fb5c0333"
+    },
+    {
+      "bytes": 263680,
+      "encoded_sha256": "3785e9b2dac64f36a06d693f27770eebaa3f6bffedcf5819c82304a581964c86",
+      "name": "journal.sqlite3-journal",
+      "sha256": "f90b001a3d54b40b335a102310f849b75735374e5589c65ee280e6528ea1d7cb"
+    },
+    {
+      "bytes": 458752,
+      "encoded_sha256": "d1bee843963dcc5b931da3c8c477e1be4d5c76ed1d9119958bd7360082ecc233",
+      "name": "committed.sqlite3",
+      "sha256": "f2d7174ff587dcf850a42dc35535680ea3d109fcdb06d02521fbef1c71caba50"
+    }
+  ],
+  "journal_page_size_uint32": 65536,
+  "source": "native SQLite CLI creates private synthetic schema; native SQLite C API sqlite3_db_cacheflush syncs uncommitted changes; private writer _exit avoids rollback",
+  "sqlite_cli": "/usr/bin/sqlite3",
+  "sqlite_version": "3.51.0 2025-06-12 13:14:41 f0ca7bba1c5e232e5d279fad6338121ab55af0c8c68c84cdfb18ba5114dcaapl (64-bit)",
+  "writer_output": "synthetic-hot64-flushed sqlite=3.51.0"
+}

@@ -15,8 +15,12 @@ large-context rotations. No dollar-cost or guaranteed-savings claim is made.
 
 Relay independently verifies enrollment, exact backend incarnation, completed
 turn identity, ledger ownership, capsule durability, and the lifecycle fence.
-The packaged source is pinned and its verified bytes are passed directly to
-the Python interpreter. A changed source requires review and a new pin.
+The original policy source is archived by its SHA-256 as historical primary
+evidence. Maintained implementations are RelayContextRotationPolicy.swift and
+the native Go policy. Both must reproduce every byte of
+remote/relayd/internal/daemon/testdata/host_rotation_policy/golden.json.
+Changing policy requires review, new goldens and both implementations updated.
+No interpreter resource is embedded or executed.
 
 Cache scheduling emits at most a pre-expiry wakeup and an expiry wakeup for one
 exact session/turn/model/request/TTL binding. It grants no refresh or lifecycle

@@ -174,12 +174,10 @@ struct RelayCodexRotationLifecycle: RelayRotationLifecycle {
     }
 }
 
-/// Bounded one-shot process calls use the existing installed Chitta executable
-/// and the supported desktop socket adapter. Unknown outcomes propagate.
+/// Ledger calls use the existing installed Chitta executable; lifecycle calls
+/// use the native app-server adapter. Unknown outcomes propagate.
 struct RelayRotationProcessTransport: RelayRotationTransport {
     let chittaExecutable: URL
-    let pythonExecutable: URL
-    let backendScript: URL
     let socketPath: String
     let socketDevice: UInt64
     let socketInode: UInt64
@@ -189,9 +187,13 @@ struct RelayRotationProcessTransport: RelayRotationTransport {
             "--args", String(decoding: arguments, as: UTF8.self), "--json"], input: nil, envelope: true)
     }
     func backend(_ operation: String, arguments: Data) async throws -> Data {
-        try await run(pythonExecutable, arguments: [backendScript.path, "--socket", socketPath,
-            "--device", String(socketDevice), "--inode", String(socketInode), "--operation", operation],
-            input: arguments, envelope: false)
+        let (path, device, inode) = (socketPath, socketDevice, socketInode)
+        return try await Task.detached {
+            do {
+                return try RelayCodexRotationBackend.perform(operation: operation, socketPath: path,
+                    device: device, inode: inode, request: arguments)
+            } catch { throw RelayRotationAdapterError.mismatchedEvidence }
+        }.value
     }
     private func run(_ executable: URL, arguments: [String], input: Data?, envelope: Bool) async throws -> Data {
         try await Task.detached {

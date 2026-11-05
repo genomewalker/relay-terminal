@@ -78,13 +78,18 @@ func ReadCommunicationActor(clientPID int) (CommunicationActor, error) {
 	if err != nil {
 		return empty, err
 	}
-	home, err := os.UserHomeDir()
+	fallback, err := defaultAgentConfigRoot("claude")
 	if err != nil {
 		return empty, err
 	}
 	pane, source := "", "foreground_worker_kernel_ancestry"
 	for _, pid := range chain {
-		path := filepath.Join(home, ".claude", "sessions", strconv.Itoa(pid)+".json")
+		// Each Claude process publishes in its own account directory.
+		config, configErr := agentConfigRoot(pid, "claude")
+		if configErr != nil {
+			config = fallback
+		}
+		path := filepath.Join(config, "sessions", strconv.Itoa(pid)+".json")
 		if nativeClaudePublicationKind(path) != "bg" {
 			continue
 		}
@@ -96,7 +101,7 @@ func ReadCommunicationActor(clientPID int) (CommunicationActor, error) {
 		if err != nil || !nativeClaudeJobID.MatchString(bg.JobID) {
 			return empty, errors.New("native background client publication unavailable")
 		}
-		fronts, err := nativeClaudePublications(home, "interactive", bg.JobID)
+		fronts, err := nativeClaudePublications(config, "interactive", bg.JobID)
 		if err != nil || len(fronts) != 1 {
 			return empty, errors.New("native background client has no unique parked foreground")
 		}

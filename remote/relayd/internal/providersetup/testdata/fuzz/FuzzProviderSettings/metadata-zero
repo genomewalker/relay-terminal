@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"enabledPlugins\":{\"chitta@genomewalker-chitta\":0e0},\"hooks\":\"å😀\"}")

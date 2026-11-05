@@ -52,11 +52,9 @@ payload_dir="$relay_root/bin"
 shim_dir="$relay_root/shims"
 lock_dir="$relay_root/install.lock"
 temporary_launcher=
-temporary_claude_shim=
-temporary_codex_shim=
 lock_owned=0
 cleanup() {
-    rm -f "$upload" "$temporary_launcher" "$temporary_claude_shim" "$temporary_codex_shim"
+    rm -f "$upload" "$temporary_launcher"
     if [ "$lock_owned" = 1 ]; then rmdir "$lock_dir" 2>/dev/null || true; fi
 }
 trap cleanup EXIT HUP INT TERM
@@ -108,25 +106,11 @@ exec "$relay_payload" "$@"
 RELAY_LAUNCHER
 chmod 700 "$temporary_launcher"
 mv -f "$temporary_launcher" "$bin_dir/relayd"
-temporary_claude_shim="$(mktemp "$shim_dir/.claude-shim.XXXXXX")"
-temporary_codex_shim="$(mktemp "$shim_dir/.codex-shim.XXXXXX")"
-cat > "$temporary_claude_shim" <<'RELAY_CLAUDE_SHIM'
-#!/bin/sh
-set -eu
-RELAY_INVOKED_AS=claude
-export RELAY_INVOKED_AS
-exec "$HOME/.local/bin/relayd" "$@"
-RELAY_CLAUDE_SHIM
-cat > "$temporary_codex_shim" <<'RELAY_CODEX_SHIM'
-#!/bin/sh
-set -eu
-RELAY_INVOKED_AS=codex
-export RELAY_INVOKED_AS
-exec "$HOME/.local/bin/relayd" "$@"
-RELAY_CODEX_SHIM
-chmod 700 "$temporary_claude_shim" "$temporary_codex_shim"
-mv -f "$temporary_claude_shim" "$shim_dir/claude"
-mv -f "$temporary_codex_shim" "$shim_dir/codex"
+# relayd installs or repairs its own claude/codex launchers: missing ones are
+# written, stale Relay ones fixed, and any file Relay did not write is kept.
+if ! "$bin_dir/relayd" agent-launchers --repair >/dev/null; then
+    echo "Relay could not install its claude/codex launchers on this host; Settings > Agent Accounts shows why." >&2
+fi
 printf 'relay-managed-v1\n' > "$relay_root/managed-v1"
 if [ ! -e "$bin_dir/rcode" ] && [ ! -L "$bin_dir/rcode" ]; then
     ln -s "$bin_dir/relayd" "$bin_dir/rcode"
@@ -147,5 +131,14 @@ elif ! "$bin_dir/relayd" upgrade-supervisor --force; then
     echo "Helper staged, but supervisor upgrade was refused; running jobs and workers were retained." >&2
     echo "After the blocker is resolved, run: ~/.local/bin/relayd upgrade-supervisor --force" >&2
     exit 1
+else
+    # Move live pane workers onto the new relayd in place (same PID, shell and
+    # PTY), detached so a host with many panes does not hold this install open.
+    # Workers already on it and legacy workers are left as they are; busy panes
+    # (mid-edit or mid-rotation) are retried 10 times, 30 s apart. The receipt
+    # lists each pane's result.
+    receipt="$relay_root/upgrade-workers-last.json"
+    ( nohup sh -c '"$1" upgrade-workers > "$2.tmp" 2>&1; mv -f "$2.tmp" "$2"' upgrade-workers "$bin_dir/relayd" "$receipt" \
+        </dev/null >/dev/null 2>&1 & )
 fi
 REMOTE_INSTALL

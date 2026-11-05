@@ -155,27 +155,17 @@ actor RemoteUpload {
             throw RemoteFileTransferError.failed("Source file changed; discard the partial upload before starting again")
         }
     }
-    private func hash(_ file: FileHandle, count: Int64) throws -> String {
-        try file.seek(toOffset: 0)
-        var remaining = count, hasher = SHA256()
-        while remaining > 0 {
-            try Task.checkCancellation()
-            guard let bytes = try file.read(upToCount: Int(min(1 << 20, remaining))), !bytes.isEmpty else { throw RemoteFileTransferError.failed("Source file is incomplete") }
-            hasher.update(data: bytes); remaining -= Int64(bytes.count)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-    private func accept(_ receipt: RemoteUploadReceipt, file: FileHandle, saved: inout RemoteUploadCheckpoint) throws {
+    private func accept(_ receipt: RemoteUploadReceipt, file: FileHandle, prefix: RelayTransferChecksum, saved: inout RemoteUploadCheckpoint) throws {
         guard receipt.id == saved.jobID, receipt.size == saved.size, receipt.sha256 == saved.sha256,
               receipt.offset >= saved.offset, receipt.offset <= saved.size,
               ["receiving", "committing", "committed"].contains(receipt.state),
               receipt.directory.hasPrefix("/"), saved.directory == nil || saved.directory == receipt.directory,
-              try hash(file, count: receipt.offset) == receipt.prefixSHA256 else { throw RemoteFileTransferError.invalidResponse }
+              prefix.offset == receipt.offset, prefix.digest == receipt.prefixSHA256 else { throw RemoteFileTransferError.invalidResponse }
         try checkSource(file, expected: saved.sourceVersion)
         saved.offset = receipt.offset; saved.directory = receipt.directory
         try store.save(saved); checkpoint = saved
     }
-    func upload(resume: Bool, fetch: Fetch) async throws -> RemoteFileEntry {
+    func upload(resume: Bool, progress: RelayTransferProgressHandler? = nil, fetch: Fetch) async throws -> RemoteFileEntry {
         guard !running else { throw RemoteFileTransferError.failed("Upload is already running") }
         if checkpoint != nil, !resume { throw RemoteFileTransferError.recoveryAvailable }
         running = true; defer { running = false }
@@ -188,7 +178,14 @@ actor RemoteUpload {
         guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw RemoteFileTransferError.notAFile(source.lastPathComponent) }
         guard info.st_size <= RemoteFileTransfer.maximumBytes else { throw RemoteFileTransferError.tooLarge(source.lastPathComponent) }
         let sourceVersion = Self.version(info)
-        let sha256 = try hash(file, count: info.st_size)
+        let name = source.lastPathComponent
+        await progress?(.init(phase: .preparing, name: name, totalBytes: info.st_size))
+        var full = RelayTransferChecksum()
+        let sourceSize = info.st_size
+        try await full.advance(file, to: sourceSize) { offset in
+            await progress?(.init(phase: .preparing, name: name, completedBytes: offset, totalBytes: sourceSize))
+        }
+        let sha256 = full.digest
         try checkSource(file, expected: sourceVersion)
         let existing = checkpoint != nil
         var saved = checkpoint ?? RemoteUploadCheckpoint(key: key, jobID: "upload-" + UUID().uuidString.lowercased(), sourceVersion: sourceVersion, size: info.st_size, sha256: sha256)
@@ -200,25 +197,34 @@ actor RemoteUpload {
             ? RemoteUploadRequest(operation: "file_upload_status", jobID: saved.jobID)
             : RemoteUploadRequest(operation: "file_upload_begin", jobID: saved.jobID, pane: pane, name: source.lastPathComponent, size: saved.size, sha256: saved.sha256)
         var receipt = try await fetch(request)
-        try accept(receipt, file: file, saved: &saved)
+        guard receipt.offset >= 0, receipt.offset <= saved.size else { throw RemoteFileTransferError.invalidResponse }
+        var prefix = RelayTransferChecksum()
+        if receipt.offset > 0 { await progress?(.init(phase: .verifying, name: name, totalBytes: saved.size)) }
+        try await prefix.advance(file, to: receipt.offset)
+        try accept(receipt, file: file, prefix: prefix, saved: &saved)
+        await progress?(.init(phase: .uploading, name: name, completedBytes: saved.offset, totalBytes: saved.size))
         while receipt.state == "receiving", saved.offset < saved.size {
             try Task.checkCancellation(); try checkSource(file, expected: saved.sourceVersion)
             try file.seek(toOffset: UInt64(saved.offset))
             guard let bytes = try file.read(upToCount: Int(min(4 << 20, saved.size - saved.offset))), !bytes.isEmpty else { throw RemoteFileTransferError.failed("Source file is incomplete") }
             try checkSource(file, expected: saved.sourceVersion)
             let expectedOffset = saved.offset + Int64(bytes.count)
+            prefix.append(bytes)
             receipt = try await fetch(RemoteUploadRequest(operation: "file_upload_chunk", jobID: saved.jobID, offset: saved.offset, data: bytes))
             guard receipt.offset == expectedOffset else { throw RemoteFileTransferError.invalidResponse }
-            try accept(receipt, file: file, saved: &saved)
+            try accept(receipt, file: file, prefix: prefix, saved: &saved)
+            await progress?(.init(phase: .uploading, name: name, completedBytes: saved.offset, totalBytes: saved.size))
         }
         if receipt.state != "committed" {
+            await progress?(.init(phase: .verifying, name: name, completedBytes: saved.offset, totalBytes: saved.size))
             try Task.checkCancellation(); try checkSource(file, expected: saved.sourceVersion)
             receipt = try await fetch(RemoteUploadRequest(operation: "file_upload_commit", jobID: saved.jobID))
-            try accept(receipt, file: file, saved: &saved)
+            try accept(receipt, file: file, prefix: prefix, saved: &saved)
         }
         guard receipt.state == "committed", receipt.offset == saved.size,
               let path = receipt.path, (path as NSString).deletingLastPathComponent == receipt.directory,
               !path.contains("\0") else { throw RemoteFileTransferError.invalidResponse }
+        await progress?(.init(phase: .complete, name: name, completedBytes: saved.size, totalBytes: saved.size))
         return RemoteFileEntry(name: (path as NSString).lastPathComponent, path: path, directory: false, symbolicLink: false, size: saved.size, modificationNS: 0)
     }
     func hasCheckpoint() -> Bool { checkpoint != nil }

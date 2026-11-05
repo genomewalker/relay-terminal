@@ -1,0 +1,141 @@
+diff --git a/src/Surface.zig b/src/Surface.zig
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -6104,7 +6104,14 @@
+ ) !void {
+     // Create a temporary directory to store our scrollback.
+     var tmp_dir = try internal_os.TempDir.init();
+-    errdefer tmp_dir.deinit();
++    // The file outlives this call (it is opened or read later), so only a
++    // successful write keeps the directory. Both directory handles are
++    // closed either way; an embedder reads the screen on every refresh.
++    var keep = false;
++    defer {
++        if (keep) tmp_dir.dir.close() else tmp_dir.deinit();
++        tmp_dir.closeParent();
++    }
+ 
+     var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+     const filename = try std.fmt.bufPrint(
+@@ -6173,7 +6180,6 @@
+ 
+         const sel = sel_ orelse {
+             // If we have no selection we have no data so we do nothing.
+-            tmp_dir.deinit();
+             return;
+         };
+ 
+@@ -6223,6 +6229,7 @@
+             path,
+         ), .unlocked),
+     }
++    keep = true;
+ }
+ 
+ /// Call this to complete a clipboard request sent to apprt. This should
+diff --git a/src/os/TempDir.zig b/src/os/TempDir.zig
+--- a/src/os/TempDir.zig
++++ b/src/os/TempDir.zig
+@@ -29,12 +29,15 @@
+     var tmp_path_buf: [TMP_PATH_LEN:0]u8 = undefined;
+     var rand_buf: [RANDOM_BYTES]u8 = undefined;
+ 
+-    const dir = dir: {
++    var dir = dir: {
+         const cwd = std.fs.cwd();
+         const tmp_dir = allocTmpDir(std.heap.page_allocator) orelse break :dir cwd;
+         defer freeTmpDir(std.heap.page_allocator, tmp_dir);
+         break :dir try cwd.openDir(tmp_dir, .{});
+     };
++    // Until the TempDir is returned the parent handle is ours: close it if
++    // creating or opening the folder fails (never the current directory).
++    errdefer if (dir.fd != std.fs.cwd().fd) dir.close();
+ 
+     // We now loop forever until we can find a directory that we can create.
+     while (true) {
+@@ -47,8 +50,13 @@
+             else => |e| return e,
+         };
+ 
++        // A folder that cannot be opened is removed again.
++        const folder = dir.openDir(tmp_path, .{}) catch |err| {
++            dir.deleteDir(tmp_path) catch {};
++            return err;
++        };
+         return TempDir{
+-            .dir = try dir.openDir(tmp_path, .{}),
++            .dir = folder,
+             .parent = dir,
+             .name_buf = tmp_path_buf,
+         };
+@@ -69,6 +77,12 @@
+         log.err("error deleting temp dir err={}", .{err});
+ }
+ 
++/// Close the parent directory handle, which deinit leaves open. The current
++/// directory, used when there is no temporary directory, is never closed.
++pub fn closeParent(self: *TempDir) void {
++    if (self.parent.fd != std.fs.cwd().fd) self.parent.close();
++}
++
+ // The amount of random bytes to get to determine our filename.
+ const RANDOM_BYTES = 16;
+ const TMP_PATH_LEN = b64_encoder.calcSize(RANDOM_BYTES);
+@@ -78,6 +92,48 @@
+ const b64_encoder = std.base64.Base64Encoder.init(b64_alphabet, null);
+ const b64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".*;
+ 
++const test_env = struct {
++    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
++};
++
++fn openDescriptors() usize {
++    var count: usize = 0;
++    var fd: c_int = 0;
++    while (fd < 1024) : (fd += 1) {
++        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) count += 1;
++    }
++    return count;
++}
++
++test "a failed init leaves no descriptor open" {
++    // A temporary directory that can be opened but not written to.
++    var parent = std.testing.tmpDir(.{});
++    defer parent.cleanup();
++    try parent.dir.makeDir("readonly");
++    var buf: [std.fs.max_path_bytes]u8 = undefined;
++    const path = try parent.dir.realpath("readonly", &buf);
++    var pathz: [std.fs.max_path_bytes:0]u8 = undefined;
++    @memcpy(pathz[0..path.len], path);
++    pathz[path.len] = 0;
++    try std.posix.fchmodat(parent.dir.fd, "readonly", 0o500, 0);
++    defer std.posix.fchmodat(parent.dir.fd, "readonly", 0o700, 0) catch {};
++
++    const saved = std.c.getenv("TMPDIR");
++    var saved_copy: [std.fs.max_path_bytes:0]u8 = undefined;
++    if (saved) |value| {
++        const slice = std.mem.span(value);
++        @memcpy(saved_copy[0..slice.len], slice);
++        saved_copy[slice.len] = 0;
++    }
++    try testing.expectEqual(@as(c_int, 0), test_env.setenv("TMPDIR", &pathz, 1));
++    defer _ = if (saved != null) test_env.setenv("TMPDIR", &saved_copy, 1) else test_env.unsetenv("TMPDIR");
++
++    const before = openDescriptors();
++    for (0..30) |_| try testing.expectError(error.AccessDenied, init());
++    try testing.expectEqual(before, openDescriptors());
++}
++
+ test {
+     var td = try init();
+     errdefer td.deinit();
+@@ -92,4 +148,8 @@
+     // Should be deleted after we deinit
+     td.deinit();
+     try testing.expectError(error.FileNotFound, td.parent.openDir(nameval, .{}));
++
++    const parent = td.parent.fd;
++    td.closeParent();
++    try testing.expectEqual(@as(c_int, -1), std.c.fcntl(parent, std.c.F.GETFD));
+ }

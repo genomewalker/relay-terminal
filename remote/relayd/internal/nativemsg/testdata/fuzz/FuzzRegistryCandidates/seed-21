@@ -1,0 +1,4 @@
+go test fuzz v1
+string("\x31\x5f\x30\x30\x30\x2e\x6a\x73\x6f\x6e")
+int64(1000)
+bool(false)

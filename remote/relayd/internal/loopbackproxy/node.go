@@ -159,6 +159,8 @@ func RelayNodeWithHostRequestHandlers(ctx context.Context, input io.Reader, outp
 					}
 					if hostAccounts != nil {
 						caps = append(caps, "host_accounts_v1")
+						caps = append(caps, "pane_health_tools_v1")
+						caps = append(caps, "relay_assistant_v1")
 					}
 					status["capabilities"], _ = json.Marshal(caps)
 					if encoded, err := json.Marshal(status); err == nil {

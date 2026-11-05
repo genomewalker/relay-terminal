@@ -21,6 +21,8 @@ private struct RelayHostRotationPanel: View {
     @ObservedObject var pane: PaneModel
     @Environment(\.openSettings) private var openSettings
     @State private var status: RelayHostRotationRPC.Status?
+    @State private var textStatus: RelayHostRotationTextRPC.Status?
+    @State private var credentials: [RelayHostRotationTextRPC.CredentialRecord]?
     @State private var busy = false
     @State private var needsStatus = false
     @State private var error: String?
@@ -38,6 +40,23 @@ private struct RelayHostRotationPanel: View {
                 if busy { ProgressView().controlSize(.small) }
             }
             Text(hostName).font(.caption).foregroundStyle(.secondary)
+            if status != nil || textStatus != nil {
+                let summary = RelayContextManagementSummary(rotation: status, text: textStatus, credentials: credentials)
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+                    ForEach(Array([summary.handoffText, summary.enrollment, summary.completedTurns].enumerated()), id: \.offset) { _, check in
+                        Label(check.text, systemImage: check.isOK ? "checkmark.circle.fill" :
+                                (check.isUnknown ? "questionmark.circle" : "exclamationmark.circle"))
+                            .font(.caption)
+                            .foregroundStyle(check.isOK ? Color.green : (check.isUnknown ? Color.secondary : Color.orange))
+                    }
+                    if let next = summary.nextStep {
+                        Text(next).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(summary.line)
+                .accessibilityIdentifier("relay.context-management.summary")
+            }
             if let status {
                 Text(status.title).font(.subheadline.weight(.semibold))
                 if status.isUnsupported {
@@ -120,6 +139,14 @@ private struct RelayHostRotationPanel: View {
             status = result; error = nil; needsStatus = false
         } catch {
             status = nil; self.error = error.localizedDescription
+        }
+        // Read-only host checks for the summary; a failure leaves them unknown.
+        let accounts = RelayHostAccountsService(profile: pane.profile)
+        if accounts.canManageAccounts {
+            textStatus = try? await accounts.readHostRotationTextStatus()
+            credentials = try? await accounts.readHostRotationCredentials()
+        } else {
+            textStatus = nil; credentials = nil
         }
     }
 

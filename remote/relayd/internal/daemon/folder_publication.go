@@ -81,7 +81,7 @@ func folderPublishFile(root, staging *os.File, identities map[string]string, ent
 		return errors.New("private owned folder staging directory required")
 	}
 	digestBytes, err := hex.DecodeString(entry.SHA256)
-	if err != nil || len(digestBytes) != 32 || entry.SHA256 != strings.ToLower(entry.SHA256) || entry.Size < 0 || entry.Size > maxImportedFileBytes {
+	if err != nil || len(digestBytes) != 32 || entry.SHA256 != strings.ToLower(entry.SHA256) || entry.Size < 0 {
 		return errors.New("bounded folder file and canonical checksum required")
 	}
 	parent, err := folderOpenDirectory(root, path.Dir(entry.Path), identities)

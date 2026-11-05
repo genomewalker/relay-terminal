@@ -217,18 +217,18 @@ struct RelayPromptEditorNativeFrameTests {
         io.sendPromptControlInput(Data(repeating: 0x7F, count: 8))
         if let request { request.respond(allow: true) }
         else { view.sendText("first\nsecond") }
-        #expect(writer.inputs.isEmpty)
-        #expect(io.endPromptControlCapture())
-        #expect(writer.inputs.count == 1)
-        let body = Data(try #require(writer.inputs.first).dropFirst(24))
-        #expect(body.starts(with: Data(repeating: 0x7F, count: 8)))
-        let text = String(decoding: body, as: UTF8.self)
-        #expect(!text.contains("first") && !text.contains("second"))
+        // Ghostty's I/O thread publishes the paste on its own schedule. Wait for
+        // it instead of racing it: it must leave while the capture is still
+        // open, outside the thread-bound buffer.
         var packets = writer.events.stream.makeAsyncIterator()
-        _ = try #require(await packets.next())
         let later = Data(try #require(await packets.next()).dropFirst(24))
         let pasted = String(decoding: later, as: UTF8.self)
         #expect(pasted.contains("first") && pasted.contains("second"), "Later bytes: \(Array(later.prefix(128)))")
+        #expect(!later.contains(0x7F))
+        // The paste is unacknowledged input ahead of the captured edit, so the
+        // edit is refused rather than applied to a prompt the user changed.
+        #expect(!io.endPromptControlCapture())
+        #expect(writer.inputs.count == 1)
     }
 
     @MainActor private func terminal() async throws -> (NSWindow, AppTerminalView, TerminalIOBridge, TerminalController) {

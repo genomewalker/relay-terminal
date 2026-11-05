@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -117,10 +116,10 @@ func communicationFanoutLocked(root string, fn func() error) error {
 		return err
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := communicationLockExclusive(f); err != nil {
 		return err
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	defer communicationUnlock(f)
 	return fn()
 }
 func communicationPin(member communicationMember) communicationPinnedConversation {
@@ -145,7 +144,8 @@ func communicationNativeOutcome(native map[string]any, err error) map[string]any
 		result["error"] = communicationBoundedString(err.Error(), 2048)
 		return result
 	}
-	for _, key := range []string{"status", "transport", "command_id", "provider_turn_id", "acknowledgement", "error", "reason"} {
+	for _, key := range []string{"status", "transport", "command_id", "provider_turn_id", "acknowledgement", "error", "reason",
+		"held_expected", "recipient_mode", "sender_mode"} {
 		if text, ok := native[key].(string); ok && len(text) <= 2048 && text != "" {
 			result[key] = text
 		}

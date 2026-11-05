@@ -22,6 +22,9 @@ enum TerminalSnapshotRecordCodec {
     struct Snapshot: Equatable {
         let payload: Data
         let remoteSequence: UInt64
+        /// Restore trackers' state at the payload's end; nil for legacy
+        /// records, whose payload must be observed instead.
+        var trackerState: TerminalSnapshotTrackerState? = nil
     }
 
     static func encode(
@@ -82,25 +85,235 @@ enum TerminalSnapshotRecordCodec {
     }
 }
 
+/// Per-pane append-only snapshot log. A checkpoint frame holds a bounded
+/// payload; each delta frame holds only the bytes appended since. Every frame
+/// records the restore trackers' state at its end, so a restore reads the
+/// newest state instead of rescanning the whole payload. A frame's checksum
+/// covers its header, state and payload; loading stops at the first torn or
+/// corrupt frame and keeps everything before it.
+enum TerminalSnapshotLogCodec {
+    static let magic = Data("RELAYSL1".utf8)
+    static var headerBytes: Int { magic.count + 4 }
+    static let frameHeaderBytes = 1 + 1 + 4 + 8 + 4
+    static let checksumBytes = 8
+
+    enum Kind: UInt8 {
+        case checkpoint = 1
+        case delta = 2
+    }
+
+    struct Log: Equatable {
+        var viewport: RelayViewport
+        var payload: Data
+        var remoteSequence: UInt64
+        /// The checkpoint is a suffix without its screen base. It still carries
+        /// a resume cursor, but replaying it would draw stray cells.
+        var truncated: Bool
+        var trackerState: TerminalSnapshotTrackerState?
+        var validLength: Int
+        var deltaFrames: Int
+    }
+
+    static func header(viewport: RelayViewport) -> Data {
+        var data = magic
+        append(viewport.columns, to: &data)
+        append(viewport.rows, to: &data)
+        return data
+    }
+
+    static func frame(
+        kind: Kind,
+        truncated: Bool,
+        remoteSequence: UInt64,
+        trackerState: TerminalSnapshotTrackerState?,
+        payload: Data
+    ) -> Data {
+        let state = trackerState.flatMap { try? JSONEncoder().encode($0) } ?? Data()
+        var frame = Data()
+        frame.reserveCapacity(frameHeaderBytes + state.count + payload.count + checksumBytes)
+        frame.append(kind.rawValue)
+        frame.append(truncated ? 1 : 0)
+        append(UInt32(payload.count), to: &frame)
+        append(remoteSequence, to: &frame)
+        append(UInt32(state.count), to: &frame)
+        frame.append(state)
+        frame.append(payload)
+        frame.append(contentsOf: SHA256.hash(data: frame).prefix(checksumBytes))
+        return frame
+    }
+
+    /// The grid a log was saved at, from its header alone. A zero dimension
+    /// is refused: no Relay grid has one.
+    static func headerViewport(_ header: Data) -> RelayViewport? {
+        let header = header.startIndex == 0 ? header : Data(header)
+        guard header.count >= headerBytes, header.starts(with: magic) else { return nil }
+        let columns = read(UInt16.self, from: header, at: magic.count)
+        let rows = read(UInt16.self, from: header, at: magic.count + 2)
+        guard columns > 0, rows > 0 else { return nil }
+        return RelayViewport(columns: columns, rows: rows)
+    }
+
+    static func decode(_ file: Data) -> Log? {
+        let file = file.startIndex == 0 ? file : Data(file)
+        guard file.count >= headerBytes, file.starts(with: magic) else { return nil }
+        let viewport = RelayViewport(
+            columns: read(UInt16.self, from: file, at: magic.count),
+            rows: read(UInt16.self, from: file, at: magic.count + 2)
+        )
+        guard let checkpoint = readFrame(file, at: headerBytes),
+              checkpoint.kind == .checkpoint else { return nil }
+        var log = Log(
+            viewport: viewport,
+            payload: checkpoint.payload,
+            remoteSequence: checkpoint.remoteSequence,
+            truncated: checkpoint.truncated,
+            trackerState: checkpoint.trackerState,
+            validLength: checkpoint.end,
+            deltaFrames: 0
+        )
+        while let delta = readFrame(file, at: log.validLength), delta.kind == .delta {
+            log.payload.append(delta.payload)
+            log.remoteSequence = delta.remoteSequence
+            log.trackerState = delta.trackerState
+            log.validLength = delta.end
+            log.deltaFrames += 1
+        }
+        return log
+    }
+
+    private struct Frame {
+        let kind: Kind
+        let truncated: Bool
+        let remoteSequence: UInt64
+        let trackerState: TerminalSnapshotTrackerState?
+        let payload: Data
+        let end: Int
+    }
+
+    private static func readFrame(_ file: Data, at offset: Int) -> Frame? {
+        guard file.count - offset >= frameHeaderBytes + checksumBytes,
+              let kind = Kind(rawValue: file[offset]) else { return nil }
+        let payloadLength = Int(read(UInt32.self, from: file, at: offset + 2))
+        let remoteSequence = read(UInt64.self, from: file, at: offset + 6)
+        let stateLength = Int(read(UInt32.self, from: file, at: offset + 14))
+        let stateStart = offset + frameHeaderBytes
+        let payloadStart = stateStart + stateLength
+        let checksumStart = payloadStart + payloadLength
+        let end = checksumStart + checksumBytes
+        guard end <= file.count,
+              SHA256.hash(data: file[offset..<checksumStart]).prefix(checksumBytes)
+                .elementsEqual(file[checksumStart..<end]) else { return nil }
+        var trackerState: TerminalSnapshotTrackerState?
+        if stateLength > 0 {
+            // A state this build cannot decode makes the frame unusable: its
+            // payload is valid, but restore would observe the wrong modes.
+            guard let decoded = try? JSONDecoder().decode(
+                TerminalSnapshotTrackerState.self, from: file[stateStart..<payloadStart]
+            ) else { return nil }
+            trackerState = decoded
+        }
+        return Frame(
+            kind: kind,
+            truncated: file[offset + 1] != 0,
+            remoteSequence: remoteSequence,
+            trackerState: trackerState,
+            payload: file.subdata(in: payloadStart..<checksumStart),
+            end: end
+        )
+    }
+
+    private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var bigEndian = value.bigEndian
+        withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func read<T: FixedWidthInteger>(_: T.Type, from data: Data, at offset: Int) -> T {
+        data[offset..<(offset + MemoryLayout<T>.size)].reduce(T(0)) { ($0 << 8) | T($1) }
+    }
+}
+
 /// A small, local reconstruction stream for instant visual restore. The
 /// authoritative PTY remains remote; this cache is display-only and is replaced
 /// as soon as relayd finishes replaying the current screen.
+///
+/// Agent TUIs redraw by cursor addressing and rarely emit a full clear, so
+/// compaction cannot shrink their streams. Saves therefore append only the
+/// bytes added since the previous save instead of rewriting the payload, and
+/// write a fresh checkpoint only when the stream is replaced, trimmed, resized
+/// or has accumulated too many frames.
 final class TerminalSnapshotStore: @unchecked Sendable {
     static let shared = TerminalSnapshotStore()
     static let maximumBytes = 16 << 20
     private static let legacyMaximumBytes = 2 << 20
+    /// Bounds per-frame overhead and the frames verified on load.
+    static let maximumDeltaFrames = 512
+    private static let maximumLogBytes = maximumBytes + (8 << 20)
+    /// Identifies the persisted prefix cheaply. A replaced or trimmed buffer
+    /// differs at its start or at the old end; a full hash per save would cost
+    /// a linear pass over megabytes on every debounce.
+    private static let fingerprintBytes = 4_096
+
+    typealias Bound = (Data) -> (data: Data, truncated: Bool)
 
     private let directory: URL
     private let queue = DispatchQueue(label: "relay.terminal-snapshots", qos: .utility)
     private let lock = NSLock()
-    private var generations: [UUID: UInt64] = [:]
-    private var scheduledDigests: [UUID: Data] = [:]
+    private var epochs: [UUID: UInt64] = [:]
+    private var tips: [UUID: LogTip] = [:]
+    /// Bracketed paste at a cursor-only restore point, for the suffix
+    /// checkpoints written after it when the loaded log carried no state.
+    private var bracketedPasteSeeds: [UUID: TerminalBracketedPasteStateTracker.PersistentState] = [:]
+    private var paneLocks: [UUID: NSLock] = [:]
+    private let bound: Bound
 
-    init(directory: URL? = nil) {
+    /// What the newest enqueued write leaves on disk for a pane.
+    private struct LogTip {
+        let epoch: UInt64
+        var viewport: RelayViewport
+        var payloadCount: Int
+        var fingerprint: Fingerprint
+        var remoteSequence: UInt64
+        var truncated: Bool
+        var trackerState: TerminalSnapshotTrackerState?
+        var fileLength: Int
+        var deltaFrames: Int
+        /// Set when the checkpoint bounded an oversized stream, so an unchanged
+        /// oversized save is recognised before compacting it again.
+        var oversizedSource: OversizedSource?
+    }
+
+    private struct Fingerprint: Equatable {
+        let head: SHA256.Digest
+        let tail: SHA256.Digest
+    }
+
+    private struct OversizedSource: Equatable {
+        let byteCount: Int
+        let digest: SHA256.Digest
+    }
+
+    private enum PendingWrite {
+        case checkpoint(Data)
+        case append(Data, offset: Int)
+    }
+
+    init(
+        directory: URL? = nil,
+        bound: @escaping Bound = { TerminalSnapshotStore.boundedReportingTruncation($0) }
+    ) {
         let base = directory ?? RelayStateProfile.applicationSupportRoot
             .appendingPathComponent("Relay/TerminalSnapshots", isDirectory: true)
         self.directory = base
+        self.bound = bound
         SecureFiles.createPrivateDirectory(at: base)
+    }
+
+    /// The grid this pane's log was last saved at, read from its header only.
+    func savedViewport(paneID: UUID) -> RelayViewport? {
+        guard let handle = try? FileHandle(forReadingFrom: snapshotURL(paneID)) else { return nil }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: TerminalSnapshotLogCodec.headerBytes) else { return nil }
+        return TerminalSnapshotLogCodec.headerViewport(header)
     }
 
     func load(paneID: UUID, viewport: RelayViewport) -> Data? {
@@ -111,7 +324,19 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         paneID: UUID,
         viewport: RelayViewport
     ) -> TerminalSnapshotRecordCodec.Snapshot? {
-        guard let record = loadRecord(paneID: paneID) else { return nil }
+        if let log = loadLog(paneID: paneID) {
+            // Bounded overflow suffixes have no self-contained screen; the
+            // window check still catches buffers bounded outside this store.
+            guard log.viewport == viewport, !log.truncated,
+                  !Self.isLegacyLossySnapshot(log.payload) else { return nil }
+            adoptLoadedLog(log, paneID: paneID)
+            return TerminalSnapshotRecordCodec.Snapshot(
+                payload: log.payload,
+                remoteSequence: log.remoteSequence,
+                trackerState: log.trackerState
+            )
+        }
+        guard let record = loadLegacyRecord(paneID: paneID) else { return nil }
         guard let snapshot = TerminalSnapshotRecordCodec.decodeSnapshot(
             record, expectedViewport: viewport
         ) else { return nil }
@@ -126,22 +351,58 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         )
     }
 
+    /// Bracketed paste is an input mode, not screen geometry. A cursor-only
+    /// restore (other viewport, truncated suffix) still resumes after the
+    /// bytes that enabled it, so its last observed state must survive. Also
+    /// adopts the log so a later suffix checkpoint can carry that state.
+    func loadBracketedPasteState(paneID: UUID) -> TerminalBracketedPasteStateTracker.PersistentState? {
+        guard let log = loadLog(paneID: paneID) else { return nil }
+        let state: TerminalBracketedPasteStateTracker.PersistentState
+        if let saved = log.trackerState {
+            state = saved.bracketedPaste
+        } else if !log.truncated {
+            // Quit-time checkpoints skip the tracker scan; a complete
+            // stream's last 2004 toggle is still authoritative.
+            let tracker = TerminalBracketedPasteStateTracker()
+            tracker.observe(log.payload)
+            state = tracker.persistentState
+        } else {
+            return nil
+        }
+        adoptLoadedLog(log, paneID: paneID)
+        lock.lock()
+        bracketedPasteSeeds[paneID] = state
+        lock.unlock()
+        return state
+    }
+
     func loadResumeCursor(paneID: UUID) -> UInt64? {
-        guard let record = loadRecord(paneID: paneID) else { return nil }
+        if let log = loadLog(paneID: paneID) { return log.remoteSequence }
+        guard let record = loadLegacyRecord(paneID: paneID) else { return nil }
         return TerminalSnapshotRecordCodec.resumeCursor(record)
     }
 
+    /// `truncated` marks a buffer already cut to a suffix without its screen
+    /// base; it is persisted for the resume cursor but never replayed.
     func save(
         _ data: Data,
         paneID: UUID,
         viewport: RelayViewport,
-        remoteSequence: UInt64 = 0
+        remoteSequence: UInt64 = 0,
+        truncated: Bool = false
     ) {
-        guard let pending = reserve(
-            data, paneID: paneID, viewport: viewport, remoteSequence: remoteSequence
+        let paneLock = lockForPane(paneID)
+        paneLock.lock()
+        defer { paneLock.unlock() }
+        guard let (pending, epoch) = reserve(
+            data, paneID: paneID, viewport: viewport,
+            remoteSequence: remoteSequence, truncated: truncated,
+            computesTrackerState: true
         ) else { return }
+        // Enqueued under the pane lock: appends must reach disk in the order
+        // their offsets were assigned.
         queue.async { [weak self] in
-            self?.write(pending.record, paneID: paneID, generation: pending.generation)
+            self?.perform(pending, paneID: paneID, epoch: epoch)
         }
     }
 
@@ -151,14 +412,20 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         _ data: Data,
         paneID: UUID,
         viewport: RelayViewport,
-        remoteSequence: UInt64 = 0
+        remoteSequence: UInt64 = 0,
+        truncated: Bool = false
     ) {
-        if let pending = reserve(
-            data, paneID: paneID, viewport: viewport, remoteSequence: remoteSequence
+        let paneLock = lockForPane(paneID)
+        paneLock.lock()
+        defer { paneLock.unlock() }
+        // Quit must stay fast across many panes: a checkpoint written here
+        // skips the tracker scan, and restore falls back to observing it.
+        if let (pending, epoch) = reserve(
+            data, paneID: paneID, viewport: viewport,
+            remoteSequence: remoteSequence, truncated: truncated,
+            computesTrackerState: false
         ) {
-            queue.sync {
-                write(pending.record, paneID: paneID, generation: pending.generation)
-            }
+            queue.sync { perform(pending, paneID: paneID, epoch: epoch) }
         } else {
             // An identical async write may already be queued. A synchronous
             // barrier guarantees it completes before AppKit exits.
@@ -168,22 +435,46 @@ final class TerminalSnapshotStore: @unchecked Sendable {
 
     func remove(paneID: UUID) {
         lock.lock()
-        generations[paneID] = (generations[paneID] ?? 0) &+ 1
-        scheduledDigests.removeValue(forKey: paneID)
+        epochs[paneID] = (epochs[paneID] ?? 0) &+ 1
+        tips.removeValue(forKey: paneID)
+        bracketedPasteSeeds.removeValue(forKey: paneID)
         lock.unlock()
-        queue.async { [directory] in
-            try? FileManager.default.removeItem(
-                at: directory.appendingPathComponent(paneID.uuidString.lowercased() + ".ansi")
-            )
+        let urls = [snapshotURL(paneID), legacySnapshotURL(paneID)]
+        queue.async {
+            for url in urls { try? FileManager.default.removeItem(at: url) }
         }
     }
 
     private func snapshotURL(_ paneID: UUID) -> URL {
+        directory.appendingPathComponent(paneID.uuidString.lowercased() + ".snap")
+    }
+
+    private func legacySnapshotURL(_ paneID: UUID) -> URL {
         directory.appendingPathComponent(paneID.uuidString.lowercased() + ".ansi")
     }
 
-    private func loadRecord(paneID: UUID) -> Data? {
+    private func lockForPane(_ paneID: UUID) -> NSLock {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = paneLocks[paneID] { return existing }
+        let created = NSLock()
+        paneLocks[paneID] = created
+        return created
+    }
+
+    private func loadLog(paneID: UUID) -> TerminalSnapshotLogCodec.Log? {
         let url = snapshotURL(paneID)
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize,
+              size > TerminalSnapshotLogCodec.headerBytes,
+              size <= Self.maximumLogBytes,
+              let file = try? Data(contentsOf: url, options: .mappedIfSafe)
+        else { return nil }
+        return TerminalSnapshotLogCodec.decode(file)
+    }
+
+    private func loadLegacyRecord(paneID: UUID) -> Data? {
+        let url = legacySnapshotURL(paneID)
         guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
               let size = values.fileSize,
               size > TerminalSnapshotRecordCodec.minimumHeaderBytes,
@@ -192,40 +483,171 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         return try? Data(contentsOf: url, options: .mappedIfSafe)
     }
 
+    /// A restored payload becomes the live buffer, so the next save can append
+    /// to the log it came from. A torn tail beyond `validLength` is truncated
+    /// by that first append.
+    private func adoptLoadedLog(_ log: TerminalSnapshotLogCodec.Log, paneID: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard tips[paneID] == nil else { return }
+        tips[paneID] = LogTip(
+            epoch: epochs[paneID] ?? 0,
+            viewport: log.viewport,
+            payloadCount: log.payload.count,
+            fingerprint: Self.fingerprint(log.payload, count: log.payload.count),
+            remoteSequence: log.remoteSequence,
+            truncated: log.truncated,
+            trackerState: log.trackerState,
+            fileLength: log.validLength,
+            deltaFrames: log.deltaFrames,
+            oversizedSource: nil
+        )
+    }
+
+    private static func fingerprint(_ data: Data, count: Int) -> Fingerprint {
+        let sample = min(fingerprintBytes, count)
+        let start = data.startIndex
+        return Fingerprint(
+            head: SHA256.hash(data: data[start..<(start + sample)]),
+            tail: SHA256.hash(data: data[(start + count - sample)..<(start + count)])
+        )
+    }
+
+    /// Caller holds the pane lock.
     private func reserve(
         _ data: Data,
         paneID: UUID,
         viewport: RelayViewport,
-        remoteSequence: UInt64
-    ) -> (record: Data, generation: UInt64)? {
+        remoteSequence: UInt64,
+        truncated: Bool,
+        computesTrackerState: Bool
+    ) -> (PendingWrite, epoch: UInt64)? {
         guard !data.isEmpty else { return nil }
-        let bounded = Self.bounded(data)
-        let record = TerminalSnapshotRecordCodec.encode(
-            bounded, viewport: viewport, remoteSequence: remoteSequence
-        )
-        let digest = Data(SHA256.hash(data: record))
         lock.lock()
-        defer { lock.unlock() }
-        guard scheduledDigests[paneID] != digest else { return nil }
-        scheduledDigests[paneID] = digest
-        let generation = (generations[paneID] ?? 0) &+ 1
-        generations[paneID] = generation
-        return (record, generation)
+        let epoch = epochs[paneID] ?? 0
+        let tip = tips[paneID].flatMap { $0.epoch == epoch ? $0 : nil }
+        let bracketedPasteSeed = tip?.trackerState?.bracketedPaste ?? bracketedPasteSeeds[paneID]
+        lock.unlock()
+
+        // Tracker state at the end of `data`, when it extends the persisted log.
+        var extendedState: TerminalSnapshotTrackerState?
+        if let tip, tip.viewport == viewport, tip.truncated == truncated,
+           data.count <= Self.maximumBytes, data.count >= tip.payloadCount,
+           Self.fingerprint(data, count: tip.payloadCount) == tip.fingerprint {
+            if data.count == tip.payloadCount, remoteSequence == tip.remoteSequence {
+                return nil
+            }
+            let delta = data.subdata(in: (data.startIndex + tip.payloadCount)..<data.endIndex)
+            let state = tip.trackerState.flatMap { $0.advanced(by: delta) }
+            extendedState = state
+            // A quit-time checkpoint has no state; the next background save
+            // replaces it once rather than appending stateless frames forever.
+            let healsState = computesTrackerState && tip.trackerState == nil
+            if tip.deltaFrames < Self.maximumDeltaFrames, !healsState {
+                let frame = TerminalSnapshotLogCodec.frame(
+                    kind: .delta, truncated: truncated, remoteSequence: remoteSequence,
+                    trackerState: state, payload: delta
+                )
+                var next = tip
+                next.payloadCount = data.count
+                next.fingerprint = Self.fingerprint(data, count: data.count)
+                next.remoteSequence = remoteSequence
+                next.trackerState = state
+                next.fileLength += frame.count
+                next.deltaFrames += 1
+                next.oversizedSource = nil
+                lock.lock()
+                tips[paneID] = next
+                lock.unlock()
+                return (.append(frame, offset: tip.fileLength), epoch)
+            }
+        }
+
+        var payload = data
+        var payloadTruncated = truncated
+        var oversizedSource: OversizedSource?
+        if data.count > Self.maximumBytes {
+            // Hashing is a single linear pass; compaction rescans for replay
+            // sequences. Rule out an unchanged stream before paying for it.
+            let source = OversizedSource(byteCount: data.count, digest: SHA256.hash(data: data))
+            if let tip, tip.oversizedSource == source, tip.viewport == viewport,
+               tip.remoteSequence == remoteSequence {
+                return nil
+            }
+            let bounded = bound(data)
+            payload = bounded.data
+            payloadTruncated = truncated || bounded.truncated
+            oversizedSource = source
+        }
+        // A frame-limit checkpoint reuses the incremental state: `payload` is
+        // `data` there, since only in-bound streams extend the log.
+        // A suffix has no screen base, but bracketed paste is last-wins over
+        // the whole stream: seed it from the previous state so a mode enabled
+        // before the cut survives the next cursor-only restore. Suffix logs
+        // never hydrate the screen trackers, so even a quit-time checkpoint
+        // records this one cheap mode.
+        var state = extendedState
+        if state == nil, computesTrackerState {
+            var base = TerminalSnapshotTrackerState.initial
+            if payloadTruncated, let bracketedPasteSeed { base.bracketedPaste = bracketedPasteSeed }
+            state = base.advanced(by: payload)
+        } else if state == nil, payloadTruncated, let bracketedPasteSeed {
+            let tracker = TerminalBracketedPasteStateTracker()
+            tracker.restore(bracketedPasteSeed)
+            tracker.observe(payload)
+            var suffix = TerminalSnapshotTrackerState.initial
+            suffix.bracketedPaste = tracker.persistentState
+            state = suffix
+        }
+        var file = TerminalSnapshotLogCodec.header(viewport: viewport)
+        file.append(TerminalSnapshotLogCodec.frame(
+            kind: .checkpoint, truncated: payloadTruncated, remoteSequence: remoteSequence,
+            trackerState: state, payload: payload
+        ))
+        lock.lock()
+        tips[paneID] = LogTip(
+            epoch: epoch,
+            viewport: viewport,
+            payloadCount: payload.count,
+            fingerprint: Self.fingerprint(payload, count: payload.count),
+            remoteSequence: remoteSequence,
+            truncated: payloadTruncated,
+            trackerState: state,
+            fileLength: file.count,
+            deltaFrames: 0,
+            oversizedSource: oversizedSource
+        )
+        lock.unlock()
+        return (.checkpoint(file), epoch)
     }
 
-    private func write(_ record: Data, paneID: UUID, generation: UInt64) {
+    private func perform(_ pending: PendingWrite, paneID: UUID, epoch: UInt64) {
         lock.lock()
-        let current = generations[paneID] == generation
+        let current = (epochs[paneID] ?? 0) == epoch
         lock.unlock()
         guard current else { return }
         let url = snapshotURL(paneID)
         do {
-            try record.write(to: url, options: .atomic)
-            SecureFiles.restrictToOwner(url)
+            switch pending {
+            case .checkpoint(let file):
+                try file.write(to: url, options: .atomic)
+                SecureFiles.restrictToOwner(url)
+                try? FileManager.default.removeItem(at: legacySnapshotURL(paneID))
+            case .append(let frame, let offset):
+                let handle = try FileHandle(forUpdating: url)
+                defer { try? handle.close() }
+                // Drops a torn frame left by a crash before appending.
+                try handle.truncate(atOffset: UInt64(offset))
+                try handle.seek(toOffset: UInt64(offset))
+                try handle.write(contentsOf: frame)
+            }
         } catch {
+            // Later queued deltas assume this write landed. Invalidate them;
+            // the next save starts a fresh checkpoint.
             lock.lock()
-            if generations[paneID] == generation {
-                scheduledDigests.removeValue(forKey: paneID)
+            if (epochs[paneID] ?? 0) == epoch {
+                epochs[paneID] = epoch &+ 1
+                tips.removeValue(forKey: paneID)
             }
             lock.unlock()
             RelayDiagnostics.shared.record(category: "snapshot", name: "write-failed", details: [
@@ -235,18 +657,27 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         }
     }
 
-    static func bounded(_ data: Data) -> Data {
+    static func bounded(_ data: Data, maximumBytes: Int = maximumBytes) -> Data {
+        boundedReportingTruncation(data, maximumBytes: maximumBytes).data
+    }
+
+    /// `truncated` is true when even the compacted stream had to be cut to a
+    /// suffix, which loses the screen base its cursor addressing relies on.
+    static func boundedReportingTruncation(
+        _ data: Data,
+        maximumBytes: Int = maximumBytes
+    ) -> (data: Data, truncated: Bool) {
         // Small snapshots are already bounded and replay quickly. Scanning the
         // same ANSI stream on every periodic save was pure background work.
-        guard data.count > maximumBytes else { return data }
+        guard data.count > maximumBytes else { return (data, false) }
         let compacted = TerminalReplayCompactor.compact(data)
-        guard compacted.count > maximumBytes else { return compacted }
+        guard compacted.count > maximumBytes else { return (compacted, false) }
         var result = Data("\u{001B}c".utf8)
         result.append(TerminalReplayCompactor.safeSuffix(
             compacted,
             maximumBytes: maximumBytes - result.count
         ))
-        return result
+        return (result, true)
     }
 
     /// Older overflow snapshots were cut at an arbitrary byte, including the

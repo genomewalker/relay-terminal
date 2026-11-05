@@ -122,8 +122,8 @@ func (s *Server) hostFileOperation(r hostRequest) (any, error) {
 			tools[name] = err == nil
 		}
 		return map[string]any{"platform": runtime.GOOS, "architecture": runtime.GOARCH, "home": home,
-			"operations": []string{"exec", "status", "input", "cancel", "file_stat", "file_list", "file_read", "file_write", "file_verify", "file_upload_begin", "file_upload_status", "file_upload_chunk", "file_upload_commit", "file_upload_cancel", "file_folder_destination", "file_folder_begin", "file_folder_status", "file_folder_chunk", "file_folder_file_commit", "file_folder_commit", "file_folder_cancel", "file_folder_cleanup", "process_list", "process_signal"}, "tools": tools,
-			"folder_upload_protocol": 1, "folder_upload_limits": map[string]any{"max_entries": 1024, "max_file_bytes": maxImportedFileBytes, "max_total_bytes": int64(1 << 30), "max_chunk_bytes": 4 << 20}, "folder_atomic_visibility": false}, nil
+			"operations": []string{"exec", "status", "input", "cancel", "file_stat", "file_list", "file_read", "file_write", "file_verify", "file_upload_begin", "file_upload_status", "file_upload_chunk", "file_upload_commit", "file_upload_cancel", "file_folder_destination", "file_folder_begin", "file_folder_status", "file_folder_chunk", "file_folder_file_commit", "file_folder_commit", "file_folder_cancel", "file_folder_cleanup", "process_list", "process_signal", "agent_accounts"}, "tools": tools,
+			"file_upload_protocol": 2, "file_upload_unbounded": true, "file_upload_chunk_bytes": 4 << 20, "folder_upload_protocol": 1, "folder_upload_limits": map[string]any{"max_entries": 1024, "max_file_bytes": maximumStreamedFileBytes, "max_total_bytes": maximumStreamedFileBytes, "max_chunk_bytes": 4 << 20}, "folder_atomic_visibility": false}, nil
 	}
 	if r.Path == "" || len(r.Path) > 4096 || strings.ContainsRune(r.Path, 0) {
 		return nil, errors.New("bounded path required")

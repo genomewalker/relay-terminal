@@ -31,7 +31,20 @@ final class RelayCallerControl: ObservableObject {
         let paneID: String?
         let jobID: String?
         let outcome: String
+        /// The user request behind an in-process Relay assistant action.
+        var request: String? = nil
+        /// Relay assistant Change actions: stable action ID, SHA-256 of the
+        /// exact request body, and a redacted preview of its arguments.
+        var actionID: String? = nil
+        var argumentsDigest: String? = nil
+        var preview: String? = nil
     }
+    static let assistantCaller = "relay-assistant"
+    /// A reserved, app-owned publisher namespace. No caller token maps to it;
+    /// only the in-process assistant route may select it. It grants nothing.
+    static let assistantPublisher = "a5515700-0000-4000-8000-00000000face"
+    /// MCP calls on the Miko supervisor channel, by kernel-verified pane.
+    static let supervisorCaller = "miko-supervisor"
     private struct Disk: Codable {
         var callers: [Caller] = []
         var audit: [Audit] = []
@@ -40,10 +53,25 @@ final class RelayCallerControl: ObservableObject {
     }
     @Published private var disk = Disk()
     @Published private var daemonSnapshots: [String: [Summary]] = [:]
-    @Published private var daemonReadFailed = false
+    /// Hosts whose latest caller-list read failed.
+    @Published private var daemonReadFailures: Set<String> = []
+    private var daemonReadFailed: Bool { !daemonReadFailures.isEmpty }
     /// Recorded on every MCP request. Deliberately not published: SwiftUI
     /// would otherwise lay out caller views twice per request.
     private var auditRecords: [Audit] = []
+    /// Connection key -> the transport incarnation and policy revision the
+    /// daemon last received. A matching attach is skipped entirely.
+    private var attachedDaemons: [String: String] = [:]
+    /// Bumped whenever local callers or the installation pause change, so the
+    /// next attach to each host imports them again.
+    private var policyRevision = 0
+    /// Replaceable in tests: the daemon transport and its incarnation.
+    var policyTransport: @MainActor (ConnectionProfile, [String: Any]) async throws -> [String: Any] = { profile, packet in
+        let result = try await RelayHostExecution.communicationRequest(profile: profile, packet: packet)
+        guard let value = result.value else { throw RelayHostRPCError.invalidRequest }
+        return value
+    }
+    var transportIncarnation: (ConnectionProfile) -> String? = { RelayNodeTransportPool.shared.incarnation(profile: $0) }
     static let auditLimit = 2000
     private let url: URL
     private let auditLog: RelayCallerAuditLog
@@ -94,6 +122,7 @@ final class RelayCallerControl: ObservableObject {
         }
         disk.callers.append(caller)
         do { try save() } catch { disk.callers.removeLast(); throw error }
+        policyRevision += 1
         return ["caller_id": id.uuidString.lowercased(), "caller_token": token,
                 "identity": "registered_client; thread_label_is_claimed"]
     }
@@ -101,52 +130,76 @@ final class RelayCallerControl: ObservableObject {
         guard storageReady else { throw RelayHostRPCError.invalidRequest }
         guard let token else { return "legacy-unattributed" }
         guard token.utf8.count <= 200,
-              let caller = disk.callers.first(where: { $0.tokenHash == hash(token) }) else {
+              let caller = disk.callers.first(where: { $0.tokenHash == hash(token) }),
+              caller.id.uuidString.lowercased() != Self.assistantPublisher else {
             throw RelayHostRPCError.invalidRequest
         }
         return caller.id.uuidString.lowercased()
     }
     func permitted(_ identity: String) -> Bool {
+        // The in-app Relay assistant uses the installation credential path, so
+        // the installation-level pause also pauses it.
         if identity == "legacy-unattributed" { return !disk.legacyPaused }
+        if identity == Self.assistantCaller { return !disk.legacyPaused }
+        if identity == Self.assistantPublisher { return !disk.legacyPaused }
         return disk.callers.first { $0.id.uuidString.lowercased() == identity }?.paused == false
     }
-    @discardableResult private func daemonPolicyRequest(profile: ConnectionProfile, packet: [String: Any]) async throws -> [String: Any] {
-        let fallback = RelayHostExecution.daemonCommand(profile: profile, arguments: ["communication"])
-        let command = "if [ -x \"$HOME/.local/share/relay/bin/relayd-communication\" ]; then \"$HOME/.local/share/relay/bin/relayd-communication\" communication; else " + fallback + "; fi"
-        let result = try await RelayHostExecution.capture(profile: profile, command: command,
-            input: JSONSerialization.data(withJSONObject: packet, options: .sortedKeys), timeout: 60, maximumBytes: 128 << 10)
-        guard result.exitCode == 0, let value = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any] else { throw RelayHostRPCError.invalidRequest }
-        return value
+    func isRegisteredPublisher(_ identity: String) -> Bool {
+        identity == Self.assistantPublisher || summaries.contains { $0.id == identity }
     }
+    @discardableResult private func daemonPolicyRequest(profile: ConnectionProfile, packet: [String: Any]) async throws -> [String: Any] {
+        try await policyTransport(profile, packet)
+    }
+    /// Imports the local caller policy into a host's daemon once per transport
+    /// incarnation and policy revision; a reconnect or a local policy change
+    /// imports it again. Only an actual import reads that host's caller list.
     func attachDaemon(profile: ConnectionProfile) async throws {
         guard storageReady else { throw RelayHostRPCError.invalidRequest }
+        let key = profile.connectionKey
+        let revision = policyRevision
+        let incarnation = transportIncarnation(profile)
+        if let incarnation, attachedDaemons[key] == "\(incarnation)|\(revision)" { return }
         // Import is create-only: server pause changes survive stale client caches.
         let policy: [String: Any] = ["callers": try JSONSerialization.jsonObject(with: JSONEncoder().encode(disk.callers)),
                                     "legacyPaused": disk.legacyPaused]
         try await daemonPolicyRequest(profile: profile, packet: ["operation": "caller_policy_import", "policy": policy])
-        if !(disk.daemonOwners ?? []).contains(where: { $0.connectionKey == profile.connectionKey }) {
+        if !(disk.daemonOwners ?? []).contains(where: { $0.connectionKey == key }) {
             let old = disk
             disk.daemonOwners = (disk.daemonOwners ?? []) + [profile]
             do { try save() } catch { disk = old; throw error }
         }
-        try await refreshDaemonPolicies()
+        try await refreshDaemonPolicy(profile)
+        // Only the incarnation read before the import is known to hold the
+        // policy, and only while it is still current: a transport created or
+        // reconnected during these requests is attached again next time.
+        if let incarnation, transportIncarnation(profile) == incarnation { attachedDaemons[key] = "\(incarnation)|\(revision)" }
     }
+    /// Reads every daemon owner's caller list: after a policy change, and
+    /// while the Settings caller view is open. Polling paths never call it.
     func refreshDaemonPolicies() async throws {
-        daemonReadFailed = false
         var failed = false
         for profile in disk.daemonOwners ?? [] {
-            do {
-                let response = try await daemonPolicyRequest(profile: profile, packet: ["operation": "caller_list"])
-                guard response["authority"] as? String == "relayd", let callers = response["callers"] as? [[String: Any]] else { throw RelayHostRPCError.invalidRequest }
-                let values = try callers.map { item -> Summary in
-                    guard let id = item["caller_id"] as? String, let label = item["label"] as? String, let paused = item["paused"] as? Bool else { throw RelayHostRPCError.invalidRequest }
-                    return Summary(id: id, label: label, thread: item["thread"] as? String, paused: paused)
-                }
-                daemonSnapshots[profile.connectionKey] = values
-            } catch { failed = true }
+            do { try await refreshDaemonPolicy(profile) } catch { failed = true }
         }
-        daemonReadFailed = failed
         if failed { throw RelayHostRPCError.invalidRequest }
+    }
+    private func refreshDaemonPolicy(_ profile: ConnectionProfile) async throws {
+        do {
+            try await readDaemonPolicy(profile)
+            daemonReadFailures.remove(profile.connectionKey)
+        } catch {
+            daemonReadFailures.insert(profile.connectionKey)
+            throw error
+        }
+    }
+    private func readDaemonPolicy(_ profile: ConnectionProfile) async throws {
+        let response = try await daemonPolicyRequest(profile: profile, packet: ["operation": "caller_list"])
+        guard response["authority"] as? String == "relayd", let callers = response["callers"] as? [[String: Any]] else { throw RelayHostRPCError.invalidRequest }
+        let values = try callers.map { item -> Summary in
+            guard let id = item["caller_id"] as? String, let label = item["label"] as? String, let paused = item["paused"] as? Bool else { throw RelayHostRPCError.invalidRequest }
+            return Summary(id: id, label: label, thread: item["thread"] as? String, paused: paused)
+        }
+        daemonSnapshots[profile.connectionKey] = values
     }
     func setPaused(id: String, paused: Bool) async throws {
         guard id == "legacy-unattributed" || disk.callers.contains(where: { $0.id.uuidString.lowercased() == id }) else { throw RelayHostRPCError.invalidRequest }
@@ -169,6 +222,7 @@ final class RelayCallerControl: ObservableObject {
             disk.callers[i].paused = paused
         }
         do { try save() } catch { disk = old; throw error }
+        policyRevision += 1
         try await refreshDaemonPolicies()
     }
     func listing() -> [[String: String]] {
@@ -194,6 +248,40 @@ final class RelayCallerControl: ObservableObject {
         summaries.first(where: { $0.id == identity })?.label ?? identity
     }
     func audit() -> [Audit] { auditRecords }
+    /// Relay assistant navigation runs in-process rather than over MCP, but is
+    /// journaled in the same durable, append-only caller audit with the
+    /// assistant request that caused it.
+    func recordAssistantAction(operation: String, requestID: String, request: String,
+                               tabID: UUID?, paneID: UUID?, outcome: String, path: String = "in-process/relay-assistant",
+                               actionID: UUID? = nil, argumentsDigest: String? = nil, preview: String? = nil) throws {
+        guard storageReady else { throw RelayHostRPCError.invalidRequest }
+        var record = Audit(id: UUID(), at: Date(), caller: Self.assistantCaller, path: String(path.prefix(180)),
+            operation: String(operation.prefix(128)), requestID: String(requestID.prefix(128)),
+            tabID: tabID?.uuidString.lowercased(), paneID: paneID?.uuidString.lowercased(), jobID: nil,
+            outcome: String(outcome.prefix(64)), request: RelayAssistantSnapshot.clean(request, limit: 240))
+        record.actionID = actionID?.uuidString.lowercased()
+        record.argumentsDigest = argumentsDigest.map { String($0.prefix(64)) }
+        record.preview = preview.map { RelayAssistantSnapshot.clean($0, limit: 240) }
+        try auditLog.append(record)
+        auditRecords.append(record)
+        if auditRecords.count > Self.auditLimit { auditRecords.removeFirst(auditRecords.count - Self.auditLimit) }
+    }
+    /// A Miko supervisor channel call: the supervisor's kernel-verified pane,
+    /// the single-use attestation it was proven by, and the exact arguments'
+    /// digest. Durable before the call is answered.
+    func recordSupervisorAction(supervisorPaneID: String, operation: String, requestID: String, attestationID: String,
+                                argumentsDigest: String, preview: String?, outcome: String) throws {
+        guard storageReady else { throw RelayHostRPCError.invalidRequest }
+        var record = Audit(id: UUID(), at: Date(), caller: Self.supervisorCaller,
+            path: "mcp/miko-supervisor/attestation/" + String(attestationID.prefix(32)),
+            operation: String(operation.prefix(128)), requestID: String(requestID.prefix(128)),
+            tabID: nil, paneID: String(supervisorPaneID.prefix(64)), jobID: nil, outcome: String(outcome.prefix(64)))
+        record.argumentsDigest = String(argumentsDigest.prefix(64))
+        record.preview = preview.map { RelayAssistantSnapshot.clean(RelayAssistantRedaction.redact($0), limit: 240) }
+        try auditLog.append(record)
+        auditRecords.append(record)
+        if auditRecords.count > Self.auditLimit { auditRecords.removeFirst(auditRecords.count - Self.auditLimit) }
+    }
     /// Durable before returning, so callers can keep refusing to dispatch an
     /// operation whose audit failed. Costs one small append, not a rewrite.
     func record(caller: String, request: RelaySidePanelHTTPRequest, outcome: String,

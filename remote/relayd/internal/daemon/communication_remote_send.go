@@ -44,6 +44,9 @@ func remoteOutboundResult(receipt communicationRemoteOutbound) map[string]any {
 	result["target_node_id"], result["pane_id"], result["submitting_client_id"] = receipt.Wire.TargetNodeID, receipt.Wire.TargetPaneID, receipt.Wire.CallerID
 	result["fingerprint"], result["link_id"], result["authority"] = receipt.Wire.Fingerprint, receipt.Wire.LinkID, "relayd"
 	result["source_authentication"], result["desktop_required"], result["replay_permitted"] = "claimed_pane_label", false, false
+	if receipt.Result["source_authentication"] == "source_signed" {
+		result["source_authentication"] = "source_signed"
+	}
 	result["peer_authentication"] = "not_confirmed"
 	if receipt.PeerConfirmed {
 		result["peer_authentication"] = "mutual_tls_pinned_node"
@@ -137,6 +140,9 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 	wire := receipt.Wire
 	if !existing {
 		source := hooks.observe(r.SourcePaneID)
+		// A kernel-verified sender signs this exact message on this node, so the
+		// recipient can deliver its observed identity and permission class.
+		signature := communicationRemoteSourceSignature(root, node, r, link.PeerPaneID, hooks.observe)
 		claimed := false
 		err = communicationFanoutLocked(root, func() error {
 			identity, err := communicationAuthorize(root, r)
@@ -166,7 +172,8 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 			}
 			wire = communicationRemoteMessage{Version: 1, Operation: "send", LinkID: current.ID, SourceLinkRevision: current.Revision, TargetLinkRevision: current.PeerRevision,
 				SourceNodeID: node, TargetNodeID: current.PeerNodeID, SourcePaneID: current.LocalPaneID, TargetPaneID: current.PeerPaneID, CallerID: caller,
-				SourceConversation: current.LocalConversation, TargetConversation: current.PeerConversation, MessageID: r.MessageID, Text: r.Text}
+				SourceConversation: current.LocalConversation, TargetConversation: current.PeerConversation, MessageID: r.MessageID, Text: r.Text,
+				SourceSignature: signature}
 			wire.Fingerprint = remoteMessageFingerprint(wire)
 			receipt = communicationRemoteOutbound{Version: 1, NodeID: node, RouteID: current.RouteID, RouteRevision: current.RouteRevision,
 				PeerCertificateSHA256: current.PeerCertificateSHA256, Wire: wire, CreatedAt: time.Now().UTC(), Result: map[string]any{"status": "outcome_unknown"}}
@@ -220,6 +227,9 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 		reply["submitting_client_id"] == wire.CallerID && reply["fingerprint"] == wire.Fingerprint {
 		confirmed = true
 		outcome = communicationNativeOutcome(reply, nil)
+		if reply["source_authentication"] == "source_signed" {
+			outcome["source_authentication"] = "source_signed"
+		}
 	} else {
 		outcome["error"] = "peer outcome unavailable; query the durable receipt without resending"
 	}
@@ -245,6 +255,24 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 		return communicationEvent(root, node, "remote_outbound_outcome", []map[string]string{{"message_id": wire.MessageID, "status": fmtRemoteStatus(outcome)}})
 	})
 	return remoteOutboundResult(receipt), err
+}
+
+// communicationRemoteSourceSignature signs a remote message for its exact
+// target pane with this node's session certificate. A sender that is not
+// kernel-verified, or a node without a signing identity, sends unsigned.
+func communicationRemoteSourceSignature(root, node string, r CommunicationRequest, target string, observe func(string) communicationMember) string {
+	if !communicationSourceVerified(r) {
+		return ""
+	}
+	deps := defaultCommunicationSigningDeps(root, node)
+	deps.observe = observe
+	result, err := communicationSign(root, node, CommunicationRequest{Operation: "sign", SourcePaneID: r.SourcePaneID,
+		ActorPaneID: r.ActorPaneID, PaneID: target, MessageID: r.MessageID, Text: r.Text, ClientID: r.ClientID, actorVerified: true}, deps)
+	if err != nil {
+		return ""
+	}
+	signature, _ := result["source_signature"].(string)
+	return signature
 }
 
 func remotePeerPost(ctx context.Context, root, node string, binding CommunicationPeerBinding, body []byte) ([]byte, error) {

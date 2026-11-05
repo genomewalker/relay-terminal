@@ -16,15 +16,73 @@ type agentProcessSource func() (map[int]string, <-chan struct{})
 // Claude. The durable worker feeds this from Session's single /proc watcher, so
 // transcript support adds no extra process-tree traversals per pane.
 func observeAgentTranscripts(source agentProcessSource) (<-chan protocol.Frame, func()) {
+	run := observeAgentTranscriptsFrom(source, nil)
+	return run.frames, run.stop
+}
+
+// transcriptCursor is one provider transcript reader's position. A pane worker
+// that re-executes itself resumes from these instead of re-reading transcripts
+// from the start.
+type transcriptCursor struct {
+	Agent               string          `json:"agent"`
+	RootPID             int             `json:"root_pid"`
+	RootStart           uint64          `json:"root_start"`
+	Path                string          `json:"path,omitempty"`
+	Offset              int64           `json:"offset"`
+	DiscardingOversized bool            `json:"discarding_oversized,omitempty"`
+	Identity            [2]uint64       `json:"identity"`
+	Known               map[string]bool `json:"known,omitempty"`
+	Active              map[string]bool `json:"active,omitempty"`
+}
+
+type transcriptRun struct {
+	frames <-chan protocol.Frame
+	// stop cancels at once, possibly mid-transcript; used on worker exit.
+	stop func()
+	// drain stops after the current poll has delivered every frame it read
+	// and returns the cursors. The consumer must keep reading frames until
+	// the channel closes, or drain does not return.
+	drain func() []transcriptCursor
+}
+
+func observeAgentTranscriptsFrom(source agentProcessSource, seed []transcriptCursor) transcriptRun {
 	frames := make(chan protocol.Frame, 64)
 	stopped := make(chan struct{})
-	var stopOnce sync.Once
+	quit := make(chan struct{})
+	finished := make(chan struct{})
+	var cursors []transcriptCursor
+	var stopOnce, quitOnce sync.Once
+	codexReaders := make(map[int]*codexTranscriptReader)
+	claudeReaders := make(map[int]*claudeTranscriptReader)
+	for _, c := range seed {
+		switch c.Agent {
+		case "codex":
+			codexReaders[c.RootPID] = &codexTranscriptReader{rootPID: c.RootPID, rootStart: c.RootStart, path: c.Path,
+				offset: c.Offset, discardingOversized: c.DiscardingOversized, identity: c.Identity,
+				known: nonNilFlags(c.Known), active: nonNilFlags(c.Active)}
+		case "claude":
+			claudeReaders[c.RootPID] = &claudeTranscriptReader{rootPID: c.RootPID, rootStart: c.RootStart, path: c.Path,
+				offset: c.Offset, discardingOversized: c.DiscardingOversized, identity: c.Identity,
+				known: nonNilFlags(c.Known), active: nonNilFlags(c.Active)}
+		}
+	}
 	go func() {
+		defer close(finished)
 		defer close(frames)
+		defer func() {
+			for _, r := range codexReaders {
+				cursors = append(cursors, transcriptCursor{Agent: "codex", RootPID: r.rootPID, RootStart: r.rootStart,
+					Path: r.path, Offset: r.offset, DiscardingOversized: r.discardingOversized, Identity: r.identity,
+					Known: r.known, Active: r.active})
+			}
+			for _, r := range claudeReaders {
+				cursors = append(cursors, transcriptCursor{Agent: "claude", RootPID: r.rootPID, RootStart: r.rootStart,
+					Path: r.path, Offset: r.offset, DiscardingOversized: r.discardingOversized, Identity: r.identity,
+					Known: r.known, Active: r.active})
+			}
+		}()
 		timer := time.NewTimer(0)
 		defer timer.Stop()
-		codexReaders := make(map[int]*codexTranscriptReader)
-		claudeReaders := make(map[int]*claudeTranscriptReader)
 		var changed <-chan struct{}
 		idlePolls := 0
 
@@ -115,8 +173,25 @@ func observeAgentTranscripts(source agentProcessSource) (<-chan protocol.Frame, 
 				resetTimer(activity)
 			case <-stopped:
 				return
+			case <-quit:
+				return
 			}
 		}
 	}()
-	return frames, func() { stopOnce.Do(func() { close(stopped) }) }
+	return transcriptRun{
+		frames: frames,
+		stop:   func() { stopOnce.Do(func() { close(stopped) }) },
+		drain: func() []transcriptCursor {
+			quitOnce.Do(func() { close(quit) })
+			<-finished
+			return cursors
+		},
+	}
+}
+
+func nonNilFlags(flags map[string]bool) map[string]bool {
+	if flags == nil {
+		return make(map[string]bool)
+	}
+	return flags
 }

@@ -1,0 +1,11 @@
+{
+  "primary_wrapper_sha256": "4d5013c0d4f8faac8608e635c3fe48ab34f221898b1aae43948f9140688539ff",
+  "primary_wrapper_bytes": 814,
+  "cases": 12,
+  "corpus_sha256": "d6c20143938256122898bc0b5cba1ef08511d51a77ba965292fd1451b93c7df1",
+  "generator": "capture-primary.py outside selected source",
+  "method": "unchanged captured Python wrapper in isolated HOME beside fake private credential, execs copied native Go fixture; all 12 PID and parent identities matched, fake credential unchanged",
+  "normalization": "replace private HOME with /primary-home and dynamic PID/parent with zero; argv/env values unchanged",
+  "limits": "synthetic valid scalar desktop configurations; stricter malformed/oversize and caller-credential refusal is tested separately; no real credential or installed wrapper/provider",
+  "original_python_source_in_candidate": false
+}

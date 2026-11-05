@@ -12,8 +12,10 @@ bundle_name="${RELAY_BUNDLE_NAME:-Relay}"
 bundle_identifier="${RELAY_BUNDLE_IDENTIFIER:-dev.relay.terminal}"
 build_jobs="${RELAY_BUILD_JOBS:-2}"
 cd "$project_root"
-python3 "$project_root/scripts/check-rotation-resources.py"
-swift_build_args=(-c "$configuration" --jobs "$build_jobs")
+source "$project_root/scripts/build-app-steps.sh"
+check_rotation_resources "$project_root"
+check_native_library "$project_root/Vendor/libghostty-spm"
+swift_build_args=(-c "$configuration" --jobs "$build_jobs" --force-resolved-versions)
 # Keep compiler caches outside File Provider and use SwiftPM's supported default.
 # Canonicalize /tmp to /private/tmp so Clang never sees two module-cache paths.
 build_scratch="${RELAY_BUILD_SCRATCH_PATH:-/private/tmp/relay-swiftpm-build}"
@@ -39,15 +41,7 @@ fi
 output_path="${RELAY_APP_OUTPUT:-$default_output}"
 
 is_executable_running() {
-    /bin/ps -axo comm= | /usr/bin/perl -MCwd=realpath -e '
-        my $target = realpath(shift) // "";
-        while (my $path = <STDIN>) {
-            chomp $path;
-            my $resolved = realpath($path) // $path;
-            exit 0 if length($target) && $resolved eq $target;
-        }
-        exit 1;
-    ' -- "$1"
+    /bin/ps -axo comm= | relay_build_helper running "$1" 2>/dev/null
 }
 stage_root="$(mktemp -d "${TMPDIR:-/tmp}/relay-app.XXXXXX")"
 trap '/bin/rm -rf "$stage_root"' EXIT
@@ -57,8 +51,28 @@ mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
 cp "$binary_path/Relay" "$app_path/Contents/MacOS/Relay"
 cp "$binary_path/relay-bridge" "$app_path/Contents/MacOS/relay-bridge"
 # One signed Keychain client. Secrets use stdin/stdout pipes, never argv or files.
-/usr/bin/swiftc -O "$project_root/native/credentials/relay-credentials.swift" \
-    -o "$app_path/Contents/MacOS/relay-credentials"
+# Reuse the reviewed client while its source is unchanged: recompilation and
+# signing can change an ad-hoc requirement that an existing Keychain item trusts.
+credential_source_hash="$(/usr/bin/shasum -a 256 "$project_root/native/credentials/relay-credentials.swift" | /usr/bin/awk '{print $1}')"
+credential_previous_source="$(/usr/libexec/PlistBuddy -c 'Print :RelayCredentialHelperSourceSHA256' "$output_path/Contents/Info.plist" 2>/dev/null || true)"
+if [[ -n "$credential_previous_source" ]]; then
+    if [[ "$credential_previous_source" != "$credential_source_hash" ]]; then
+        echo "Credential helper source changed; prepare a Keychain migration before replacing the installed client." >&2
+        exit 1
+    fi
+    credential_previous_hash="$(/usr/libexec/PlistBuddy -c 'Print :RelayCredentialHelperSHA256' "$output_path/Contents/Info.plist")"
+    credential_actual_hash="$(/usr/bin/shasum -a 256 "$output_path/Contents/MacOS/relay-credentials" | /usr/bin/awk '{print $1}')"
+    if [[ "$credential_actual_hash" != "$credential_previous_hash" ]]; then
+        echo "Installed credential helper differs from its reviewed hash." >&2
+        exit 1
+    fi
+    /usr/bin/codesign --verify --strict "$output_path/Contents/MacOS/relay-credentials"
+    cp -p "$output_path/Contents/MacOS/relay-credentials" "$app_path/Contents/MacOS/relay-credentials"
+else
+    /usr/bin/swiftc -O "$project_root/native/credentials/relay-credentials.swift" \
+        -o "$app_path/Contents/MacOS/relay-credentials"
+fi
+credential_helper_hash="$(/usr/bin/shasum -a 256 "$app_path/Contents/MacOS/relay-credentials" | /usr/bin/awk '{print $1}')"
 
 # This bridge runs as the user, never as root. The privileged tunnel service is
 # separate; Homebrew libraries must not be loaded by a privileged service.
@@ -88,13 +102,7 @@ fi
 # File Provider-managed).
 for resource_bundle in "$binary_path"/*.bundle; do
     if [[ -d "$resource_bundle" ]]; then
-        # SwiftPM resource caches can contain symlinks to source assets. Materialize
-        # them so the installed bundle never depends on that build cache or checkout.
-        python3 - "$resource_bundle" "$app_path/Contents/Resources/$(basename "$resource_bundle")" <<'PY'
-import shutil
-import sys
-shutil.copytree(sys.argv[1], sys.argv[2], symlinks=False)
-PY
+        copy_resource_bundle "$resource_bundle" "$app_path/Contents/Resources/$(basename "$resource_bundle")"
     fi
 done
 
@@ -109,29 +117,7 @@ resource_root() {
 ghostty_bundle="$(resource_root "$app_path/Contents/Resources/GhosttyKit_GhosttyTerminal.bundle")"
 # Xcode's SwiftPM cache can emit an empty resource bundle with directory stubs.
 # Copy the pinned dependency's canonical resources as part of packaging.
-python3 - "$project_root/Vendor/libghostty-spm/Sources/GhosttyTerminal/Resources" "$ghostty_bundle" <<'PY'
-from pathlib import Path
-import shutil
-import sys
-source, destination = map(Path, sys.argv[1:])
-for name in ("Ghostty", "terminfo"):
-    if not (source / name).is_dir():
-        raise SystemExit("canonical Ghostty resources are missing")
-    shutil.copytree(source / name, destination / name, symlinks=False, dirs_exist_ok=True)
-required = (
-    "Ghostty/shell-integration/bash/bash-preexec.sh",
-    "Ghostty/shell-integration/bash/ghostty.bash",
-    "Ghostty/shell-integration/elvish/lib/ghostty-integration.elv",
-    "Ghostty/shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish",
-    "Ghostty/shell-integration/nushell/vendor/autoload/ghostty.nu",
-    "Ghostty/shell-integration/zsh/ghostty-integration",
-    "terminfo/67/ghostty", "terminfo/78/xterm-ghostty",
-)
-for relative in required:
-    path = destination / relative
-    if not path.is_file() or path.stat().st_size == 0:
-        raise SystemExit("packaged Ghostty resource is missing: " + relative)
-PY
+copy_ghostty_resources "$project_root/Vendor/libghostty-spm/Sources/GhosttyTerminal/Resources" "$ghostty_bundle"
 if [[ ! -d "$ghostty_bundle/Ghostty" || ! -d "$ghostty_bundle/terminfo" ]]; then
     echo "packaged Ghostty resources are incomplete" >&2
     exit 1
@@ -152,7 +138,8 @@ fi
 # Remote installation is explicit in the UI, but it must remain offline and
 # reproducible once authorized. Bundle the exact static Linux helpers inside
 # the signed app rather than downloading an executable at connection time.
-python3 "$project_root/scripts/sync-daemon-communication-assets.py"
+check_daemon_communication_assets "$project_root"
+native_helper_names="$(relay_build_helper helper-names)"
 for relay_architecture in amd64 arm64; do
     (
         cd "$project_root/remote/relayd"
@@ -168,6 +155,23 @@ for relay_architecture in amd64 arm64; do
             -o "$app_path/Contents/Resources/relay-peer-link-linux-$relay_architecture" ./cmd/relay-peer-link
     )
     chmod 0555 "$app_path/Contents/Resources/relay-peer-link-linux-$relay_architecture"
+    (
+        cd "$project_root/remote/relayd"
+        CGO_ENABLED=0 GOOS=linux GOARCH="$relay_architecture" \
+            go build -trimpath -ldflags="-s -w" \
+            -o "$app_path/Contents/Resources/relay-mcp-linux-$relay_architecture" ./cmd/relay-mcp
+    )
+    chmod 0555 "$app_path/Contents/Resources/relay-mcp-linux-$relay_architecture"
+    while IFS= read -r relay_helper; do
+        [[ -n "$relay_helper" ]] || continue
+        (
+            cd "$project_root/remote/relayd"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$relay_architecture" \
+                go build -trimpath -ldflags="-s -w" \
+                -o "$app_path/Contents/Resources/$relay_helper-linux-$relay_architecture" "./cmd/$relay_helper"
+        )
+        chmod 0555 "$app_path/Contents/Resources/$relay_helper-linux-$relay_architecture"
+    done <<< "$native_helper_names"
 done
 
 # The Linux payloads cannot run on the build Mac. Build the same source for the
@@ -190,8 +194,17 @@ cp "$relayd_version_check" "$app_path/Contents/MacOS/relayd"
     go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-connection" ./cmd/relay-connection
     go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-workspace" ./cmd/relay-workspace
 )
+while IFS= read -r relay_helper; do
+    [[ -n "$relay_helper" ]] || continue
+    (cd "$project_root/remote/relayd" && go build -trimpath -ldflags="-s -w" \
+        -o "$app_path/Contents/MacOS/$relay_helper" "./cmd/$relay_helper")
+done <<< "$native_helper_names
+relay-restart
+relay-preserving-update"
+# Reject stale SwiftPM resources in the completed bundle before signing.
+relay_build_helper assets-check "$app_path/Contents/Resources"
+write_release_manifest "$app_path" "$app_version" "$relayd_version" "$build_number"
 mkdir -p "$app_path/Contents/Resources/R"
-cp "$project_root/scripts/relay-workspace.py" "$app_path/Contents/Resources/relay-workspace.py"
 cp "$project_root/remote/r/relay-r.R" "$app_path/Contents/Resources/R/relay-r.R"
 cp "$project_root/remote/r/editor-tools.R" "$app_path/Contents/Resources/R/editor-tools.R"
 
@@ -253,12 +266,25 @@ fi
 # Some dependency bundles intentionally ship read-only terminfo and shader
 # files. The staged copy must be owner-writable while xattrs and signatures are
 # normalized; installed runtime permissions remain non-executable for data.
+/usr/libexec/PlistBuddy -c "Add :RelayCredentialHelperSourceSHA256 string $credential_source_hash" "$app_path/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :RelayCredentialHelperSHA256 string $credential_helper_hash" "$app_path/Contents/Info.plist"
 chmod -R u+w "$app_path"
 /usr/bin/xattr -cr "$app_path"
+# Keychain grants are bound to this helper's own signing requirement. Keep the
+# compiler's signed helper intact when normalizing the surrounding bundle; a
+# deep re-sign with the app's identity otherwise strands existing saved keys.
+cp -p "$app_path/Contents/MacOS/relay-credentials" "$stage_root/relay-credentials.signed"
 if [[ "$signing_identity" == "-" ]]; then
     /usr/bin/codesign --force --deep --sign - "$app_path"
 else
     /usr/bin/codesign --force --deep --options runtime --timestamp --sign "$signing_identity" "$app_path"
+fi
+cp -p "$stage_root/relay-credentials.signed" "$app_path/Contents/MacOS/relay-credentials"
+# Seal the restored nested signature without recursively replacing it again.
+if [[ "$signing_identity" == "-" ]]; then
+    /usr/bin/codesign --force --sign - "$app_path"
+else
+    /usr/bin/codesign --force --options runtime --timestamp --sign "$signing_identity" "$app_path"
 fi
 /usr/bin/xattr -cr "$app_path"
 /usr/bin/codesign --verify --deep --strict "$app_path"

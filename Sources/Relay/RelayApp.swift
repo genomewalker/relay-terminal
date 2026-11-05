@@ -184,6 +184,15 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
             return
         }
         Task { await RelayPluginManager.shared.installBundledVPN() }
+        if RelayAgentAccountDirectory.repairsLaunchersAtStart(bundlePath: Bundle.main.bundlePath,
+                environment: ProcessInfo.processInfo.environment, isolated: RelayStateProfile.isIsolated || RelayLaunchMode.isSafeMode) {
+            Task { _ = try? await RelayAgentAccountDirectory.shared.refreshLaunchers(.local, repair: true) }
+        }
+        // Remote hosts' account lists load as their panes report an account.
+        RelayAgentAccountDirectory.shared.registryLoader = { profile in
+            _ = try await RelayAgentAccountDirectory.shared.refresh(profile)
+        }
+        RelayLocalWorkerUpgrade.runAtLaunchIfNeeded(isolated: RelayStateProfile.isIsolated || RelayLaunchMode.isSafeMode)
         if ProcessInfo.processInfo.environment["RELAY_TERMINAL_DEBUG"] == "1" {
             // Developer-only lifecycle tracing. Deliberately excludes input
             // and output categories so terminal contents and secrets never
@@ -379,6 +388,7 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
         // Persist layout and tear down transports/children even when the last
         // window closed first (the SwiftUI subscription is already gone).
         PeerNetworkController.shared.disconnectAll()
+        RelayAssistantEntryPoints.shared.stop()
         workspace?.shutdown()
         responsivenessMonitor.stop()
         presentationSuspensionTask?.cancel()
@@ -550,6 +560,9 @@ struct RelayApp: App {
         // system xterm entry when this machine cannot resolve xterm-relay.
         RelayTerminfo.bootstrap()
         let workspace = WorkspaceModel()
+        RelayAttentionNotifier.shared.install(workspace: workspace)
+        // Saved auto-link scopes keep working after a relaunch.
+        if !RelayLaunchMode.isRunningTests { RelayAutoLinker.shared.attach(workspace) }
         _workspace = StateObject(wrappedValue: workspace)
         _preferences = StateObject(wrappedValue: RelayPreferences.shared)
         _sidePanelServer = StateObject(wrappedValue: RelaySidePanelServer(workspace: workspace))
@@ -629,6 +642,7 @@ struct RelayApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: .relaySplitDown)) { _ in
                     workspace.splitActive(axis: .vertical)
                 }
+                .modifier(RelayWorkOverviewCommand(workspace: workspace))
                 .onReceive(NotificationCenter.default.publisher(for: .relayClosePane)) { _ in
                     workspace.closeActivePane()
                 }
@@ -661,7 +675,10 @@ struct RelayApp: App {
                     PeerNetworkController.shared.disconnectAll()
                     workspace.shutdown()
                 }
-                .onAppear { applicationDelegate.workspace = workspace }
+                .onAppear {
+                    applicationDelegate.workspace = workspace
+                    RelayAssistantEntryPoints.shared.start { [weak workspace] in workspace?.toggleHaikuAssistant() }
+                }
         }
         .defaultSize(width: 1320, height: 820)
         .commands {
@@ -685,10 +702,12 @@ struct RelayApp: App {
                     .keyboardShortcut("a", modifiers: .command)
             }
             CommandGroup(replacing: .newItem) {
-                Button("New tab in session") { workspace.newTabInActiveSession() }
+                Button("New tab") { workspace.newTabInActiveSession() }
                     .keyboardShortcut(shortcut(.newTab).keyEquivalent, modifiers: shortcut(.newTab).eventModifiers)
                 Button("New local session") { workspace.newTab(profile: .local) }
                     .keyboardShortcut(shortcut(.newLocalSession).keyEquivalent, modifiers: shortcut(.newLocalSession).eventModifiers)
+                Button("Work overview…") { workspace.presentQuickNavigate() }
+                    .keyboardShortcut(shortcut(.quickNavigate).keyEquivalent, modifiers: shortcut(.quickNavigate).eventModifiers)
                 Button("Find SSH host…") { workspace.presentHostLauncher() }
                     .keyboardShortcut(shortcut(.findHost).keyEquivalent, modifiers: shortcut(.findHost).eventModifiers)
                 Button("Connect to host…") { workspace.presentConnectionSheet() }
@@ -703,19 +722,25 @@ struct RelayApp: App {
                     workspace.toggleActivePaneZoom()
                 }
                     .keyboardShortcut(shortcut(.zoomPane).keyEquivalent, modifiers: shortcut(.zoomPane).eventModifiers)
+                    .disabled(workspace.activePane == nil)
                 Button("Float or dock active pane") {
                     workspace.toggleActivePaneFloating()
                 }
                     .keyboardShortcut(shortcut(.floatPane).keyEquivalent, modifiers: shortcut(.floatPane).eventModifiers)
+                    .disabled(workspace.activePane == nil)
                 Button("Balance pane layout") { workspace.balanceActiveTabPanes() }
                     .keyboardShortcut(shortcut(.balancePanes).keyEquivalent, modifiers: shortcut(.balancePanes).eventModifiers)
+                    .disabled(workspace.visibleTab == nil)
                 Divider()
                 Button("Split right") { workspace.splitActive(axis: .horizontal) }
                     .keyboardShortcut(shortcut(.splitRight).keyEquivalent, modifiers: shortcut(.splitRight).eventModifiers)
+                    .disabled(workspace.activePane == nil)
                 Button("Split down") { workspace.splitActive(axis: .vertical) }
                     .keyboardShortcut(shortcut(.splitDown).keyEquivalent, modifiers: shortcut(.splitDown).eventModifiers)
+                    .disabled(workspace.activePane == nil)
                 Button("New floating pane") { workspace.newFloatingPane() }
                     .keyboardShortcut(shortcut(.newFloatingPane).keyEquivalent, modifiers: shortcut(.newFloatingPane).eventModifiers)
+                    .disabled(workspace.activePane == nil)
                 Divider()
                 Button("Previous pane") { workspace.selectAdjacentPane(offset: -1) }
                     .keyboardShortcut(shortcut(.previousPane).keyEquivalent, modifiers: shortcut(.previousPane).eventModifiers)
@@ -732,6 +757,7 @@ struct RelayApp: App {
                     workspace.closeActivePane()
                 }
                     .keyboardShortcut(shortcut(.closePane).keyEquivalent, modifiers: shortcut(.closePane).eventModifiers)
+                    .disabled(workspace.activePane == nil)
                 Button("Reopen closed pane") { workspace.reopenLastClosedPane() }
                     .keyboardShortcut(shortcut(.reopenClosedPane).keyEquivalent, modifiers: shortcut(.reopenClosedPane).eventModifiers)
                     .disabled(!workspace.canReopenClosedPane)
@@ -743,11 +769,46 @@ struct RelayApp: App {
                 Button("Next tab") { workspace.selectTab(offset: 1) }
                     .keyboardShortcut(shortcut(.nextTab).keyEquivalent, modifiers: shortcut(.nextTab).eventModifiers)
                 Divider()
-                Button("Previous session") { workspace.selectSession(offset: -1) }
-                Button("Next session") { workspace.selectSession(offset: 1) }
+                Button("Previous workspace") { workspace.selectWorkspace(offset: -1) }
+                Button("Next workspace") { workspace.selectWorkspace(offset: 1) }
+            }
+            CommandMenu("Workspace") {
+                Button("Show workspaces") { workspace.sidebarVisible = true }
+                    .keyboardShortcut(shortcut(.workspaceOverview).keyEquivalent, modifiers: shortcut(.workspaceOverview).eventModifiers)
+                Button("Back") { workspace.organization.goBack() }
+                    .keyboardShortcut(shortcut(.workspaceBack).keyEquivalent, modifiers: shortcut(.workspaceBack).eventModifiers)
+                Button("Forward") { workspace.organization.goForward() }
+                    .keyboardShortcut(shortcut(.workspaceForward).keyEquivalent, modifiers: shortcut(.workspaceForward).eventModifiers)
+                WorkspacePinnedMenu(workspace: workspace)
+                Divider()
+                Button("Stack active pane with…") {
+                    NotificationCenter.default.post(name: .relayChoosePaneStack, object: nil)
+                }
+                .keyboardShortcut(shortcut(.stackPane).keyEquivalent, modifiers: shortcut(.stackPane).eventModifiers)
+                Button("Unstack active pane") {
+                    guard let id = workspace.activePaneID else { return }
+                    do { try workspace.unstackPane(id) }
+                    catch { NSAlert(error: error).runModal() }
+                }
+                .keyboardShortcut(shortcut(.unstackPane).keyEquivalent, modifiers: shortcut(.unstackPane).eventModifiers)
+                Button("Previous pane in stack") { workspace.selectAdjacentStackMember(offset: -1) }
+                    .keyboardShortcut(shortcut(.previousStackPane).keyEquivalent, modifiers: shortcut(.previousStackPane).eventModifiers)
+                Button("Next pane in stack") { workspace.selectAdjacentStackMember(offset: 1) }
+                    .keyboardShortcut(shortcut(.nextStackPane).keyEquivalent, modifiers: shortcut(.nextStackPane).eventModifiers)
+                Divider()
+                Button("Save current view…") {
+                    NotificationCenter.default.post(name: .relaySaveWorkspaceView, object: nil)
+                }
+                .keyboardShortcut(shortcut(.saveWorkspaceView).keyEquivalent, modifiers: shortcut(.saveWorkspaceView).eventModifiers)
+                Button("Open saved view…") {
+                    NotificationCenter.default.post(name: .relayChooseWorkspaceView, object: nil)
+                }
+                .keyboardShortcut(shortcut(.openWorkspaceView).keyEquivalent, modifiers: shortcut(.openWorkspaceView).eventModifiers)
+                Divider()
+                Button("Workspace migration…") { workspace.presentWorkspaceMigration() }
             }
             CommandGroup(after: .sidebar) {
-                Button(workspace.sidebarVisible ? "Hide sessions" : "Show sessions") {
+                Button(workspace.sidebarVisible ? "Hide navigator" : "Show navigator") {
                     workspace.sidebarVisible.toggle()
                 }
                 .keyboardShortcut(shortcut(.toggleSidebar).keyEquivalent, modifiers: shortcut(.toggleSidebar).eventModifiers)
@@ -819,7 +880,17 @@ struct RelayApp: App {
         .defaultSize(width: 1220, height: 650)
 
         Settings {
-            RelaySettingsView()
+            RelaySettingsView(workspace: workspace)
+        }
+    }
+}
+
+/// Keep the publisher subscription out of the large Scene expression.
+private struct RelayWorkOverviewCommand: ViewModifier {
+    let workspace: WorkspaceModel
+    func body(content: Content) -> some View {
+        content.onReceive(NotificationCenter.default.publisher(for: .relayWorkOverview)) { _ in
+            workspace.presentQuickNavigate()
         }
     }
 }

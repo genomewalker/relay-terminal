@@ -19,6 +19,9 @@ type SavedConversationPlan struct {
 	SessionID  string `json:"session_id"`
 	Directory  string `json:"directory"`
 	BindingSHA string `json:"binding_sha"`
+	// ConfigDir is the conversation's provider account (CLAUDE_CONFIG_DIR or
+	// CODEX_HOME of the process that produced it); "" is the provider default.
+	ConfigDir string `json:"config_dir,omitempty"`
 }
 
 func ReadSavedConversationPlan(pane string) (SavedConversationPlan, error) {
@@ -65,7 +68,7 @@ func readSavedConversationPlan(server *Server, pane string) (SavedConversationPl
 	if start, err := processStartTime(binding.Producer.ProcessID); err == nil && start == binding.Producer.ProcessStart {
 		return plan, errors.New("saved provider process is still running; reconnect it instead")
 	}
-	if binding.TranscriptPath == "" || validateBindingTranscript(binding.TranscriptPath, binding.Producer.Provider) != nil {
+	if binding.TranscriptPath == "" || validateAccountTranscript(binding.TranscriptPath, binding.Producer.Provider, binding.Producer.ConfigDir) != nil {
 		return plan, errors.New("saved provider transcript is unavailable")
 	}
 	transcript, err := os.Open(binding.TranscriptPath)
@@ -113,5 +116,6 @@ func readSavedConversationPlan(server *Server, pane string) (SavedConversationPl
 	digest := sha256.Sum256(data)
 	plan.PaneID, plan.Provider, plan.SessionID = pane, binding.Producer.Provider, binding.SessionID
 	plan.BindingSHA = hex.EncodeToString(digest[:])
+	plan.ConfigDir = binding.Producer.ConfigDir
 	return plan, nil
 }

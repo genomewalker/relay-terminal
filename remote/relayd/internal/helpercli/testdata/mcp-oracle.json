@@ -1,0 +1,140 @@
+[
+  {
+    "config": {
+      "token": "secret",
+      "port": 47471
+    },
+    "error": null,
+    "token": "secret",
+    "port": "47471",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "token": "secret",
+      "port": "47472"
+    },
+    "error": null,
+    "token": "secret",
+    "port": "47472",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "token": "",
+      "port": 0
+    },
+    "error": null,
+    "token": "",
+    "port": "0",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "token": "secret",
+      "port": 1.0
+    },
+    "error": null,
+    "token": "secret",
+    "port": "1.0",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "token": "secret",
+      "port": 1000000.0
+    },
+    "error": null,
+    "token": "secret",
+    "port": "1000000.0",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "token": "secret",
+      "port": 1e-05
+    },
+    "error": null,
+    "token": "secret",
+    "port": "1e-05",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "token": "secret",
+      "port": 1e+20
+    },
+    "error": null,
+    "token": "secret",
+    "port": "1e+20",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "token": "secret",
+      "port": true
+    },
+    "error": null,
+    "token": "secret",
+    "port": "True",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "token": "secret",
+      "port": null
+    },
+    "error": null,
+    "token": "secret",
+    "port": "None",
+    "caller": "caller",
+    "args": [
+      "relay-mcp"
+    ]
+  },
+  {
+    "config": {
+      "port": 47471
+    },
+    "error": "KeyError",
+    "token": null,
+    "port": null,
+    "caller": null,
+    "args": null
+  },
+  {
+    "config": {
+      "token": 123,
+      "port": 47471
+    },
+    "error": "TypeError",
+    "token": null,
+    "port": null,
+    "caller": null,
+    "args": null
+  }
+]

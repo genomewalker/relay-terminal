@@ -61,6 +61,7 @@ func hostRotationCredentialService(ctx context.Context, operation, reference, se
 	probe := exec.CommandContext(ctx, "/usr/bin/gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
 		"--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.NameHasOwner", "org.freedesktop.secrets")
 	probe.Stderr = io.Discard
+	probe.Env = hostSecretServiceEnvironment()
 	presence, err := probe.Output()
 	if err != nil || string(bytes.TrimSpace(presence)) != "(true,)" {
 		return nil, errors.New("an unlocked encrypted Secret Service is required on this host")
@@ -70,6 +71,7 @@ func hostRotationCredentialService(ctx context.Context, operation, reference, se
 		command := exec.CommandContext(ctx, "/usr/bin/secret-tool", args...)
 		command.Stdin = bytes.NewReader(input)
 		command.Stderr = io.Discard
+		command.Env = hostSecretServiceEnvironment()
 		var output rotationBoundedOutput
 		command.Stdout = &output
 		err := command.Run()

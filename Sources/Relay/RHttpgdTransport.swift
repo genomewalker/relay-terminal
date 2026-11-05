@@ -71,6 +71,14 @@ final class RHttpgdClient: RHttpgdAPI, @unchecked Sendable {
     let endpoint: RHttpgdEndpoint
     private let token: String
     private let session: URLSession
+    /// An invalidated session raises an Objective-C exception, not a Swift
+    /// error, when asked for a new task, and that ends the app. So closing
+    /// refuses new requests and waits for those already admitted.
+    private let lifecycle = NSLock()
+    private var closed = false
+    private var admitted = 0
+    /// Tests act between a request's admission and its task's creation.
+    var afterAdmission: (@Sendable () -> Void)?
 
     init(endpoint: RHttpgdEndpoint, token: String) {
         self.endpoint = endpoint
@@ -89,7 +97,37 @@ final class RHttpgdClient: RHttpgdAPI, @unchecked Sendable {
         session = URLSession(configuration: configuration, delegate: RHttpgdRedirectRefusal(), delegateQueue: nil)
     }
 
-    func invalidate() { session.invalidateAndCancel() }
+    /// Cancels requests now; the session itself is invalidated once no
+    /// admitted request can still create a task in it.
+    func invalidate() {
+        enum Step { case none, invalidate, cancel }
+        let step: Step = lifecycle.withLock {
+            guard !closed else { return .none }
+            closed = true
+            return admitted == 0 ? .invalidate : .cancel
+        }
+        switch step {
+        case .none: break
+        case .invalidate: session.invalidateAndCancel()
+        case .cancel: session.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+        }
+    }
+
+    private func admit() -> Bool {
+        lifecycle.withLock {
+            guard !closed else { return false }
+            admitted += 1
+            return true
+        }
+    }
+
+    private func release() {
+        let last = lifecycle.withLock {
+            admitted -= 1
+            return closed && admitted == 0
+        }
+        if last { session.invalidateAndCancel() }
+    }
 
     private func request(_ path: String, _ query: [URLQueryItem] = []) -> URLRequest {
         var components = URLComponents(url: endpoint.baseURL, resolvingAgainstBaseURL: false)!
@@ -103,6 +141,9 @@ final class RHttpgdClient: RHttpgdAPI, @unchecked Sendable {
     }
 
     private func fetch(_ path: String, _ query: [URLQueryItem] = [], limit: Int, mime: String) async throws -> Data {
+        guard admit() else { throw CancellationError() }
+        defer { release() }
+        afterAdmission?()
         let (bytes, response): (URLSession.AsyncBytes, URLResponse)
         do { (bytes, response) = try await session.bytes(for: request(path, query)) }
         catch let error as URLError where error.code == .cancelled { throw CancellationError() }
@@ -181,12 +222,17 @@ final class RHttpgdClient: RHttpgdAPI, @unchecked Sendable {
         try decodeState(try await fetch("/clear", limit: RHttpgdLimits.stateBytes, mime: "application/json"))
     }
 
+    /// Nil once closed. Created under the lock, so `invalidate` either
+    /// cancels it or comes first.
     func makeWebSocket() -> URLSessionWebSocketTask? {
         var request = URLRequest(url: endpoint.socketURL)
         request.timeoutInterval = 20
-        let task = session.webSocketTask(with: request)
-        task.maximumMessageSize = 64 * 1024
-        return task
+        return lifecycle.withLock {
+            guard !closed else { return nil }
+            let task = session.webSocketTask(with: request)
+            task.maximumMessageSize = 64 * 1024
+            return task
+        }
     }
 }
 

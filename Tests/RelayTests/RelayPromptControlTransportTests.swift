@@ -23,6 +23,7 @@ private final class OwnedPromptFrameWriter: RelayFrameWriting, @unchecked Sendab
         lock.lock(); defer { lock.unlock() }
         return inputPayloads
     }
+
 }
 
 @Suite(.serialized)
@@ -251,4 +252,33 @@ struct RelayPromptControlTransportTests {
         #expect(nextWriter.inputs.first?.dropFirst(24) == Data([7]))
     }
 
+    @MainActor @Test
+    func maintenanceScreenRejectsNewOutputAndChangedGeometryBeforeInputAdmission() throws {
+        let profile = ConnectionProfile(name: "Owned hidden screen", host: "owned-screen.invalid")
+        let paneID = UUID(), writer = OwnedPromptFrameWriter()
+        let original = transport(writer, profile: profile, paneID: paneID)
+        let io = TerminalIOBridge()
+        io.installTransport(original)
+        _ = io.restoreSnapshot(paneID: paneID)
+        defer {
+            _ = io.removeTransport(); original.detach()
+            TerminalSnapshotStore.shared.remove(paneID: paneID)
+        }
+        io.receive(Data("\u{1b}[2J\u{1b}[H❯ \r\n────────\r\n⏵⏵ bypass permissions on".utf8), remoteSequence: 100)
+        let snapshot = try #require(io.maintenanceScreenSnapshot())
+        let lease = try #require(io.promptEditorControlLease(paneID: paneID, hostID: profile.id))
+        #expect(io.maintenanceScreenIsCurrent(snapshot.token))
+        io.receive(Data("new output".utf8), remoteSequence: 110)
+        #expect(!io.sendPromptEditorControlInput(Data("/exit\r".utf8), expectedControlLease: lease,
+            expectedMaintenanceScreen: snapshot.token))
+        #expect(writer.inputs.isEmpty)
+        let next = try #require(io.maintenanceScreenSnapshot())
+        io.terminalDidResize(columns: 90, rows: 30)
+        #expect(!io.maintenanceScreenIsCurrent(next.token))
+        #expect(!io.sendPromptEditorControlInput(Data("/exit\r".utf8), expectedControlLease: lease,
+            expectedMaintenanceScreen: next.token))
+        #expect(writer.inputs.isEmpty)
+        io.beginReplay()
+        #expect(io.maintenanceScreenSnapshot() == nil)
+    }
 }

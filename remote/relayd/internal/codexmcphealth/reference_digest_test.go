@@ -1,0 +1,3 @@
+package codexmcphealth
+
+const healthReferenceSHA = "e5d388f18ca984c01b4d18e155a768a448c035aa6b8a1b988c20f63423daf9db"

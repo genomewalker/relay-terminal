@@ -3,12 +3,11 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -186,6 +185,33 @@ func TestHostRotationRestartsRevalidateAndDoNotReplayDeadline(t *testing.T) {
 	}
 }
 
+func TestHostRotationReloadPreservesPausedEnrollmentAndAdvancesEpoch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	saved := hostRotationRecord{Version: 1, OperationID: "11111111111111111111111111111111",
+		Enrollment: hostRotationFixture(), State: "human_takeover", Enabled: false, Generation: 2,
+		NextEvaluationMS: time.Now().Add(time.Hour).UnixMilli(), Fingerprint: strings.Repeat("a", 64),
+		Decision: json.RawMessage(`{"decision":"hold"}`), Lifecycle: "quiet", RefreshCapability: "verified"}
+	data, err := json.Marshal(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	supervisor := newHostRotationSupervisor(path, func(context.Context, hostRotationEnrollment, time.Time) (json.RawMessage, error) {
+		calls.Add(1)
+		return nil, errors.New("paused enrollment must not evaluate")
+	})
+	defer supervisor.close()
+	r := supervisor.snapshot()
+	if r.Enrollment != saved.Enrollment || r.Enabled || r.State != saved.State || r.Generation != saved.Generation+1 ||
+		r.NextEvaluationMS != 0 || r.Fingerprint != "" || len(r.Decision) != 0 || r.Preparation != nil ||
+		r.Lifecycle != "unavailable" || r.RefreshCapability != "unverified" || calls.Load() != 0 {
+		t.Fatalf("paused reload violated the epoch fence: %+v", r)
+	}
+}
+
 func TestHostRotationEventBindingAndOperationIdentity(t *testing.T) {
 	e := hostRotationFixture()
 	for _, raw := range []string{
@@ -218,17 +244,6 @@ func TestHostRotationEventBindingAndOperationIdentity(t *testing.T) {
 	s.event([]byte("{}"), false)
 	if r := s.snapshot(); r.Enabled || r.State != "event_journal_failed" {
 		t.Fatalf("journal failure accepted: %+v", r)
-	}
-}
-
-func TestHostRotationPolicyCopyMatchesReviewedSource(t *testing.T) {
-	digest := sha256.Sum256(hostRotationPolicy)
-	if hex.EncodeToString(digest[:]) != hostRotationPolicySHA {
-		t.Fatal("embedded policy digest changed")
-	}
-	source := filepath.Join("..", "..", "..", "..", "Sources", "Relay", "Resources", "Rotation", "policy.py")
-	if data, err := os.ReadFile(source); err == nil && !bytes.Equal(data, hostRotationPolicy) {
-		t.Fatal("native and host policy copies differ")
 	}
 }
 

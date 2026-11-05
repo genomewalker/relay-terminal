@@ -145,3 +145,27 @@ func TestHostRotationCodexPublicCompletionPreservesOrderAndBounds(t *testing.T) 
 		t.Fatal("accepted unbounded pending evidence")
 	}
 }
+
+func TestHostRotationCodexPublicMemoryCitationSuffix(t *testing.T) {
+	header := rotationCodexPublicHeader() + rotationCodexPublicUser()
+	visible := "Public answer.\n\n"
+	suffix := "<oai-mem-citation>\n<citation_entries>\nPRIVATE_METADATA\n</citation_entries>\n</oai-mem-citation>"
+	event := rotationCodexPublicEvent("fixture-session", "turn-a", "a", "AgentMessage", visible)
+	response := rotationCodexPublicAssistant("", visible+suffix, "a", "turn-a")
+	for _, tail := range []string{response + event, event + response} {
+		messages, err := rotationCodexParsePublic(header + tail)
+		if err != nil || len(messages) != 2 || messages[1].Text != visible {
+			t.Fatalf("citation projection failed: %v", err)
+		}
+	}
+	for _, text := range []string{
+		"Changed answer.\n\n" + suffix,
+		visible + "<oai-mem-citation>incomplete",
+		visible + suffix + "extra public text",
+		visible + "inline " + suffix,
+	} {
+		if _, err := rotationCodexParsePublic(header + rotationCodexPublicAssistant("", text, "a", "turn-a") + event); err == nil {
+			t.Fatal("accepted unmatched public text or malformed suffix")
+		}
+	}
+}

@@ -135,9 +135,12 @@ func serve(socket, executable string, args []string) error {
 	if !supported {
 		return fmt.Errorf("persistent broker requires node_mux_v2")
 	}
+	// Any byte from the remote, not only a Pong, shows the stream is alive.
+	var lastInbound atomic.Int64
+	lastInbound.Store(time.Now().UnixNano())
 	// The broker owns this transport incarnation. Viewer fragment IDs and
 	// negotiation must never leak into the retained remote stream.
-	remoteReader := protocol.NewFragmentReader(output)
+	remoteReader := protocol.NewFragmentReader(inboundReader{output, &lastInbound})
 	for _, capability := range status.Capabilities {
 		if capability == "wire_fragments_v1" {
 			negotiation := protocol.Frame{Type: protocol.Capabilities, Payload: []byte(`{"wire_fragments":true}`)}
@@ -148,8 +151,6 @@ func serve(socket, executable string, args []string) error {
 			break
 		}
 	}
-	var lastPong atomic.Int64
-	lastPong.Store(time.Now().UnixNano())
 	broker := localbroker.New(input, ready)
 	defer broker.Close()
 	go func() {
@@ -160,27 +161,14 @@ func serve(socket, executable string, args []string) error {
 				_ = listener.Close()
 				return
 			}
-			if frame.Type == protocol.Pong {
-				lastPong.Store(time.Now().UnixNano())
-			}
 			broker.RemoteFrame(frame)
 		}
 	}()
 	// Keepalives remain active with no GUI; a dead SSH stream exits and removes
 	// the socket, allowing the next attachment to establish a fresh incarnation.
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			if time.Since(time.Unix(0, lastPong.Load())) > 6*time.Second {
-				_ = cmd.Process.Kill()
-				return
-			}
-			payload, _ := json.Marshal(time.Now().UnixNano())
-			if broker.Ping(payload) != nil {
-				return
-			}
-		}
-	}()
+	go keepalive(func() int64 { return time.Now().UnixNano() },
+		func() bool { time.Sleep(heartbeatInterval); return true },
+		&lastInbound, broker.Ping, func() { _ = cmd.Process.Kill() })
 	for {
 		_ = listener.(*net.UnixListener).SetDeadline(time.Now().Add(10 * time.Minute))
 		conn, err := listener.Accept()
@@ -188,5 +176,78 @@ func serve(socket, executable string, args []string) error {
 			return err
 		}
 		_ = broker.Serve(conn)
+	}
+}
+
+// A half-open SSH after a VPN route change moves no bytes at all. One slow
+// Pong is not that: a remote under disk pressure (dandy-07, 2026-10-22) can
+// hold a single reply past the timeout while output keeps flowing, and killing
+// the SSH then reattaches every pane on the node. A probe only counts as missed
+// when nothing arrived after it was sent; three consecutive misses (about
+// 10-12 s of total silence) kill the SSH.
+const (
+	heartbeatInterval      = 2 * time.Second
+	heartbeatTimeout       = int64(6 * time.Second)
+	heartbeatRestartMisses = 3
+)
+
+type inboundReader struct {
+	source io.Reader
+	last   *atomic.Int64
+}
+
+func (r inboundReader) Read(p []byte) (int, error) {
+	n, err := r.source.Read(p)
+	if n > 0 {
+		r.last.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+// heartbeatState holds the send times of outstanding probes, oldest first.
+type heartbeatState struct {
+	pending  []int64
+	misses   int
+	lastMiss int64 // send time of the newest counted miss
+}
+
+// check drops expired probes. One followed by inbound data is covered and not
+// counted; any inbound data after the last counted miss ends the run of misses.
+func (s heartbeatState) check(lastInbound, now int64) (heartbeatState, bool) {
+	if s.misses > 0 && lastInbound > s.lastMiss {
+		s.misses = 0
+	}
+	remaining := s.pending[:0:0]
+	for _, sent := range s.pending {
+		switch {
+		case now-sent < heartbeatTimeout:
+			remaining = append(remaining, sent)
+		case lastInbound > sent:
+		default:
+			s.misses++
+			s.lastMiss = sent
+		}
+	}
+	s.pending = remaining
+	return s, s.misses >= heartbeatRestartMisses
+}
+
+// keepalive probes the remote after each wait until a ping fails or the
+// remote has been silent for heartbeatRestartMisses probes.
+func keepalive(now func() int64, wait func() bool, lastInbound *atomic.Int64,
+	ping func([]byte) error, kill func()) {
+	var state heartbeatState
+	for wait() {
+		at := now()
+		var dead bool
+		if state, dead = state.check(lastInbound.Load(), at); dead {
+			kill()
+			return
+		}
+		payload, _ := json.Marshal(at)
+		if ping(payload) != nil {
+			return
+		}
+		state.pending = append(state.pending, at)
 	}
 }

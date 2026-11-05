@@ -6,6 +6,7 @@ import ImageIO
 @MainActor final class RelayAgentAttachmentQueue: ObservableObject {
     @Published var attachments: [RelayAgentDraftAttachment] = []
     @Published private(set) var uploading: Set<UUID> = []
+    @Published private(set) var progress: [UUID: RelayTransferProgress] = [:]
     @Published private(set) var failures: [UUID: String] = [:]
     @Published private(set) var intakeFailure: String?
     private var tasks: [UUID: Task<Void, Never>] = [:]
@@ -24,7 +25,7 @@ import ImageIO
     func remove(_ id: UUID) {
         generations.removeValue(forKey: id)
         tasks.removeValue(forKey: id)?.cancel()
-        uploading.remove(id); failures.removeValue(forKey: id)
+        uploading.remove(id); failures.removeValue(forKey: id); progress.removeValue(forKey: id)
         attachments.removeAll { $0.id == id }
         discardOwnedImageSource(id)
     }
@@ -47,13 +48,13 @@ import ImageIO
 
     func stageImage(_ data: Data) {
         intakeFailure = nil
-        guard !data.isEmpty, data.count <= 32 << 20, attachments.count < 32,
+        guard !data.isEmpty, attachments.count < 32,
               let source = CGImageSourceCreateWithData(data as CFData, nil),
               CGImageSourceGetCount(source) > 0,
               let identifier = CGImageSourceGetType(source),
               let type = UTType(identifier as String), type.conforms(to: .image),
               let ext = type.preferredFilenameExtension else {
-            intakeFailure = "Could not attach this image (maximum 32 MB)."; return
+            intakeFailure = "Could not attach this image."; return
         }
         let directory = RelayStateProfile.applicationSupportRoot
             .appendingPathComponent("Relay/AgentDraftImages", isDirectory: true)
@@ -80,6 +81,7 @@ import ImageIO
         let generation = UUID()
         generations[id] = generation
         uploading.insert(id); failures.removeValue(forKey: id)
+        progress[id] = .init(phase: .preparing, name: item.name)
         tasks[id] = Task { @MainActor [weak self, weak pane] in
             var unpublishedSnapshot: RelayAgentAttachmentSnapshot.Record?
             var unpublishedNativeImage: RelayAgentAttachmentSnapshot.Record?
@@ -136,7 +138,10 @@ import ImageIO
                     path = deliverySnapshot.url.path
                 } else {
                     let entries = try await RemoteFileTransfer.upload([deliverySnapshot.url],
-                        toPane: binding.paneID.uuidString.lowercased(), profile: profile, resume: resume)
+                        toPane: binding.paneID.uuidString.lowercased(), profile: profile, resume: resume,
+                        progress: { [weak self] update in
+                            await self?.acceptProgress(update, id: id, generation: generation, name: item.name)
+                        })
                     guard entries.count == 1, !entries[0].directory, !entries[0].symbolicLink else {
                         throw RemoteFileTransferError.invalidResponse
                     }
@@ -152,11 +157,27 @@ import ImageIO
                 ready.uploadedPath = path; ready.uploadedBinding = binding
                 guard ready.isValid else { throw RemoteFileTransferError.invalidResponse }
                 self.attachments[index] = ready
-            } catch is CancellationError { }
+                self.progress[id] = .init(phase: .complete, name: item.name,
+                    completedBytes: deliverySnapshot.bytes, totalBytes: deliverySnapshot.bytes)
+            } catch is CancellationError {
+                if self?.generations[id] == generation {
+                    self?.failures[id] = "Upload paused. Retry to resume."
+                    self?.progress[id] = .init(phase: .failed, name: item.name, message: "Upload paused. Retry to resume.")
+                }
+            }
             catch {
-                if self?.generations[id] == generation { self?.failures[id] = error.localizedDescription }
+                if self?.generations[id] == generation {
+                    self?.failures[id] = error.localizedDescription
+                    self?.progress[id] = .init(phase: .failed, name: item.name, message: error.localizedDescription)
+                }
             }
         }
+    }
+
+    private func acceptProgress(_ update: RelayTransferProgress, id: UUID, generation: UUID, name: String) {
+        guard generations[id] == generation, tasks[id] != nil else { return }
+        var update = update; update.name = name
+        progress[id] = update
     }
 
     func validateForSend(binding: RelayAgentConversationBinding) async -> Bool {

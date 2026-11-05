@@ -38,6 +38,13 @@
             set { core.configuration = newValue }
         }
 
+        /// The pasteboard this surface copies to and pastes from; nil means
+        /// the general pasteboard. Tests use a private named pasteboard.
+        open var pasteboard: NSPasteboard? {
+            get { core.pasteboard }
+            set { core.pasteboard = newValue }
+        }
+
         open func setSurfaceVisible(_ visible: Bool) {
             core.setDisplayVisible(visible)
         }

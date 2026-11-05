@@ -1,0 +1,430 @@
+[
+  {
+    "name": "preview",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": null
+  },
+  {
+    "name": "duplicate",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><p id=\"ok\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "duplicate element id"
+  },
+  {
+    "name": "script",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><SCRIPT></SCRIPT>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "draft does not need JavaScript"
+  },
+  {
+    "name": "comment",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><!-- <script> -->",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": null
+  },
+  {
+    "name": "no-language",
+    "html": "<html lang=\"da\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "Missing viewport or language"
+  },
+  {
+    "name": "no-viewport",
+    "html": "<html lang=\"en\"><meta name=\"other\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "Missing viewport or language"
+  },
+  {
+    "name": "https",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"https://example.org\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": null
+  },
+  {
+    "name": "http",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"http://example.org\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "external URL must use HTTPS"
+  },
+  {
+    "name": "scheme-relative",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"//example.org\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "protocol-relative external URL"
+  },
+  {
+    "name": "anchor",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"#ok\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": null
+  },
+  {
+    "name": "missing-anchor",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"#bad\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "#bad"
+  },
+  {
+    "name": "empty-anchor",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"#\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": null
+  },
+  {
+    "name": "local-file",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"file.txt\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [
+      "file.txt"
+    ],
+    "cname": false,
+    "error": null
+  },
+  {
+    "name": "missing-file",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"missing\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "missing"
+  },
+  {
+    "name": "escape",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"../outside\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "../outside"
+  },
+  {
+    "name": "encoded-escape",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><a href=\"%2e%2e/outside\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "%2e%2e/outside"
+  },
+  {
+    "name": "image",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><img src=\"i.png\" alt=\"\" width=\"1\" height=\"2\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [
+      "i.png"
+    ],
+    "cname": false,
+    "error": null
+  },
+  {
+    "name": "image-alt",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><img src=\"i.png\" width=\"1\" height=\"2\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "image without alternative text"
+  },
+  {
+    "name": "image-dim",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html><img src=\"i.png\" alt=\"\">",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "image without dimensions"
+  },
+  {
+    "name": "wrong-domain",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "wrong",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "Unexpected domain"
+  },
+  {
+    "name": "preview-ready",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "Use --production for a release candidate"
+  },
+  {
+    "name": "preview-cname",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": true,
+    "error": "Do not configure the domain before acceptance"
+  },
+  {
+    "name": "preview-index",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"index\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": false,
+    "files": [],
+    "cname": false,
+    "error": "Preview must be noindex"
+  },
+  {
+    "name": "production-not-ready",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": false
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": "Production acceptance has not passed"
+  },
+  {
+    "name": "production",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"index\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true,
+      "appVersion": "1",
+      "appCommit": "abc",
+      "downloadURL": "https://github.com/genomewalker/relay-terminal/releases/download/v1/app.zip",
+      "notarizationStatus": "accepted",
+      "acceptanceRecord": "record"
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": null
+  },
+  {
+    "name": "production-noindex",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"noindex\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true,
+      "appVersion": "1",
+      "appCommit": "abc",
+      "downloadURL": "https://github.com/genomewalker/relay-terminal/releases/download/v1/app.zip",
+      "notarizationStatus": "accepted",
+      "acceptanceRecord": "record"
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": "Production page is noindex"
+  },
+  {
+    "name": "production-missing-appVersion",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"index\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true,
+      "appVersion": "",
+      "appCommit": "abc",
+      "downloadURL": "https://github.com/genomewalker/relay-terminal/releases/download/v1/app.zip",
+      "notarizationStatus": "accepted",
+      "acceptanceRecord": "record"
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": "Missing production evidence: appVersion"
+  },
+  {
+    "name": "production-missing-appCommit",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"index\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true,
+      "appVersion": "1",
+      "appCommit": "",
+      "downloadURL": "https://github.com/genomewalker/relay-terminal/releases/download/v1/app.zip",
+      "notarizationStatus": "accepted",
+      "acceptanceRecord": "record"
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": "Missing production evidence: appCommit"
+  },
+  {
+    "name": "production-missing-downloadURL",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"index\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true,
+      "appVersion": "1",
+      "appCommit": "abc",
+      "downloadURL": "",
+      "notarizationStatus": "accepted",
+      "acceptanceRecord": "record"
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": "Missing production evidence: downloadURL"
+  },
+  {
+    "name": "production-missing-notarizationStatus",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"index\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true,
+      "appVersion": "1",
+      "appCommit": "abc",
+      "downloadURL": "https://github.com/genomewalker/relay-terminal/releases/download/v1/app.zip",
+      "notarizationStatus": "",
+      "acceptanceRecord": "record"
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": "Missing production evidence: notarizationStatus"
+  },
+  {
+    "name": "production-missing-acceptanceRecord",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"index\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true,
+      "appVersion": "1",
+      "appCommit": "abc",
+      "downloadURL": "https://github.com/genomewalker/relay-terminal/releases/download/v1/app.zip",
+      "notarizationStatus": "accepted",
+      "acceptanceRecord": ""
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": "Missing production evidence: acceptanceRecord"
+  },
+  {
+    "name": "production-host",
+    "html": "<html lang=\"en\"><meta name=\"viewport\"><meta name=\"robots\" content=\"index\"><div id=\"ok\"></div></html>",
+    "gate": {
+      "domain": "relay.vaklab.dev",
+      "productionReady": true,
+      "appVersion": "1",
+      "appCommit": "abc",
+      "downloadURL": "https://evil.example/app",
+      "notarizationStatus": "accepted",
+      "acceptanceRecord": "record"
+    },
+    "production": true,
+    "files": [],
+    "cname": false,
+    "error": "Unexpected release download host"
+  }
+]

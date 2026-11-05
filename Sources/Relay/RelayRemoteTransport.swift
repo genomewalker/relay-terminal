@@ -154,6 +154,9 @@ enum RelayPaneAttachPolicy {
     // Do not mistake that deliberate work
     // for a dead multiplex route and fan the pane out onto another SSH process.
     static let handshakeTimeoutMilliseconds = 5_000
+    /// A pane still waiting this long for its shared node checks that the
+    /// node is still the pooled one for its host and, if it is not, rejoins.
+    static let nodeRecoveryCheckMilliseconds = 15_000
     static let dedicatedTransportAfterAttempt = 1
 
     static func retryDelayMilliseconds(attempt: Int, waitingForInputLease: Bool) -> Int {
@@ -235,9 +238,18 @@ final class RelayRemoteTransport: @unchecked Sendable {
     }
     private var promptEditorConnectionID = UUID()
     private var promptEditorControlGranted = false
+    private var attachedWithInputLease = false
     private var promptEditorLeaseObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
     private var hasAttachedWorker = false
     private var supportsInputAcknowledgements = false
+    /// The worker accepts Relay's own keystrokes as automation input, which it
+    /// does not count as a human takeover of context rotation.
+    private var supportsAutomationInput = false
+    /// Consecutive dedicated reattachments made only to obtain the input lease.
+    private var dedicatedLeaseRetryAttempt = 0
+    /// Pending acknowledged sequences that were sent as automation input. A
+    /// reconnect replays them with the same classification.
+    private var automationInputSequences: Set<UInt64> = []
     private var supportsViewportCommits = false
     private var supportsSupervisorViewportCommits = false
     private var supportsExactViewportCommits = false
@@ -248,6 +260,13 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var sessionEnded = false
     private var attachRetryCount = 0
     private var attachRetryScheduled = false
+    private var nodeRecoveryScheduled = false
+    /// The current attempt to join a shared node. Replaced by every attempt
+    /// and cancelled by detach, so a superseded attempt cannot register.
+    private var nodeAdmission: RelayNodeAdmission?
+    /// The shared node pool; tests supply their own.
+    var nodePool = RelayNodeTransportPool.shared
+    var nodeRecoveryCheckMilliseconds = RelayPaneAttachPolicy.nodeRecoveryCheckMilliseconds
     private var diagnosticSessionID = "unknown"
     private var inputDiagnosticCount = 0
     private var connectionContext: RelayConnectionContext?
@@ -317,6 +336,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
 
     deinit {
         for continuation in promptEditorLeaseObservers.values { continuation.finish() }
+        nodeAdmission?.cancel()
         nodeChannel?.close()
         if let process, process.processIdentifier != 0 { process.terminate() }
     }
@@ -341,6 +361,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         tabID: String?,
         paneTitle: String,
         contentKind: String,
+        workingDirectory: String? = nil,
         requiresExistingWorker: Bool = false,
         initialLastSequence: UInt64 = 0,
         forceAttachRepaint: Bool = false,
@@ -365,7 +386,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
             onAgentEvent: onAgentEvent,
             onArtifact: onArtifact,
             onDisconnect: onDisconnect,
-            observeAgentsOnly: observeAgentsOnly
+            observeAgentsOnly: observeAgentsOnly,
+            workingDirectory: workingDirectory
         )
         lock.lock()
         connectionContext = context
@@ -377,6 +399,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         reconnectAttempt = 0
         reconnectScheduled = false
         pendingInputs.removeAll(keepingCapacity: true)
+        automationInputSequences.removeAll(keepingCapacity: true)
         pendingInputBytes = 0
         inputOverflowed = false
         attachRepaintPending = forceAttachRepaint
@@ -384,6 +407,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         attached = false
         hasAttachedWorker = false
         supportsInputAcknowledgements = false
+        supportsAutomationInput = false
         supportsViewportCommits = false
         supportsSupervisorViewportCommits = false
         supportsExactViewportCommits = false
@@ -400,26 +424,113 @@ final class RelayRemoteTransport: @unchecked Sendable {
     }
 
     private func connectMultiplexed(_ context: RelayConnectionContext) {
-        let channel = RelayNodeTransportPool.shared.attach(
+        lock.lock()
+        guard !detached else {
+            lock.unlock()
+            return
+        }
+        nodeAdmission?.cancel()
+        let admission = RelayNodeAdmission()
+        nodeAdmission = admission
+        let nodePool = self.nodePool
+        lock.unlock()
+        // The node registers this pane only while `admission` is current; a
+        // detach or newer attempt in the meantime makes it refuse.
+        guard let channel = nodePool.attach(
             profile: context.profile,
             sessionID: context.sessionID,
-            onReady: { [weak self] channel in self?.openMultiplexed(context, channel: channel) },
+            admission: admission,
+            onReady: { [weak self] channel in self?.openMultiplexed(context, channel: channel, admission: admission) },
             onFrame: { [weak self] frame in self?.receive(frame, context: context) },
             onDisconnect: { [weak self] failure in self?.nodeDisconnected(context, failure: failure) }
-        )
+        ) else { return }
         lock.lock()
+        guard !detached, admission.isActive else {
+            lock.unlock()
+            // Superseded after joining: release only this channel's own
+            // subscription (a successor's registration is left untouched).
+            channel.close()
+            return
+        }
+        // The current attempt owns the route; a channel left by an earlier
+        // attempt of this transport is closed.
+        let replaced = nodeChannel === channel ? nil : nodeChannel
         nodeChannel = channel
         writer = channel
         lock.unlock()
+        replaced?.close()
+        scheduleNodeRecoveryCheck(context)
     }
 
-    private func openMultiplexed(_ context: RelayConnectionContext, channel: RelayNodeChannel) {
+    /// The shared-node channel this pane currently uses (tests).
+    var currentNodeChannel: RelayNodeChannel? {
+        lock.lock()
+        defer { lock.unlock() }
+        return nodeChannel
+    }
+
+    /// While this pane waits for its shared node, periodically confirm that
+    /// the node is still the pooled one for the host (a parked pooled node is
+    /// asked to reconnect now). A pane left on a replaced node rejoins the
+    /// pool instead of waiting for callbacks that node will never deliver.
+    private func scheduleNodeRecoveryCheck(_ context: RelayConnectionContext) {
+        lock.lock()
+        guard !detached, !sessionEnded, !attached, !nodeRecoveryScheduled, nodeChannel != nil else {
+            lock.unlock()
+            return
+        }
+        nodeRecoveryScheduled = true
+        let delay = nodeRecoveryCheckMilliseconds
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.nodeRecoveryScheduled = false
+            guard !self.detached, !self.sessionEnded, !self.attached, !self.attachRetryScheduled,
+                  let channel = self.nodeChannel else {
+                self.lock.unlock()
+                return
+            }
+            let pool = self.nodePool
+            self.lock.unlock()
+            guard pool.paneNeedsNewNode(channel, profile: context.profile) else {
+                self.scheduleNodeRecoveryCheck(context)
+                return
+            }
+            self.lock.lock()
+            guard !self.detached, !self.attached, self.nodeChannel === channel else {
+                self.lock.unlock()
+                return
+            }
+            self.deliveryEpoch = UUID()
+            self.nodeChannel = nil
+            self.writer = nil
+            self.supportsSupervisorViewportCommits = false
+            self.supportsExactSupervisorViewportCommits = false
+            self.lock.unlock()
+            channel.close()
+            RelayDiagnostics.shared.record(category: "connection", name: "pane-node-rejoined", details: [
+                "pane_id": context.sessionID,
+            ])
+            context.onStatus(RelayStatus(
+                state: "reconnecting",
+                message: "This pane's shared connection was replaced; rejoining the current one."
+            ), self.deliveryEpochSnapshot())
+            // Detach or restart may run during the status callback; the
+            // admission in connectMultiplexed is what fences that.
+            self.connectMultiplexed(context)
+        }
+    }
+
+    private func openMultiplexed(_ context: RelayConnectionContext, channel: RelayNodeChannel,
+        admission: RelayNodeAdmission) {
         lock.lock()
         // RelayNodeConnection can already be ready when a second pane joins.
         // Its callback may therefore arrive before attach() returns and before
         // connectMultiplexed stores the channel. Adopt that same channel here
-        // instead of dropping the only Hello handshake for this pane.
-        if nodeChannel == nil {
+        // instead of dropping the only Hello handshake for this pane, unless
+        // its attempt has been superseded.
+        if nodeChannel == nil, !detached, admission.isActive {
             nodeChannel = channel
             writer = channel
         }
@@ -438,6 +549,29 @@ final class RelayRemoteTransport: @unchecked Sendable {
             channel.supports("viewport_commit_compat_v2")
         supportsExactSupervisorViewportCommits = channel.supports("viewport_commit_compat_v2")
         lock.unlock()
+        let hello = multiplexedHello(context, viewport: viewport,
+            resumeSequence: resumeSequence, resumeEventSequence: resumeEventSequence)
+        let payload = (try? JSONSerialization.data(withJSONObject: hello.compactMapValues { $0 })) ?? Data()
+        TerminalReplayTrace.log("hello pane=\(context.sessionID) seq=\(resumeSequence) viewport=\(viewport.0)x\(viewport.1) existing=\(context.requiresExistingWorker)")
+        channel.writeAsync(type: .hello, payload: payload)
+        scheduleAttachWatchdog(context, channel: channel)
+    }
+
+    /// The next shared-channel Hello for the installed context (tests).
+    func nextMultiplexedHello() -> [String: Any]? {
+        lock.lock()
+        let context = connectionContext
+        let viewport = latestResize ?? (RelayViewport.default.columns, RelayViewport.default.rows)
+        let resumeSequence = lastSequence
+        let resumeEventSequence = lastEventSequence
+        lock.unlock()
+        guard let context else { return nil }
+        return multiplexedHello(context, viewport: viewport,
+            resumeSequence: resumeSequence, resumeEventSequence: resumeEventSequence)
+    }
+
+    private func multiplexedHello(_ context: RelayConnectionContext, viewport: (UInt16, UInt16),
+        resumeSequence: UInt64, resumeEventSequence: UInt64) -> [String: Any] {
         var hello: [String: Any] = [
             "version": 1,
             "session_id": context.sessionID,
@@ -465,12 +599,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
             hello["tab_id"] = context.tabID
             hello["pane_title"] = context.paneTitle
             hello["content_kind"] = context.contentKind
+            if let directory = context.workingDirectory { hello["working_directory"] = directory }
             if !context.profile.command.isEmpty { hello["command"] = context.profile.command }
         }
-        let payload = (try? JSONSerialization.data(withJSONObject: hello.compactMapValues { $0 })) ?? Data()
-        TerminalReplayTrace.log("hello pane=\(context.sessionID) seq=\(resumeSequence) viewport=\(viewport.0)x\(viewport.1) existing=\(context.requiresExistingWorker)")
-        channel.writeAsync(type: .hello, payload: payload)
-        scheduleAttachWatchdog(context, channel: channel)
+        return hello
     }
 
     private func nodeDisconnected(_ context: RelayConnectionContext, failure: SSHConnectionFailure) {
@@ -513,6 +645,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             state: state,
             message: failure.userMessage + " The shared node connection is retrying automatically."
         ), deliveryEpochSnapshot())
+        scheduleNodeRecoveryCheck(context)
     }
 
     private func receive(_ frame: RelayWireFrame, context: RelayConnectionContext) {
@@ -535,6 +668,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 if controlGranted {
                     didAttach(context: context, capabilities: capabilities, controlGranted: decoded.controlGranted)
                 } else {
+                    owePendingAttachRepaint(capabilities: capabilities, controlGranted: decoded.controlGranted,
+                        observeAgentsOnly: context.observeAgentsOnly)
                     context.onStatus(RelayStatus(
                         state: "read_only",
                         message: "Another client currently controls input for this pane. Retrying input ownership automatically.",
@@ -581,6 +716,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 if let removed = pendingInputs.removeValue(forKey: acknowledgement.sequence) {
                     pendingInputBytes = max(0, pendingInputBytes - removed.count)
                 }
+                automationInputSequences.remove(acknowledgement.sequence)
                 signalPromptEditorLeaseChangedLocked()
                 lock.unlock()
             }
@@ -779,7 +915,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             return
         }
 
-        DispatchQueue.global(qos: .utility).async {
+        RelayBlockingIO.start(name: "relay.legacy.stderr", qos: .utility) {
             defer { stderrFinished.signal() }
             while true {
                 let hasData = autoreleasepool { () -> Bool in
@@ -792,7 +928,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             }
         }
 
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+        RelayBlockingIO.start(name: "relay.legacy.frames", qos: .userInteractive) { [weak self] in
             do {
                 while true {
                     try autoreleasepool {
@@ -867,6 +1003,15 @@ final class RelayRemoteTransport: @unchecked Sendable {
         return isCurrentDedicatedProcess(source)
     }
 
+    /// Drive the shared-channel reader with the installed context (tests).
+    func receiveMultiplexedFrame(_ frame: RelayWireFrame) {
+        lock.lock()
+        let context = connectionContext
+        lock.unlock()
+        guard let context else { return }
+        receive(frame, context: context)
+    }
+
     /// Owned framed peers use the actual dedicated reader and admission path.
     func receiveAttachedDedicatedFrame(_ frame: RelayWireFrame, sourceProcess: Process) throws {
         lock.lock()
@@ -891,8 +1036,20 @@ final class RelayRemoteTransport: @unchecked Sendable {
                         self.lock.unlock()
                     }
                     if decoded.state == "attached" {
-                        self.negotiateProgramStatus(context: context, capabilities: decoded.capabilities ?? [])
-                        self.didAttach(context: context, capabilities: decoded.capabilities ?? [], controlGranted: decoded.controlGranted)
+                        let capabilities = decoded.capabilities ?? []
+                        self.negotiateProgramStatus(context: context, capabilities: capabilities)
+                        self.didAttach(context: context, capabilities: capabilities, controlGranted: decoded.controlGranted)
+                        // Output stays visible, but a route without the input
+                        // lease cannot type or resize. Keep asking for the lease
+                        // instead of staying read-only after its holder leaves.
+                        if RelayInputLeaseRetryPolicy.needsRetry(capabilities: capabilities,
+                            controlGranted: decoded.controlGranted, observeAgentsOnly: context.observeAgentsOnly) {
+                            // didAttach cleared the repaint debt; this attach
+                            // could not pay it, so the lease retry must.
+                            self.owePendingAttachRepaint(capabilities: capabilities,
+                                controlGranted: decoded.controlGranted, observeAgentsOnly: context.observeAgentsOnly)
+                            self.scheduleDedicatedLeaseRetry(context, sourceProcess: sourceProcess)
+                        }
                     }
                     guard isCurrentDedicatedProcess(sourceProcess) else { return }
                     if decoded.state == "exited" || decoded.state == "error" { self.markSessionEnded() }
@@ -919,6 +1076,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                     if let removed = self.pendingInputs.removeValue(forKey: acknowledgement.sequence) {
                         self.pendingInputBytes = max(0, self.pendingInputBytes - removed.count)
                     }
+                    self.automationInputSequences.remove(acknowledgement.sequence)
                     self.signalPromptEditorLeaseChangedLocked()
                     self.lock.unlock()
                 }
@@ -934,10 +1092,62 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
     }
 
+    /// The worker performs its pre-attach repaint (resizeForAttach) only for
+    /// the input-lease holder. A read-only attach therefore receives replay
+    /// but no repaint, while still advancing lastSequence past 0, so the
+    /// worker's own cold-attach repaint no longer applies to the next Hello.
+    /// Carry the repaint request to the attach that obtains the lease.
+    private func owePendingAttachRepaint(capabilities: [String], controlGranted: Bool?, observeAgentsOnly: Bool) {
+        guard RelayAttachRepaintPolicy.owesRepaintAfterAttach(capabilities: capabilities,
+            controlGranted: controlGranted, observeAgentsOnly: observeAgentsOnly) else { return }
+        lock.lock()
+        attachRepaintPending = true
+        lock.unlock()
+    }
+
+    /// The worker applies resize and viewport commits only from the lease holder.
+    var acceptsViewportRepaint: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return RelayAttachRepaintPolicy.routeAcceptsResize(attached: attached && writer != nil,
+            leaseCapable: attachedWithInputLease, controlGranted: promptEditorControlGranted)
+    }
+
+    /// Whether the next Hello will ask the worker for a pre-attach repaint.
+    var nextAttachRequestsRepaint: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return attachRepaintPending
+    }
+
     private func markSessionEnded() {
         lock.lock()
         sessionEnded = true
         lock.unlock()
+    }
+
+    /// Reconnect a dedicated read-only route so its next Hello can take the
+    /// input lease. The worker grants the lease to this transport's client ID
+    /// once the previous holder has gone; Hello is its only acquisition point.
+    private func scheduleDedicatedLeaseRetry(_ context: RelayConnectionContext, sourceProcess: Process) {
+        lock.lock()
+        dedicatedLeaseRetryAttempt += 1
+        let delay = RelayInputLeaseRetryPolicy.delayMilliseconds(attempt: dedicatedLeaseRetryAttempt)
+        lock.unlock()
+        context.onStatus(RelayStatus(state: "read_only",
+            message: "Another client currently controls input for this pane. Retrying input ownership automatically."),
+            deliveryEpochSnapshot())
+        RelayDiagnostics.shared.record(category: "pane", name: "dedicated-lease-retry-scheduled",
+            details: ["pane_id": context.sessionID, "delay_ms": String(delay)])
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+            guard let self, self.isCurrentDedicatedProcess(sourceProcess) else { return }
+            self.lock.lock()
+            let stillReadOnly = self.attached && !self.promptEditorControlGranted && !self.reconnectScheduled
+            self.lock.unlock()
+            guard stillReadOnly else { return }
+            self.scheduleReconnect(context, failure: .diagnose("input lease unavailable"), sourceProcess: sourceProcess)
+            if sourceProcess.isRunning { sourceProcess.terminate() }
+        }
     }
 
     private func connectionEnded(
@@ -988,11 +1198,14 @@ final class RelayRemoteTransport: @unchecked Sendable {
         reconnectScheduled = false
         attached = true
         promptEditorControlGranted = capabilities.contains("input_lease_v1") && controlGranted == true
+        attachedWithInputLease = capabilities.contains("input_lease_v1")
+        if promptEditorControlGranted || !capabilities.contains("input_lease_v1") { dedicatedLeaseRetryAttempt = 0 }
         hasAttachedWorker = true
         attachRepaintPending = false
         attachRetryCount = 0
         attachRetryScheduled = false
         supportsInputAcknowledgements = capabilities.contains("input_ack_v1")
+        supportsAutomationInput = supportsInputAcknowledgements && capabilities.contains("automation_input_v1")
         supportsViewportCommits = RelayTransportCapabilityPolicy.supportsViewportCommit(capabilities)
         supportsExactViewportCommits = RelayTransportCapabilityPolicy.supportsExactViewportCommit(capabilities)
         let needsPostAttachResize = RelayTransportCapabilityPolicy.needsPostAttachResize(capabilities)
@@ -1009,13 +1222,24 @@ final class RelayRemoteTransport: @unchecked Sendable {
             acknowledgedFrames[sequence] = backlog
         }
         let acknowledgementsEnabled = supportsInputAcknowledgements
+        let automationSequences = supportsAutomationInput ? automationInputSequences : []
         let overflowed = inputOverflowed
         inputOverflowed = false
         lock.unlock()
+        if !backlog.isEmpty {
+            RelayDiagnostics.shared.record(category: "terminal-input", name: "reattach-backlog", details: [
+                "pane_id": context.sessionID,
+                "bytes": String(backlog.count),
+                "acknowledged": String(acknowledgementsEnabled),
+                "terminal_report": TerminalInputDiagnosticReport.name(backlog),
+            ])
+        }
         if acknowledgementsEnabled {
             for (sequence, data) in acknowledgedFrames.sorted(by: { $0.key < $1.key }) {
+                // A worker without automation support receives it as ordinary
+                // input; that keeps the bytes and only loses the classification.
                 writer?.writeAsync(
-                    type: .inputV2,
+                    type: automationSequences.contains(sequence) ? .automationInputV2 : .inputV2,
                     payload: RelayWireFrame.inputV2Payload(clientID: inputClientID, sequence: sequence, data: data)
                 )
             }
@@ -1081,10 +1305,18 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// This phase only validates and records the packet. It performs no
     /// writer, diagnostic or observer callbacks while the caller holds its
     /// original IO binding lock.
+    /// `automation` marks Relay's own keystrokes (native maintenance, compiled
+    /// prompts). With `requireAutomation`, a worker that cannot classify them
+    /// refuses admission instead of receiving them as human input.
     func preparePromptControlInput(_ data: Data,
-        expectedControlLease lease: RelayPromptEditorControlLease) -> RelayPromptControlAdmission? {
+        expectedControlLease lease: RelayPromptEditorControlLease,
+        automation: Bool = false, requireAutomation: Bool = false) -> RelayPromptControlAdmission? {
         guard !data.isEmpty, data.count <= 64 << 10 else { return nil }
         lock.lock()
+        guard !requireAutomation || automation && supportsAutomationInput else {
+            lock.unlock()
+            return nil
+        }
         guard let context = connectionContext, let writer,
               context.profile.id == lease.hostID,
               context.sessionID == lease.paneID.uuidString.lowercased(),
@@ -1100,6 +1332,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let sequence = RelayInputSequenceAllocator.shared.next()
         pendingInputs[sequence] = data
         pendingInputBytes = data.count
+        let frameType: RelayWireType = automation && supportsAutomationInput ? .automationInputV2 : .inputV2
+        if frameType == .automationInputV2 { automationInputSequences.insert(sequence) }
         let clientID = inputClientID
         let paneID = diagnosticSessionID
         let recordDiagnostic = inputDiagnosticCount < 8
@@ -1109,14 +1343,15 @@ final class RelayRemoteTransport: @unchecked Sendable {
             if recordDiagnostic {
                 RelayDiagnostics.shared.record(category: "terminal-input", name: "transport-send",
                     details: ["pane_id": paneID, "bytes": String(data.count),
-                        "writer": "true", "attached": "true", "acknowledged": "true"])
+                        "writer": "true", "attached": "true", "acknowledged": "true",
+                        "automation": String(frameType == .automationInputV2)])
             }
             if let self {
                 self.lock.lock()
                 self.signalPromptEditorLeaseChangedLocked()
                 self.lock.unlock()
             }
-            writer.writeAsync(type: .inputV2,
+            writer.writeAsync(type: frameType,
                 payload: RelayWireFrame.inputV2Payload(clientID: clientID, sequence: sequence, data: data))
         }
     }
@@ -1177,6 +1412,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                     "writer": String(writer != nil),
                     "attached": String(canSend),
                     "acknowledged": String(acknowledged),
+                    "terminal_report": TerminalInputDiagnosticReport.name(data),
                 ]
             )
         }
@@ -1337,6 +1573,20 @@ final class RelayRemoteTransport: @unchecked Sendable {
     @discardableResult
     func reconnectExistingPaneRoute() -> Bool {
         lock.lock()
+        // A dedicated fallback route reopens through the same retained-worker
+        // reconnect as an interrupted connection: the next Hello requires the
+        // existing worker and resumes from the last acknowledged sequences.
+        if !detached, !sessionEnded, attached, hasAttachedWorker, nodeChannel == nil,
+           !reconnectScheduled, let dedicated = process, let context = connectionContext {
+            let dedicatedWriter = writer
+            lock.unlock()
+            context.onStatus(RelayStatus(state: "reconnecting",
+                message: "Reopening this pane's terminal route."), deliveryEpochSnapshot())
+            dedicatedWriter?.writeAsync(type: .detach)
+            scheduleReconnect(context, failure: .diagnose("route reopen requested"), sourceProcess: dedicated)
+            if dedicated.isRunning { dedicated.terminate() }
+            return true
+        }
         guard !detached, !sessionEnded, attached, hasAttachedWorker,
               !attachRetryScheduled, let channel = nodeChannel,
               let context = connectionContext else {
@@ -1364,6 +1614,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let writer = self.writer
         let channel = nodeChannel
         let ssh = process
+        nodeAdmission?.cancel()
+        nodeAdmission = nil
         nodeChannel = nil
         process = nil
         self.writer = nil
@@ -1445,6 +1697,9 @@ private struct RelayConnectionContext: Sendable {
     let onArtifact: @Sendable (RelayArtifact, UUID) -> Void
     let onDisconnect: @Sendable (String, UUID) -> Void
     let observeAgentsOnly: Bool
+    /// Starting directory for a newly created worker (relayd hello
+    /// working_directory). An existing worker keeps its own directory.
+    var workingDirectory: String? = nil
 }
 
 struct StatusWirePayload: Decodable {
@@ -1494,9 +1749,41 @@ struct EventWireEnvelope: Decodable {
     }
 }
 
+/// A route attached without the input lease shows output but cannot type or
+/// resize. Retry with backoff; another Mac may legitimately hold the lease.
+enum RelayInputLeaseRetryPolicy {
+    static func needsRetry(capabilities: [String], controlGranted: Bool?, observeAgentsOnly: Bool) -> Bool {
+        !observeAgentsOnly && capabilities.contains("input_lease_v1") && controlGranted != true
+    }
+
+    static func delayMilliseconds(attempt: Int) -> Int {
+        min(30_000, 5_000 << min(max(attempt, 1) - 1, 3))
+    }
+}
+
+/// A worker denies resize and repaint to a client without the input lease.
+/// The attach that later obtains the lease must request the repaint itself.
+enum RelayAttachRepaintPolicy {
+    /// Only attach_repaint_v2 workers repaint an unchanged grid in place.
+    /// A retained v1 worker pulses a temporary row count, producing bytes for
+    /// a grid the renderer never had; for those, the client's actual-grid
+    /// width repaint (deferred until control is granted) remains the path.
+    static func owesRepaintAfterAttach(capabilities: [String], controlGranted: Bool?, observeAgentsOnly: Bool) -> Bool {
+        capabilities.contains("attach_repaint_v2") &&
+            RelayInputLeaseRetryPolicy.needsRetry(capabilities: capabilities,
+                controlGranted: controlGranted, observeAgentsOnly: observeAgentsOnly)
+    }
+
+    static func routeAcceptsResize(attached: Bool, leaseCapable: Bool, controlGranted: Bool) -> Bool {
+        attached && (!leaseCapable || controlGranted)
+    }
+}
+
 enum RelayWireType: UInt8 {
     case unsupported = 0
     case hello = 1, input, resize, output, status, detach, ping, pong, agentEvent, artifact, inputAck, inputV2, hostEvent, workspaceState, viewportCommit, viewportAck, hostRequest, hostResponse, fragment, capabilities
+    /// Same payload as inputV2; the worker does not count it as human input.
+    case automationInputV2 = 22
 }
 
 struct RelayWireFrame {
@@ -1505,27 +1792,36 @@ struct RelayWireFrame {
     let type: RelayWireType
     let payload: Data
 
-    static func read(from handle: FileHandle) throws -> RelayWireFrame {
-        let header = try readExactly(5, from: handle)
+    /// `progress` runs after every chunk read, before the frame is complete.
+    static func read(from handle: FileHandle, progress: () -> Void = {}) throws -> RelayWireFrame {
+        let header = try readExactly(5, from: handle, progress: progress)
         let length = header.dropFirst().reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
         guard Int(length) <= maximumPayloadBytes else { throw RelayWireError.invalidFrame }
         // Consume the declared payload before classifying the frame. A newer
         // relayd may introduce a type this app does not know yet; dropping
         // that one complete frame preserves the boundary of every frame after
         // it instead of tearing down an otherwise healthy SSH connection.
-        let payload = try readExactly(Int(length), from: handle)
+        let payload = try readExactly(Int(length), from: handle, progress: progress)
         let type = RelayWireType(rawValue: header[0]) ?? .unsupported
         return RelayWireFrame(type: type, payload: payload)
     }
 
-    private static func readExactly(_ count: Int, from handle: FileHandle) throws -> Data {
+    private static func readExactly(_ count: Int, from handle: FileHandle, progress: () -> Void) throws -> Data {
         if count == 0 { return Data() }
         var data = Data()
+        // read(2) returns whatever the pipe holds; FileHandle.read(upToCount:)
+        // waits for the whole count, so a slow payload would show no progress.
+        var chunk = [UInt8](repeating: 0, count: min(count, 64 << 10))
         while data.count < count {
-            guard let chunk = try handle.read(upToCount: count - data.count), !chunk.isEmpty else {
-                throw RelayWireError.endOfStream
+            let wanted = min(count - data.count, chunk.count)
+            let n = chunk.withUnsafeMutableBytes { Darwin.read(handle.fileDescriptor, $0.baseAddress, wanted) }
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            data.append(chunk)
+            guard n > 0 else { throw RelayWireError.endOfStream }
+            data.append(contentsOf: chunk[..<n])
+            progress()
         }
         return data
     }

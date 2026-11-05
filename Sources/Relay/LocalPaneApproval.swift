@@ -3,6 +3,12 @@ import AppKit
 struct LocalPaneProposal: Codable, Equatable {
     let instance: UUID
     let requestID: UUID
+    /// Optional anchor for MCP local tabs: open right after this pane's tab
+    /// or this tab, in its session and workspace. At most one is set.
+    var anchorPaneID: UUID? = nil
+    var anchorTabID: UUID? = nil
+
+    var isAnchored: Bool { anchorPaneID != nil || anchorTabID != nil }
 }
 
 struct LocalPaneReceipt: Codable {

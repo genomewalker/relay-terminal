@@ -60,12 +60,14 @@ struct PeerNetworkTopologyView: View {
     @State private var reportedSelection: HostedPeerLink?
     @State private var desktopTasks: [DesktopPeerRoute.TaskInfo] = []
     @State private var desktopTaskObservedAt: Date?
+    @State private var desktopDiscoveryError: String?
     @State private var chosenConnections: [NetworkParticipant.Identity: PeerGroupPlan.Endpoint] = [:]
     @State private var groupSheet = false
     @State private var verifiedPaneSelection: [PeerGroupPlan.Endpoint]?
     @State private var paneMessageLink: RelayPaneMessaging.Link?
     @State private var connectingPaneMessages = false
     @State private var paneMessageError: String?
+    @State private var daemonCheck = RelayPaneMessaging.DaemonPairCheck()
     @State private var addingSessions = false
     @State private var includeAllAppSessions = false
     @State private var additionalPaneSearch = ""
@@ -265,16 +267,46 @@ struct PeerNetworkTopologyView: View {
     private var selectionCheckFinished: Bool {
         selectedPaneHosts.isSubset(of: checkedHosts) || now.timeIntervalSince(verificationStartedAt) >= 25
     }
+    /// Two panes on one relayd can be verified and linked by that relayd alone.
+    /// Its per-pane check resolves Codex app-server endpoints, which the
+    /// host-wide peer inventory (Claude session records only) never lists.
+    private var daemonPairProfile: ConnectionProfile? {
+        guard requestedPaneIDs.count == 2 else { return nil }
+        return RelayPaneMessaging.sharedDaemonProfile(
+            requestedPaneIDs.sorted { $0.uuidString < $1.uuidString }.compactMap { workspace.panes[$0] })
+    }
+    private var daemonPairVerified: Bool {
+        daemonPairProfile != nil && RelayPaneMessaging.daemonPairVerified(requestedPaneIDs, transports: daemonCheck.transports)
+    }
+    private func paneVerified(_ id: UUID) -> Bool {
+        seededPaneIDs.contains(id) || daemonCheck.transports[id] != nil
+    }
+    private func verifyDaemonPair() async {
+        guard daemonPairProfile != nil else { return }
+        let check = daemonCheck.begin()
+        for id in requestedPaneIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+            guard let pane = workspace.panes[id] else {
+                daemonCheck.record(id, check: check, result: .failure(RemoteCatalogError.failed("Pane unavailable.")))
+                continue
+            }
+            do {
+                let transport = try await RelayPaneMessaging.shared.daemonEndpointTransport(pane)
+                daemonCheck.record(id, check: check, result: .success(transport))
+            } catch {
+                daemonCheck.record(id, check: check, result: .failure(error))
+            }
+        }
+    }
     private var selectedPaneVerification: some View {
         VStack(alignment: .leading, spacing: RelayTheme.spacing(14)) {
-            Label(selectionCheckFinished ? "Choose a messaging connection" : "Verifying selected panes", systemImage: "link")
+            Label(daemonPairVerified ? "Link these panes" : selectionCheckFinished ? "Choose a messaging connection" : "Verifying selected panes", systemImage: "link")
                 .font(.headline)
-            Text(selectionCheckFinished ? "Native peer messaging is unavailable for one or more selected panes. You can connect two live Claude or Codex panes through their existing terminals instead." : "Relay is checking the messaging identity for each pane you selected. You don’t need to select them again.")
+            Text(daemonPairVerified ? "Both panes have a verified messaging endpoint on \(daemonPairProfile?.kind == .ssh ? daemonPairProfile?.host ?? "their host" : "This Mac"). Their relayd saves and checks the pair." : selectionCheckFinished ? "Native peer messaging is unavailable for one or more selected panes. You can connect two live Claude or Codex panes through their existing terminals instead." : "Relay is checking the messaging identity for each pane you selected. You don’t need to select them again.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             HStack(spacing: RelayTheme.spacing(8)) {
-                if !selectionCheckFinished { ProgressView().controlSize(.small) }
-                Text("\(seededPaneIDs.count) of \(requestedPaneIDs.count) verified")
+                if !selectionCheckFinished && !daemonPairVerified { ProgressView().controlSize(.small) }
+                Text("\(requestedPaneIDs.filter(paneVerified).count) of \(requestedPaneIDs.count) verified")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -282,8 +314,8 @@ struct PeerNetworkTopologyView: View {
                 VStack(alignment: .leading, spacing: RelayTheme.spacing(8)) {
                     ForEach(requestedPaneIDs.sorted { $0.uuidString < $1.uuidString }, id: \.self) { id in
                         HStack(spacing: RelayTheme.spacing(9)) {
-                            Image(systemName: seededPaneIDs.contains(id) ? "checkmark.circle.fill" : (selectionCheckFinished ? "exclamationmark.circle" : "hourglass.circle"))
-                                .foregroundStyle(seededPaneIDs.contains(id) ? RelayTheme.mint : RelayTheme.textMuted)
+                            Image(systemName: paneVerified(id) ? "checkmark.circle.fill" : (selectionCheckFinished ? "exclamationmark.circle" : "hourglass.circle"))
+                                .foregroundStyle(paneVerified(id) ? RelayTheme.mint : RelayTheme.textMuted)
                             VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
                                 Text(workspace.panes[id]?.displayName ?? "Pane unavailable")
                                     .font(RelayTheme.font(size: 12, weight: .medium))
@@ -293,18 +325,18 @@ struct PeerNetworkTopologyView: View {
                                         .foregroundStyle(.secondary)
                                         .lineLimit(1)
                                         .truncationMode(.middle)
-                                    if pane.connectionState != .connected && !seededPaneIDs.contains(id) {
+                                    if pane.connectionState != .connected && !paneVerified(id) {
                                         Text("Reconnect this pane before linking.")
                                             .font(.caption2)
                                             .foregroundStyle(.orange)
-                                    } else if selectionCheckFinished && !seededPaneIDs.contains(id) {
-                                        Text("No verified messaging endpoint. This pane’s terminal output remains separate from messaging.")
-                                            .font(.caption2).foregroundStyle(.orange)
+                                    } else if (selectionCheckFinished || daemonCheck.failures[id] != nil) && !paneVerified(id) {
+                                        Text(daemonCheck.failures[id].map { "relayd: \($0)" } ?? "No verified messaging endpoint. This pane’s terminal output remains separate from messaging.")
+                                            .font(.caption2).foregroundStyle(.orange).textSelection(.enabled)
                                     }
                                 }
                             }
                             Spacer(minLength: 0)
-                            if seededPaneIDs.contains(id) {
+                            if paneVerified(id) {
                                 Text("Verified").font(.caption2).foregroundStyle(.secondary)
                             }
                         }
@@ -329,17 +361,18 @@ struct PeerNetworkTopologyView: View {
                         let host = target?.profile.kind == .ssh ? target?.profile.host : nil
                         checkedHosts.remove(host ?? "This Mac")
                         discover(host: host)
+                        Task { await verifyDaemonPair() }
                     }.disabled(discoveringHost != nil || connectingPaneMessages)
-                    if requestedPaneIDs.count == 2 {
-                        Button("Connect pane messaging") {
-                            connectingPaneMessages = true; paneMessageError = nil
-                            Task {
-                                defer { connectingPaneMessages = false }
-                                do { paneMessageLink = try await RelayPaneMessaging.shared.connect(panes: Array(requestedPaneIDs), workspace: workspace) }
-                                catch { paneMessageError = error.localizedDescription }
-                            }
-                        }.buttonStyle(RelayPrimaryButtonStyle()).disabled(connectingPaneMessages)
-                    }
+                }
+                if requestedPaneIDs.count == 2 && (selectionCheckFinished || daemonPairVerified) {
+                    Button(daemonPairVerified ? "Link panes" : "Connect pane messaging") {
+                        connectingPaneMessages = true; paneMessageError = nil
+                        Task {
+                            defer { connectingPaneMessages = false }
+                            do { paneMessageLink = try await RelayPaneMessaging.shared.connect(panes: Array(requestedPaneIDs), workspace: workspace) }
+                            catch { paneMessageError = error.localizedDescription }
+                        }
+                    }.buttonStyle(RelayPrimaryButtonStyle()).disabled(connectingPaneMessages)
                 }
                 Spacer()
                 Button("Cancel") { dismiss() }
@@ -349,6 +382,7 @@ struct PeerNetworkTopologyView: View {
         }
         .padding(RelayTheme.spacing(20))
         .frame(width: 480, height: 390)
+        .task(id: requestedPaneIDs) { await verifyDaemonPair() }
     }
 
     private var additionalPaneCandidates: [NetworkParticipant] {
@@ -901,6 +935,7 @@ struct PeerNetworkTopologyView: View {
                         }
                     }
                 }
+                if let desktopDiscoveryError { Text(desktopDiscoveryError).foregroundStyle(.orange) }
                 if let selectionError { Text(selectionError).foregroundStyle(.orange) }
                 HStack {
                     Text("\(chosenConnections.count) selected · up to 8")
@@ -943,8 +978,10 @@ struct PeerNetworkTopologyView: View {
                 case .success(let tasks):
                     desktopTasks = tasks
                     desktopTaskObservedAt = Date()
-                case .failure:
+                    desktopDiscoveryError = nil
+                case .failure(let error):
                     desktopTaskObservedAt = nil
+                    desktopDiscoveryError = DesktopPeerRoute.discoveryMessage(error)
                 }
                 do { try await Task.sleep(for: .seconds(5)) } catch { return }
             }

@@ -65,10 +65,17 @@ enum RelayHostRotationRPC {
         let preparation: Preparation?
         let nativeRecoveryState: String?
         let message: String?
+        /// Root completed turns the host worker observed for this pane, enrolled
+        /// or not. Nil from helpers that predate the observation.
+        var observedCompletedTurns: UInt64? = nil
+        var lastCompletedTurnAt: String? = nil
+        var lastCompletedTurnAgent: String? = nil
         enum CodingKeys: String, CodingKey {
             case version = "v", operationID = "operation_id", operation, enabled, state, generation, enrollment
             case lifecycle, refreshCapability = "refresh_capability", nextEvaluationMS = "next_evaluation_ms"
             case decision, preparation, nativeRecoveryState = "native_recovery_state", message
+            case observedCompletedTurns = "observed_completed_turns", lastCompletedTurnAt = "last_completed_turn_at"
+            case lastCompletedTurnAgent = "last_completed_turn_agent"
         }
         var isUnsupported: Bool { state == "unsupported" }
         func valid(for paneID: UUID) -> Bool {
@@ -79,6 +86,8 @@ enum RelayHostRotationRPC {
                   lifecycle?.isEmpty == false, (lifecycle?.utf8.count ?? 0) <= 80,
                   refreshCapability?.isEmpty == false, (refreshCapability?.utf8.count ?? 0) <= 80,
                   (nativeRecoveryState?.utf8.count ?? 0) <= 160,
+                  (lastCompletedTurnAt?.utf8.count ?? 0) <= 64,
+                  lastCompletedTurnAgent.map({ ["claude", "codex"].contains($0) }) ?? true,
                   nextEvaluationMS.map({ $0 >= 0 }) ?? true,
                   decision.map({ $0.v == 1 && !$0.decision.isEmpty && $0.decision.utf8.count <= 80 }) ?? true,
                   preparation.map({ !$0.state.isEmpty && $0.state.utf8.count <= 80 && ($0.code?.utf8.count ?? 0) <= 1024 }) ?? true

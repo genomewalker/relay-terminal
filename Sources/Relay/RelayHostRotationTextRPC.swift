@@ -38,7 +38,7 @@ enum RelayHostRotationTextRPC {
                   RelayHostRotationTextRPC.providers.contains(provider),
                   (0...200_000_000).contains(dailyLimitMicrousd),
                   (0...200_000_000).contains(monthlyLimitMicrousd),
-                  (0...10_000).contains(maxRequestsPerDay), !enabled || maxRequestsPerDay > 0 else { return false }
+                  (0...10_000).contains(maxRequestsPerDay), !enabled || provider == "anthropic_api" || maxRequestsPerDay > 0 else { return false }
             if provider == "anthropic_api" {
                 guard authDirectory == nil, model == nil, cliPath == nil,
                       credentialReference.map(RelayHostRotationRPC.validOperationID) ?? true,
@@ -76,7 +76,7 @@ enum RelayHostRotationTextRPC {
                   (0...200_000_000).contains(dailyLimitMicrousd),
                   (0...200_000_000).contains(monthlyLimitMicrousd),
                   (0...10_000).contains(maxRequestsPerDay) else { return false }
-            if enabled && (maxRequestsPerDay == 0 || providers.contains("anthropic_api") &&
+            if enabled && (maxRequestsPerDay == 0 && providers != ["anthropic_api"] || providers.contains("anthropic_api") &&
                 min(dailyLimitMicrousd, monthlyLimitMicrousd) < 1_000_000) { return false }
             if let codexModel, codexModel.range(of: #"^[A-Za-z0-9_.-]{1,128}$"#, options: .regularExpression) == nil { return false }
             guard [claudePath, codexPath].allSatisfy({ $0.map(RelayHostRotationRPC.validDirectory) ?? true }) else { return false }
@@ -152,18 +152,20 @@ enum RelayHostRotationTextRPC {
         let state: String?
         let accountUsage: [AccountUsage]?
         let credentialSupport: String?
+        var vaultUnlockSupport: String? = nil
         var supportsCredentials: Bool { credentialSupport == "v1" }
         enum CodingKeys: String, CodingKey {
             case version = "v", status, configurationID = "configuration_id", settings, day, month
             case requestsToday = "requests_today", chargedTodayMicrousd = "charged_today_microusd"
             case chargedMonthMicrousd = "charged_month_microusd", unresolved, state
-            case accountUsage = "account_usage", credentialSupport = "credential_support"
+            case accountUsage = "account_usage", credentialSupport = "credential_support", vaultUnlockSupport = "vault_unlock_support"
         }
         var isUnsupported: Bool { state == "unsupported" }
         var isNotConfigured: Bool { status == "not_configured" }
         var valid: Bool {
             if isUnsupported { return version == nil && status == nil && settings == nil }
-            guard version == 1, credentialSupport == nil || credentialSupport == "v1" else { return false }
+            guard version == 1, credentialSupport == nil || credentialSupport == "v1",
+                  vaultUnlockSupport == nil || vaultUnlockSupport == "gnome_secret_service_v1" else { return false }
             if isNotConfigured { return settings == nil && configurationID == nil }
             guard ["ready", "reconciliation_required"].contains(status ?? ""), let settings, settings.valid,
                   let configurationID, configurationID.isEmpty || RelayHostRotationRPC.validOperationID(configurationID),
@@ -188,6 +190,7 @@ enum RelayHostRotationTextRPC {
         case status = "text_status", configure = "text_configure", abandon = "text_abandon"
         case credentialSave = "text_credential_save", credentialStatus = "text_credential_status"
         case credentialDelete = "text_credential_delete", credentialList = "text_credential_list"
+        case vaultUnlock = "text_vault_unlock"
     }
     struct Request: Encodable, Sendable {
         let v = 1
@@ -204,9 +207,12 @@ enum RelayHostRotationTextRPC {
             case credentialAccountID = "credential_account_id"
         }
         var valid: Bool {
-            let credentialOperation = [.credentialSave, .credentialStatus, .credentialDelete].contains(operation)
+            let credentialOperation = [.credentialSave, .credentialStatus, .credentialDelete, .vaultUnlock].contains(operation)
             if !credentialOperation && (credentialReference != nil || credentialSecret != nil || credentialAccountID != nil) { return false }
             switch operation {
+            case .vaultUnlock:
+                return id == nil && settings == nil && operationID == nil && credentialReference == nil && credentialAccountID == nil &&
+                    credentialSecret.map({ (16...512).contains($0.utf8.count) && $0.utf8.allSatisfy { $0 > 32 && $0 < 127 } }) == true
             case .credentialSave:
                 return id == nil && settings == nil && operationID == nil &&
                     RelayHostRotationRPC.validOperationID(credentialReference ?? "") &&
@@ -286,10 +292,10 @@ enum RelayHostRotationTextRPC {
         if failure.status == "failed" {
             let message: String
             switch failure.code {
-            case "invalid_settings", "positive_limits_required": message = "Choose a provider and positive request limits. Claude API also needs daily and monthly budgets of at least $1."
+            case "invalid_settings", "positive_limits_required": message = "Choose a provider and valid limits. Claude API needs daily and monthly budgets of at least $1; saved CLI accounts need a positive daily request cap."
             case "invalid_accounts", "invalid_account", "invalid_account_name", "invalid_billing_group",
                  "api_account_configuration_required", "saved_account_configuration_required", "account_required":
-                message = "Complete the named account, its saved credential or login directory, and its request limits."
+                message = "Complete the named account, its saved credential or login directory, and its spending limits. Saved CLI accounts also need a positive daily request cap."
             case "configuration_changed": message = "The host settings changed in another tab. Reload before saving again."
             case "invalid_cli_path": message = "Use an absolute path to the account CLI on this host."
             case "invalid_model": message = "Enter a valid Codex model name."

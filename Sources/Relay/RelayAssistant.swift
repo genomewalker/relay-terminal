@@ -265,7 +265,7 @@ final class RelayAssistantController: ObservableObject {
                  "panes": tab.allPaneIDs.compactMap { workspace.panes[$0] }.dropFirst(requestedTab == nil ? 0 : start).prefix(requestedTab == nil ? 2 : 4).map { pane -> [String: Any] in
                      ["id": pane.id.uuidString.lowercased(), "name": String(pane.displayName.prefix(60)),
                       "host": String(pane.profile.name.prefix(40)), "directory": String((pane.directory ?? "").prefix(100)),
-                      "kind": pane.kind.rawValue, "connection": pane.connectionState.label,
+                      "kind": pane.kind.rawValue, "connection": pane.connectionStatusLabel,
                       "phase": pane.detector.phase.rawValue, "activity": String(pane.activitySummary.prefix(180)),
                       "activeSubagents": pane.activeSubagents,
                       "chatVisible": pane.nativeConversationVisible]
@@ -278,7 +278,7 @@ final class RelayAssistantController: ObservableObject {
         case .readPane:
             let pane = try targetPane(command.targetID, workspace: workspace)
             status = "observed"
-            detail = json(["paneID": pane.id.uuidString.lowercased(), "connection": pane.connectionState.label,
+            detail = json(["paneID": pane.id.uuidString.lowercased(), "connection": pane.connectionStatusLabel,
                            "lastCommandExitCode": pane.lastCommandExitCode as Any? ?? NSNull(),
                            "viewport": String((workspace.sidePanelViewport(pane.id) ?? "Viewport unavailable").prefix(2400))])
         case .closeChat:

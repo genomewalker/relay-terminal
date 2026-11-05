@@ -42,6 +42,8 @@ func runUpgradeSupervisor(arguments []string) {
 	socket := flags.String("socket", defaultSocket(), "supervisor socket")
 	legacy := flags.String("legacy-socket", legacySocket(), "legacy supervisor socket")
 	force := flags.Bool("force", false, "replace the validated supervisor even when its version matches")
+	archiveJobs := flags.Bool("archive-host-jobs", false, "preserve older completed jobs outside the legacy upgrade inspection set")
+	stateDir := flags.String("state-dir", "", "worker state directory for completed job archival")
 	_ = flags.Parse(arguments)
 
 	current, currentErr := inspectSupervisor(*socket)
@@ -49,6 +51,13 @@ func runUpgradeSupervisor(arguments []string) {
 		current.Status.ProtocolVersion == supervisorProtocolVersion {
 		fmt.Printf("relayd supervisor %s is current\n", relaydVersion)
 		return
+	}
+	if *archiveJobs {
+		archived, err := daemon.ArchiveCompletedHostJobs(*stateDir)
+		if err != nil {
+			fatal("cannot prepare completed job history: " + err.Error())
+		}
+		fmt.Printf("preserved %d completed jobs in the archive; %d records remain for the upgrade guard\n", archived.Archived, archived.Retained)
 	}
 
 	// Prepare every affected supervisor before stopping any of them. A legacy
@@ -128,7 +137,11 @@ func inspectSupervisorMode(socket string, prepare bool) (liveSupervisor, error) 
 		return live, err
 	}
 	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
+	probeTimeout := 2 * time.Second
+	if prepare {
+		probeTimeout = 30 * time.Second
+	}
+	_ = connection.SetDeadline(time.Now().Add(probeTimeout))
 	_, peerPID, err := daemon.PeerCredentials(connection)
 	if err != nil {
 		return live, err

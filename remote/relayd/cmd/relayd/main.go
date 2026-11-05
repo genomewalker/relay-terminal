@@ -23,8 +23,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/relay-terminal/relayd/internal/agentaccounts"
 	"github.com/relay-terminal/relayd/internal/agentlaunch"
 	"github.com/relay-terminal/relayd/internal/daemon"
+	"github.com/relay-terminal/relayd/internal/desktoproute"
 	"github.com/relay-terminal/relayd/internal/loopbackproxy"
 	"github.com/relay-terminal/relayd/internal/protocol"
 	relayterminfo "github.com/relay-terminal/relayd/internal/terminfo"
@@ -49,9 +51,73 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|artifact|files|terminfo|live-status|upgrade-supervisor|communication|peer-serve>")
+		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|agent-launchers|artifact|files|terminfo|live-status|upgrade-supervisor|upgrade-workers|communication|peer-serve>")
 	}
 	switch os.Args[1] {
+	case "desktop-route":
+		ctx, stop, err := desktopSignalContext()
+		if err != nil {
+			fatal(err.Error())
+		}
+		defer stop()
+		if err := desktoproute.Run(ctx, os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "desktop-remote":
+		// SIGTERM requests the native inbox's bounded backlog drain. A clean
+		// zero exit is required before the supervisor can hand its route over.
+		ctx, stop, err := desktopSignalContext()
+		if err != nil {
+			fatal(err.Error())
+		}
+		defer stop()
+		if err := desktoproute.RunRemote(ctx, os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "desktop-group":
+		ctx, stop, err := desktopSignalContext()
+		if err != nil {
+			fatal(err.Error())
+		}
+		defer stop()
+		if err := desktoproute.RunGroup(ctx, os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "subscription-quota":
+		data, err := daemon.ReadSubscriptionQuota(context.Background(), os.Args[2:])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if _, err := os.Stdout.Write(append(data, '\n')); err != nil {
+			fatal(err.Error())
+		}
+	case "subscription-quota-statusline":
+		if len(os.Args) != 3 {
+			fatal("usage: relayd subscription-quota-statusline ENCODED_COMMAND")
+		}
+		code, err := daemon.RunSubscriptionQuotaStatusline(context.Background(), os.Args[2], os.Stdin, os.Stdout, os.Stderr)
+		if err != nil {
+			fatal(err.Error())
+		}
+		os.Exit(code)
+	case "native-group":
+		if err := daemon.RunNativeGroup(context.Background(), os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "agent-conversation":
+		if err := daemon.RunAgentConversation(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "agent-maintenance":
+		if err := daemon.RunAgentMaintenance(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "pane-messaging":
+		if err := daemon.RunPaneMessaging(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "codex-managed-backend":
+		runManagedStockCodexBackend(os.Args[2:])
 	case "codex-proxy":
 		runStockCodexProxy(os.Args[2:])
 	case "loopback-proxy":
@@ -62,8 +128,14 @@ func main() {
 		runDaemon(os.Args[2:])
 	case "node":
 		runNode(os.Args[2:])
+	case "pane-health-controller-rpc":
+		runPaneHealthControllerRPC(os.Args[2:])
 	case "worker":
 		runWorker(os.Args[2:])
+	case "worker-reexec-probe":
+		runWorkerReexecProbe(os.Args[2:])
+	case "upgrade-workers":
+		runUpgradeWorkers(os.Args[2:])
 	case "attach":
 		runAttach(os.Args[2:])
 	case "observe":
@@ -83,6 +155,32 @@ func main() {
 			fatal(err.Error())
 		}
 		if err := daemon.EncodeJSON(os.Stdout, record); err != nil {
+			fatal(err.Error())
+		}
+	case "account-transcript-check":
+		// The binding validator a resumed agent must pass, run against a
+		// target account before a move exits its source agent.
+		if len(os.Args) != 5 {
+			fatal("usage: relayd account-transcript-check PROVIDER CONFIG_DIR|- TRANSCRIPT")
+		}
+		override := os.Args[3]
+		if override == "-" {
+			override = ""
+		}
+		if err := daemon.ValidateAccountTranscript(os.Args[4], os.Args[2], override); err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, map[string]bool{"bindable": true}); err != nil {
+			fatal(err.Error())
+		}
+	case "claude-move-onboarding":
+		// Run before a Claude account move exits its source agent; a
+		// nonzero exit refuses the move.
+		result, err := claudeMoveOnboarding(os.Args[2:])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, result); err != nil {
 			fatal(err.Error())
 		}
 	case "rotation-native-bridge":
@@ -203,6 +301,8 @@ func main() {
 		runForget(os.Args[2:])
 	case "gc":
 		runGC(os.Args[2:])
+	case "gc-host-jobs":
+		runGCHostJobs(os.Args[2:])
 	case "event":
 		runEvent(os.Args[2:])
 	case "agent-launch":
@@ -213,22 +313,45 @@ func main() {
 		runRotationExec(os.Args[2:])
 	case "rotation-send":
 		runRotationSend(os.Args[2:])
+	case "rotation-receipt":
+		runRotationReceipt(os.Args[2:])
 	case "rotation-status":
 		runRotationStatus(os.Args[2:])
+	case "rotation-text-reconcile":
+		runRotationTextReconcile(os.Args[2:])
 	case "codex-runtime":
 		runCodexRuntime(os.Args[2:])
 	case "codex-start-parameters":
 		runCodexStartParameters(os.Args[2:])
 	case "claude-status-capture":
 		runClaudeStatusCapture(os.Args[2:])
+	case "claude-statusline":
+		runClaudeStatusLine(os.Args[2:])
 	case "claude-start-parameters":
 		runClaudeStartParameters(os.Args[2:])
 	case "rotation-codex-launch":
 		runCodexRotationLaunch(os.Args[2:])
 	case "rotation-codex-exec":
 		runCodexRotationExec(os.Args[2:])
+	case "native-chat":
+		runNativeChat(os.Args[2:])
 	case "agent":
 		runAgent(os.Args[2:])
+	case "agent-launchers":
+		runAgentLaunchers(os.Args[2:])
+	case "codex-relay-profile":
+		runCodexRelayProfile(os.Args[2:])
+	case "codex-pane-resume-plan":
+		if len(os.Args) != 5 {
+			fatal("usage: relayd codex-pane-resume-plan PANE EXPECTED_SESSION TARGET_SESSION")
+		}
+		plan, err := daemon.ReadCodexPaneResumePlan(os.Args[2], os.Args[3], os.Args[4])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, plan); err != nil {
+			fatal(err.Error())
+		}
 	case "resume-plan":
 		if len(os.Args) != 3 {
 			fatal("usage: relayd resume-plan PANE")
@@ -258,11 +381,27 @@ func main() {
 		if err := daemon.EncodeJSON(os.Stdout, actor); err != nil {
 			fatal(err.Error())
 		}
-	case "communication":
-		var request daemon.CommunicationRequest
-		decoder := json.NewDecoder(io.LimitReader(os.Stdin, 65537))
-		if err := decoder.Decode(&request); err != nil {
+	case "peer-inbound-class":
+		// Read-only: the native messaging adapter predicts a recipient's
+		// cross-session hold before writing to its inbox.
+		if len(os.Args) != 4 {
+			fatal("usage: relayd peer-inbound-class PID SESSION")
+		}
+		pid, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			fatal("invalid recipient PID")
+		}
+		class, reason := daemon.ReadRecipientInboundClass(pid, os.Args[3])
+		if err := daemon.EncodeJSON(os.Stdout, map[string]string{"class": class, "reason": reason}); err != nil {
+			fatal(err.Error())
+		}
+	case "communication", "communication-shepherd":
+		request, decodeErr := daemon.DecodeCommunicationRequest(os.Stdin)
+		if decodeErr != nil {
 			fatal("invalid communication request")
+		}
+		if os.Args[1] == "communication-shepherd" && (!request.ShepherdReport || request.Operation != "assistant_send") {
+			fatal("a shepherd report envelope is required")
 		}
 		request, actorErr := daemon.ReconcileCommunicationActor(request, os.Getppid())
 		if actorErr != nil {
@@ -626,6 +765,11 @@ func runResumeSaved(arguments []string) {
 	if err := os.Chdir(plan.Directory); err != nil {
 		fatal("saved working directory is unavailable")
 	}
+	// The conversation lives in its own account directory. The new pane's
+	// inherited environment never chooses the account for a resumed session.
+	if err := resumeSavedAccount(plan.Provider, plan.ConfigDir); err != nil {
+		fatal(err.Error())
+	}
 	if plan.Provider == "claude" {
 		runClaude([]string{"--resume", plan.SessionID})
 	} else {
@@ -633,11 +777,30 @@ func runResumeSaved(arguments []string) {
 	}
 }
 
+func resumeSavedAccount(provider, configDir string) error {
+	name, err := agentlaunch.ConfigDirVariable(provider)
+	if err != nil {
+		return err
+	}
+	if inherited := os.Getenv(name); inherited != "" && inherited != configDir {
+		fmt.Fprintln(os.Stderr, "Relay: this pane's account differs from the saved conversation's; resuming with the conversation's own account.")
+	}
+	if configDir == "" {
+		return os.Unsetenv(name)
+	}
+	if !filepath.IsAbs(configDir) || filepath.Clean(configDir) != configDir {
+		return errors.New("saved conversation account directory is invalid")
+	}
+	return os.Setenv(name, configDir)
+}
+
 func runClaude(arguments []string) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fatal(err.Error())
 	}
+	admitAccount(home, "claude", false)
+	prepareAccount(home, "claude")
 	settingsDir := filepath.Join(home, ".relay")
 	if err := os.MkdirAll(settingsDir, 0o700); err != nil {
 		fatal(err.Error())
@@ -657,6 +820,18 @@ func runClaude(arguments []string) {
 	if err != nil {
 		fatal(err.Error())
 	}
+	requested := arguments
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if configDir == "" {
+		configDir = filepath.Join(home, ".claude")
+	}
+	// The legacy status settings repeated every Relay hook; its status line is now in claude-hooks.json.
+	retiredStatus := filepath.Join(home, ".config", "relay", "claude-hooks-status.json")
+	withDefaults := agentaccounts.WithClaudeDefaults(accountModelDefaults("claude", claudeConfigRoot(home)), arguments)
+	arguments, err = agentlaunch.ManagedClaudeLaunchArguments(configDir, settingsPath, withDefaults, retiredStatus)
+	if err != nil {
+		fatal("Claude could not start with Relay launch defaults: " + err.Error())
+	}
 	// Native rendering observes the official CLI session; it must not replace
 	// this invocation with a Relay-owned SDK worker.
 	// Continuing a detached background conversation exits in recent Claude CLIs.
@@ -672,7 +847,8 @@ func runClaude(arguments []string) {
 		}
 		fmt.Fprintln(os.Stderr, "Relay: a Claude conversation is still running in the background here. Select it to reattach.")
 		chooserArguments := []string{"claude", "agents", "--cwd", cwd, "--settings", settingsPath}
-		for _, argument := range arguments {
+		// The chooser keeps the caller's own options without Relay's settings files; defaults apply to launches only.
+		for _, argument := range agentlaunch.WithoutRelayClaudeSettings(settingsPath, requested, retiredStatus) {
 			if argument != "--continue" && argument != "-c" {
 				chooserArguments = append(chooserArguments, argument)
 			}
@@ -683,18 +859,22 @@ func runClaude(arguments []string) {
 	}
 	claudeArguments := []string{"claude", "--settings", settingsPath}
 	claudeArguments = append(claudeArguments, arguments...)
-	if err := syscall.Exec(executable, claudeArguments, captureAgentLaunch(home, "claude", executable, arguments, claudeArguments[1:])); err != nil {
+	if err := syscall.Exec(executable, claudeArguments, captureAgentLaunch(home, "claude", executable, requested, claudeArguments[1:])); err != nil {
 		fatal(err.Error())
 	}
 }
 
 func claudeContinuationTarget(executable string, arguments []string) (string, bool) {
 	continuations := 0
-	for _, argument := range arguments {
-		switch argument {
-		case "--continue", "-c":
+	for i := 0; i < len(arguments); i++ {
+		switch argument := arguments[i]; {
+		case argument == "--continue" || argument == "-c":
 			continuations++
-		case "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions":
+		case argument == "--dangerously-skip-permissions" || argument == "--allow-dangerously-skip-permissions":
+		// A starting permission mode, such as an account's Relay default, does not select a session.
+		case argument == "--permission-mode" && i+1 < len(arguments) && !strings.HasPrefix(arguments[i+1], "-"):
+			i++
+		case strings.HasPrefix(argument, "--permission-mode=") && argument != "--permission-mode=":
 		default:
 			return "", false
 		}
@@ -760,16 +940,73 @@ func runCodex(arguments []string) {
 	if err != nil {
 		fatal(err.Error())
 	}
+	admitAccount(home, "codex", false)
+	prepareAccount(home, "codex")
 	executable, err := resolveStockCodexExecutable()
 	if err != nil {
 		fatal(err.Error())
 	}
-	codexArguments := append([]string{"codex"}, arguments...)
+	withDefaults := agentaccounts.WithCodexDefaults(accountModelDefaults("codex", codexHome(os.Environ())), arguments)
+	effective, stop, err := prepareManagedStockCodex(executable, withDefaults, stockCodexEnvironment(os.Environ()))
+	if err != nil {
+		fatal("Codex could not start with Relay messaging: " + err.Error())
+	}
+	codexArguments := append([]string{"codex"}, effective...)
 	environment := captureAgentLaunch(home, "codex", executable, arguments, codexArguments[1:])
 	environment = stockCodexEnvironment(environment)
 	if err := syscall.Exec(executable, codexArguments, environment); err != nil {
+		stop()
 		fatal(err.Error())
 	}
+}
+
+// admitAccount starts an agent only with the provider default or one of
+// this host's registered account folders; a removed account is never started
+// again. The folder stays open in the agent, so a removal in progress sees it.
+// held: the variable was set by this process (a rotation worker), so it is
+// not in the environment a removal reads, and the folder must be held open.
+func admitAccount(home, provider string, held bool) {
+	name, err := agentlaunch.ConfigDirVariable(provider)
+	if err != nil {
+		fatal(err.Error())
+	}
+	admit := agentaccounts.AdmitLaunch
+	if held {
+		admit = agentaccounts.AdmitHeldLaunch
+	}
+	if err := admit(home, provider, os.Getenv(name)); err != nil {
+		fatal(err.Error())
+	}
+}
+
+// prepareAccount copies the main account's first-run and trust answers into
+// the account this agent starts with, so it never stops at a first-run
+// screen. It never blocks the launch.
+func prepareAccount(home, provider string) {
+	name, err := agentlaunch.ConfigDirVariable(provider)
+	if err != nil {
+		return
+	}
+	if note := agentaccounts.PrepareLaunch(home, provider, os.Getenv(name)); note != "" {
+		fmt.Fprintln(os.Stderr, "Relay: "+note+".")
+	}
+}
+
+// accountModelDefaults reads the launching account's model and effort; a
+// file that cannot be used is reported and ignored.
+func accountModelDefaults(provider, root string) agentaccounts.ModelDefaults {
+	defaults, err := agentaccounts.ReadModelDefaults(provider, root)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Relay: this account's model defaults were not applied: "+err.Error())
+	}
+	return defaults
+}
+
+func claudeConfigRoot(home string) string {
+	if configured := os.Getenv("CLAUDE_CONFIG_DIR"); configured != "" && filepath.IsAbs(configured) {
+		return configured
+	}
+	return filepath.Join(home, ".claude")
 }
 
 // Capture before exec, while argv is available verbatim. Exec preserves the
@@ -826,6 +1063,9 @@ func findRealAgentExecutable(name string) (string, error) {
 		selfInfo, _ = os.Stat(selfPath)
 	}
 	if configured := strings.TrimSpace(os.Getenv("RELAY_" + strings.ToUpper(name) + "_BIN")); configured != "" {
+		if fallback, ok := agentaccounts.ConfiguredExecutableFallback(name, configured); ok {
+			return fallback, nil
+		}
 		info, err := os.Stat(configured)
 		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
 			return "", fmt.Errorf("configured %s executable is not runnable: %s", name, configured)
@@ -1007,7 +1247,8 @@ const claudeHookSettings = `{
     "SubagentStop": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
     "Stop": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}],
     "SessionEnd": [{"hooks": [{"type": "command", "command": "if [ -n \"$RELAY_SESSION\" ]; then ~/.local/bin/relayd event --session \"$RELAY_SESSION\" --agent claude --bind; fi"}]}]
-  }
+  },
+  "statusLine": {"type": "command", "command": "~/.local/bin/relayd claude-statusline", "refreshInterval": 10}
 }`
 
 func runEvent(arguments []string) {
@@ -1144,7 +1385,12 @@ func runDaemon(arguments []string) {
 	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
 	_ = flags.Parse(arguments)
-	if err := daemon.NewServerWithBuildInfo(relaydVersion, supervisorProtocolVersion).Serve(*socket); err != nil {
+	// Question-thread leases renew and notify from the same long-lived daemon.
+	go daemon.RunQuestionThreadPoller(context.Background())
+	server := daemon.NewServerWithBuildInfo(relaydVersion, supervisorProtocolVersion)
+	// Archive deletion requires every relayd on this node to support tombstones.
+	server.SetHostJobPeerSockets([]string{*socket, defaultSocket(), legacySocket()})
+	if err := server.Serve(*socket); err != nil {
 		fatal(err.Error())
 	}
 }
@@ -1156,6 +1402,11 @@ func runWorker(arguments []string) {
 	session := flags.String("session", "", "durable session ID")
 	cols := flags.Uint("cols", 120, "terminal columns")
 	rows := flags.Uint("rows", 36, "terminal rows")
+	resumeStateFD := flags.Int("resume-state-fd", -1, "worker state descriptor left by a re-executing worker")
+	resumePTYFD := flags.Int("resume-pty-fd", -1, "PTY master descriptor left by a re-executing worker")
+	resumeListenerFD := flags.Int("resume-listener-fd", -1, "socket descriptor left by a re-executing worker")
+	resumeShellPID := flags.Int("resume-shell-pid", 0, "pane shell PID owned by a re-executing worker")
+	resumeOperation := flags.String("resume-operation", "", "worker upgrade operation ID")
 	_ = flags.Parse(arguments)
 	token := os.Getenv("RELAY_WORKER_TOKEN")
 	commandBase64 := os.Getenv("RELAY_WORKER_COMMAND_B64")
@@ -1181,8 +1432,62 @@ func runWorker(arguments []string) {
 		RotationControlled: os.Getenv("RELAY_ROTATION_WORKER") == "1",
 		Cols:               uint16(*cols), Rows: uint16(*rows),
 	}
+	if *resumePTYFD >= 0 {
+		config.Resume = &daemon.WorkerResume{
+			StateFD: *resumeStateFD, PTYFD: *resumePTYFD, ListenerFD: *resumeListenerFD,
+			ShellPID: *resumeShellPID, Operation: *resumeOperation,
+		}
+	}
 	if err := daemon.ServeWorker(config); err != nil {
 		fatal(err.Error())
+	}
+}
+
+// runWorkerReexecProbe is run by a pane worker, as the executable it is about
+// to exec, on the state it will hand over. It only decodes; it owns nothing.
+func runWorkerReexecProbe(arguments []string) {
+	flags := flag.NewFlagSet("worker-reexec-probe", flag.ExitOnError)
+	stateFD := flags.Int("state-fd", -1, "worker state descriptor")
+	_ = flags.Parse(arguments)
+	if *stateFD < 3 {
+		fatal("usage: relayd worker-reexec-probe --state-fd FD")
+	}
+	if err := daemon.ProbeWorkerReexecState(os.NewFile(uintptr(*stateFD), "relay-worker-state"), os.Stdout); err != nil {
+		fatal(err.Error())
+	}
+}
+
+// runUpgradeWorkers moves live pane workers on this node to this relayd
+// without restarting their shells or agents. Run it after upgrade-supervisor.
+func runUpgradeWorkers(arguments []string) {
+	flags := flag.NewFlagSet("upgrade-workers", flag.ExitOnError)
+	executable := flags.String("executable", "", "relayd to run in the workers (default: this executable)")
+	session := flags.String("session", "", "upgrade only this pane")
+	stateDir := flags.String("state-dir", "", "worker state directory (default: the daemon's)")
+	dryRun := flags.Bool("dry-run", false, "report what would be upgraded")
+	timeout := flags.Duration("timeout", 30*time.Second, "per-worker deadline")
+	busyRetries := flags.Int("busy-retries", 10, "times to retry a worker whose pane is busy")
+	busyRetryInterval := flags.Duration("busy-retry-interval", 30*time.Second, "wait between busy retries")
+	_ = flags.Parse(arguments)
+	if flags.NArg() != 0 || *busyRetries < 0 || *busyRetryInterval < 0 {
+		fatal("usage: relayd upgrade-workers [--session ID] [--executable PATH] [--dry-run] [--busy-retries N] [--busy-retry-interval D]")
+	}
+	options := daemon.WorkerUpgradeOptions{StateDir: *stateDir, Executable: *executable, DryRun: *dryRun, Timeout: *timeout,
+		BusyRetries: *busyRetries, BusyRetryInterval: *busyRetryInterval}
+	if *session != "" {
+		options.Sessions = []string{*session}
+	}
+	results, err := daemon.UpgradeWorkers(options)
+	if err != nil {
+		fatal(err.Error())
+	}
+	if err := daemon.EncodeJSON(os.Stdout, results); err != nil {
+		fatal(err.Error())
+	}
+	for _, result := range results {
+		if result.Result == "failed" || result.Result == "unconfirmed" {
+			os.Exit(1)
+		}
 	}
 }
 
@@ -1266,7 +1571,7 @@ func runNode(arguments []string) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := loopbackproxy.RelayNodeWithHostRequestHandlers(ctx, os.Stdin, os.Stdout, connection, daemon.HandleNodeHostRotationRequest, daemon.HandleNodeHostAccountsRequest); err != nil && err != io.EOF && ctx.Err() == nil {
+	if err := loopbackproxy.RelayNodeWithHostRequestHandlers(ctx, os.Stdin, os.Stdout, connection, daemon.HandleNodeHostRotationRequest, daemon.NodeHostAccountsHandler(*socket)); err != nil && err != io.EOF && ctx.Err() == nil {
 		fatal("node transport ended: " + err.Error())
 	}
 }
@@ -1345,6 +1650,84 @@ func runGC(arguments []string) {
 	for _, id := range removed {
 		fmt.Println(id)
 	}
+}
+
+// runGCHostJobs deletes archived host-job folders past the retention. Each
+// deleted job ID stays reserved by a tombstone; the report is JSON.
+func runGCHostJobs(arguments []string) {
+	const usage = "usage: relayd gc-host-jobs [--older-than 7d] [--dry-run] [--state-dir DIR] | --activate | --deactivate"
+	flags := flag.NewFlagSet("gc-host-jobs", flag.ExitOnError)
+	olderThan := flags.String("older-than", "", "retention for finished archived jobs, in days (7d) or a duration (36h); "+
+		"default: RELAYD_HOST_JOB_RETENTION, then the state directory's host-job-retention file, then 7d")
+	dryRun := flags.Bool("dry-run", false, "report what would be removed without changing anything")
+	activate := flags.Bool("activate", false, "allow archive deletion for this state directory; only after every node sharing it runs a tombstone-aware relayd")
+	deactivate := flags.Bool("deactivate", false, "stop archive deletion for this state directory and clear legacy evidence")
+	stateDir := flags.String("state-dir", "", "worker state directory")
+	_ = flags.Parse(arguments)
+	if flags.NArg() != 0 || *activate && *deactivate || (*activate || *deactivate) && (*dryRun || *olderThan != "") {
+		fatal(usage)
+	}
+	directory := *stateDir
+	if directory != "" {
+		var err error
+		if directory, err = filepath.Abs(directory); err != nil {
+			fatal(err.Error())
+		}
+	}
+	if *deactivate {
+		if err := daemon.DeactivateHostJobCleanup(directory); err != nil {
+			fatal(err.Error())
+		}
+		fmt.Println("archive deletion deactivated; legacy evidence cleared")
+		return
+	}
+	if *activate {
+		pids, err := tombstoneAwareRelaydPIDs([]string{defaultSocket(), legacySocket()})
+		if err != nil {
+			fatal(err.Error() + "; not activated")
+		}
+		activation, err := daemon.ActivateHostJobCleanup(directory, relaydVersion, pids, time.Now())
+		if err != nil {
+			fatal(err.Error() + "; not activated")
+		}
+		raw, _ := json.MarshalIndent(activation, "", "  ")
+		fmt.Println(string(raw))
+		return
+	}
+	retention := daemon.ResolveHostJobRetention(directory)
+	if *olderThan != "" {
+		parsed, err := daemon.ParseHostJobRetention(*olderThan)
+		if err != nil {
+			fatal(usage + ": " + err.Error())
+		}
+		retention = daemon.HostJobRetention{Duration: parsed, Source: "--older-than"}
+	}
+	for _, warning := range retention.Warnings {
+		fmt.Fprintln(os.Stderr, "relayd: warning:", warning)
+	}
+	options := daemon.HostJobCleanupOptions{OlderThan: retention.Duration, DryRun: *dryRun, Wait: time.Minute}
+	if !*dryRun {
+		// The same handshake as the daemon's pass: every relayd on this node
+		// must know tombstones and be registered for this state directory.
+		pids, err := tombstoneAwareRelaydPIDs([]string{defaultSocket(), legacySocket()})
+		if err != nil {
+			fatal(err.Error() + "; nothing was deleted")
+		}
+		options.LiveServerPIDs = pids
+	}
+	result, err := daemon.CleanupArchivedHostJobs(directory, options)
+	daemon.ApplyHostJobRetention(&result, retention)
+	raw, _ := json.MarshalIndent(result, "", "  ")
+	fmt.Println(string(raw))
+	if err != nil {
+		fatal(err.Error())
+	}
+}
+
+// tombstoneAwareRelaydPIDs probes each socket with the daemon's shared
+// handshake. A live relayd that does not support tombstones refuses.
+func tombstoneAwareRelaydPIDs(sockets []string) ([]int, error) {
+	return daemon.ProbeHostJobTombstoneServers(sockets)
 }
 
 func runObserve(arguments []string) {
@@ -1608,14 +1991,46 @@ func dialDaemon(socket string, timeout time.Duration) (net.Conn, error) {
 	return connection, nil
 }
 
+// Filesystem discovery is a dependency of socket selection. Tests supply a
+// private fixture rather than consulting the user's running supervisor.
+var defaultSocketRuntimeProbe = existingOwnedRelaydRuntimeSocket
+
 func defaultSocket() string {
 	if runtime := os.Getenv("XDG_RUNTIME_DIR"); runtime != "" {
 		return filepath.Join(runtime, "relayd.sock")
+	}
+	if runtime.GOOS == "linux" {
+		if socket := defaultSocketRuntimeProbe(filepath.Join("/run/user", strconv.Itoa(os.Getuid())), os.Getuid()); socket != "" {
+			return socket
+		}
 	}
 	// HPC nodes commonly share $HOME. The executable and durable catalog can
 	// live there, but a Unix socket must remain local to the node that owns the
 	// supervisor and PTYs.
 	return filepath.Join("/tmp", "relay-"+strconv.Itoa(os.Getuid()), "relayd.sock")
+}
+
+// Noninteractive SSH can omit XDG_RUNTIME_DIR even while the user's existing
+// supervisor is running there. Never select a shared, foreign or symlinked path.
+func existingOwnedRelaydRuntimeSocket(directory string, uid int) string {
+	root, err := os.Lstat(directory)
+	if err != nil || !root.IsDir() || root.Mode().Perm()&0077 != 0 {
+		return ""
+	}
+	owner, ok := root.Sys().(*syscall.Stat_t)
+	if !ok || int(owner.Uid) != uid {
+		return ""
+	}
+	path := filepath.Join(directory, "relayd.sock")
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm()&0077 != 0 {
+		return ""
+	}
+	owner, ok = info.Sys().(*syscall.Stat_t)
+	if !ok || int(owner.Uid) != uid {
+		return ""
+	}
+	return path
 }
 
 func legacySocket() string {

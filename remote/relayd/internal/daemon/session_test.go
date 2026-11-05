@@ -687,7 +687,7 @@ func TestBashIntegrationKeepsRelayShimsAheadOfUserPathChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(bash, "--rcfile", rcPath, "-i", "-c", "command -v codex")
+	command := exec.Command(bash, "--rcfile", rcPath, "-i", "-c", "type codex")
 	command.Env = append(os.Environ(), "HOME="+home, "PATH="+realDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -695,6 +695,34 @@ func TestBashIntegrationKeepsRelayShimsAheadOfUserPathChanges(t *testing.T) {
 	}
 	if !strings.Contains(string(output), filepath.Join(shimDirectory, "codex")) {
 		t.Fatalf("Relay shim did not win command lookup: %s", output)
+	}
+}
+
+func TestBashCodexShimSurvivesEnvironmentPathReorder(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	home := t.TempDir()
+	shimDirectory := filepath.Join(home, "relay shims")
+	condaDirectory := filepath.Join(home, "environment")
+	for directory, marker := range map[string]string{shimDirectory: "managed", condaDirectory: "unmanaged"} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "codex"), []byte("#!/bin/sh\nprintf '"+marker+":%s\\n' \"$1\"\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rcPath, err := writeBashIntegration(home, shimDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(bash, "--rcfile", rcPath, "-i", "-c", "export PATH="+shellQuote(condaDirectory)+":$PATH; codex 'literal argument'")
+	command.Env = append(os.Environ(), "HOME="+home)
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "managed:literal argument") || strings.Contains(string(output), "unmanaged:") {
+		t.Fatalf("environment bypassed the managed launcher: %v: %s", err, output)
 	}
 }
 
@@ -887,6 +915,138 @@ func TestViewportResizeSignalsExactlyOnce(t *testing.T) {
 	}
 }
 
+// bashPromptMarkers runs three prompts in a Relay bash session with bashrc
+// and counts the prompt-start and input-start markers it printed.
+func bashPromptMarkers(t *testing.T, bashrc string) (starts, inputs int, output string) {
+	t.Helper()
+	output = bashSessionOutput(t, bashrc, "true\ntrue\nexit\n")
+	return strings.Count(output, "\x1b]133;A;"), strings.Count(output, "\x1b]133;B\a"), output
+}
+
+// bashSessionOutput types input into a Relay bash session with bashrc and
+// returns everything it wrote.
+func bashSessionOutput(t *testing.T, bashrc, input string) string {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	// The integration needs Bash 4.4 or later.
+	if exec.Command(bash, "-c", "(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) ))").Run() != nil {
+		t.Skip("bash is older than 4.4")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".bashrc"), []byte(bashrc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command, err := sessionCommand(bash, "", home, filepath.Join(home, "shims"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The test runner's own prompt settings must not reach the session.
+	for _, entry := range os.Environ() {
+		if name, _, _ := strings.Cut(entry, "="); name != "PROMPT_COMMAND" && name != "PS0" && name != "PS1" && name != "BASH_ENV" {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, "HOME="+home)
+	command.Stdin = strings.NewReader(input)
+	raw, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bash session failed: %v: %q", err, raw)
+	}
+	return string(raw)
+}
+
+// Each command is marked started, then finished with its own status, in the
+// shell's output itself (no terminal is needed for PS0).
+func TestBashMarksEachCommandStartedAndFinished(t *testing.T) {
+	for name, bashrc := range map[string]string{
+		"plain":        "",
+		"bash-preexec": bashPreexecReplacingPromptCommand,
+	} {
+		t.Run(name, func(t *testing.T) {
+			output := bashSessionOutput(t, bashrc, "true\nfalse\n(exit 7)\nexit 0\n")
+			starts := strings.Count(output, "\x1b]133;C\a")
+			finished := []string{"\x1b]133;D;0\a", "\x1b]133;D;1\a", "\x1b]133;D;7\a"}
+			last := -1
+			for _, marker := range finished {
+				index := strings.Index(output, marker)
+				if index <= last || strings.Count(output, marker) != 1 {
+					t.Fatalf("want %q once, after the previous command: %q", marker, output)
+				}
+				last = index
+			}
+			// The started mark adds nothing visible around a silent command.
+			if !strings.Contains(output, "true\n\x1b]133;C\a\x1b]133;D;0\a") {
+				t.Fatalf("stray output around the started mark: %q", output)
+			}
+			// Started: the three commands and the final exit.
+			if starts != 4 || strings.Count(output, "\x1b]133;D;") != 3 {
+				t.Fatalf("starts %d (want 4), finishes %d (want 3): %q", starts, strings.Count(output, "\x1b]133;D;"), output)
+			}
+		})
+	}
+}
+
+// An empty command line runs nothing, so it is not reported as finished.
+func TestBashDoesNotFinishAnEmptyCommandLine(t *testing.T) {
+	output := bashSessionOutput(t, "", "\ntrue\n\ntrue\nexit 0\n")
+	if strings.Count(output, "\x1b]133;D;") != 2 {
+		t.Fatalf("want two finished commands: %q", output)
+	}
+}
+
+// Old bash-preexec releases replace PROMPT_COMMAND when they install at the
+// first prompt, and their install adds a user precmd that may rewrite PS1.
+const bashPreexecReplacingPromptCommand = `
+__bp_imported=defined
+__bp_set_ret_value() { return "${1:-0}"; }
+__bp_precmd_invoke_cmd() {
+    local status=$? hook
+    for hook in "${precmd_functions[@]}"; do __bp_set_ret_value "$status"; "$hook"; done
+}
+__bp_interactive_mode() { :; }
+__bp_install() {
+    [[ "$PROMPT_COMMAND" == *__bp_precmd_invoke_cmd* ]] && return 1
+    PROMPT_COMMAND="__bp_precmd_invoke_cmd; __bp_interactive_mode"
+    precmd_functions+=(precmd)
+    eval "$PROMPT_COMMAND"
+}
+PROMPT_COMMAND=$'\n__bp_install\n'
+precmd() { PS1='user$ '; }
+`
+
+func TestBashPromptMarkersSurviveBashPreexecReplacingPromptCommand(t *testing.T) {
+	starts, inputs, output := bashPromptMarkers(t, bashPreexecReplacingPromptCommand)
+	// The first prompt runs the user's precmd after the hook; it is moved
+	// last from then on.
+	if starts != 3 || inputs != 2 {
+		t.Fatalf("prompt starts %d (want 3), marked inputs %d (want 2): %q", starts, inputs, output)
+	}
+}
+
+func TestBashPromptMarkersRunOnceWithVendoredBashPreexec(t *testing.T) {
+	preexec, err := filepath.Abs("../../../../Vendor/libghostty-spm/Sources/GhosttyTerminal/Resources/Ghostty/shell-integration/bash/bash-preexec.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(preexec); err != nil {
+		t.Skip("vendored bash-preexec is not in this tree")
+	}
+	starts, inputs, output := bashPromptMarkers(t, ". "+shellQuote(preexec)+"\n")
+	if starts != 3 || inputs != 3 {
+		t.Fatalf("prompt starts %d, marked inputs %d, want 3 each: %q", starts, inputs, output)
+	}
+}
+
+func TestBashPromptMarkersWithoutBashPreexec(t *testing.T) {
+	starts, inputs, output := bashPromptMarkers(t, "PROMPT_COMMAND='USER_HOOK=1'\n")
+	if starts != 3 || inputs != 3 {
+		t.Fatalf("prompt starts %d, marked inputs %d, want 3 each: %q", starts, inputs, output)
+	}
+}
+
 func TestStartupCommandReturnsToInteractiveShell(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {
@@ -923,6 +1083,48 @@ func TestPromptEditorLaunchSettingDefaultsOnlyNewShellEnvironment(t *testing.T) 
 	for _, test := range cases {
 		if got := promptEditorLaunchSetting(test.environment); got != test.want {
 			t.Fatalf("launch setting for %v = %q, want %q", test.environment, got, test.want)
+		}
+	}
+}
+
+// A pane shell started by a relayd that was itself launched from a Claude Code
+// session does not inherit that session's markers.
+func TestSessionShellDoesNotInheritClaudeSessionMarkers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/sh")
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "inherited-session")
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude-max"))
+	output := filepath.Join(home, "env.txt")
+	session, err := startSession("claude-marker-test", "env > "+output+".tmp && mv "+output+".tmp "+output, "", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.pty.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	var data []byte
+	for {
+		if data, err = os.ReadFile(output); err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The shell's environment holds the developer's own variables, credentials
+	// included: failures name variables, never print values.
+	for _, line := range strings.Split(string(data), "\n") {
+		if name, _, _ := strings.Cut(line, "="); name == "CLAUDECODE" || strings.HasPrefix(name, "CLAUDE_CODE_") {
+			t.Fatalf("pane shell inherited %s", name)
+		}
+	}
+	for _, setting := range []string{"CLAUDE_CONFIG_DIR=" + filepath.Join(home, ".claude-max"), "RELAY_SESSION=claude-marker-test"} {
+		if !strings.Contains("\n"+string(data), "\n"+setting+"\n") {
+			name, _, _ := strings.Cut(setting, "=")
+			t.Fatalf("pane environment lost its own %s", name)
 		}
 	}
 }

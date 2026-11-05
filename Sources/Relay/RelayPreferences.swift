@@ -87,6 +87,7 @@ final class RelayPreferences: ObservableObject {
     static let shared = RelayPreferences()
 
     private static let availableFontFamilies: Set<String> = {
+        _ = RelayBundledFonts.registered
         let families = CTFontManagerCopyAvailableFontFamilyNames() as NSArray
         return Set(families.compactMap { ($0 as? String)?.lowercased() })
     }()
@@ -106,12 +107,49 @@ final class RelayPreferences: ObservableObject {
     @Published var automaticAgentSummaries: Bool { didSet { save() } }
     @Published var semanticAgentSearch: Bool { didSet { save() } }
     @Published var automaticallyUpdateRelayd: Bool { didSet { save() } }
+    @Published var automaticAgentMaintenance: Bool { didSet { save() } }
+    /// Relay clears an agent's context at its measured budget and restores the
+    /// agent's own capsule (stock CLIs, guarded /clear). Off by default.
+    @Published var automaticContextRotation: Bool { didSet { save() } }
+    @Published var contextRotationBudget: Int { didSet { save() } }
+    /// The single pane process allowed to rotate; nil (the default) enrolls none.
+    @Published var contextRotationEnrollment: RelayContextRotationEnrollment? { didSet { save() } }
+    @Published var haikuPaneHealth: Bool { didSet { save() } }
+    // User-only; absent from MCP settings schemas and supervisor corrections.
+    @Published var shepherd: RelayShepherdSettings { didSet { save() } }
+    /// connectionKey of the host whose account runs Miko; focus never chooses it.
+    @Published var mikoHostKey: String { didSet { save() } }
+    @Published var mikoAutonomy: RelayMikoPolicySettings.Autonomy { didSet { save() } }
+    @Published var mikoMinute: Int { didSet { save() } }
+    @Published var mikoHour: Int { didSet { save() } }
+    @Published var mikoTargetMinute: Int { didSet { save() } }
+    @Published var mikoRepetitions: Int { didSet { save() } }
+    var mikoPolicy: RelayMikoPolicySettings {
+        .init(autonomy: mikoAutonomy, minute: mikoMinute, hour: mikoHour,
+              targetMinute: mikoTargetMinute, repetitions: mikoRepetitions).bounded
+    }
+    @Published var assistantHotkeyEnabled: Bool { didSet { save() } }
+    @Published var assistantHotkey: RelayAssistantHotkey { didSet { save() } }
     @Published private(set) var keyBindings: [String: RelayKeyBinding] { didSet { save() } }
 
-    private let defaults = RelayStateProfile.defaults
+    @Published var claudeQuotaFailover: RelayClaudeQuotaSettings { didSet { save() } }
+
+    private let defaults: UserDefaults
+
+    /// Miko runs on This Mac until the user pins another host.
+    static func storedMikoHostKey(_ defaults: UserDefaults) -> String {
+        defaults.string(forKey: "relay.settings.miko-host") ?? ConnectionProfile.local.connectionKey
+    }
     private var isLoading = true
 
-    private init() {
+    init(defaults: UserDefaults = RelayStateProfile.defaults) {
+        self.defaults = defaults
+        claudeQuotaFailover = .restored(defaults.data(forKey: "relay.settings.claude-quota-failover"))
+        mikoAutonomy = RelayMikoPolicySettings.Autonomy(rawValue: defaults.string(forKey: "relay.settings.miko-autonomy") ?? "") ?? .autonomous
+        mikoMinute = (defaults.object(forKey: "relay.settings.miko-minute") as? Int ?? 60)
+        mikoHour = (defaults.object(forKey: "relay.settings.miko-hour") as? Int ?? 600)
+        mikoTargetMinute = (defaults.object(forKey: "relay.settings.miko-target-minute") as? Int ?? 12)
+        mikoRepetitions = (defaults.object(forKey: "relay.settings.miko-repetitions") as? Int ?? 3)
         fontFamily = defaults.string(forKey: "relay.settings.font-family") ?? "Menlo"
         let storedSize = defaults.double(forKey: "relay.settings.font-size")
         fontSize = storedSize == 0 ? 13.5 : storedSize
@@ -141,6 +179,18 @@ final class RelayPreferences: ObservableObject {
             storedRevision: intelligenceRevision
         )
         automaticallyUpdateRelayd = defaults.object(forKey: "relay.settings.relayd-auto-update") as? Bool ?? false
+        automaticAgentMaintenance = defaults.object(forKey: "relay.settings.agent-maintenance") as? Bool ?? false
+        automaticContextRotation = defaults.object(forKey: "relay.settings.context-rotation") as? Bool ?? false
+        contextRotationBudget = min(max(defaults.object(forKey: "relay.settings.context-rotation-budget") as? Int
+            ?? RelayStockRotationPolicy.defaultBudget, 20_000), 2_000_000)
+        contextRotationEnrollment = defaults.data(forKey: "relay.settings.context-rotation-enrollment")
+            .flatMap { try? JSONDecoder().decode(RelayContextRotationEnrollment.self, from: $0) }
+        haikuPaneHealth = defaults.object(forKey: "relay.settings.haiku-pane-health") as? Bool ?? false
+        shepherd = defaults.data(forKey: "relay.settings.miko-shepherd").flatMap { try? RelayShepherdSettings.decode($0) } ?? .init()
+        mikoHostKey = Self.storedMikoHostKey(defaults)
+        let assistantHotkey = RelayAssistantHotkeyStorage.load(from: defaults)
+        assistantHotkeyEnabled = assistantHotkey.enabled
+        self.assistantHotkey = assistantHotkey.hotkey
         keyBindings = RelayKeyBindingStorage.load(from: defaults)
         isLoading = false
         // Remove stale completion preferences left by older builds.
@@ -261,6 +311,20 @@ final class RelayPreferences: ObservableObject {
         }
     }
 
+    var obelTrialPreviousFamily: String? { defaults.string(forKey: "relay.settings.obel-trial-previous-family") }
+
+    func beginObelFontTrial() {
+        guard RelayBundledFonts.registered, fontFamily != "Obel Mono" else { return }
+        defaults.set(fontFamily, forKey: "relay.settings.obel-trial-previous-family")
+        fontFamily = "Obel Mono"
+    }
+
+    func undoObelFontTrial() {
+        guard fontFamily == "Obel Mono", let previous = obelTrialPreviousFamily else { return }
+        fontFamily = previous
+        defaults.removeObject(forKey: "relay.settings.obel-trial-previous-family")
+    }
+
     var resolvedFontFamily: String {
         let requested = fontFamily.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !requested.isEmpty else { return "Menlo" }
@@ -282,6 +346,11 @@ final class RelayPreferences: ObservableObject {
 
     private func save() {
         guard !isLoading else { return }
+        defaults.set(mikoAutonomy.rawValue, forKey: "relay.settings.miko-autonomy")
+        defaults.set(mikoPolicy.minute, forKey: "relay.settings.miko-minute")
+        defaults.set(mikoPolicy.hour, forKey: "relay.settings.miko-hour")
+        defaults.set(mikoPolicy.targetMinute, forKey: "relay.settings.miko-target-minute")
+        defaults.set(mikoPolicy.repetitions, forKey: "relay.settings.miko-repetitions")
         defaults.set(fontFamily, forKey: "relay.settings.font-family")
         defaults.set(fontSize, forKey: "relay.settings.font-size")
         defaults.set(terminalPadding, forKey: "relay.settings.terminal-padding")
@@ -297,6 +366,21 @@ final class RelayPreferences: ObservableObject {
         defaults.set(automaticAgentSummaries, forKey: "relay.settings.intelligence-summaries")
         defaults.set(semanticAgentSearch, forKey: "relay.settings.intelligence-search")
         defaults.set(automaticallyUpdateRelayd, forKey: "relay.settings.relayd-auto-update")
+        defaults.set(automaticAgentMaintenance, forKey: "relay.settings.agent-maintenance")
+        defaults.set(automaticContextRotation, forKey: "relay.settings.context-rotation")
+        defaults.set(contextRotationBudget, forKey: "relay.settings.context-rotation-budget")
+        if let enrollment = contextRotationEnrollment, let data = try? JSONEncoder().encode(enrollment) {
+            defaults.set(data, forKey: "relay.settings.context-rotation-enrollment")
+        } else {
+            defaults.removeObject(forKey: "relay.settings.context-rotation-enrollment")
+        }
+        defaults.set(haikuPaneHealth, forKey: "relay.settings.haiku-pane-health")
+        defaults.set(try? JSONEncoder().encode(shepherd.bounded), forKey: "relay.settings.miko-shepherd")
+        defaults.set(mikoHostKey, forKey: "relay.settings.miko-host")
+        RelayAssistantHotkeyStorage.save(enabled: assistantHotkeyEnabled, hotkey: assistantHotkey, to: defaults)
         RelayKeyBindingStorage.save(keyBindings, to: defaults)
+        if let data = try? JSONEncoder().encode(claudeQuotaFailover) {
+            defaults.set(data, forKey: "relay.settings.claude-quota-failover")
+        }
     }
 }

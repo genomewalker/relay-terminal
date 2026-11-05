@@ -16,30 +16,78 @@ enum RelayAgentObserverHello {
 
 @MainActor
 final class RelayHostAgentMonitorToken {
+    private let monitor: RelayHostAgentMonitor
     private let hostKey: String
     private let subscriptionID: UUID
+    private let sessionID: String
     private var stopped = false
 
-    init(hostKey: String, subscriptionID: UUID) {
+    init(monitor: RelayHostAgentMonitor, hostKey: String, subscriptionID: UUID, sessionID: String) {
+        self.monitor = monitor
         self.hostKey = hostKey
         self.subscriptionID = subscriptionID
+        self.sessionID = sessionID
+    }
+
+    /// The pane's agent may have changed: identify it at the fast interval.
+    func expectHarnessChange() {
+        guard !stopped else { return }
+        monitor.expectHarnessChange(hostKey: hostKey, sessionID: sessionID)
     }
 
     func stop() {
         guard !stopped else { return }
         stopped = true
-        RelayHostAgentMonitor.shared.unsubscribe(hostKey: hostKey, subscriptionID: subscriptionID)
+        monitor.unsubscribe(hostKey: hostKey, subscriptionID: subscriptionID)
     }
+}
+
+/// The host stream that carries agent events. Its attachment says only that
+/// this observer is attached, never that a pane's terminal route connected.
+protocol RelayHostAgentObserving: AnyObject, Sendable {
+    /// `onAttached` names the attached session, or nil when one stream
+    /// attached for every session.
+    func start(profile: ConnectionProfile, sessions: [String: UInt64],
+               onEvent: @escaping @Sendable (String, Data) -> Void,
+               onAttached: @escaping @Sendable (String?) -> Void)
+    /// Observes one more session without disturbing the others. False when
+    /// only a restart can add it.
+    func addSession(_ sessionID: String, cursor: UInt64) -> Bool
+    func stop()
 }
 
 @MainActor
 final class RelayHostAgentMonitor {
-    static let shared = RelayHostAgentMonitor()
+    static let shared = RelayHostAgentMonitor(
+        makeTransport: { RelayHostAgentMonitor.liveTransport() },
+        queryHarnesses: RelayHostAgentMonitor.queryInstalledHelper
+    )
+
+    /// Runs `relayd agent-harnesses` for the panes; returns its exit code and stdout.
+    typealias HarnessQuery = @MainActor (ConnectionProfile, [String]) async throws -> (exitCode: Int, stdout: Data)
+
+    private let makeTransport: @MainActor () -> any RelayHostAgentObserving
+    private let queryHarnesses: HarnessQuery
+
+    /// Tests pass a controlled transport and harness query.
+    init(makeTransport: @escaping @MainActor () -> any RelayHostAgentObserving, queryHarnesses: @escaping HarnessQuery) {
+        self.makeTransport = makeTransport
+        self.queryHarnesses = queryHarnesses
+    }
+
+    nonisolated static func liveTransport() -> any RelayHostAgentObserving { RelayHostAgentTransport() }
+
+    static func queryInstalledHelper(profile: ConnectionProfile, panes: [String]) async throws -> (exitCode: Int, stdout: Data) {
+        let command = RelayHostExecution.daemonCommand(profile: profile, arguments: ["agent-harnesses"] + panes)
+        let output = try await RelayHostExecution.capture(profile: profile, command: command,
+            timeout: 8, maximumBytes: 256 << 10)
+        return (output.exitCode, output.stdout)
+    }
 
     private struct Subscription {
         let sessionID: String
         let onEvent: (Data) -> Void
-        let onAttached: () -> Void
+        let onObserverAttached: () -> Void
         let onHarness: ((AgentHarnessIdentity) -> Void)?
     }
 
@@ -50,21 +98,64 @@ final class RelayHostAgentMonitor {
         let profile: ConnectionProfile
         var subscriptions: [UUID: Subscription] = [:]
         var eventCursors: [String: UInt64] = [:]
-        var transport: RelayHostAgentTransport?
+        var transport: (any RelayHostAgentObserving)?
         var restartTask: Task<Void, Never>?
         var harnessTask: Task<Void, Never>?
+        var harnessNap: Task<Void, Never>?
+        var identified: Set<String> = []
+        var harnessHints: [String: Date] = [:]
 
         init(profile: ConnectionProfile) { self.profile = profile }
     }
 
     private var hosts: [String: HostEntry] = [:]
+    private var visibleByWorkspace: [ObjectIdentifier: Set<String>] = [:]
+    private var visibleSessions: Set<String> { visibleByWorkspace.values.reduce(into: []) { $0.formUnion($1) } }
+
+    /// Harness identification is a durable host job per poll. It runs every
+    /// 3 s only while the app is active and a visible pane awaits its first
+    /// identity, or a pane expects a change; otherwise every 20 s.
+    nonisolated static let harnessHotInterval: Double = 3
+    nonisolated static let harnessColdInterval: Double = 20
+    static let harnessHintLifetime: TimeInterval = 30
+
+    nonisolated static func harnessDelay(active: Bool, panes: [String], identified: Set<String>, visible: Set<String>,
+                             hints: [String: Date], now: Date, retryDelay: Double) -> Double {
+        let hot = active && panes.contains { pane in
+            (visible.contains(pane) && !identified.contains(pane)) || hints[pane].map { now < $0 } == true
+        }
+        return max(hot ? harnessHotInterval : harnessColdInterval, retryDelay)
+    }
+
+    /// The panes in a workspace's selected tab. A newly visible pane with no
+    /// identity yet is identified at the fast interval.
+    func setVisibleSessions(_ sessions: Set<String>, workspace: ObjectIdentifier) {
+        guard sessions != visibleByWorkspace[workspace] else { return }
+        visibleByWorkspace[workspace] = sessions.isEmpty ? nil : sessions
+        for entry in hosts.values where entry.subscriptions.values.contains(where: {
+            sessions.contains($0.sessionID) && !entry.identified.contains($0.sessionID)
+        }) { entry.harnessNap?.cancel() }
+    }
+
+    /// A pane's agent may have started, stopped or been replaced: identify it
+    /// at the fast interval for a while.
+    func expectHarnessChange(profile: ConnectionProfile, sessionID: String) {
+        expectHarnessChange(hostKey: hostKey(profile), sessionID: sessionID)
+    }
+
+    func expectHarnessChange(hostKey: String, sessionID: String) {
+        guard let entry = hosts[hostKey],
+              entry.subscriptions.values.contains(where: { $0.sessionID == sessionID }) else { return }
+        entry.harnessHints[sessionID] = Date().addingTimeInterval(Self.harnessHintLifetime)
+        entry.harnessNap?.cancel()
+    }
 
     func subscribe(
         profile: ConnectionProfile,
         sessionID: String,
         lastEventSequence: UInt64,
         onEvent: @escaping (Data) -> Void,
-        onAttached: @escaping () -> Void,
+        onObserverAttached: @escaping () -> Void,
         onHarness: ((AgentHarnessIdentity) -> Void)? = nil
     ) -> RelayHostAgentMonitorToken {
         let key = hostKey(profile)
@@ -72,11 +163,20 @@ final class RelayHostAgentMonitor {
         hosts[key] = entry
         let subscriptionID = UUID()
         entry.subscriptions[subscriptionID] = Subscription(
-            sessionID: sessionID, onEvent: onEvent, onAttached: onAttached, onHarness: onHarness
+            sessionID: sessionID, onEvent: onEvent, onObserverAttached: onObserverAttached, onHarness: onHarness
         )
-        entry.eventCursors[sessionID] = max(entry.eventCursors[sessionID] ?? 0, lastEventSequence)
-        scheduleRestart(key: key, entry: entry)
-        return RelayHostAgentMonitorToken(hostKey: key, subscriptionID: subscriptionID)
+        let observed = entry.eventCursors[sessionID] != nil
+        let cursor = max(entry.eventCursors[sessionID] ?? 0, lastEventSequence)
+        entry.eventCursors[sessionID] = cursor
+        entry.harnessHints[sessionID] = Date().addingTimeInterval(Self.harnessHintLifetime)
+        // A running stream gains the session in place: restarting it would
+        // re-attach every other pane's observer for one new pane.
+        let joined = entry.restartTask == nil
+            && entry.transport.map { observed || $0.addSession(sessionID, cursor: cursor) } == true
+        if !joined { scheduleRestart(key: key, entry: entry) }
+        // Identify the new pane now, not after the current harness nap.
+        entry.harnessNap?.cancel()
+        return RelayHostAgentMonitorToken(monitor: self, hostKey: key, subscriptionID: subscriptionID, sessionID: sessionID)
     }
 
     func unsubscribe(hostKey: String, subscriptionID: UUID) {
@@ -84,9 +184,12 @@ final class RelayHostAgentMonitor {
         entry.subscriptions.removeValue(forKey: subscriptionID)
         let retainedSessions = Set(entry.subscriptions.values.map(\.sessionID))
         entry.eventCursors = entry.eventCursors.filter { retainedSessions.contains($0.key) }
+        entry.identified.formIntersection(retainedSessions)
+        entry.harnessHints = entry.harnessHints.filter { retainedSessions.contains($0.key) }
         if entry.subscriptions.isEmpty {
             entry.restartTask?.cancel()
             entry.harnessTask?.cancel()
+            entry.harnessNap?.cancel()
             entry.transport?.stop()
             hosts.removeValue(forKey: hostKey)
         } else {
@@ -99,9 +202,10 @@ final class RelayHostAgentMonitor {
         entry.restartTask = Task { [weak self, weak entry] in
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled, let self, let entry, self.hosts[key] === entry else { return }
+            entry.restartTask = nil
             self.startHarnessIdentification(key: key, entry: entry)
             entry.transport?.stop()
-            let transport = RelayHostAgentTransport()
+            let transport = self.makeTransport()
             entry.transport = transport
             let sessions = entry.eventCursors
             transport.start(profile: entry.profile, sessions: sessions) { [weak self, weak entry] sessionID, payload in
@@ -114,10 +218,12 @@ final class RelayHostAgentMonitor {
                         subscription.onEvent(payload)
                     }
                 }
-            } onAttached: { [weak self, weak entry] in
+            } onAttached: { [weak self, weak entry] sessionID in
                 Task { @MainActor in
                     guard let self, let entry, self.hosts[key] === entry else { return }
-                    entry.subscriptions.values.forEach { $0.onAttached() }
+                    for subscription in entry.subscriptions.values where sessionID == nil || subscription.sessionID == sessionID {
+                        subscription.onObserverAttached()
+                    }
                 }
             }
         }
@@ -133,37 +239,45 @@ final class RelayHostAgentMonitor {
     private func startHarnessIdentification(key: String, entry: HostEntry) {
         guard entry.harnessTask == nil else { return }
         entry.harnessTask = Task { [weak self, weak entry] in
-            var retryDelay: Double = 3
+            var retryDelay: Double = 0
             while !Task.isCancelled {
                 guard let self, let entry, self.hosts[key] === entry else { return }
                 let panes = Array(Set(entry.subscriptions.values.filter { $0.onHarness != nil }.map(\.sessionID))).sorted()
                 if !panes.isEmpty {
                     do {
                         try Task.checkCancellation()
-                        let command = RelayHostExecution.daemonCommand(profile: entry.profile,
-                            arguments: ["agent-harnesses"] + panes)
-                        let output = try await RelayHostExecution.capture(profile: entry.profile, command: command,
-                            timeout: 8, maximumBytes: 256 << 10)
+                        let output = try await self.queryHarnesses(entry.profile, panes)
                         try Task.checkCancellation()
                         guard self.hosts[key] === entry else { return }
-                        if output.exitCode == 0 {
-                            let report = try JSONDecoder().decode(AgentHarnessReport.self, from: output.stdout)
-                            if report.version == 1 {
-                                retryDelay = 3
-                                for identity in report.panes where panes.contains(identity.paneID.uuidString.lowercased()) {
-                                    for subscription in entry.subscriptions.values where subscription.sessionID == identity.paneID.uuidString.lowercased() {
-                                        subscription.onHarness?(identity)
-                                    }
+                        let report = output.exitCode == 0 ? try JSONDecoder().decode(AgentHarnessReport.self, from: output.stdout) : nil
+                        if let report, report.version == 1 {
+                            retryDelay = 0
+                            // Every pane asked about is answered, with or without an agent.
+                            entry.identified.formUnion(panes)
+                            for identity in report.panes where panes.contains(identity.paneID.uuidString.lowercased()) {
+                                let session = identity.paneID.uuidString.lowercased()
+                                for subscription in entry.subscriptions.values where subscription.sessionID == session {
+                                    subscription.onHarness?(identity)
                                 }
                             }
                         } else {
-                            retryDelay = min(60, retryDelay * 2)
+                            // A failed command or an unknown report version backs off alike.
+                            retryDelay = min(60, max(3, retryDelay) * 2)
                         }
                     } catch is CancellationError { return }
-                    catch { retryDelay = min(60, retryDelay * 2) }
+                    catch { retryDelay = min(60, max(3, retryDelay) * 2) }
                 }
-                do { try await Task.sleep(for: .seconds(RelayApplicationActivityState.allowsContinuousUpdates ? retryDelay : max(15, retryDelay))) }
-                catch { return }
+                let now = Date()
+                entry.harnessHints = entry.harnessHints.filter { now < $0.value }
+                let delay = Self.harnessDelay(active: RelayApplicationActivityState.allowsContinuousUpdates, panes: panes,
+                    identified: entry.identified, visible: self.visibleSessions, hints: entry.harnessHints,
+                    now: now, retryDelay: retryDelay)
+                // A hint or a newly visible pane cancels the nap, not the loop.
+                let nap = Task { _ = try? await Task.sleep(for: .seconds(delay)) }
+                entry.harnessNap = nap
+                await withTaskCancellationHandler { await nap.value } onCancel: { nap.cancel() }
+                entry.harnessNap = nil
+                if Task.isCancelled { return }
             }
         }
     }
@@ -175,7 +289,7 @@ final class RelayHostAgentMonitor {
     }
 }
 
-private final class RelayHostAgentTransport: @unchecked Sendable {
+private final class RelayHostAgentTransport: RelayHostAgentObserving, @unchecked Sendable {
     private final class EventCursor: @unchecked Sendable {
         private let lock = NSLock()
         private var sequence: UInt64
@@ -201,35 +315,56 @@ private final class RelayHostAgentTransport: @unchecked Sendable {
     private var channels: [String: RelayNodeChannel] = [:]
     private var legacyTransport: RelayLegacyHostAgentTransport?
     private var stopped = false
+    private var profile: ConnectionProfile?
+    private var sessions: [String: UInt64] = [:]
+    private var onEvent: (@Sendable (String, Data) -> Void)?
+    private var onAttached: (@Sendable (String?) -> Void)?
 
     func start(
         profile: ConnectionProfile,
         sessions: [String: UInt64],
         onEvent: @escaping @Sendable (String, Data) -> Void,
-        onAttached: @escaping @Sendable () -> Void
+        onAttached: @escaping @Sendable (String?) -> Void
     ) {
         lock.lock()
         stopped = false
+        self.profile = profile
+        self.sessions = sessions
+        self.onEvent = onEvent
+        self.onAttached = onAttached
         lock.unlock()
         for (sessionID, cursor) in sessions {
             startMultiplexedObserver(
                 profile: profile,
                 sessionID: sessionID,
                 cursor: cursor,
-                allSessions: sessions,
                 onEvent: onEvent,
                 onAttached: onAttached
             )
         }
     }
 
+    func addSession(_ sessionID: String, cursor: UInt64) -> Bool {
+        lock.lock()
+        // The legacy observe-many command fixes its session list at launch.
+        guard !stopped, legacyTransport == nil, let profile, let onEvent, let onAttached else {
+            lock.unlock()
+            return false
+        }
+        guard sessions[sessionID] == nil else { lock.unlock(); return true }
+        sessions[sessionID] = cursor
+        lock.unlock()
+        startMultiplexedObserver(profile: profile, sessionID: sessionID, cursor: cursor,
+                                 onEvent: onEvent, onAttached: onAttached)
+        return true
+    }
+
     private func startMultiplexedObserver(
         profile: ConnectionProfile,
         sessionID: String,
         cursor: UInt64,
-        allSessions: [String: UInt64],
         onEvent: @escaping @Sendable (String, Data) -> Void,
-        onAttached: @escaping @Sendable () -> Void
+        onAttached: @escaping @Sendable (String?) -> Void
     ) {
         let routeID = "observer_" + UUID().uuidString.lowercased()
         let eventCursor = EventCursor(cursor)
@@ -239,12 +374,7 @@ private final class RelayHostAgentTransport: @unchecked Sendable {
             onReady: { [weak self] channel in
                 guard let self else { return }
                 guard channel.supports("node_mux_v2") else {
-                    self.startLegacy(
-                        profile: profile,
-                        sessions: allSessions,
-                        onEvent: onEvent,
-                        onAttached: onAttached
-                    )
+                    self.startLegacy(profile: profile, onEvent: onEvent, onAttached: onAttached)
                     return
                 }
                 // event_only is the publisher role, not an observer modifier.
@@ -264,7 +394,7 @@ private final class RelayHostAgentTransport: @unchecked Sendable {
                 case .status:
                     if let status = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload),
                        status.state == "attached" {
-                        onAttached()
+                        onAttached(sessionID)
                     }
                 default:
                     break
@@ -296,19 +426,19 @@ private final class RelayHostAgentTransport: @unchecked Sendable {
 
     private func startLegacy(
         profile: ConnectionProfile,
-        sessions: [String: UInt64],
         onEvent: @escaping @Sendable (String, Data) -> Void,
-        onAttached: @escaping @Sendable () -> Void
+        onAttached: @escaping @Sendable (String?) -> Void
     ) {
         lock.lock()
         guard !stopped, legacyTransport == nil else { lock.unlock(); return }
+        let sessions = self.sessions
         let activeChannels = Array(channels.values)
         channels.removeAll()
         let legacy = RelayLegacyHostAgentTransport()
         legacyTransport = legacy
         lock.unlock()
         activeChannels.forEach { $0.close() }
-        legacy.start(profile: profile, sessions: sessions, onEvent: onEvent, onAttached: onAttached)
+        legacy.start(profile: profile, sessions: sessions, onEvent: onEvent, onAttached: { onAttached(nil) })
     }
 }
 

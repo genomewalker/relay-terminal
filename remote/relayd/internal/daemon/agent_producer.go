@@ -18,6 +18,9 @@ type agentProducer struct {
 	ProcessID    int    `json:"process_id"`
 	ProcessStart uint64 `json:"process_start"`
 	SenderPID    int    `json:"sender_pid"`
+	// ConfigDir is the agent process's own CLAUDE_CONFIG_DIR or CODEX_HOME
+	// ("" for the provider default): the pane's provider account.
+	ConfigDir string `json:"config_dir,omitempty"`
 }
 
 // Infer the provider root from the sender's kernel ancestry. Claimed PIDs,
@@ -67,6 +70,11 @@ func verifiedAgentProcess(sender int, manifest workerManifest, provider string) 
 	if !belongs || root == 0 {
 		return agentProducer{}, errors.New("agent sender belongs to another pane")
 	}
+	// Read before the ancestry recheck so the account belongs to this incarnation.
+	configDir, err := agentConfigOverride(root, provider)
+	if err != nil {
+		return agentProducer{}, errors.New("agent account directory unavailable")
+	}
 	for pid, before := range starts {
 		after, e := processStartTime(pid)
 		if e != nil || after != before {
@@ -77,7 +85,7 @@ func verifiedAgentProcess(sender int, manifest workerManifest, provider string) 
 	if err != nil || after != senderStart {
 		return agentProducer{}, errors.New("agent sender changed")
 	}
-	return agentProducer{manifest.SessionID, provider, root, starts[root], sender}, nil
+	return agentProducer{manifest.SessionID, provider, root, starts[root], sender, configDir}, nil
 }
 
 // StoreNativeAgentHook binds a real CLI hook even when its already-running
@@ -124,10 +132,16 @@ func StoreNativeAgentHook(pane, provider string, raw []byte) error {
 	case "SessionEnd":
 		state = "exited"
 	}
-	return server.storeAgentBinding(map[string]any{
+	if err := server.storeAgentBinding(map[string]any{
 		"session_id": hook["session_id"], "transcript_path": hook["transcript_path"],
 		"lifecycle": state,
-	}, producer)
+	}, producer); err != nil {
+		return err
+	}
+	if turn, _ := hook["turn_id"].(string); name == "Stop" && turn != "" {
+		return recordQuestionTurnStop(turn)
+	}
+	return nil
 }
 
 // A new opt-in hook channel keeps binding metadata outside the activity journal.
@@ -240,7 +254,7 @@ func (server *Server) storeAgentBinding(input map[string]any, producer agentProd
 	if session == "" || len(session) > 128 || !validSessionID.MatchString(session) || len(transcript) > 4096 || strings.ContainsRune(transcript, 0) {
 		return errors.New("invalid agent binding")
 	}
-	if err := validateBindingTranscript(transcript, producer.Provider); err != nil {
+	if err := validateAccountTranscript(transcript, producer.Provider, producer.ConfigDir); err != nil {
 		return err
 	}
 	if bootstrap, e := server.readPromptBootstrapOwner(producer.PaneID); e == nil && bootstrap.Producer.ProcessID == producer.ProcessID &&
@@ -264,6 +278,31 @@ func (server *Server) storeAgentBinding(input map[string]any, producer agentProd
 	}
 	record := map[string]any{"lifecycle": lifecycle, "revision": revision, "version": 1, "producer": producer, "session_id": session, "transcript_path": transcript, "observed_at": time.Now().UTC().Format(time.RFC3339Nano)}
 	return writeBindingRecord(directory, producer.PaneID, record)
+}
+
+// ValidateAccountTranscript is the binding check for a transcript in the
+// account selected by override ("" = the provider default).
+func ValidateAccountTranscript(transcript, provider, override string) error {
+	if provider != "claude" && provider != "codex" {
+		return errors.New("unsupported provider")
+	}
+	if override != "" && (!filepath.IsAbs(override) || filepath.Clean(override) != override || len(override) > 4096) {
+		return errors.New("agent account directory is invalid")
+	}
+	return validateAccountTranscript(transcript, provider, override)
+}
+
+// validateAccountTranscript checks a transcript against the producer's own
+// account directory. The provider default keeps the legacy namespace check.
+func validateAccountTranscript(transcript, provider, configDir string) error {
+	if configDir == "" || transcript == "" {
+		return validateBindingTranscript(transcript, provider)
+	}
+	if len(transcript) > 4096 || strings.ContainsRune(transcript, 0) {
+		return errors.New("invalid transcript binding")
+	}
+	_, err := rotationSourcePathIn(transcript, provider, configDir)
+	return err
 }
 
 func validateBindingTranscript(transcript, provider string) error {

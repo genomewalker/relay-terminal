@@ -73,7 +73,7 @@ func readPrivate(path string, limit int64) ([]byte, error) {
 // two processes can advertise the same Claude session ID after a resume.
 func Resolve(home, name, session string, pid int) (Record, error) {
 	var r Record
-	b, e := readPrivate(filepath.Join(home, ".claude", "sessions", fmt.Sprintf("%d.json", pid)), 16384)
+	b, e := readPrivate(filepath.Join(claudeConfig(home, pid), "sessions", fmt.Sprintf("%d.json", pid)), 16384)
 	if e != nil {
 		return r, e
 	}
@@ -100,7 +100,7 @@ func Resolve(home, name, session string, pid int) (Record, error) {
 
 func token(home string, r Record) (string, error) {
 	h := sha256.Sum256([]byte(r.Socket))
-	b, e := readPrivate(filepath.Join(home, ".claude", "sessions", fmt.Sprintf("%d.%x.key", r.PID, h)), 4096)
+	b, e := readPrivate(filepath.Join(claudeConfig(home, r.PID), "sessions", fmt.Sprintf("%d.%x.key", r.PID, h)), 4096)
 	if e != nil {
 		return "", e
 	}
@@ -140,7 +140,7 @@ type registration struct {
 }
 
 func register(home, socket, name, session string) (*registration, error) {
-	dir := filepath.Join(home, ".claude", "sessions")
+	dir := filepath.Join(ownClaudeConfig(home), "sessions")
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		return nil, e
 	}

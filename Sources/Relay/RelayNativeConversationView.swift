@@ -1,0 +1,242 @@
+import AppKit
+import SwiftUI
+import UniformTypeIdentifiers
+
+struct RelayNativeConversationView: View {
+    @StateObject private var conversation: RelayNativeConversation
+    @State private var text = ""
+    @State private var images: [String] = []
+    @State private var observation = UUID()
+    private let observeLive: Bool
+    init(binding: RelayNativeBinding) {
+        _conversation = StateObject(wrappedValue: RelayNativeConversation(binding: binding))
+        observeLive = true
+    }
+    /// Offline presentation/export uses the same native view without connecting.
+    init(conversation: RelayNativeConversation, observeLive: Bool) {
+        _conversation = StateObject(wrappedValue: conversation)
+        self.observeLive = observeLive
+    }
+    private var unavailable: Bool {
+        conversation.busy || conversation.failure != nil || conversation.uncertainAction != nil
+    }
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: "text.bubble")
+                Text(conversation.binding.identity.provider == "codex" ? "Codex" : "Claude").font(.headline)
+                Text(conversation.binding.account.label).foregroundStyle(.secondary)
+                if let snapshot = conversation.snapshot {
+                    Text(snapshot.model).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(snapshot.phase).font(.caption).foregroundStyle(.secondary)
+                } else { Spacer(); ProgressView().controlSize(.small) }
+                Button("Reconnect", systemImage: "arrow.clockwise") { observation = UUID() }
+                    .labelStyle(.iconOnly).help("Read the same worker without replaying actions")
+            }.padding(12)
+            if let cwd = conversation.snapshot?.cwd {
+                Text(cwd).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.bottom, 8)
+            }
+            if conversation.snapshot?.phase == "exited" {
+                HStack {
+                    Text("Saved conversation. The original worker is no longer connected.").font(.callout)
+                    Spacer()
+                    Button("Resume in new pane", action: resume)
+                }.padding(12)
+            }
+            Divider()
+            if let failure = conversation.failure {
+                HStack(alignment: .top) {
+                    Image(systemName: "exclamationmark.triangle")
+                    Text(failure).textSelection(.enabled)
+                    Spacer()
+                }.font(.callout).padding(12).background(Color.orange.opacity(0.1))
+            }
+            if conversation.uncertainAction != nil {
+                HStack {
+                    Text("Action outcome is unconfirmed. It will not be sent again.").font(.callout)
+                    Spacer()
+                    Button("Check receipt") { Task { await conversation.inspectReceipt() } }
+                }.padding(12)
+            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        if (conversation.snapshot?.olderBefore ?? 0) > 0 {
+                            Button("Load earlier messages") { Task { await conversation.loadOlder() } }
+                        }
+                        ForEach(items) { item in
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack {
+                                    Text(item.role.capitalized).font(.caption.bold())
+                                    if let tool = item.tool { Text(tool).font(.caption.monospaced()) }
+                                    Spacer()
+                                    if let status = item.status { Text(status).font(.caption).foregroundStyle(.secondary) }
+                                }
+                                Text(item.text).font(item.role == "tool" ? .system(.callout, design: .monospaced) : .body)
+                                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                if item.truncated == true { Text("Display truncated").font(.caption).foregroundStyle(.secondary) }
+                            }
+                            .padding(12)
+                            .background(item.role == "user" ? Color.accentColor.opacity(0.08) : Color.primary.opacity(0.035),
+                                        in: RoundedRectangle(cornerRadius: 9))
+                            .id(item.id)
+                        }
+                        ForEach(conversation.snapshot?.requests ?? []) { request in
+                            RelayNativeRequestView(request: request, disabled: unavailable ||
+                                !(conversation.snapshot?.capabilities.respond ?? false)) { decision, answers in
+                                Task { await conversation.act(kind: "respond", request: request, decision: decision, answers: answers) }
+                            }
+                        }
+                        Color.clear.frame(height: 1).id("native-bottom")
+                    }.padding(14)
+                }
+                .onChange(of: conversation.snapshot?.items.last?.id) { _, _ in
+                    proxy.scrollTo("native-bottom", anchor: .bottom)
+                }
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                if !images.isEmpty {
+                    HStack {
+                        Text("\(images.count) image\(images.count == 1 ? "" : "s") attached").font(.caption)
+                        Button("Remove") { images = [] }
+                    }
+                }
+                TextEditor(text: $text).font(.body).frame(minHeight: 65, maxHeight: 140)
+                    .scrollContentBackground(.hidden).padding(6)
+                    .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityLabel("Message")
+                HStack {
+                    Button("Attach image", systemImage: "paperclip", action: selectImages)
+                        .disabled(unavailable || images.count >= 4)
+                    Spacer()
+                    if conversation.snapshot?.capabilities.interrupt == true {
+                        Button(conversation.snapshot?.capabilities.interruptScope == "session" ? "Interrupt Claude" : "Stop turn", systemImage: "stop.fill") {
+                            Task { await conversation.act(kind: "interrupt") }
+                        }.disabled(unavailable)
+                    }
+                    if conversation.snapshot?.capabilities.steer == true {
+                        Button("Steer") { submit("steer") }
+                            .disabled(unavailable || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty)
+                    }
+                    Button("Send", systemImage: "arrow.up") { submit("send") }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .disabled(unavailable || !(conversation.snapshot?.capabilities.send ?? false) ||
+                            (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && images.isEmpty))
+                }
+            }.padding(12)
+        }
+        .task(id: observation) { if observeLive { await conversation.observe() } }
+    }
+    private var items: [RelayNativeItem] {
+        let current = conversation.snapshot?.items ?? []
+        let known = Set(current.map(\.id))
+        return conversation.older.filter { !known.contains($0.id) } + current
+    }
+    private func resume() {
+        guard let workspace = RelayAgentAccountDirectory.shared.workspace,
+              let paneID = UUID(uuidString: conversation.binding.identity.pane) else { return }
+        Task {
+            if let refusal = await workspace.startNativeAgentInNewTab(conversation.binding.account,
+                besidePane: paneID, resuming: conversation.binding) {
+                conversation.failure = refusal
+            }
+        }
+    }
+    private func submit(_ kind: String) {
+        let submitted = text
+        let attachments = images
+        text = ""; images = []
+        Task { await conversation.act(kind: kind, text: submitted, images: attachments) }
+    }
+    private func selectImages() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.png, .jpeg, .gif]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.begin { response in
+            guard response == .OK else { return }
+            let urls = Array(panel.urls.prefix(4 - images.count))
+            Task { @MainActor in
+                do {
+                    for url in urls {
+                        let attributes = try url.resourceValues(forKeys: [.fileSizeKey])
+                        guard let count = attributes.fileSize, count <= 4 << 20 else {
+                            throw RelayNativeService.Failure.refused("Images must be at most 4 MB.")
+                        }
+                        images.append(try await conversation.upload(Data(contentsOf: url)))
+                    }
+                } catch { conversation.failure = error.localizedDescription }
+            }
+        }
+    }
+}
+
+private struct RelayNativeRequestView: View {
+    let request: RelayNativeRequest
+    let disabled: Bool
+    let respond: (String, [String: [String]]) -> Void
+    @State private var selected: [String: Set<String>] = [:]
+    @State private var freeText: [String: String] = [:]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(request.title).font(.headline)
+            if !request.detail.isEmpty { Text(request.detail).font(.callout.monospaced()).textSelection(.enabled) }
+            if request.kind == "approval" {
+                HStack {
+                    Button("Allow once") { respond("allow", [:]) }.buttonStyle(.borderedProminent)
+                    Button("Deny") { respond("deny", [:]) }
+                }
+            } else {
+                ForEach(request.questions ?? []) { question in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(question.text).font(.callout.bold())
+                        ForEach(question.options ?? []) { option in
+                            Toggle(isOn: Binding(
+                                get: { selected[question.id, default: []].contains(option.id) },
+                                set: { value in
+                                    if question.multiple != true { selected[question.id] = [] }
+                                    if value { selected[question.id, default: []].insert(option.id) }
+                                    else { selected[question.id, default: []].remove(option.id) }
+                                })) {
+                                    VStack(alignment: .leading) {
+                                        Text(option.label)
+                                        if let detail = option.description { Text(detail).font(.caption).foregroundStyle(.secondary) }
+                                    }
+                                }.toggleStyle(.checkbox)
+                        }
+                        if question.secret == true {
+                            SecureField("Your answer", text: answerBinding(question.id))
+                        } else {
+                            TextField("Your answer", text: answerBinding(question.id))
+                        }
+                    }
+                }
+                Button("Submit answers") { respond("", answers) }
+                    .buttonStyle(.borderedProminent).disabled(answers.count != request.questions?.count)
+            }
+            if request.responding { Text("Response submitted; waiting for provider").font(.caption) }
+        }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+            .disabled(disabled || request.responding)
+    }
+    private func answerBinding(_ id: String) -> Binding<String> {
+        Binding(get: { freeText[id, default: ""] }, set: { freeText[id] = $0 })
+    }
+    private var answers: [String: [String]] {
+        var values: [String: [String]] = [:]
+        for question in request.questions ?? [] {
+            var answer = (question.options ?? []).filter { selected[question.id, default: []].contains($0.id) }.map(\.id)
+            let other = freeText[question.id, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !other.isEmpty {
+                if question.multiple == true { answer.append(other) } else { answer = [other] }
+            }
+            if !answer.isEmpty { values[question.id] = answer }
+        }
+        return values
+    }
+}

@@ -34,6 +34,11 @@ const (
 	Fragment       Type = 19
 	Capabilities   Type = 20
 	AgentBinding   Type = 21
+	// AutomationInputV2 carries Relay's own native maintenance and compiled
+	// prompt keystrokes. Same payload and acknowledgement as InputV2, but the
+	// worker does not count it as human input. Sent only to workers that
+	// advertise automation_input_v1.
+	AutomationInputV2 Type = 22
 )
 
 const MaxPayload = 16 << 20
@@ -67,11 +72,13 @@ func ParseHostEvent(frame Frame) (string, Frame, error) {
 }
 
 type HelloPayload struct {
+	HostHealthController  bool            `json:"host_health_controller,omitempty"`
 	NativeRotationBridge  bool            `json:"native_rotation_bridge,omitempty"`
 	HostRotation          json.RawMessage `json:"host_rotation,omitempty"`
 	PromptEditor          json.RawMessage `json:"prompt_editor,omitempty"`
 	BindAgent             bool            `json:"bind_agent,omitempty"`
 	PrepareUpgrade        bool            `json:"prepare_upgrade,omitempty"`
+	WorkerUpgrade         json.RawMessage `json:"worker_upgrade,omitempty"`
 	Version               int             `json:"version"`
 	SessionID             string          `json:"session_id"`
 	ParentSessionID       string          `json:"parent_session_id,omitempty"`
@@ -120,6 +127,8 @@ type StatusPayload struct {
 	EventReset            bool                    `json:"event_reset,omitempty"`
 	ControlGranted        *bool                   `json:"control_granted,omitempty"`
 	ClientCount           int                     `json:"client_count,omitempty"`
+	ReexecOperation       string                  `json:"reexec_operation,omitempty"`
+	ExecutableSHA256      string                  `json:"executable_sha256,omitempty"`
 }
 
 const inputIdentityBytes = 16
@@ -132,9 +141,17 @@ func InputV2Frame(clientID [inputIdentityBytes]byte, sequence uint64, data []byt
 	return Frame{Type: InputV2, Payload: payload}
 }
 
+func AutomationInputV2Frame(clientID [inputIdentityBytes]byte, sequence uint64, data []byte) Frame {
+	frame := InputV2Frame(clientID, sequence, data)
+	frame.Type = AutomationInputV2
+	return frame
+}
+
+// ParseInputV2 accepts both acknowledged input frame types; the caller
+// distinguishes human from automation input by frame.Type.
 func ParseInputV2(frame Frame) ([inputIdentityBytes]byte, uint64, []byte, error) {
 	var clientID [inputIdentityBytes]byte
-	if frame.Type != InputV2 || len(frame.Payload) < inputIdentityBytes+8 {
+	if (frame.Type != InputV2 && frame.Type != AutomationInputV2) || len(frame.Payload) < inputIdentityBytes+8 {
 		return clientID, 0, nil, errors.New("invalid acknowledged input frame")
 	}
 	copy(clientID[:], frame.Payload[:inputIdentityBytes])

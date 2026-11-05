@@ -6,7 +6,11 @@
   "targets": ["aarch64-macos.14.0", "x86_64-macos.14.0"],
   "patch": "relay-host-managed-input.patch",
   "patch_sha256": "54c98b756f03a2b1be9eb2c091caa2810ad81011585593af8842c56b7985d7b5",
-  "library_sha256": "8a8f015f00d97e03767799e8b887925c35dd173ea47c15cc8fd74aa02d5469e7",
+  "screen_file_patch": "relay-screen-file-descriptors.patch",
+  "screen_file_patch_sha256": "c55df1415acf6685e1a3fd5b26d4457a827859b8496dd5061c9315a20cc0c8e8",
+  "screen_file_descriptors": "write_screen_file closes its temporary directory handles (parent and folder) on every path; the file is kept only after a successful write. TempDir.init closes the parent when creating or opening the folder fails.",
+  "library_sha256": "15623affaa0a18c28fbe3c13b6a0949ca6db73343f08205140fae711a487152c",
+  "library_slice_sha256": {"arm64": "7336ad01edaf7981c66717920e382d2514e849aa4e04bf68b56c3c5f7174ba7b", "x86_64": "18504be374f40e58cc8626dede90209f7c8d78e231549be9ebeaba07c8edc780"},
   "header_sha256": "3d26615e5f6f05b5a2debad04a74443c491da6fe363a978061dd801d4ef5a3a4",
   "build_options": {
     "jobs": 2,

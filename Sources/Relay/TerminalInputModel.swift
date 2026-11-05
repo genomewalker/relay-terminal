@@ -477,3 +477,24 @@ struct TerminalPromptEditHistory: Sendable {
         coalescingBroken = true
     }
 }
+
+extension TerminalBracketedPasteStateTracker {
+    /// State after an observed stream, persisted by snapshot checkpoints.
+    struct PersistentState: Codable, Equatable, Sendable {
+        var pending: Data
+        var active: Bool
+    }
+
+    var persistentState: PersistentState {
+        lock.lock()
+        defer { lock.unlock() }
+        return PersistentState(pending: pending, active: active)
+    }
+
+    func restore(_ saved: PersistentState) {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = saved.pending
+        active = saved.active
+    }
+}

@@ -141,10 +141,21 @@ missing helpers, path escapes and stale pane ownership. New operations need test
 for both the Swift consumer and Go producer. A successful helper response alone
 does not prove native UI behavior or terminal responsiveness.
 
-[`test-plugin-helper.py`](../scripts/test-plugin-helper.py) checks a staged helper
-against a disposable `/tmp` fixture locally or over SSH. Its docstring describes
-the required files. It is a smoke harness, not an installer or complete acceptance
+[`test-plugin-helper.sh`](../scripts/test-plugin-helper.sh) checks a staged helper
+against a disposable `/tmp` fixture locally or over SSH. The fixture contains
+`package.json`, `pnpm-lock.yaml`, `table.csv`, and `empty.txt`, with `table.csv`
+staged in Git for Git review checks. The wrapper builds `relay-verify-plugin`;
+the helper and fixture must both have explicit `/tmp/` paths. It is a smoke harness, not an installer or complete acceptance
 suite. Do not use real jobs or research files as mutation fixtures.
+
+Run `scripts/test-plugin-helper.sh /tmp/relayd /tmp/fixture` from the repository,
+or run `go run -buildvcs=false ./cmd/relay-verify-plugin /tmp/relayd /tmp/fixture`
+from `remote/relayd`. Both accept an optional `--ssh HOST`. This is a developer
+verification command; it is not installed as an application runtime helper.
+The native regression suite uses a private fake Git command with canonical
+staged output and a private fake SSH executable. Artifact and transfer checks
+use the actual staged Go helper and private filesystem. Those fixtures establish
+the harness contract, not live Git/SSH interoperability.
 
 ## Publish and install
 

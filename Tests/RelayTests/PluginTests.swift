@@ -115,7 +115,7 @@ func pluginCorruptState() async throws {
     #expect(try Data(contentsOf: file) == invalid)
 }
 
-@Test("Plugin manager refreshes cached display packages after external changes")
+@Test("Plugin manager refreshes cached display packages after external changes", .timeLimit(.minutes(5)))
 @MainActor
 func pluginManagerDisplayCache() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -125,11 +125,11 @@ func pluginManagerDisplayCache() async throws {
     try await store.install(candidate, approvedDigest: candidate.digest)
     let manager = RelayPluginManager(directory: directory)
 
+    // Wait for the operation itself; the test's time limit bounds a hang. A
+    // wall-clock bound here also counts time spent queued behind other
+    // MainActor tests in the suite.
     func settle() async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while manager.busy && ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        while manager.busy { try await Task.sleep(for: .milliseconds(10)) }
         #expect(!manager.busy)
         #expect(manager.error == nil)
     }

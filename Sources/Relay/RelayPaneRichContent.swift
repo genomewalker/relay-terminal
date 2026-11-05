@@ -42,16 +42,64 @@ enum RelayRichContentDetector {
     }
 }
 
+/// Page and zoom commands for a mounted `RelayPDFPreview`; state is read back from PDFKit.
+@MainActor final class RelayPDFController: ObservableObject {
+    @Published private(set) var pageIndex = 0
+    @Published private(set) var pageCount = 0
+    fileprivate weak var view: PDFView?
+    var canGoBack: Bool { pageIndex > 0 }
+    var canGoForward: Bool { pageIndex + 1 < pageCount }
+    func previous() { view?.goToPreviousPage(nil) }
+    func next() { view?.goToNextPage(nil) }
+    func zoomIn() { zoom(by: 1.25) }
+    func zoomOut() { zoom(by: 0.8) }
+    func fit() { view?.autoScales = true }
+    private func zoom(by factor: CGFloat) {
+        guard let view else { return }
+        let current = view.scaleFactor
+        view.autoScales = false
+        view.scaleFactor = min(view.maxScaleFactor, max(view.minScaleFactor, current * factor))
+    }
+    fileprivate func sync() {
+        guard let view, let document = view.document else { pageIndex = 0; pageCount = 0; return }
+        pageCount = document.pageCount
+        pageIndex = view.currentPage.map { document.index(for: $0) } ?? 0
+    }
+}
+
 struct RelayPDFPreview: NSViewRepresentable {
     let data: Data
+    var controller: RelayPDFController? = nil
+    @MainActor final class Coordinator: NSObject {
+        var data = Data()
+        weak var controller: RelayPDFController?
+        @objc func pageChanged(_ note: Notification) {
+            Task { @MainActor [weak controller] in controller?.sync() }
+        }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> PDFView {
         let view = PDFView(); view.autoScales = true
+        view.minScaleFactor = 0.1; view.maxScaleFactor = 8
         view.displayMode = .singlePageContinuous
         view.document = PDFDocument(data: data)
+        context.coordinator.data = data
+        NotificationCenter.default.addObserver(context.coordinator, selector: #selector(Coordinator.pageChanged(_:)),
+            name: .PDFViewPageChanged, object: view)
+        attach(view, context: context)
         return view
     }
     func updateNSView(_ view: PDFView, context: Context) {
-        if view.document?.dataRepresentation() != data { view.document = PDFDocument(data: data) }
+        if context.coordinator.data != data {
+            context.coordinator.data = data; view.document = PDFDocument(data: data)
+            Task { @MainActor [weak controller] in controller?.sync() }
+        }
+        if let controller, context.coordinator.controller !== controller || controller.view !== view { attach(view, context: context) }
+    }
+    private func attach(_ view: PDFView, context: Context) {
+        context.coordinator.controller = controller
+        controller?.view = view
+        Task { @MainActor [weak controller] in controller?.sync() }
     }
 }
 

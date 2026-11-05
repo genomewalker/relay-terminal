@@ -60,3 +60,34 @@ func TestAgentBindingNativeDiagnosticDoesNotFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAgentBindingTargetSessionUsesOnlyTheTargetReader(t *testing.T) {
+	original := readTargetAgentBinding
+	defer func() { readTargetAgentBinding = original }()
+	calls := 0
+	readTargetAgentBinding = func(pane, session string) (daemon.AgentBindingRecord, error) {
+		calls++
+		if pane != "pane" || session != "5577ee9d-5e02-4ca8-b208-74360e3f65d1" {
+			t.Fatal(pane, session)
+		}
+		return daemon.AgentBindingRecord{Source: "native_pane_job_kernel_owner", SessionID: session}, nil
+	}
+	other := func(string) (daemon.AgentBindingRecord, error) {
+		t.Fatal("a target session fell back to the pane binding")
+		return daemon.AgentBindingRecord{}, nil
+	}
+	record, err := readAgentBindingArgs([]string{"pane", "--session", "5577ee9d-5e02-4ca8-b208-74360e3f65d1"}, other, other)
+	if err != nil || calls != 1 || record.Source != "native_pane_job_kernel_owner" {
+		t.Fatal(record, err)
+	}
+	want := errors.New("target unavailable")
+	readTargetAgentBinding = func(string, string) (daemon.AgentBindingRecord, error) { return daemon.AgentBindingRecord{}, want }
+	if _, err := readAgentBindingArgs([]string{"pane", "--session", "5577ee9d-5e02-4ca8-b208-74360e3f65d1"}, other, other); !errors.Is(err, want) {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"pane", "--session"}, {"pane", "--session", ""}, {"--session", "pane", "id"}, {"--native", "--session", "id"}} {
+		if _, err := readAgentBindingArgs(args, other, other); err == nil {
+			t.Fatalf("accepted %q", args)
+		}
+	}
+}

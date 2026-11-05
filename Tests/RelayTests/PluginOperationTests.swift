@@ -102,11 +102,11 @@ func pluginProcessCancellation() async throws {
         process.arguments = ["10"]
         let output = Pipe(), errors = Pipe()
         process.standardOutput = output; process.standardError = errors
-        let start = Date()
-        #expect(throws: (any Error).self) {
+        // Cancellation, not the 12 s timeout, must stop it. Check which one
+        // did rather than a wall-clock budget that a loaded pool can exceed.
+        #expect(throws: ProcessCaptureError.readFailed("Operation cancelled")) {
             try ProcessCapture.run(process, output: output, errors: errors, timeout: 12, shouldCancel: { true })
         }
-        #expect(Date().timeIntervalSince(start) < 3)
         #expect(!process.isRunning)
     }.value
 }

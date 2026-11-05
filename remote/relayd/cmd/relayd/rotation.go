@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -73,10 +74,16 @@ func runRotationExec(arguments []string) {
 	if err != nil {
 		fatal("private rotation launch plan unavailable")
 	}
+	if err := keepRotationAccount(snapshot); err != nil {
+		fatal("rotation account refused: " + err.Error())
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fatal("private home unavailable")
 	}
+	// The source's account must still be registered; a removed one is never
+	// started again.
+	admitAccount(home, "claude", true)
 	newSnapshot, err := agentlaunch.Save(filepath.Join(home, ".local", "share", "relay", "agent-launches"),
 		"claude", snapshot.Executable, snapshot.CWD, *pane, agentlaunch.ProcessStart(), args, args)
 	if err != nil {
@@ -91,6 +98,28 @@ func runRotationExec(arguments []string) {
 	if err := syscall.Exec(snapshot.Executable, append([]string{snapshot.Executable}, args...), os.Environ()); err != nil {
 		fatal("agent execution failed: " + errors.New("executable unavailable").Error())
 	}
+}
+
+// keepRotationAccount gives the new worker the source pane's provider account.
+// The dedicated worker inherits the daemon's environment, not the source
+// pane's, so CLAUDE_CONFIG_DIR or CODEX_HOME is set (or cleared) from the
+// source process before the fresh launch snapshot records it.
+func keepRotationAccount(snapshot agentlaunch.Snapshot) error {
+	override, known, err := agentlaunch.LaunchConfigDirectory(snapshot)
+	if err != nil {
+		return err
+	}
+	if !known {
+		return nil
+	}
+	name, err := agentlaunch.ConfigDirVariable(snapshot.Client)
+	if err != nil {
+		return err
+	}
+	if override == "" {
+		return os.Unsetenv(name)
+	}
+	return os.Setenv(name, override)
 }
 
 // The text arrives on stdin, never in argv, shell history, worker manifests,
@@ -197,4 +226,15 @@ func runClaudeStartParameters(arguments []string) {
 		fatal("Claude effective settings unavailable: " + err.Error())
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(settings)
+}
+
+// rotation-receipt is the one command a rotated Claude session runs before
+// its first turn; its output is the receipt the executor verifies.
+func runRotationReceipt(arguments []string) {
+	if err := daemon.RotationReceipt(context.Background(), arguments, os.Stdout); err != nil {
+		if daemon.IsRotationReceiptRefused(err) {
+			os.Exit(1)
+		}
+		fatal("rotation receipt unavailable: " + err.Error())
+	}
 }

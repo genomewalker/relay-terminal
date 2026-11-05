@@ -45,18 +45,62 @@ struct DesktopPeerRoute: Identifiable, Sendable {
             .appendingPathComponent(".codex/app-server-control/app-server-control.sock").path
     }
 
+    static var runtimeExecutable: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/relayd")
+    }
+
+    struct DiscoveryFailure: Error, LocalizedError, Sendable, Equatable {
+        enum Work: String, Sendable { case noSaved = "no_saved_work_refs", savedUnverified = "saved_work_unverified", unavailable = "work_discovery_unavailable" }
+        enum Legacy: String, Sendable { case empty, unavailable, notChecked = "not_checked", conflict = "identity_conflict" }
+        let work: Work
+        let legacy: Legacy
+
+        var errorDescription: String? {
+            let workMessage: String = switch work {
+            case .noSaved: "No saved Work endpoints."
+            case .savedUnverified: "Saved Work endpoint identity could not be verified."
+            case .unavailable: "The Work endpoint registry could not be checked."
+            }
+            let legacyMessage: String = switch legacy {
+            case .empty: "Legacy discovery found no tasks."
+            case .unavailable: "Legacy discovery is unavailable."
+            case .notChecked: "Legacy discovery was not checked."
+            case .conflict: "A legacy task conflicts with a pinned Work identity; explicit repair is required."
+            }
+            return "Desktop task discovery incomplete: " + workMessage + " " + legacyMessage
+        }
+    }
+
+    static func discoveryMessage(_ error: Error) -> String {
+        (error as? DiscoveryFailure)?.errorDescription ?? "Desktop task discovery unavailable."
+    }
+
+    static func discoveryFailure(_ data: Data) -> DiscoveryFailure? {
+        let prefix = "relayd: relay-desktop-discovery-go-v1:"
+        guard data.count <= 160, let text = String(data: data, encoding: .utf8),
+              text.hasPrefix(prefix), text.hasSuffix("\n") else { return nil }
+        let fields = text.dropFirst(prefix.count).dropLast().split(separator: ":", omittingEmptySubsequences: false)
+        guard fields.count == 2, let work = DiscoveryFailure.Work(rawValue: String(fields[0])),
+              let legacy = DiscoveryFailure.Legacy(rawValue: String(fields[1])) else { return nil }
+        switch (work, legacy) {
+        case (.noSaved, .empty), (.noSaved, .unavailable),
+             (.savedUnverified, .empty), (.savedUnverified, .unavailable), (.savedUnverified, .conflict),
+             (.unavailable, .notChecked): return DiscoveryFailure(work: work, legacy: legacy)
+        default: return nil
+        }
+    }
+
     private static func runtime(_ arguments: [String]) throws -> Data {
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/share/relay/desktop-routing")
         let process = Process()
-        process.executableURL = root.appendingPathComponent("venv/bin/python")
-        process.arguments = [root.appendingPathComponent("relay-desktop-route.py").path] + arguments
+        process.executableURL = Self.runtimeExecutable
+        process.arguments = ["desktop-route"] + arguments
         let output = Pipe(), errors = Pipe()
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = output; process.standardError = errors
         let result = try ProcessCapture.run(process, output: output, errors: errors,
             timeout: 20, maximumBytesPerStream: 65_536)
         guard process.terminationStatus == 0 else {
+            if arguments.first == "tasks", let failure = discoveryFailure(result.standardError) { throw failure }
             throw NSError(domain: "DesktopPeerRoute", code: 1, userInfo: [NSLocalizedDescriptionKey:
                 "Desktop routing failed. Check that the desktop app and Relay routing runtime are running; changed bindings must be reviewed explicitly."])
         }
@@ -128,10 +172,9 @@ struct DesktopPeerRoute: Identifiable, Sendable {
         let file = directory.appendingPathComponent("group.json")
         guard FileManager.default.createFile(atPath: file.path, contents: try JSONEncoder().encode(plan),
             attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
-        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share/relay/desktop-routing")
         let process = Process()
-        process.executableURL = root.appendingPathComponent("venv/bin/python")
-        process.arguments = [root.appendingPathComponent("relay-desktop-group.py").path, file.path]
+        process.executableURL = Self.runtimeExecutable
+        process.arguments = ["desktop-group", file.path]
         let output = Pipe(), errors = Pipe()
         process.standardInput = FileHandle.nullDevice; process.standardOutput = output; process.standardError = errors
         let result = try ProcessCapture.run(process, output: output, errors: errors, timeout: 300, maximumBytesPerStream: 32_768)
@@ -215,12 +258,9 @@ struct DesktopPeerRoute: Identifiable, Sendable {
               current.remoteStart == remoteStart, current.remoteName == remoteName else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/share/relay/desktop-routing")
         let process = Process()
-        process.executableURL = root.appendingPathComponent("venv/bin/python")
-        process.arguments = [root.appendingPathComponent("relay-desktop-route.py").path,
-                             "send", "--config", configurationURL.path]
+        process.executableURL = Self.runtimeExecutable
+        process.arguments = ["desktop-route", "send", "--config", configurationURL.path]
         let output = Pipe(), errors = Pipe()
         process.standardInput = Pipe(); process.standardOutput = output; process.standardError = errors
         let input = try JSONSerialization.data(withJSONObject: ["id": messageID, "content": content])
@@ -265,8 +305,9 @@ struct DesktopPeerRoute: Identifiable, Sendable {
               label.range(of: #"^dev\.vaklab\.relay-desktop-[A-Za-z0-9_-]{1,64}$"#, options: .regularExpression) != nil,
               service.lastPathComponent == label + ".plist",
               let args = plist["ProgramArguments"] as? [String], args.count == 5,
-              args[0] == root.appendingPathComponent("venv/bin/python").path,
-              args[1] == root.appendingPathComponent("relay-desktop-route.py").path,
+              ((args[0] == Self.runtimeExecutable.path && args[1] == "desktop-route") ||
+               (args[0] == root.appendingPathComponent("venv/bin/python").path &&
+                args[1] == root.appendingPathComponent("relay-desktop-route.py").path)),
               args[2] == "listen", args[3] == "--config" else { throw CocoaError(.fileReadCorruptFile) }
         let configuration = URL(fileURLWithPath: args[4]).standardizedFileURL
         guard configuration.deletingLastPathComponent() == root.standardizedFileURL else {
@@ -310,7 +351,13 @@ struct DesktopPeerRoute: Identifiable, Sendable {
               current.remotePID == remotePID, current.remoteStart == remoteStart else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        if connected { try Self.prepareTask(thread) }
+        if connected {
+            // The native runtime validates and migrates only this exact saved
+            // launch service before enabling it; legacy definitions are read
+            // for discovery and disconnect, never executed by this app.
+            _ = try Self.runtime(["remember", "--connect", "--config", configurationURL.path])
+            return
+        }
         let target = "gui/\(getuid())/\(id)"
         // launchd's disabled override survives logout. Killing alone would let
         // RunAtLoad silently reconnect a route the user explicitly disconnected.

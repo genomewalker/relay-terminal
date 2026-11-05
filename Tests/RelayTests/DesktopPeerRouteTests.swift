@@ -57,7 +57,7 @@ func desktopRouteDiscovery() throws {
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: config.path)
     let label = "dev.vaklab.relay-desktop-test"
     let service = agents.appendingPathComponent(label + ".plist")
-    var plist: [String: Any] = ["Label": label, "ProgramArguments": [root.appendingPathComponent("venv/bin/python").path, root.appendingPathComponent("relay-desktop-route.py").path, "listen", "--config", config.path]]
+    var plist: [String: Any] = ["Label": label, "ProgramArguments": [DesktopPeerRoute.runtimeExecutable.path, "desktop-route", "listen", "--config", config.path]]
     func save() throws {
         try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: service)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: service.path)
@@ -76,4 +76,49 @@ func desktopRouteDiscovery() throws {
     plist["Label"] = "unrelated-service"
     try save()
     #expect(DesktopPeerRoute.read(home: home).isEmpty)
+}
+
+@Test("Native desktop discovery markers are exact, bounded and fail closed")
+func nativeDesktopDiscoveryMarkerParser() {
+    let prefix = "relayd: relay-desktop-discovery-go-v1:"
+    let combinations: [(DesktopPeerRoute.DiscoveryFailure.Work, DesktopPeerRoute.DiscoveryFailure.Legacy)] = [
+        (.noSaved, .empty), (.noSaved, .unavailable),
+        (.savedUnverified, .empty), (.savedUnverified, .unavailable), (.savedUnverified, .conflict),
+        (.unavailable, .notChecked),
+    ]
+    var valid = Set<Data>()
+    for (work, legacy) in combinations {
+        let bytes = Data((prefix + work.rawValue + ":" + legacy.rawValue + "\n").utf8)
+        valid.insert(bytes)
+        #expect(DesktopPeerRoute.discoveryFailure(bytes) == .init(work: work, legacy: legacy))
+        #expect(DesktopPeerRoute.discoveryFailure(bytes.dropLast()) == nil)
+        #expect(DesktopPeerRoute.discoveryFailure(bytes.dropLast() + Data("x".utf8)) == nil)
+        #expect(DesktopPeerRoute.discoveryFailure(bytes + Data("private".utf8)) == nil)
+    }
+    #expect(DesktopPeerRoute.discoveryFailure(Data((prefix + "no_saved_work_refs:identity_conflict\n").utf8)) == nil)
+    #expect(DesktopPeerRoute.discoveryFailure(Data((prefix + "private:empty\n").utf8)) == nil)
+    #expect(DesktopPeerRoute.discoveryFailure(Data(repeating: 65, count: 161)) == nil)
+    var state: UInt64 = 0x1a2b3c4d5e6f7788
+    for _ in 0..<10_000 {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        let count = Int((state >> 32) % 200)
+        var bytes = Data(); bytes.reserveCapacity(count)
+        for _ in 0..<count {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            bytes.append(UInt8(truncatingIfNeeded: state >> 32))
+        }
+        #expect((DesktopPeerRoute.discoveryFailure(bytes) != nil) == valid.contains(bytes))
+    }
+}
+
+@Test("Native desktop discovery API failure remains 503 and hides arbitrary errors")
+func nativeDesktopDiscoveryFailureResponse() {
+    let known = DesktopPeerRoute.DiscoveryFailure(work: .savedUnverified, legacy: .conflict)
+    let response = RelaySidePanelHTTPResponse.desktopDiscoveryFailure(known)
+    #expect(response.status == 503)
+    #expect(String(decoding: response.body, as: UTF8.self) == known.errorDescription)
+    let secret = NSError(domain: "private-secret", code: 1, userInfo: [NSLocalizedDescriptionKey: "private-secret"])
+    let unknown = RelaySidePanelHTTPResponse.desktopDiscoveryFailure(secret)
+    #expect(unknown.status == 503)
+    #expect(String(decoding: unknown.body, as: UTF8.self) == "Desktop task discovery unavailable.")
 }

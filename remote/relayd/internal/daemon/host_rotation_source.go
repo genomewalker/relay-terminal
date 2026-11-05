@@ -17,8 +17,10 @@ import (
 )
 
 const (
-	rotationSourceFileLimit  = 64 << 20
-	rotationSourceLineLimit  = 2 << 20
+	// Provider logs include tool output and can greatly exceed public evidence.
+	// Stream the bounded log; retain the independent line, record and text caps.
+	rotationSourceFileLimit  = 1 << 30
+	rotationSourceLineLimit  = 4 << 20
 	rotationSourceTextLimit  = 4 << 20
 	rotationSourceChunkLimit = 64 << 10
 	rotationSourceMaxChunks  = 128
@@ -121,6 +123,25 @@ func rotationSourcePath(path, provider string) (string, error) {
 		}
 		logicalRoot = filepath.Join(home, "."+provider)
 	}
+	return rotationSourcePathIn(path, provider, logicalRoot)
+}
+
+// bindingSourcePath resolves a bound transcript inside the account directory
+// recorded for its verified producer (CLAUDE_CONFIG_DIR or CODEX_HOME of
+// that process). A producer on the provider default keeps the host namespace.
+func bindingSourcePath(binding AgentBindingRecord, provider string) (string, error) {
+	if binding.Producer.ConfigDir != "" {
+		if provider != "claude" && provider != "codex" {
+			return "", errors.New("unsupported source provider")
+		}
+		return rotationSourcePathIn(binding.TranscriptPath, provider, binding.Producer.ConfigDir)
+	}
+	return rotationSourcePath(binding.TranscriptPath, provider)
+}
+
+// rotationSourcePathIn accepts only a regular, owner-controlled transcript
+// below logicalRoot's projects (Claude) or sessions (Codex) directory.
+func rotationSourcePathIn(path, provider, logicalRoot string) (string, error) {
 	if !filepath.IsAbs(logicalRoot) || filepath.Clean(logicalRoot) != logicalRoot ||
 		len(logicalRoot) > 4096 || strings.ContainsRune(logicalRoot, 0) {
 		return "", errors.New("invalid source namespace")
@@ -132,23 +153,38 @@ func rotationSourcePath(path, provider string) (string, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return "", errors.New("invalid source path")
 	}
-	// Canonicalize only the known home prefix. Child links are never followed.
+	history := "projects"
+	if provider == "codex" {
+		history = "sessions"
+	}
+	shared := sharedHistoryDirectory(provider, root, history)
+	// Canonicalize only the known home prefix. Child links are never followed,
+	// except an account's exact shared-history link (see sharedHistoryDirectory).
 	relative, err := filepath.Rel(logicalRoot, path)
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		relative, err = filepath.Rel(root, path)
+	}
+	if (err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator))) && shared != "" {
+		// The canonical form of a transcript reached through that link.
+		if below, belowErr := filepath.Rel(shared, path); belowErr == nil && below != "." && below != ".." &&
+			!strings.HasPrefix(below, ".."+string(filepath.Separator)) {
+			relative, err = filepath.Join(history, below), nil
+		}
 	}
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return "", errors.New("source outside provider namespace")
 	}
 	pieces := strings.Split(relative, string(filepath.Separator))
-	if (provider == "codex" && pieces[0] != "sessions") || (provider == "claude" && pieces[0] != "projects") ||
-		!strings.HasSuffix(relative, ".jsonl") {
+	if pieces[0] != history || !strings.HasSuffix(relative, ".jsonl") {
 		return "", errors.New("unsupported source location")
 	}
 	current := root
 	for i := -1; i < len(pieces); i++ {
 		if i >= 0 {
 			current = filepath.Join(current, pieces[i])
+		}
+		if i == 0 && shared != "" {
+			current = shared
 		}
 		info, err := os.Lstat(current)
 		if err != nil {
@@ -164,6 +200,49 @@ func rotationSourcePath(path, provider string) (string, error) {
 	return current, nil
 }
 
+// sharedHistoryDirectory is the resolved main history directory when the
+// account at root (resolved) holds exactly the link Relay's opt-in history
+// sync creates: <root>/<history> -> <home>/.<provider>/<history>, owned by
+// this user, from a non-default account, with a main root that passes the
+// strict walk's root checks. Anything else returns "" and the
+// strict walk refuses the link. Only that one link is followed; every
+// component below it is still checked.
+func sharedHistoryDirectory(provider, root, history string) string {
+	fallback, err := defaultAgentConfigRoot(provider)
+	if err != nil {
+		return ""
+	}
+	main, err := filepath.EvalSymlinks(fallback)
+	if err != nil || main == root {
+		return ""
+	}
+	// The main provider root passes the strict walk's own root rules: a
+	// directory owned by this user that no one else can write.
+	if info, err := os.Lstat(main); err != nil || !info.IsDir() || info.Mode().Perm()&0022 != 0 {
+		return ""
+	} else if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Getuid() {
+		return ""
+	}
+	link := filepath.Join(root, history)
+	info, err := os.Lstat(link)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return ""
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Getuid() {
+		return ""
+	}
+	target, err := os.Readlink(link)
+	expected := filepath.Join(fallback, history)
+	if err != nil || target != expected {
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(expected)
+	if err != nil || resolved != filepath.Join(main, history) {
+		return ""
+	}
+	return resolved
+}
+
 func sameRotationSourceFile(a, b os.FileInfo) bool {
 	return a != nil && b != nil && os.SameFile(a, b) && a.Size() == b.Size() &&
 		a.ModTime().Equal(b.ModTime()) && a.Mode() == b.Mode()
@@ -171,7 +250,7 @@ func sameRotationSourceFile(a, b os.FileInfo) bool {
 
 func readHostRotationSource(ctx context.Context, e hostRotationEnrollment, boundary hostRotationSourceBoundary, binding AgentBindingRecord) (hostRotationSource, error) {
 	var empty hostRotationSource
-	path, err := rotationSourcePath(binding.TranscriptPath, e.Client)
+	path, err := bindingSourcePath(binding, e.Client)
 	if err != nil {
 		return empty, err
 	}
@@ -194,7 +273,7 @@ func readHostRotationSource(ctx context.Context, e hostRotationEnrollment, bound
 		return empty, err
 	}
 	after, err := file.Stat()
-	finalPath, pathErr := rotationSourcePath(binding.TranscriptPath, e.Client)
+	finalPath, pathErr := bindingSourcePath(binding, e.Client)
 	final, finalErr := os.Lstat(path)
 	if err != nil || pathErr != nil || finalErr != nil || finalPath != path ||
 		!sameRotationSourceFile(before, after) || !sameRotationSourceFile(before, final) {

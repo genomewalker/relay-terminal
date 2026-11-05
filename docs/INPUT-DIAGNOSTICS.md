@@ -4,7 +4,7 @@ Relay records sampled input path metadata in its diagnostic timeline and input j
 
 The journal is under the active profile's application support root at Relay/input-diagnostics.jsonl. New files use mode 0600 and directories 0700. The journal rotates at 1 MiB and keeps three archives.
 
-Sampling admits up to four events per pane/event name in each five-second window, and 128 events across all panes. Each window resets admission so a long-running pane remains observable. Pending journal writes are capped at 128; unavailable storage can cause samples to be omitted.
+Sampling admits up to four events per pane/event name in each five-second window, and 128 events across all panes. Each window resets admission so a long-running pane remains observable. Events that repeat while nothing changes are sampled once per pane per interval instead: prompt-history-suspend, which a reconnecting pane emits every few seconds, once per pane per minute. Pending journal writes are capped at 128; unavailable storage can cause samples to be omitted.
 
 Allowed numeric byte and character counts must be integers from 0 through 1,000,000,000. Unknown metadata fields are removed before the in-memory timeline and disk journal. Other allowed fields describe pane identity, focus, input inspection, paste approval, and outcome state.
 

@@ -56,14 +56,14 @@ func canonicalFolderManifest(entries []folderEntry) ([]folderEntry, string, erro
 			}
 		case "file":
 			digest, err := hex.DecodeString(e.SHA256)
-			if err != nil || len(digest) != 32 || e.Size < 0 || e.Size > maxImportedFileBytes {
-				return nil, "", errors.New("bounded file size and SHA256 required")
+			if err != nil || len(digest) != 32 || e.Size < 0 {
+				return nil, "", errors.New("nonnegative file size and SHA256 required")
 			}
 			e.SHA256 = strings.ToLower(e.SHA256)
-			total += e.Size
-			if total > 1<<30 {
-				return nil, "", errors.New("folder exceeds 1 GiB")
+			if e.Size > maximumStreamedFileBytes-total {
+				return nil, "", errors.New("folder total length overflows file offsets")
 			}
+			total += e.Size
 		default:
 			return nil, "", errors.New("folder entry must be a file or directory")
 		}

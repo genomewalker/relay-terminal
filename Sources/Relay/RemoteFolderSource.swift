@@ -94,7 +94,8 @@ final class RemoteFolderSource {
             } else {
                 guard entry.kind == "file", let size = entry.size, size >= 0, size <= RemoteFileTransfer.maximumBytes,
                       let sha = entry.sha256, sha.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else { throw RemoteFileTransferError.invalidResponse }
-                total += size
+                let sum = total.addingReportingOverflow(size)
+                guard !sum.overflow else { throw RemoteFileTransferError.invalidResponse }; total = sum.partialValue
             }
         }
         for entry in snapshot.entries {
@@ -110,7 +111,7 @@ final class RemoteFolderSource {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let versions = snapshot.versions.sorted { ordered($0.path, $1.path) }
-        guard versionPaths.contains(Data(".".utf8)), total <= 1 << 30, total == snapshot.totalBytes,
+        guard versionPaths.contains(Data(".".utf8)), total == snapshot.totalBytes,
               digest(canonicalManifest(snapshot.entries)) == snapshot.manifestSHA256,
               digest(try encoder.encode(versions)) == snapshot.sourceVersion else { throw RemoteFileTransferError.invalidResponse }
     }
@@ -175,8 +176,8 @@ final class RemoteFolderSource {
                 try walk(childFD, relative: child, depth: depth + 1, entries: &entries, versions: &versions, total: &total)
             case S_IFREG:
                 guard info.st_size >= 0, info.st_size <= RemoteFileTransfer.maximumBytes else { throw RemoteFileTransferError.tooLarge(child) }
-                total += info.st_size
-                guard total <= 1 << 30 else { throw RemoteFileTransferError.failed("Folder exceeds the 1 GiB transfer limit") }
+                let sum = total.addingReportingOverflow(info.st_size)
+                guard !sum.overflow else { throw RemoteFileTransferError.failed("Folder total length cannot be represented") }; total = sum.partialValue
                 let childFD = openat(fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
                 guard childFD >= 0 else { throw Self.changed }
                 let file = FileHandle(fileDescriptor: childFD, closeOnDealloc: true)

@@ -80,7 +80,8 @@ func ReadNativeCodexBinding(pane string) (AgentBindingRecord, error) {
 	if err != nil {
 		return empty, err
 	}
-	if !validSessionID.MatchString(runtime.ThreadID) || validateBindingTranscript(runtime.TranscriptPath, "codex") != nil {
+	override := processAccountOverride(pid, "codex")
+	if !validSessionID.MatchString(runtime.ThreadID) || validateAccountTranscript(runtime.TranscriptPath, "codex", override) != nil {
 		return empty, errors.New("native transcript binding invalid")
 	}
 	after, err := nativeCodexEndpoint(ctx, pid)
@@ -106,7 +107,7 @@ func ReadNativeCodexBinding(pane string) (AgentBindingRecord, error) {
 	}{pane, pid, start, before, runtime.ThreadID, runtime.TranscriptPath})
 	sum := sha256.Sum256(revisionData)
 	return AgentBindingRecord{
-		Version: 1, Producer: agentProducer{PaneID: pane, Provider: "codex", ProcessID: pid, ProcessStart: start},
+		Version: 1, Producer: agentProducer{PaneID: pane, Provider: "codex", ProcessID: pid, ProcessStart: start, ConfigDir: override},
 		SessionID: runtime.ThreadID, TranscriptPath: runtime.TranscriptPath, ObservedAt: time.Now().UTC(),
 		Lifecycle: "unknown", Revision: hex.EncodeToString(sum[:]), Source: "native_runtime_mcp_origin", NativeEndpoint: &before,
 	}, nil
@@ -146,10 +147,34 @@ func nativeBindingFrontend(shell int) (string, int) {
 			roots = append(roots, pid)
 		}
 	}
+	if len(roots) > 1 {
+		// A resumed conversation can leave the previous frontend suspended
+		// (job control) under the same shell. Only the terminal's foreground
+		// process group receives the pane's input, so it is the frontend.
+		roots = foregroundFrontendRoots(roots, harnessProcessGroup, harnessForegroundGroup)
+	}
 	if len(roots) != 1 {
 		return "", 0
 	}
 	return processes[roots[0]], roots[0]
+}
+
+// foregroundFrontendRoots keeps the roots whose process group is the
+// controlling terminal's foreground group. Stopped or background jobs are
+// never that group; any lookup failure keeps nothing, so ambiguity refuses.
+func foregroundFrontendRoots(roots []int, group, foreground func(int) (int, error)) []int {
+	kept := []int{}
+	for _, pid := range roots {
+		processGroup, groupErr := group(pid)
+		foregroundGroup, foregroundErr := foreground(pid)
+		if groupErr != nil || foregroundErr != nil {
+			return nil
+		}
+		if processGroup > 0 && processGroup == foregroundGroup {
+			kept = append(kept, pid)
+		}
+	}
+	return kept
 }
 
 // nativeFrontendProcesses removes an identified stock Node launcher only when

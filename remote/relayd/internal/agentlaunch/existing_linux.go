@@ -96,5 +96,9 @@ func CaptureExisting(directory, client string, pid int, expectedStart, expectedE
 	}
 	// Requested argv before the shim is unknowable for an already running
 	// process; nil records that absence, while effective argv is exact.
-	return save(directory, client, executable, cwd, pane, start, pid, nil, argv[1:])
+	_, configDir, err := ProcessConfigDirectory(pid, client)
+	if err != nil {
+		return "", err
+	}
+	return save(directory, client, executable, cwd, pane, start, pid, configDir, nil, argv[1:])
 }

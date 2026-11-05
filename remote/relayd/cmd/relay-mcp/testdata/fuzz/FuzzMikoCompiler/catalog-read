@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"tool_name\":\"relay_list_panes\",\"arguments\":{}}")

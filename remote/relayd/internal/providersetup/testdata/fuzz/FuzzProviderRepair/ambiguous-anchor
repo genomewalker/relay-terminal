@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("    client.apply(plan)\n    if plan.get(\"provenance\"):\n    client.apply(plan)\n    if plan.get(\"provenance\"):")

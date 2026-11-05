@@ -222,12 +222,12 @@ through the same native model as Settings. Credentials and MCP grants are not
 writable settings. Plugin installation and host management remain separate operations.
 
 ```bash
-./scripts/relay-settings.py get
-./scripts/relay-settings.py schema
-./scripts/relay-settings.py get intelligence_enabled
-./scripts/relay-settings.py set intelligence_enabled true
-./scripts/relay-settings.py set font_size 13.5
-./scripts/relay-settings.py update --file preferences.json
+./scripts/relay-settings.sh get
+./scripts/relay-settings.sh schema
+./scripts/relay-settings.sh get intelligence_enabled
+./scripts/relay-settings.sh set intelligence_enabled true
+./scripts/relay-settings.sh set font_size 13.5
+./scripts/relay-settings.sh update --file preferences.json
 ```
 
 MCP clients can use `relay_get_settings` and `relay_update_settings`. Updates
@@ -241,8 +241,8 @@ object resets all shortcuts; otherwise supply the complete override map.
 For a graceful restart or signed update:
 
 ```bash
-./scripts/restart-relay.py
-./scripts/restart-relay.py --candidate /path/to/Relay.app
+./scripts/restart-relay.sh
+./scripts/restart-relay.sh --candidate /path/to/Relay.app
 ```
 
 ### Native agent rendering

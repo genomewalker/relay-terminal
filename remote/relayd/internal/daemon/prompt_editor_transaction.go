@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -31,6 +32,7 @@ type promptEditorTransaction struct {
 	appliedDone   chan struct{}
 	appliedState  string
 	appliedDigest [32]byte
+	deliveredAt   time.Time
 }
 
 func newPromptEditorTransaction(expected PromptOwnerBinding,
@@ -151,7 +153,28 @@ func (transaction *promptEditorTransaction) completedResult() (promptEditorResul
 	}
 	result := promptEditorResult{Apply: transaction.result.Apply, Text: bytes.Clone(transaction.result.Text)}
 	transaction.state = "delivered"
+	transaction.deliveredAt = time.Now()
 	return result, nil
+}
+
+// promptEditorReceiptWindow is how long a delivered draft waits for its
+// application receipt; the receipt request waits as long.
+const promptEditorReceiptWindow = 20 * time.Second
+
+// inProgress reports an edit a worker upgrade must wait for: not yet
+// delivered or cancelled, or delivered with its application receipt still
+// due. A finished edit stays attached to the session but no longer counts.
+func (transaction *promptEditorTransaction) inProgress(now time.Time) bool {
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	switch transaction.state {
+	case "cancelled":
+		return false
+	case "delivered":
+		return transaction.result.Apply && transaction.appliedState == "" &&
+			now.Sub(transaction.deliveredAt) < promptEditorReceiptWindow
+	}
+	return true
 }
 
 func (transaction *promptEditorTransaction) recordApplication(caller PromptOwnerBinding, digest [32]byte, success bool) error {

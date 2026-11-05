@@ -26,7 +26,7 @@ Primary specifications: [SSH channels](https://www.rfc-editor.org/rfc/rfc4254), 
 
 ## AI observability
 
-`relay-settings.py ai-status` reports recovery model availability and production decision counters/source. `ai-check` calls the production Apple proposal schema using synthetic evidence, verifies the expected action and permission/freshness guards, and cannot reconnect or change agents. An unavailable or skipped model fails the check. A passing check demonstrates this recovery decision path, not every AI feature or overall model quality.
+`relay-settings.sh ai-status` reports recovery model availability and production decision counters/source. `ai-check` calls the production Apple proposal schema using synthetic evidence, verifies the expected action and permission/freshness guards, and cannot reconnect or change agents. An unavailable or skipped model fails the check. A passing check demonstrates this recovery decision path, not every AI feature or overall model quality.
 
 ## Remaining integration
 

@@ -238,3 +238,67 @@ final class TerminalCommandReturnCleanup: @unchecked Sendable {
         }
     }
 }
+
+extension TerminalCommandReturnCleanup {
+    /// Parser and session state after an observed stream. Snapshot checkpoints
+    /// persist it so a restore need not rescan the whole cached payload.
+    struct PersistentState: Codable, Equatable, Sendable {
+        var parser: UInt8
+        var token: [UInt8]
+        var stringIsOSC: Bool
+        var stringIsIgnored: Bool
+        var programOwnsDisplay: Bool
+        var programInputModesActive: Bool
+        var commandStarted: Bool
+        var hasSeenShellPrompt: Bool
+        var commandFinished: Bool
+        var alternateMode: String?
+        var restoringInputPrelude: Bool
+        var restoredShellInputPrelude: Bool
+        var finishesShellInputPrelude: Bool
+    }
+
+    private static let persistentParsers: [State] = [.ground, .escape, .csi, .string, .stringEscape]
+
+    var persistentState: PersistentState {
+        lock.lock()
+        defer { lock.unlock() }
+        return PersistentState(
+            parser: UInt8(Self.persistentParsers.firstIndex(of: state)!),
+            token: token,
+            stringIsOSC: stringIsOSC,
+            stringIsIgnored: stringIsIgnored,
+            programOwnsDisplay: programOwnsDisplay,
+            programInputModesActive: programInputModesActive,
+            commandStarted: commandStarted,
+            hasSeenShellPrompt: hasSeenShellPrompt,
+            commandFinished: commandFinished,
+            alternateMode: alternateMode,
+            restoringInputPrelude: restoringInputPrelude,
+            restoredShellInputPrelude: restoredShellInputPrelude,
+            finishesShellInputPrelude: finishesShellInputPrelude
+        )
+    }
+
+    /// Returns false, leaving the tracker unchanged, for a corrupt record.
+    @discardableResult
+    func restore(_ saved: PersistentState) -> Bool {
+        guard Int(saved.parser) < Self.persistentParsers.count else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        state = Self.persistentParsers[Int(saved.parser)]
+        token = saved.token
+        stringIsOSC = saved.stringIsOSC
+        stringIsIgnored = saved.stringIsIgnored
+        programOwnsDisplay = saved.programOwnsDisplay
+        programInputModesActive = saved.programInputModesActive
+        commandStarted = saved.commandStarted
+        hasSeenShellPrompt = saved.hasSeenShellPrompt
+        commandFinished = saved.commandFinished
+        alternateMode = saved.alternateMode
+        restoringInputPrelude = saved.restoringInputPrelude
+        restoredShellInputPrelude = saved.restoredShellInputPrelude
+        finishesShellInputPrelude = saved.finishesShellInputPrelude
+        return true
+    }
+}

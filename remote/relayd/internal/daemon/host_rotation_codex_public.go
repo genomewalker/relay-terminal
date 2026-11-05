@@ -138,6 +138,7 @@ func (source *rotationCodexPublicSource) response(raw json.RawMessage) error {
 		text, err = rotationCodexUserText(message.Content, metadata, present)
 	} else {
 		text, err = rotationPublicText(message.Content, "assistant", false)
+		text = rotationCodexVisibleText(text)
 	}
 	if err != nil {
 		return err
@@ -257,4 +258,24 @@ func (source *rotationCodexPublicSource) messages() []rotationSourceMessage {
 		}
 	}
 	return messages
+}
+
+// Codex's public AgentMessage completion omits the trailing memory-citation
+// envelope retained in response_item. Exclude only that complete suffix;
+// the remaining public text must still match the exact completion digest.
+func rotationCodexVisibleText(text string) string {
+	const open = "<oai-mem-citation>"
+	const close = "</oai-mem-citation>"
+	i := strings.LastIndex(text, open)
+	if i < 0 || (i > 0 && text[i-1] != '\n') {
+		return text
+	}
+	suffix := strings.TrimRight(text[i:], " \t\r\n")
+	if !strings.HasSuffix(suffix, close) ||
+		strings.Count(suffix, open) != 1 || strings.Count(suffix, close) != 1 {
+		return text
+	}
+	// The public stream removes the envelope, retaining its surrounding whitespace.
+	end := i + strings.LastIndex(text[i:], close) + len(close)
+	return text[:i] + text[end:]
 }

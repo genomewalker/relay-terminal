@@ -16,12 +16,13 @@ import (
 // Discovery reads only the verified provider transcript. It neither enrolls a
 // pane nor obtains terminal input ownership.
 type hostRotationNativeCandidate struct {
-	Version int                `json:"v"`
-	State   string             `json:"state"`
-	CWD     string             `json:"cwd"`
-	Binding AgentBindingRecord `json:"binding"`
-	path    string
-	info    os.FileInfo
+	Version     int                `json:"v"`
+	State       string             `json:"state"`
+	CWD         string             `json:"cwd"`
+	Binding     AgentBindingRecord `json:"binding"`
+	path        string
+	info        os.FileInfo
+	directories []string
 }
 
 func sameHostRotationNativeBinding(a, b AgentBindingRecord) bool {
@@ -52,6 +53,9 @@ func readHostRotationNativeCandidate(ctx context.Context, pane string) (hostRota
 	if err := candidate.verifyFile(); err != nil {
 		return empty, err
 	}
+	if err := candidate.verifyCurrentCWD(); err != nil {
+		return empty, err
+	}
 	return candidate, nil
 }
 
@@ -60,7 +64,7 @@ func readHostRotationNativeDirectory(ctx context.Context, binding AgentBindingRe
 	if binding.Version != 1 || binding.Revision == "" || !validSessionID.MatchString(binding.SessionID) {
 		return empty, errors.New("native session directory unavailable")
 	}
-	path, err := rotationSourcePath(binding.TranscriptPath, binding.Producer.Provider)
+	path, err := bindingSourcePath(binding, binding.Producer.Provider)
 	if err != nil {
 		return empty, err
 	}
@@ -76,7 +80,7 @@ func readHostRotationNativeDirectory(ctx context.Context, binding AgentBindingRe
 		before.Size() <= 0 || before.Size() > rotationSourceFileLimit {
 		return empty, errors.New("native transcript changed or exceeds directory discovery limit")
 	}
-	cwd, err := parseHostRotationNativeDirectory(ctx, io.LimitReader(file, rotationSourceFileLimit+1),
+	cwd, directories, err := parseHostRotationNativeDirectoryEvidence(ctx, io.LimitReader(file, rotationSourceFileLimit+1),
 		binding.Producer.Provider, binding.SessionID)
 	if err != nil {
 		return empty, err
@@ -86,7 +90,7 @@ func readHostRotationNativeDirectory(ctx context.Context, binding AgentBindingRe
 		return empty, errors.New("native transcript changed")
 	}
 	candidate := hostRotationNativeCandidate{Version: 1, State: "ready", CWD: cwd,
-		Binding: binding, path: path, info: before}
+		Binding: binding, path: path, info: before, directories: directories}
 	if err := candidate.verifyFile(); err != nil {
 		return empty, err
 	}
@@ -96,32 +100,69 @@ func readHostRotationNativeDirectory(ctx context.Context, binding AgentBindingRe
 // Metadata is checked across the bounded stream so mixed session/directory
 // records cannot select a directory. Public message bodies are never returned.
 func parseHostRotationNativeDirectory(ctx context.Context, reader io.Reader, provider, session string) (string, error) {
+	root, _, err := parseHostRotationNativeDirectoryEvidence(ctx, reader, provider, session)
+	return root, err
+}
+
+// The first root-session CWD remains the project root. Later legitimate CWDs
+// may be descendants; they cannot replace the root or escape it.
+func nativeDirectoryWithin(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
+// This is directory/identity evidence only, never a process quiescence claim.
+func (c hostRotationNativeCandidate) verifyCurrentCWD() error {
+	live, err := processWorkingDirectory(c.Binding.Producer.ProcessID)
+	if err != nil {
+		return errors.New("native live process directory unavailable")
+	}
+	return verifyNativeDirectoryEvidence(c.CWD, c.directories, live)
+}
+func verifyNativeDirectoryEvidence(rootPath string, directories []string, live string) error {
+	root, err := filepath.EvalSymlinks(rootPath)
+	if err != nil {
+		return errors.New("native original project root unavailable")
+	}
+	paths := append(append([]string{}, directories...), live)
+	for _, path := range paths {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil || !nativeDirectoryWithin(root, resolved) {
+			return errors.New("native process/session directory escapes project root or is unavailable")
+		}
+	}
+	return nil
+}
+
+func parseHostRotationNativeDirectoryEvidence(ctx context.Context, reader io.Reader, provider, session string) (string, []string, error) {
 	if provider != "codex" && provider != "claude" {
-		return "", errors.New("unsupported native provider")
+		return "", nil, errors.New("unsupported native provider")
 	}
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64<<10), rotationSourceLineLimit)
 	cwd, identified, records := "", false, 0
+	directories := []string{}
+	seen := map[string]bool{}
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return "", nil, ctx.Err()
 		}
 		records++
 		if records > 200000 {
-			return "", errors.New("native directory record limit exceeded")
+			return "", nil, errors.New("native directory record limit exceeded")
 		}
 		line := scanner.Bytes()
 		if !utf8.Valid(line) || !rotationSourceJSONUnambiguous(line) {
-			return "", errors.New("invalid native directory metadata")
+			return "", nil, errors.New("invalid native directory metadata")
 		}
 		var row rotationSourceRow
 		if json.Unmarshal(line, &row) != nil {
-			return "", errors.New("invalid native directory record")
+			return "", nil, errors.New("invalid native directory record")
 		}
 		observed := ""
 		if provider == "codex" {
 			if row.Type == "response_item" && !identified {
-				return "", errors.New("native directory identity must precede messages")
+				return "", nil, errors.New("native directory identity must precede messages")
 			}
 			if row.Type != "session_meta" {
 				continue
@@ -135,7 +176,7 @@ func parseHostRotationNativeDirectory(ctx context.Context, reader io.Reader, pro
 			if identified || json.Unmarshal(row.Payload, &meta) != nil || meta.ID != session ||
 				(meta.ThreadSource != "" && meta.ThreadSource != "user") ||
 				(meta.ThreadSource == "" && string(meta.Source) != `"cli"`) {
-				return "", errors.New("native directory session identity mismatch")
+				return "", nil, errors.New("native directory session identity mismatch")
 			}
 			observed = meta.CWD
 		} else {
@@ -143,26 +184,35 @@ func parseHostRotationNativeDirectory(ctx context.Context, reader io.Reader, pro
 				continue
 			}
 			if row.SessionID != session {
-				return "", errors.New("native directory session identity mismatch")
+				return "", nil, errors.New("native directory session identity mismatch")
 			}
 			observed = row.CWD
 		}
-		if !filepath.IsAbs(observed) || len(observed) > 4096 || strings.ContainsRune(observed, 0) ||
-			(identified && cwd != observed) {
-			return "", errors.New("native session directory is missing or inconsistent")
+		if !filepath.IsAbs(observed) || len(observed) > 4096 || strings.ContainsRune(observed, 0) || filepath.Clean(observed) != observed ||
+			(identified && !nativeDirectoryWithin(cwd, observed)) {
+			return "", nil, errors.New("native session directory is missing or outside the original project root")
 		}
-		cwd, identified = observed, true
+		if !identified {
+			cwd, identified = observed, true
+		}
+		if !seen[observed] {
+			if len(directories) >= 256 {
+				return "", nil, errors.New("native session directory inventory exceeds bound")
+			}
+			seen[observed] = true
+			directories = append(directories, observed)
+		}
 	}
 	if scanner.Err() != nil {
-		return "", errors.New("native directory line limit or read failure")
+		return "", nil, errors.New("native directory line limit or read failure")
 	}
 	if ctx.Err() != nil {
-		return "", ctx.Err()
+		return "", nil, ctx.Err()
 	}
 	if !identified {
-		return "", errors.New("native session directory metadata unavailable")
+		return "", nil, errors.New("native session directory metadata unavailable")
 	}
-	return cwd, nil
+	return cwd, directories, nil
 }
 
 func (c hostRotationNativeCandidate) matches(req hostRotationRequest, pane string) bool {
@@ -173,7 +223,7 @@ func (c hostRotationNativeCandidate) matches(req hostRotationRequest, pane strin
 }
 
 func (c hostRotationNativeCandidate) verifyFile() error {
-	path, err := rotationSourcePath(c.Binding.TranscriptPath, c.Binding.Producer.Provider)
+	path, err := bindingSourcePath(c.Binding, c.Binding.Producer.Provider)
 	if err != nil || path != c.path {
 		return errors.New("native directory source path changed")
 	}
@@ -202,6 +252,9 @@ func (c hostRotationNativeCandidate) verifyEnrollment(e hostRotationEnrollment) 
 	provider, pid := nativeBindingFrontend(manifest.ShellPID)
 	if provider != e.Client || pid != e.AgentPID {
 		return errors.New("host rotation frontend selection changed")
+	}
+	if err := c.verifyCurrentCWD(); err != nil {
+		return err
 	}
 	return c.verifyFile()
 }

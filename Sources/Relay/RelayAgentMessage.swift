@@ -496,9 +496,21 @@ struct RelayAgentArtifactView: View {
                 }
             }
             if let artifact {
-                if artifact.isPDF { RelayPDFPreview(data: artifact.data).frame(height: 440) }
+                if artifact.isPDF {
+                    RelayPDFPreview(data: artifact.data).frame(height: 440)
+                    Button("Open in pane preview") { pane.presentRequestedArtifact(artifact) }
+                        .buttonStyle(RelayAgentQuietButtonStyle())
+                        .accessibilityLabel("Preview " + artifact.filename)
+                        .accessibilityIdentifier("relay.file-card")
+                }
                 else if let image = artifact.image {
-                    Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 440)
+                    Button { pane.presentRequestedArtifact(artifact) } label: {
+                        Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 440)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open in pane preview")
+                    .accessibilityLabel("Preview " + artifact.filename)
+                    .accessibilityIdentifier("relay.file-card")
                 } else { Text("This file cannot be previewed.").font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.secondaryInk) }
             }
             if let failure { Text(failure).font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.failureInk) }
@@ -533,6 +545,7 @@ struct RelayAgentProviderImageView: View {
     @ObservedObject var pane: PaneModel
     let reference: String
     @State private var image: NSImage?
+    @State private var verified: PaneArtifact?
     @State private var failure: String?
     @State private var generation = UUID()
     private struct Response: Decodable {
@@ -544,8 +557,14 @@ struct RelayAgentProviderImageView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
             if let image {
-                Image(nsImage: image).resizable().scaledToFit().frame(maxWidth: 560, maxHeight: 360)
-                    .accessibilityLabel("Provider image attachment")
+                Button { if let verified { pane.presentRequestedArtifact(verified) } } label: {
+                    Image(nsImage: image).resizable().scaledToFit().frame(maxWidth: 560, maxHeight: 360)
+                }
+                .buttonStyle(.plain)
+                .disabled(verified == nil)
+                .help("Open in pane preview")
+                .accessibilityLabel("Preview provider image attachment")
+                .accessibilityIdentifier("relay.file-card")
             } else if let failure {
                 Text(failure).font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.secondaryInk)
             } else {
@@ -553,22 +572,18 @@ struct RelayAgentProviderImageView: View {
             }
         }
         .task(id: reference) { await load() }
-        .onDisappear { generation = UUID(); image = nil }
+        .onDisappear { generation = UUID(); image = nil; verified = nil }
     }
     @MainActor private func load() async {
-        let token = UUID(); generation = token; image = nil; failure = nil
+        let token = UUID(); generation = token; image = nil; verified = nil; failure = nil
         do {
-            guard reference.utf8.count <= 4096, Data(base64Encoded: reference) != nil,
-                  let root = RelayResources.bundle?.url(forResource: "Rotation", withExtension: nil) else { throw RemoteCatalogError.invalidResponse }
-            let script = try Data(contentsOf: root.appendingPathComponent("agent_conversation.py"))
-            guard script.count <= 64 << 10 else { throw RemoteCatalogError.invalidResponse }
+            guard reference.utf8.count <= 4096, Data(base64Encoded: reference) != nil else { throw RemoteCatalogError.invalidResponse }
             let rootPID = pane.profile.kind == .local ? Int(pane.networkForegroundPID ?? 0) : 0
-            let daemon = RelayHostExecution.daemonCommand(profile: pane.profile, arguments: [])
-            // Base64 is restricted to an alphabet with no shell quotes or expansions.
-            let command = "python3 - --binding-daemon " + daemon + " --pane '" + pane.id.uuidString.lowercased() +
-                "' --root-pid " + String(rootPID) + " --attachment '" + reference + "'"
+            let command = RelayHostExecution.daemonCommand(profile: pane.profile, arguments: [
+                "agent-conversation", "--pane", pane.id.uuidString.lowercased(),
+                "--root-pid", String(rootPID), "--attachment", reference])
             let result = try await RelayHostExecution.capture(profile: pane.profile, command: command,
-                input: script, timeout: 20, maximumBytes: 12 << 20)
+                timeout: 20, maximumBytes: 12 << 20)
             try Task.checkCancellation()
             guard generation == token else { return }
             guard result.exitCode == 0 else { throw RemoteCatalogError.failed("Image reader could not complete on this host.") }
@@ -588,6 +603,9 @@ struct RelayAgentProviderImageView: View {
                     kCGImageSourceShouldCacheImmediately: true
                   ] as CFDictionary) else { throw RemoteCatalogError.failed("Image attachment could not be decoded within preview limits.") }
             image = NSImage(cgImage: thumbnail, size: .zero)
+            // The viewer gets the same verified, full-resolution bytes.
+            let ext = ["image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"][response.mime ?? ""] ?? "png"
+            verified = PaneArtifact(remotePath: "Provider image." + ext, data: data)
         } catch is CancellationError { }
         catch {
             guard generation == token else { return }

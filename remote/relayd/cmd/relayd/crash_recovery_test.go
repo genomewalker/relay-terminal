@@ -36,11 +36,7 @@ func TestSupervisorCrashPreservesPaneWorkerAndShell(t *testing.T) {
 			t.Fatalf("build relayd: %v\n%s", err, output)
 		}
 	}
-	runtimeDir, err := os.MkdirTemp("/tmp", "relay-crash-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(runtimeDir) })
+	runtimeDir := newTestRuntime(t, "relay-crash-", temporary)
 	stateDir := filepath.Join(temporary, "state")
 	environment := append(os.Environ(), "XDG_RUNTIME_DIR="+runtimeDir, "XDG_STATE_HOME="+stateDir)
 	socket := filepath.Join(runtimeDir, "relayd.sock")
@@ -103,11 +99,7 @@ func TestSupervisorUpgradePreservesPaneWorkerAndShell(t *testing.T) {
 		buildTestRelayd(t, oldBinary, "0.5.1")
 		buildTestRelayd(t, newBinary, "0.5.2")
 	}
-	runtimeDir, err := os.MkdirTemp("/tmp", "relay-upgrade-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(runtimeDir) })
+	runtimeDir := newTestRuntime(t, "relay-upgrade-", temporary)
 	stateDir := filepath.Join(temporary, "state")
 	environment := append(os.Environ(), "XDG_RUNTIME_DIR="+runtimeDir, "XDG_STATE_HOME="+stateDir)
 	socket := filepath.Join(runtimeDir, "relayd.sock")

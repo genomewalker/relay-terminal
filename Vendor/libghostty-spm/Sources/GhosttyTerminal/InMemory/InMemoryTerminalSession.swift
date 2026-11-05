@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Darwin
 import GhosttyKit
 
 public final class InMemoryTerminalSession: @unchecked Sendable {
@@ -120,11 +121,60 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         TerminalDebugLog.log(.lifecycle, "in-memory session surface=nil matched")
     }
 
+    /// Runs `release` (which frees `surface`) once no output or read
+    /// operation is using it: now if idle, otherwise on the main thread after
+    /// the last operation returns. Never blocks the caller.
+    func retireSurface(_ surface: ghostty_surface_t, release: @escaping @Sendable () -> Void) {
+        surfaceAccess.retireSurface(surface, release: release)
+    }
+
+    var activeSurfaceOperationCountForTesting: Int { surfaceAccess.activeOperationCountForTesting }
+    var pendingSurfaceRetirementCountForTesting: Int { surfaceAccess.pendingRetirementCountForTesting }
+
     var currentSurface: ghostty_surface_t? {
         surfaceAccess.currentSurface
     }
 
     // MARK: - Viewport Read
+
+    /// Exports the engine's active screen with SGR attributes. The native
+    /// screen-file action neither submits PTY input nor changes selection.
+    /// Its clipboard path is captured in-process; the system clipboard is
+    /// untouched, and the owner-only temporary file is removed after reading.
+    @MainActor public func readActiveScreenVT() -> String? {
+        guard let viewport = readViewportText() else { return nil }
+        return surfaceAccess.withCurrentSurface { surface -> String? in
+            guard let pointer = ghostty_surface_userdata(surface) else { return nil }
+            let bridge = Unmanaged<TerminalCallbackBridge>.fromOpaque(pointer).takeUnretainedValue()
+            guard let capture = bridge.capturedClipboardWrite.begin() else { return nil }
+            let action = "write_screen_file:copy,vt"
+            let accepted = action.withCString { ghostty_surface_binding_action(surface, $0, UInt(action.utf8.count)) }
+            let path = bridge.capturedClipboardWrite.finish(capture)
+            guard accepted, let path, path.hasPrefix("/") else { return nil }
+            let file = URL(fileURLWithPath: path)
+            let parent = file.deletingLastPathComponent()
+            guard file.lastPathComponent == "screen.txt" else { return nil }
+            let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW)
+            guard fd >= 0 else { return nil }
+            defer {
+                Darwin.close(fd)
+                Darwin.unlink(path)
+                // rmdir succeeds only for the now-empty native temporary folder.
+                if parent.path != FileManager.default.temporaryDirectory.path && parent.path != "/tmp" && parent.path != "/private/tmp" {
+                    Darwin.rmdir(parent.path)
+                }
+            }
+            var metadata = stat()
+            guard fstat(fd, &metadata) == 0, metadata.st_uid == getuid(),
+                  metadata.st_mode & S_IFMT == S_IFREG, metadata.st_mode & 0o077 == 0,
+                  metadata.st_size >= 0, metadata.st_size <= 1 << 20 else { return nil }
+            var bytes = Data(count: Int(metadata.st_size))
+            let read = bytes.withUnsafeMutableBytes { buffer in Darwin.read(fd, buffer.baseAddress, buffer.count) }
+            guard read == bytes.count else { return nil }
+            guard let raw = String(data: bytes, encoding: .utf8) else { return nil }
+            return TerminalScreenViewportProjection.project(raw, viewport: viewport)
+        } ?? nil
+    }
 
     /// Returns the active viewport as a UTF-8 string, or `nil` if no surface
     /// is attached. Lines are separated by `\n`. The `ghostty_text_s`
@@ -382,6 +432,20 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     /// Advances only after accepted host output is parsed into this surface.
     /// Cursor, selection, preedit and renderer-only updates do not advance it.
     public var parsedHostOutputRevision: UInt64 { surfaceAccess.parsedHostOutputRevision }
+
+    /// Native screen-mutation state for callers that cache a screen read:
+    /// the surface generation, completed host-output and process-exit
+    /// mutations, whether one is being applied now, and the last dispatched
+    /// grid. Binding actions and resize reflow are not counted; a cache must
+    /// also compare the screen's text.
+    public var screenState: InMemoryTerminalScreenState? {
+        guard var state = surfaceAccess.screenState else { return nil }
+        resizeLock.lock()
+        state.columns = lastResize?.columns
+        state.rows = lastResize?.rows
+        resizeLock.unlock()
+        return state
+    }
 
     /// Ordered, coalescing completion notifications for parsed host output.
     /// Subscribe before requesting a provider repaint. Presentation callbacks

@@ -8,16 +8,14 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/relay-terminal/relayd/internal/rotationtext"
 )
 
-func TestHostRotationTextResourceParity(t *testing.T) {
-	source, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "Sources", "Relay", "Resources", "Rotation", "text_backend.py"))
-	if err != nil || !bytes.Equal(source, hostRotationText) {
-		t.Fatal("embedded text adapter differs from the canonical resource", err)
-	}
-}
-
+// The service runs in relayd itself: no interpreter is reachable on PATH, and
+// the journal is the Go ledger.
 func TestHostRotationTextServiceDefaultsAndPrivateSettings(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 	root := filepath.Join(t.TempDir(), "workers")
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)
@@ -58,9 +56,24 @@ func TestHostRotationTextServiceDefaultsAndPrivateSettings(t *testing.T) {
 	if result["code"] != "invalid_settings" {
 		t.Fatalf("secret accepted in settings: %v", result)
 	}
-	path := filepath.Join(root, "rotation-text", "operations.sqlite3")
+	path := filepath.Join(root, "rotation-text", "ledger.log")
 	data, err := privatePromptEditorBytes(path, 1<<20)
-	if err != nil || bytes.Contains(data, []byte("secret-must-never-persist")) {
+	if err != nil || !bytes.Contains(data, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")) ||
+		bytes.Contains(data, []byte("secret-must-never-persist")) {
 		t.Fatal("journal permissions or secret persistence", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "rotation-text", "operations.sqlite3")); !os.IsNotExist(err) {
+		t.Fatal("a fresh journal created SQLite state", err)
+	}
+}
+
+// The Mac vault helper is relayd's sibling, as the co-process environment had.
+func TestHostRotationTextUsesTheSiblingCredentialHelper(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Skip("relayd cannot locate itself")
+	}
+	if rotationtext.CredentialHelper != filepath.Join(filepath.Dir(executable), "relay-credentials") {
+		t.Fatalf("credential helper = %q", rotationtext.CredentialHelper)
 	}
 }

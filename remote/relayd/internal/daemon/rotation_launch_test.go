@@ -10,7 +10,7 @@ import (
 func TestClaudeRotationPlanBindsCapturedArgsAndNarrowReceiptRule(t *testing.T) {
 	fresh := []string{"--model", "haiku", "--permission-mode", "default"}
 	session := ClaudeRotationID("intent-one")
-	rule := "Bash(python3 /maps/relay/rotation-decision/claude_backend.py receipt *)"
+	rule := "Bash(/home/u/.local/bin/relayd rotation-receipt *)"
 	planned := append(append([]string{}, fresh...), "--session-id", session, "--allowedTools", rule)
 	if err := validateClaudeRotationArgs(fresh, planned, session); err != nil {
 		t.Fatal(err)
@@ -21,11 +21,17 @@ func TestClaudeRotationPlanBindsCapturedArgsAndNarrowReceiptRule(t *testing.T) {
 		t.Fatal("captured allow rule accepted")
 	}
 	for name, changed := range map[string][]string{
-		"configuration": {"--model", "sonnet", "--permission-mode", "default", "--session-id", session, "--allowedTools", rule},
-		"session":       {"--model", "haiku", "--permission-mode", "default", "--session-id", ClaudeRotationID("other"), "--allowedTools", rule},
-		"broad rule":    {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(*)"},
-		"shell syntax":  {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(python3 /maps/relay/rotation-decision/claude_backend.py;evil receipt *)"},
-		"duplicate":     append(append([]string{}, planned...), "--allowedTools", rule),
+		"configuration":   {"--model", "sonnet", "--permission-mode", "default", "--session-id", session, "--allowedTools", rule},
+		"session":         {"--model", "haiku", "--permission-mode", "default", "--session-id", ClaudeRotationID("other"), "--allowedTools", rule},
+		"broad rule":      {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(*)"},
+		"shell syntax":    {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(/home/u/.local/bin/relayd;evil rotation-receipt *)"},
+		"python3 receipt": {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(python3 /maps/relay/rotation-decision/claude_backend.py receipt *)"},
+		"python3 relayd":  {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(python3 /home/u/.local/bin/relayd rotation-receipt *)"},
+		"relative":        {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(relayd rotation-receipt *)"},
+		"other binary":    {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(/home/u/.local/bin/relayd.py rotation-receipt *)"},
+		"unclean":         {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(/home/u/../u/.local/bin/relayd rotation-receipt *)"},
+		"other command":   {"--model", "haiku", "--permission-mode", "default", "--session-id", session, "--allowedTools", "Bash(/home/u/.local/bin/relayd rotation-status *)"},
+		"duplicate":       append(append([]string{}, planned...), "--allowedTools", rule),
 	} {
 		if err := validateClaudeRotationArgs(fresh, changed, session); err == nil {
 			t.Errorf("%s was accepted", name)

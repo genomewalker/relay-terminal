@@ -2,8 +2,11 @@ import SwiftUI
 import AppKit
 
 struct RelaySettingsView: View {
+    var workspace: WorkspaceModel? = nil
     @ObservedObject private var preferences = RelayPreferences.shared
     @ObservedObject private var navigation = RelaySettingsNavigation.shared
+    @ObservedObject private var assistantEntryPoints = RelayAssistantEntryPoints.shared
+    @State private var settingsSearch = ""
     @State private var showingKeyBindings = false
     @State private var showingPlugins = false
     @State private var showingCallers = false
@@ -11,16 +14,7 @@ struct RelaySettingsView: View {
     @State private var intelligenceAvailability = "checking"
     @State private var decisionModelStatus: String?
 
-    private let sections: [(id: String, title: String, icon: String)] = [
-        ("general", "Appearance", "paintbrush"),
-        ("keyboard", "Keyboard", "keyboard"),
-        ("accounts", "Accounts", "person.crop.circle"),
-        ("intelligence", "Intelligence", "sparkles"),
-        ("connections", "Connections", "server.rack"),
-        ("clients", "Clients", "person.2"),
-        ("plugins", "Plugins", "puzzlepiece.extension"),
-        ("advanced", "Advanced", "gearshape.2")
-    ]
+    private let sections = RelaySettingsSearch.sections
 
     private var selectedTitle: String {
         sections.first(where: { $0.id == navigation.section })?.title ?? "Appearance"
@@ -28,7 +22,8 @@ struct RelaySettingsView: View {
     private var selectedDescription: String {
         switch navigation.section {
         case "keyboard": "Customize shortcuts for sessions, tabs and panes."
-        case "accounts": "Manage accounts shared by every tab on a host."
+        case "accounts": "API keys Relay itself uses on each host (handoff text), shared by every tab. Agent sign-ins are under Agent Accounts."
+        case "agent-accounts": "Work and personal Claude and Codex accounts on each host."
         case "intelligence": "Optional features that use models on this Mac."
         case "connections": "Manage Relay helpers and remote sessions."
         case "clients": "Control which clients can work with Relay."
@@ -44,8 +39,11 @@ struct RelaySettingsView: View {
                 Text("Settings")
                     .font(RelayTheme.font(size: 17, weight: .semibold))
                     .padding(.horizontal, 12).padding(.top, 12)
+                TextField("Search settings", text: $settingsSearch)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("relay.settings.search")
                 VStack(spacing: 4) {
-                    ForEach(sections, id: \.id) { section in
+                    ForEach(sections.filter { RelaySettingsSearch.matches(section: $0.id, title: $0.title, query: settingsSearch) }, id: \.id) { section in
                         Button { navigation.section = section.id } label: {
                             Label(section.title, systemImage: section.icon)
                                 .font(RelayTheme.font(size: 13, weight: .medium))
@@ -61,6 +59,12 @@ struct RelaySettingsView: View {
                         .accessibilityAddTraits(navigation.section == section.id ? .isSelected : [])
                     }
                 }
+                if !settingsSearch.isEmpty && !sections.contains(where: {
+                    RelaySettingsSearch.matches(section: $0.id, title: $0.title, query: settingsSearch)
+                }) {
+                    Text("No matching settings").font(RelayTheme.font(size: 11))
+                        .foregroundStyle(RelayTheme.textMuted)
+                }
                 Spacer()
                 Text("Relay")
                     .font(RelayTheme.font(size: 11))
@@ -74,6 +78,15 @@ struct RelaySettingsView: View {
                     Text(selectedTitle).font(RelayTheme.font(size: 22, weight: .semibold))
                     Text(selectedDescription).font(RelayTheme.font(size: 13))
                         .foregroundStyle(RelayTheme.textMuted)
+                    if let workspace {
+                        Button("Ask Miko about settings…") {
+                            if !workspace.haikuAssistantVisible { workspace.toggleHaikuAssistant() }
+                        }
+                        .buttonStyle(.link)
+                        .accessibilityIdentifier("relay.settings.askMiko")
+                    }
+                    Text("Miko can explain common settings and propose an exact change on This Mac. Review the target and value; completion includes a verified settings receipt. You can also use the controls below.")
+                        .font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
                 }
                 .padding(26)
                 Divider().overlay(RelayTheme.line.opacity(0.4))
@@ -104,6 +117,13 @@ struct RelaySettingsView: View {
     @ViewBuilder private var sectionContent: some View {
         switch navigation.section {
         case "accounts": RelayHostAccountsSettingsView()
+        case "agent-accounts":
+            RelayCapacitySettingsView(pane: workspace?.activePane)
+            RelayClaudeQuotaSettingsView(configuredHosts: Set(workspace.map {
+                RelayAgentAccountsSettingsView.hosts($0.profileStore).map { RelayAgentAccountDirectory.hostKey($0) }
+            } ?? ["local"]))
+            if let workspace { RelayAgentAccountsSettingsView(workspace: workspace) }
+            else { Text("Open a Relay workspace window to manage agent accounts.").foregroundStyle(RelayTheme.textMuted) }
         case "keyboard": keyboardSettings
         case "intelligence": intelligenceSettings
         case "connections": connectionsSettings
@@ -123,6 +143,7 @@ HStack(alignment: .top, spacing: 22) {
                         .padding(.horizontal, RelayTheme.spacing(10))
                         .frame(height: 32)
                         .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+                    RelayObelFontTrialView(preferences: preferences)
                     if preferences.isUsingFontFallback {
                         Text("Font not installed — using Menlo")
                             .font(RelayTheme.font(size: 11))
@@ -280,6 +301,45 @@ settingSection("Images") {
             .padding(16)
             .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 10))
             .accessibilityIdentifier("relay.settings.intelligence.availability")
+
+            settingSection("Relay assistant") {
+                RelayMikoPolicySettingsView()
+                RelayMikoShepherdSettingsView(workspace: workspace)
+
+                Toggle("Open the assistant with a global shortcut", isOn: $preferences.assistantHotkeyEnabled)
+                    .accessibilityIdentifier("relay.settings.assistant.hotkey-enabled")
+                Picker("Shortcut", selection: $preferences.assistantHotkey) {
+                    ForEach(RelayAssistantHotkey.presets, id: \.self) { hotkey in
+                        Text(hotkey.displayName).tag(hotkey)
+                    }
+                }
+                .disabled(!preferences.assistantHotkeyEnabled)
+                .accessibilityIdentifier("relay.settings.assistant.hotkey")
+                if let notice = assistantEntryPoints.hotkeyStatus.notice {
+                    Label(notice, systemImage: "exclamationmark.triangle")
+                        .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.coral)
+                        .accessibilityIdentifier("relay.settings.assistant.hotkey-notice")
+                }
+                HStack(spacing: 8) {
+                    Button("Test shortcut") { assistantEntryPoints.testHotkey() }
+                        .disabled(!preferences.assistantHotkeyEnabled || assistantEntryPoints.testingHotkey)
+                        .accessibilityIdentifier("relay.settings.assistant.hotkey-test")
+                    if let message = assistantEntryPoints.hotkeyTest.message {
+                        Text(message).font(RelayTheme.font(size: 12))
+                            .foregroundStyle(assistantEntryPoints.testingHotkey || assistantEntryPoints.hotkeyTest == .received(
+                                preferences.assistantHotkey.displayName) ? RelayTheme.textMuted : RelayTheme.coral)
+                            .accessibilityIdentifier("relay.settings.assistant.hotkey-test-result")
+                    }
+                }
+                Text("Haiku answers questions about panes, health holds and rotation, and can select, zoom and switch tabs. It shares the host's Claude API account and budget with pane health, stops while the host's last daily requests are reserved for pane health (at most 200 assistant requests a day), and never types into panes.")
+                    .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+            }
+
+            settingSection("Miko supervisors") {
+                RelayMikoSupervisorSettingsView(workspace: workspace)
+            }
+
+            RelayAgentMaintenanceSettingsView()
 
             settingSection("On-device features") {
                 Toggle("Use on-device intelligence", isOn: $preferences.intelligenceEnabled)

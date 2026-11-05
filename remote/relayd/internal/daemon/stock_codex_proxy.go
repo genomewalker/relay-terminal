@@ -14,11 +14,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/net/websocket"
+
+	"github.com/relay-terminal/relayd/internal/agentlaunch"
 )
 
 const stockCodexProxySource = "stock_app_server_proxy"
@@ -28,11 +31,14 @@ var errNoStockCodexProxy = errors.New("no stock Codex proxy")
 // CodexProxyOptions attaches one stock CLI to an existing App Server. It does
 // not start a provider, change its binary, submit a turn, or replace its socket.
 type CodexProxyOptions struct {
-	Pane          string
-	Session       string
-	BackendSocket string
-	BackendPID    int
-	BackendStart  uint64
+	Pane              string
+	Session           string
+	BackendSocket     string
+	BackendPID        int
+	BackendStart      uint64
+	TrackPrimary      bool
+	ExitWithFrontend  bool
+	ResumePermissions *agentlaunch.CodexPermissions
 }
 
 type StockCodexProxyProof struct {
@@ -49,6 +55,7 @@ type codexProxyDescriptor struct {
 	Version        int                 `json:"version"`
 	Pane           string              `json:"pane"`
 	Session        string              `json:"session"`
+	TrackPrimary   bool                `json:"track_primary,omitempty"`
 	ProxyPID       int                 `json:"proxy_pid"`
 	ProxyStart     uint64              `json:"proxy_start"`
 	WorkerPID      int                 `json:"worker_pid"`
@@ -62,22 +69,43 @@ type codexProxyDescriptor struct {
 }
 
 type codexProxySelection struct {
-	wanted             string
-	session            string
-	path               string
-	epoch              uint64
-	pending            map[string]uint64
-	resumeRequests     uint64
-	resumeResponses    uint64
-	lastFrontendMethod string
-	lastInvalidation   string
+	trackPrimary        bool
+	wanted              string
+	session             string
+	path                string
+	epoch               uint64
+	pending             map[string]uint64
+	resumeRequests      uint64
+	resumeResponses     uint64
+	lastFrontendMethod  string
+	lastInvalidation    string
+	lastFrontendThread  string
+	confirmedResume     bool
+	confirmedPath       string
+	pendingTurns        map[string]codexProxyPendingTurn
+	turnReconfirmations uint64
+	temporaryRequests   map[string]struct{}
+	temporaryThreads    map[string]struct{}
+	temporaryConfirmed  uint64
+}
+
+type codexProxyPendingTurn struct {
+	epoch  uint64
+	method string
 }
 
 func (s *codexProxySelection) invalidate(reason string) {
+	if reason == "connection_changed" {
+		s.temporaryRequests, s.temporaryThreads = nil, nil
+	}
+	if reason == "connection_changed" || reason == "invalid_frontend_rpc" || reason == "invalid_backend_rpc" || reason == "non_text_frame" || reason == "thread/start" || reason == "thread/fork" || reason == "thread/resume" || reason == "temporary_tracking_limit" || reason == "temporary_identity_conflict" {
+		s.confirmedResume, s.confirmedPath = false, ""
+	}
 	s.lastInvalidation = reason
 	s.epoch++
 	s.session, s.path = "", ""
 	s.pending = make(map[string]uint64)
+	s.pendingTurns = make(map[string]codexProxyPendingTurn)
 }
 
 // Inspect only routing metadata. Frames are never logged, persisted or replayed.
@@ -87,7 +115,8 @@ func (s *codexProxySelection) frontend(data []byte) error {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
 		Params struct {
-			ThreadID string `json:"threadId"`
+			ThreadID  string `json:"threadId"`
+			Ephemeral bool   `json:"ephemeral"`
 		} `json:"params"`
 	}
 	if json.Unmarshal(data, &frame) != nil {
@@ -97,23 +126,63 @@ func (s *codexProxySelection) frontend(data []byte) error {
 	// Background reads populate the stock CLI agent list; they do not change
 	// the primary conversation confirmed by its explicit resume RPC.
 	s.lastFrontendMethod = frame.Method
+	if frame.Params.ThreadID != "" {
+		s.lastFrontendThread = frame.Params.ThreadID
+	}
 	switch frame.Method {
 	case "thread/start", "thread/fork":
+		// The same frontend also creates temporary helper conversations. Their
+		// replies and turns must never become the pane's research conversation.
+		if frame.Params.Ephemeral {
+			_, primaryPending := s.pending[string(frame.ID)]
+			_, turnPending := s.pendingTurns[string(frame.ID)]
+			if !validProxyRPCID(frame.ID) || len(s.temporaryRequests) >= 64 {
+				s.invalidate("temporary_tracking_limit")
+				return nil
+			}
+			if primaryPending || turnPending {
+				s.invalidate("temporary_identity_conflict")
+				return nil
+			}
+			if s.temporaryRequests == nil {
+				s.temporaryRequests = make(map[string]struct{})
+			}
+			s.temporaryRequests[string(frame.ID)] = struct{}{}
+			return nil
+		}
 		s.invalidate(frame.Method)
+		if s.trackPrimary && validProxyRPCID(frame.ID) {
+			s.wanted = ""
+			s.pending[string(frame.ID)] = s.epoch
+		}
 	case "thread/resume":
+		if _, temporary := s.temporaryThreads[frame.Params.ThreadID]; temporary {
+			return nil
+		}
 		s.invalidate(frame.Method)
+		if s.trackPrimary {
+			s.wanted = frame.Params.ThreadID
+		}
 		if frame.Params.ThreadID == s.wanted && validProxyRPCID(frame.ID) {
 			s.resumeRequests++
 			s.pending[string(frame.ID)] = s.epoch
 		}
 	case "turn/start", "turn/steer":
+		if _, temporary := s.temporaryThreads[frame.Params.ThreadID]; temporary {
+			return nil
+		}
 		if frame.Params.ThreadID != "" && frame.Params.ThreadID != s.session {
 			s.invalidate(frame.Method)
+			// A later successful turn can reconfirm a previously resumed primary.
+			// The request alone and turns for other threads cannot establish identity.
+			if frame.Params.ThreadID == s.wanted && s.confirmedResume && validProxyRPCID(frame.ID) {
+				s.pendingTurns[string(frame.ID)] = codexProxyPendingTurn{s.epoch, frame.Method}
+			}
 		}
 	case "thread/unsubscribe":
 		// The TUI also unsubscribes from background and completed subagent
 		// threads. Only releasing the confirmed primary breaks this binding.
-		if frame.Params.ThreadID != "" && frame.Params.ThreadID == s.session {
+		if frame.Params.ThreadID != "" && frame.Params.ThreadID == s.wanted {
 			s.invalidate(frame.Method)
 		}
 	}
@@ -152,8 +221,53 @@ func (s *codexProxySelection) backend(data []byte) error {
 		s.invalidate("invalid_backend_rpc")
 		return errors.New("invalid backend RPC")
 	}
-	if (frame.Method == "thread/closed" || frame.Method == "thread/unloaded") && frame.Params.ThreadID == s.session {
+	if _, temporary := s.temporaryRequests[string(frame.ID)]; temporary {
+		delete(s.temporaryRequests, string(frame.ID))
+		var result struct {
+			Thread struct {
+				ID        string `json:"id"`
+				Ephemeral bool   `json:"ephemeral"`
+			} `json:"thread"`
+		}
+		if (len(frame.Error) == 0 || string(frame.Error) == "null") && json.Unmarshal(frame.Result, &result) == nil &&
+			result.Thread.Ephemeral && validSessionID.MatchString(result.Thread.ID) {
+			if result.Thread.ID == s.wanted || len(s.temporaryThreads) >= 64 {
+				s.invalidate("temporary_identity_conflict")
+				return nil
+			}
+			if s.temporaryThreads == nil {
+				s.temporaryThreads = make(map[string]struct{})
+			}
+			s.temporaryThreads[result.Thread.ID] = struct{}{}
+			s.temporaryConfirmed++
+		}
+		return nil
+	}
+	if frame.Method == "thread/closed" || frame.Method == "thread/unloaded" {
+		delete(s.temporaryThreads, frame.Params.ThreadID)
+	}
+	if (frame.Method == "thread/closed" || frame.Method == "thread/unloaded") && frame.Params.ThreadID == s.wanted {
 		s.invalidate(frame.Method)
+	}
+	if pending, ok := s.pendingTurns[string(frame.ID)]; ok {
+		delete(s.pendingTurns, string(frame.ID))
+		var result struct {
+			Turn struct {
+				ID string `json:"id"`
+			} `json:"turn"`
+			TurnID string `json:"turnId"`
+		}
+		if pending.epoch != s.epoch || !s.confirmedResume ||
+			(len(frame.Error) != 0 && string(frame.Error) != "null") || json.Unmarshal(frame.Result, &result) != nil {
+			return nil
+		}
+		if (pending.method == "turn/start" && !validSessionID.MatchString(result.Turn.ID)) ||
+			(pending.method == "turn/steer" && !validSessionID.MatchString(result.TurnID)) {
+			return nil
+		}
+		s.session, s.path = s.wanted, s.confirmedPath
+		s.turnReconfirmations++
+		return nil
 	}
 	epoch, ok := s.pending[string(frame.ID)]
 	if !ok {
@@ -162,16 +276,22 @@ func (s *codexProxySelection) backend(data []byte) error {
 	delete(s.pending, string(frame.ID))
 	var result struct {
 		Thread struct {
-			ID   string `json:"id"`
-			Path string `json:"path"`
+			ID        string `json:"id"`
+			Path      string `json:"path"`
+			Ephemeral bool   `json:"ephemeral"`
 		} `json:"thread"`
 	}
-	if epoch != s.epoch || (len(frame.Error) != 0 && string(frame.Error) != "null") || json.Unmarshal(frame.Result, &result) != nil || result.Thread.ID != s.wanted {
+	if epoch != s.epoch || (len(frame.Error) != 0 && string(frame.Error) != "null") || json.Unmarshal(frame.Result, &result) != nil ||
+		result.Thread.Ephemeral || !validSessionID.MatchString(result.Thread.ID) || (result.Thread.ID != s.wanted && !(s.trackPrimary && s.wanted == "")) {
 		s.invalidate("resume_response_mismatch")
 		return nil
 	}
 	s.resumeResponses++
-	s.session, s.path = s.wanted, result.Thread.Path
+	s.session, s.path = result.Thread.ID, result.Thread.Path
+	if s.trackPrimary {
+		s.wanted = result.Thread.ID
+	}
+	s.confirmedResume, s.confirmedPath = true, result.Thread.Path
 	return nil
 }
 
@@ -181,14 +301,18 @@ type codexProxyPeer struct {
 }
 type codexProxyPeerKey struct{}
 type codexProxy struct {
-	server     *Server
-	manifest   workerManifest
-	descriptor codexProxyDescriptor
-	mu         sync.Mutex
-	active     bool
-	connection uint64
-	frontend   codexProxyPeer
-	selection  codexProxySelection
+	server            *Server
+	manifest          workerManifest
+	descriptor        codexProxyDescriptor
+	mu                sync.Mutex
+	active            bool
+	auxiliary         *websocket.Conn
+	connection        uint64
+	frontend          codexProxyPeer
+	selection         codexProxySelection
+	frontendDone      chan struct{}
+	codexHome         string
+	resumePermissions *agentlaunch.CodexPermissions
 }
 
 func codexProxyDirectory(server *Server, pane string) string {
@@ -278,7 +402,7 @@ func (p *codexProxy) binding() (AgentBindingRecord, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var empty AgentBindingRecord
-	if !p.active || p.selection.session != p.descriptor.Session || p.selection.session == "" {
+	if !p.active || (!p.descriptor.TrackPrimary && p.selection.session != p.descriptor.Session) || p.selection.session == "" {
 		return empty, errors.New("stock Codex has no verified current session")
 	}
 	if err := p.verifyFrontend(p.frontend); err != nil {
@@ -295,7 +419,7 @@ func (p *codexProxy) binding() (AgentBindingRecord, error) {
 	if path != "" {
 		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 			path = ""
-		} else if err != nil || validateBindingTranscript(path, "codex") != nil {
+		} else if err != nil || validateAccountTranscript(path, "codex", processAccountOverride(p.frontend.pid, "codex")) != nil {
 			return empty, errors.New("stock Codex transcript ownership unavailable")
 		}
 	}
@@ -308,12 +432,139 @@ func (p *codexProxy) binding() (AgentBindingRecord, error) {
 		Proof    StockCodexProxyProof
 		Backend  NativeCodexEndpoint
 	}{
-		agentProducer{PaneID: p.descriptor.Pane, Provider: "codex", ProcessID: p.frontend.pid, ProcessStart: p.frontend.start},
+		agentProducer{PaneID: p.descriptor.Pane, Provider: "codex", ProcessID: p.frontend.pid, ProcessStart: p.frontend.start,
+			ConfigDir: processAccountOverride(p.frontend.pid, "codex")},
 		p.selection.session, path, proof, p.descriptor.Backend})
 	sum := sha256.Sum256(revisionData)
-	return AgentBindingRecord{Version: 1, Producer: agentProducer{PaneID: p.descriptor.Pane, Provider: "codex", ProcessID: p.frontend.pid, ProcessStart: p.frontend.start},
+	return AgentBindingRecord{Version: 1, Producer: agentProducer{PaneID: p.descriptor.Pane, Provider: "codex", ProcessID: p.frontend.pid, ProcessStart: p.frontend.start,
+		ConfigDir: processAccountOverride(p.frontend.pid, "codex")},
 		SessionID: p.selection.session, TranscriptPath: path, ObservedAt: time.Now().UTC(), Lifecycle: "unknown",
 		Revision: hex.EncodeToString(sum[:]), Source: stockCodexProxySource, NativeEndpoint: &p.descriptor.Backend, StockProxy: &proof}, nil
+}
+
+// A --remote TUI cannot send permission flags, so a shared App Server resumes
+// a thread with the server's default sandbox. When a resume request leaves the
+// sandbox unset, ask for the one the thread last ran with. Other frames,
+// explicit choices and threads without a readable record pass unchanged.
+func (p *codexProxy) restoreResumeSandbox(data []byte) []byte {
+	// A --remote TUI can encode its local default as an explicit Workspace
+	// value. For the first primary task only, the user's resolved launch mode
+	// is authoritative. Later /permissions choices remain ordinary frontend RPC.
+	p.mu.Lock()
+	initial := p.selection.session == ""
+	p.mu.Unlock()
+	if initial {
+		permissions, configured, err := agentlaunch.CodexLaunchDefaults(p.codexHome)
+		if p.resumePermissions != nil {
+			permissions, configured = *p.resumePermissions, true
+		}
+		if err == nil && configured {
+			if restored, applied := initialCodexPermissions(data, permissions); applied {
+				return restored
+			}
+		}
+	}
+	restored, err := restoreCodexResumePermissions(data, p.codexHome, p.resumePermissions)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Relay could not restore this Codex conversation's saved sandbox; Codex defaults apply.")
+		return data
+	}
+	return restored
+}
+
+func initialCodexPermissions(data []byte, permissions agentlaunch.CodexPermissions) ([]byte, bool) {
+	if len(permissions.AppServerArguments()) == 0 {
+		return data, false
+	}
+	var frame map[string]json.RawMessage
+	var method string
+	if json.Unmarshal(data, &frame) != nil || json.Unmarshal(frame["method"], &method) != nil || (method != "thread/start" && method != "thread/resume") {
+		return data, false
+	}
+	var params map[string]json.RawMessage
+	if json.Unmarshal(frame["params"], &params) != nil || params == nil {
+		return data, false
+	}
+	if method == "thread/resume" {
+		var thread string
+		if json.Unmarshal(params["threadId"], &thread) != nil {
+			return data, false
+		}
+		if _, valid := agentlaunch.CodexResumedThread([]string{"resume", thread}); !valid {
+			return data, false
+		}
+	}
+	params["sandbox"], _ = json.Marshal(permissions.SandboxMode)
+	params["approvalPolicy"], _ = json.Marshal(permissions.ApprovalPolicy)
+	frame["params"], _ = json.Marshal(params)
+	restored, err := json.Marshal(frame)
+	return restored, err == nil
+}
+
+func restoreCodexResumeSandbox(data []byte, codexHome string) ([]byte, error) {
+	return restoreCodexResumePermissions(data, codexHome, nil)
+}
+
+func restoreCodexResumePermissions(data []byte, codexHome string, launch *agentlaunch.CodexPermissions) ([]byte, error) {
+	var frame map[string]json.RawMessage
+	var method string
+	if json.Unmarshal(data, &frame) != nil || json.Unmarshal(frame["method"], &method) != nil || method != "thread/resume" {
+		return data, nil
+	}
+	var params map[string]json.RawMessage
+	var thread string
+	if json.Unmarshal(frame["params"], &params) != nil || params == nil || json.Unmarshal(params["threadId"], &thread) != nil {
+		return data, nil
+	}
+	if _, valid := agentlaunch.CodexResumedThread([]string{"resume", thread}); !valid {
+		return data, nil
+	}
+	set := func(key string) bool {
+		value, ok := params[key]
+		return ok && string(value) != "null" && string(value) != `""`
+	}
+	// History and path resumes do not name the rollout by thread.
+	if set("sandbox") || set("history") || set("path") || set("permissions") || set("permissionProfile") {
+		return data, nil
+	}
+	approvalExplicit := set("approvalPolicy")
+	if set("config") {
+		var config map[string]json.RawMessage
+		if json.Unmarshal(params["config"], &config) != nil {
+			return data, nil
+		}
+		for key := range config {
+			if key == "sandbox_mode" || strings.HasPrefix(key, "sandbox_") {
+				return data, nil
+			}
+			if key == "approval_policy" || key == "approvals_reviewer" {
+				approvalExplicit = true
+			}
+		}
+	}
+	permissions, configured, err := agentlaunch.CodexLaunchDefaults(codexHome)
+	if err == nil && launch != nil {
+		permissions, configured = *launch, true
+		if len(permissions.AppServerArguments()) == 0 {
+			return data, errors.New("invalid managed Codex resume permissions")
+		}
+	}
+	if err == nil && !configured {
+		permissions, err = agentlaunch.SavedCodexPermissions(codexHome, thread)
+	}
+	if err != nil {
+		return data, err
+	}
+	params["sandbox"], _ = json.Marshal(permissions.SandboxMode)
+	if configured && !approvalExplicit {
+		params["approvalPolicy"], _ = json.Marshal(permissions.ApprovalPolicy)
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return data, err
+	}
+	frame["params"] = encoded
+	return json.Marshal(frame)
 }
 
 type codexProxyFrame struct {
@@ -339,22 +590,85 @@ var codexProxyFrameCodec = websocket.Codec{
 	},
 }
 
-func (p *codexProxy) serveFrontend(front *websocket.Conn) {
-	peer, ok := front.Request().Context().Value(codexProxyPeerKey{}).(codexProxyPeer)
-	if !ok || p.verifyFrontend(peer) != nil {
-		return
-	}
+type codexFrontendRole uint8
+
+const (
+	codexFrontendDenied codexFrontendRole = iota
+	codexFrontendPrimary
+	codexFrontendAuxiliary
+)
+
+// The caller must first verify the peer against the retained worker.
+func (p *codexProxy) reserveFrontend(peer codexProxyPeer, front *websocket.Conn) codexFrontendRole {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.active {
-		p.mu.Unlock()
-		return
+		if p.frontend != peer || p.auxiliary != nil {
+			return codexFrontendDenied
+		}
+		p.auxiliary = front
+		return codexFrontendAuxiliary
 	}
 	p.active = true
 	p.connection++
 	p.frontend = peer
 	p.selection.invalidate("connection_changed")
-	p.mu.Unlock()
-	defer func() { p.mu.Lock(); p.active = false; p.selection.invalidate("connection_changed"); p.mu.Unlock() }()
+	return codexFrontendPrimary
+}
+
+func (p *codexProxy) releaseAuxiliary(front *websocket.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.auxiliary == front {
+		p.auxiliary = nil
+	}
+}
+
+func (p *codexProxy) retirePrimary() *websocket.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.active = false
+	aux := p.auxiliary
+	p.auxiliary = nil
+	p.selection.invalidate("connection_changed")
+	return aux
+}
+
+func (p *codexProxy) serveFrontend(front *websocket.Conn) {
+	peer, ok := front.Request().Context().Value(codexProxyPeerKey{}).(codexProxyPeer)
+	if !ok || p.verifyFrontend(peer) != nil {
+		return
+	}
+	p.serveVerifiedFrontend(peer, front)
+}
+
+func (p *codexProxy) serveVerifiedFrontend(peer codexProxyPeer, front *websocket.Conn) {
+	role := p.reserveFrontend(peer, front)
+	if role == codexFrontendDenied {
+		return
+	}
+	if role == codexFrontendAuxiliary {
+		defer p.releaseAuxiliary(front)
+		p.serveAuxiliary(front)
+		return
+	}
+	var retired sync.Once
+	retire := func() {
+		retired.Do(func() {
+			if aux := p.retirePrimary(); aux != nil {
+				aux.Close()
+			}
+		})
+	}
+	defer func() {
+		retire()
+		if p.frontendDone != nil {
+			select {
+			case p.frontendDone <- struct{}{}:
+			default:
+			}
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, err := codexProxyBackendConnection(ctx, p.descriptor.Backend)
@@ -383,6 +697,9 @@ func (p *codexProxy) serveFrontend(front *websocket.Conn) {
 			if codexProxyFrameCodec.Receive(src, &frame) != nil {
 				return
 			}
+			if frontend && frame.kind == websocket.TextFrame {
+				frame.data = p.restoreResumeSandbox(frame.data)
+			}
 			p.mu.Lock()
 			var inspectErr error
 			if frame.kind != websocket.TextFrame {
@@ -391,6 +708,10 @@ func (p *codexProxy) serveFrontend(front *websocket.Conn) {
 				inspectErr = p.selection.frontend(frame.data)
 			} else {
 				inspectErr = p.selection.backend(frame.data)
+			}
+			if inspectErr == nil && p.descriptor.TrackPrimary && p.descriptor.Session != p.selection.session {
+				p.descriptor.Session = p.selection.session
+				inspectErr = persistCodexProxyDescriptor(codexProxyDirectory(p.server, p.descriptor.Pane), p.descriptor)
 			}
 			p.mu.Unlock()
 			if inspectErr != nil || codexProxyFrameCodec.Send(dst, frame) != nil {
@@ -402,10 +723,54 @@ func (p *codexProxy) serveFrontend(front *websocket.Conn) {
 	go copyFrames(front, back, false)
 	<-done
 	// Clear identity before closing either side. Never replay pending frames.
-	p.mu.Lock()
-	p.active = false
-	p.selection.invalidate("connection_changed")
-	p.mu.Unlock()
+	retire()
+	front.Close()
+	back.Close()
+	<-done
+}
+
+// Auxiliary connections are owned by the same authenticated frontend. They
+// must never change the primary selection or signal primary termination.
+func (p *codexProxy) serveAuxiliary(front *websocket.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := codexProxyBackendConnection(ctx, p.descriptor.Backend)
+	if err != nil {
+		return
+	}
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	config, err := websocket.NewConfig("ws://localhost/", "http://localhost/")
+	if err != nil {
+		conn.Close()
+		return
+	}
+	back, err := websocket.NewClient(config, conn)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	defer back.Close()
+	conn.SetDeadline(time.Time{})
+	front.MaxPayloadBytes, back.MaxPayloadBytes = 64<<20, 64<<20
+	done := make(chan struct{}, 2)
+	copyFrames := func(dst, src *websocket.Conn, frontend bool) {
+		defer func() { done <- struct{}{} }()
+		for {
+			var frame codexProxyFrame
+			if codexProxyFrameCodec.Receive(src, &frame) != nil {
+				return
+			}
+			if frontend && frame.kind == websocket.TextFrame {
+				frame.data = p.restoreResumeSandbox(frame.data)
+			}
+			if codexProxyFrameCodec.Send(dst, frame) != nil {
+				return
+			}
+		}
+	}
+	go copyFrames(back, front, true)
+	go copyFrames(front, back, false)
+	<-done
 	front.Close()
 	back.Close()
 	<-done
@@ -429,6 +794,11 @@ func (p *codexProxy) serveControl(conn net.Conn) {
 			"primary_session": p.selection.session, "wanted_session": p.selection.wanted, "selection_epoch": p.selection.epoch,
 			"resume_requests": p.selection.resumeRequests, "resume_responses": p.selection.resumeResponses,
 			"last_frontend_method": p.selection.lastFrontendMethod, "last_invalidation": p.selection.lastInvalidation}
+		state["last_frontend_thread"] = p.selection.lastFrontendThread
+		state["turn_reconfirmations"] = p.selection.turnReconfirmations
+		state["temporary_threads"] = len(p.selection.temporaryThreads)
+		state["temporary_requests"] = len(p.selection.temporaryRequests)
+		state["temporary_confirmations"] = p.selection.temporaryConfirmed
 		p.mu.Unlock()
 		_ = json.NewEncoder(conn).Encode(state)
 		return
@@ -438,7 +808,7 @@ func (p *codexProxy) serveControl(conn net.Conn) {
 	}
 	record, err := p.binding()
 	if err != nil {
-		_ = json.NewEncoder(conn).Encode(map[string]string{"error": "stock Codex binding unavailable"})
+		_ = json.NewEncoder(conn).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	_ = json.NewEncoder(conn).Encode(record)
@@ -447,7 +817,7 @@ func (p *codexProxy) serveControl(conn net.Conn) {
 // ServeStockCodexProxy forwards standard RPC without provider patches. A private
 // descriptor locates a read-only live identity endpoint; it is never a lease.
 func ServeStockCodexProxy(ctx context.Context, options CodexProxyOptions, ready io.Writer) error {
-	if !validSessionID.MatchString(options.Pane) || !validSessionID.MatchString(options.Session) || !filepath.IsAbs(options.BackendSocket) ||
+	if !validSessionID.MatchString(options.Pane) || (!validSessionID.MatchString(options.Session) && !(options.TrackPrimary && options.Session == "")) || !filepath.IsAbs(options.BackendSocket) ||
 		options.BackendPID <= 1 || options.BackendStart == 0 {
 		return errors.New("invalid stock proxy scope")
 	}
@@ -464,8 +834,12 @@ func ServeStockCodexProxy(ctx context.Context, options CodexProxyOptions, ready 
 	if err != nil {
 		return err
 	}
-	p := &codexProxy{server: server, manifest: manifest, selection: codexProxySelection{wanted: options.Session}}
-	p.descriptor = codexProxyDescriptor{Version: 1, Pane: options.Pane, Session: options.Session, ProxyPID: os.Getpid(), ProxyStart: start,
+	p := &codexProxy{server: server, manifest: manifest, selection: codexProxySelection{wanted: options.Session, trackPrimary: options.TrackPrimary},
+		codexHome: agentlaunch.CodexHome(os.Environ()), resumePermissions: options.ResumePermissions}
+	if options.ExitWithFrontend {
+		p.frontendDone = make(chan struct{}, 1)
+	}
+	p.descriptor = codexProxyDescriptor{Version: 1, Pane: options.Pane, Session: options.Session, TrackPrimary: options.TrackPrimary, ProxyPID: os.Getpid(), ProxyStart: start,
 		WorkerPID: manifest.WorkerPID, WorkerStart: manifest.WorkerStartTime, ShellPID: manifest.ShellPID,
 		Backend: NativeCodexEndpoint{Socket: options.BackendSocket, DaemonPID: options.BackendPID, DaemonStart: options.BackendStart, Device: dev, Inode: ino}}
 	checkCtx, checkCancel := context.WithTimeout(ctx, 3*time.Second)
@@ -513,11 +887,7 @@ func ServeStockCodexProxy(ctx context.Context, options CodexProxyOptions, ready 
 	if err != nil {
 		return err
 	}
-	descriptor, err := json.Marshal(p.descriptor)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(directory, "descriptor.json"), descriptor, 0600); err != nil {
+	if err := persistCodexProxyDescriptor(directory, p.descriptor); err != nil {
 		return err
 	}
 	httpServer := &http.Server{ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 16384, ErrorLog: log.New(io.Discard, "", 0),
@@ -556,6 +926,9 @@ func ServeStockCodexProxy(ctx context.Context, options CodexProxyOptions, ready 
 		return err
 	}
 	select {
+	case <-p.frontendDone:
+		httpServer.Close()
+		return nil
 	case <-ctx.Done():
 		httpServer.Close()
 		return ctx.Err()
@@ -563,6 +936,40 @@ func ServeStockCodexProxy(ctx context.Context, options CodexProxyOptions, ready 
 		httpServer.Close()
 		return err
 	}
+}
+
+// Keep the current confirmed session in the v1 descriptor so retained
+// supervisors can verify this proxy without a supervisor/worker replacement.
+func persistCodexProxyDescriptor(directory string, descriptor codexProxyDescriptor) error {
+	data, err := json.Marshal(descriptor)
+	if err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(directory, ".descriptor-")
+	if err != nil {
+		return err
+	}
+	name := file.Name()
+	defer os.Remove(name)
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := os.Rename(name, filepath.Join(directory, "descriptor.json")); err != nil {
+		return err
+	}
+	parent, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	return parent.Sync()
 }
 
 func readStockCodexProxyDescriptor(server *Server, pane string) (codexProxyDescriptor, error) {
@@ -590,7 +997,7 @@ func readStockCodexProxyDescriptor(server *Server, pane string) (codexProxyDescr
 	}
 	data, err := io.ReadAll(io.LimitReader(file, 65537))
 	if err != nil || len(data) > 65536 || json.Unmarshal(data, &descriptor) != nil || descriptor.Version != 1 ||
-		descriptor.Pane != pane || !validSessionID.MatchString(descriptor.Session) || descriptor.ProxyPID <= 1 || descriptor.ProxyStart == 0 {
+		descriptor.Pane != pane || (!validSessionID.MatchString(descriptor.Session) && !(descriptor.TrackPrimary && descriptor.Session == "")) || descriptor.ProxyPID <= 1 || descriptor.ProxyStart == 0 {
 		return descriptor, errors.New("invalid stock proxy descriptor")
 	}
 	return descriptor, nil
@@ -628,8 +1035,14 @@ func readStockCodexProxyBinding(pane string) (AgentBindingRecord, error) {
 	if err != nil || len(data) > 65536 || json.Unmarshal(data, &record) != nil {
 		return empty, errors.New("stock proxy identity response unavailable")
 	}
+	var responseError struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(data, &responseError) == nil && responseError.Error != "" {
+		return empty, fmt.Errorf("stock proxy binding unavailable: %s", responseError.Error)
+	}
 	proof := record.StockProxy
-	if record.Version != 1 || record.Source != stockCodexProxySource || record.SessionID != before.Session || record.NativeEndpoint == nil ||
+	if record.Version != 1 || record.Source != stockCodexProxySource || !validSessionID.MatchString(record.SessionID) || (!before.TrackPrimary && record.SessionID != before.Session) || record.NativeEndpoint == nil ||
 		*record.NativeEndpoint != before.Backend || proof == nil || proof.ProxyPID != before.ProxyPID || proof.ProxyStart != before.ProxyStart ||
 		proof.ControlSocket != before.ControlSocket || proof.ControlDevice != dev || proof.ControlInode != ino || proof.Connection == 0 || proof.Selection == 0 ||
 		record.Producer.PaneID != pane || record.Producer.Provider != "codex" || record.ObservedAt.IsZero() || time.Since(record.ObservedAt) > 5*time.Second ||
@@ -645,7 +1058,7 @@ func readStockCodexProxyBinding(pane string) (AgentBindingRecord, error) {
 	if err != nil || start != record.Producer.ProcessStart || provider != "codex" || front != record.Producer.ProcessID {
 		return empty, errors.New("stock proxy frontend changed")
 	}
-	if record.TranscriptPath != "" && validateBindingTranscript(record.TranscriptPath, "codex") != nil {
+	if record.TranscriptPath != "" && validateAccountTranscript(record.TranscriptPath, "codex", processAccountOverride(record.Producer.ProcessID, "codex")) != nil {
 		return empty, errors.New("stock proxy transcript changed")
 	}
 	backend, err := codexProxyBackendConnection(ctx, before.Backend)

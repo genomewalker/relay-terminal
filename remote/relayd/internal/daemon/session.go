@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,6 +19,8 @@ import (
 	"unsafe"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
+
 	"github.com/relay-terminal/relayd/internal/programstatus"
 	"github.com/relay-terminal/relayd/internal/protocol"
 	relayterminfo "github.com/relay-terminal/relayd/internal/terminfo"
@@ -50,23 +53,24 @@ func (viewer *client) markLagged() {
 }
 
 type Session struct {
-	nativeRotationMu       sync.Mutex
-	nativeRotation         *hostNativeRotationBridge
-	hostRotation           *hostRotationSupervisor
-	promptEditorMu         sync.Mutex
-	promptEditor           *promptEditorPending
-	id                     string
-	command                string
-	pty                    *os.File
-	process                *exec.Cmd
-	resizeMu               sync.Mutex
-	inputMu                sync.Mutex
-	humanInputRevision     uint64 // inputMu; invalidates enrollment prepared outside this lock
-	rotationControlled     bool
-	rotationGuardDirectory string
-	rotationHumanInputSeen bool
-	rotationGuardInstalled bool
-	eventMu                sync.Mutex
+	nativeRotationMu        sync.Mutex
+	nativeRotation          *hostNativeRotationBridge
+	hostRotation            *hostRotationSupervisor
+	promptEditorMu          sync.Mutex
+	promptEditor            *promptEditorPending
+	id                      string
+	command                 string
+	pty                     *os.File
+	process                 *exec.Cmd
+	resizeMu                sync.Mutex
+	inputMu                 sync.Mutex
+	humanInputRevision      uint64 // inputMu; invalidates enrollment prepared outside this lock
+	automationInputRevision uint64 // inputMu; Relay's own input also invalidates a prepared enrollment
+	rotationControlled      bool
+	rotationGuardDirectory  string
+	rotationHumanInputSeen  bool
+	rotationGuardInstalled  bool
+	eventMu                 sync.Mutex
 
 	mu                    sync.Mutex
 	sequence              uint64
@@ -100,6 +104,17 @@ type Session struct {
 	controlConnections    int
 	controlGraceUntil     time.Time
 	done                  chan struct{}
+
+	// The PTY reader can be stopped between reads so a worker can hand the
+	// master to a re-executed image without losing or duplicating output.
+	reader *outputReader
+	// Set when agentProcesses was carried from a previous worker image, so
+	// processes already announced are not announced again.
+	agentProcessesSeeded bool
+	// The upgrade operation that produced this image, reported by probes.
+	reexecOperation string
+	// Handles an authenticated worker upgrade request; nil outside a worker.
+	workerUpgrade func(*protocol.Writer, json.RawMessage)
 }
 
 func (session *Session) acquireControl(clientID string) bool {
@@ -179,7 +194,17 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	if err != nil {
 		return nil, err
 	}
-	session := &Session{
+	session := newSession(id, command, terminal, child)
+	// Seed the shared process snapshot once so transcript observers can attach
+	// immediately. Thereafter one monitor owns /proc traversal for the pane and
+	// broadcasts changes to both Codex and Claude readers.
+	session.agentProcesses = descendantAgentProcesses(child.Process.Pid)
+	session.start()
+	return session, nil
+}
+
+func newSession(id, command string, terminal *os.File, child *exec.Cmd) *Session {
+	return &Session{
 		id: id, command: command, pty: terminal, process: child,
 		sequence: initialOutputSequence(),
 		clients:  make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
@@ -191,15 +216,13 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 		terminalModes:        newTerminalModeState(),
 		programStatusReplies: make(chan int, 8),
 	}
-	// Seed the shared process snapshot once so transcript observers can attach
-	// immediately. Thereafter one monitor owns /proc traversal for the pane and
-	// broadcasts changes to both Codex and Claude readers.
-	session.agentProcesses = descendantAgentProcesses(child.Process.Pid)
+}
+
+func (session *Session) start() {
 	go session.writeProgramStatusReplies()
-	go session.readOutput()
+	session.startOutputReader()
 	go session.wait()
 	go session.monitorAgentProcesses()
-	return session, nil
 }
 
 // Every worker owns a distinct output sequence space. Starting from a random
@@ -274,6 +297,7 @@ func writeZshIntegration(home, shimPath string) (string, error) {
 		"if [ -r \"${RELAY_ORIGINAL_ZDOTDIR:-$HOME}/.zshrc\" ]; then source \"${RELAY_ORIGINAL_ZDOTDIR:-$HOME}/.zshrc\"; fi\n" +
 		"export PATH=" + shellQuote(shimPath) + ":$PATH\n" +
 		"rehash 2>/dev/null || true\n" +
+		relayCodexShellFunction(shimPath) +
 		zshSemanticPromptIntegration
 	if err := os.WriteFile(filepath.Join(directory, ".zshrc"), []byte(contents), 0o600); err != nil {
 		return "", err
@@ -304,11 +328,22 @@ func writeBashIntegration(home, shimPath string) (string, error) {
 		"unset __relay_profile __relay_profile_loaded\n" +
 		"export PATH=" + shellQuote(shimPath) + ":$PATH\n" +
 		"hash -r 2>/dev/null || true\n" +
+		relayCodexShellFunction(shimPath) +
 		bashSemanticPromptIntegration
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+// Environment activators can reorder PATH after shell startup. Keep interactive
+// Codex launches on the managed entry point without changing other tools' PATH.
+func relayCodexShellFunction(shimPath string) string {
+	shim := shellQuote(filepath.Join(shimPath, "codex"))
+	return "if [ -x " + shim + " ]; then\n" +
+		"  unalias codex 2>/dev/null || true\n" +
+		"  function codex { command " + shim + " \"$@\"; }\n" +
+		"fi\n"
 }
 
 // OSC 133 divides terminal output into prompt, input, and command-output
@@ -320,14 +355,22 @@ const bashSemanticPromptIntegration = `
 # Relay semantic prompt integration (OSC 133).
 if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
   __relay_command_active=""
-
-  __relay_preexec() {
-    builtin printf '\e]133;C\a'
-    __relay_command_active=1
-  }
+  # Always empty: PS0 expands one of its elements to mark a command started.
+  __relay_ps0=()
 
   __relay_prompt_hook() {
-    builtin local command_status=$?
+    builtin local command_status=$? __relay_function
+    builtin local -a __relay_others
+
+    # Stay the last bash-preexec precmd function, so the markers wrap the
+    # PS1 that other functions (such as its own precmd) leave behind.
+    if [[ " ${precmd_functions[*]:-} " == *" __relay_prompt_hook "* &&
+          "${precmd_functions[-1]}" != __relay_prompt_hook ]]; then
+      for __relay_function in "${precmd_functions[@]}"; do
+        [[ "$__relay_function" == __relay_prompt_hook ]] || __relay_others+=("$__relay_function")
+      done
+      precmd_functions=("${__relay_others[@]}" __relay_prompt_hook)
+    fi
 
     if [[ "$__relay_command_active" == "1" ]]; then
       builtin printf '\e]133;D;%s\a' "$command_status"
@@ -354,14 +397,24 @@ if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_
     builtin printf '\e]133;A;redraw=last;cl=line\a'
     __relay_command_active=0
 
-    if [[ "$PS0" != *"__relay_preexec"* ]]; then
-      # Bash 4.4 is common on HPC nodes. Command substitution is the portable
-      # preexec hook there; redirecting to the TTY keeps OSC out of substitution.
-      PS0+='$(__relay_preexec >/dev/tty)'
+    if [[ "$PS0" != *"__relay_command_active=1"* ]]; then
+      # Bash 4.4 is common on HPC nodes and has no preexec hook. PS0 expands
+      # in this shell, so the subscript's assignment marks the command as
+      # started here (a command substitution would set it in a subshell),
+      # and the empty element adds nothing to the output.
+      PS0+='${__relay_ps0[__relay_command_active=1]}\e]133;C\a'
     fi
   }
 
-  if [[ ";${PROMPT_COMMAND[*]:-};" != *";__relay_prompt_hook 2>/dev/null;"* ]]; then
+  # bash-preexec installs itself at the first prompt, and older releases then
+  # replace PROMPT_COMMAND, dropping a hook appended after it was sourced.
+  # While it is installed or pending, run through its precmd functions.
+  if builtin declare -F __bp_precmd_invoke_cmd >/dev/null &&
+     [[ "${PROMPT_COMMAND[*]:-}" == *__bp_install* || "${PROMPT_COMMAND[*]:-}" == *__bp_precmd_invoke_cmd* ]]; then
+    if [[ " ${precmd_functions[*]:-} " != *" __relay_prompt_hook "* ]]; then
+      precmd_functions+=(__relay_prompt_hook)
+    fi
+  elif [[ ";${PROMPT_COMMAND[*]:-};" != *";__relay_prompt_hook 2>/dev/null;"* ]]; then
     if [[ -z "${PROMPT_COMMAND[*]:-}" ]]; then
       PROMPT_COMMAND="__relay_prompt_hook 2>/dev/null"
     elif [[ $(builtin declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then
@@ -447,6 +500,12 @@ func (session *Session) monitorAgentProcesses() {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	known := make(map[int]detectedAgentProcess)
+	session.mu.Lock()
+	if session.agentProcessesSeeded {
+		// Carried from the previous worker image, which already announced them.
+		known = observedAgentProcesses(session.agentProcesses, nil, processStartIdentity)
+	}
+	session.mu.Unlock()
 	for range timer.C {
 		session.mu.Lock()
 		exited := session.exited
@@ -577,9 +636,63 @@ func (session *Session) hasExited() bool {
 	return session.exited
 }
 
-func (session *Session) readOutput() {
+type outputReader struct {
+	wake     *os.File // read end, readable once a stop is requested
+	wakeFD   int
+	stop     *os.File // write end
+	done     chan struct{}
+	stopped  bool // the reader returned because of a stop, not a PTY error
+	gated    bool // reads wait in select, so a stop never interrupts a read
+	stopOnce sync.Once
+}
+
+// startOutputReader reads the PTY on its own goroutine. Each read first waits
+// in select(2) on the master and a wake pipe, so stopOutputReader can stop the
+// reader between reads: bytes the reader has not consumed stay in the kernel
+// for the next owner. select is used rather than poll because Darwin's poll
+// does not support terminal devices. Without a wake pipe, or for a descriptor
+// select cannot hold, the reader cannot be stopped and an upgrade is refused.
+const selectableFDLimit = int(unsafe.Sizeof(unix.FdSet{})) * 8
+
+func (session *Session) startOutputReader() {
+	reader := &outputReader{done: make(chan struct{})}
+	// Fd puts the master in blocking mode, so a read after select reports
+	// readiness returns without parking on Go's poller.
+	ptyFD := int(session.pty.Fd())
+	if wake, stop, err := os.Pipe(); err == nil {
+		if wakeFD := int(wake.Fd()); ptyFD < selectableFDLimit && wakeFD < selectableFDLimit {
+			reader.wake, reader.wakeFD, reader.stop, reader.gated = wake, wakeFD, stop, true
+		} else {
+			_ = wake.Close()
+			_ = stop.Close()
+		}
+	}
+	session.mu.Lock()
+	session.reader = reader
+	session.mu.Unlock()
+	go session.readOutput(reader, ptyFD)
+}
+
+func (session *Session) readOutput(reader *outputReader, ptyFD int) {
+	defer close(reader.done)
 	buffer := make([]byte, 32<<10)
 	for {
+		if reader.gated {
+			wakeFD := reader.wakeFD
+			var readable unix.FdSet
+			readable.Set(ptyFD)
+			readable.Set(wakeFD)
+			if _, err := unix.Select(max(ptyFD, wakeFD)+1, &readable, nil, nil, nil); err != nil {
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
+				return
+			}
+			if readable.IsSet(wakeFD) {
+				reader.stopped = true
+				return
+			}
+		}
 		count, err := session.pty.Read(buffer)
 		if count > 0 {
 			session.publish(buffer[:count])
@@ -588,6 +701,23 @@ func (session *Session) readOutput() {
 			return
 		}
 	}
+}
+
+// stopOutputReader stops the reader between reads and reports whether it did;
+// false means the reader cannot be stopped or had already ended on a PTY
+// error. Every byte read before the stop has been published.
+func (session *Session) stopOutputReader() bool {
+	session.mu.Lock()
+	reader := session.reader
+	session.mu.Unlock()
+	if reader == nil || !reader.gated {
+		return false
+	}
+	reader.stopOnce.Do(func() { _, _ = reader.stop.Write([]byte{0}) })
+	<-reader.done
+	_ = reader.wake.Close()
+	_ = reader.stop.Close()
+	return reader.stopped
 }
 
 func (session *Session) publish(data []byte) {
@@ -916,10 +1046,143 @@ func (session *Session) detachAgentObserver(observer *client) {
 	session.mu.Unlock()
 }
 
+// Focus reports are generated by the terminal renderer, including during pane
+// selection and reconnect. Keep them flowing without cancelling context work.
+// Reconnect can coalesce complete reports in one frame. Keys, pastes and
+// mixed or partial frames retain the human-takeover and guarded-input behavior.
+func terminalFocusReport(data []byte) bool {
+	if len(data) == 0 || len(data)%3 != 0 {
+		return false
+	}
+	for offset := 0; offset < len(data); offset += 3 {
+		if data[offset] != 0x1b || data[offset+1] != '[' || (data[offset+2] != 'I' && data[offset+2] != 'O') {
+			return false
+		}
+	}
+	return true
+}
+
+// Focus and SGR motion with no button pressed cannot edit or submit a draft.
+// A reconnect backlog may combine them. Any other byte keeps human ownership
+// checks, including wheel, drag, button releases and partial reports.
+func terminalPassiveReport(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	for offset := 0; offset < len(data); {
+		if offset+3 <= len(data) && terminalFocusReport(data[offset:offset+3]) {
+			offset += 3
+			continue
+		}
+		if length := terminalDeviceReply(data[offset:]); length > 0 {
+			offset += length
+			continue
+		}
+		if offset+3 >= len(data) || data[offset] != 0x1b || data[offset+1] != '[' || data[offset+2] != '<' {
+			return false
+		}
+		offset += 3
+		for field := 0; field < 3; field++ {
+			start := offset
+			var value uint64
+			for offset < len(data) && data[offset] >= '0' && data[offset] <= '9' {
+				if offset-start >= 10 {
+					return false
+				}
+				value = value*10 + uint64(data[offset]-'0')
+				if value > 1_000_000_000 {
+					return false
+				}
+				offset++
+			}
+			if offset == start || offset >= len(data) {
+				return false
+			}
+			// Cb <= 63 excludes both wheel (64) and extended buttons (128).
+			if (field == 0 && (value > 63 || value&0x23 != 0x23)) || (field > 0 && value == 0) {
+				return false
+			}
+			if (field < 2 && data[offset] != ';') || (field == 2 && data[offset] != 'M') {
+				return false
+			}
+			offset++
+		}
+	}
+	return true
+}
+
+// terminalDeviceReply returns the length of one complete terminal reply to a
+// program's capability query at the start of data, or 0. The terminal sends
+// these by itself (for example when an agent or editor starts), so they are
+// not human input. Only reply grammars that no key or mouse report produces
+// are accepted: DA1/DA2 (CSI ? ... c, CSI > ... c), DECRPM (CSI ? n ; n $ y),
+// the kitty keyboard flags reply (CSI ? n u), window-size reports
+// (CSI 4|6|8|9 ; n ; n t) and cursor-position reports, except those that are
+// identical to modified F3 (CSI 1 ; 2..16 R).
+func terminalDeviceReply(data []byte) int {
+	if len(data) < 4 || data[0] != 0x1b || data[1] != '[' {
+		return 0
+	}
+	end := 2
+	for end < len(data) && end < 64 && (data[end] < 0x40 || data[end] > 0x7e) {
+		end++
+	}
+	if end >= len(data) || end >= 64 {
+		return 0
+	}
+	params, final := data[2:end], data[end]
+	digits := func(b []byte, separators string) bool {
+		if len(b) == 0 {
+			return false
+		}
+		for _, c := range b {
+			if (c < '0' || c > '9') && !strings.ContainsRune(separators, rune(c)) {
+				return false
+			}
+		}
+		return b[0] != ';' && b[len(b)-1] != ';'
+	}
+	fields := func(b []byte) []int {
+		var out []int
+		for _, part := range strings.Split(string(b), ";") {
+			if len(part) == 0 || len(part) > 6 {
+				return nil
+			}
+			value, err := strconv.Atoi(part)
+			if err != nil {
+				return nil
+			}
+			out = append(out, value)
+		}
+		return out
+	}
+	ok := false
+	switch final {
+	case 'c':
+		ok = len(params) > 1 && (params[0] == '?' || params[0] == '>') && digits(params[1:], ";")
+	case 'y':
+		ok = len(params) > 3 && params[0] == '?' && params[len(params)-1] == '$' &&
+			len(fields(params[1:len(params)-1])) == 2
+	case 'u':
+		ok = len(params) > 1 && params[0] == '?' && digits(params[1:], "")
+	case 't':
+		values := fields(params)
+		ok = len(values) == 3 && (values[0] == 4 || values[0] == 6 || values[0] == 8 || values[0] == 9)
+	case 'R':
+		values := fields(params)
+		ok = len(values) == 2 && values[0] >= 1 && values[1] >= 1 && !(values[0] == 1 && values[1] >= 2 && values[1] <= 16)
+	}
+	if !ok {
+		return 0
+	}
+	return end + 1
+}
+
 func (session *Session) input(data []byte) error {
 	session.inputMu.Lock()
 	defer session.inputMu.Unlock()
-	if session.rotationControlled {
+	humanInput := len(data) > 0 && !terminalPassiveReport(data)
+	if session.rotationControlled && humanInput {
 		if session.rotationGuardInstalled {
 			return errors.New("rotation owns terminal input")
 		}
@@ -932,15 +1195,25 @@ func (session *Session) input(data []byte) error {
 	if exited {
 		return io.ErrClosedPipe
 	}
-	session.humanInputRevision++
-	if supervisor != nil {
-		supervisor.humanInput()
+	if humanInput {
+		session.humanInputRevision++
+		if supervisor != nil {
+			supervisor.humanInput()
+		}
 	}
 	_, err := session.pty.Write(data)
 	return err
 }
 
 func (session *Session) acknowledgedInput(clientID [16]byte, sequence uint64, data []byte) error {
+	return session.acknowledgedInputFrom(clientID, sequence, data, false)
+}
+
+// acknowledgedInputFrom writes one acknowledged input frame. Automation input
+// is Relay's own native maintenance or compiled-prompt keystrokes: it is not a
+// human takeover and does not advance humanInputRevision, but it still cancels
+// any outstanding rotation decision and is refused while rotation owns input.
+func (session *Session) acknowledgedInputFrom(clientID [16]byte, sequence uint64, data []byte, automation bool) error {
 	// PTY writes may block when the foreground process stops draining its input.
 	// Serialize those writes independently so output publication, snapshots,
 	// reconnects, status and agent events never wait behind terminal input.
@@ -955,18 +1228,27 @@ func (session *Session) acknowledgedInput(clientID [16]byte, sequence uint64, da
 		session.mu.Unlock()
 		return nil
 	}
-	if session.rotationControlled {
-		if session.rotationGuardInstalled {
-			session.mu.Unlock()
-			return errors.New("rotation owns terminal input")
-		}
+	active := len(data) > 0 && !terminalPassiveReport(data)
+	humanInput := active && !automation
+	if session.rotationControlled && active && session.rotationGuardInstalled {
+		session.mu.Unlock()
+		return errors.New("rotation owns terminal input")
+	}
+	if session.rotationControlled && humanInput {
 		session.rotationHumanInputSeen = true
 	}
 	supervisor := session.hostRotation
 	session.mu.Unlock()
-	session.humanInputRevision++
-	if supervisor != nil {
-		supervisor.humanInput()
+	if humanInput {
+		session.humanInputRevision++
+		if supervisor != nil {
+			supervisor.humanInput()
+		}
+	} else if active {
+		session.automationInputRevision++
+		if supervisor != nil {
+			supervisor.automationInput()
+		}
 	}
 	remaining := data
 	for len(remaining) > 0 {

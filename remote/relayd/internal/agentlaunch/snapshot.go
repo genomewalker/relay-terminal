@@ -26,13 +26,24 @@ type Snapshot struct {
 	RequestedArgs         []string  `json:"requested_args"`
 	EffectiveArgs         []string  `json:"effective_args"`
 	Arguments             Arguments `json:"arguments"`
+	// The provider account directory variable (CLAUDE_CONFIG_DIR or
+	// CODEX_HOME) the process started with; "" means the provider default.
+	// Recorded only by snapshots that set ConfigDirRecorded.
+	ConfigDir         string `json:"config_dir,omitempty"`
+	ConfigDirRecorded bool   `json:"config_dir_recorded,omitempty"`
 }
 
+// Save records the calling process, which is about to exec the agent with its
+// own environment, so the account directory is read from that environment.
 func Save(directory, client, executable, cwd, paneID, start string, requested, effective []string) (string, error) {
-	return save(directory, client, executable, cwd, paneID, start, os.Getpid(), append([]string{}, requested...), effective)
+	name, err := ConfigDirVariable(client)
+	if err != nil {
+		return "", errors.New("invalid launch binding")
+	}
+	return save(directory, client, executable, cwd, paneID, start, os.Getpid(), os.Getenv(name), append([]string{}, requested...), effective)
 }
 
-func save(directory, client, executable, cwd, paneID, start string, pid int, requested, effective []string) (string, error) {
+func save(directory, client, executable, cwd, paneID, start string, pid int, configDir string, requested, effective []string) (string, error) {
 	if !filepath.IsAbs(directory) || !filepath.IsAbs(executable) || !filepath.IsAbs(cwd) || (client != "claude" && client != "codex") {
 		return "", errors.New("invalid launch binding")
 	}
@@ -56,7 +67,8 @@ func save(directory, client, executable, cwd, paneID, start string, pid int, req
 		args.Reusable = false
 		args.Reason = "process_incarnation_unverified"
 	}
-	snapshot := Snapshot{RequestedArgsCaptured: requested != nil, Schema: 1, LaunchID: id, Client: client, Executable: executable, CWD: cwd, PID: pid, ProcessStart: start, RelayPaneID: paneID, CapturedAt: time.Now().UTC(), RequestedArgs: append([]string{}, requested...), EffectiveArgs: append([]string{}, effective...), Arguments: args}
+	snapshot := Snapshot{RequestedArgsCaptured: requested != nil, Schema: 1, LaunchID: id, Client: client, Executable: executable, CWD: cwd, PID: pid, ProcessStart: start, RelayPaneID: paneID, CapturedAt: time.Now().UTC(), RequestedArgs: append([]string{}, requested...), EffectiveArgs: append([]string{}, effective...), Arguments: args,
+		ConfigDir: configDir, ConfigDirRecorded: true}
 	data, err := json.Marshal(snapshot)
 	if err != nil || len(data) > 65536 {
 		return "", errors.New("launch snapshot exceeds bound")

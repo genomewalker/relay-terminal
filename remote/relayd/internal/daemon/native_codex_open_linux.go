@@ -24,10 +24,11 @@ func linuxOpenCodexTranscript(pid int) (string, string, string, error) {
 		return "", "", "", errors.New("native transcript descriptors unavailable")
 	}
 	candidates := map[string]nativeCodexTranscriptCandidate{}
+	override := processAccountOverride(pid, "codex")
 	for _, entry := range entries {
 		descriptor := filepath.Join(directory, entry.Name())
 		path, e := os.Readlink(descriptor)
-		if e != nil || !strings.HasSuffix(path, ".jsonl") || validateBindingTranscript(path, "codex") != nil {
+		if e != nil || !strings.HasSuffix(path, ".jsonl") || validateAccountTranscript(path, "codex", override) != nil {
 			continue
 		}
 		canonical, e := filepath.EvalSymlinks(path)

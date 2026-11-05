@@ -1,19 +1,46 @@
 import AppKit
 import SwiftUI
 
+/// Chrome colours as AppKit colours. Under a dark appearance every colour is
+/// Relay's own value; a light appearance uses the matching system colour.
+enum RelayPalette {
+    static let canvas = dynamic(dark: 0x171717, light: .windowBackgroundColor)
+    static let sidebar = dynamic(dark: 0x1B1B1B, light: .underPageBackgroundColor)
+    static let surface = dynamic(dark: 0x222222, light: .controlBackgroundColor)
+    static let elevated = dynamic(dark: 0x2A2A2A, light: .textBackgroundColor)
+    static let text = dynamic(dark: 0xEBEBEB, light: .labelColor)
+    static let textMuted = dynamic(dark: 0xAAAAAA, light: .secondaryLabelColor)
+    static let textFaint = dynamic(dark: 0x969696, light: .tertiaryLabelColor)
+    static let accent = dynamic(dark: 0x8DB7EB, light: .controlAccentColor)
+    static let coral = dynamic(dark: 0xDDA398, light: .systemOrange)
+    static let red = dynamic(dark: 0xDE827B, light: .systemRed)
+
+    static func dynamic(dark: UInt32, light: NSColor) -> NSColor {
+        let dark = hex(dark)
+        return NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light }
+    }
+
+    private static func hex(_ value: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((value >> 16) & 0xff) / 255, green: CGFloat((value >> 8) & 0xff) / 255,
+                blue: CGFloat(value & 0xff) / 255, alpha: 1)
+    }
+}
+
 enum RelayTheme {
     // The application chrome is deliberately independent from the terminal
     // palette. A terminal theme should not recolor navigation and controls.
     // App-wide template. Edit these values to restyle every Relay surface.
     static let colorScheme: ColorScheme = .dark
     static let appearanceName: NSAppearance.Name = .darkAqua
-    static let canvas = Color(hex: 0x171717)
-    static let sidebar = Color(hex: 0x1B1B1B)
-    static let surface = Color(hex: 0x222222)
-    static let elevated = Color(hex: 0x2A2A2A)
-    static let text = Color(hex: 0xEBEBEB)
-    static let textMuted = Color(hex: 0xAAAAAA)
-    static let textFaint = Color(hex: 0x969696)
+    static let canvas = Color(nsColor: RelayPalette.canvas)
+    /// Behind terminals, which keep their dark background in any appearance.
+    static let terminalCanvas = Color(hex: 0x171717)
+    static let sidebar = Color(nsColor: RelayPalette.sidebar)
+    static let surface = Color(nsColor: RelayPalette.surface)
+    static let elevated = Color(nsColor: RelayPalette.elevated)
+    static let text = Color(nsColor: RelayPalette.text)
+    static let textMuted = Color(nsColor: RelayPalette.textMuted)
+    static let textFaint = Color(nsColor: RelayPalette.textFaint)
     static let stroke = text.opacity(0.07)
     static let line = stroke
     static let wash = text.opacity(0.08)
@@ -21,13 +48,13 @@ enum RelayTheme {
     static let hover = text.opacity(0.15)
     static let codeFill = text.opacity(0.05)
     static let composerFill = text.opacity(0.03)
-    static let accent = Color(hex: 0x8DB7EB)
+    static let accent = Color(nsColor: RelayPalette.accent)
     static let accentDim = surface
     static let blue = accent
     static let blueDim = accentDim
     static let mint = accent
-    static let coral = Color(hex: 0xDDA398)
-    static let red = Color(hex: 0xDE827B)
+    static let coral = Color(nsColor: RelayPalette.coral)
+    static let red = Color(nsColor: RelayPalette.red)
 
     static let typeScale: CGFloat = 1
     static let spacingScale: CGFloat = 1
@@ -75,7 +102,7 @@ enum RelayTheme {
     // Visual configuration only. Sheets and panels retain native roles, focus,
     // modal behavior and traffic-light policy.
     @MainActor static func configureAppearance(_ window: NSWindow) {
-        let background = NSColor(canvas)
+        let background = RelayPalette.canvas
         if window.backgroundColor != background { window.backgroundColor = background }
         if window.appearance?.name != appearanceName { window.appearance = NSAppearance(named: appearanceName) }
         if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }

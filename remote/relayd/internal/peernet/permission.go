@@ -33,8 +33,8 @@ func runtimePermissionClass(home string, target Record) string {
 	if start, err := processStart(target.PID); err != nil || start != target.Start {
 		return ""
 	}
-	codex, _ := filepath.Glob(filepath.Join(home, ".codex/sessions/*/*/*/rollout-*-"+target.Session+".jsonl"))
-	claude, _ := filepath.Glob(filepath.Join(home, ".claude/projects/*/"+target.Session+".jsonl"))
+	codex, _ := filepath.Glob(filepath.Join(codexConfig(home, target.PID), "sessions/*/*/*/rollout-*-"+target.Session+".jsonl"))
+	claude, _ := filepath.Glob(filepath.Join(claudeConfig(home, target.PID), "projects/*/"+target.Session+".jsonl"))
 	mode := ""
 	hasRuntimeMode := false
 	paths := codex
@@ -93,12 +93,7 @@ func runtimePermissionClass(home string, target Record) string {
 			}
 			if len(codex) != 1 && row.Type == "permission-mode" && row.Session == target.Session {
 				hasRuntimeMode = true
-				switch row.Mode {
-				case "bypassPermissions":
-					mode = "bypass"
-				case "default", "acceptEdits", "plan":
-					mode = "prompting"
-				}
+				mode = claudePermissionClass(row.Mode)
 				break
 			}
 		}
@@ -116,16 +111,102 @@ func runtimePermissionClass(home string, target Record) string {
 				args = strings.Fields(string(data))
 			}
 		}
-		if len(args) > 0 && filepath.Base(args[0]) == "claude" {
-			for _, arg := range args {
-				if arg == "--dangerously-skip-permissions" {
-					mode = "bypass"
-				}
-			}
-		}
+		mode = launchPermissionClass(home, args)
 	}
 	if start, err := processStart(target.PID); err != nil || start != target.Start {
 		return ""
 	}
 	return mode
+}
+
+// launchPermissionClass reads only explicit launch flags. The native
+// installer runs Claude as ~/.local/share/claude/versions/<v>, so argv[0] is
+// that path rather than "claude". Claude applies --dangerously-skip-permissions
+// and --permission-mode in order (the last wins) and falls back to
+// --inherit-permission-mode; settings files are not read, so a mode set only
+// there stays unknown.
+func launchPermissionClass(home string, args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	switch launchHarness(home, args[0]) {
+	case "claude":
+		return claudeLaunchPermissionClass(args[1:])
+	case "codex":
+		for _, arg := range args[1:] {
+			if arg == "--dangerously-bypass-approvals-and-sandbox" {
+				return "bypass"
+			}
+		}
+	}
+	return ""
+}
+
+func claudeLaunchPermissionClass(args []string) string {
+	explicit, inherited := "", ""
+	for i := 0; i < len(args); i++ {
+		name, value, inline := strings.Cut(args[i], "=")
+		next := func() string {
+			if inline {
+				return value
+			}
+			if i+1 < len(args) {
+				i++
+				return args[i]
+			}
+			return ""
+		}
+		switch {
+		case args[i] == "--":
+			i = len(args)
+		case args[i] == "--dangerously-skip-permissions":
+			explicit = "bypassPermissions"
+		case name == "--permission-mode":
+			explicit = next()
+		case name == "--inherit-permission-mode":
+			inherited = next()
+		}
+	}
+	mode := explicit
+	if mode == "" {
+		mode = inherited
+	}
+	return claudePermissionClass(mode)
+}
+
+// claudePermissionClass maps Claude's permission modes to the inbound policy's
+// two classes; an unrecognised mode is unknown, never guessed. Claude counts
+// plan as bypass for an interactive session with bypass available, which can
+// come from settings as well as flags, so plan is never asserted.
+func claudePermissionClass(mode string) string {
+	switch mode {
+	case "bypassPermissions":
+		return "bypass"
+	case "default", "acceptEdits":
+		return "prompting"
+	}
+	return ""
+}
+
+func launchHarness(home, executable string) string {
+	switch base := filepath.Base(executable); base {
+	case "claude", "codex":
+		return base
+	}
+	if !filepath.IsAbs(executable) || !filepath.IsAbs(home) {
+		return ""
+	}
+	versions, err := filepath.EvalSymlinks(filepath.Join(home, ".local", "share", "claude", "versions"))
+	if err != nil {
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(executable)
+	if err != nil {
+		return ""
+	}
+	if info, err := os.Stat(resolved); err == nil && info.Mode().IsRegular() &&
+		filepath.Dir(resolved) == versions && filepath.Base(resolved) == filepath.Base(executable) {
+		return "claude"
+	}
+	return ""
 }

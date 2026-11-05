@@ -85,8 +85,19 @@ func readNativeClaudeRegistration(path string, pid int, identity string) (native
 
 func readNativeClaudeRegistrationKind(path string, pid int, identity, kind string) (nativeClaudeRegistration, []byte, os.FileInfo, error) {
 	var empty nativeClaudeRegistration
-	if nativeClaudeMetadataObject(filepath.Dir(path), true) != nil || nativeClaudeMetadataObject(path, false) != nil {
-		return empty, nil, nil, errors.New("native Claude registration owner or integrity mismatch")
+	for _, item := range []struct {
+		path      string
+		directory bool
+	}{{filepath.Dir(path), true}, {path, false}} {
+		if err := nativeClaudeMetadataObject(item.path, item.directory); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return empty, nil, nil, errors.New("native Claude registration metadata not found")
+			}
+			if errors.Is(err, os.ErrPermission) {
+				return empty, nil, nil, errors.New("native Claude registration metadata unreadable")
+			}
+			return empty, nil, nil, errors.New("native Claude registration owner or integrity mismatch")
+		}
 	}
 	file, err := os.OpenFile(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
@@ -129,10 +140,11 @@ func nativeClaudeSocketIdentity(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
-// An optional transcript is read from the same private provider namespace. A
-// missing initial transcript stays empty; this observation grants no input.
-func nativeClaudeTranscript(home, session string) (string, error) {
-	directory, err := os.Open(filepath.Join(home, ".claude", "projects"))
+// An optional transcript is read from the same private provider namespace:
+// config is the frontend's own Claude account directory. A missing initial
+// transcript stays empty; this observation grants no input.
+func nativeClaudeTranscript(config, session string) (string, error) {
+	directory, err := os.Open(filepath.Join(config, "projects"))
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
@@ -152,12 +164,12 @@ func nativeClaudeTranscript(home, session string) (string, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		path := filepath.Join(home, ".claude", "projects", entry.Name(), session+".jsonl")
+		path := filepath.Join(config, "projects", entry.Name(), session+".jsonl")
 		_, err := os.Lstat(path)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err != nil || validateBindingTranscript(path, "claude") != nil {
+		if err != nil || validateClaudeConfigTranscript(path, config) != nil {
 			return "", errors.New("native Claude transcript unavailable")
 		}
 		if found != "" {
@@ -172,6 +184,19 @@ func nativeClaudeTranscript(home, session string) (string, error) {
 // the socket's kernel owner, without writing protocol bytes or binding files.
 // It is an association observation, not a prompt lease or control capability.
 func ReadNativeClaudeBinding(pane string) (AgentBindingRecord, error) {
+	return readNativeClaudeBinding(pane, "")
+}
+
+// ReadNativeClaudePaneJobBinding binds one named background job of the pane's
+// Claude frontend: an explicit message target, never the pane default.
+func ReadNativeClaudePaneJobBinding(pane, session string) (AgentBindingRecord, error) {
+	if !nativeClaudeSessionID.MatchString(session) {
+		return AgentBindingRecord{}, errors.New("invalid target session")
+	}
+	return readNativeClaudeBinding(pane, session)
+}
+
+func readNativeClaudeBinding(pane, target string) (AgentBindingRecord, error) {
 	var empty AgentBindingRecord
 	if !validSessionID.MatchString(pane) {
 		return empty, errors.New("invalid pane")
@@ -193,14 +218,22 @@ func ReadNativeClaudeBinding(pane string) (AgentBindingRecord, error) {
 	if err != nil {
 		return empty, err
 	}
-	home, err := os.UserHomeDir()
+	// Claude publishes its session registry in its own account directory. The
+	// registration is verified against this PID below, so an unreadable
+	// environment can only fall back to the default directory, never misbind.
+	config, err := agentConfigRoot(pid, "claude")
 	if err != nil {
-		return empty, err
+		if config, err = defaultAgentConfigRoot("claude"); err != nil {
+			return empty, err
+		}
 	}
-	path := filepath.Join(home, ".claude", "sessions", fmt.Sprintf("%d.json", pid))
+	path := filepath.Join(config, "sessions", fmt.Sprintf("%d.json", pid))
 	registration, data, file, err := readNativeClaudeRegistration(path, pid, identity)
 	if err != nil {
 		return empty, err
+	}
+	if target != "" {
+		return readNativeClaudeTargetJobBinding(pane, pid, start, identity, path, registration, data, file, target)
 	}
 	if registration.ParkedJobID != "" {
 		return readNativeClaudeParkedBinding(pane, pid, start, identity, path, registration, data, file)
@@ -218,7 +251,7 @@ func ReadNativeClaudeBinding(pane string) (AgentBindingRecord, error) {
 	if peerErr != nil || uid != os.Getuid() || owner != pid {
 		return empty, errors.New("native Claude socket kernel owner mismatch")
 	}
-	transcript, err := nativeClaudeTranscript(home, registration.SessionID)
+	transcript, err := nativeClaudeTranscript(config, registration.SessionID)
 	if err != nil {
 		return empty, err
 	}
@@ -234,7 +267,7 @@ func ReadNativeClaudeBinding(pane string) (AgentBindingRecord, error) {
 		latest.WorkerPID != manifest.WorkerPID || latest.WorkerStartTime != manifest.WorkerStartTime || latest.ShellPID != manifest.ShellPID || latest.NodeBootID != manifest.NodeBootID || validateWorkerIdentity(latest) != nil {
 		return empty, errors.New("native Claude frontend changed during observation")
 	}
-	finalTranscript, err := nativeClaudeTranscript(home, registration.SessionID)
+	finalTranscript, err := nativeClaudeTranscript(config, registration.SessionID)
 	if err != nil || finalTranscript != transcript {
 		return empty, errors.New("native Claude transcript association changed")
 	}
@@ -248,5 +281,9 @@ func ReadNativeClaudeBinding(pane string) (AgentBindingRecord, error) {
 		Transcript    string
 	}{pane, pid, start, registration, uint64(socketStat.Dev), uint64(socketStat.Ino), transcript})
 	sum := sha256.Sum256(revisionData)
-	return AgentBindingRecord{Version: 1, Producer: agentProducer{PaneID: pane, Provider: "claude", ProcessID: pid, ProcessStart: start}, SessionID: registration.SessionID, TranscriptPath: transcript, ObservedAt: time.Now().UTC(), Lifecycle: "unknown", Revision: hex.EncodeToString(sum[:]), Source: "native_registration_kernel_owner"}, nil
+	override, err := claudeRecordOverride(pid, config)
+	if err != nil {
+		return empty, err
+	}
+	return AgentBindingRecord{Version: 1, Producer: agentProducer{PaneID: pane, Provider: "claude", ProcessID: pid, ProcessStart: start, ConfigDir: override}, SessionID: registration.SessionID, TranscriptPath: transcript, ObservedAt: time.Now().UTC(), Lifecycle: "unknown", Revision: hex.EncodeToString(sum[:]), Source: "native_registration_kernel_owner"}, nil
 }

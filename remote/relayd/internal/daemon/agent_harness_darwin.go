@@ -47,6 +47,27 @@ func darwinHarnessArguments(pid int) (string, error) {
 	return strings.Join(args, "\x00"), nil
 }
 
+// darwinExecPath returns the path recorded at exec time, which remains
+// available after the executable file is deleted.
+func darwinExecPath(pid int) (string, error) {
+	raw, err := unix.SysctlRaw("kern.procargs2", pid)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) < 5 || len(raw) > 1<<20 {
+		return "", errors.New("invalid process arguments")
+	}
+	end := bytes.IndexByte(raw[4:], 0)
+	if end <= 0 || end > 4096 {
+		return "", errors.New("invalid executable argument")
+	}
+	path := string(raw[4 : 4+end])
+	if !strings.HasPrefix(path, "/") {
+		return "", errors.New("relative executable path")
+	}
+	return path, nil
+}
+
 func harnessForegroundGroup(pid int) (int, error) {
 	info, err := darwinProcessInfo(pid)
 	if err != nil {

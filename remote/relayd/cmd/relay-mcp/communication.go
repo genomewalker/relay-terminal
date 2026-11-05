@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -39,34 +40,79 @@ func (s *server) communicationActor() (string, error) {
 // client transport; none of those tools are advertised as server automation.
 func (s *server) daemonCommunication(name string, arguments map[string]json.RawMessage) (any, bool) {
 	operations := map[string]string{"relay_link_panes": "link", "relay_unlink_panes": "unlink", "relay_list_pane_links": "list",
-		"relay_message_pane": "send", "relay_pane_message_receipt": "receipt"}
+		"relay_message_pane": "send", "relay_pane_message_receipt": "receipt",
+		"relay_bind_question_thread": "question_bind", "relay_unbind_question_thread": "question_unbind"}
 	operation, ok := operations[name]
 	if !ok {
 		return nil, false
 	}
+	// Only this process mints source proofs; a client never supplies one.
+	for _, minted := range []string{"source_attestation", "source_signature", "source_proof_error"} {
+		if _, supplied := arguments[minted]; supplied {
+			return map[string]any{"content": []map[string]any{{"type": "text", "text": "Unexpected daemon communication argument"}}, "isError": true}, true
+		}
+	}
 	// With a desktop transport configured, the node daemon serves only pairs
 	// it owns; cross-host pairs and the full link list stay on the desktop path.
 	desktopFallback := s.token != ""
+	// A remote pane never creates a cross-host link directly. proposal_id alone
+	// reads a proposal's status; a cross-host target below becomes a proposal.
+	var proposalID string
+	if operation == "link" {
+		var valid bool
+		if proposalID, valid = takeProposalID(arguments); !valid {
+			return map[string]any{"content": []map[string]any{{"type": "text", "text": "proposal_id must be a lowercase UUID"}}, "isError": true}, true
+		}
+		_, hasSource := arguments["source_pane_id"]
+		_, hasTarget := arguments["pane_id"]
+		if proposalID != "" && !hasSource && !hasTarget && desktopFallback && linkProposalRemote() {
+			return s.linkProposalStatus(proposalID), true
+		}
+	}
 	if desktopFallback && operation == "list" {
 		return nil, false
 	}
+	// A named background session is proven by the recipient host's relayd;
+	// the desktop route cannot carry it, so such a send never falls back.
+	_, targeted := arguments["target_session_id"]
+	if targeted && operation != "send" {
+		return map[string]any{"content": []map[string]any{{"type": "text", "text": "target_session_id applies only to relay_message_pane"}}, "isError": true}, true
+	}
+	refuseTargetFallback := map[string]any{"content": []map[string]any{{"type": "text", "text": "target_session_id needs a pair on this host's relayd; the desktop route cannot address a session. Nothing was sent."}}, "isError": true}
+	// Question threads live only on the pane's host; the desktop path never serves them.
+	questionOperation := strings.HasPrefix(operation, "question_")
 	packet := map[string]any{"operation": operation}
 	if s.callerToken != "" {
 		packet["client_token"] = s.callerToken
 	}
-	actor := ""
-	if os.Getenv("RELAY_SESSION") != "" {
-		var err error
-		actor, err = s.communicationActor()
-		if err != nil {
-			if desktopFallback {
+	// The pane is proven from kernel ancestry, never from the environment, and
+	// relayd re-derives it independently. Harnesses such as Codex scrub
+	// RELAY_SESSION from MCP servers, so its absence only means an unowned
+	// client keeps the unattributed path instead of failing.
+	actor, actorErr := s.communicationActor()
+	if actorErr != nil {
+		actor = ""
+		if os.Getenv("RELAY_SESSION") != "" {
+			if desktopFallback && !questionOperation {
+				if operation == "link" && linkProposalRemote() {
+					return map[string]any{"content": []map[string]any{{"type": "text", "text": "A remote pane link needs this pane's proven identity: " + actorErr.Error()}}, "isError": true}, true
+				}
+				// The desktop refuses an unproven remote sender; say why on its receipt.
+				if targeted {
+					return refuseTargetFallback, true
+				}
+				if operation == "send" {
+					arguments["source_proof_error"], _ = json.Marshal(proofDiagnostic("communication-actor", actorErr.Error()))
+				}
 				return nil, false
 			}
-			return map[string]any{"content": []map[string]any{{"type": "text", "text": err.Error()}}, "isError": true}, true
+			return map[string]any{"content": []map[string]any{{"type": "text", "text": actorErr.Error()}}, "isError": true}, true
 		}
+	} else {
 		packet["actor_pane_id"] = actor
 	}
-	allowed := map[string]bool{"source_pane_id": true, "pane_id": true, "message_id": true, "text": true, "link_id": true}
+	allowed := map[string]bool{"source_pane_id": true, "pane_id": true, "message_id": true, "text": true, "link_id": true,
+		"thread_id": true, "realm": true, "ttl": true, "target_session_id": true}
 	result := func(text string, failed bool) any {
 		return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": failed}
 	}
@@ -82,7 +128,7 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	}
 	// A provider-local MCP client can label only its own pane as sender.
 	// Actual recipient/session/socket identity is checked again by relayd.
-	if actor != "" && (operation == "send" || operation == "link" || operation == "unlink") {
+	if actor != "" && (operation == "send" || operation == "link" || operation == "unlink" || questionOperation) {
 		source, _ := packet["source_pane_id"].(string)
 		if source != "" && !strings.EqualFold(source, actor) {
 			return result("Sender must be this MCP client's own pane", true), true
@@ -101,7 +147,37 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		if desktopFallback && daemonDeclinedBeforeWrite(operation, stderr.String()) {
+		if desktopFallback && !questionOperation && daemonDeclinedBeforeWrite(operation, stderr.String()) {
+			if targeted {
+				return refuseTargetFallback, true
+			}
+			if operation == "link" && linkProposalRemote() {
+				target, _ := packet["pane_id"].(string)
+				return s.proposeLink(actor, target, proposalID), true
+			}
+			// Cross-host pairs are brokered by the desktop. Carry the proven
+			// sender so a client that names only the recipient still links,
+			// and the scoped bridge sees this pane rather than an empty source.
+			if actor != "" {
+				arguments["source_pane_id"], _ = json.Marshal(actor)
+				if operation == "send" {
+					id, attestErr := s.sourceAttestation(packet)
+					if id != "" {
+						arguments["source_attestation"], _ = json.Marshal(id)
+					}
+					// The signature lets the receiving host verify the sender
+					// itself; the attestation remains for older receivers.
+					signature, signErr := s.sourceSignature(packet)
+					if signature != "" {
+						arguments["source_signature"], _ = json.Marshal(signature)
+					}
+					if id == "" && signature == "" {
+						arguments["source_proof_error"], _ = json.Marshal(proofDiagnostic("attest", attestErr) + "; " + proofDiagnostic("sign", signErr))
+					}
+				}
+			} else if operation == "send" && actorErr != nil {
+				arguments["source_proof_error"], _ = json.Marshal(proofDiagnostic("communication-actor", actorErr.Error()))
+			}
 			return nil, false
 		}
 		return result(fmt.Sprintf("Daemon communication unavailable: %s", strings.TrimSpace(stderr.String())), true), true
@@ -120,6 +196,109 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 		}
 	}
 	return result(out.String(), false), true
+}
+
+var attestationID = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// sourceAttestation asks this node's relayd to record the sender it proves
+// from this process's kernel ancestry, bound to this exact message. Only the
+// proof ID travels through the desktop; the desktop redeems it on this host.
+// Without one the desktop delivers the message as an unverified claim.
+func (s *server) sourceAttestation(packet map[string]any) (string, string) {
+	attest := map[string]any{"operation": "attest"}
+	for _, key := range []string{"client_token", "actor_pane_id", "source_pane_id", "pane_id", "message_id", "text"} {
+		if value, ok := packet[key]; ok {
+			attest[key] = value
+		}
+	}
+	encoded, err := json.Marshal(attest)
+	if err != nil {
+		return "", "request encoding failed"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, s.daemonHelper, "communication")
+	cmd.Stdin = bytes.NewReader(encoded)
+	var out, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil || out.Len() > 4096 {
+		return "", helperFailure(err, stderr.String())
+	}
+	var reply struct {
+		ID string `json:"attestation_id"`
+	}
+	if json.Unmarshal(out.Bytes(), &reply) != nil || !attestationID.MatchString(reply.ID) {
+		return "", "invalid attestation reply"
+	}
+	return reply.ID, ""
+}
+
+func helperFailure(err error, stderr string) string {
+	if detail := strings.TrimSpace(stderr); detail != "" {
+		return detail
+	}
+	if err != nil {
+		return err.Error()
+	}
+	return "reply exceeds limit"
+}
+
+// proofDiagnostic is bounded, single-line text for the desktop receipt. It
+// names the failing step only; it carries no authority.
+func proofDiagnostic(step, detail string) string {
+	if detail == "" {
+		detail = "failed"
+	}
+	text := strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return ' '
+		}
+		return r
+	}, step+": "+detail)
+	if len(text) > 240 {
+		text = text[:240]
+	}
+	return strings.ToValidUTF8(text, "")
+}
+
+var sourceSignatureAlphabet = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// validSourceSignature accepts only a bounded base64url envelope.
+func validSourceSignature(value string) bool {
+	return len(value) <= 32768 && sourceSignatureAlphabet.MatchString(value)
+}
+
+// sourceSignature asks this node's relayd to sign this exact message as the
+// pane it proves from this process's kernel ancestry. The receiving host's
+// relayd verifies it against pinned host keys; brokers carry it opaque.
+func (s *server) sourceSignature(packet map[string]any) (string, string) {
+	sign := map[string]any{"operation": "sign"}
+	for _, key := range []string{"client_token", "actor_pane_id", "source_pane_id", "pane_id", "message_id", "text"} {
+		if value, ok := packet[key]; ok {
+			sign[key] = value
+		}
+	}
+	encoded, err := json.Marshal(sign)
+	if err != nil {
+		return "", "request encoding failed"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, s.daemonHelper, "communication")
+	cmd.Stdin = bytes.NewReader(encoded)
+	var out, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil || out.Len() > 64<<10 {
+		return "", helperFailure(err, stderr.String())
+	}
+	var reply struct {
+		Signature string `json:"source_signature"`
+		Authority string `json:"authority"`
+	}
+	if json.Unmarshal(out.Bytes(), &reply) != nil || reply.Authority != "relayd" || !validSourceSignature(reply.Signature) {
+		return "", "invalid signature reply"
+	}
+	return reply.Signature, ""
 }
 
 // daemonDeclinedBeforeWrite matches only refusals relayd returns before it

@@ -21,11 +21,16 @@ import Darwin
         let directory: String?
         let links: [Link]
     }
-    private let directory = RelayStateProfile.applicationSupportRoot
-        .appendingPathComponent("Relay/Recovery", isDirectory: true)
+    private let directory: URL
     private let writer = DispatchQueue(label: "relay.recovery.graph", qos: .utility)
     private var membership: [UUID: UUID] = [:]
     private var knownConversations: [UUID: String] = [:]
+
+    /// `directory` overrides the profile's recovery store, for tests.
+    init(directory: URL = RelayStateProfile.applicationSupportRoot
+        .appendingPathComponent("Relay/Recovery", isDirectory: true)) {
+        self.directory = directory
+    }
 
     private func archiveURL(_ id: UUID) -> URL {
         directory.appendingPathComponent("closed-\(id.uuidString.lowercased()).json")

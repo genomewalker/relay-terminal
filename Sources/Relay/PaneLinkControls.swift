@@ -4,6 +4,7 @@ struct PaneHeaderLinkButton: View {
     @EnvironmentObject private var selection: PaneLinkSelection
     let paneID: UUID
     @State private var showingLinks = false
+    @State private var showingCleanup = false
     private var links: [PaneLinkMembership] { selection.memberships(for: paneID) }
     private var selected: Bool { selection.paneIDs.contains(paneID) }
     private var saved: Bool { !links.isEmpty }
@@ -67,12 +68,22 @@ struct PaneHeaderLinkButton: View {
                     Text(error).foregroundStyle(RelayTheme.coral).fixedSize(horizontal: false, vertical: true)
                 }
                 Divider()
+                Button("Review detached-pane links…") {
+                    selection.reviewDetachedLinks?()
+                    showingCleanup = true
+                }.disabled(selection.refreshingLinks || selection.cleanupRunning)
+                    .accessibilityIdentifier("relay.pane.link.review-detached")
+                if selection.cleanupRunning { ProgressView("Removing detached-pane links…") }
+                if let result = selection.cleanupResult { Text(result).foregroundStyle(.secondary) }
                 Button("Link another pane") { showingLinks = false; selection.selectPairPane(paneID) }
                 Text("Saved links identify collaborators. Message delivery is checked separately.")
                     .font(RelayTheme.font(size: 10.5)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .font(RelayTheme.font(size: 11.5)).padding(16).frame(width: 350)
+            .sheet(isPresented: $showingCleanup, onDismiss: { selection.cleanup.cancel() }) {
+                DetachedPaneLinkCleanupView(selection: selection) { showingCleanup = false }
+            }
         }
     }
 }

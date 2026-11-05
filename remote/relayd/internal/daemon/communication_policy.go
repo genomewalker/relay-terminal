@@ -49,9 +49,10 @@ func communicationAuthorize(root string, r CommunicationRequest) (string, error)
 	if strings.HasPrefix(r.Operation, "route_") && (r.ClientToken != "" || r.ActorPaneID != "") {
 		return "", errors.New("owner administration required")
 	}
-	mutation := r.Operation == "send" || r.Operation == "link" || r.Operation == "unlink" || r.Operation == "group_set" || r.Operation == "group_retire" || r.Operation == "group_send" || r.Operation == "route_set" || r.Operation == "route_retire" || r.Operation == "route_identity_create" || r.Operation == "route_binding_set"
+	mutation := r.Operation == "send" || r.Operation == "attest" || r.Operation == "sign" || r.Operation == "link" || r.Operation == "unlink" || r.Operation == "group_set" || r.Operation == "group_retire" || r.Operation == "group_send" || r.Operation == "route_set" || r.Operation == "route_retire" || r.Operation == "route_identity_create" || r.Operation == "route_binding_set"
 	mutation = mutation || r.Operation == "route_identity_rotate"
 	mutation = mutation || r.Operation == "route_link_set" || r.Operation == "route_link_retire" || r.Operation == "remote_receive" || r.Operation == "remote_send"
+	mutation = mutation || r.Operation == "assistant_send" || r.Operation == "question_bind" || r.Operation == "question_unbind" || r.Operation == "question_notices" || r.Operation == "question_notice_send" || r.Operation == "question_notice_ack"
 	if r.ActorPaneID != "" && (!validSessionID.MatchString(strings.ToLower(r.ActorPaneID)) ||
 		(mutation && !strings.EqualFold(r.SourcePaneID, r.ActorPaneID))) {
 		return "", errors.New("sender must be this client's own pane")
@@ -96,6 +97,15 @@ func communicationAuthorize(root string, r CommunicationRequest) (string, error)
 func communicationPolicyAdmin(root string, r CommunicationRequest) (map[string]any, error) {
 	if r.ClientToken != "" || r.ActorPaneID != "" {
 		return nil, errors.New("owner administration required")
+	}
+	// The Relay assistant's ID is reserved: it is never imported or
+	// registered as a generic caller (its authority is the app's signing key).
+	if r.Policy != nil {
+		for _, c := range r.Policy.Callers {
+			if strings.EqualFold(c.ID, communicationAssistantCallerID) {
+				return nil, errors.New("the relay-assistant identity is reserved and cannot be registered as a caller")
+			}
+		}
 	}
 	path := communicationPolicyPath(root)
 	var policy communicationPolicy

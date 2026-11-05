@@ -23,7 +23,7 @@ only when a later session starts with the updated bundle.
 Verify recovery against the freshly built binary using the private fixture:
 
 ```sh
-python3 scripts/test-native-mcp-recovery.py \
+scripts/test-native-mcp-recovery.sh \
   --binary /absolute/path/to/codex-source/codex-rs/target/release/codex \
   --result /absolute/path/to/recovery-result.json
 ```
@@ -37,8 +37,8 @@ tests for retry selection and backoff do not establish this runtime behavior.
 For the macOS arm64 bundle, from the Relay checkout:
 
 ```sh
-python3 scripts/build-native-codehost.py /absolute/path/to/codex-source aarch64-apple-darwin --native-bundle
-python3 scripts/install-native-codex.py \
+sh scripts/build-native-codehost.sh /absolute/path/to/codex-source aarch64-apple-darwin --native-bundle
+sh scripts/install-native-codex.sh \
   --codex /absolute/path/to/codex-source/codex-rs/target/release/codex \
   --worker /absolute/path/to/codex-source/codex-rs/target/release/codex-peer-worker \
   --code-mode-host /absolute/path/to/codex-source/codex-rs/target/release/codex-code-mode-host

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/relay-terminal/relayd/internal/agentaccounts"
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
@@ -26,51 +27,64 @@ type hostRotationRPCRequest struct {
 	Request  json.RawMessage `json:"request"`
 }
 type hostRequest struct {
+	NativeChat   json.RawMessage         `json:"native_chat,omitempty"`
 	HostRotation *hostRotationRPCRequest `json:"host_rotation,omitempty"`
+	AccountForce *forceAccountRPCRequest `json:"account_force,omitempty"`
 
-	Communication       *CommunicationRequest `json:"communication,omitempty"`
-	WaitMillis          int                   `json:"wait_millis,omitempty"`
-	RequestID           string                `json:"request_id"`
-	Operation           string                `json:"operation"`
-	ProcessPID          int                   `json:"process_pid,omitempty"`
-	ProcessStart        string                `json:"process_start,omitempty"`
-	Signal              string                `json:"signal,omitempty"`
-	JobID               string                `json:"job_id"`
-	Command             string                `json:"command,omitempty"`
-	Argv                []string              `json:"argv,omitempty"`
-	Cwd                 string                `json:"cwd,omitempty"`
-	Env                 map[string]string     `json:"env,omitempty"`
-	Stdin               []byte                `json:"stdin,omitempty"`
-	KeepStdin           bool                  `json:"keep_stdin,omitempty"`
-	InputSequence       int64                 `json:"input_sequence,omitempty"`
-	CloseStdin          bool                  `json:"close_stdin,omitempty"`
-	StdoutOffset        int64                 `json:"stdout_offset,omitempty"`
-	StderrOffset        int64                 `json:"stderr_offset,omitempty"`
-	TimeoutSeconds      int                   `json:"timeout_seconds,omitempty"`
-	Path                string                `json:"path,omitempty"`
-	Offset              int64                 `json:"offset,omitempty"`
-	Length              int                   `json:"length,omitempty"`
-	Version             string                `json:"version,omitempty"`
-	Data                []byte                `json:"data,omitempty"`
-	UploadSize          int64                 `json:"upload_size,omitempty"`
-	UploadSHA256        string                `json:"upload_sha256,omitempty"`
-	UploadName          string                `json:"upload_name,omitempty"`
-	UploadPane          string                `json:"upload_pane,omitempty"`
-	FolderManifest      []folderEntry         `json:"folder_manifest,omitempty"`
-	FolderSourceVersion string                `json:"folder_source_version,omitempty"`
-	FolderChild         string                `json:"folder_child,omitempty"`
-	Plugin              *PluginRequest        `json:"plugin,omitempty"`
+	Communication       *CommunicationRequest  `json:"communication,omitempty"`
+	WaitMillis          int                    `json:"wait_millis,omitempty"`
+	RequestID           string                 `json:"request_id"`
+	Operation           string                 `json:"operation"`
+	ProcessPID          int                    `json:"process_pid,omitempty"`
+	ProcessStart        string                 `json:"process_start,omitempty"`
+	Signal              string                 `json:"signal,omitempty"`
+	JobID               string                 `json:"job_id"`
+	Kind                string                 `json:"kind,omitempty"`
+	Command             string                 `json:"command,omitempty"`
+	Argv                []string               `json:"argv,omitempty"`
+	Cwd                 string                 `json:"cwd,omitempty"`
+	Env                 map[string]string      `json:"env,omitempty"`
+	Stdin               []byte                 `json:"stdin,omitempty"`
+	KeepStdin           bool                   `json:"keep_stdin,omitempty"`
+	InputSequence       int64                  `json:"input_sequence,omitempty"`
+	CloseStdin          bool                   `json:"close_stdin,omitempty"`
+	StdoutOffset        int64                  `json:"stdout_offset,omitempty"`
+	StderrOffset        int64                  `json:"stderr_offset,omitempty"`
+	TimeoutSeconds      int                    `json:"timeout_seconds,omitempty"`
+	Path                string                 `json:"path,omitempty"`
+	Offset              int64                  `json:"offset,omitempty"`
+	Length              int                    `json:"length,omitempty"`
+	Version             string                 `json:"version,omitempty"`
+	Data                []byte                 `json:"data,omitempty"`
+	UploadSize          int64                  `json:"upload_size,omitempty"`
+	UploadSHA256        string                 `json:"upload_sha256,omitempty"`
+	UploadName          string                 `json:"upload_name,omitempty"`
+	UploadPane          string                 `json:"upload_pane,omitempty"`
+	FolderManifest      []folderEntry          `json:"folder_manifest,omitempty"`
+	FolderSourceVersion string                 `json:"folder_source_version,omitempty"`
+	FolderChild         string                 `json:"folder_child,omitempty"`
+	Plugin              *PluginRequest         `json:"plugin,omitempty"`
+	AgentAccounts       *agentaccounts.Request `json:"agent_accounts,omitempty"`
+	Listener            *peerListenerSpec      `json:"listener,omitempty"`
 }
 type hostJobRecord struct {
 	JobID        string `json:"job_id"`
 	Fingerprint  string `json:"fingerprint"`
+	Kind         string `json:"kind,omitempty"`
 	State        string `json:"state"`
 	PID          int    `json:"pid,omitempty"`
 	ProcessStart string `json:"process_start,omitempty"`
 	ExitCode     *int   `json:"exit_code,omitempty"`
 	Error        string `json:"error,omitempty"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	Successor    string `json:"successor,omitempty"`
+	// A listener's route and owner, kept in the ledger so a later supervisor
+	// can follow a disconnect along the successor chain.
+	Listener  *peerListenerBinding `json:"listener,omitempty"`
+	CreatedAt string               `json:"created_at"`
+	UpdatedAt string               `json:"updated_at"`
+	// Ledger is hostJobLedgerTombstones in every record a tombstone-aware
+	// daemon creates; see host_job_servers.go.
+	Ledger int `json:"ledger,omitempty"`
 }
 type hostJob struct {
 	notify      chan struct{}
@@ -83,11 +97,15 @@ type hostJob struct {
 	inputHashes map[int64][32]byte
 	inputErrors map[int64]string
 	directory   string
+	listener    *peerListenerSpec
 }
 
 func (s *Server) hostRPC(r hostRequest) (any, error) {
 	if !validSessionID.MatchString(r.RequestID) {
 		return nil, errors.New("valid request_id required")
+	}
+	if r.Operation == "native_chat" {
+		return CallNativeChat(r.NativeChat)
 	}
 	if r.Operation == "host_rotation" {
 		if r.HostRotation == nil {
@@ -109,6 +127,13 @@ func (s *Server) hostRPC(r hostRequest) (any, error) {
 	if r.Operation == "capabilities" || strings.HasPrefix(r.Operation, "file_") {
 		return s.hostFileRPC(r)
 	}
+	if r.Operation == "agent_accounts" {
+		if r.AgentAccounts == nil {
+			return nil, errors.New("agent account request required")
+		}
+		// Account directories and links only; credentials are never read.
+		return agentaccounts.Handle(*r.AgentAccounts, agentaccounts.ProviderProbe)
+	}
 	if r.Operation == "plugin" {
 		if r.Plugin == nil {
 			return nil, errors.New("plugin request required")
@@ -121,9 +146,14 @@ func (s *Server) hostRPC(r hostRequest) (any, error) {
 	if r.Operation == "exec" {
 		return s.startHostJob(r)
 	}
+	if r.Operation == "cancel" {
+		if result, handled, err := s.cancelPeerListenerJob(r.JobID); handled {
+			return result, err
+		}
+	}
 	value, ok := s.hostJobs.Load(r.JobID)
 	if !ok {
-		raw, err := os.ReadFile(filepath.Join(s.stateDir, "host-jobs", r.JobID, "record.json"))
+		raw, directory, tombstone, err := s.readHostJobRecord(r.JobID)
 		if err != nil {
 			return nil, errors.New("unknown job; do not replay execution")
 		}
@@ -137,7 +167,11 @@ func (s *Server) hostRPC(r hostRequest) (any, error) {
 		if r.Operation != "status" {
 			return nil, errors.New("job no longer controlled by this daemon; do not replay")
 		}
-		return hostJobSnapshot(record, filepath.Join(s.stateDir, "host-jobs", r.JobID), r)
+		if tombstone != nil {
+			return hostJobTombstoneSnapshot(*tombstone, r)
+		}
+		// The folder may move into the archive, or be cleaned, during this read.
+		return s.resolveHostJobSnapshot(nil, record, directory, r)
 	}
 	job := value.(*hostJob)
 	if r.Operation == "input" {
@@ -148,10 +182,10 @@ func (s *Server) hostRPC(r hostRequest) (any, error) {
 			r.WaitMillis = 15000
 		}
 		job.mu.Lock()
-		running := job.record.State == "running"
+		running, directory := job.record.State == "running", job.directory
 		job.mu.Unlock()
-		out, _ := os.Stat(filepath.Join(job.directory, "stdout"))
-		errout, _ := os.Stat(filepath.Join(job.directory, "stderr"))
+		out, _ := os.Stat(filepath.Join(directory, "stdout"))
+		errout, _ := os.Stat(filepath.Join(directory, "stderr"))
 		if running && out != nil && errout != nil && out.Size() <= r.StdoutOffset && errout.Size() <= r.StderrOffset {
 			select {
 			case <-job.notify:
@@ -163,7 +197,9 @@ func (s *Server) hostRPC(r hostRequest) (any, error) {
 	defer job.mu.Unlock()
 	switch r.Operation {
 	case "status":
-		return hostJobSnapshot(job.record, job.directory, r)
+		// A finished job this daemon still tracks may be archived by another
+		// daemon sharing the state directory, then cleaned.
+		return s.resolveHostJobSnapshot(job, job.record, job.directory, r)
 	case "cancel":
 		if job.cmd != nil && job.record.State == "running" {
 			if err := syscall.Kill(-job.cmd.Process.Pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
@@ -259,23 +295,29 @@ func hostJobSnapshot(record hostJobRecord, dir string, r hostRequest) (any, erro
 }
 
 // Unknown outcome is not permission to rerun a command. Liveness is separate
-// evidence used only by the approved messaging listener's recovery policy.
+// evidence used by listener recovery and supervisor upgrade quiescence.
 func hostJobProcessState(record hostJobRecord) string {
+	return hostJobProcessStateWith(record, syscall.Kill, processStartIdentity)
+}
+
+// Probe dependencies are explicit so fail-closed errors can be checked without
+// changing global process inspection or signalling a live process.
+func hostJobProcessStateWith(record hostJobRecord, probe func(int, syscall.Signal) error, identity func(int) (string, error)) string {
 	if record.State == "exited" || record.State == "failed" {
 		return "absent"
 	}
 	if record.PID <= 1 {
 		return "unknown"
 	}
-	err := syscall.Kill(record.PID, 0)
+	err := probe(record.PID, 0)
 	if err == syscall.ESRCH {
 		return "absent"
 	}
 	if err != nil || record.ProcessStart == "" {
 		return "unknown"
 	}
-	start, err := processStartIdentity(record.PID)
-	if err != nil {
+	start, err := identity(record.PID)
+	if err != nil || start == "" {
 		return "unknown"
 	}
 	if start != record.ProcessStart {
@@ -312,11 +354,47 @@ func (job *hostJob) save() error {
 	defer directory.Close()
 	return directory.Sync()
 }
+func hostJobFingerprint(r hostRequest) string {
+	identity := r
+	identity.RequestID = ""
+	identity.Operation = ""
+	identity.StdoutOffset = 0
+	identity.StderrOffset = 0
+	identity.WaitMillis = 0
+	raw, _ := json.Marshal(identity)
+	hash := sha256.Sum256(raw)
+	return hex.EncodeToString(hash[:])
+}
+
 func (s *Server) startHostJob(r hostRequest) (any, error) {
 	if r.KeepStdin && len(r.Stdin) > 0 {
 		return nil, errors.New("use sequenced input after creating a keep_stdin job")
 	}
-	if (r.Command == "") == (len(r.Argv) == 0) || len(r.Command) > 60000 || len(r.Argv) > 128 || len(r.Env) > 128 || len(r.Stdin) > 256<<10 || r.TimeoutSeconds < 0 || r.TimeoutSeconds > 86400 {
+	switch r.Kind {
+	case "":
+		if r.Listener != nil {
+			return nil, errors.New("listener specification requires the peer listener kind")
+		}
+		if (r.Command == "") == (len(r.Argv) == 0) {
+			return nil, errors.New("bounded command or argv required")
+		}
+	case hostJobKindPeerListener:
+		// A declared listener is a restartable inbox, never a one-shot command.
+		// relayd builds its argv from the typed specification, so the registry
+		// can relaunch exactly this listener without parsing command text.
+		if r.Listener == nil || r.Command != "" || len(r.Argv) > 0 || len(r.Env) > 0 || !r.KeepStdin || len(r.Stdin) > 0 || r.TimeoutSeconds != 0 {
+			return nil, errors.New("peer listener requires a listener specification and kept stdin, without argv, env or timeout")
+		}
+		if err := r.Listener.validate(); err != nil {
+			return nil, err
+		}
+		if r.Listener.legacyPython() {
+			return nil, errors.New("legacy peer listener requires a native migration")
+		}
+	default:
+		return nil, errors.New("unsupported host job kind")
+	}
+	if len(r.Command) > 60000 || len(r.Argv) > 128 || len(r.Env) > 128 || len(r.Stdin) > 256<<10 || r.TimeoutSeconds < 0 || r.TimeoutSeconds > 86400 {
 		return nil, errors.New("bounded command or argv required")
 	}
 	for _, a := range r.Argv {
@@ -329,15 +407,7 @@ func (s *Server) startHostJob(r hostRequest) (any, error) {
 			return nil, errors.New("invalid environment")
 		}
 	}
-	identity := r
-	identity.RequestID = ""
-	identity.Operation = ""
-	identity.StdoutOffset = 0
-	identity.StderrOffset = 0
-	identity.WaitMillis = 0
-	raw, _ := json.Marshal(identity)
-	hash := sha256.Sum256(raw)
-	fingerprint := hex.EncodeToString(hash[:])
+	fingerprint := hostJobFingerprint(r)
 	// Serialize reservation, including the durable ledger lookup.
 	s.hostJobsMu.Lock()
 	defer s.hostJobsMu.Unlock()
@@ -354,7 +424,7 @@ func (s *Server) startHostJob(r hostRequest) (any, error) {
 		return job.record, nil
 	}
 	directory := filepath.Join(s.stateDir, "host-jobs", r.JobID)
-	if raw, e := os.ReadFile(filepath.Join(directory, "record.json")); e == nil {
+	if raw, _, _, e := s.readHostJobRecord(r.JobID); e == nil {
 		var old hostJobRecord
 		if json.Unmarshal(raw, &old) != nil || old.Fingerprint != fingerprint {
 			return nil, errors.New("job ID already reserved")
@@ -363,6 +433,24 @@ func (s *Server) startHostJob(r hostRequest) (any, error) {
 			old.State = "unknown_after_daemon_restart"
 		}
 		return old, nil
+	} else if !os.IsNotExist(e) {
+		return nil, e
+	}
+	if r.Listener != nil {
+		// Exactly one listener per route: a second launch, e.g. a client
+		// respawn racing a registry resume, is reserved as superseded and
+		// names the job that serves the route. It never starts a process.
+		if serving := s.activePeerListenerLocked(r.Listener.Route); serving != "" {
+			return s.reserveSupersededHostJob(r, fingerprint, directory, serving)
+		}
+	}
+	return s.launchHostJobLocked(r, fingerprint, directory)
+}
+
+// The caller holds hostJobsMu and has established that r.JobID is unreserved.
+func (s *Server) launchHostJobLocked(r hostRequest, fingerprint, directory string) (any, error) {
+	if r.Listener != nil && r.Listener.legacyPython() {
+		return nil, errors.New("legacy peer listener requires a native migration")
 	}
 	active := 0
 	s.hostJobs.Range(func(_, v any) bool {
@@ -383,7 +471,7 @@ func (s *Server) startHostJob(r hostRequest) (any, error) {
 	if e := os.Mkdir(directory, 0700); e != nil {
 		return nil, errors.New("job ID already reserved")
 	}
-	job := &hostJob{notify: make(chan struct{}, 1), directory: directory, inputHashes: make(map[int64][32]byte), record: hostJobRecord{JobID: r.JobID, Fingerprint: fingerprint, State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}}
+	job := &hostJob{notify: make(chan struct{}, 1), directory: directory, inputHashes: make(map[int64][32]byte), listener: r.Listener, record: hostJobRecord{JobID: r.JobID, Fingerprint: fingerprint, Kind: r.Kind, Listener: r.Listener.binding(), State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Ledger: hostJobLedgerTombstones}}
 	if e := job.save(); e != nil {
 		return nil, e
 	}
@@ -406,10 +494,25 @@ func (s *Server) startHostJob(r hostRequest) (any, error) {
 		return fail(e)
 	}
 	var cmd *exec.Cmd
-	if r.Command != "" {
+	if r.Listener != nil {
+		argv := r.Listener.argv()
+		argv, err := resolveNativeHostArgv(argv)
+		if err != nil {
+			out.Close()
+			errout.Close()
+			return fail(err)
+		}
+		cmd = exec.Command(argv[0], argv[1:]...)
+	} else if r.Command != "" {
 		cmd = exec.Command("/bin/sh", "-lc", r.Command)
 	} else {
-		cmd = exec.Command(r.Argv[0], r.Argv[1:]...)
+		argv, err := resolveNativeHostArgv(r.Argv)
+		if err != nil {
+			out.Close()
+			errout.Close()
+			return fail(err)
+		}
+		cmd = exec.Command(argv[0], argv[1:]...)
 	}
 	cmd.Dir = r.Cwd
 	cmd.Env = os.Environ()
@@ -454,6 +557,14 @@ func (s *Server) startHostJob(r hostRequest) (any, error) {
 		// failure rather than authorizing a fresh execution or losing Wait.
 		job.record.Error = "running job persistence failed: " + e.Error()
 	}
+	if job.listener != nil {
+		// Without its registry entry the listener still serves, but it is no
+		// longer resumable, so it blocks a supervisor upgrade as before.
+		if e := s.recordPeerListener(job.listener, r.Cwd, r.JobID); e != nil {
+			job.record.Error = "peer listener registry write failed: " + e.Error()
+			job.save()
+		}
+	}
 	go func() {
 		var timer *time.Timer
 		if r.TimeoutSeconds > 0 {
@@ -491,6 +602,11 @@ func (s *Server) startHostJob(r hostRequest) (any, error) {
 			job.input = nil
 		}
 		job.save()
+		if job.listener != nil {
+			// A listener suspended for an upgrade stays registered for resume;
+			// any other exit ends its registration.
+			s.releasePeerListener(job.listener.Route, job.record.JobID)
+		}
 	}()
 	return job.record, nil
 }

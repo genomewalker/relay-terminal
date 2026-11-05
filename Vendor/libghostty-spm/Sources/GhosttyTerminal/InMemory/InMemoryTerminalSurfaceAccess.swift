@@ -17,14 +17,42 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
     private var surface: ghostty_surface_t?
     /// Invalidates work that was enqueued for a surface that has been replaced.
     private var generation: UInt64 = 0
-    /// Prevents the caller from freeing a surface while a C operation uses it.
-    private var activeOperations = 0
+    /// C operations in progress, per surface. A surface is freed only once its
+    /// count is zero (`retireSurface`). Replacing or clearing the surface no
+    /// longer waits for them: a write can be blocked on Ghostty's app mailbox,
+    /// which only the main thread drains, and the main thread is where views
+    /// are torn down and rebuilt.
+    private var activeOperations: [UnsafeMutableRawPointer: Int] = [:]
+    /// Release work for retired surfaces that still had an operation running.
+    private var retirements: [UnsafeMutableRawPointer: @Sendable () -> Void] = [:]
+    /// Where a deferred release runs. Ghostty surfaces are freed on the main
+    /// thread; tests inject a recorder.
+    private let scheduleRelease: @Sendable (@escaping @Sendable () -> Void) -> Void
+    /// Runs on the drain after a batch is taken and the lock dropped, before
+    /// the surface is looked up. Tests use it to change the surface in that
+    /// window; production passes the default no-op.
+    private let drainWillUseSurface: @Sendable () -> Void
     private var hostOutputRevision: UInt64 = 0
     private var hostOutputObservers: [UUID: AsyncStream<UInt64>.Continuation] = [:]
 
     var parsedHostOutputRevision: UInt64 {
         condition.lock(); defer { condition.unlock() }
         return hostOutputRevision
+    }
+
+    /// Counts completed native screen mutations from this queue: parsed host
+    /// output and process-exit reports. `screenMutationInFlight` is true from
+    /// before such a C call starts until after the count advances, so a
+    /// reader never pairs an unchanged count with a half-applied mutation.
+    private var screenMutations: UInt64 = 0
+    private var screenMutationInFlight = false
+
+    /// A consistent read of the screen-mutation state; nil without a surface.
+    var screenState: InMemoryTerminalScreenState? {
+        condition.lock(); defer { condition.unlock() }
+        guard surface != nil else { return nil }
+        return InMemoryTerminalScreenState(surfaceGeneration: generation, mutations: screenMutations,
+                                           mutationInFlight: screenMutationInFlight)
     }
 
     func parsedHostOutputEvents() -> AsyncStream<UInt64> {
@@ -75,18 +103,25 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
     init(
         write: @escaping Write,
         processExit: @escaping ProcessExit,
-        queuedWriteByteLimit: Int = 8 << 20
+        queuedWriteByteLimit: Int = 8 << 20,
+        scheduleRelease: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void = { release in
+            DispatchQueue.main.async(execute: release)
+        },
+        drainWillUseSurface: @escaping @Sendable () -> Void = {}
     ) {
         self.write = write
         self.processExit = processExit
         self.queuedWriteByteLimit = max(1, queuedWriteByteLimit)
+        self.scheduleRelease = scheduleRelease
+        self.drainWillUseSurface = drainWillUseSurface
     }
 
+    /// Attaches `surface`. The previous surface, if any, stops receiving
+    /// operations at once (its generation is retired) but is not waited for;
+    /// whoever frees it must go through `retireSurface`.
     func setSurface(_ surface: ghostty_surface_t?) {
         condition.lock()
         generation &+= 1
-        self.surface = nil
-        waitForActiveOperations()
         self.surface = surface
         queuedWrites = Data()
         leadingWrite = nil
@@ -127,7 +162,6 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
 
         generation &+= 1
         surface = nil
-        waitForActiveOperations()
         queuedWrites = Data()
         leadingWrite = nil
         postExitWrites = Data()
@@ -220,10 +254,10 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
             condition.unlock()
             return nil
         }
-        activeOperations += 1
+        beginOperationLocked(on: surface)
         condition.unlock()
 
-        defer { finishOperation() }
+        defer { finishOperation(on: surface) }
         return operation(surface)
     }
 
@@ -257,22 +291,30 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
                 condition.unlock()
                 return
             }
+            screenMutationInFlight = true
             condition.broadcast()
             condition.unlock()
+            drainWillUseSurface()
 
             if !batch.isEmpty {
                 withSurface(generation: batchGeneration) { surface in
                     write(surface, batch)
                     condition.lock()
                     hostOutputRevision &+= 1
+                    screenMutations &+= 1
                     for observer in hostOutputObservers.values { observer.yield(hostOutputRevision) }
                     condition.unlock()
                 }
+                condition.lock()
+                screenMutationInFlight = false
+                condition.unlock()
             } else if let exit {
                 withSurface(generation: exit.generation) { surface in
                     processExit(surface, exit.code, exit.runtime)
                 }
                 condition.lock()
+                screenMutations &+= 1
+                screenMutationInFlight = false
                 if !postExitWrites.isEmpty {
                     queuedWrites.append(postExitWrites)
                     postExitWrites = Data()
@@ -299,25 +341,61 @@ final class InMemoryTerminalSurfaceAccess: @unchecked Sendable {
             condition.unlock()
             return
         }
-        activeOperations += 1
+        beginOperationLocked(on: surface)
         condition.unlock()
 
-        defer { finishOperation() }
+        defer { finishOperation(on: surface) }
         operation(surface)
     }
 
-    private func finishOperation() {
-        condition.lock()
-        activeOperations -= 1
-        if activeOperations == 0 {
-            condition.broadcast()
-        }
-        condition.unlock()
+    private func beginOperationLocked(on surface: ghostty_surface_t) {
+        activeOperations[surface, default: 0] += 1
     }
 
-    private func waitForActiveOperations() {
-        while activeOperations > 0 {
-            condition.wait()
+    private func finishOperation(on surface: ghostty_surface_t) {
+        condition.lock()
+        let remaining = (activeOperations[surface] ?? 1) - 1
+        activeOperations[surface] = remaining > 0 ? remaining : nil
+        let release = remaining > 0 ? nil : retirements.removeValue(forKey: surface)
+        condition.broadcast()
+        condition.unlock()
+        if let release { scheduleRelease(release) }
+    }
+
+    /// Hands over `surface` for release once nothing uses it.
+    ///
+    /// The surface must no longer be current (`clearSurface` or `setSurface`
+    /// replaced it); if it still is, it is cleared first so no new operation
+    /// can start on it. With no operation running, `release` runs now, on the
+    /// caller's thread. Otherwise it runs once, through `scheduleRelease`,
+    /// after the last operation on this surface returns. The caller never
+    /// waits, so a write blocked on the main-thread mailbox can finish.
+    func retireSurface(_ retired: ghostty_surface_t, release: @escaping @Sendable () -> Void) {
+        condition.lock()
+        if surface == retired {
+            generation &+= 1
+            surface = nil
+            queuedWrites = Data()
+            leadingWrite = nil
+            postExitWrites = Data()
+            queuedWriteGeneration = generation
+            pendingProcessExit = nil
+            condition.broadcast()
         }
+        let busy = (activeOperations[retired] ?? 0) > 0
+        if busy { retirements[retired] = release }
+        condition.unlock()
+        if !busy { release() }
+    }
+
+    /// Test-only view of the per-surface bookkeeping.
+    var activeOperationCountForTesting: Int {
+        condition.lock(); defer { condition.unlock() }
+        return activeOperations.values.reduce(0, +)
+    }
+
+    var pendingRetirementCountForTesting: Int {
+        condition.lock(); defer { condition.unlock() }
+        return retirements.count
     }
 }

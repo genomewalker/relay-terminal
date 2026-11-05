@@ -55,6 +55,10 @@ type communicationRemoteMessage struct {
 	MessageID          string                          `json:"message_id"`
 	Fingerprint        string                          `json:"fingerprint"`
 	Text               string                          `json:"text,omitempty"`
+	// SourceSignature is the sender's session-signed statement for this
+	// message, issued by the sending node's relayd. It is outside the
+	// fingerprint, so older peers ignore it and deliver a claimed label.
+	SourceSignature string `json:"source_signature,omitempty"`
 }
 type communicationRemoteReceipt struct {
 	Version      int            `json:"version"`
@@ -265,6 +269,7 @@ func communicationRemoteLinkOperation(root, node string, r CommunicationRequest)
 func remoteMessageFingerprint(message communicationRemoteMessage) string {
 	message.Operation = "send"
 	message.Fingerprint = ""
+	message.SourceSignature = ""
 	data, _ := json.Marshal(message)
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
@@ -290,6 +295,9 @@ func remoteReceiptResult(receipt communicationRemoteReceipt) map[string]any {
 	result["message_id"], result["source_node_id"], result["source_pane_id"] = receipt.MessageID, receipt.PeerNodeID, receipt.SourcePaneID
 	result["target_node_id"], result["pane_id"], result["submitting_client_id"] = receipt.NodeID, receipt.TargetPaneID, receipt.CallerID
 	result["peer_authentication"], result["source_authentication"] = "mutual_tls_pinned_node", "claimed_pane_label"
+	if receipt.Result["source_authentication"] == "source_signed" {
+		result["source_authentication"] = "source_signed"
+	}
 	result["authority"], result["desktop_required"], result["replay_permitted"] = "relayd", false, false
 	result["fingerprint"] = receipt.Fingerprint
 	return result
@@ -361,6 +369,9 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 			TargetPaneID: message.TargetPaneID, CallerID: message.CallerID, MessageID: message.MessageID, Fingerprint: message.Fingerprint, Result: map[string]any{"status": "unknown"}}), nil
 	}
 	target := hooks.observe(message.TargetPaneID)
+	// A sender signature is verified against this route's own pinned peer: the
+	// node that authenticated the channel must be the node that signed.
+	source, authentication, signatureError := communicationRemoteSourcePacket(message, certificateHash, time.Now().UTC())
 	claimed := false
 	err = communicationFanoutLocked(root, func() error {
 		if err := ctx.Err(); err != nil {
@@ -385,8 +396,11 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 			SourcePaneID: message.SourcePaneID, TargetPaneID: message.TargetPaneID, CallerID: message.CallerID, MessageID: message.MessageID,
 			Fingerprint: message.Fingerprint, CreatedAt: time.Now().UTC(), Result: map[string]any{"status": "outcome_unknown", "message_id": message.MessageID,
 				"source_node_id": message.SourceNodeID, "source_pane_id": message.SourcePaneID, "target_node_id": node, "pane_id": message.TargetPaneID,
-				"submitting_client_id": message.CallerID, "peer_authentication": "mutual_tls_pinned_node", "source_authentication": "claimed_pane_label",
+				"submitting_client_id": message.CallerID, "peer_authentication": "mutual_tls_pinned_node", "source_authentication": authentication,
 				"authority": "relayd", "desktop_required": false, "replay_permitted": false}}
+		if signatureError != "" {
+			receipt.Result["source_signature_error"] = signatureError
+		}
 		if err := communicationAtomic(path, receipt); err != nil {
 			return err
 		}
@@ -406,7 +420,7 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 		return remoteReceiptResult(receipt), nil
 	}
 	packet := map[string]any{"operation": "send", "expected": target.Endpoint, "messageID": message.MessageID, "targetPaneID": message.TargetPaneID,
-		"text": message.Text, "submittingClientID": message.CallerID, "source": map[string]any{"hostID": message.SourceNodeID, "paneID": message.SourcePaneID, "sessionID": message.SourceConversation.SessionID}}
+		"text": message.Text, "submittingClientID": message.CallerID, "source": source}
 	native, sendErr := hooks.send(message.TargetPaneID, packet)
 	outcome := communicationNativeOutcome(native, sendErr)
 	err = communicationFanoutLocked(root, func() error {
@@ -426,6 +440,31 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 	})
 	return remoteReceiptResult(receipt), err
 }
+
+// communicationRemoteSourcePacket builds the sender packet for a peer-route
+// message. Without a valid signature from this route's pinned peer it is the
+// claimed pane label, as before; with one it is source_signed and carries the
+// sender's permission class as observed on the sending node.
+func communicationRemoteSourcePacket(message communicationRemoteMessage, certificateHash string, now time.Time) (map[string]any, string, string) {
+	claimed := map[string]any{"hostID": message.SourceNodeID, "paneID": message.SourcePaneID, "sessionID": message.SourceConversation.SessionID}
+	if message.Operation != "send" || message.SourceSignature == "" {
+		return claimed, "claimed_pane_label", ""
+	}
+	verified, err := communicationVerifyEnvelope(message.SourceSignature,
+		[]communicationTrustedNode{{NodeID: message.SourceNodeID, CertificateSHA256: certificateHash}}, now)
+	if err != nil {
+		return claimed, "claimed_pane_label", communicationBoundedString(err.Error(), 200)
+	}
+	statement := verified.Statement
+	if statement.SourceNodeID != message.SourceNodeID || statement.SourcePaneID != message.SourcePaneID ||
+		statement.TargetPaneID != message.TargetPaneID || statement.MessageID != message.MessageID ||
+		statement.SourceSessionID != message.SourceConversation.SessionID ||
+		statement.TextSHA256 != communicationTextDigest(message.Text) {
+		return claimed, "claimed_pane_label", "signed statement does not match this message"
+	}
+	return communicationSignedSourcePacket(verified), "source_signed", ""
+}
+
 func fmtRemoteStatus(result map[string]any) string {
 	status, _ := result["status"].(string)
 	return status

@@ -59,7 +59,7 @@ enum PaneLinkLabel {
                           link.paneIDs.allSatisfy({ self.panes[$0] != nil }), pairs.insert(Set(link.paneIDs)).inserted else { continue }
                     links.append(link)
                 }
-                selection.replaceMemberships(links, ifRevision: revision)
+                selection.replaceMemberships(links, ifRevision: revision, allSaved: rows.compactMap(PaneLinkMembership.init(record:)))
             } catch { selection.linkManagementError = "Saved links could not be loaded. Try Refresh." }
         }
     }
@@ -76,6 +76,56 @@ enum PaneLinkLabel {
                 }
                 paneLinkSelection.forgetMembership(id)
             } catch { paneLinkSelection.linkManagementError = error.localizedDescription }
+        }
+    }
+}
+
+@MainActor extension WorkspaceModel {
+    private var attachedLinkPaneIDs: Set<UUID> {
+        Set(tabs.flatMap(\.allPaneIDs)).intersection(Set(panes.keys))
+    }
+
+    func reviewDetachedPaneLinks() {
+        guard !paneLinkSelection.cleanupRunning else { return }
+        paneLinkSelection.cleanupResult = nil
+        paneLinkSelection.cleanup.review(paneLinkSelection.allSavedMemberships, attached: attachedLinkPaneIDs)
+    }
+
+    func confirmDetachedPaneLinks() {
+        let selection = paneLinkSelection
+        guard !selection.cleanupRunning else { return }
+        let approved = selection.cleanup.confirm(current: selection.allSavedMemberships, attached: attachedLinkPaneIDs)
+        guard !approved.isEmpty else { selection.cleanupResult = "No detached-pane links to remove."; return }
+        selection.cleanupRunning = true
+        selection.linkManagementError = nil
+        Task { @MainActor [weak self] in
+            defer { selection.cleanupRunning = false }
+            guard let self else { return }
+            var removed = 0
+            var skipped = 0
+            do {
+                for link in approved {
+                    let rows = try await RelayPaneMessaging.shared.savedLinks(workspace: self)
+                    let current = rows.compactMap(PaneLinkMembership.init(record:))
+                    guard DetachedPaneLinkCleanup.canRemove(link, current: current, attached: self.attachedLinkPaneIDs) else {
+                        skipped += 1; continue
+                    }
+                    let result = try await RelayPaneMessaging.shared.disconnect(linkID: link.id, workspace: self, beforeRetire: {
+                        guard DetachedPaneLinkCleanup.canRemove(link, current: current, attached: self.attachedLinkPaneIDs) else {
+                            throw RemoteCatalogError.failed("A pane was reattached. Review the remaining links again.")
+                        }
+                    })
+                    guard ["retired", "not_found"].contains(result["status"] ?? "") else {
+                        throw RemoteCatalogError.failed("Removal was not confirmed. Refresh before trying again.")
+                    }
+                    selection.forgetMembership(link.id)
+                    if result["status"] == "retired" { removed += 1 } else { skipped += 1 }
+                }
+                selection.cleanupResult = "Removed \(removed) links. Skipped \(skipped) links after rechecking."
+            } catch {
+                selection.linkManagementError = "Removed \(removed) links, then stopped: " + error.localizedDescription
+            }
+            self.refreshPaneLinkMemberships()
         }
     }
 }

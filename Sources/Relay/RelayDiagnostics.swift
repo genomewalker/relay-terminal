@@ -48,27 +48,49 @@ final class RelayDiagnostics: @unchecked Sendable {
 
     private let inputLogURL: URL
 
-    init(inputLogURL: URL? = nil) {
+    /// Categories also written to the connection journal as they happen, so
+    /// the lead-up to a stuck reconnect survives a restart or crash.
+    static let connectionJournalCategories: Set<String> = ["connection", "pane", "network", "app"]
+    /// Journal events included in an export: earlier launches as well as this one.
+    static let exportedJournalLimit = 2_000
+    private let connectionLogURL: URL?
+
+    /// Tests get a connection journal only when they name one, so they never
+    /// write into the profile's real journal.
+    init(inputLogURL: URL? = nil, connectionLogURL: URL? = nil) {
         self.inputLogURL = inputLogURL ?? RelayStateProfile.applicationSupportRoot
             .appendingPathComponent("Relay/input-diagnostics.jsonl")
+        self.connectionLogURL = connectionLogURL ?? (RelayLaunchMode.isRunningTests ? nil :
+            RelayStateProfile.applicationSupportRoot.appendingPathComponent("Relay/connection-diagnostics.jsonl"))
     }
 
     private static func inputDetails(_ details: [String: String]) -> [String: String] {
         let allowed: Set<String> = ["pane_id", "kind", "remote", "reason", "phase", "queued_actions",
             "first_responder", "surface_visible", "focus_claimed", "window_key", "eligible",
             "presented", "app_active", "sheet_active", "success", "inspection_active", "paste_active",
-            "bytes", "characters"]
+            "bytes", "characters", "terminal_report", "acknowledged", "line"]
         return details.filter {
                 guard allowed.contains($0.key) else { return false }
-                if $0.key == "bytes" || $0.key == "characters" {
+                if $0.key == "bytes" || $0.key == "characters" || $0.key == "line" {
                     guard let count = Int($0.value), count >= 0, count <= 1_000_000_000 else { return false }
                 }
+                if $0.key == "terminal_report" {
+                    guard ["none", "focus_in", "focus_out", "focus_multiple", "device_response", "mouse_motion", "mouse_wheel", "mouse_button"].contains($0.value) else { return false }
+                }
+                if $0.key == "acknowledged", $0.value != "true", $0.value != "false" { return false }
                 return true
         }
     }
 
-    private func persistInputEvent(_ event: RelayDiagnosticEvent) {
-        guard event.category == "terminal-input" else { return }
+    private func persistEvent(_ event: RelayDiagnosticEvent) {
+        let journal: URL
+        if event.category == "terminal-input" {
+            journal = inputLogURL
+        } else if Self.connectionJournalCategories.contains(event.category), let connectionLogURL {
+            journal = connectionLogURL
+        } else {
+            return
+        }
         lock.lock()
         guard inputPersistencePending < 128 else { lock.unlock(); return }
         inputPersistencePending += 1
@@ -81,27 +103,35 @@ final class RelayDiagnostics: @unchecked Sendable {
             }
             do {
                 let fm = FileManager.default
-                try fm.createDirectory(at: inputLogURL.deletingLastPathComponent(),
+                try fm.createDirectory(at: journal.deletingLastPathComponent(),
                     withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                let size = (try? fm.attributesOfItem(atPath: inputLogURL.path)[.size] as? NSNumber)?.intValue ?? 0
+                let size = (try? fm.attributesOfItem(atPath: journal.path)[.size] as? NSNumber)?.intValue ?? 0
                 if size >= 1_048_576 {
                     for index in stride(from: 3, through: 1, by: -1) {
-                        let destination = inputLogURL.appendingPathExtension(String(index))
+                        let destination = journal.appendingPathExtension(String(index))
                         if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
-                        let source = index == 1 ? inputLogURL : inputLogURL.appendingPathExtension(String(index - 1))
+                        let source = index == 1 ? journal : journal.appendingPathExtension(String(index - 1))
                         if fm.fileExists(atPath: source.path) { try fm.moveItem(at: source, to: destination) }
                     }
                 }
-                if !fm.fileExists(atPath: inputLogURL.path) {
-                    fm.createFile(atPath: inputLogURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+                if !fm.fileExists(atPath: journal.path) {
+                    fm.createFile(atPath: journal.path, contents: nil, attributes: [.posixPermissions: 0o600])
                 }
-                let file = try FileHandle(forWritingTo: inputLogURL)
+                let file = try FileHandle(forUpdating: journal)
                 defer { try? file.close() }
-                try file.seekToEnd()
-                var data = try JSONEncoder.relayDiagnostics.encode(event)
+                var data = Data()
+                // A crash can leave a torn last line. End it first, so this
+                // event starts its own line instead of being lost with it.
+                let end = try file.seekToEnd()
+                if end > 0 {
+                    try file.seek(toOffset: end - 1)
+                    if try file.read(upToCount: 1) != Data([10]) { data.append(10) }
+                    try file.seekToEnd()
+                }
+                data.append(try JSONEncoder.relayDiagnostics.encode(event))
                 data.append(10)
                 try file.write(contentsOf: data)
-            } catch { NSLog("Relay input diagnostic persistence failed: %@", String(describing: error)) }
+            } catch { NSLog("Relay diagnostic journal write failed: %@", String(describing: error)) }
         }
     }
 
@@ -131,6 +161,14 @@ final class RelayDiagnostics: @unchecked Sendable {
         }
     }
 
+    /// Tests only: begin a fresh input sampling window, so a test's events
+    /// are not dropped because earlier tests spent the shared 5 s budget.
+    func resetInputSamplerForTesting() {
+        lock.lock()
+        inputSampler = RelayInputDiagnosticSampler()
+        lock.unlock()
+    }
+
     func record(category: String, name: String, details: [String: String] = [:]) {
         if category == "terminal-input" {
             lock.lock()
@@ -148,7 +186,7 @@ final class RelayDiagnostics: @unchecked Sendable {
         events.append(event)
         if events.count > capacity { events.removeFirst(events.count - capacity) }
         lock.unlock()
-        persistInputEvent(event)
+        persistEvent(event)
         scheduleLiveExport()
     }
 
@@ -184,6 +222,24 @@ final class RelayDiagnostics: @unchecked Sendable {
         return (events, healthByConnection)
     }
 
+    /// The newest connection journal events, oldest first, across launches.
+    /// Reads without waiting for queued writes (an export can run on the
+    /// journal queue); those events are still in this launch's timeline.
+    func connectionJournal(limit: Int = exportedJournalLimit) -> [RelayDiagnosticEvent] {
+        guard let connectionLogURL, limit > 0 else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var events: [RelayDiagnosticEvent] = []
+        for url in [connectionLogURL.appendingPathExtension("1"), connectionLogURL] {
+            guard let data = try? Data(contentsOf: url) else { continue }
+            for line in data.split(separator: 10) {
+                // A crash can leave a torn last line; skip anything unreadable.
+                if let event = try? decoder.decode(RelayDiagnosticEvent.self, from: line) { events.append(event) }
+            }
+        }
+        return Array(events.suffix(limit))
+    }
+
     func export(to url: URL) throws {
         let snapshot = snapshot()
         let bundle: [String: Any] = [
@@ -194,6 +250,7 @@ final class RelayDiagnostics: @unchecked Sendable {
             "safe_mode": RelayLaunchMode.isSafeMode,
             "events": try Self.jsonValue(snapshot.events),
             "connections": try Self.jsonValue(snapshot.health),
+            "connection_journal": try Self.jsonValue(connectionJournal()),
         ]
         let data = try JSONSerialization.data(withJSONObject: bundle, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url, options: .atomic)
@@ -206,13 +263,28 @@ final class RelayDiagnostics: @unchecked Sendable {
         panel.nameFieldStringValue = "relay-diagnostics-\(Self.fileTimestamp()).json"
         panel.allowedContentTypes = [.json]
         panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            do { try self?.export(to: url) }
-            catch { RelayTheme.alert(error: error).runModal() }
+            // The outcome goes to the connection journal, so where an export
+            // went, or that it never happened, is not left to memory.
+            guard response == .OK, let url = panel.url else {
+                self?.record(category: "app", name: "diagnostics-export-cancelled")
+                return
+            }
+            do {
+                try self?.export(to: url)
+                self?.record(category: "app", name: "diagnostics-exported", details: ["path": url.path])
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } catch {
+                self?.record(category: "app", name: "diagnostics-export-failed", details: [
+                    "path": url.path, "reason": String(describing: error),
+                ])
+                RelayTheme.alert(error: error).runModal()
+            }
         }
     }
 
-    static func redact(_ value: String, key: String = "") -> String {
+    /// `limit` nil returns the whole redacted text; callers that report
+    /// completeness must not rely on the default 8 KB cut.
+    static func redact(_ value: String, key: String = "", limit: Int? = 8_192) -> String {
         let sensitiveKey = key.range(
             of: #"(?i)(password|passwd|token|secret|authorization|cookie|private.?key|credential)"#,
             options: .regularExpression
@@ -231,9 +303,11 @@ final class RelayDiagnostics: @unchecked Sendable {
                 of: pattern, with: replacement, options: .regularExpression
             )
         }
+        // Sign-in codes (device codes, OAuth code/state, pasted codes).
+        result = RelayAgentSignIn.redact(result)
         let home = redactionHome
         if !home.isEmpty { result = result.replacingOccurrences(of: home, with: "~") }
-        return String(result.prefix(8_192))
+        return limit.map { String(result.prefix($0)) } ?? result
     }
 
     private static func jsonValue<T: Encodable>(_ value: T) throws -> Any {

@@ -629,14 +629,20 @@ enum TerminalEnergyPolicy {
 }
 
 enum TerminalSnapshotCompactionPolicy {
-    /// Keep live appends O(1). Once a snapshot reaches its 2 MiB storage
-    /// boundary, compacting every following SSH packet repeatedly rescans the
-    /// entire buffer. A bounded high-water window amortizes that scan while
-    /// synchronous and scheduled persistence still enforce the disk limit.
-    static let highWaterBytes = TerminalSnapshotStore.maximumBytes * 2
+    /// Keep live appends O(1). The live buffer is trimmed as soon as it
+    /// passes the storage bound, so scheduled saves never hand the store an
+    /// oversized stream to compact on every debounce. Trimming to half the
+    /// bound leaves headroom: compacting at exactly the bound would rescan the
+    /// whole buffer again on every following SSH packet.
+    static let highWaterBytes = TerminalSnapshotStore.maximumBytes
+    static let trimTargetBytes = TerminalSnapshotStore.maximumBytes / 2
 
     static func shouldCompact(byteCount: Int) -> Bool {
         byteCount > highWaterBytes
+    }
+
+    static func trim(_ buffer: Data) -> (data: Data, truncated: Bool) {
+        TerminalSnapshotStore.boundedReportingTruncation(buffer, maximumBytes: trimTargetBytes)
     }
 }
 
@@ -722,6 +728,14 @@ struct TerminalPresentationAttachmentState {
 
 @MainActor
 final class TerminalRuntime: NSObject {
+    /// The external observations and final write used by shell admission.
+    /// Supplying a transport does not replace any identity, revision or
+    /// authorization check in sendAssistantShellCommand.
+    struct AssistantShellTransport {
+        let promptIsEmpty: @MainActor () -> Bool
+        let readOwner: @MainActor () async -> RelayPromptOwnerIdentity?
+        let send: @MainActor (String, Int) -> Bool
+    }
     private weak var pane: PaneModel?
     private let io = TerminalIOBridge()
     private let activityCoalescer = TerminalActivityCoalescer()
@@ -731,6 +745,9 @@ final class TerminalRuntime: NSObject {
     private var hoveredLink: String?
     private var fileTransferTask: Task<Void, Never>?
     private var started = false
+    /// Whether this runtime has started (attached). Read only; for checks
+    /// that hidden workspace moves never start a pane.
+    var hasStarted: Bool { started }
     private var reconnectRequiresExistingWorker = false
     private var awaitingInitialViewport = false
     private var restoreStartedAt: UInt64?
@@ -766,6 +783,9 @@ final class TerminalRuntime: NSObject {
     private var promptEditorProbeTask: Task<Void, Never>?
 
     fileprivate var usesReadlinePromptUnits: Bool { readlineShellIdentity != nil }
+    /// Tests only: the readline identity is otherwise proven by a remote
+    /// process-inventory probe.
+    func setReadlineShellIdentityForTesting(_ identity: String?) { readlineShellIdentity = identity }
 
     fileprivate func synchronizePromptWidthPolicy(active: Bool) {
         io.configurePromptWidth(readline: usesReadlinePromptUnits, promptActive: active)
@@ -884,7 +904,7 @@ final class TerminalRuntime: NSObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.initialReplayDisplayCommitted = true
-                if self.pane?.kind == .codex && !hasVisibleScreen {
+                if self.pane?.kind.usesNativePromptEditing == true && !hasVisibleScreen {
                     self.initialWidthRepaintPending = true
                 }
                 TerminalReplayTrace.log("finish-start pane=\(self.pane?.id.uuidString ?? "unknown") attached=\(self.view.window != nil) presented=\(self.presentationAttachment.isPresented) surfaceVisible=\(self.view.relaySurfaceIsVisible) renderingAllowed=\(self.allowsRendering) appActive=\(NSApp.isActive) windowVisible=\(self.view.window?.isVisible == true) alpha=\(self.view.alphaValue) epoch=\(self.pendingViewportCommitEpoch.map(String.init) ?? "none")")
@@ -1016,6 +1036,15 @@ final class TerminalRuntime: NSObject {
         setApplicationRenderingAllowed(allowed)
     }
 
+    /// Tests only: marks the terminal started on an injected transport, as
+    /// startIfNeeded does after its viewport is ready, without connecting.
+    /// Call before the view joins a window so no real transport starts.
+    func startForTesting(transport: RelayRemoteTransport) {
+        started = true
+        io.installTransport(transport)
+    }
+    var ioForTesting: TerminalIOBridge { io }
+
     func startIfNeeded() {
         guard !started, let pane else { return }
         guard pane.profile.backend == .relay else {
@@ -1078,7 +1107,7 @@ final class TerminalRuntime: NSObject {
         initialReplayWritesResumed = false
         initialWidthRepaintCompleted = false
         initialWidthRepaintFailureEpoch = nil
-        initialWidthRepaintPending = pane.kind == .codex
+        initialWidthRepaintPending = pane.kind.usesNativePromptEditing
         let forceAttachRepaint = TerminalSnapshotDisplayPolicy.requiresAttachRepaint(
             rendered: initialRestoreUsedCachedDisplay, isAgent: pane.kind != .shell
         )
@@ -1102,6 +1131,8 @@ final class TerminalRuntime: NSObject {
             tabID: pane.remoteTabID,
             paneTitle: pane.displayName,
             contentKind: pane.contentKind.rawValue,
+            // A requested start directory applies only when relayd creates the worker.
+            workingDirectory: pane.requestedStartDirectory,
             requiresExistingWorker: pane.requiresExistingWorker || reconnectRequiresExistingWorker,
             initialLastSequence: restoredSequence,
             // Retained v1 workers repaint an unchanged attach by briefly
@@ -1286,7 +1317,7 @@ final class TerminalRuntime: NSObject {
     /// committed only after both have arrived instead of relying on startup
     /// timing.
     func agentKindDidChange(_ kind: AgentKind) {
-        if kind == .codex, !initialWidthRepaintCompleted,
+        if kind.usesNativePromptEditing, !initialWidthRepaintCompleted,
            initialWidthRepaintTask == nil {
             initialWidthRepaintPending = true
             initialAuthoritativeRepaintPending = true
@@ -1308,6 +1339,10 @@ final class TerminalRuntime: NSObject {
               !explicitGeometryTransitionPending, pendingViewportCommitEpoch == nil,
               initialWidthRepaintTask == nil else { return }
         if initialWidthRepaintPending {
+            // A route without the input lease drops resizes, so the attempt
+            // could only time out and lock this presentation out of its
+            // repaint. The lease-granted attach's caught_up calls back here.
+            guard io.routeAcceptsViewportRepaint else { return }
             // A failed attempt belongs to its presentation. Retry only after
             // a new tab/window/geometry presentation, not on each output burst.
             guard initialWidthRepaintFailureEpoch != viewportPresentationEpoch else { return }
@@ -1321,7 +1356,7 @@ final class TerminalRuntime: NSObject {
         commitStableViewport()
     }
 
-    /// Codex keeps a diff buffer across SIGWINCH. A one-column change makes
+    /// Claude and Codex keep a diff buffer across SIGWINCH. A one-column change makes
     /// it redraw while Ghostty parses each frame on that same actual grid.
     /// The existing inspection surface withholds the temporary frame.
     private func beginInitialWidthRepaint() -> Bool {
@@ -1341,7 +1376,7 @@ final class TerminalRuntime: NSObject {
             return false
         }
         initialWidthRepaintEvents = continuation
-        RelayDiagnostics.shared.record(category: "snapshot", name: "codex-width-repaint-started",
+        RelayDiagnostics.shared.record(category: "snapshot", name: "agent-width-repaint-started",
             details: ["pane_id": pane?.id.uuidString.lowercased() ?? "unknown",
                       "columns": String(original.columns), "rows": String(original.rows)])
         initialWidthRepaintTask = Task { @MainActor [weak self] in
@@ -1386,7 +1421,7 @@ final class TerminalRuntime: NSObject {
                     }
                 }
                 RelayDiagnostics.shared.record(category: "snapshot",
-                    name: succeeded ? "codex-width-repaint-completed" : "codex-width-repaint-incomplete",
+                    name: succeeded ? "agent-width-repaint-completed" : "agent-width-repaint-incomplete",
                     details: ["pane_id": self.pane?.id.uuidString.lowercased() ?? "unknown"])
             }
             for await event in events {
@@ -1446,6 +1481,17 @@ final class TerminalRuntime: NSObject {
         started = false
     }
 
+    /// Attaches a restored pane whose tab has not been shown, at the grid its
+    /// snapshot log was saved at. An unattached view has no surface, so
+    /// nothing resizes until a window lays it out. A pane in a window is left
+    /// to its presentation path.
+    func startInBackground(viewport: RelayViewport) {
+        guard !started, let pane, pane.profile.backend == .relay, pane.contentKind == .terminal,
+              view.window == nil else { return }
+        io.seedInitialViewport(viewport)
+        startIfNeeded()
+    }
+
     func restart() {
         io.removeTransport()?.detach()
         started = false
@@ -1477,8 +1523,20 @@ final class TerminalRuntime: NSObject {
         keyboardFocusEligible && presentationAttachment.isPresented && view.relaySurfaceIsVisible
     }
 
-    fileprivate func notePreservedTyping() {
-        pane?.terminalInputDraftMessage = "Your text is preserved. Press Escape to cancel the draft check, or use Copy Preserved Text in the pane menu."
+    /// The notice names the exits that exist in the current hold. Escape never
+    /// discards: only the pane menu's Discard Preserved Input does.
+    fileprivate func notePreservedTyping(inspectionActive: Bool, files: Bool) {
+        pane?.terminalInputDraftMessage = Self.preservedTypingNotice(inspectionActive: inspectionActive, files: files)
+    }
+
+    static func preservedTypingNotice(inspectionActive: Bool, files: Bool) -> String {
+        if files {
+            return "Your text and files are kept. Use Copy Preserved Text or Copy Preserved Files in the pane menu, or Discard Preserved Input."
+        }
+        if inspectionActive {
+            return "Relay is checking the draft. Your text is kept. Press Escape to stop the check and resume typing; held keys are not sent, use Copy Preserved Text in the pane menu."
+        }
+        return "Typing is paused: Relay could not verify the draft. Your text is kept. Press Escape to resume typing; held keys are not sent, use Copy Preserved Text in the pane menu."
     }
 
     fileprivate func clearPreservedTypingNotice() { pane?.terminalInputDraftMessage = nil }
@@ -2191,7 +2249,11 @@ final class TerminalRuntime: NSObject {
         return accepted
     }
 
+    /// Tests only: replaces the host's prompt-owner-binding RPC.
+    var promptOwnerBindingForTesting: (() async -> RelayPromptOwnerIdentity?)?
+
     fileprivate func readPromptOwnerBinding() async -> RelayPromptOwnerIdentity? {
+        if let promptOwnerBindingForTesting { return await promptOwnerBindingForTesting() }
         guard let pane, pane.profile.backend == .relay else { return nil }
         let paneID = pane.id
         let hostID = pane.profile.id
@@ -2378,7 +2440,7 @@ final class TerminalRuntime: NSObject {
         guard promptInspectionControlLease(inputLease) == lease else { return false }
         // The supported bridge is already armed. Ctrl+G opens the editor;
         // no Return or provider submission is part of this inspection.
-        return io.sendPromptEditorControlInput(Data([0x07]), expectedControlLease: lease)
+        return io.sendPromptEditorControlInput(Data([0x07]), expectedControlLease: lease, automation: true)
     }
 
     fileprivate func beginPromptInspectionRestorationBarrier(inputLease: UUID,
@@ -2432,6 +2494,8 @@ final class TerminalRuntime: NSObject {
     }
     private var nativeImageValidation: AsyncStream<NativeImageWakeup>.Continuation?
     private var conversationInputLease: UUID?
+    /// Whether an inspection or conversation input operation holds the prompt.
+    var holdsConversationInputLease: Bool { conversationInputLease != nil }
 
     fileprivate func acquirePromptInspectionInputLease() -> UUID? {
         guard conversationInputLease == nil else { return nil }
@@ -2443,6 +2507,40 @@ final class TerminalRuntime: NSObject {
     fileprivate func releasePromptInspectionInputLease(_ lease: UUID) {
         guard conversationInputLease == lease else { return }
         conversationInputLease = nil
+    }
+
+    func accountForceScreenSnapshot() -> TerminalIOBridge.MaintenanceScreenSnapshot? {
+        io.maintenanceScreenSnapshot()
+    }
+
+    func accountForceScreenIsCurrent(_ token: TerminalIOBridge.MaintenanceScreenToken) -> Bool {
+        io.maintenanceScreenIsCurrent(token)
+    }
+
+    /// The account-force card is pinned to a rendered screen, pane profile and
+    /// input revision. This lease excludes other Relay conversation-input
+    /// operations. Physical input can still arrive; if it or the screen changes
+    /// while the host request is in flight, the result is uncertain and the
+    /// caller must not continue the account move.
+    func withAccountForceLease(expectedPane: PaneModel, profile: ConnectionProfile, inputRevision: UInt64,
+                               screen: TerminalIOBridge.MaintenanceScreenToken,
+                               permits: @MainActor () -> Bool,
+                               execute: @MainActor () async -> RelayAccountForceTransaction.Result) async -> RelayAccountForceTransaction.Result {
+        guard pane === expectedPane, expectedPane.profile == profile,
+              expectedPane.agentInputRevision == inputRevision, expectedPane.pendingAgentApprovals == 0,
+              !view.promptInspectionBlocksExternalInput,
+              let inputLease = acquirePromptInspectionInputLease() else { return .refused }
+        defer { releasePromptInspectionInputLease(inputLease) }
+        guard let control = promptInspectionControlLease(inputLease, requireIdleInput: false) else { return .refused }
+        func current() -> Bool {
+            pane === expectedPane && expectedPane.profile == profile &&
+                expectedPane.agentInputRevision == inputRevision && expectedPane.pendingAgentApprovals == 0 &&
+                promptInspectionControlLease(inputLease, requireIdleInput: false) == control &&
+                io.maintenanceScreenIsCurrent(screen) && !view.promptInspectionBlocksExternalInput && permits()
+        }
+        guard current(), !Task.isCancelled else { return .refused }
+        let result = await execute()
+        return current() ? result : .unknown
     }
 
     /// A native submission owns the same original PTY for one synchronous write.
@@ -2652,18 +2750,82 @@ final class TerminalRuntime: NSObject {
         return sendPromptTransport(text, maximumBytes: maximumBytes)
     }
 
+    /// Relay assistant input fence, using agent maintenance's empty-prompt
+    /// proof (live screen, or the prepared screen for a hidden pane). Nil when
+    /// the pane cannot be inspected; `empty` false means a draft or unknown.
+    func assistantPromptProof() async -> RelayAssistantInputFence.Proof? {
+        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
+              pane.connectionState == .connected else { return nil }
+        await prepareAgentMaintenancePromptProof()
+        guard self.pane === pane else { return nil }
+        let observation = observeActiveScreen()
+        return .init(empty: assistantPromptIsEmptyNow(observation), inputRevision: pane.agentInputRevision,
+                     draft: assistantPromptHasTypedTextNow(observation))
+    }
+
+    /// Positive evidence only: a visible typed draft, as maintenance reads it.
+    private func assistantPromptHasTypedTextNow(_ observation: RelayActiveScreenCache.Observation) -> Bool {
+        guard let pane else { return false }
+        if let composer = pane.composerStateIfCreated, !composer.draft.isEmpty || !composer.attachmentQueue.attachments.isEmpty {
+            return true
+        }
+        switch pane.kind {
+        case .claude, .codex: return agentMaintenanceTerminalPromptHasTypedText(observation)
+        case .shell:
+            return RelayAgentMaintenancePrompt.retainedShellHasTypedText(observation.screen)
+        case .other: return false
+        }
+    }
+
+    private func assistantPromptIsEmptyNow(_ observation: RelayActiveScreenCache.Observation) -> Bool {
+        guard let pane, conversationInputLease == nil, !view.promptInspectionBlocksExternalInput else { return false }
+        switch pane.kind {
+        case .claude, .codex: return agentMaintenancePromptIsEmpty(observation, preservingComposerDraft: false)
+        case .shell: return agentMaintenanceRetainedShellPromptIsEmpty(observation)
+        case .other: return false
+        }
+    }
+
+    /// Sends user-approved assistant text only if, at this moment, the input
+    /// revision is the one shown on the card and the prompt is still provably
+    /// empty. The check and the write happen under the conversation input
+    /// lease with no suspension in between. A draft is never cleared or joined.
+    func sendAssistantApprovedText(_ text: String, expectedInputRevision: UInt64) async -> RelayAssistantInputFence.Outcome {
+        guard let pane, pane.connectionState == .connected else { return .unavailable }
+        await prepareAgentMaintenancePromptProof()
+        guard self.pane === pane, pane.connectionState == .connected else { return .unavailable }
+        let observation = observeActiveScreen()
+        let outcome = RelayAssistantInputFence.admit(expected: expectedInputRevision, current: pane.agentInputRevision,
+                                                     empty: assistantPromptIsEmptyNow(observation),
+                                                     draft: assistantPromptHasTypedTextNow(observation))
+        guard outcome == .sent, conversationInputLease == nil else { return outcome == .sent ? .inputChanged : outcome }
+        guard let fence = screenFence(observation) else { return .inputChanged }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        return sendPromptTransport(text, maximumBytes: 64 << 10, fence: fence) ? .sent : .unavailable
+    }
+
     /// Autonomous assistant input uses a fresh owner binding and an observed,
     /// empty shell prompt. It cannot append to a draft or an agent composer.
-    func sendAssistantShellCommand(_ text: String) async -> Bool {
-        guard let pane, pane.kind == .shell, pane.connectionState == .connected,
-              pane.profile.backend == .relay, view.assistantShellPromptIsEmpty() else { return false }
+    func sendAssistantShellCommand(_ text: String, authorization: @MainActor () -> Bool = { true },
+                                   transport: AssistantShellTransport? = nil) async -> Bool {
+        func promptIsEmpty() -> Bool {
+            if let transport { return transport.promptIsEmpty() }
+            return view.assistantShellPromptIsEmpty()
+        }
+        guard !Task.isCancelled, authorization(), let pane, pane.kind == .shell, pane.connectionState == .connected,
+              pane.profile.backend == .relay, promptIsEmpty() else { return false }
         let revision = pane.agentInputRevision
-        let owner = await readPromptOwnerBinding()
-        guard RelayAssistantShellAdmission.allows(owner, paneID: pane.id, hostID: pane.profile.id),
+        let owner: RelayPromptOwnerIdentity?
+        if let transport { owner = await transport.readOwner() }
+        else { owner = await readPromptOwnerBinding() }
+        guard !Task.isCancelled, authorization(), RelayAssistantShellAdmission.allows(owner, paneID: pane.id, hostID: pane.profile.id),
               self.pane === pane, pane.kind == .shell,
-              pane.agentInputRevision == revision, view.assistantShellPromptIsEmpty() else { return false }
+              pane.agentInputRevision == revision, promptIsEmpty() else { return false }
+        if let transport { return transport.send(text, 16 << 10) }
         return sendSidePanelPrompt(text, maximumBytes: 16 << 10)
     }
+
 
     /// Explicit user recovery of an ended provider in its retained Bash pane.
     /// Recheck the worker, shell, and foreground owner before clearing the
@@ -2674,23 +2836,9 @@ final class TerminalRuntime: NSObject {
               pane.profile.backend == .relay else { return false }
         let identity = pane.id
         let revision = pane.agentInputRevision
-        let script = """
-        import pathlib,json,os
-        pane='\(identity.uuidString.lowercased())'
-        def stat(pid):
-            return (pathlib.Path('/proc')/str(pid)/'stat').read_text().rsplit(')',1)[1].split()
-        manifest=json.loads((pathlib.Path.home()/'.local/state/relay/workers'/(pane+'.json')).read_text())
-        worker=stat(\(input.workerPID)); shell=stat(\(input.shellPID))
-        ok=(manifest['worker_pid']==\(input.workerPID) and manifest['shell_pid']==\(input.shellPID)
-            and worker[19]=='\(input.workerStart)' and shell[19]=='\(input.shellStart)'
-            and int(shell[1])==\(input.workerPID) and int(shell[5])==\(input.shellPID)
-            and os.readlink('/proc/\(input.shellPID)/exe').endswith('/bash'))
-        print(json.dumps({'verified':ok,'pane_id':pane}))
-        """
-        let encoded = Data(script.utf8).base64EncodedString()
+        guard let command = RelayShellRecoveryProof.command(paneID: identity, input: input) else { return false }
         do {
-            let result = try await RelayHostExecution.capture(profile: pane.profile,
-                command: "/usr/bin/python3 -c 'import base64;exec(base64.b64decode(\"\(encoded)\"))'",
+            let result = try await RelayHostExecution.capture(profile: pane.profile, command: command,
                 timeout: 10, maximumBytes: 4_096)
             guard result.exitCode == 0,
                   let proof = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any],
@@ -2715,7 +2863,484 @@ final class TerminalRuntime: NSObject {
 
     func assistantShellPromptIsEmpty() -> Bool { view.assistantShellPromptIsEmpty() }
 
-    private func sendPromptTransport(_ text: String, maximumBytes: Int = 64 << 10) -> Bool {
+    /// The serialized active screen; see RelayActiveScreenCache. An unchanged
+    /// screen is answered from memory, a changed one is dumped once.
+    /// Each admission takes exactly one observation, after its last
+    /// suspension, decides from it alone, and passes its fence to the send.
+    private var activeScreenCache = RelayActiveScreenCache()
+    var activeScreenDumpCount: Int { activeScreenCache.dumps }
+    func observeActiveScreen() -> RelayActiveScreenCache.Observation {
+        // Output received but not yet shown (an open replay or viewport
+        // transition): refuse at admission as a changing screen, so callers
+        // refuse before their pre-send step and can retry. Advisory only;
+        // the send fence rechecks the phase under outputOrderingLock.
+        if io.outputPhaseOpenNow {
+            activeScreenCache.invalidate()
+            return .unstable
+        }
+        let session = session
+        let sample = activeScreenSampleForTesting ?? { session.activeScreenSample() }
+        return activeScreenCache.read(sample: sample, dump: { session.readActiveScreenVT() })
+    }
+    /// Tests only: replaces the admission's in-memory sample. The send fence
+    /// in TerminalIOBridge always samples the real session.
+    var activeScreenSampleForTesting: (() -> RelayActiveScreenCache.Sample)?
+
+    /// The hidden-pane replay proof. Used only when no native surface is
+    /// attached; a live surface that is changing never falls back to it.
+    private func currentPreparedPrompt(_ observation: RelayActiveScreenCache.Observation) -> PreparedMaintenancePrompt? {
+        guard observation == .noSurface, let pane, let prepared = preparedMaintenancePrompt,
+              prepared.inputRevision == pane.agentInputRevision, io.maintenanceScreenIsCurrent(prepared.token) else { return nil }
+        return prepared
+    }
+
+    /// What the send must re-verify at the write: the admitted live screen,
+    /// or for a pane with no surface the current replayed screen's token.
+    /// There is no fence without one of them, so every automatic input needs
+    /// a live key or a current replay token (nil = refuse): a changing live
+    /// screen, or a hidden pane whose replayed screen was never read or has
+    /// changed since, is refused before any other evidence counts.
+    enum ScreenFence: Equatable {
+        case live(RelayActiveScreenCache.Key)
+        case replay(TerminalIOBridge.MaintenanceScreenToken)
+        var live: RelayActiveScreenCache.Key? { if case .live(let key) = self { return key }; return nil }
+        var replay: TerminalIOBridge.MaintenanceScreenToken? { if case .replay(let token) = self { return token }; return nil }
+    }
+    func screenFence(_ observation: RelayActiveScreenCache.Observation) -> ScreenFence? {
+        switch observation {
+        case .screen(_, let key): return .live(key)
+        case .unstable: return nil
+        case .noSurface: return currentPreparedPrompt(observation).map { .replay($0.token) }
+        }
+    }
+
+    var agentMaintenancePromptIsEmpty: Bool { agentMaintenancePromptIsEmpty(preservingComposerDraft: false) }
+    var agentMaintenanceTerminalPromptIsEmpty: Bool { agentMaintenancePromptIsEmpty(preservingComposerDraft: true) }
+    /// `explainedAgents` is how many footer agents relayd's evidence accounts
+    /// for (`RelayAgentMaintenancePolicy.explainedFooterAgents`); a larger
+    /// footer agent count is running work.
+    func agentMaintenancePromptIsEmpty(explainedAgents: Int) -> Bool {
+        agentMaintenancePromptIsEmpty(preservingComposerDraft: false, explainedAgents: explainedAgents)
+    }
+    func agentMaintenanceTerminalPromptIsEmpty(explainedAgents: Int) -> Bool {
+        agentMaintenancePromptIsEmpty(preservingComposerDraft: true, explainedAgents: explainedAgents)
+    }
+
+    /// Positive evidence of typed (non-placeholder) prompt text on the current
+    /// screen. False also means "unknown"; it never authorizes a capture alone.
+    var agentMaintenanceTerminalPromptHasTypedText: Bool { agentMaintenanceTerminalPromptHasTypedText(observeActiveScreen()) }
+
+    private func agentMaintenanceTerminalPromptHasTypedText(_ observation: RelayActiveScreenCache.Observation) -> Bool {
+        guard let pane, pane.profile.backend == .relay, pane.connectionState == .connected else { return false }
+        let provider = pane.kind == .codex ? "codex" : "claude"
+        switch observation {
+        case .screen(let screen, _): return RelayAgentMaintenancePrompt.hasTypedText(screen, provider: provider)
+        case .unstable: return false
+        case .noSurface: return currentPreparedPrompt(observation)?.agentTyped ?? false
+        }
+    }
+
+    /// Positive evidence that Claude's settings overlay, and nothing else,
+    /// covers the prompt. False also means unknown.
+    var agentMaintenanceClaudeSettingsOverlay: Bool { agentMaintenanceClaudeSettingsOverlay(observeActiveScreen()) }
+
+    private func agentMaintenanceClaudeSettingsOverlay(_ observation: RelayActiveScreenCache.Observation) -> Bool {
+        guard let pane, pane.kind != .codex, pane.profile.backend == .relay, pane.connectionState == .connected else { return false }
+        switch observation {
+        case .screen(let screen, _): return RelayAgentMaintenancePrompt.isClaudeSettingsOverlay(screen)
+        case .unstable: return false
+        case .noSurface: return currentPreparedPrompt(observation)?.claudeOverlay ?? false
+        }
+    }
+
+    /// Why the terminal prompt could not be confirmed empty, for the pane's
+    /// maintenance hold. Mirrors agentMaintenancePromptIsEmpty's checks in order.
+    var agentMaintenanceTerminalPromptBlocker: String? { agentMaintenanceTerminalPromptBlocker(explainedAgents: 0) }
+
+    func agentMaintenanceTerminalPromptBlocker(explainedAgents: Int) -> String? {
+        agentMaintenanceTerminalPromptBlocker(observeActiveScreen(), explainedAgents: explainedAgents)
+    }
+
+    private func agentMaintenanceTerminalPromptBlocker(_ observation: RelayActiveScreenCache.Observation,
+                                                       explainedAgents: Int) -> String? {
+        guard let pane else { return "the pane closed" }
+        let provider = pane.kind == .codex ? "codex" : "claude"
+        for (passed, reason) in [
+            (pane.profile.backend == .relay, "the pane is not a Relay terminal"),
+            (pane.connectionState == .connected, "the pane is not connected"),
+            // Agent monitoring marks a pane connected before its terminal
+            // starts; that waits for the tab's first layout.
+            (started, "the pane's terminal has not been opened since Relay started; select its tab once so its prompt can be read"),
+            (pane.pendingAgentApprovals == 0, "an approval prompt is pending"),
+            (conversationInputLease == nil, "another input operation holds the prompt"),
+            ((pane.remoteClientCount ?? 1) <= 1, "\(pane.remoteClientCount ?? 0) viewers are attached"),
+            (!view.promptInspectionBlocksExternalInput, "a prompt inspection is active"),
+            (view.window == nil || promptEditingViewportIsLive, "the visible viewport is not live"),
+            (io.isBracketedPasteActive, "the agent has not enabled bracketed paste"),
+            (view.markedRange().location == NSNotFound, "text composition (IME) is in progress"),
+        ] where !passed { return reason }
+        if let composer = pane.composerStateIfCreated, composer.submitting || composer.nativeDeliveryHeld {
+            return "the composer is delivering a prompt"
+        }
+        if observation == .unstable { return "the screen is changing, so its prompt cannot be read yet" }
+        if let screen = observation.screen {
+            if RelayAgentMaintenancePrompt.isEmpty(screen, provider: provider, explainedAgents: explainedAgents) { return nil }
+            if let work = RelayAgentMaintenancePrompt.backgroundWork(screen, provider: provider, explainedAgents: explainedAgents) {
+                if RelayAgentMaintenancePrompt.backgroundWork(screen, provider: provider, explainedAgents: .max) == nil {
+                    return "the footer shows \(RelayAgentMaintenancePrompt.footerAgentCount(screen, provider: provider)) agent(s) but " +
+                        "relayd accounts for \(explainedAgents): the pane's subagents, harness status or the host's background " +
+                        "agent jobs are not verified (\(String(work.suffix(60))))"
+                }
+                return "the footer shows background work still running (\(String(work.suffix(60))))"
+            }
+            return "the screen's prompt or footer was not recognised"
+        }
+        guard preparedMaintenancePrompt != nil else { return "the hidden pane's screen has not been read" }
+        guard let prepared = currentPreparedPrompt(observation) else { return "the hidden pane's screen reading is stale" }
+        return prepared.empty(explainedAgents: explainedAgents) ? nil
+            : "the hidden pane's prompt or footer was not recognised, or its footer agents are not accounted for"
+    }
+
+    private func agentMaintenancePromptIsEmpty(preservingComposerDraft: Bool, explainedAgents: Int = 0) -> Bool {
+        agentMaintenancePromptIsEmpty(observeActiveScreen(), preservingComposerDraft: preservingComposerDraft,
+                                      explainedAgents: explainedAgents)
+    }
+
+    private func agentMaintenancePromptIsEmpty(_ observation: RelayActiveScreenCache.Observation,
+                                               preservingComposerDraft: Bool, explainedAgents: Int = 0) -> Bool {
+        guard let pane, pane.profile.backend == .relay, pane.connectionState == .connected, started,
+              pane.pendingAgentApprovals == 0, conversationInputLease == nil,
+              (pane.remoteClientCount ?? 1) <= 1,
+              !view.promptInspectionBlocksExternalInput,
+              (view.window == nil || promptEditingViewportIsLive), io.isBracketedPasteActive,
+              view.markedRange().location == NSNotFound else { return false }
+        if let composer = pane.composerStateIfCreated {
+            guard !composer.submitting, !composer.nativeDeliveryHeld,
+                  preservingComposerDraft || composer.draft.isEmpty && composer.attachmentQueue.attachments.isEmpty else { return false }
+        }
+        switch observation {
+        case .screen(let screen, _):
+            return RelayAgentMaintenancePrompt.isEmpty(screen, provider: pane.kind == .codex ? "codex" : "claude",
+                                                       explainedAgents: explainedAgents)
+        case .unstable: return false
+        case .noSurface: return currentPreparedPrompt(observation)?.empty(explainedAgents: explainedAgents) ?? false
+        }
+    }
+
+    private struct PreparedMaintenancePrompt {
+        let token: TerminalIOBridge.MaintenanceScreenToken
+        let inputRevision: UInt64
+        let agentEmpty: Bool
+        /// Empty apart from the footer agent count, and that count.
+        let agentEmptyIgnoringAgents: Bool
+        let footerAgents: Int
+
+        func empty(explainedAgents: Int) -> Bool {
+            explainedAgents == 0 ? agentEmpty : agentEmptyIgnoringAgents && footerAgents <= explainedAgents
+        }
+        let agentTyped: Bool
+        let shellEmpty: Bool
+        var claudeOverlay = false
+    }
+    private var preparedMaintenancePrompt: PreparedMaintenancePrompt?
+
+    /// Uses the provider's editor bridge to read exact bytes, including hard
+    /// newlines and expanded pastes. No draft is inferred from a screen and no
+    /// Return is sent. The caller must persist the backup before allowing a clear.
+    func editAgentMaintenanceDraft(proof: RelayAgentMaintenanceProbe, inputRevision: UInt64,
+        expected: Data?, replacement: Data?, beforeApply: (Data) throws -> Void = { _ in }) async throws -> Data {
+        guard let pane else { throw RelayAgentMaintenanceDraftRefusal("the pane closed") }
+        for (admitted, reason) in [
+            (proof.valid(for: pane.id) && proof.owner != nil, "the native agent identity is not verified"),
+            (proof.provider == "claude", "only Claude drafts can be captured exactly"),
+            (proof.lifecycle == "quiet", "the agent is not idle"),
+            (proof.backgroundWork == false, "background work is not verified absent"),
+            (pane.agentInputRevision == inputRevision, "new input arrived"),
+            (pane.connectionState == .connected, "the pane is not connected"),
+            (pane.pendingAgentApprovals == 0, "an approval prompt is pending"),
+            ((pane.remoteClientCount ?? 1) <= 1, "another Relay window is attached"),
+            (!view.promptInspectionBlocksExternalInput, "a prompt inspection is already active"),
+            (view.markedRange().location == NSNotFound, "text composition (IME) is in progress"),
+            (io.isBracketedPasteActive, "the agent has not enabled bracketed paste"),
+        ] where !admitted {
+            throw RelayAgentMaintenanceDraftRefusal(reason)
+        }
+        guard let owner = proof.owner, let inputLease = acquirePromptInspectionInputLease() else {
+            throw RelayAgentMaintenanceDraftRefusal("the terminal input lease is unavailable")
+        }
+        defer { releasePromptInspectionInputLease(inputLease) }
+        let profile = pane.profile
+        guard let control = promptInspectionControlLease(inputLease),
+              await readPromptOwnerBinding()?.binding == owner else { throw RelayPromptEditorRPC.Failure.changedConnection }
+        func current() -> Bool {
+            self.pane === pane && pane.profile == profile && pane.agentInputRevision == inputRevision &&
+            pane.pendingAgentApprovals == 0 && !Task.isCancelled &&
+            promptInspectionControlLease(inputLease, requireIdleInput: false) == control
+        }
+        let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        func request(_ operation: RelayPromptEditorRPC.Operation) -> RelayPromptEditorRPC.Request {
+            .init(operation: operation, id: id, owner: owner)
+        }
+        let armed = try await promptEditorRequest(request(.arm), inputLease: inputLease, expectedControlLease: control)
+        guard current(), armed.state == .armed,
+              triggerReadOnlyPromptEditor(inputLease: inputLease, expectedControlLease: control) else {
+            throw RelayPromptEditorRPC.Failure.invalidResponse
+        }
+        let captured = try await promptEditorRequest(request(.snapshot), inputLease: inputLease, expectedControlLease: control)
+        guard current(), captured.state == .captured, let text = captured.text,
+              RelayAgentMaintenanceDraft.validText(text),
+              let barrier = beginPromptInspectionRestorationBarrier(inputLease: inputLease, expectedControlLease: control) else {
+            throw RelayPromptEditorRPC.Failure.invalidResponse
+        }
+        defer { endPromptInspectionRestorationBarrier(barrier.id) }
+        var iterator = barrier.events.makeAsyncIterator()
+        guard let event = await iterator.next(), case .armed = event, current() else {
+            throw RelayPromptEditorRPC.Failure.changedConnection
+        }
+        // Cancellation restores the original text if admission or persistence
+        // fails. Once a commit is attempted its uncertain outcome is never retried.
+        do {
+            guard expected == nil || text == expected else { throw RelayPromptEditorRPC.Failure.changedConnection }
+            try beforeApply(text)
+        } catch {
+            _ = try? await promptEditorRequest(request(.cancel), inputLease: inputLease, expectedControlLease: control)
+            throw error
+        }
+        if let replacement {
+            guard RelayAgentMaintenanceDraft.validText(replacement), current() else { throw RelayPromptEditorRPC.Failure.invalidRequest }
+            var commit = request(.commit); commit.digest = RelayPromptEditorRPC.digest(text); commit.text = replacement
+            let committed = try await promptEditorRequest(commit, inputLease: inputLease, expectedControlLease: control)
+            guard committed.state == .committed, current() else { throw RelayPromptEditorRPC.Failure.invalidResponse }
+            var receipt = request(.receipt); receipt.digest = RelayPromptEditorRPC.digest(replacement)
+            let applied = try await promptEditorRequest(receipt, inputLease: inputLease, expectedControlLease: control)
+            guard applied.state == .applied, current() else { throw RelayPromptEditorRPC.Failure.invalidResponse }
+        } else {
+            let cancelled = try await promptEditorRequest(request(.cancel), inputLease: inputLease, expectedControlLease: control)
+            guard cancelled.state == .cancelled, current() else { throw RelayPromptEditorRPC.Failure.invalidResponse }
+        }
+        let (wakeups, continuation) = AsyncStream<Bool>.makeStream(bufferingPolicy: .bufferingNewest(2))
+        let frames = Task { @MainActor in
+            for await event in barrier.events {
+                switch event {
+                case .parsedFrame, .hostFrame: continuation.yield(true)
+                case .invalidated: continuation.yield(false)
+                case .armed: continue
+                }
+                break
+            }
+        }
+        let timeout = Task { @MainActor in
+            do { try await Task.sleep(for: .seconds(10)) } catch { return }
+            continuation.yield(false)
+        }
+        defer { frames.cancel(); timeout.cancel(); continuation.finish() }
+        var ready = wakeups.makeAsyncIterator()
+        guard await ready.next() == true, current(), await readPromptOwnerBinding()?.binding == owner else {
+            throw RelayPromptEditorRPC.Failure.changedConnection
+        }
+        preparedMaintenancePrompt = nil
+        view.unobservedPromptInput()
+        return text
+    }
+
+    /// Whether an explicit account move can read this pane's screen now:
+    /// its live surface, or a complete replayed buffer for the hidden
+    /// renderer. Nothing is started or attached here. A pane that has not been
+    /// opened since Relay started has neither; attaching it headless would
+    /// size its remote PTY to a default grid and still yield no complete
+    /// screen (an idle agent never repaints in full until it is presented).
+    /// The move presents the pane itself and polls this until it is nil.
+    func accountMoveScreenRefusal() -> String? {
+        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
+              pane.connectionState == .connected else { return "the pane is not connected" }
+        if started {
+            switch observeActiveScreen() {
+            case .screen: return nil
+            case .unstable: return "the screen of “\(pane.displayName)” is changing"
+            case .noSurface: if io.maintenanceScreenSnapshot() != nil { return nil }
+            }
+        }
+        return "Relay has no complete screen for “\(pane.displayName)” yet"
+    }
+
+    func prepareAgentMaintenancePromptProof() async {
+        guard let pane, pane.profile.backend == .relay, pane.connectionState == .connected,
+              observeActiveScreen() == .noSurface else { return }
+        if let cached = preparedMaintenancePrompt,
+           cached.inputRevision == pane.agentInputRevision, io.maintenanceScreenIsCurrent(cached.token) { return }
+        preparedMaintenancePrompt = nil
+        let revision = pane.agentInputRevision
+        guard let snapshot = io.maintenanceScreenSnapshot(),
+              let screen = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport),
+              self.pane === pane, pane.agentInputRevision == revision,
+              io.maintenanceScreenIsCurrent(snapshot.token) else { return }
+        preparedMaintenancePrompt = PreparedMaintenancePrompt(token: snapshot.token, inputRevision: revision,
+            agentEmpty: RelayAgentMaintenancePrompt.isEmpty(screen, provider: pane.kind == .codex ? "codex" : "claude"),
+            agentEmptyIgnoringAgents: RelayAgentMaintenancePrompt.isEmpty(screen,
+                provider: pane.kind == .codex ? "codex" : "claude", explainedAgents: .max),
+            footerAgents: RelayAgentMaintenancePrompt.footerAgentCount(screen, provider: pane.kind == .codex ? "codex" : "claude"),
+            agentTyped: RelayAgentMaintenancePrompt.hasTypedText(screen, provider: pane.kind == .codex ? "codex" : "claude"),
+            shellEmpty: RelayAgentMaintenancePrompt.retainedShellIsEmpty(screen))
+        preparedMaintenancePrompt?.claudeOverlay = pane.kind != .codex && RelayAgentMaintenancePrompt.isClaudeSettingsOverlay(screen)
+    }
+
+    /// Fixed native commands only. The model, terminal transcript and peer
+    /// messages cannot supply maintenance input. Admission is tied to the
+    /// original transport lease and a twice-checked native process proof.
+    func sendAgentMaintenanceCommand(_ command: String, proof: RelayAgentMaintenanceProbe,
+        inputRevision: UInt64, preservingComposerDraft: Bool = false) -> Bool {
+        sendAgentMaintenanceCommandOutcome(command, proof: proof, inputRevision: inputRevision,
+            preservingComposerDraft: preservingComposerDraft) == .sent
+    }
+
+    enum AgentMaintenanceSendOutcome: Equatable, Sendable {
+        case sent
+        /// Refused at admission, before any transport call, because a replay
+        /// or viewport transition was open: nothing was typed.
+        case outputPhaseOpen
+        /// Any other refusal, including one at the write, which callers must
+        /// not retry blindly.
+        case refused
+    }
+
+    func sendAgentMaintenanceCommandOutcome(_ command: String, proof: RelayAgentMaintenanceProbe,
+        inputRevision: UInt64, preservingComposerDraft: Bool = false) -> AgentMaintenanceSendOutcome {
+        guard let pane else { return .refused }
+        let observation = observeActiveScreen()
+        if observation == .unstable, io.outputPhaseOpenNow { return .outputPhaseOpen }
+        let empty = agentMaintenancePromptIsEmpty(observation, preservingComposerDraft: preservingComposerDraft,
+            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents))
+        guard proof.valid(for: pane.id), RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: empty, hasDraft: false), proof.backgroundWork != true,
+              proof.subagentWork != true,
+              command == RelayAgentMaintenancePolicy.exitCommand(provider: proof.provider),
+              pane.agentInputRevision == inputRevision,
+              empty, let fence = screenFence(observation),
+              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id),
+              let payload = TerminalPastePayload.directPayload(for: command, bracketed: true) else { return .refused }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        let sent = io.sendPromptEditorControlInput(Data((payload + "\r").utf8), expectedControlLease: lease,
+            expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        return sent ? .sent : .refused
+    }
+
+    /// r3: the context rotation's send-time gates (RelayStockRotationPolicy.sendBlocker) over the live
+    /// prompt, composer draft, approvals and input revision; nil when the input may be typed now.
+    /// The prompt is judged on `observation` when given, so a sender gates and fences one screen;
+    /// without one, the active screen is observed here.
+    func contextRotationSendBlocker(_ text: String, kind: RelayContextRotationInput, proof: RelayAgentMaintenanceProbe,
+        inputRevision: UInt64, observation: RelayActiveScreenCache.Observation? = nil) -> String? {
+        guard let pane else { return "The pane is gone" }
+        let empty = agentMaintenancePromptIsEmpty(observation ?? observeActiveScreen(), preservingComposerDraft: false,
+            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents))
+        return RelayStockRotationPolicy.sendBlocker(proof, paneID: pane.id, emptyPrompt: empty,
+            hasDraft: pane.contextRotationDraftPending, pendingApprovals: pane.pendingAgentApprovals,
+            inputRevision: pane.agentInputRevision, expectedRevision: inputRevision, text: text, kind: kind)
+    }
+
+    /// Context rotation's three inputs (capsule request, `/clear`, restore),
+    /// under the same native proof, idle evidence, input-revision, empty-prompt
+    /// and control-lease fences as a maintenance command. A composer draft is
+    /// never preserved around it: any draft defers. Only text that
+    /// RelayContextRotationPolicy admits for `kind` is typed.
+    func sendContextRotationInput(_ text: String, kind: RelayContextRotationInput, proof: RelayAgentMaintenanceProbe,
+        inputRevision: UInt64) -> Bool {
+        guard let pane else { return false }
+        let observation = observeActiveScreen()
+        let empty = agentMaintenancePromptIsEmpty(observation, preservingComposerDraft: false,
+            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents))
+        guard contextRotationSendBlocker(text, kind: kind, proof: proof, inputRevision: inputRevision,
+                                         observation: observation) == nil,
+              proof.valid(for: pane.id), proof.bound == true,
+              RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: empty, hasDraft: false), proof.backgroundWork != true,
+              proof.subagentWork != true, pane.pendingAgentApprovals == 0,
+              RelayStockRotationPolicy.admits(text, kind: kind),
+              pane.agentInputRevision == inputRevision,
+              empty, let fence = screenFence(observation),
+              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id),
+              let payload = TerminalPastePayload.directPayload(for: text, bracketed: true) else { return false }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        let sent = io.sendPromptEditorControlInput(Data((payload + "\r").utf8), expectedControlLease: lease,
+            expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        return sent
+    }
+
+    /// One Esc that closes Claude's settings overlay, under the same native
+    /// proof, input-revision and control-lease fences as a maintenance
+    /// command. It is automation, like a draft edit: the pane's input
+    /// revision is not advanced.
+    func dismissClaudeSettingsOverlay(proof: RelayAgentMaintenanceProbe, inputRevision: UInt64) -> Bool {
+        let observation = observeActiveScreen()
+        guard let pane, proof.valid(for: pane.id), proof.provider == "claude", proof.lifecycle == "quiet",
+              proof.backgroundWork != true, proof.subagentWork != true,
+              pane.agentInputRevision == inputRevision, pane.pendingAgentApprovals == 0,
+              conversationInputLease == nil, (pane.remoteClientCount ?? 1) <= 1,
+              !view.promptInspectionBlocksExternalInput, view.markedRange().location == NSNotFound,
+              agentMaintenanceClaudeSettingsOverlay(observation), let fence = screenFence(observation),
+              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id) else { return false }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        let sent = io.sendPromptEditorControlInput(Data([0x1b]), expectedControlLease: lease,
+            expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
+        if sent { preparedMaintenancePrompt = nil; view.unobservedPromptInput() }
+        return sent
+    }
+
+    /// A changing live screen refuses before any other evidence is consulted.
+    private func agentMaintenanceRetainedShellPromptIsEmpty(_ observation: RelayActiveScreenCache.Observation) -> Bool {
+        guard observation != .unstable else { return false }
+        return view.assistantShellPromptIsEmpty() ||
+            // A hidden pane has no live prompt mirror. An OSC 133 shell that
+            // has echoed nothing since its input-start mark has an empty line.
+            (io.shellInputIsEmpty && view.markedRange().location == NSNotFound &&
+             !view.promptInspectionBlocksExternalInput) ||
+            (view.markedRange().location == NSNotFound && !view.promptInspectionBlocksExternalInput &&
+             (RelayAgentMaintenancePrompt.retainedShellIsEmpty(observation.screen) ||
+              currentPreparedPrompt(observation)?.shellEmpty == true))
+    }
+
+    func resumeAgentAfterMaintenance(_ command: String, original: RelayAgentMaintenanceProbe,
+        inputRevision: UInt64, willSend: () throws -> Void) async throws -> Bool {
+        await prepareAgentMaintenancePromptProof()
+        let first = observeActiveScreen()
+        guard let pane, original.valid(for: pane.id), ["claude", "codex"].contains(original.provider ?? ""),
+              command == original.resumeCommand, command.utf8.count <= 8192,
+              !command.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),
+              pane.agentInputRevision == inputRevision, conversationInputLease == nil,
+              pane.connectionState == .connected, (pane.remoteClientCount ?? 1) <= 1, agentMaintenanceRetainedShellPromptIsEmpty(first),
+              !view.promptInspectionBlocksExternalInput else { return false }
+        let profile = pane.profile
+        let currentShell = await readPromptOwnerBinding()
+        await prepareAgentMaintenancePromptProof()
+        // The admitted observation is taken after the last suspension.
+        let observation = observeActiveScreen()
+        guard let shell = currentShell, let old = original.owner,
+              shell.hostID == profile.id, shell.binding.provider == "shell",
+              shell.binding.nodeBootId == old.nodeBootId,
+              shell.binding.workerPid == old.workerPid, shell.binding.workerStart == old.workerStart,
+              shell.binding.shellPid == old.shellPid, shell.binding.shellStart == old.shellStart,
+              self.pane === pane, pane.profile == profile, pane.agentInputRevision == inputRevision,
+              pane.connectionState == .connected, conversationInputLease == nil,
+              agentMaintenanceRetainedShellPromptIsEmpty(observation), !view.promptInspectionBlocksExternalInput,
+              let fence = screenFence(observation),
+              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: profile.id),
+              let payload = TerminalPastePayload.directPayload(for: command, bracketed: io.isBracketedPasteActive)
+              else { return false }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        try willSend()
+        let sent = io.sendPromptEditorControlInput(Data((payload + "\r").utf8), expectedControlLease: lease,
+            expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        return sent
+    }
+
+    /// With a fence, the relay write is refused unless the admitted screen is
+    /// still current at the transport boundary (TerminalIOBridge.sendUserInput).
+    private func sendPromptTransport(_ text: String, maximumBytes: Int = 64 << 10, fence: ScreenFence? = nil) -> Bool {
         guard pane?.contentKind == .terminal,
               !text.isEmpty, text.utf8.count <= maximumBytes, maximumBytes <= 128 << 10 else { return false }
         let prompt = text.replacingOccurrences(of: "\r\n", with: "\n")
@@ -2723,7 +3348,11 @@ final class TerminalRuntime: NSObject {
             guard let payload = TerminalPastePayload.directPayload(
                 for: prompt, bracketed: io.isBracketedPasteActive
             ) else { return false }
-            guard io.sendUserInput(Data((payload + "\r").utf8)) else { return false }
+            let data = Data((payload + "\r").utf8)
+            let sent = fence.map {
+                io.sendUserInput(data, expectedLiveScreen: $0.live, expectedMaintenanceScreen: $0.replay)
+            } ?? io.sendUserInput(data)
+            guard sent else { return false }
             view.unobservedPromptInput()
             pane?.userEnteredInput()
             return true
@@ -2757,6 +3386,158 @@ final class TerminalRuntime: NSObject {
 
     func endSidePanelTerminalMirror(_ id: UUID) {
         io.endSidePanelMirror(id)
+    }
+
+    private enum TerminalEditScreen {
+        case background(TerminalIOBridge.MaintenanceScreenSnapshot)
+        case renderer(ScreenFence)
+    }
+    private struct PreparedTerminalEdit {
+        let token: UUID
+        let pane: PaneModel
+        let profile: ConnectionProfile
+        let owner: RelayPromptOwnerIdentity
+        let revision: UInt64
+        let screen: TerminalEditScreen
+        let expires: TimeInterval
+    }
+    var terminalEditUptimeForTesting: (() -> TimeInterval)?
+    private var terminalEditUptime: TimeInterval { terminalEditUptimeForTesting?() ?? ProcessInfo.processInfo.systemUptime }
+    private var preparedTerminalEdit: PreparedTerminalEdit?
+
+    /// Background read of the exact ordered worker buffer. It never attaches,
+    /// selects, focuses or resizes the live terminal to make a screen readable.
+    func backgroundViewportText() async -> String? {
+        if let text = sidePanelViewportText() { return text }
+        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
+              pane.connectionState == .connected, let snapshot = io.maintenanceScreenSnapshot() else { return nil }
+        let profile = pane.profile
+        guard let text = await RelayAgentMaintenanceScreen.editingScreen(snapshot.data, viewport: snapshot.token.viewport, identity: snapshot.token.producer),
+              self.pane === pane, pane.profile == profile, io.maintenanceScreenIsCurrent(snapshot.token) else { return nil }
+        return String(text.prefix(32_768))
+    }
+
+    private func terminalEditScreenIsCurrent(_ screen: TerminalEditScreen) -> Bool {
+        switch screen {
+        case .background(let snapshot): return io.maintenanceScreenIsCurrent(snapshot.token)
+        case .renderer(let fence):
+            guard let key = fence.live else { return false }
+            return screenFence(observeActiveScreen()) == fence && io.nativeEditingScreenIsCurrent(key)
+        }
+    }
+
+    /// Read-only proof from the ordered worker snapshot or an already attached
+    /// native renderer. Neither path opens a window, changes focus or resizes.
+    func terminalEditState() async -> [String: String] {
+        preparedTerminalEdit = nil
+        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
+              pane.connectionState == .connected, conversationInputLease == nil,
+              !view.promptInspectionBlocksExternalInput, view.markedRange().location == NSNotFound else {
+            return ["status": "unavailable", "reason": "No current terminal editing surface; no focus change was attempted."]
+        }
+        let profile = pane.profile, revision = pane.agentInputRevision
+        guard let owner = await readPromptOwnerBinding() else { return ["status": "changed"] }
+        let screen: TerminalEditScreen, plain: String, source: String
+        if let snapshot = io.maintenanceScreenSnapshot() {
+            guard let text = await RelayAgentMaintenanceScreen.editingScreen(snapshot.data,
+                viewport: snapshot.token.viewport, identity: snapshot.token.producer) else { return ["status": "changed"] }
+            screen = .background(snapshot); plain = text; source = "ordered_worker_snapshot"
+        } else {
+            // AppKit retains the native surface when a tab leaves its window.
+            // Its current parsed screen is still fenced; no view is attached or
+            // constructed here, and an absent/retired surface cannot prove it.
+            let observation = observeActiveScreen()
+            guard case .screen(_, let key) = observation else {
+                return ["status": observation == .noSurface ? "unavailable" : "changed",
+                    "reason": "No complete ordered snapshot or current native renderer; no focus change was attempted."]
+            }
+            screen = .renderer(.live(key)); plain = key.rows.joined(separator: "\n")
+            source = view.window == nil ? "retained_native_renderer" : "attached_native_renderer"
+        }
+        guard await readPromptOwnerBinding() == owner, self.pane === pane, pane.profile == profile,
+              pane.agentInputRevision == revision, terminalEditScreenIsCurrent(screen),
+              conversationInputLease == nil, pane.connectionState == .connected else { return ["status": "changed"] }
+        let token = UUID()
+        preparedTerminalEdit = .init(token: token, pane: pane, profile: profile, owner: owner,
+            revision: revision, screen: screen, expires: terminalEditUptime + 30)
+        return ["status": "observed", "proof_id": token.uuidString.lowercased(),
+            "pane_id": pane.id.uuidString.lowercased(), "host": profile.kind == .local ? "This Mac" : profile.host,
+            "input_revision": String(revision), "provider": owner.binding.provider, "screen_source": source,
+            "viewport_tail": RelayAssistantRedaction.boundedTail(plain, limit: 2000),
+            "session_id": owner.binding.sessionId ?? "",
+            "note": "User focus unchanged. Proof expires in 30 seconds. New output, input or process invalidates it."]
+    }
+
+    /// Same source and kernel fences as terminal editing, without changing focus.
+    /// Only a recognized empty native prompt authorizes an operator resume.
+    func codexResumePromptProof(expected: RelayPromptOwnerBinding) async -> UUID? {
+        guard io.maintenanceScreenSnapshot() != nil else { return nil }
+        let state = await terminalEditState()
+        guard state["status"] == "observed", let proof = preparedTerminalEdit,
+              proof.owner.binding == expected else { return nil }
+        let vt: String?
+        switch proof.screen {
+        case .background(let snapshot):
+            vt = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport)
+        case .renderer: return nil
+        }
+        guard terminalEditScreenIsCurrent(proof.screen),
+              await readPromptOwnerBinding() == proof.owner,
+              pane?.pendingAgentApprovals == 0,
+              pane?.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) != true,
+              expected.provider == "codex" ? RelayAgentMaintenancePrompt.isEmpty(vt, provider: "codex") :
+                expected.provider == "shell" && RelayAgentMaintenancePrompt.retainedShellIsEmpty(vt) else { return nil }
+        return proof.token
+    }
+
+    func codexResumeOwner() async -> RelayPromptOwnerBinding? { await readPromptOwnerBinding()?.binding }
+
+    /// Budget notices may observe the native prompt but never authorize input.
+    func budgetPromptEmpty() -> Bool? {
+        let observation = observeActiveScreen()
+        if agentMaintenancePromptIsEmpty(observation, preservingComposerDraft: false) { return true }
+        if agentMaintenanceTerminalPromptHasTypedText(observation) { return false }
+        return nil
+    }
+
+    func sendTerminalEdit(_ request: RelayTerminalEditRequest, appendShellReturn: Bool = false,
+                          authorization: @MainActor () -> Bool = { true }) async -> String {
+        guard request.isValid, let proof = preparedTerminalEdit, proof.token == request.token else { return "not_sent" }
+        guard !appendShellReturn || (proof.owner.binding.provider == "shell" && request.action == "insert_text") else { return "not_sent" }
+        preparedTerminalEdit = nil
+        let pane = proof.pane
+        guard let inputLease = acquirePromptInspectionInputLease() else { return "not_sent" }
+        defer { releasePromptInspectionInputLease(inputLease) }
+        guard await readPromptOwnerBinding() == proof.owner else { return "not_sent" }
+        var packet: Data
+        switch proof.screen {
+        case .background(let snapshot):
+            guard let data = await RelayAgentMaintenanceScreen.editingInput(snapshot.data,
+                viewport: snapshot.token.viewport, request: request, identity: snapshot.token.producer) else { return "not_sent" }
+            packet = data
+        case .renderer:
+            guard terminalEditScreenIsCurrent(proof.screen),
+                  let data = view.collectNativeInput({ view.translateTerminalEdit(request) }) else { return "not_sent" }
+            packet = data
+        }
+        if appendShellReturn { packet.append(0x0d) }
+        guard !packet.isEmpty, await readPromptOwnerBinding() == proof.owner,
+              self.pane === pane, pane.profile == proof.profile, terminalEditUptime < proof.expires,
+              pane.connectionState == .connected, pane.agentInputRevision == proof.revision,
+              terminalEditScreenIsCurrent(proof.screen), !view.promptInspectionBlocksExternalInput,
+              view.markedRange().location == NSNotFound, authorization(),
+              let control = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id) else { return "not_sent" }
+        let sent: Bool
+        switch proof.screen {
+        case .background(let snapshot):
+            sent = io.sendPromptEditorControlInput(packet, expectedControlLease: control,
+                expectedMaintenanceScreen: snapshot.token, automation: true)
+        case .renderer(let fence):
+            sent = io.sendPromptEditorControlInput(packet, expectedControlLease: control,
+                expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
+        }
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        return sent ? "input_submitted" : "not_sent"
     }
 
     @discardableResult
@@ -2918,7 +3699,10 @@ final class TerminalRuntime: NSObject {
         if let command = profile.remoteCommand(forPane: pane.id) {
             parts.append(ShellQuoting.quote(command))
         }
-        return parts.joined(separator: " ")
+        // Ghostty applies the configured local shell integration to custom
+        // commands. A noninteractive shell prevents shell-only flags (such as
+        // bash's --posix) from reaching SSH, and exec keeps SSH in the foreground.
+        return "/bin/sh -c " + ShellQuoting.quote("exec " + parts.joined(separator: " "))
     }
 
 
@@ -3013,16 +3797,27 @@ final class TerminalRuntime: NSObject {
               let pane, pane.profile.backend == .relay else { return false }
         let profile = pane.profile
         let paneID = pane.id.uuidString.lowercased()
-        view.toolTip = "Uploading \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) files")…"
+        let transferID = UUID()
+        pane.uploadProgressID = transferID
+        let transferName = urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) items"
+        pane.uploadProgress = .init(phase: .preparing, name: transferName)
+        view.toolTip = "Uploading \(transferName)…"
         fileTransferTask = Task { @MainActor [weak self] in
             do {
                 let imported = try await RemoteFileTransfer.upload(
                     urls,
                     toPane: paneID,
                     profile: profile,
-                    resume: resume
+                    resume: resume,
+                    progress: { [weak pane] update in
+                        await MainActor.run {
+                            guard let pane, pane.uploadProgressID == transferID else { return }
+                            pane.uploadProgress = update
+                        }
+                    }
                 )
-                guard let self, !Task.isCancelled else { return }
+                guard let self, !Task.isCancelled, self.pane?.id == pane.id,
+                      pane.uploadProgressID == transferID else { return }
                 self.fileTransferTask = nil
                 if let path = imported.first?.path {
                     pane.directory = TerminalPathSyntax.parentDirectory(path)
@@ -3036,9 +3831,16 @@ final class TerminalRuntime: NSObject {
                     "pane_id": pane.id.uuidString.lowercased(),
                     "files": String(imported.count),
                 ])
+            } catch is CancellationError {
+                self?.fileTransferTask = nil
+                if pane.uploadProgressID == transferID {
+                    pane.uploadProgress = .init(phase: .failed, name: transferName,
+                        message: "Upload paused. Drop the same items here to resume.")
+                }
             } catch {
-                guard let self else { return }
+                guard let self, pane.uploadProgressID == transferID else { return }
                 self.fileTransferTask = nil
+                pane.uploadProgress = .init(phase: .failed, name: transferName, message: error.localizedDescription)
                 self.view.toolTip = error.localizedDescription
                 NSSound.beep()
                 let alert = RelayTheme.alert()
@@ -3102,23 +3904,8 @@ final class TerminalRuntime: NSObject {
     }
 
     private func showArtifact(path: String) {
-        if let lastArtifact, lastArtifact.path == path {
-            pane?.receivedArtifact(path: path, data: lastArtifact.data)
-            return
-        }
-        guard let profile = pane?.profile else { return }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let data = try await RemoteArtifactLoader.load(path: path, profile: profile)
-                self.presentArtifact(path: path, data: data)
-            } catch {
-                RelayDiagnostics.shared.record(category: "artifact", name: "open_failed", details: [
-                    "path": path,
-                    "message": error.localizedDescription,
-                ])
-            }
-        }
+        // An explicit open always rereads the file: cached bytes may be stale.
+        pane?.openFilePreview(path: path, kind: RelayFilePreviewKind.from(path: path))
     }
 
     @discardableResult
@@ -3128,6 +3915,8 @@ final class TerminalRuntime: NSObject {
         case .web(let url):
             NSWorkspace.shared.open(url)
         case .image(let path):
+            showArtifact(path: resolvedRemotePath(path))
+        case .file(let path) where RelayFilePreviewKind.from(path: path) != nil:
             showArtifact(path: resolvedRemotePath(path))
         case .file(let path):
             guard let pane else { return false }
@@ -3243,6 +4032,18 @@ final class TerminalActivityCoalescer: @unchecked Sendable {
 }
 
 final class TerminalIOBridge: @unchecked Sendable {
+    struct MaintenanceScreenToken: Equatable, Sendable {
+        let producer: UUID
+        let sequence: UInt64
+        let replayGeneration: UInt64
+        let viewport: RelayViewport
+        var snapshotRevision: UInt64 = 0
+    }
+    struct MaintenanceScreenSnapshot: Sendable {
+        let token: MaintenanceScreenToken
+        let data: Data
+    }
+
     struct SnapshotRestoration {
         let remoteSequence: UInt64
         let rendered: Bool
@@ -3251,6 +4052,9 @@ final class TerminalIOBridge: @unchecked Sendable {
     enum PromptEditorRestorationEvent: Equatable, Sendable {
         case armed(revision: UInt64)
         case parsedFrame(revision: UInt64)
+        // Raw frame completion wakes a hidden pane. Its caller must still use
+        // the exact editor readback or a current offscreen native screen proof.
+        case hostFrame
         case invalidated
     }
     struct PromptEditorRestorationBarrier: Sendable {
@@ -3335,6 +4139,27 @@ final class TerminalIOBridge: @unchecked Sendable {
     private let displayQueue = DispatchQueue(label: "relay.terminal-display", qos: .userInteractive)
     private var displayBuffer = Data()
     private var displayDrainScheduled = false
+    /// Display bytes accepted from receive() and not yet handed to the native
+    /// session: buffered or taken by a drain still delivering. Guarded by
+    /// displayLock. The live-screen send fence requires zero.
+    private var displayBytesInTransit = 0
+    /// Tests only: runs inside outputOrderingLock right after a send's final
+    /// fence check and before the transport records the input.
+    var fenceCheckedForTesting: (() -> Void)?
+    /// Tests only: runs on the replay commit with replayLock held, just before
+    /// the commit enters the display queue.
+    var replayCommitWillEnqueueForTesting: (() -> Void)?
+    /// Tests only: runs when a send-side phase read, holding
+    /// outputOrderingLock, is about to take replayLock.
+    var phaseReadWillLockReplayForTesting: (() -> Void)?
+    var snapshotRevisionForTesting: UInt64 {
+        receiveLock.lock(); defer { receiveLock.unlock() }
+        return snapshotRevision
+    }
+    var displayBytesInTransitForTesting: Int {
+        displayLock.lock(); defer { displayLock.unlock() }
+        return displayBytesInTransit
+    }
     /// Uptime of the last display drain; guarded by displayLock.
     private var lastDisplayDrainUptime: UInt64?
     /// Live browser companions observe the exact byte stream delivered to
@@ -3378,12 +4203,20 @@ final class TerminalIOBridge: @unchecked Sendable {
     private var programStatusReplyOwnedByWorker = false
     private var filterDeviceResponsesUntil = Date.distantPast
     private var snapshotPaneID: UUID?
-    private var snapshotBuffer = Data()
+    /// Guarded by receiveLock. Every mutation (append, compaction, restore,
+    /// replay commit, reset) advances snapshotRevision, so a maintenance
+    /// token names these exact bytes, not only their remote sequence.
+    private var snapshotBuffer = Data() { didSet { snapshotRevision &+= 1 } }
+    private var snapshotRevision: UInt64 = 0
+    /// The buffer was cut to a suffix without its screen base. It is still
+    /// persisted for its resume cursor, but the store will not replay it.
+    private var snapshotBufferTruncated = false
     private var snapshotRemoteSequence: UInt64 = 0
     private let alternateScreenCleanup = TerminalAlternateScreenCleanupFilter()
     private let commandReturnCleanup = TerminalCommandReturnCleanup()
     private let bracketedPasteTracker = TerminalBracketedPasteStateTracker()
     private let semanticPromptTracker = TerminalSemanticPromptStateTracker()
+    private let shellInputTracker = TerminalShellInputTracker()
     private let promptWidthMode = TerminalPromptWidthMode()
     private var snapshotWriteWindowStartedAt: DispatchTime?
     private var snapshotScheduledDeadline: DispatchTime?
@@ -3457,6 +4290,14 @@ final class TerminalIOBridge: @unchecked Sendable {
         suppressesPixelOnlyResizes: true
     )
 
+    /// The grid a hidden pane's first Hello carries. Only before a transport
+    /// is installed; a laid-out surface reports its own grid afterwards.
+    func seedInitialViewport(_ viewport: RelayViewport) {
+        resizeLock.lock()
+        if transport == nil { latestViewport = viewport }
+        resizeLock.unlock()
+    }
+
     func installTransport(_ transport: RelayRemoteTransport) {
         outputOrderingLock.lock()
         invalidatePromptEditorRestorationBarrier()
@@ -3502,6 +4343,14 @@ final class TerminalIOBridge: @unchecked Sendable {
         return current?.promptEditorLeaseEvents()
     }
 
+    /// Whether the worker will act on a resize sent over the current route.
+    var routeAcceptsViewportRepaint: Bool {
+        resizeLock.lock()
+        let current = transport
+        resizeLock.unlock()
+        return current?.acceptsViewportRepaint == true
+    }
+
     @discardableResult
     func reconnectExistingPaneRoute() -> Bool {
         resizeLock.lock()
@@ -3528,6 +4377,40 @@ final class TerminalIOBridge: @unchecked Sendable {
         let viewport = latestViewport
         resizeLock.unlock()
         return viewport
+    }
+
+    func maintenanceScreenSnapshot() -> MaintenanceScreenSnapshot? {
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
+        phaseReadWillLockReplayForTesting?()
+        replayLock.lock()
+        let ready = !replaying && replayCommitGeneration == nil
+        let generation = replayGeneration
+        let observed = maximumObservedRemoteSequence
+        replayLock.unlock()
+        guard ready else { return nil }
+        // Sequence-zero bytes buffered in an open viewport transition change
+        // neither the sequence nor the replay buffer: no token while it is open.
+        presentationLock.lock()
+        let transitionOpen = viewportTransitionActive
+        presentationLock.unlock()
+        guard !transitionOpen else { return nil }
+        resizeLock.lock()
+        let producer = outputProducerID
+        let viewport = latestViewport
+        let connected = transport != nil
+        resizeLock.unlock()
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        guard connected, !snapshotBufferTruncated, !snapshotBuffer.isEmpty,
+              snapshotRemoteSequence > 0, observed <= snapshotRemoteSequence else { return nil }
+        return MaintenanceScreenSnapshot(token: MaintenanceScreenToken(producer: producer,
+            sequence: snapshotRemoteSequence, replayGeneration: generation, viewport: viewport,
+            snapshotRevision: snapshotRevision), data: snapshotBuffer)
+    }
+
+    func maintenanceScreenIsCurrent(_ token: MaintenanceScreenToken) -> Bool {
+        maintenanceScreenSnapshot()?.token == token
     }
 
     func beginSidePanelMirror(
@@ -3573,6 +4456,10 @@ final class TerminalIOBridge: @unchecked Sendable {
     var isBracketedPasteActive: Bool {
         bracketedPasteTracker.isActive
     }
+
+    /// The retained shell has begun reading a command line and has echoed
+    /// nothing since; see TerminalShellInputTracker.
+    var shellInputIsEmpty: Bool { shellInputTracker.inputIsEmpty }
 
     func terminalDidResize(columns: UInt16, rows: UInt16) {
         let viewport = RelayViewport(columns: columns, rows: rows)
@@ -3725,6 +4612,10 @@ final class TerminalIOBridge: @unchecked Sendable {
     }
 
     func beginViewportTransition() {
+        // Opening the phase is ordered with the send fence, which refuses
+        // while it is open (outputPhaseIsOpen).
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
         resizeLock.lock()
         pendingConfirmedViewport = nil
         pendingConfirmedRepaint = false
@@ -3751,18 +4642,15 @@ final class TerminalIOBridge: @unchecked Sendable {
         presentationLock.unlock()
     }
 
-    func finishViewportTransition(
-        rows: UInt16,
-        completion: (@Sendable () -> Void)? = nil
-    ) {
+    /// Caller holds outputOrderingLock. True when a replacement was queued.
+    private func finishViewportTransitionOrdered() -> Bool {
         resizeLock.lock()
         resizeTransitionActive = false
         resizeLock.unlock()
         presentationLock.lock()
         guard viewportTransitionActive else {
             presentationLock.unlock()
-            completion?()
-            return
+            return false
         }
         viewportTransitionActive = false
         let replacement = viewportTransitionBuffer
@@ -3774,8 +4662,7 @@ final class TerminalIOBridge: @unchecked Sendable {
 
         guard !replacement.isEmpty else {
             presentationLock.unlock()
-            completion?()
-            return
+            return false
         }
         // Resize does not imply a complete repaint, even on the alternate
         // screen. Preserve the application stream verbatim: a synthetic erase
@@ -3789,6 +4676,23 @@ final class TerminalIOBridge: @unchecked Sendable {
         // whether to feed Ghostty, the side-panel observers, or both.
         enqueueDisplayWhilePresentationLocked(replacement, immediate: true)
         presentationLock.unlock()
+        return true
+    }
+
+    func finishViewportTransition(
+        rows: UInt16,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
+        // Ordered with the send fence: the replacement frame and its snapshot
+        // bytes enter under outputOrderingLock, taken before presentationLock.
+        // The completion never runs under the lock.
+        outputOrderingLock.lock()
+        let queued = finishViewportTransitionOrdered()
+        outputOrderingLock.unlock()
+        guard queued else {
+            completion?()
+            return
+        }
         guard let completion else { return }
         // Drain explicitly so completion cannot overtake the zero-delay
         // display work item. Waiting for the in-memory backend is the parser
@@ -3846,6 +4750,16 @@ final class TerminalIOBridge: @unchecked Sendable {
         return outputProducerID == id
     }
 
+    /// The transport incarnation producing output, and the shell's command
+    /// count and prompt state, for binding a sign-in code hand-off.
+    var signInContext: (producer: UUID, execution: UInt64, promptShown: Bool) {
+        resizeLock.lock()
+        let producer = outputProducerID
+        resizeLock.unlock()
+        let prompt = semanticPromptTracker.persistentState
+        return (producer, prompt.executions, prompt.promptActive)
+    }
+
     func isCurrentTransport(_ source: RelayRemoteTransport, deliveryEpoch: UUID? = nil) -> Bool {
         acceptsOutputSource(source) &&
             (deliveryEpoch.map { source.isCurrentDeliveryEpoch($0) } ?? true)
@@ -3872,6 +4786,7 @@ final class TerminalIOBridge: @unchecked Sendable {
         let sourceEpoch = sourceTransport?.deliveryEpochSnapshot()
         let preprocessingStartedAt = TerminalReplayTrace.enabled ? ProcessInfo.processInfo.systemUptime : 0
         bracketedPasteTracker.observe(data)
+        shellInputTracker.observe(data)
         let priorExecution = semanticPromptTracker.executionGeneration
         let semanticState = semanticPromptTracker.observe(data)
         let executionChanged = semanticPromptTracker.executionGeneration != priorExecution
@@ -3965,6 +4880,11 @@ final class TerminalIOBridge: @unchecked Sendable {
     }
 
     func restoreSnapshot(paneID: UUID) -> SnapshotRestoration? {
+        // The restored bytes replace the replay buffer and enter the display
+        // queue; both are ordered with the send fence.
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
+        shellInputTracker.forget()
         let cacheStartedAt = TerminalReplayTrace.enabled ? ProcessInfo.processInfo.systemUptime : 0
         receiveLock.lock()
         snapshotPaneID = paneID
@@ -3976,8 +4896,20 @@ final class TerminalIOBridge: @unchecked Sendable {
             preservesRestoredScreenOnReconnect = false
             replayLock.unlock()
             if let resumeCursor = store.loadResumeCursor(paneID: paneID), resumeCursor > 0 {
+                // The worker resumes after this cursor, so the bytes that
+                // enabled bracketed paste are never replayed. Workers without
+                // terminal_mode_state_v1 send no mode prelude either.
+                if let saved = store.loadBracketedPasteState(paneID: paneID),
+                   bracketedPasteTracker.persistentState == TerminalSnapshotTrackerState.initial.bracketedPaste {
+                    bracketedPasteTracker.restore(saved)
+                }
                 receiveLock.lock()
                 TerminalBufferRetentionPolicy.clear(&snapshotBuffer)
+                // relayd resumes a valid cursor with only the bytes after it,
+                // and nothing here holds their screen base: neither a truncated
+                // log nor one for another viewport. Keep the rebuilt buffer
+                // unreplayable until a full clear or replacement commit.
+                snapshotBufferTruncated = true
                 snapshotRemoteSequence = resumeCursor
                 receiveLock.unlock()
                 RelayDiagnostics.shared.record(
@@ -4008,11 +4940,12 @@ final class TerminalIOBridge: @unchecked Sendable {
             replayLock.unlock()
             receiveLock.lock()
             TerminalBufferRetentionPolicy.clear(&snapshotBuffer)
+            // Cursor-only like the branch above: the delta that follows has
+            // lost the cached modes it was drawn under.
+            snapshotBufferTruncated = true
             snapshotRemoteSequence = cached.remoteSequence
             receiveLock.unlock()
-            commandReturnCleanup.observe(cached.payload)
-            alternateScreenCleanup.observe(cached.payload)
-            bracketedPasteTracker.observe(cached.payload)
+            _ = hydrateRestoreTrackers(cached, includesSemanticPrompt: false)
             RelayDiagnostics.shared.record(
                 category: "snapshot",
                 name: "mode-only-cursor-restored",
@@ -4035,23 +4968,20 @@ final class TerminalIOBridge: @unchecked Sendable {
         }
         receiveLock.lock()
         snapshotBuffer = cached.payload
+        snapshotBufferTruncated = false
         snapshotRemoteSequence = cached.remoteSequence
         receiveLock.unlock()
         replayLock.lock()
         preservesRestoredScreenOnReconnect = true
         replayLock.unlock()
         let trackersStartedAt = TerminalReplayTrace.enabled ? ProcessInfo.processInfo.systemUptime : 0
-        commandReturnCleanup.observe(cached.payload)
-        alternateScreenCleanup.observe(cached.payload)
-        let alternateFinishedAt = TerminalReplayTrace.enabled ? ProcessInfo.processInfo.systemUptime : 0
-        bracketedPasteTracker.observe(cached.payload)
-        let pasteFinishedAt = TerminalReplayTrace.enabled ? ProcessInfo.processInfo.systemUptime : 0
-        if let active = semanticPromptTracker.observe(cached.payload) {
+        let hydration = hydrateRestoreTrackers(cached, includesSemanticPrompt: true)
+        if let active = hydration.semanticChange {
             onSemanticPromptStateChanged?(active)
         }
         if TerminalReplayTrace.enabled {
             let finishedAt = ProcessInfo.processInfo.systemUptime
-            TerminalReplayTrace.log("cache-hydration pane=\(paneID.uuidString) bytes=\(cached.payload.count) loadSeconds=\(trackersStartedAt - cacheStartedAt) alternateSeconds=\(alternateFinishedAt - trackersStartedAt) pasteSeconds=\(pasteFinishedAt - alternateFinishedAt) semanticSeconds=\(finishedAt - pasteFinishedAt)")
+            TerminalReplayTrace.log("cache-hydration pane=\(paneID.uuidString) bytes=\(cached.payload.count) loadSeconds=\(trackersStartedAt - cacheStartedAt) trackerSeconds=\(finishedAt - trackersStartedAt) trackers=\(hydration.fromCheckpoint ? "checkpoint" : "scan")")
         }
         // Historical screen bytes stay intact; only stale worker input protocols
         // identified at a known shell prompt are neutralized after hydration.
@@ -4077,7 +5007,41 @@ final class TerminalIOBridge: @unchecked Sendable {
         )
     }
 
+    /// Brings the restore trackers to the cached payload's end state. A log
+    /// checkpoint carries that state, avoiding a scan that costs hundreds of
+    /// milliseconds for a multi-megabyte agent transcript. Legacy records, and
+    /// trackers that already observed output, still scan the payload.
+    private func hydrateRestoreTrackers(
+        _ cached: TerminalSnapshotRecordCodec.Snapshot,
+        includesSemanticPrompt: Bool
+    ) -> (semanticChange: Bool?, fromCheckpoint: Bool) {
+        let initial = TerminalSnapshotTrackerState.initial
+        if let saved = cached.trackerState,
+           TerminalCommandReturnCleanup().restore(saved.commandReturn),
+           TerminalSemanticPromptStateTracker().restore(saved.semanticPrompt),
+           commandReturnCleanup.persistentState == initial.commandReturn,
+           alternateScreenCleanup.persistentState == initial.alternateScreen,
+           bracketedPasteTracker.persistentState == initial.bracketedPaste,
+           !includesSemanticPrompt ||
+            semanticPromptTracker.persistentState == initial.semanticPrompt {
+            commandReturnCleanup.restore(saved.commandReturn)
+            alternateScreenCleanup.restore(saved.alternateScreen)
+            bracketedPasteTracker.restore(saved.bracketedPaste)
+            guard includesSemanticPrompt else { return (nil, true) }
+            semanticPromptTracker.restore(saved.semanticPrompt)
+            return (saved.semanticChange, true)
+        }
+        commandReturnCleanup.observe(cached.payload)
+        alternateScreenCleanup.observe(cached.payload)
+        bracketedPasteTracker.observe(cached.payload)
+        guard includesSemanticPrompt else { return (nil, false) }
+        return (semanticPromptTracker.observe(cached.payload), false)
+    }
+
     func resetRemoteSequence() {
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
+        shellInputTracker.forget()
         replayLock.lock()
         replayUsesRetainedGrid = false
         replayRequiresFreshBase = true
@@ -4091,6 +5055,7 @@ final class TerminalIOBridge: @unchecked Sendable {
         // Also remove the merge base: prepare() normally extends cached data
         // when incoming bytes have no full clear. That is unsafe after a gap.
         TerminalBufferRetentionPolicy.clear(&snapshotBuffer)
+        snapshotBufferTruncated = false
         snapshotRemoteSequence = 0
         receiveLock.unlock()
         onPromptHistoryInvalidated?()
@@ -4102,6 +5067,7 @@ final class TerminalIOBridge: @unchecked Sendable {
         receiveLock.lock()
         let paneID = snapshotPaneID
         let snapshot = snapshotBuffer
+        let truncated = snapshotBufferTruncated
         let remoteSequence = snapshotRemoteSequence
         snapshotWriteWindowStartedAt = nil
         snapshotScheduledDeadline = nil
@@ -4110,12 +5076,14 @@ final class TerminalIOBridge: @unchecked Sendable {
         if let paneID, !snapshot.isEmpty {
             TerminalSnapshotStore.shared.saveSynchronously(
                 snapshot, paneID: paneID, viewport: currentViewport,
-                remoteSequence: remoteSequence
+                remoteSequence: remoteSequence, truncated: truncated
             )
         }
     }
 
     func beginReplay() {
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
         invalidatePromptEditorRestorationBarrier()
         replayLock.lock()
         if !replaying { replayKnownSequence = maximumObservedRemoteSequence }
@@ -4151,6 +5119,9 @@ final class TerminalIOBridge: @unchecked Sendable {
     }
 
     func setExplicitReplayBoundary(_ enabled: Bool) {
+        // May reopen a replay, so it is ordered with the send fence.
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
         replayLock.lock()
         expectsExplicitReplayBoundary = enabled
         if enabled {
@@ -4230,11 +5201,15 @@ final class TerminalIOBridge: @unchecked Sendable {
             // reconstruction, and that live tail as one ordered display commit
             // before reopening the live path. Previously `replaying` became
             // false above, allowing the tail to overtake the reconstruction.
+            // outputOrderingLock first (the order receive() uses), so the
+            // commit is ordered with the send fence.
+            self.outputOrderingLock.lock()
             self.replayLock.lock()
             guard self.replaying,
                   self.replayGeneration == generation,
                   self.replayCommitGeneration == generation else {
                 self.replayLock.unlock()
+                self.outputOrderingLock.unlock()
                 return
             }
             let liveTail: Data
@@ -4247,13 +5222,18 @@ final class TerminalIOBridge: @unchecked Sendable {
             TerminalReplayTrace.log("commit pane=\(self.snapshotPaneID?.uuidString ?? "unknown") cached=\(cached.count) replacement=\(replacement.count) tail=\(liveTail.count) visible=\(TerminalSnapshotDisplayPolicy.hasVisibleContent(commit))")
             if !commit.isEmpty {
                 self.receiveLock.lock()
-                self.snapshotBuffer = TerminalSnapshotStore.bounded(
+                let bounded = TerminalSnapshotStore.boundedReportingTruncation(
                     retainGrid ? self.snapshotBuffer + commit : commit
                 )
+                // A cut base survives unless the commit replaced it outright.
+                self.snapshotBufferTruncated = bounded.truncated ||
+                    (self.snapshotBufferTruncated && (retainGrid || !requiresFreshBase))
+                self.snapshotBuffer = bounded.data
                 self.scheduleSnapshotSaveLocked()
                 self.receiveLock.unlock()
                 // receive() cannot pass replayLock until this has entered the
                 // display queue, so later live frames cannot overtake it.
+                self.replayCommitWillEnqueueForTesting?()
                 self.enqueueDisplay(commit, immediate: true)
             }
             TerminalBufferRetentionPolicy.clear(&self.replayBuffer)
@@ -4265,6 +5245,7 @@ final class TerminalIOBridge: @unchecked Sendable {
             self.replayRequiresFreshBase = false
             self.replayCommitGeneration = nil
             self.replayLock.unlock()
+            self.outputOrderingLock.unlock()
 
             // Publish as soon as the parser barrier completes. Device-query
             // suppression is a separate guard and must not delay first paint.
@@ -4316,10 +5297,14 @@ final class TerminalIOBridge: @unchecked Sendable {
         guard snapshotPaneID != nil else { return }
         snapshotBuffer.append(data)
         snapshotRemoteSequence = max(snapshotRemoteSequence, remoteSequence)
-        // Compact at a bounded high-water mark, not after every packet beyond
-        // the persisted 2 MiB limit. The store applies the exact disk bound.
+        // Trim once past the storage bound, down to a lower target, so later
+        // packets append without rescanning and saves never need compaction.
         if TerminalSnapshotCompactionPolicy.shouldCompact(byteCount: snapshotBuffer.count) {
-            snapshotBuffer = TerminalSnapshotStore.bounded(snapshotBuffer)
+            // Compaction rebuilds from the latest full clear, which restores a
+            // complete base; only a suffix cut leaves the buffer without one.
+            let trimmed = TerminalSnapshotCompactionPolicy.trim(snapshotBuffer)
+            snapshotBuffer = trimmed.data
+            snapshotBufferTruncated = trimmed.truncated
         }
         scheduleSnapshotSaveLocked()
     }
@@ -4366,6 +5351,7 @@ final class TerminalIOBridge: @unchecked Sendable {
             return
         }
         let snapshot = snapshotBuffer
+        let truncated = snapshotBufferTruncated
         let remoteSequence = snapshotRemoteSequence
         snapshotWriteWindowStartedAt = nil
         snapshotScheduledDeadline = nil
@@ -4374,8 +5360,23 @@ final class TerminalIOBridge: @unchecked Sendable {
 
         TerminalSnapshotStore.shared.save(
             snapshot, paneID: paneID, viewport: currentViewport,
-            remoteSequence: remoteSequence
+            remoteSequence: remoteSequence, truncated: truncated
         )
+    }
+
+    /// Sends input only if the live screen an admission judged is still the
+    /// settled native screen. The check and the transport's recording of the
+    /// packet happen under outputOrderingLock; the transport writes
+    /// asynchronously, so the lock is never held across network I/O.
+    func sendUserInput(_ data: Data, expectedLiveScreen live: RelayActiveScreenCache.Key?,
+                       expectedMaintenanceScreen screen: MaintenanceScreenToken?) -> Bool {
+        guard live != nil || screen != nil else { return false }
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
+        guard screen.map({ maintenanceScreenIsCurrent($0) }) ?? true,
+              live.map({ liveScreenIsSettled($0) }) ?? true else { return false }
+        fenceCheckedForTesting?()
+        return sendUserInput(data)
     }
 
     @discardableResult
@@ -4497,10 +5498,22 @@ final class TerminalIOBridge: @unchecked Sendable {
     }
 
     func sendPromptEditorControlInput(_ data: Data,
-        expectedControlLease lease: RelayPromptEditorControlLease) -> Bool {
+        expectedControlLease lease: RelayPromptEditorControlLease,
+        expectedMaintenanceScreen screen: MaintenanceScreenToken? = nil,
+        expectedLiveScreen live: RelayActiveScreenCache.Key? = nil,
+        automation: Bool = false, requireAutomation: Bool = false) -> Bool {
+        outputOrderingLock.lock()
+        guard screen.map({ maintenanceScreenIsCurrent($0) }) ?? true,
+              live.map({ liveScreenIsSettled($0) }) ?? true else {
+            outputOrderingLock.unlock()
+            return false
+        }
+        fenceCheckedForTesting?()
         resizeLock.lock()
-        let admitted = transport?.preparePromptControlInput(data, expectedControlLease: lease)
+        let admitted = transport?.preparePromptControlInput(data, expectedControlLease: lease,
+            automation: automation, requireAutomation: requireAutomation)
         resizeLock.unlock()
+        outputOrderingLock.unlock()
         return admitted?.dispatch() == true
     }
 
@@ -4543,6 +5556,7 @@ final class TerminalIOBridge: @unchecked Sendable {
             "bytes": String(data.count),
             "filtering": String(filterDeviceResponses),
             "forwarded": String(shouldForward),
+            "terminal_report": TerminalInputDiagnosticReport.name(data),
         ])
         guard shouldForward else { return }
         sendUserInput(data)
@@ -4607,8 +5621,14 @@ final class TerminalIOBridge: @unchecked Sendable {
     /// 4–8 KiB SSH packet can retain gigabytes during a repaint storm. One
     /// scheduled drain preserves byte order and interactive latency while a
     /// high-water compaction makes overload memory-bounded.
+    /// Every display producer enters here or holds outputOrderingLock around
+    /// enqueueDisplayWhilePresentationLocked: the one ordering boundary with
+    /// the live-screen send fence. Lock order: outputOrderingLock, then
+    /// replayLock / presentationLock / receiveLock / displayLock.
     private func enqueueDisplay(_ data: Data, immediate: Bool = false) {
         guard !data.isEmpty else { return }
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
         presentationLock.lock()
         // Native and browser parsers consume the same lossless ordered stream,
         // even while rendering is occluded.
@@ -4621,6 +5641,7 @@ final class TerminalIOBridge: @unchecked Sendable {
     private func enqueueDisplayWhilePresentationLocked(_ data: Data, immediate: Bool) {
         displayLock.lock()
         displayBuffer.append(data)
+        displayBytesInTransit += data.count
         if observedRepaint != nil {
             let event = observedRepaint?.tracker.observe(data)
             if event == .completedFrame {
@@ -4665,6 +5686,70 @@ final class TerminalIOBridge: @unchecked Sendable {
         presentationLock.unlock()
         guard !batch.isEmpty else { return }
         deliverDisplayBatch(batch, observedFrameID: observedFrameID)
+        displayLock.lock()
+        displayBytesInTransit -= batch.count
+        displayLock.unlock()
+    }
+
+    /// Whether the native screen still shows exactly `expected` and every
+    /// output byte this bridge has received is already parsed into it: nothing
+    /// in the display pipeline, nothing queued in the session, no mutation in
+    /// flight, and a fresh state, rows, state sample equal to the admitted
+    /// one. The caller holds outputOrderingLock, so receive() cannot accept
+    /// more output until the caller's input is recorded by the transport.
+    /// Received output can wait before display in four places: the replay
+    /// buffer (while a replay or its commit is open), the viewport-transition
+    /// buffer (while a transition is open), the display buffer (counted in
+    /// displayBytesInTransit) and the session's queue. The first two are
+    /// covered by phase: while either phase is open no fenced send passes,
+    /// whether or not bytes are buffered yet. Caller holds outputOrderingLock;
+    /// every opener and closer of these phases takes it.
+    private func outputPhaseIsOpen() -> Bool {
+        phaseReadWillLockReplayForTesting?()
+        replayLock.lock()
+        let replayOpen = replaying || replayCommitGeneration != nil
+        replayLock.unlock()
+        presentationLock.lock()
+        let transitionOpen = viewportTransitionActive
+        presentationLock.unlock()
+        return replayOpen || transitionOpen
+    }
+
+    /// An unlocked read of the phase, for admissions and tests. Only the read
+    /// under outputOrderingLock inside the send fence decides a send.
+    var outputPhaseOpenNow: Bool { outputPhaseIsOpen() }
+
+    /// Read-only admission for retained renderers. A stable native grid alone
+    /// is insufficient when new output is still in the display pipeline or
+    /// the transport that supplied it has retired.
+    func nativeEditingScreenIsCurrent(_ expected: RelayActiveScreenCache.Key) -> Bool {
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
+        resizeLock.lock()
+        let connected = transport != nil
+        resizeLock.unlock()
+        return connected && liveScreenIsSettled(expected)
+    }
+
+    private func liveScreenIsSettled(_ expected: RelayActiveScreenCache.Key) -> Bool {
+        let phaseOpen = outputPhaseIsOpen()
+        displayLock.lock()
+        let inTransit = displayBytesInTransit
+        displayLock.unlock()
+        let session = session
+        return Self.liveScreenIsSettled(outputPhaseOpen: phaseOpen, displayBytesInTransit: inTransit,
+            sessionPendingBytes: { session.pendingOutputByteCount },
+            sample: { session.activeScreenSample() }, expected: expected)
+    }
+
+    /// Read in pipeline order: bytes leave the display buffer only after they
+    /// are queued in the session, and leave the session queue only with the
+    /// in-flight flag set, so a byte moving between reads is still seen.
+    static func liveScreenIsSettled(outputPhaseOpen: Bool, displayBytesInTransit: Int, sessionPendingBytes: () -> Int,
+        sample: () -> RelayActiveScreenCache.Sample, expected: RelayActiveScreenCache.Key) -> Bool {
+        guard !outputPhaseOpen else { return false }
+        guard displayBytesInTransit == 0, sessionPendingBytes() == 0 else { return false }
+        return sample() == .stable(expected)
     }
 
     private func deliverDisplayBatch(
@@ -4711,6 +5796,8 @@ final class TerminalIOBridge: @unchecked Sendable {
                         let revision = session.parsedHostOutputRevision
                         if revision != pending.baseline {
                             pending.continuation.yield(.parsedFrame(revision: revision))
+                        } else {
+                            pending.continuation.yield(.hostFrame)
                         }
                     }
                 }
@@ -4733,6 +5820,72 @@ final class TerminalIOBridge: @unchecked Sendable {
 /// their prompt still emits `133;B` and `133;C`. Keeping this small state
 /// machine in the transport makes remote click-to-move use the same prompt
 /// safety gate as a local shell without depending on packet boundaries.
+/// Whether the shell's command line is provably empty, from the remote byte
+/// stream alone: an OSC 133;B (input begins) has been seen and nothing the
+/// shell echoes has followed it. Escape sequences do not count; any printable
+/// or editing byte does. Unknown (not empty) until a B arrives in this
+/// process's stream, after a restore or an output reset, and after 133;A/P/C/D.
+/// Hidden panes have no live prompt mirror, so this is how a maintenance
+/// resume proves the retained shell prompt is empty.
+final class TerminalShellInputTracker: @unchecked Sendable {
+    private enum State { case ground, escape, csi, osc, oscEscape }
+    private let lock = NSLock()
+    private var state = State.ground
+    private var payload: [UInt8] = []
+    private var awaitingInput = false
+    private var echoed = 0
+
+    var inputIsEmpty: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return awaitingInput && echoed == 0
+    }
+
+    func forget() {
+        lock.lock(); defer { lock.unlock() }
+        awaitingInput = false
+        echoed = 0
+        state = .ground
+        payload.removeAll(keepingCapacity: true)
+    }
+
+    func observe(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        for byte in data {
+            switch state {
+            case .ground:
+                if byte == 0x1B { state = .escape } else if awaitingInput { echoed &+= 1 }
+            case .escape:
+                switch byte {
+                case 0x5B: state = .csi                      // ESC [
+                case 0x5D: payload.removeAll(keepingCapacity: true); state = .osc // ESC ]
+                case 0x1B: state = .escape
+                default: state = .ground                     // two-byte escape
+                }
+            case .csi:
+                if (0x40...0x7E).contains(byte) { state = .ground }
+            case .osc:
+                if byte == 0x07 { finish(); state = .ground }
+                else if byte == 0x1B { state = .oscEscape }
+                else if payload.count < 16 { payload.append(byte) }
+            case .oscEscape:
+                if byte == 0x5C { finish(); state = .ground } else { state = .osc }
+            }
+        }
+    }
+
+    private func finish() {
+        defer { payload.removeAll(keepingCapacity: true) }
+        guard payload.count >= 5, payload[0] == 0x31, payload[1] == 0x33, payload[2] == 0x33,
+              payload[3] == 0x3B else { return }
+        switch payload[4] {
+        case 0x42: awaitingInput = true; echoed = 0          // B: input begins
+        case 0x41, 0x50, 0x43, 0x44: awaitingInput = false   // A, P, C, D
+        default: break
+        }
+    }
+}
+
 final class TerminalSemanticPromptStateTracker: @unchecked Sendable {
     private enum ParserState {
         case ground
@@ -5465,6 +6618,42 @@ enum TerminalReplayCompactor {
     }
 }
 
+enum TerminalFocusReport {
+    /// A non-sensitive diagnostic category; never log the terminal input bytes.
+    static func name(_ data: Data) -> String? {
+        guard !data.isEmpty, data.count.isMultiple(of: 3) else { return nil }
+        let bytes = Array(data)
+        for offset in stride(from: 0, to: bytes.count, by: 3) {
+            guard bytes[offset] == 0x1B, bytes[offset + 1] == 0x5B,
+                  bytes[offset + 2] == 0x49 || bytes[offset + 2] == 0x4F else { return nil }
+        }
+        if bytes.count > 3 { return "focus_multiple" }
+        if bytes[2] == 0x49 { return "focus_in" }
+        if bytes[2] == 0x4F { return "focus_out" }
+        return nil
+    }
+}
+
+enum TerminalInputDiagnosticReport {
+    /// Recognize report grammars without retaining their content or coordinates.
+    static func name(_ data: Data) -> String {
+        if let focus = TerminalFocusReport.name(data) { return focus }
+        if TerminalDeviceResponseFilter.matches(data) { return "device_response" }
+        let bytes = Array(data)
+        if bytes.count >= 9, bytes.starts(with: [0x1B, 0x5B, 0x3C]),
+           bytes.last == 0x4D || bytes.last == 0x6D {
+            let fields = bytes.dropFirst(3).dropLast().split(separator: 0x3B, omittingEmptySubsequences: false)
+            if fields.count == 3,
+               fields.allSatisfy({ !$0.isEmpty && $0.allSatisfy { (0x30...0x39).contains($0) } }),
+               let button = Int(String(decoding: fields[0], as: UTF8.self)) {
+                if button & 64 != 0 { return "mouse_wheel" }
+                return button & 0x23 == 0x23 ? "mouse_motion" : "mouse_button"
+            }
+        }
+        return "none"
+    }
+}
+
 enum TerminalDeviceResponseFilter {
     /// Ghostty and the shell share one in-memory write callback. During surface
     /// startup, drop only complete terminal capability replies; ordinary input
@@ -5789,6 +6978,9 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     private var promptInspectionPreservesInput = false
     private var preservedPromptInputIdentity: TerminalRuntime.PromptInspectionIdentity?
     private var promptInspectionVisualCopy: String?
+    /// A local agent Command-A over the painted composer, whose exact text is
+    /// unproven. The first edit that needs that text starts exact inspection.
+    private var localSelectAllNeedsExactText = false
     private var replayingDeferredPromptText = false
     private var quarantinedPromptKeyCodes: Set<UInt16> = []
     private var translatingPromptControlKey = false
@@ -5805,6 +6997,25 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     private var promptMirrorAwaitingHostOutput: (session: InMemoryTerminalSession, revision: UInt64)?
     var promptMirrorIsAwaitingHostOutput: Bool { promptMirrorAwaitingHostOutput != nil }
     var promptInspectionBlocksInput: Bool { promptInspectionPreservesInput }
+    /// Tests only: recovery is meaningful only together with a visible hold.
+    var promptInspectionRecoveryPendingForTesting: Bool { promptInspectionRequiresRecovery }
+    /// Tests only: the held queue in order, by kind (keys with characters).
+    var deferredPromptInputSummaryForTesting: [String] {
+        deferredPromptInput.map { action in
+            switch action {
+            case .key(let event): return "key:" + (event.characters ?? "")
+            case .deleteSelection: return "deleteSelection"
+            default: return String(String(describing: action).prefix { $0 != "(" })
+            }
+        }
+    }
+    /// Tests only: run the replay loop (as inspection completion does) over a
+    /// deletion of the current selection followed by `keys`.
+    func replaySelectionDeletionThenKeysForTesting(_ keys: [NSEvent]) {
+        guard let expected = promptBuffer.snapshot, let selection = promptSelection else { return }
+        let queued = [DeferredPromptInput.deleteSelection(expected, selection)] + keys.map { DeferredPromptInput.key($0) }
+        for action in queued { replayDeferredPromptInput(action) }
+    }
 
     private func preservedPromptText(_ text: Any) -> Any {
         if let attributed = text as? NSAttributedString { return attributed.copy() }
@@ -6015,6 +7226,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         promptSelection = nil
         keyboardSelectionOffset = nil
         keyboardSelectionIsVisual = false
+        localSelectAllNeedsExactText = false
         pointerDownPoint = point
         let agentPrompt = owner?.forcesLocalPromptSelection == true
         let canBeginPromptSelection = owner?.allowsPromptSelectionEditing == true &&
@@ -6173,6 +7385,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     override func keyDown(with event: NSEvent) {
+        if handleWorkOverviewShortcut(event) { quarantinedPromptKeyCodes.insert(event.keyCode); return }
         quarantinedPromptKeyCodes.remove(event.keyCode)
         var forwardsOriginalKey = false
         defer {
@@ -6192,14 +7405,23 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
            preservedPromptFiles.isEmpty {
             resumeNativeTypingPreservingText()
         }
+        if localSelectAllNeedsExactText, !promptInspectionPreservesInput {
+            // Replacing or deleting the local selection needs the exact draft:
+            // inspect now and queue this key. Other keys end the selection;
+            // Command shortcuts (copy, paste, cut) are handled on their own path.
+            if Self.editsPromptSelection(event) { beginDeferredSelectAllInspection() }
+            else if !event.modifierFlags.contains(.command) { localSelectAllNeedsExactText = false }
+        }
         if promptInspectionPreservesInput {
             owner?.recordInputDiagnostic("input-blocked", details: ["phase": promptInspectionPhase,
                 "queued_actions": String(deferredPromptInput.count),
                 "inspection_active": String(promptInspectionTask != nil),
                 "paste_active": String(nativePasteConfirmation != nil)])
-            owner?.notePreservedTyping()
+            owner?.notePreservedTyping(inspectionActive: promptInspectionTask != nil,
+                                       files: !preservedPromptFiles.isEmpty)
             if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "a" {
-                if promptInspectionTask == nil { _ = beginExactPromptInspection() }
+                // Command-A stays local; it never starts or restarts inspection.
+                owner?.recordInputDiagnostic("select-all-local", details: ["path": "preserved"])
             } else { deferredPromptInput.append(.key(event)) }
             return
         }
@@ -6253,9 +7475,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     override func insertText(_ string: Any, replacementRange: NSRange) {
+        if localSelectAllNeedsExactText, !replayingDeferredPromptText { beginDeferredSelectAllInspection() }
         if promptInspectionPreservesInput {
             consumeCurrentTextInputEvent()
             deferredPromptInput.append(.text(preservedPromptText(string), replacementRange))
+            recordInsertTextRoute("preserved")
             return
         }
         owner?.prepareForUserInteraction()
@@ -6275,11 +7499,13 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                 // Clear the local IME preview while retaining the committed
                 // text as the transaction's original recovery action.
                 super.unmarkText()
+                recordInsertTextRoute("exact_replacement")
                 _ = handleExactPromptReplacement(text, kind: .typing,
                     recoveryAction: .text(preservedPromptText(string), replacementRange))
                 return
             }
             hasLocalInputSincePromptBoundary = true
+            recordInsertTextRoute(promptSelection != nil ? "selection_replace" : "native")
             if let promptSelection {
                 // Match native text fields: typing replaces the active
                 // selection and remains one undoable edit.
@@ -6308,6 +7534,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             if !promptBuffer.isReliable { resetPromptHistory() }
             owner?.userEnteredInput()
         }
+        else { recordInsertTextRoute("native") }
         if replayingDeferredPromptText {
             // Inspection may finish after keyboard focus changes. Replay the
             // already admitted commit on its captured ordered surface path.
@@ -6346,12 +7573,13 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
 
     @discardableResult
     func handleApplicationClipboardAction(_ action: RelayClipboardAction) -> Bool {
+        if localSelectAllNeedsExactText, action == .cut || action == .paste { beginDeferredSelectAllInspection() }
         if promptInspectionPreservesInput {
             if action == .copy, promptInspectionTask == nil, nativePasteConfirmation == nil,
                copyPreservedPromptText() { return true }
             if action == .selectAll {
                 if nativePasteConfirmation != nil { deferredPromptInput.append(.clipboard(action)) }
-                else if promptInspectionTask == nil { _ = beginExactPromptInspection() }
+                else { owner?.recordInputDiagnostic("select-all-local", details: ["path": "preserved"]) }
             } else if action == .copy, let text = promptInspectionVisualCopy {
                 _ = writeCopiedText(text, source: "preserved-composer-selection")
             } else if action == .paste {
@@ -6391,6 +7619,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         // AppKit offers equivalents to sibling views too. A visible terminal
         // must never consume an editor's paste, selection or navigation keys.
         guard window?.firstResponder === self else { return false }
+        if handleWorkOverviewShortcut(event) { quarantinedPromptKeyCodes.insert(event.keyCode); return true }
         if promptInspectionPreservesInput {
             quarantinedPromptKeyCodes.insert(event.keyCode)
             if handleApplicationClipboardShortcut(event) { quarantinedPromptKeyCodes.insert(event.keyCode); return true }
@@ -6430,6 +7659,21 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     /// Consume the native diagnostics equivalent in the focused terminal too.
     /// Accessibility key events can be delivered directly to this view while
     /// AppKit's menu tracking is elsewhere; they must never enter the PTY.
+    private func handleWorkOverviewShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown,
+              let binding = RelayKeyBinding(event: event),
+              binding == RelayKeyBindingStorage.binding(
+                for: .quickNavigate, overrides: RelayKeyBindingStorage.load()
+              ) else { return false }
+        // AppKit can deliver equivalents directly to the terminal. Application
+        // navigation must precede draft preservation and never enter its queue
+        // or Ghostty, including when prompt inspection owns native input.
+        if !event.isARepeat {
+            NotificationCenter.default.post(name: .relayWorkOverview, object: nil)
+        }
+        return true
+    }
+
     private func handlePaneReconnectShortcut(_ event: NSEvent) -> Bool {
         guard event.type == .keyDown,
               event.modifierFlags.intersection([.command, .option, .control, .shift]) == [.command, .option, .shift],
@@ -6645,6 +7889,10 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                 sendPromptPlainText(String(target.characters))
                 for _ in 0..<caretKeys { sendSyntheticPromptKey(123) }
             }) else {
+            // Nothing was dispatched; an undo/redo restore has no native
+            // single-key equivalent, so the caller keeps the hold.
+            owner?.recordInputDiagnostic("prompt-control-refused", details: [
+                "reason": "restore", "queued_actions": String(deferredPromptInput.count)])
             promptInspectionRequiresRecovery = true
             return false
         }
@@ -6840,7 +8088,8 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     /// shortcut conservatively until the prompt mirror becomes reliable again.
     private func selectAllRelayContent() -> Bool {
         if promptInspectionPreservesInput {
-            if promptInspectionTask == nil { _ = beginExactPromptInspection() }
+            // Command-A stays local; it never starts or restarts inspection.
+            owner?.recordInputDiagnostic("select-all-local", details: ["path": "preserved"])
             return true
         }
         synchronizePromptMirrorFromRenderer()
@@ -6852,11 +8101,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             if agentPrompt {
                 // An agent TUI does not necessarily publish shell input marks,
                 // and its busy phase can lag an editable restored composer.
-                // Recover only this live prompt, preserving all kernel checks
-                // for inspection and later edits; never select its transcript.
+                // Select only this live composer, locally; exact inspection
+                // waits for an edit. Never select its transcript.
                 if owner?.allowsPromptSelectionEditing == true,
-                   owner?.promptEditingViewportIsLive == true,
-                   !beginExactPromptInspection() { _ = selectRenderedProviderComposer() }
+                   owner?.promptEditingViewportIsLive == true { selectRenderedComposerLocally() }
+                else { owner?.recordInputDiagnostic("select-all-local", details: ["path": "unknown", "reason": "not_editable"]) }
                 return true
             }
             return performBindingAction("select_all")
@@ -6867,14 +8116,14 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             // A restored agent composer may not have a trustworthy mirror yet.
             // Cmd+A must never expand that uncertainty into transcript selection.
             if agentPrompt {
-                if !beginExactPromptInspection() { _ = selectRenderedProviderComposer() }
+                selectRenderedComposerLocally()
                 return true
             }
             return performBindingAction("select_all")
         }
         clearPromptSelection()
         guard !snapshot.characters.isEmpty else {
-            if agentPrompt, !beginExactPromptInspection() { _ = selectRenderedProviderComposer() }
+            if agentPrompt { selectRenderedComposerLocally() }
             return true
         }
         promptHistory.breakCoalescing()
@@ -6886,11 +8135,55 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             "characters": String(snapshot.characters.count),
             "cursor": String(snapshot.cursor)
         ])
+        if agentPrompt {
+            owner?.recordInputDiagnostic("select-all-local", details: ["path": "mirror",
+                "visual": String(!applicationIsCapturingMouse)])
+            // A synthesized drag would be a mouse report while the TUI captures
+            // the mouse; keep the exact mirror range without the highlight.
+            guard !applicationIsCapturingMouse else { return true }
+        }
         keyboardSelectionIsVisual = beginKeyboardPromptSelection(
             delta: snapshot.characters.count - snapshot.cursor,
             anchorOffset: -snapshot.cursor
         )
         return true
+    }
+
+    /// Agent Command-A without a trusted mirror: select the painted composer
+    /// locally, never the transcript, and leave its exact text to the first
+    /// edit. No bytes, editor bridge or resize. Unknown screens select nothing.
+    @discardableResult
+    private func selectRenderedComposerLocally() -> Bool {
+        let reason = applicationIsCapturingMouse ? "mouse_capture" : selectRenderedProviderComposer() ? nil : "no_composer"
+        owner?.recordInputDiagnostic("select-all-local", details: ["path": reason == nil ? "rendered" : "unknown",
+            "reason": reason ?? ""])
+        guard reason == nil else { return false }
+        localSelectAllNeedsExactText = true
+        return true
+    }
+
+    /// The exact inspection a local agent Command-A deferred, started when an
+    /// edit needs the exact draft. The caller's action is then queued by the
+    /// existing preserved-input path. Without inspection the local selection
+    /// is dropped and the edit applies at the caret, as a plain edit.
+    private func beginDeferredSelectAllInspection() {
+        guard localSelectAllNeedsExactText else { return }
+        localSelectAllNeedsExactText = false
+        guard !promptInspectionPreservesInput else { return }
+        let started = beginExactPromptInspection()
+        owner?.recordInputDiagnostic("select-all-deferred-inspection", details: ["started": String(started)])
+        if !started { clearPromptSelection() }
+    }
+
+    /// Keys that replace or delete a selected draft: Delete, Forward Delete
+    /// and printable text without Command or Control. Navigation, Return, Tab
+    /// and Escape are not.
+    private static func editsPromptSelection(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.modifierFlags.intersection([.command, .control]).isEmpty else { return false }
+        if event.keyCode == 51 || event.keyCode == 117 { return true }
+        guard ![36, 48, 53, 76].contains(event.keyCode), let scalars = event.characters?.unicodeScalars,
+              !scalars.isEmpty else { return false }
+        return scalars.allSatisfy { $0.value >= 32 && $0.value != 127 && !(0xF700...0xF8FF).contains($0.value) }
     }
 
     /// Widen only the native viewport to make provider word wrapping reversible.
@@ -7195,6 +8488,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                     case .invalidated: self.promptInspectionPhase = "editor_restoration_invalidated"; return
                     case .armed: break
                     case .parsedFrame(let revision): editorRestoredRevision = revision
+                    case .hostFrame: break
                     }
                 case .paint, .parsedHostOutput, .inputLeaseChanged: break
                 }
@@ -7401,7 +8695,17 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                 preserveDeferredPromptInput(action, message: "The original deletion is preserved; its draft and selection could not be verified.")
                 return
             }
-            _ = deleteCurrentPromptSelection()
+            guard deleteCurrentPromptSelection() else {
+                // Nothing was dispatched, but applyPromptEdit may have
+                // invalidated the mirror and set recovery. Keep this original
+                // action (its snapshot and selection predate invalidation)
+                // behind a visible hold. Replay runs with no hold and an empty
+                // queue, so this lands first; later queued items re-queue
+                // behind it in order, and it is preserved once.
+                promptInspectionRequiresRecovery = true
+                preserveDeferredPromptInput(action, message: "The original deletion is preserved; it could not be dispatched.")
+                return
+            }
         case .marked(let text, let selected, let replacement):
             setMarkedText(text, selectedRange: selected, replacementRange: replacement)
         case .unmark: unmarkText()
@@ -7409,21 +8713,34 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         }
     }
 
-    private func preserveDeferredPromptInput(_ action: DeferredPromptInput, message: String, atFront: Bool = false) {
+    private func preserveDeferredPromptInput(_ action: DeferredPromptInput, message: String, atFront: Bool = false,
+                                             line: Int = #line) {
         if atFront { deferredPromptInput.insert(action, at: 0) }
         else { deferredPromptInput.append(action) }
         promptInspectionPreservesInput = true
         preservedPromptInputIdentity = owner?.promptInspectionIdentity
         toolTip = message
+        // Metadata only: the call site's line and the hold's state, never text.
         owner?.recordInputDiagnostic("prompt-inspection-input-preserved", details: [
-            "queued_actions": String(deferredPromptInput.count)])
+            "queued_actions": String(deferredPromptInput.count),
+            "reason": promptInspectionRequiresRecovery ? "recovery_required" : "held",
+            "inspection_active": String(promptInspectionTask != nil),
+            "line": String(line)])
+    }
+
+    private func recordInsertTextRoute(_ route: String) {
+        owner?.recordInputDiagnostic("insert-text-route", details: ["reason": route,
+            "queued_actions": String(deferredPromptInput.count),
+            "inspection_active": String(promptInspectionTask != nil)])
     }
 
     private var recoveredPreservedText = ""
 
-    /// A completed read-only check must not keep the native keyboard captive.
-    /// Captured text stays available for copying and is never replayed blindly.
-    private func resumeNativeTypingPreservingText() {
+    /// A completed read-only check, or the user's explicit Escape/Control-C,
+    /// must not keep the native keyboard captive. Captured text is appended to
+    /// the retained copy (never overwriting earlier retained text), stays
+    /// available for copying, and is never replayed. Only Discard clears it.
+    private func resumeNativeTypingPreservingText(reason: String = "completed-readonly-check") {
         let text = preservedCommittedPromptText
         recoveredPreservedText = text
         deferredPromptInput.removeAll()
@@ -7433,7 +8750,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         promptInspectionVisualCopy = nil
         clearPromptSelection()
         invalidatePromptMirror()
-        owner?.recordInputDiagnostic("input-resumed", details: ["reason": "completed-readonly-check"])
+        owner?.recordInputDiagnostic("input-resumed", details: ["reason": reason])
     }
 
     private var preservedCommittedPromptText: String {
@@ -7479,7 +8796,19 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             restoreViewportAfterInspection()
             finishViewportInspection()
         }
-        _ = discardPreservedPromptInput()
+        // Cancelling the check never discards captured input; only the pane
+        // menu's Discard Preserved Input does. Retained files keep the whole
+        // hold, which the notice and menu make recoverable.
+        if !preservedPromptFiles.isEmpty {
+            owner?.recordInputDiagnostic("input-hold-kept", details: ["reason": "files",
+                "queued_actions": String(deferredPromptInput.count)])
+            owner?.notePreservedTyping(inspectionActive: false, files: true)
+        } else {
+            resumeNativeTypingPreservingText(reason: "native_cancel")
+            super.unmarkText()
+            toolTip = nil
+            owner?.clearPreservedTypingNotice()
+        }
         promptInspectionPhase = "cancelled_by_native_input"
         owner?.reclaimNativeViewportOwnership()
     }
@@ -7568,6 +8897,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        if localSelectAllNeedsExactText { beginDeferredSelectAllInspection() }
         if promptInspectionPreservesInput {
             deferredPromptInput.append(.marked(preservedPromptText(string), selectedRange, replacementRange))
             return
@@ -7668,11 +8998,16 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         clearPromptSelection()
         if movementOffset != 0 {
             guard sendPromptControl(movementOffset: movementOffset) else {
+                // A refused controlled move dispatched nothing: admission is
+                // all-or-nothing (the remote transport refuses while earlier
+                // input awaits acknowledgement, or without a lease). Nothing
+                // is uncertain, so do not pause typing. The mirror no longer
+                // knows the caret; this key continues on the ordinary ordered
+                // native path like any other key. No held input is replayed.
                 invalidatePromptMirror()
-                promptInspectionRequiresRecovery = true
-                preserveDeferredPromptInput(.key(event),
-                    message: "The prompt cursor move could not be dispatched. Input is preserved for recovery.")
-                return true
+                owner?.recordInputDiagnostic("prompt-cursor-native-fallback", details: [
+                    "reason": "control_refused", "queued_actions": String(deferredPromptInput.count)])
+                return false
             }
             promptBuffer.move(by: movementOffset)
         }
@@ -8441,6 +9776,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
 
     private func clearPromptSelection() {
         _ = resetSelection()
+        localSelectAllNeedsExactText = false
         promptSelection = nil
         keyboardSelectionOffset = nil
         keyboardSelectionIsVisual = false
@@ -8458,6 +9794,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             movementOffset: selection.movementOffset,
             deletionCount: selection.characterCount, followingText: followingText
         ) else {
+            // Nothing was dispatched (admission is all-or-nothing), but the
+            // selection this edit replaces is local intent with no single-key
+            // native equivalent. Callers keep the hold rather than guess.
+            owner?.recordInputDiagnostic("prompt-control-refused", details: [
+                "reason": "edit", "queued_actions": String(deferredPromptInput.count)])
             remoteTerminalStateWasRestored()
             promptInspectionRequiresRecovery = true
             return false
@@ -8477,7 +9818,17 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
               index >= 0, index < snapshot.characters.count,
               promptEditorKeyCount(snapshot.characters[index...index]) > 1 else { return false }
         guard applyPromptEdit(PromptSelection(characterCount: 1,
-            movementOffset: event.keyCode == 51 ? 0 : 1), recordHistory: true) else { return false }
+            movementOffset: event.keyCode == 51 ? 0 : 1), recordHistory: true) else {
+            // This character spans several readline units, so a native
+            // Backspace/Delete would remove only part of it. Nothing was
+            // dispatched; keep the whole draft and hold this key, so the
+            // recovery state applyPromptEdit set always has a visible hold
+            // (Escape resumes and keeps the text) instead of a stale flag
+            // that would make a later transient hold stick.
+            preserveDeferredPromptInput(.key(event),
+                message: "The deletion could not be dispatched. Input is preserved for recovery.")
+            return true
+        }
         owner?.userEnteredInput()
         return true
     }
@@ -8527,6 +9878,23 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             for _ in 0..<deletionKeys { sendSyntheticPromptKey(51) }
             if let followingText { sendPromptPlainText(followingText) }
         }
+    }
+
+    /// Same Ghostty translation used by physical terminal input. Captured by
+    /// collectNativeInput; this method alone never claims transport delivery.
+    func translateTerminalEdit(_ request: RelayTerminalEditRequest) {
+        if request.action == "insert_text", let text = request.text { super.sendText(text); return }
+        guard let key = request.key.flatMap(RelayTerminalEditKey.init(rawValue:)) else { return }
+        let native = key.native
+        let modifiers = request.nativeModifiers
+        let characters = modifiers.contains(.shift) ? native.characters.uppercased() : native.characters
+        guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window?.windowNumber ?? 0, context: nil,
+            characters: characters, charactersIgnoringModifiers: native.characters, isARepeat: false, keyCode: native.code) else { return }
+        let previous = translatingPromptControlKey
+        translatingPromptControlKey = true
+        defer { translatingPromptControlKey = previous }
+        super.keyDown(with: event)
     }
 
     private func sendSyntheticPromptKey(
@@ -8720,7 +10088,18 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         clearPromptSelection()
         _ = performBindingAction("select_all")
     }
-    @objc private func deleteRelayPromptSelection() { _ = deleteCurrentPromptSelection() }
+    @objc private func deleteRelayPromptSelection() {
+        // Capture the original draft and selection before a refused edit
+        // invalidates them.
+        guard let selection = promptSelection else { return }
+        let expected = promptBuffer.snapshot
+        guard !deleteCurrentPromptSelection(), let expected else { return }
+        // Nothing was dispatched; keep the deletion behind a visible hold
+        // instead of leaving recovery set with no hold.
+        promptInspectionRequiresRecovery = true
+        preserveDeferredPromptInput(.deleteSelection(expected, selection),
+            message: "The selection deletion could not be dispatched. It is preserved for recovery.")
+    }
     @objc private func clearScrollback() { _ = performBindingAction("clear_scrollback") }
     @objc private func previousPrompt() { _ = owner?.jumpToPrompt(by: -1) }
     @objc private func nextPrompt() { _ = owner?.jumpToPrompt(by: 1) }
@@ -8871,6 +10250,7 @@ extension Notification.Name {
     static let relaySelectPane = Notification.Name("relay.select-pane")
     static let relaySplitRight = Notification.Name("relay.split-right")
     static let relaySplitDown = Notification.Name("relay.split-down")
+    static let relayWorkOverview = Notification.Name("relay.work-overview")
     static let relayClosePane = Notification.Name("relay.close-pane")
     static let relayRestartExitedPane = Notification.Name("relay.restart-exited-pane")
     static let relayResumeSavedConversation = Notification.Name("relay.resume-saved-conversation")
@@ -9052,5 +10432,136 @@ struct TerminalSurface: NSViewRepresentable, Equatable {
             guard !Task.isCancelled, !coordinator.isDismantled else { return }
             presentAfterLayout(view, coordinator: coordinator)
         }
+    }
+}
+
+extension TerminalSemanticPromptStateTracker {
+    /// Parser state after an observed stream, persisted by snapshot
+    /// checkpoints so a restore need not rescan the whole cached payload.
+    struct PersistentState: Codable, Equatable, Sendable {
+        var parser: UInt8
+        var payload: [UInt8]
+        var promptActive: Bool
+        var executions: UInt64
+    }
+
+    private static let persistentParsers: [ParserState] = [.ground, .escape, .osc, .oscEscape]
+
+    var persistentState: PersistentState {
+        lock.lock()
+        defer { lock.unlock() }
+        return PersistentState(
+            parser: UInt8(Self.persistentParsers.firstIndex(of: parserState)!),
+            payload: payload,
+            promptActive: promptActive,
+            executions: executions
+        )
+    }
+
+    /// Returns false, leaving the tracker unchanged, for a corrupt record.
+    @discardableResult
+    func restore(_ saved: PersistentState) -> Bool {
+        guard Int(saved.parser) < Self.persistentParsers.count else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        parserState = Self.persistentParsers[Int(saved.parser)]
+        payload = saved.payload
+        promptActive = saved.promptActive
+        executions = saved.executions
+        return true
+    }
+}
+
+extension TerminalAlternateScreenCleanupFilter {
+    /// State after an observed stream, persisted by snapshot checkpoints.
+    struct PersistentState: Codable, Equatable, Sendable {
+        var pending: [UInt8]
+        var inAlternateScreen: Bool
+    }
+
+    var persistentState: PersistentState {
+        lock.lock()
+        defer { lock.unlock() }
+        return PersistentState(pending: pending, inAlternateScreen: inAlternateScreen)
+    }
+
+    func restore(_ saved: PersistentState) {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = saved.pending
+        inAlternateScreen = saved.inAlternateScreen
+    }
+}
+
+/// Everything `restoreSnapshot` would derive by observing a cached payload
+/// with fresh trackers. `semanticChange` is the last non-nil result of
+/// `TerminalSemanticPromptStateTracker.observe` over that payload.
+struct TerminalSnapshotTrackerState: Codable, Equatable, Sendable {
+    var commandReturn: TerminalCommandReturnCleanup.PersistentState
+    var alternateScreen: TerminalAlternateScreenCleanupFilter.PersistentState
+    var bracketedPaste: TerminalBracketedPasteStateTracker.PersistentState
+    var semanticPrompt: TerminalSemanticPromptStateTracker.PersistentState
+    var semanticChange: Bool?
+
+    static var initial: TerminalSnapshotTrackerState {
+        TerminalSnapshotTrackerState(
+            commandReturn: TerminalCommandReturnCleanup().persistentState,
+            alternateScreen: TerminalAlternateScreenCleanupFilter().persistentState,
+            bracketedPaste: TerminalBracketedPasteStateTracker().persistentState,
+            semanticPrompt: TerminalSemanticPromptStateTracker().persistentState,
+            semanticChange: nil
+        )
+    }
+
+    /// Continues the restore-time scan from this state over appended bytes.
+    func advanced(by data: Data) -> TerminalSnapshotTrackerState? {
+        guard !data.isEmpty else { return self }
+        let commandReturn = TerminalCommandReturnCleanup()
+        let alternateScreen = TerminalAlternateScreenCleanupFilter()
+        let bracketedPaste = TerminalBracketedPasteStateTracker()
+        let semanticPrompt = TerminalSemanticPromptStateTracker()
+        guard commandReturn.restore(self.commandReturn),
+              semanticPrompt.restore(self.semanticPrompt) else { return nil }
+        alternateScreen.restore(self.alternateScreen)
+        bracketedPaste.restore(self.bracketedPaste)
+        commandReturn.observe(data)
+        alternateScreen.observe(data)
+        bracketedPaste.observe(data)
+        let change = semanticPrompt.observe(data)
+        return TerminalSnapshotTrackerState(
+            commandReturn: commandReturn.persistentState,
+            alternateScreen: alternateScreen.persistentState,
+            bracketedPaste: bracketedPaste.persistentState,
+            semanticPrompt: semanticPrompt.persistentState,
+            semanticChange: change ?? semanticChange
+        )
+    }
+}
+
+/// The code hand-off's view of a login pane. Nothing but the code and
+/// Return is typed; input diagnostics record only its length.
+extension TerminalRuntime: RelayAgentSignInPort {
+    func signInPaneState() -> RelayAgentSignInPaneState? {
+        guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay else { return nil }
+        let context = io.signInContext
+        return RelayAgentSignInPaneState(paneID: pane.id, hostID: pane.profile.id,
+            connected: pane.connectionState == .connected, inputLeaseHeld: conversationInputLease != nil,
+            producer: context.producer, execution: context.execution, shellPromptShown: context.promptShown,
+            viewport: sidePanelViewportText())
+    }
+
+    func signInProcesses() async throws -> [[String: Any]] {
+        guard let pane else { throw RelayHostRPCError.invalidRequest }
+        // Process inventory is host-scoped and does not use the request cwd.
+        let result = try await RelayHostFiles.request(context: RelayExecutionContext(profile: pane.profile, directory: "/"),
+                                                      fields: ["operation": "process_list"])
+        guard let rows = result["processes"] as? [[String: Any]] else { throw RelayHostRPCError.invalidRequest }
+        return rows
+    }
+
+    func sendSignInInput(_ data: Data) -> Bool {
+        guard let pane, io.sendUserInput(data) else { return false }
+        pane.userEnteredInput()
+        return true
     }
 }

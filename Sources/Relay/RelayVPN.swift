@@ -42,6 +42,7 @@ import SwiftUI
                     let store = Self.shared
                     store.record("Laptop awake")
                     RelayNodeTransportPool.shared.setSystemSleeping(false)
+                    RelayNodeTransportPool.shared.resumeAfterNetworkChange()
                     store.checkRetainedPanes()
                     await store.refresh()
                 }
@@ -55,6 +56,7 @@ import SwiftUI
                 guard store.active else { return }
                 if let previous = store.lastPathAvailable, previous != available {
                     store.record(available ? "Network available" : "Network unavailable")
+                    if available { RelayNodeTransportPool.shared.resumeAfterNetworkChange() }
                     await store.refresh()
                 }
                 store.lastPathAvailable = available

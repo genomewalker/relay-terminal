@@ -2,6 +2,11 @@ import CryptoKit
 import Darwin
 import Foundation
 
+extension Notification.Name {
+    /// Posted on the main actor with the node's connection key each time it is ready.
+    static let relayNodeReady = Notification.Name("relay.node-ready")
+}
+
 enum LocalRelayProcess {
     /// Local execution strips SSH's remote command prefix. Preserve terminal
     /// negotiation as process environment rather than losing its env arguments.
@@ -38,7 +43,11 @@ enum LocalRelayProcess {
 
 final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
     let sessionID: String
-    private weak var connection: RelayNodeConnection?
+    // Strong until close(): an open pane keeps its node, with its SSH process
+    // and pending retry, alive even after the pool has replaced it. A weak
+    // reference let a node outside the pool be freed silently, leaving its
+    // panes waiting for a ready or disconnect callback that never came.
+    private var connection: RelayNodeConnection?
     private let lock = NSLock()
     private var closed = false
 
@@ -47,29 +56,36 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
         self.connection = connection
     }
 
-    func write(type: RelayWireType, payload: Data = Data()) throws {
+    private var openConnection: RelayNodeConnection? {
         lock.lock()
-        let active = !closed
-        lock.unlock()
-        guard active, let connection else { throw RelayNodeTransportError.disconnected }
+        defer { lock.unlock() }
+        return closed ? nil : connection
+    }
+
+    /// The node this open channel belongs to.
+    var node: RelayNodeConnection? { openConnection }
+
+    func write(type: RelayWireType, payload: Data = Data()) throws {
+        guard let connection = openConnection else { throw RelayNodeTransportError.disconnected }
         try connection.write(sessionID: sessionID, frame: RelayWireFrame(type: type, payload: payload), expectedChannel: self)
     }
 
     func writeAsync(type: RelayWireType, payload: Data = Data()) {
-        connection?.writeAsync(sessionID: sessionID, frame: RelayWireFrame(type: type, payload: payload), expectedChannel: self)
+        openConnection?.writeAsync(sessionID: sessionID, frame: RelayWireFrame(type: type, payload: payload), expectedChannel: self)
     }
 
     func supports(_ capability: String) -> Bool {
-        connection?.supports(capability) == true
+        openConnection?.supports(capability) == true
     }
 
     func close() {
         lock.lock()
         guard !closed else { lock.unlock(); return }
         closed = true
+        let connection = self.connection
+        self.connection = nil
         lock.unlock()
         connection?.close(sessionID: sessionID, channel: self)
-        connection = nil
     }
 }
 
@@ -188,23 +204,93 @@ final class RelayNodeFrameDispatcher: @unchecked Sendable {
 
 enum RelayHeartbeatPolicy {
     // A half-open SSH socket is the common failure mode when a VPN route is
-    // replaced: the local process remains alive but no bytes move. Three
-    // lightweight protocol probes give the route time to recover without
-    // leaving an interactive pane frozen for the previous 30–40 seconds.
+    // replaced: the local process remains alive but no bytes move. One slow
+    // reply is not that: a host under disk pressure (dandy-07, 2026-10-22) can
+    // hold a single pong past the timeout while the stream keeps moving, and a
+    // restart then reattaches every pane on the node at once. So a probe only
+    // counts as missed when nothing at all arrived after it was sent, and the
+    // transport restarts after three consecutive misses: about 10–12 s of total
+    // silence, still well short of the previous 30–40 second freeze.
     static let intervalSeconds = 2
     static let timeoutNanoseconds: UInt64 = 6_000_000_000
+    static let restartMisses = 3
 
     static func expired(_ pending: [UInt64: UInt64], now: UInt64) -> [UInt64] {
         guard now >= timeoutNanoseconds else { return [] }
         let boundary = now - timeoutNanoseconds
         return pending.filter { $0.value <= boundary }.map(\.key)
     }
+
+    /// Expired probes leave `pending`. Those followed by any inbound data are
+    /// covered and dropped uncounted; the rest add to `consecutiveMisses`.
+    static func shouldRestart(
+        pending: [UInt64: UInt64], lastInbound: UInt64?, now: UInt64, consecutiveMisses: Int
+    ) -> (restart: Bool, misses: Int, expired: [UInt64]) {
+        let timedOut = expired(pending, now: now)
+        let missed = timedOut.filter { sequence in
+            guard let lastInbound, let sentAt = pending[sequence] else { return true }
+            return lastInbound <= sentAt
+        }
+        let misses = consecutiveMisses + missed.count
+        return (misses >= restartMisses, misses, timedOut)
+    }
+}
+
+/// One attempt by a pane transport to join a node. The transport cancels it
+/// when it detaches, restarts or starts another attempt. A node checks it under
+/// its own lock at the moment it would register the pane, so a cancelled
+/// attempt can never replace the subscription of the pane's successor.
+final class RelayNodeAdmission: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
+enum RelayNodeJoin {
+    case joined(RelayNodeChannel)
+    case retired
+    case cancelled
 }
 
 final class RelayNodeTransportPool: @unchecked Sendable {
     static let shared = RelayNodeTransportPool()
     private let lock = NSLock()
     private var nodes: [String: RelayNodeConnection] = [:]
+    typealias NodeFactory = @Sendable (ConnectionProfile,
+        @escaping @Sendable (RelayNodeConnection) -> Void) -> RelayNodeConnection
+    private let makeNode: NodeFactory
+    /// Runs after a node is looked up and before a pane or request joins it,
+    /// outside the pool lock (tests interleave an eviction there).
+    private var lookupHook: (@Sendable (RelayNodeConnection) -> Void)?
+    var afterLookup: (@Sendable (RelayNodeConnection) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return lookupHook }
+        set { lock.lock(); lookupHook = newValue; lock.unlock() }
+    }
+
+    init(makeNode: @escaping NodeFactory = { RelayNodeConnection(profile: $0, onIdle: $1) }) {
+        self.makeNode = makeNode
+    }
+
+    private func pooledNode(_ profile: ConnectionProfile) -> RelayNodeConnection {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = profile.connectionKey
+        if let node = nodes[key] { return node }
+        let node = makeNode(profile) { [weak self] node in self?.evictIfIdle(node, key: key) }
+        nodes[key] = node
+        return node
+    }
 
     /// Read-only observations; inspecting Network never creates or reconnects a node.
     func networkSnapshots() -> [NetworkTransportSnapshot] {
@@ -217,6 +303,11 @@ final class RelayNodeTransportPool: @unchecked Sendable {
     func setSystemSleeping(_ sleeping: Bool) {
         lock.lock(); let current = Array(nodes.values); lock.unlock()
         current.forEach { $0.setSystemSleeping(sleeping) }
+    }
+
+    func resumeAfterNetworkChange() {
+        lock.lock(); let current = Array(nodes.values); lock.unlock()
+        current.forEach { $0.resumeAfterNetworkChange() }
     }
 
     var cachedNodeCount: Int {
@@ -232,40 +323,82 @@ final class RelayNodeTransportPool: @unchecked Sendable {
         onFrame: @escaping @Sendable (RelayWireFrame) -> Void,
         onDisconnect: @escaping @Sendable (SSHConnectionFailure) -> Void
     ) -> RelayNodeChannel {
-        lock.lock()
-        let key = profile.connectionKey
-        let node = nodes[key] ?? RelayNodeConnection(
-            profile: profile,
-            onIdle: { [weak self] node in self?.evictIfIdle(node, key: key) }
-        )
-        nodes[key] = node
-        lock.unlock()
+        // Without an admission the join cannot be cancelled.
+        attach(profile: profile, sessionID: sessionID, admission: nil,
+            onReady: onReady, onFrame: onFrame, onDisconnect: onDisconnect)!
+    }
+
+    /// Joins the pooled node unless `admission` is cancelled first (nil).
+    func attach(
+        profile: ConnectionProfile,
+        sessionID: String,
+        admission: RelayNodeAdmission?,
+        onReady: @escaping @Sendable (RelayNodeChannel) -> Void,
+        onFrame: @escaping @Sendable (RelayWireFrame) -> Void,
+        onDisconnect: @escaping @Sendable (SSHConnectionFailure) -> Void
+    ) -> RelayNodeChannel? {
         Task { @MainActor in RelayHostRegistry.shared.register(profile, origin: "Terminal connection") }
-        return node.add(sessionID: sessionID, onReady: onReady, onFrame: onFrame, onDisconnect: onDisconnect)
+        // A node retired between lookup and join refuses the pane; the next
+        // lookup finds or creates the pooled successor.
+        while true {
+            let node = pooledNode(profile)
+            afterLookup?(node)
+            switch node.addUnlessRetired(sessionID: sessionID, admission: admission, onReady: onReady,
+                onFrame: onFrame, onDisconnect: onDisconnect) {
+            case .joined(let channel): return channel
+            case .retired: continue
+            case .cancelled: return nil
+            }
+        }
     }
 
-    private func rpcNode(profile: ConnectionProfile) -> RelayNodeConnection {
+    /// Removes the pooled node for a host without closing it or its panes,
+    /// the state a pane's recovery check repairs (tests).
+    func abandonPooledNode(profile: ConnectionProfile) {
         lock.lock()
-        let key = profile.connectionKey
-        let node = nodes[key] ?? RelayNodeConnection(profile: profile,
-            onIdle: { [weak self] node in self?.evictIfIdle(node, key: key) })
-        nodes[key] = node
+        nodes.removeValue(forKey: profile.connectionKey)
         lock.unlock()
-        Task { @MainActor in RelayHostRegistry.shared.register(profile, origin: "Host RPC transport; requester unspecified") }
-        return node
     }
 
-    func request(profile: ConnectionProfile, payload: Data, requiredCapability: String? = nil) async throws -> Data {
-        let node = rpcNode(profile: profile)
+    /// Whether a waiting pane must leave its node: true when the channel is
+    /// closed or its node is no longer the pooled one for its host. Otherwise
+    /// a parked node is asked to start its transport now.
+    func paneNeedsNewNode(_ channel: RelayNodeChannel, profile: ConnectionProfile) -> Bool {
+        guard let node = channel.node else { return true }
+        lock.lock()
+        let pooled = nodes[profile.connectionKey] === node
+        lock.unlock()
+        if pooled { node.resumeAfterNetworkChange() }
+        return !pooled
+    }
+
+    /// The current transport incarnation for a host, without creating or
+    /// reconnecting it: changes whenever the node is replaced or reconnects.
+    func incarnation(profile: ConnectionProfile) -> String? {
+        lock.lock()
+        let node = nodes[profile.connectionKey]
+        lock.unlock()
+        return node?.incarnation
+    }
+
+    func request(profile: ConnectionProfile, payload: Data, requiredCapability: String? = nil, timeoutSeconds: Int = 20) async throws -> Data {
+        Task { @MainActor in RelayHostRegistry.shared.register(profile, origin: "Host RPC transport; requester unspecified") }
         return try await withCheckedThrowingContinuation { continuation in
-            node.request(payload: payload, requiredCapability: requiredCapability) { continuation.resume(with: $0) }
+            while true {
+                let node = pooledNode(profile)
+                afterLookup?(node)
+                if node.request(payload: payload, requiredCapability: requiredCapability,
+                    timeoutSeconds: timeoutSeconds, completion: { continuation.resume(with: $0) }) { return }
+            }
         }
     }
 
     private func evictIfIdle(_ node: RelayNodeConnection, key: String) {
         lock.lock()
         defer { lock.unlock() }
-        guard nodes[key] === node, node.isIdle else { return }
+        // The node decides under its own lock; once retired it admits no pane
+        // or request, so nothing can join it after it leaves the pool.
+        guard nodes[key] === node, node.retireIfIdle() else { return }
         nodes.removeValue(forKey: key)
         RelayDiagnostics.shared.record(category: "connection", name: "node-evicted", details: [
             "connection_id": node.diagnosticID,
@@ -318,29 +451,33 @@ final class RelayNodeConnection: @unchecked Sendable {
     private var pendingRPC: [String: PendingRPC] = [:]
     private var retainsHostConnection = false
 
-    func request(payload: Data, requiredCapability: String? = nil, completion: @escaping @Sendable (Result<Data, Error>) -> Void) {
+    /// False only when this node is retired: the caller sends the request to
+    /// the pooled node instead. Every admitted request completes exactly once.
+    @discardableResult
+    func request(payload: Data, requiredCapability: String? = nil, timeoutSeconds: Int = 20, completion: @escaping @Sendable (Result<Data, Error>) -> Void) -> Bool {
         // A 4 MiB upload chunk expands to about 5.6 MiB in base64 JSON.
         // Keep requests bounded below the 16 MiB wire frame limit.
-        guard payload.count <= 8 << 20,
+        guard (1...80).contains(timeoutSeconds), payload.count <= 8 << 20,
               let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
               let id = object["request_id"] as? String,
               id.range(of: #"^[A-Za-z0-9_-]{1,96}$"#, options: .regularExpression) != nil else {
-            completion(.failure(RelayHostRPCError.invalidRequest)); return
+            completion(.failure(RelayHostRPCError.invalidRequest)); return true
         }
         lock.lock()
-        guard pendingRPC[id] == nil else { lock.unlock(); completion(.failure(RelayHostRPCError.duplicateRequest)); return }
+        guard !retired else { lock.unlock(); return false }
+        guard pendingRPC[id] == nil else { lock.unlock(); completion(.failure(RelayHostRPCError.duplicateRequest)); return true }
         retainsHostConnection = true
         pendingRPC[id] = PendingRPC(payload: payload, requiredCapability: requiredCapability, completion: completion)
-        if stopped { stopped = false; startLocked() }
+        resumeLocked()
         let canSend = ready
         lock.unlock()
         if canSend { flushHostRequests() }
-        let timeoutSeconds = 20
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .seconds(timeoutSeconds)) { [weak self] in
             guard let self else { return }
             self.lock.lock(); let pending = self.pendingRPC.removeValue(forKey: id); self.lock.unlock()
             pending?.completion(.failure(RelayHostRPCError.outcomeUnknown))
         }
+        return true
     }
 
     private func flushHostRequests() {
@@ -374,20 +511,30 @@ final class RelayNodeConnection: @unchecked Sendable {
     private var stopped = true
     private var generation = 0
     private var reconnectAttempt = 0
+    private var lastStartUptime: UInt64 = 0
+    private var attachedPeer = false
+    /// Set once, under this lock, when the pool evicts the idle node.
+    private var retired = false
     private var capabilities: Set<String> = []
     private var systemSleeping = false
     private var heartbeatSequence: UInt64 = 0
     private var pendingHeartbeats: [UInt64: UInt64] = [:]
+    /// Uptime of the last bytes read from the node, of any kind.
+    private var lastInboundUptime: UInt64?
+    private var consecutiveHeartbeatMisses = 0
+    private let uptime: @Sendable () -> UInt64
     private let heartbeatTimer: DispatchSourceTimer
     private let diagnosticConnectionID: String
     private let onIdle: @Sendable (RelayNodeConnection) -> Void
 
     init(
         profile: ConnectionProfile,
-        onIdle: @escaping @Sendable (RelayNodeConnection) -> Void = { _ in }
+        onIdle: @escaping @Sendable (RelayNodeConnection) -> Void = { _ in },
+        uptime: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) {
         self.profile = profile
         self.onIdle = onIdle
+        self.uptime = uptime
         diagnosticConnectionID = String(
             format: "%016llx", UInt64(bitPattern: Int64(profile.connectionKey.hashValue))
         )
@@ -401,10 +548,13 @@ final class RelayNodeConnection: @unchecked Sendable {
     /// started. Subscription identity and outbound routing use the same paths
     /// as the live node connection.
     convenience init(profile: ConnectionProfile, attachedFrameWriter: any RelayFrameWriting,
-        attachedGeneration: Int = 0, protocolReady: Bool = true) {
-        self.init(profile: profile)
+        attachedGeneration: Int = 0, protocolReady: Bool = true,
+        onIdle: @escaping @Sendable (RelayNodeConnection) -> Void = { _ in },
+        uptime: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) {
+        self.init(profile: profile, onIdle: onIdle, uptime: uptime)
         generation = attachedGeneration
         writer = attachedFrameWriter
+        attachedPeer = true
         ready = protocolReady
         stopped = false
     }
@@ -412,6 +562,14 @@ final class RelayNodeConnection: @unchecked Sendable {
     deinit { heartbeatTimer.cancel() }
 
     var diagnosticID: String { diagnosticConnectionID }
+
+    private let incarnationSerial = UUID()
+    /// This connection object and its current process generation.
+    var incarnation: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return "\(incarnationSerial.uuidString)/\(generation)"
+    }
 
     func networkSnapshot() -> NetworkTransportSnapshot {
         lock.lock()
@@ -425,10 +583,27 @@ final class RelayNodeConnection: @unchecked Sendable {
         )
     }
 
-    var isIdle: Bool {
+    /// Retires the node if it is idle, deciding under the same lock that
+    /// admits panes and requests. The pool never routes anything to it again.
+    func retireIfIdle() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return subscriptions.isEmpty && stopped
+        guard !retired, subscriptions.isEmpty, pendingRPC.isEmpty, stopped else { return false }
+        retired = true
+        return true
+    }
+
+    /// Whether `channel` is the registered route for its session (tests).
+    func isRegistered(_ channel: RelayNodeChannel) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return subscriptions[channel.sessionID]?.channel === channel
+    }
+
+    var isRetired: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return retired
     }
 
     func supports(_ capability: String) -> Bool {
@@ -437,12 +612,41 @@ final class RelayNodeConnection: @unchecked Sendable {
         return capabilities.contains(capability)
     }
 
+    /// Owned (unpooled) nodes are never retired, so add always joins them.
     func add(
         sessionID: String,
         onReady: @escaping @Sendable (RelayNodeChannel) -> Void,
         onFrame: @escaping @Sendable (RelayWireFrame) -> Void,
         onDisconnect: @escaping @Sendable (SSHConnectionFailure) -> Void
     ) -> RelayNodeChannel {
+        guard case .joined(let channel) = join(sessionID: sessionID, admission: nil, onReady: onReady,
+            onFrame: onFrame, onDisconnect: onDisconnect, refuseRetired: false) else {
+            preconditionFailure("an unpooled join without admission always succeeds")
+        }
+        return channel
+    }
+
+    /// Joins this node unless the pool has already retired it or `admission`
+    /// has been cancelled; both are decided under this node's lock.
+    func addUnlessRetired(
+        sessionID: String,
+        admission: RelayNodeAdmission? = nil,
+        onReady: @escaping @Sendable (RelayNodeChannel) -> Void,
+        onFrame: @escaping @Sendable (RelayWireFrame) -> Void,
+        onDisconnect: @escaping @Sendable (SSHConnectionFailure) -> Void
+    ) -> RelayNodeJoin {
+        join(sessionID: sessionID, admission: admission, onReady: onReady, onFrame: onFrame,
+            onDisconnect: onDisconnect, refuseRetired: true)
+    }
+
+    private func join(
+        sessionID: String,
+        admission: RelayNodeAdmission?,
+        onReady: @escaping @Sendable (RelayNodeChannel) -> Void,
+        onFrame: @escaping @Sendable (RelayWireFrame) -> Void,
+        onDisconnect: @escaping @Sendable (SSHConnectionFailure) -> Void,
+        refuseRetired: Bool
+    ) -> RelayNodeJoin {
         let channel = RelayNodeChannel(sessionID: sessionID, connection: self)
         let frameDispatcher = RelayNodeFrameDispatcher(
             label: "relay.node-pane.\(sessionID)", initiallyPaused: true
@@ -450,6 +654,14 @@ final class RelayNodeConnection: @unchecked Sendable {
             onFrame(frame)
         }
         lock.lock()
+        if refuseRetired, retired {
+            lock.unlock()
+            return .retired
+        }
+        if let admission, !admission.isActive {
+            lock.unlock()
+            return .cancelled
+        }
         let previous = subscriptions.updateValue(
             Subscription(
                 channel: channel,
@@ -460,15 +672,12 @@ final class RelayNodeConnection: @unchecked Sendable {
             forKey: sessionID
         )
         let isReady = ready
-        if stopped {
-            stopped = false
-            startLocked()
-        }
+        resumeLocked()
         if isReady { frameDispatcher.enqueueLifecycle { onReady(channel) } }
         lock.unlock()
         previous?.frameDispatcher.close()
         frameDispatcher.resume()
-        return channel
+        return .joined(channel)
     }
 
     func close(sessionID: String, channel: RelayNodeChannel) {
@@ -485,7 +694,7 @@ final class RelayNodeConnection: @unchecked Sendable {
             writer = nil
             capabilities.removeAll(keepingCapacity: true)
             heartbeatTimer.schedule(deadline: .distantFuture)
-            pendingHeartbeats.removeAll(keepingCapacity: true)
+            clearHeartbeatsLocked()
             let process = self.process
             self.process = nil
             lock.unlock()
@@ -525,7 +734,30 @@ final class RelayNodeConnection: @unchecked Sendable {
         writer?.writeAsync(type: envelope.type, payload: envelope.payload)
     }
 
+    /// A stopped node starts. A node whose transport ended and is waiting for
+    /// a retry (no process) starts now, at most once per few seconds, so a
+    /// host request or pane reconnect never waits on a parked transport.
+    private func resumeLocked() {
+        if stopped {
+            stopped = false
+            startLocked()
+        } else if process == nil, !attachedPeer,
+                  DispatchTime.now().uptimeNanoseconds &- lastStartUptime >= Self.demandRestartInterval {
+            startLocked()
+        }
+    }
+
+    private static let demandRestartInterval: UInt64 = 5_000_000_000
+
+    /// Wake and network-path recovery: start any parked transport now.
+    func resumeAfterNetworkChange() {
+        lock.lock()
+        if !stopped { resumeLocked() }
+        lock.unlock()
+    }
+
     private func startLocked() {
+        lastStartUptime = DispatchTime.now().uptimeNanoseconds
         generation += 1
         let currentGeneration = generation
         usesPersistentBroker = false
@@ -602,7 +834,7 @@ final class RelayNodeConnection: @unchecked Sendable {
                 if ssh?.isRunning == true { ssh?.terminate() }
             }
         }
-        DispatchQueue.global(qos: .utility).async {
+        RelayBlockingIO.start(name: "relay.node.stderr", qos: .utility) {
             defer { diagnosticsFinished.signal() }
             while true {
                 let hasData = autoreleasepool { () -> Bool in
@@ -614,7 +846,7 @@ final class RelayNodeConnection: @unchecked Sendable {
                 if !hasData { break }
             }
         }
-        DispatchQueue.global(qos: .userInteractive).async { [weak self, weak ssh] in
+        RelayBlockingIO.start(name: "relay.node.frames", qos: .userInteractive) { [weak self, weak ssh] in
             var fragments = RelayWireFragmentAssembler()
             do {
                 // Read until EOF (readExactly throws .endOfStream) rather
@@ -623,15 +855,8 @@ final class RelayNodeConnection: @unchecked Sendable {
                 // terminal "exited" status — must be drained, not dropped.
                 while let self {
                     try autoreleasepool {
-                        let raw = try RelayWireFrame.read(from: output.fileHandleForReading)
-                        if raw.type == .status,
-                           let status = try? JSONDecoder().decode(StatusWirePayload.self, from: raw.payload),
-                           status.state == "ready", status.capabilities?.contains("wire_fragments_v1") == true {
-                            fragments.enabled = true
-                        }
-                        if let frame = try fragments.accept(raw) {
-                            self.receive(frame, generation: currentGeneration)
-                        }
+                        try self.readNodeFrame(from: output.fileHandleForReading, fragments: &fragments,
+                            generation: currentGeneration)
                     }
                 }
             } catch {
@@ -640,9 +865,44 @@ final class RelayNodeConnection: @unchecked Sendable {
         }
     }
 
+    /// Reads and routes one frame of the node stream. Every chunk of bytes
+    /// shows the stream moving, even one partway through a large frame that
+    /// takes longer than the heartbeat timeout to arrive.
+    func readNodeFrame(from handle: FileHandle, fragments: inout RelayWireFragmentAssembler,
+        generation currentGeneration: Int) throws {
+        let raw = try RelayWireFrame.read(from: handle) { noteInbound(generation: currentGeneration) }
+        if raw.type == .status,
+           let status = try? JSONDecoder().decode(StatusWirePayload.self, from: raw.payload),
+           status.state == "ready", status.capabilities?.contains("wire_fragments_v1") == true {
+            fragments.enabled = true
+        }
+        if let frame = try fragments.accept(raw) {
+            receive(frame, generation: currentGeneration)
+        }
+    }
+
     /// Owned framed peers enter the same generation-checked reader path.
     func receiveAttachedFrame(_ frame: RelayWireFrame, generation: Int) {
+        noteInbound(generation: generation)
         receive(frame, generation: generation)
+    }
+
+    /// Inbound data of any kind proves the transport alive and ends a run of
+    /// heartbeat misses; probes sent before it can no longer count as missed.
+    private func noteInbound(generation currentGeneration: Int) {
+        let now = uptime()
+        lock.lock()
+        if generation == currentGeneration, !stopped {
+            lastInboundUptime = now
+            consecutiveHeartbeatMisses = 0
+        }
+        lock.unlock()
+    }
+
+    private func clearHeartbeatsLocked() {
+        pendingHeartbeats.removeAll(keepingCapacity: true)
+        lastInboundUptime = nil
+        consecutiveHeartbeatMisses = 0
     }
 
     private func receive(_ frame: RelayWireFrame, generation currentGeneration: Int) {
@@ -696,6 +956,10 @@ final class RelayNodeConnection: @unchecked Sendable {
                 RelayHostRegistry.shared.connection(profile, ready: true, capabilities: status.capabilities ?? [],
                     version: status.version, protocolVersion: status.protocolVersion,
                     supervisorPID: status.supervisorPID)
+                if status.capabilities?.contains("host_accounts_v1") == true {
+                    RelayHostAccountSharing.shared.hostReady(profile)
+                }
+                NotificationCenter.default.post(name: .relayNodeReady, object: profile.connectionKey)
             }
             flushHostRequests()
             RelayDiagnostics.shared.record(category: "connection", name: "ready", details: [
@@ -705,7 +969,7 @@ final class RelayNodeConnection: @unchecked Sendable {
         }
         if frame.type == .pong, frame.payload.count == 8 {
             let sequence = frame.payload.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-            let now = DispatchTime.now().uptimeNanoseconds
+            let now = uptime()
             lock.lock()
             guard generation == currentGeneration, !stopped else { lock.unlock(); return }
             let sentAt = pendingHeartbeats.removeValue(forKey: sequence)
@@ -739,7 +1003,7 @@ final class RelayNodeConnection: @unchecked Sendable {
         process = nil
         reconnectAttempt += 1
         heartbeatTimer.schedule(deadline: .distantFuture)
-        pendingHeartbeats.removeAll(keepingCapacity: true)
+        clearHeartbeatsLocked()
         let attempt = reconnectAttempt
         let failure = SSHConnectionFailure.diagnoseNodeTransport(
             diagnostic,
@@ -760,12 +1024,17 @@ final class RelayNodeConnection: @unchecked Sendable {
             "reason": failure.userMessage,
             "retry": String(failure.shouldRetry),
         ])
-        guard failure.shouldRetry else { return }
-        let delay = min(3_000, 150 * (1 << min(attempt - 1, 4)))
+        // A failure classed as permanent (authentication, remote install, a
+        // stream closed before the handshake) can still clear outside Relay,
+        // e.g. after a network drop or an ssh-agent unlock. Keep retrying
+        // slowly; never leave the node parked with no process until restart.
+        let delay = failure.shouldRetry ? min(3_000, 150 * (1 << min(attempt - 1, 4))) : 30_000
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            guard !self.stopped, self.process == nil else { self.lock.unlock(); return }
+            guard !self.stopped, self.process == nil, self.generation == currentGeneration else {
+                self.lock.unlock(); return
+            }
             self.startLocked()
             self.lock.unlock()
         }
@@ -774,32 +1043,41 @@ final class RelayNodeConnection: @unchecked Sendable {
     func setSystemSleeping(_ sleeping: Bool) {
         lock.lock()
         systemSleeping = sleeping
-        pendingHeartbeats.removeAll(keepingCapacity: true)
+        clearHeartbeatsLocked()
         lock.unlock()
         if !sleeping { sendHeartbeat() }
     }
 
-    private func sendHeartbeat() {
-        let now = DispatchTime.now().uptimeNanoseconds
+    /// The heartbeat timer's tick (tests drive it directly with their clock).
+    func sendHeartbeat() {
+        let now = uptime()
         lock.lock()
         guard ready, !systemSleeping, let writer else { lock.unlock(); return }
-        let timedOut = RelayHeartbeatPolicy.expired(pendingHeartbeats, now: now)
-        for sequence in timedOut { pendingHeartbeats.removeValue(forKey: sequence) }
-        if !timedOut.isEmpty {
+        let verdict = RelayHeartbeatPolicy.shouldRestart(
+            pending: pendingHeartbeats, lastInbound: lastInboundUptime,
+            now: now, consecutiveMisses: consecutiveHeartbeatMisses
+        )
+        let missed = verdict.misses - consecutiveHeartbeatMisses
+        for sequence in verdict.expired { pendingHeartbeats.removeValue(forKey: sequence) }
+        consecutiveHeartbeatMisses = verdict.misses
+        let missDetails = [
+            "connection_id": diagnosticConnectionID,
+            "missed": String(missed),
+            "consecutive_misses": String(verdict.misses),
+            "last_inbound_age_ms": lastInboundUptime.map { String(now >= $0 ? (now - $0) / 1_000_000 : 0) } ?? "none",
+        ]
+        if verdict.restart {
             // An alive local ssh PID does not prove that the relay protocol is
             // moving. Stop the wedged transport so its normal termination
             // handler creates a fresh SSH connection and resubscribes panes.
             heartbeatTimer.schedule(deadline: .distantFuture)
             let stalledProcess = process
             lock.unlock()
-            for _ in timedOut {
+            for _ in 0..<missed {
                 RelayDiagnostics.shared.heartbeatTimedOut(connection: diagnosticConnectionID)
             }
-            RelayDiagnostics.shared.record(category: "connection", name: "heartbeat-watchdog", details: [
-                "connection_id": diagnosticConnectionID,
-                "missed": String(timedOut.count),
-                "action": "restart-ssh",
-            ])
+            RelayDiagnostics.shared.record(category: "connection", name: "heartbeat-watchdog",
+                details: missDetails.merging(["action": "restart-ssh"]) { $1 })
             stalledProcess?.terminate()
             if let stalledProcess {
                 let pid = stalledProcess.processIdentifier
@@ -814,6 +1092,13 @@ final class RelayNodeConnection: @unchecked Sendable {
         pendingHeartbeats[sequence] = now
         lock.unlock()
 
+        if missed > 0 {
+            // Below the threshold a silent probe is recorded and the transport kept.
+            for _ in 0..<missed {
+                RelayDiagnostics.shared.heartbeatTimedOut(connection: diagnosticConnectionID)
+            }
+            RelayDiagnostics.shared.record(category: "connection", name: "heartbeat-missed", details: missDetails)
+        }
         RelayDiagnostics.shared.heartbeatSent(connection: diagnosticConnectionID)
         var bigEndian = sequence.bigEndian
         let payload = withUnsafeBytes(of: &bigEndian) { Data($0) }

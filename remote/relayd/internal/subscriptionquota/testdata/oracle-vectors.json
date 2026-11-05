@@ -1,0 +1,472 @@
+{
+  "oracle_sha256": "b36faaa9290d972ba4e7f5a4f9aaa0177304c3ffc24e84cb5674922f16d29a0b",
+  "captured_at": "2026-10-25T07:00:00.123456Z",
+  "usage": [
+    {
+      "name": "case-0",
+      "input": {},
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": null,
+      "error": false
+    },
+    {
+      "name": "case-1",
+      "input": {
+        "five_hour": {
+          "utilization": 25,
+          "resets_at": "2026-10-25T08:30:00Z"
+        }
+      },
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": {
+        "provider": "claude",
+        "account_scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+        "observation": {
+          "session_id": "account-usage",
+          "rate_limits": {
+            "five_hour": {
+              "used_percentage": 25,
+              "resets_at": 1792917000.0
+            }
+          },
+          "plan_type": "max",
+          "additional_limits": [],
+          "spend": null,
+          "captured_at": "2026-10-25T07:00:00.123456Z"
+        }
+      },
+      "error": false
+    },
+    {
+      "name": "case-2",
+      "input": {
+        "five_hour": {
+          "utilization": 0.0,
+          "resets_at": "2026-10-25T08:30:00.123456+02:00"
+        },
+        "seven_day": {
+          "utilization": 12.5,
+          "resets_at": "2026-10-25T08:30:00.123456+02:00"
+        },
+        "seven_day_oauth_apps": {
+          "utilization": 25.0,
+          "resets_at": "2026-10-25T08:30:00.123456+02:00"
+        },
+        "seven_day_opus": {
+          "utilization": 37.5,
+          "resets_at": "2026-10-25T08:30:00.123456+02:00"
+        },
+        "seven_day_sonnet": {
+          "utilization": 50.0,
+          "resets_at": "2026-10-25T08:30:00.123456+02:00"
+        },
+        "seven_day_cowork": {
+          "utilization": 62.5,
+          "resets_at": "2026-10-25T08:30:00.123456+02:00"
+        },
+        "seven_day_omelette": {
+          "utilization": 75.0,
+          "resets_at": "2026-10-25T08:30:00.123456+02:00"
+        }
+      },
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": {
+        "provider": "claude",
+        "account_scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+        "observation": {
+          "session_id": "account-usage",
+          "rate_limits": {
+            "five_hour": {
+              "used_percentage": 0.0,
+              "resets_at": 1792909800.123456
+            },
+            "seven_day": {
+              "used_percentage": 12.5,
+              "resets_at": 1792909800.123456
+            },
+            "seven_day_oauth_apps": {
+              "used_percentage": 25.0,
+              "resets_at": 1792909800.123456
+            },
+            "seven_day_opus": {
+              "used_percentage": 37.5,
+              "resets_at": 1792909800.123456
+            },
+            "seven_day_sonnet": {
+              "used_percentage": 50.0,
+              "resets_at": 1792909800.123456
+            },
+            "seven_day_cowork": {
+              "used_percentage": 62.5,
+              "resets_at": 1792909800.123456
+            },
+            "seven_day_omelette": {
+              "used_percentage": 75.0,
+              "resets_at": 1792909800.123456
+            }
+          },
+          "plan_type": "max",
+          "additional_limits": [],
+          "spend": null,
+          "captured_at": "2026-10-25T07:00:00.123456Z"
+        }
+      },
+      "error": false
+    },
+    {
+      "name": "case-3",
+      "input": {
+        "five_hour": {
+          "utilization": true
+        },
+        "seven_day": {
+          "utilization": 101
+        }
+      },
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": null,
+      "error": false
+    },
+    {
+      "name": "case-4",
+      "input": {
+        "five_hour": {
+          "utilization": 50,
+          "resets_at": 123
+        }
+      },
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": {
+        "provider": "claude",
+        "account_scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+        "observation": {
+          "session_id": "account-usage",
+          "rate_limits": {
+            "five_hour": {
+              "used_percentage": 50,
+              "resets_at": null
+            }
+          },
+          "plan_type": "max",
+          "additional_limits": [],
+          "spend": null,
+          "captured_at": "2026-10-25T07:00:00.123456Z"
+        }
+      },
+      "error": false
+    },
+    {
+      "name": "case-5",
+      "input": {
+        "five_hour": {
+          "utilization": 50,
+          "resets_at": "invalid"
+        }
+      },
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": null,
+      "error": true
+    },
+    {
+      "name": "case-6",
+      "input": {
+        "limits": [
+          {
+            "kind": "scoped",
+            "percent": 31.5,
+            "group": "weekly",
+            "scope": {
+              "model": {
+                "display_name": "Opus \u2603"
+              },
+              "n": 1.0,
+              "flag": true
+            },
+            "resets_at": "2026-10-26T01:02:03.123456+0000"
+          }
+        ],
+        "spend": {
+          "enabled": true,
+          "used": {
+            "amount_minor": 1250,
+            "exponent": 2,
+            "currency": "USD"
+          }
+        }
+      },
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": {
+        "provider": "claude",
+        "account_scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+        "observation": {
+          "session_id": "account-usage",
+          "rate_limits": {},
+          "plan_type": "max",
+          "additional_limits": [
+            {
+              "id": "scoped-ef941e0231202fcc",
+              "label": "Opus \u2603",
+              "used_percentage": 31.5,
+              "resets_at": 1792976523.123456,
+              "duration_minutes": 10080
+            }
+          ],
+          "spend": {
+            "enabled": true,
+            "used": {
+              "amount_minor": 1250,
+              "exponent": 2,
+              "currency": "USD"
+            }
+          },
+          "captured_at": "2026-10-25T07:00:00.123456Z"
+        }
+      },
+      "error": false
+    },
+    {
+      "name": "case-7",
+      "input": {
+        "limits": [
+          {
+            "kind": "session",
+            "percent": 9,
+            "scope": {
+              "model": {
+                "display_name": "skip"
+              }
+            },
+            "resets_at": "2026-10-26T01:02:03Z"
+          },
+          {
+            "kind": "other",
+            "percent": 12,
+            "scope": {
+              "model": {
+                "display_name": "Daily"
+              },
+              "exp": 1e+20,
+              "tiny": 1e-06
+            },
+            "resets_at": "2026-10-26T01:02:03+01:00"
+          }
+        ]
+      },
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": {
+        "provider": "claude",
+        "account_scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+        "observation": {
+          "session_id": "account-usage",
+          "rate_limits": {},
+          "plan_type": "max",
+          "additional_limits": [
+            {
+              "id": "scoped-19bd78231b691228",
+              "label": "Daily",
+              "used_percentage": 12,
+              "resets_at": 1792972923.0,
+              "duration_minutes": null
+            }
+          ],
+          "spend": null,
+          "captured_at": "2026-10-25T07:00:00.123456Z"
+        }
+      },
+      "error": false
+    },
+    {
+      "name": "case-8",
+      "input": {
+        "five_hour": {
+          "utilization": 0
+        },
+        "limits": [
+          {
+            "kind": "x",
+            "percent": 99,
+            "scope": {
+              "model": {
+                "display_name": " "
+              }
+            },
+            "resets_at": "2026-10-26T01:02:03Z"
+          }
+        ]
+      },
+      "plan": "max",
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": {
+        "provider": "claude",
+        "account_scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+        "observation": {
+          "session_id": "account-usage",
+          "rate_limits": {
+            "five_hour": {
+              "used_percentage": 0,
+              "resets_at": null
+            }
+          },
+          "plan_type": "max",
+          "additional_limits": [],
+          "spend": null,
+          "captured_at": "2026-10-25T07:00:00.123456Z"
+        }
+      },
+      "error": false
+    }
+  ],
+  "identity": [
+    {
+      "provider": "codex",
+      "identity": [
+        "codex",
+        "account-\u2603<>&"
+      ],
+      "expected": "9c85b119c0211fbe86cc1f60bfe0b498ef10749867d5e37853616c29e69a7acb"
+    },
+    {
+      "provider": "claude",
+      "identity": [
+        "claude",
+        "account-\u2603",
+        "org-\ud83d\ude00"
+      ],
+      "expected": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546"
+    }
+  ],
+  "resets": [
+    {
+      "input": "2026-10-25T08:30:00Z",
+      "expected": 1792917000.0,
+      "error": false
+    },
+    {
+      "input": "2026-10-25T08:30:00.123456+02:00",
+      "expected": 1792909800.123456,
+      "error": false
+    },
+    {
+      "input": "2026-10-25T08:30:00-0130",
+      "expected": 1792922400.0,
+      "error": false
+    },
+    {
+      "input": "2026-1-2T3:4:5+0000",
+      "expected": 1767323045.0,
+      "error": false
+    },
+    {
+      "input": "2024-02-29T23:59:59Z",
+      "expected": 1709251199.0,
+      "error": false
+    },
+    {
+      "input": "2023-02-29T12:00:00Z",
+      "expected": null,
+      "error": true
+    },
+    {
+      "input": "2026-10-25T08:30:00",
+      "expected": null,
+      "error": true
+    },
+    {
+      "input": "2026-10-25T08:30:00.1234567Z",
+      "expected": null,
+      "error": true
+    },
+    {
+      "input": "2026-10-25T08:30:00+01:02:03.123456",
+      "expected": 1792913276.876544,
+      "error": false
+    },
+    {
+      "input": "2026-10-25T08:30:00+2400",
+      "expected": null,
+      "error": true
+    },
+    {
+      "input": "invalid",
+      "expected": null,
+      "error": true
+    }
+  ],
+  "capture": [
+    {
+      "input": {
+        "session_id": "abcdef-1234",
+        "rate_limits": {
+          "five_hour": {
+            "used_percentage": 23.5,
+            "resets_at": 1800000000
+          },
+          "seven_day": {
+            "used_percentage": true
+          }
+        }
+      },
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": {
+        "session_id": "abcdef-1234",
+        "rate_limits": {
+          "five_hour": {
+            "used_percentage": 23.5,
+            "resets_at": 1800000000
+          }
+        },
+        "account_scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+        "captured_at": "2026-10-25T07:00:00.123456Z"
+      }
+    },
+    {
+      "input": {
+        "session_id": "BAD/PATH",
+        "rate_limits": {}
+      },
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": null
+    },
+    {
+      "input": {
+        "session_id": "abcdef",
+        "rate_limits": {
+          "five_hour": {
+            "used_percentage": 0
+          },
+          "seven_day": {
+            "used_percentage": 100,
+            "resets_at": null
+          },
+          "seven_day_opus": {
+            "used_percentage": -1
+          }
+        }
+      },
+      "scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+      "expected": {
+        "session_id": "abcdef",
+        "rate_limits": {
+          "five_hour": {
+            "used_percentage": 0,
+            "resets_at": null
+          },
+          "seven_day": {
+            "used_percentage": 100,
+            "resets_at": null
+          }
+        },
+        "account_scope": "74ecf202ad02cb9e647796a2c2925a051cde007c74fa0f10f36cf77d8a51d546",
+        "captured_at": "2026-10-25T07:00:00.123456Z"
+      }
+    }
+  ]
+}

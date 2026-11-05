@@ -53,6 +53,8 @@ func TestHookEventUnavailableDaemonDoesNotFailClaude(t *testing.T) {
 
 func TestFindRealAgentExecutableSkipsRelayShim(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("RELAY_CODEX_BIN", "")
 	shimDirectory := filepath.Join(root, "shims")
 	realDirectory := filepath.Join(root, "real")
 	if err := os.MkdirAll(shimDirectory, 0o700); err != nil {
@@ -85,6 +87,7 @@ func TestFindRealAgentExecutableSkipsRelayShim(t *testing.T) {
 
 func TestFindRealAgentExecutableSkipsRelayOwnedWrapper(t *testing.T) {
 	home := t.TempDir()
+	t.Setenv("RELAY_CLAUDE_BIN", "")
 	shimDirectory := filepath.Join(home, ".local", "share", "relay", "shims")
 	realDirectory := filepath.Join(home, "real")
 	if err := os.MkdirAll(shimDirectory, 0o700); err != nil {
@@ -173,6 +176,11 @@ func TestParseObservedSessionsPreservesEventCursors(t *testing.T) {
 }
 
 func TestDefaultSocketNeverUsesSharedHome(t *testing.T) {
+	// This is the no-existing-supervisor branch. A live private socket under
+	// /run/user must not turn the fallback fixture into the adoption branch.
+	saved := defaultSocketRuntimeProbe
+	t.Cleanup(func() { defaultSocketRuntimeProbe = saved })
+	defaultSocketRuntimeProbe = func(string, int) string { return "" }
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("HOME", "/shared/home/test")
 	want := filepath.Join("/tmp", "relay-"+strconv.Itoa(os.Getuid()), "relayd.sock")
@@ -199,5 +207,45 @@ func TestDesiredMaxProcsKeepsPerPaneRuntimeSmall(t *testing.T) {
 	values["GOMAXPROCS"] = "8"
 	if got := desiredMaxProcs(lookup); got != 0 {
 		t.Fatalf("explicit Go setting was overridden: %d", got)
+	}
+}
+
+// relayd keeps the RELAY_CLAUDE_BIN it started with; after Claude's updater
+// deletes that version, the shim launches the version ~/.local/bin points to.
+// A configured file that exists but cannot run is still refused.
+func TestFindRealAgentExecutableFallsBackWhenTheConfiguredVersionIsGone(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	versions := filepath.Join(home, ".local", "share", "claude", "versions")
+	bin := filepath.Join(home, ".local", "bin")
+	for _, directory := range []string{versions, bin} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current := filepath.Join(versions, "2.1.308")
+	if err := os.WriteFile(current, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(current, filepath.Join(bin, "claude")); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_CLAUDE_BIN", filepath.Join(versions, "2.1.301"))
+	if found, err := findRealAgentExecutable("claude"); err != nil || found != want {
+		t.Fatalf("found %q %v, want %q", found, err, want)
+	}
+
+	broken := filepath.Join(home, "claude-broken")
+	if err := os.WriteFile(broken, []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_CLAUDE_BIN", broken)
+	if found, err := findRealAgentExecutable("claude"); err == nil || !strings.Contains(err.Error(), "not runnable") {
+		t.Fatalf("found %q %v, want the configured-path error", found, err)
 	}
 }

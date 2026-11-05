@@ -233,12 +233,13 @@ struct RelayPerformancePanel: View {
     @State private var settledOffset: CGSize = .zero
     @State private var collapsed = false
     @State private var reviewReceipt: RelaySupervisorActionReceipt?
-    @State private var section = "Performance"
+    @Binding private var section: String
     @StateObject private var activityPresentation = PluginToolPresentation()
     @StateObject private var activityChrome = WorkspaceChrome()
 
     init(workspace: WorkspaceModel, close: @escaping () -> Void) {
         self.close = close
+        _section = Binding(get: { workspace.performancePanelSection }, set: { workspace.performancePanelSection = $0 })
         _monitor = StateObject(wrappedValue: RelayPerformancePanelMonitor(workspace: workspace))
         _workspace = ObservedObject(wrappedValue: workspace)
     }
@@ -254,16 +255,22 @@ struct RelayPerformancePanel: View {
                     Picker("Monitoring", selection: $section) {
                         Text("Performance").tag("Performance")
                         Text("Energy").tag("Energy")
-                        Text("Processes").tag("Processes")
+                        Text("Sessions").tag("Sessions")
                         Text("Agents").tag("Agents")
                         Text("Hosts").tag("Hosts")
+                        Text("Control").tag("Control")
                     }.pickerStyle(.segmented).padding(RelayTheme.spacing(12))
                     ScrollView(.vertical) {
                         switch section {
                         case "Energy": energyContent
-                        case "Processes": RelayProcessMonitor(workspace: workspace)
-                        case "Agents": agentContent
+                        case "Sessions": RelaySessionMonitor(workspace: workspace)
+                        case "Agents":
+                            VStack(spacing: RelayTheme.spacing(8)) {
+                                RelayPaneHealthOverview()
+                                agentContent
+                            }
                         case "Hosts": RelayHostsMonitor(workspace: workspace)
+                        case "Control": RelayControlCenterView(workspace: workspace)
                         default: content
                         }
                     }
@@ -280,7 +287,7 @@ struct RelayPerformancePanel: View {
             }
             .shadow(color: .black.opacity(0.34), radius: 22, y: 10)
         }
-        .onAppear { section = workspace.energyMonitorMode ? "Energy" : "Performance"; monitor.start() }
+        .onAppear { monitor.start() }
         .onDisappear { monitor.stop() }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Relay monitoring")
@@ -335,23 +342,27 @@ struct RelayPerformancePanel: View {
             Button { collapsed.toggle() } label: {
                 Image(systemName: collapsed ? "chevron.down" : "chevron.up")
                     .font(RelayTheme.font(size: 9, weight: .medium))
-                    .frame(width: 24, height: 24)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .focusEffectDisabled()
             .help(collapsed ? "Expand monitoring" : "Collapse monitoring")
             .accessibilityLabel(collapsed ? "Expand monitoring" : "Collapse monitoring")
+            .accessibilityIdentifier("relay.monitoring.collapse")
             Button(action: close) {
                 Image(systemName: "xmark")
                     .font(RelayTheme.font(size: 9, weight: .medium))
-                    .frame(width: 24, height: 24)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayTheme.textMuted)
             .focusEffectDisabled()
             .help("Close monitoring")
             .accessibilityLabel("Close monitoring")
+            .accessibilityIdentifier("relay.monitoring.close")
         }
         .padding(.horizontal, RelayTheme.spacing(12))
         .frame(height: 42)

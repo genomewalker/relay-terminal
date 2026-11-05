@@ -12,6 +12,9 @@ const maxGarbageCollectionBatch = 128
 
 // CollectGarbage removes only exited or unvalidated panes older than the
 // retention window. A live running shell is never selected based on age.
+// Panes retained by an upgrade handoff are collected only on positive proof:
+// their still-validated worker reports the shell exited before the cutoff.
+// Missing or unvalidated retained panes may belong to an earlier helper.
 func (server *Server) CollectGarbage(olderThan time.Duration, dryRun bool) ([]string, error) {
 	cutoff := time.Now().UTC().Add(-olderThan)
 	server.mu.Lock()
@@ -25,12 +28,16 @@ func (server *Server) CollectGarbage(olderThan time.Duration, dryRun bool) ([]st
 		return nil, nil
 	}
 	type candidate struct {
-		id      string
-		updated time.Time
+		id       string
+		updated  time.Time
+		retained bool
 	}
 	candidates := make([]candidate, 0)
 	for id, pane := range catalog.Panes {
 		if pane.Retained {
+			if retainedShellExited(server.manifestPath(id), cutoff) {
+				candidates = append(candidates, candidate{id: id, updated: pane.UpdatedAt, retained: true})
+			}
 			continue
 		}
 		state := pane.State
@@ -66,6 +73,9 @@ func (server *Server) CollectGarbage(olderThan time.Duration, dryRun bool) ([]st
 	removed := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
 		manifestPath := server.manifestPath(candidate.id)
+		if candidate.retained && !retainedShellExited(manifestPath, cutoff) {
+			continue
+		}
 		if manifest, loadErr := loadManifest(manifestPath); loadErr == nil {
 			if validateWorkerIdentity(manifest) == nil {
 				if manifest.State != "exited" {
@@ -88,7 +98,8 @@ func (server *Server) CollectGarbage(olderThan time.Duration, dryRun bool) ([]st
 		latest, loadErr := loadStoredCatalog(server.catalogPath())
 		if loadErr == nil {
 			pane, exists := latest.Panes[candidate.id]
-			if exists && pane.Retained {
+			// A pane retained after selection keeps its protection.
+			if exists && pane.Retained && !candidate.retained {
 				server.mu.Unlock()
 				continue
 			}
@@ -100,7 +111,9 @@ func (server *Server) CollectGarbage(olderThan time.Duration, dryRun bool) ([]st
 					eligible = !manifest.UpdatedAt.After(cutoff)
 				}
 			} else if errors.Is(manifestErr, os.ErrNotExist) {
-				eligible = exists && !pane.UpdatedAt.After(cutoff)
+				// A retained pane's age was proven from its manifest before
+				// its worker was stopped; its catalog time may be newer.
+				eligible = exists && (candidate.retained || !pane.UpdatedAt.After(cutoff))
 			}
 			if eligible {
 				delete(latest.Panes, candidate.id)
@@ -116,6 +129,14 @@ func (server *Server) CollectGarbage(olderThan time.Duration, dryRun bool) ([]st
 		server.removeOrphanedWorkspaceStates(cutoff)
 	}
 	return removed, nil
+}
+
+// retainedShellExited reports whether a retained pane's worker is still the
+// validated original and has reported its shell exited since before cutoff.
+func retainedShellExited(manifestPath string, cutoff time.Time) bool {
+	manifest, err := loadManifest(manifestPath)
+	return err == nil && validateWorkerIdentity(manifest) == nil &&
+		manifest.State == "exited" && !manifest.UpdatedAt.After(cutoff)
 }
 
 func (server *Server) removeOrphanedWorkspaceStates(cutoff time.Time) {

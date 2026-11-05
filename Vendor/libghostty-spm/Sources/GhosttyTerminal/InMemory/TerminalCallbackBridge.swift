@@ -7,6 +7,9 @@
 
 import Foundation
 import GhosttyKit
+#if canImport(AppKit) && !canImport(UIKit)
+    import AppKit
+#endif
 
 /// Dispatches C runtime callbacks to a ``TerminalSurfaceViewDelegate``.
 ///
@@ -19,6 +22,11 @@ final class TerminalCallbackBridge {
     /// Raw surface pointer for use in C callbacks (e.g. clipboard).
     nonisolated(unsafe) var rawSurface: ghostty_surface_t?
     nonisolated let capturedClipboardRead = TerminalCapturedClipboardRead()
+    nonisolated let capturedClipboardWrite = TerminalCapturedClipboardWrite()
+    #if canImport(AppKit) && !canImport(UIKit)
+        /// The pasteboard clipboard callbacks use; nil means the general one.
+        nonisolated(unsafe) var pasteboard: NSPasteboard?
+    #endif
     var onCellSizeChange: ((UInt32, UInt32) -> Void)?
     var onRenderRequest: (() -> Void)?
 

@@ -41,11 +41,12 @@ struct RelayNodeDispatchBoundaryTests {
         }
         dispatcher.enqueue(.init(type: .output, payload: Data()))
         #expect(started.wait(timeout: .now() + 2) == .success)
-        DispatchQueue.global().async {
+        // A dedicated thread: a saturated global pool must not stand in for close.
+        Thread {
             closing.signal()
             dispatcher.close()
             closed.signal()
-        }
+        }.start()
         #expect(closing.wait(timeout: .now() + 2) == .success)
         let prematureClose = closed.wait(timeout: .now() + 0.05)
         #expect(prematureClose == .timedOut)

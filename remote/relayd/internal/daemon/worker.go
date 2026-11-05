@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,102 +25,181 @@ type WorkerConfig struct {
 	Cols               uint16
 	Rows               uint16
 	RotationControlled bool
+	// Resume is set when this image was exec'd by a previous worker image of
+	// the same process, which handed over its PTY, socket and state.
+	Resume *WorkerResume
+}
+
+// WorkerResume names the descriptors a re-executing worker left open.
+type WorkerResume struct {
+	StateFD    int
+	PTYFD      int
+	ListenerFD int
+	ShellPID   int
+	Operation  string
+}
+
+var workerCapabilities = []string{"host_rotation_v1", "host_rotation_text_v1", "host_rotation_credentials_v1", "native_rotation_bridge_v1", "input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1", "automation_input_v1", workerReexecCapability}
+
+// workerRuntime is one worker process's serving state. Everything here except
+// the session is either rebuilt by the next image or restarted after a failed
+// handoff; see worker_reexec.go.
+type workerRuntime struct {
+	config        WorkerConfig
+	listener      *net.UnixListener
+	session       *Session
+	manifest      workerManifest
+	newSupervisor func() *hostRotationSupervisor
+
+	transcripts   transcriptRun
+	forwarded     chan struct{}
+	persistStop   chan struct{}
+	persistDone   chan struct{}
+	handoffMu     sync.Mutex
+	handoff       atomic.Bool
+	acceptResumed chan struct{}
 }
 
 func ServeWorker(config WorkerConfig) error {
 	if !validSessionID.MatchString(config.SessionID) || config.Token == "" {
 		return errors.New("invalid worker identity")
 	}
-	if err := os.MkdirAll(filepath.Dir(config.SocketPath), 0o700); err != nil {
-		return err
+	runtime := &workerRuntime{config: config, acceptResumed: make(chan struct{}, 1)}
+	var resumed *workerReexecState
+	if config.Resume != nil {
+		listener, session, state, err := resumeWorker(config)
+		if err != nil {
+			return err
+		}
+		runtime.listener, runtime.session, resumed = listener, session, state
+	} else {
+		if err := os.MkdirAll(filepath.Dir(config.SocketPath), 0o700); err != nil {
+			return err
+		}
+		if err := os.Remove(config.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: config.SocketPath, Net: "unix"})
+		if err != nil {
+			return err
+		}
+		runtime.listener = listener
+		if err := os.Chmod(config.SocketPath, 0o600); err != nil {
+			_ = listener.Close()
+			return err
+		}
+		session, err := startSession(config.SessionID, config.Command, config.WorkingDirectory, config.Cols, config.Rows)
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		runtime.session = session
 	}
-	if err := os.Remove(config.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	listener, err := net.Listen("unix", config.SocketPath)
-	if err != nil {
-		return err
-	}
+	listener, session := runtime.listener, runtime.session
+	// The listener is unlinked explicitly below, never by Close, so a handoff
+	// that keeps it open can never remove the path under the next image.
+	listener.SetUnlinkOnClose(false)
 	defer listener.Close()
 	defer os.Remove(config.SocketPath)
 	defer removeManifest(config.ManifestPath)
-	if err := os.Chmod(config.SocketPath, 0o600); err != nil {
-		return err
-	}
 
-	session, err := startSession(config.SessionID, config.Command, config.WorkingDirectory, config.Cols, config.Rows)
-	if err != nil {
-		return err
-	}
 	session.rotationControlled = config.RotationControlled
 	session.rotationGuardDirectory = filepath.Join(filepath.Dir(config.ManifestPath), "rotation-input", config.SessionID)
 	eventPath := filepath.Join(filepath.Dir(filepath.Dir(config.ManifestPath)), "events", config.SessionID+".jsonl")
-	if err := session.enableEventJournal(eventPath); err != nil {
-		_ = session.signal(syscall.SIGTERM)
-		return err
+	var journalErr error
+	if resumed != nil {
+		journalErr = session.reopenEventJournal(eventPath)
+	} else {
+		journalErr = session.enableEventJournal(eventPath)
+	}
+	if journalErr != nil {
+		if resumed != nil {
+			// The PTY must outlive a journal failure after a handoff: exiting
+			// would hang up the shell. Record it as any later append failure is.
+			session.noteJournalFailure(journalErr)
+		} else {
+			_ = session.signal(syscall.SIGTERM)
+			return journalErr
+		}
 	}
 	bootID, err := nodeBootID()
-	if err != nil {
-		_ = session.signal(syscall.SIGTERM)
-		return err
+	if err == nil {
+		var workerStartTime uint64
+		workerStartTime, err = processStartTime(os.Getpid())
+		runtime.manifest = workerManifest{
+			Version: workerProtocolVersion, SessionID: config.SessionID,
+			WorkerPID: os.Getpid(), WorkerStartTime: workerStartTime,
+			ShellPID: session.processID(), NodeBootID: bootID,
+			SocketPath: config.SocketPath, Token: config.Token,
+			Command: config.Command, WorkingDirectory: config.WorkingDirectory,
+			State: "running", Capabilities: workerCapabilities, CreatedAt: time.Now().UTC(),
+		}
 	}
-	workerStartTime, err := processStartTime(os.Getpid())
-	if err != nil {
-		_ = session.signal(syscall.SIGTERM)
-		return err
+	if config.Resume != nil {
+		// Recorded even when the state was unusable: the image did change.
+		runtime.manifest.ReexecOperation = config.Resume.Operation
 	}
-	manifest := workerManifest{
-		Version: workerProtocolVersion, SessionID: config.SessionID,
-		WorkerPID: os.Getpid(), WorkerStartTime: workerStartTime,
-		ShellPID: session.processID(), NodeBootID: bootID,
-		SocketPath: config.SocketPath, Token: config.Token,
-		Command: config.Command, WorkingDirectory: config.WorkingDirectory,
-		State: "running", Capabilities: []string{"host_rotation_v1", "host_rotation_text_v1", "host_rotation_credentials_v1", "native_rotation_bridge_v1", "input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1"}, CreatedAt: time.Now().UTC(),
+	if resumed != nil {
+		runtime.manifest.CreatedAt = resumed.ManifestCreatedAt
+		runtime.manifest.LastSequence, runtime.manifest.LastEventSequence = resumed.Sequence, resumed.EventSequence
 	}
-	if err := storeManifest(config.ManifestPath, manifest); err != nil {
+	if err == nil {
+		err = storeManifest(config.ManifestPath, runtime.manifest)
+	}
+	if err != nil && config.Resume == nil {
 		_ = session.signal(syscall.SIGTERM)
 		return err
 	}
 
-	hostRotation := newHostRotationSupervisorWithDriver(
-		filepath.Join(filepath.Dir(config.ManifestPath), "rotation-supervision", config.SessionID+".json"), evaluateHostRotation,
-		nativeHostRotationFinalizer(filepath.Dir(config.ManifestPath)), filepath.Dir(config.ManifestPath),
-		nativeHostRotationTransactionDriver(session, filepath.Dir(config.ManifestPath)),
-		nativeHostRotationPreparer(filepath.Dir(config.ManifestPath)))
+	runtime.newSupervisor = func() *hostRotationSupervisor {
+		return newHostRotationSupervisorWithDriver(
+			filepath.Join(filepath.Dir(config.ManifestPath), "rotation-supervision", config.SessionID+".json"), evaluateHostRotation,
+			nativeHostRotationFinalizer(filepath.Dir(config.ManifestPath)), filepath.Dir(config.ManifestPath),
+			nativeHostRotationTransactionDriver(session, filepath.Dir(config.ManifestPath)),
+			nativeHostRotationPreparer(filepath.Dir(config.ManifestPath)))
+	}
 	session.mu.Lock()
-	session.hostRotation = hostRotation
+	session.hostRotation = runtime.newSupervisor()
+	session.workerUpgrade = runtime.serveUpgrade
 	session.mu.Unlock()
-	defer hostRotation.close()
-	transcriptFrames, stopTranscripts := observeAgentTranscripts(session.agentProcessSnapshot)
-	defer stopTranscripts()
-	go forwardTranscriptEvents(session, transcriptFrames)
-
-	stopped := make(chan struct{})
-	persistenceDone := make(chan struct{})
 	defer func() {
-		close(stopped)
-		<-persistenceDone
+		session.mu.Lock()
+		supervisor := session.hostRotation
+		session.mu.Unlock()
+		supervisor.close()
 	}()
-	go func() {
-		defer close(persistenceDone)
-		persistWorkerState(stopped, config.ManifestPath, manifest, session)
-	}()
+	var seed []transcriptCursor
+	if resumed != nil {
+		seed = resumed.Transcripts
+	}
+	runtime.startTranscripts(seed)
+	defer func() { runtime.transcripts.stop() }()
+	runtime.startPersistence()
+	defer runtime.stopPersistence()
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(signals)
+	served := make(chan struct{})
+	defer close(served)
 	go func() {
 		select {
 		case <-signals:
 			session.terminate()
 			_ = listener.Close()
-		case <-stopped:
+		case <-served:
 		}
 	}()
 
 	for {
 		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {
+			if runtime.handoff.Load() {
+				// A handoff stopped accepting; connections wait in the backlog
+				// for the next image, or for this one if exec fails.
+				<-runtime.acceptResumed
+				continue
+			}
 			if errors.Is(acceptErr, net.ErrClosed) {
 				return nil
 			}
@@ -126,6 +207,41 @@ func ServeWorker(config WorkerConfig) error {
 		}
 		go serveWorkerConnection(connection, config, session)
 	}
+}
+
+func (runtime *workerRuntime) startTranscripts(seed []transcriptCursor) {
+	runtime.transcripts = observeAgentTranscriptsFrom(runtime.session.agentProcessSnapshot, seed)
+	runtime.forwarded = make(chan struct{})
+	go func(frames <-chan protocol.Frame, done chan struct{}) {
+		defer close(done)
+		forwardTranscriptEvents(runtime.session, frames)
+	}(runtime.transcripts.frames, runtime.forwarded)
+}
+
+func (runtime *workerRuntime) startPersistence() {
+	runtime.persistStop, runtime.persistDone = make(chan struct{}), make(chan struct{})
+	go func(stop, done chan struct{}, manifest workerManifest) {
+		defer close(done)
+		persistWorkerState(stop, runtime.config.ManifestPath, manifest, runtime.session)
+	}(runtime.persistStop, runtime.persistDone, runtime.manifest)
+}
+
+func (runtime *workerRuntime) stopPersistence() {
+	if runtime.persistStop == nil {
+		return
+	}
+	close(runtime.persistStop)
+	<-runtime.persistDone
+	runtime.persistStop = nil
+}
+
+// Probes advertise only what an orchestrator needs before talking to a worker
+// whose manifest may predate the capability list (recovered workers).
+func probeCapabilities(session *Session) []string {
+	if session.reexecCapable() {
+		return []string{workerReexecCapability}
+	}
+	return nil
 }
 
 func forwardTranscriptEvents(session *Session, frames <-chan protocol.Frame) {
@@ -245,8 +361,23 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		}
 		status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
 			State: state, ExitCode: exitCode, WorkerPID: os.Getpid(),
+			ReexecOperation: session.reexecOperationID(), Capabilities: probeCapabilities(session),
+			ExecutableSHA256: runningImageDigest(),
 		})
 		_ = writer.Write(status)
+		return
+	}
+	if len(hello.WorkerUpgrade) > 0 {
+		session.mu.Lock()
+		upgrade := session.workerUpgrade
+		session.mu.Unlock()
+		if upgrade == nil {
+			refused, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+				State: "refused", Message: "this worker cannot re-execute", WorkerPID: os.Getpid()})
+			_ = writer.Write(refused)
+			return
+		}
+		upgrade(writer, hello.WorkerUpgrade)
 		return
 	}
 	if hello.GuardedInput {
@@ -296,7 +427,7 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1", "automation_input_v1"},
 		OutputReset: outputReset, EventReset: eventReset,
 		ControlGranted: &controlGranted, ClientCount: clientCount,
 	})
@@ -373,9 +504,10 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 			if controlGranted {
 				_ = session.input(frame.Payload)
 			}
-		case protocol.InputV2:
+		case protocol.InputV2, protocol.AutomationInputV2:
 			clientID, sequence, data, parseErr := protocol.ParseInputV2(frame)
-			if controlGranted && parseErr == nil && session.acknowledgedInput(clientID, sequence, data) == nil {
+			automation := frame.Type == protocol.AutomationInputV2
+			if controlGranted && parseErr == nil && session.acknowledgedInputFrom(clientID, sequence, data, automation) == nil {
 				_ = writer.Write(protocol.InputAckFrame(clientID, sequence))
 			}
 		case protocol.Resize:

@@ -46,6 +46,15 @@ func validPromptEditorID(id string) bool {
 	return err == nil && len(decoded) == 16 && strings.ToLower(id) == id
 }
 
+// promptEditOpen reports whether the pane's last prompt edit is still in
+// progress (see promptEditorTransaction.inProgress).
+func (session *Session) promptEditOpen(now time.Time) bool {
+	session.promptEditorMu.Lock()
+	pending := session.promptEditor
+	session.promptEditorMu.Unlock()
+	return pending != nil && pending.transaction.inProgress(now)
+}
+
 func (session *Session) promptEditorControlIsCurrent(clientID string) bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()

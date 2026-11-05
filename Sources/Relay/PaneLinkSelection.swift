@@ -22,6 +22,12 @@ final class PaneLinkSelection: ObservableObject {
     var refreshLinks: (() -> Void)?
     var removeLink: ((String) -> Void)?
     var describePane: ((UUID) -> String)?
+    @Published var cleanup = DetachedPaneLinkCleanup()
+    @Published var cleanupRunning = false
+    @Published var cleanupResult: String?
+    private(set) var allSavedMemberships: [PaneLinkMembership] = []
+    var reviewDetachedLinks: (() -> Void)?
+    var confirmDetachedLinks: (() -> Void)?
 
     func label(for id: UUID) -> String {
         describePane?(id) ?? String(id.uuidString.prefix(8))
@@ -37,11 +43,13 @@ final class PaneLinkSelection: ObservableObject {
     func forgetMembership(_ id: String) {
         membershipRevision &+= 1
         memberships.removeAll { $0.id == id }
+        allSavedMemberships.removeAll { $0.id == id }
     }
-    func replaceMemberships(_ links: [PaneLinkMembership], ifRevision revision: UInt64) {
+    func replaceMemberships(_ links: [PaneLinkMembership], ifRevision revision: UInt64, allSaved: [PaneLinkMembership]? = nil) {
         guard revision == membershipRevision else { return }
         membershipRevision &+= 1
         memberships = links
+        allSavedMemberships = allSaved ?? links
     }
     func retryPair() {
         guard active, pairMode, !connecting, pairFailure != nil, orderedPair.count == 2 else { return }

@@ -1,0 +1,577 @@
+[
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "old-cc-status --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 0,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "bash \"$HOME/.config/relay/cc-status.sh\"",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "",
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n"
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "old-cc-status --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 0,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "bash \"$HOME/.config/relay/cc-status.sh\"",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "",
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n"
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YWJj --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 0,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YmFzaCAiJEhPTUUvLmNvbmZpZy9yZWxheS9jYy1zdGF0dXMuc2gi --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "",
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n"
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YWJj --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 0,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YmFzaCAiJEhPTUUvLmNvbmZpZy9yZWxheS9jYy1zdGF0dXMuc2gi --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "",
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n"
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "unrelated",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 1,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "unrelated",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "Traceback (most recent call last):\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 97, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 66, in main\n    raise RuntimeError('Refusing to replace an unrelated status line')\nRuntimeError: Refusing to replace an unrelated status line\n",
+    "stdout": ""
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "unrelated",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 1,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "unrelated",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "Traceback (most recent call last):\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 97, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 66, in main\n    raise RuntimeError('Refusing to replace an unrelated status line')\nRuntimeError: Refusing to replace an unrelated status line\n",
+    "stdout": ""
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline ???",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 1,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline ???",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "Traceback (most recent call last):\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 97, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 72, in main\n    raise RuntimeError('Unknown status line wrapper format')\nRuntimeError: Unknown status line wrapper format\n",
+    "stdout": ""
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline ???",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 1,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline ???",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "Traceback (most recent call last):\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 97, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 72, in main\n    raise RuntimeError('Unknown status line wrapper format')\nRuntimeError: Unknown status line wrapper format\n",
+    "stdout": ""
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YQ== --statusline Yg==",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 1,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YQ== --statusline Yg==",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "Traceback (most recent call last):\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 97, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 72, in main\n    raise RuntimeError('Unknown status line wrapper format')\nRuntimeError: Unknown status line wrapper format\n",
+    "stdout": ""
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YQ== --statusline Yg==",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 1,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YQ== --statusline Yg==",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "Traceback (most recent call last):\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 97, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/kbd606/dev/term/work/go-only-relay-20261025/provider-setup-evidence/base/install-relay-shell-ui.py\", line 72, in main\n    raise RuntimeError('Unknown status line wrapper format')\nRuntimeError: Unknown status line wrapper format\n",
+    "stdout": ""
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YWJj --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 0,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YmFzaCAiJEhPTUUvLmNvbmZpZy9yZWxheS9jYy1zdGF0dXMuc2gi --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "",
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n"
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YWJj --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 0,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline YmFzaCAiJEhPTUUvLmNvbmZpZy9yZWxheS9jYy1zdGF0dXMuc2gi --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "",
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n"
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline\tYWJj --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": false,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 0,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline\tYmFzaCAiJEhPTUUvLmNvbmZpZy9yZWxheS9jYy1zdGF0dXMuc2gi --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "",
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n"
+  },
+  {
+    "kind": "installer",
+    "input": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline\tYWJj --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "exit": 0,
+    "settings": {
+      "statusLine": {
+        "type": "command",
+        "command": "outer --statusline\tYmFzaCAiJEhPTUUvLmNvbmZpZy9yZWxheS9jYy1zdGF0dXMuc2gi --footer user",
+        "padding": 7
+      },
+      "promptSuggestionEnabled": true,
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "user": "preserve"
+          }
+        ]
+      },
+      "custom": "å user footer"
+    },
+    "stderr": "",
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n"
+  },
+  {
+    "kind": "apply",
+    "exit": 1,
+    "stdout": "Shared prompt and cc-status launcher installed; other Claude settings preserved.\n{\"bundle_sha256\": \"e4d69294dbb0f641349d8d9226ec68e5799b9292c7d4495d8dd308359f47c3a5\", \"drift\": true, \"files\": [{\"file\": \"prompt.bash\", \"managed\": true, \"sha256\": \"1b8c47e648dff7877a967b0ebe9a89d24300e8300d5856d67fcd8c654c55730a\"}, {\"file\": \"cc-status.sh\", \"managed\": true, \"sha256\": \"a0bbd465ad5e7f6e8f9d2554216479b3d96f49126ab374b2259efff8bc72060c\"}, {\"file\": \"claude-status.py\", \"managed\": false, \"sha256\": null}], \"hooks\": {\"chitta_enabled\": false, \"failure_adapter_repaired\": false, \"user_event_count\": 0}, \"platform\": \"darwin\", \"prompt_suggestions_enabled\": true, \"schema_version\": 1, \"statusline\": {\"managed\": true, \"quota_capture\": false}}\n",
+    "stderr": ""
+  },
+  {
+    "kind": "repair",
+    "anchors": 0,
+    "input": "header\n",
+    "exit": 1,
+    "output": "header\n",
+    "mode": 416,
+    "backup": []
+  },
+  {
+    "kind": "repair",
+    "anchors": 1,
+    "input": "header\n    client.apply(plan)\n    if plan.get(\"provenance\"):\n",
+    "exit": 0,
+    "output": "header\n    # The same daemon policy handles successful and failed tool calls.\n    # Claude validates the output discriminator against the incoming event.\n    if raw.get(\"hook_event_name\") == \"PostToolUseFailure\":\n        try:\n            rendered = json.loads(plan[\"stdout\"])\n        except (ValueError, TypeError):\n            rendered = None\n        if isinstance(rendered, dict):\n            specific = rendered.get(\"hookSpecificOutput\")\n            if isinstance(specific, dict) and specific.get(\"hookEventName\") == \"PostToolUse\":\n                specific[\"hookEventName\"] = \"PostToolUseFailure\"\n                plan[\"stdout\"] = json.dumps(rendered, ensure_ascii=False) + \"\\n\"\n    client.apply(plan)\n    if plan.get(\"provenance\"):\n",
+    "mode": 416,
+    "backup": [
+      "header\n    client.apply(plan)\n    if plan.get(\"provenance\"):\n"
+    ]
+  },
+  {
+    "kind": "repair",
+    "anchors": 2,
+    "input": "header\n    client.apply(plan)\n    if plan.get(\"provenance\"):\n    client.apply(plan)\n    if plan.get(\"provenance\"):\n",
+    "exit": 1,
+    "output": "header\n    client.apply(plan)\n    if plan.get(\"provenance\"):\n    client.apply(plan)\n    if plan.get(\"provenance\"):\n",
+    "mode": 416,
+    "backup": []
+  },
+  {
+    "kind": "status",
+    "exit": 7,
+    "stdout": "{\"hook\":\"payload\"}\n|private-pane",
+    "stderr": "user-stderr",
+    "captured": "{\"hook\":\"payload\"}\n",
+    "argv": "claude-status-capture\n--pane\nprivate-pane\n"
+  }
+]

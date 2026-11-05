@@ -98,8 +98,8 @@ func (g *lockedFolderGroup) openChild(staging *os.File, entry folderEntry) (*os.
 		f.Close()
 		return nil, errors.New("folder child staging ownership changed")
 	}
-	digest, err := uploadDigest(f, upload.Offset)
-	if err != nil || digest != upload.PrefixSHA256 {
+	_, err = validatedUploadHash(f, upload.Offset, upload.PrefixSHA256, false)
+	if err != nil {
 		f.Close()
 		return nil, errors.New("folder durable child bytes changed")
 	}
@@ -158,6 +158,10 @@ func (g *lockedFolderGroup) childChunk(relative string, offset int64, data []byt
 		}
 		return nil
 	}
+	hasher, err := validatedUploadHash(f, upload.Offset, upload.PrefixSHA256, false)
+	if err != nil {
+		return err
+	}
 	n, err := f.WriteAt(data, offset)
 	if err != nil {
 		return err
@@ -169,8 +173,9 @@ func (g *lockedFolderGroup) childChunk(relative string, offset int64, data []byt
 		return err
 	}
 	upload.Offset += int64(n)
-	upload.PrefixSHA256, err = uploadDigest(f, upload.Offset)
-	if err != nil {
+	hasher.Write(data[:n])
+	upload.PrefixSHA256 = hex.EncodeToString(hasher.Sum(nil))
+	if err = rememberUploadHash(f, upload.Offset, hasher); err != nil {
 		return err
 	}
 	g.record.Uploads[relative] = upload
@@ -197,8 +202,12 @@ func (g *lockedFolderGroup) commitChild(relative string) error {
 	if err != nil {
 		return err
 	}
-	f.Close()
 	upload := g.record.Uploads[relative]
+	_, verifyErr := validatedUploadHash(f, upload.Offset, upload.PrefixSHA256, true)
+	f.Close()
+	if verifyErr != nil {
+		return verifyErr
+	}
 	if upload.Offset != entry.Size || upload.PrefixSHA256 != entry.SHA256 {
 		return errors.New("folder child incomplete or checksum differs")
 	}

@@ -57,13 +57,14 @@ struct RelayDedicatedSourceTests {
         defer { transport.detach() }
         #expect(transport.installDedicatedProcess(old, writer: oldWriter))
         let frame = output(1, "admitted")
-        DispatchQueue.global().async { try? transport.receiveAttachedDedicatedFrame(frame, sourceProcess: old) }
+        // Dedicated threads: a saturated global pool must not stand in for the barrier.
+        Thread { try? transport.receiveAttachedDedicatedFrame(frame, sourceProcess: old) }.start()
         #expect(started.wait(timeout: .now() + 2) == .success)
-        DispatchQueue.global().async {
+        Thread {
             replacing.signal()
             _ = transport.installDedicatedProcess(current, writer: newWriter)
             replaced.signal()
-        }
+        }.start()
         #expect(replacing.wait(timeout: .now() + 2) == .success)
         let premature = replaced.wait(timeout: .now() + 0.05)
         #expect(premature == .timedOut)

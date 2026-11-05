@@ -111,6 +111,7 @@ enum MCPWorkspaceCapability: String, CaseIterable, Codable {
 
 enum WorkspaceAction: String, Codable, CaseIterable {
     case select, newTab, splitRight, splitDown, zoom, unzoom, float, dock, balance, close, conversation, terminal
+    case overview, back, forward, up
 }
 
 enum WorkspaceTabAction: String, Codable {
@@ -133,6 +134,17 @@ struct WorkspaceProposal: Codable, Equatable {
     let paneID: UUID
     let action: WorkspaceAction
     var connectionHost: String? = nil
+    /// Starting directory for a new tab or split pane (absolute). Optional and
+    /// absent from older MCP clients, which keep the profile default.
+    var directory: String? = nil
+    /// Set only by the remote MCP bridge; see WorkspaceApplyAdmission.
+    var bridgeScope: WorkspaceBridgeScope? = nil
+
+    var validDirectory: Bool {
+        guard let directory else { return true }
+        return [.newTab, .splitRight, .splitDown].contains(action) && directory.hasPrefix("/") &&
+            directory.utf8.count <= 1024 && !directory.unicodeScalars.contains { $0.value < 32 || $0.value == 127 }
+    }
 }
 
 struct MCPRecoverablePanesRequest: Codable {
@@ -144,6 +156,50 @@ struct MCPRecoverPaneRequest: Codable, Equatable {
     let requestID: UUID
     let host: String
     let paneID: UUID
+}
+
+struct MCPPrivateSecretEnvelope: Decodable {
+    let tool: String
+    let requestID: UUID
+    let attestationID: String
+    let sourcePaneID: UUID
+    let arguments: String
+    enum CodingKeys: String, CodingKey {
+        case tool, arguments
+        case requestID = "request_id", attestationID = "attestation_id", sourcePaneID = "source_pane_id"
+    }
+}
+struct MCPPrivateSecretArguments: Decodable {
+    let instance: UUID
+    let requestID: UUID
+    let accountID: String?
+    let credentialReference: String?
+    let purpose: String?
+    enum CodingKeys: String, CodingKey {
+        case instance, purpose
+        case requestID = "request_id", accountID = "account_id", credentialReference = "credential_reference"
+    }
+}
+
+struct MCPAccountPreviewRequest: Decodable {
+    let instance: UUID
+    let paneID: UUID
+    let account: String
+}
+
+struct MCPAccountSyncRequest: Codable, Equatable {
+    let instance: UUID
+    let requestID: UUID
+    let paneID: UUID
+    let account: String
+    let reviewToken: String
+}
+
+struct MCPMovePaneAccountRequest: Codable, Equatable {
+    let instance: UUID
+    let requestID: UUID
+    let paneID: UUID
+    let account: String
 }
 
 struct MCPTerminatePaneRequest: Codable, Equatable {
@@ -210,6 +266,21 @@ struct MCPTerminatePaneRequest: Codable, Equatable {
 }
 
 extension WorkspaceModel {
+    func applyWorkspacePaneDrop(_ paneID: UUID, toTab tabID: UUID, onto targetID: UUID,
+                                placement: PaneDropPlacement) throws {
+        guard paneID != targetID else { return }
+        let floatingSource = tabs.contains { tab in tab.floatingPanes.contains { $0.paneID == paneID } }
+        if placement == .center && !floatingSource {
+            try stackPane(paneID, onto: targetID)
+        } else if self.tabID(containingPane: paneID) == tabID {
+            try movePane(paneID, toTab: tabID, beside: targetID, placement: placement == .center ? .trailing : placement)
+        } else {
+            // Any workspace, any legacy session: the same pane object is re-homed.
+            try movePane(paneID, to: .split(tabID: tabID, beside: targetID, placement: placement == .center ? .trailing : placement),
+                         reveal: selectedTabID == tabID)
+        }
+    }
+
     func workspaceTabActionDetail(_ proposal: WorkspaceTabProposal) throws -> String {
         guard let tab = tabs.first(where: { $0.id == proposal.tabID }) else {
             throw PluginError.invalid("Tab no longer exists")
@@ -229,13 +300,145 @@ extension WorkspaceModel {
             return "Close this tab and all its panes. Local processes stop; remote sessions may remain available for reconnection. Unsaved editor changes still require native confirmation."
         case .move:
             guard proposal.name == nil, let targetID = proposal.targetTabID,
-                  let placement = proposal.placement,
-                  let target = tabs.first(where: { $0.id == targetID }),
-                  targetID != tab.id, target.sessionID == tab.sessionID else {
-                throw PluginError.invalid("Move requires a different target tab in the same Relay session")
+                  let placement = proposal.placement else {
+                throw PluginError.invalid("Move requires a target tab and before or after placement")
             }
-            return "Move this tab \(placement.rawValue) tab \(targetID) within its Relay session."
+            let destination = try workspaceTabMoveDestination(tab.id, beside: targetID, placement: placement)
+            let name = ownership.workspace(destination.workspaceID)?.name ?? "its workspace"
+            return "Move this tab \(placement.rawValue) tab \(targetID) in workspace ‘\(name)’. Its panes, processes, agent sessions, pane links and remote attachments are unchanged; nothing is restarted, detached or closed."
         }
+    }
+
+    /// Where an exact tab move lands: the target tab's workspace, at the
+    /// index beside the target among that workspace's other tabs. The same
+    /// ownership move the tab rail's drag and drop performs, so it works
+    /// across workspaces and legacy sessions and only edits ownership records.
+    func workspaceTabMoveDestination(_ sourceID: UUID, beside targetID: UUID,
+                                     placement: TabMovePlacement) throws -> (workspaceID: UUID, index: Int) {
+        guard sourceID != targetID else { throw WorkspaceMoveRefusal.samePlace }
+        guard tabs.contains(where: { $0.id == sourceID }), tabs.contains(where: { $0.id == targetID }),
+              workspaceID(forTab: sourceID) != nil, let workspaceID = workspaceID(forTab: targetID) else {
+            throw WorkspaceMoveRefusal.unknownTab
+        }
+        guard !tabsAwaitingCloseConfirmation.contains(sourceID),
+              !tabsAwaitingCloseConfirmation.contains(targetID) else { throw WorkspaceMoveRefusal.tabClosing }
+        if let refusal = canMoveTab(sourceID, toWorkspace: workspaceID) { throw refusal }
+        let others = tabs(inWorkspace: workspaceID).map(\.id).filter { $0 != sourceID }
+        guard let targetIndex = others.firstIndex(of: targetID) else { throw WorkspaceMoveRefusal.unknownTab }
+        return (workspaceID, targetIndex + (placement == .after ? 1 : 0))
+    }
+
+    /// Moves one exact tab beside another, in any workspace. Validated first;
+    /// on success the tab sits immediately before or after the target in
+    /// the target's workspace. Returns the destination workspace.
+    @discardableResult
+    func moveWorkspaceTab(_ sourceID: UUID, beside targetID: UUID, placement: TabMovePlacement) throws -> UUID {
+        let destination = try workspaceTabMoveDestination(sourceID, beside: targetID, placement: placement)
+        try performDrop(.tabOnWorkspace(tabID: sourceID, workspaceID: destination.workspaceID, index: destination.index))
+        placeInOrganization(sourceID, beside: targetID, placement: placement)
+        // Never report a move that left either projection unchanged.
+        guard workspaceTabIsBeside(sourceID, targetID, placement: placement) else { throw WorkspaceMoveRefusal.unknownTarget }
+        return destination.workspaceID
+    }
+
+    /// Tabs shown with `tabID` in the organization outline: its group's
+    /// direct tabs, or the Ungrouped tabs. The same sibling list the
+    /// outline's tab drag and drop uses.
+    func organizationSiblings(ofTab tabID: UUID) -> (groupID: UUID?, tabIDs: [UUID]) {
+        let group = organization.group(containingTab: tabID)?.id
+        let nodes = group.map { organization.children(of: $0) } ?? organization.outline()
+        let ids = nodes.flatMap { node -> [UUID] in
+            switch node {
+            case let .tab(value): [value]
+            case let .ungrouped(children) where group == nil:
+                children.compactMap { if case let .tab(value) = $0 { value } else { nil } }
+            default: []
+            }
+        }
+        return (group, ids)
+    }
+
+    /// Shows `tabID` immediately before or after `targetID` in the target's
+    /// organization group (a session group, a project, or Ungrouped).
+    /// Presentation records only.
+    func placeInOrganization(_ tabID: UUID, beside targetID: UUID, placement: TabMovePlacement) {
+        let siblings = organizationSiblings(ofTab: targetID)
+        let others = siblings.tabIDs.filter { $0 != tabID }
+        guard let index = others.firstIndex(of: targetID) else { return }
+        organization.placeTab(tabID, inGroup: siblings.groupID, at: index + (placement == .after ? 1 : 0))
+    }
+
+    /// True when `tabID` sits immediately before or after `targetID` both in
+    /// workspace ownership (tab rail, Workspaces navigator) and in the
+    /// organization outline (session groups).
+    func workspaceTabIsBeside(_ tabID: UUID, _ targetID: UUID, placement: TabMovePlacement) -> Bool {
+        let step = placement == .after ? 1 : -1
+        guard let workspaceID = workspaceID(forTab: targetID), self.workspaceID(forTab: tabID) == workspaceID else { return false }
+        let order = ownership.tabIDs(in: workspaceID)
+        guard let source = order.firstIndex(of: tabID), let target = order.firstIndex(of: targetID),
+              source == target + step else { return false }
+        let mine = organizationSiblings(ofTab: tabID), theirs = organizationSiblings(ofTab: targetID)
+        guard mine.groupID == theirs.groupID,
+              let shown = theirs.tabIDs.firstIndex(of: tabID), let anchor = theirs.tabIDs.firstIndex(of: targetID) else { return false }
+        return shown == anchor + step
+    }
+
+    /// Where an anchored new tab goes: the anchor tab (given directly, or
+    /// the tab holding the anchor pane), which must exist, be owned and not
+    /// be closing.
+    func newTabAnchor(paneID: UUID?, tabID: UUID?) throws -> (tab: TabModel, sourcePane: UUID, workspaceID: UUID) {
+        let resolved: UUID?
+        switch (paneID, tabID) {
+        case let (pane?, nil):
+            guard panes[pane] != nil else { throw PluginError.invalid("Anchor pane no longer exists") }
+            resolved = self.tabID(containingPane: pane)
+        case let (nil, tab?): resolved = tab
+        default: throw PluginError.invalid("Give exactly one anchor: a pane ID or a tab ID")
+        }
+        guard let anchorID = resolved, let tab = tabs.first(where: { $0.id == anchorID }),
+              let workspaceID = workspaceID(forTab: anchorID),
+              let sourcePane = paneID ?? tab.allPaneIDs.first else {
+            throw PluginError.invalid("Anchor tab no longer exists")
+        }
+        guard !tabsAwaitingCloseConfirmation.contains(anchorID) else { throw WorkspaceMoveRefusal.tabClosing }
+        return (tab, sourcePane, workspaceID)
+    }
+
+    /// Opens a local shell tab immediately after the anchor tab, in the
+    /// anchor's legacy session and workspace. No existing tab, pane or
+    /// runtime is touched; only the new tab is placed.
+    func newLocalTab(anchorPaneID: UUID?, anchorTabID: UUID?) throws -> (tabID: UUID, paneID: UUID) {
+        let anchor = try newTabAnchor(paneID: anchorPaneID, tabID: anchorTabID)
+        let existing = Set(tabs.map(\.id))
+        withTabAdmission(.workspace(anchor.workspaceID)) {
+            newTab(inSession: anchor.tab.sessionID, profile: .local, origin: .agent(sourcePane: anchor.sourcePane))
+        }
+        guard let created = selectedTab, !existing.contains(created.id), let paneID = activePaneID,
+              created.allPaneIDs == [paneID], created.sessionID == anchor.tab.sessionID else {
+            throw PluginError.invalid("Local tab creation failed")
+        }
+        // Legacy order too, so session views also show it beside the anchor.
+        if let from = tabs.firstIndex(where: { $0 === created }) {
+            var reordered = tabs
+            reordered.remove(at: from)
+            if let anchorIndex = reordered.firstIndex(where: { $0.id == anchor.tab.id }) {
+                reordered.insert(created, at: anchorIndex + 1)
+                tabs = reordered
+            }
+        }
+        if workspaceID(forTab: created.id) != nil {
+            let others = tabs(inWorkspace: anchor.workspaceID).map(\.id).filter { $0 != created.id }
+            let index = (others.firstIndex(of: anchor.tab.id) ?? others.count - 1) + 1
+            try moveTab(created.id, toWorkspace: anchor.workspaceID, at: index)
+        }
+        placeInOrganization(created.id, beside: anchor.tab.id, placement: .after)
+        persistWorkspace()
+        // The tab exists now; report its exact IDs, but only claim the
+        // anchored place when both projections show it there.
+        guard workspaceTabIsBeside(created.id, anchor.tab.id, placement: .after) else {
+            throw PluginError.invalid("Created tab \(created.id.uuidString.lowercased()) could not be placed after the anchor")
+        }
+        return (created.id, paneID)
     }
 
     @discardableResult
@@ -250,8 +453,8 @@ extension WorkspaceModel {
             closeTab(tab.id)
             guard !tabs.contains(where: { $0.id == tab.id }) else { return nil }
         case .move:
-            guard let targetID = proposal.targetTabID, let placement = proposal.placement else { return nil }
-            moveTab(tab.id, relativeTo: targetID, placement: placement)
+            guard let targetID = proposal.targetTabID, let placement = proposal.placement,
+                  (try? moveWorkspaceTab(tab.id, beside: targetID, placement: placement)) != nil else { return nil }
         }
         return tab.id
     }
@@ -279,16 +482,16 @@ extension WorkspaceModel {
     }
 
     func selectWorkspacePane(_ paneID: UUID) throws -> (UUID, UUID) {
-        guard let pane = panes[paneID],
-              let tab = tabs.first(where: { $0.allPaneIDs.contains(paneID) }) else {
+        // Floating R panels belong to a tab without being in its layout.
+        guard let pane = panes[paneID], let tabID = tabID(containingPane: paneID) else {
             throw PluginError.invalid("Pane no longer exists")
         }
         revealPane(paneID)
-        guard selectedTabID == tab.id, activePaneID == pane.id else {
+        guard selectedTabID == tabID, activePaneID == pane.id else {
             throw PluginError.invalid("Pane selection failed")
         }
         activateSelectedWorkspacePane(pane)
-        return (tab.id, pane.id)
+        return (tabID, pane.id)
     }
 
     func workspaceActionDetail(_ proposal: WorkspaceProposal) throws -> String {
@@ -339,6 +542,26 @@ extension WorkspaceModel {
     func applyWorkspaceAction(_ proposal: WorkspaceProposal, expected: PaneModel, profile: ConnectionProfile? = nil) -> (UUID, UUID)? {
         guard panes[proposal.paneID] === expected,
               (try? workspaceActionDetail(proposal)) != nil else { return nil }
+        // History navigation must not first reveal the anchoring pane: doing so
+        // would insert a different history entry before processing Back.
+        if [.overview, .back, .forward, .up].contains(proposal.action) {
+            guard let tabID = tabID(containingPane: proposal.paneID) else { return nil }
+            switch proposal.action {
+            case .overview: organization.navigate(to: .all)
+            case .back: organization.goBack()
+            case .forward: organization.goForward()
+            case .up: organization.goUp()
+            default: break
+            }
+            if let selected = selectedTab, let active = activePaneID, selected.allPaneIDs.contains(active) {
+                return (selected.id, active)
+            }
+            return (tabID, proposal.paneID)
+        }
+        // A starting directory is never invented: it must already be in use on
+        // that host or have been resolved there (MCP clients never send one).
+        if let directory = proposal.directory,
+           !admitsStartingDirectory(directory, profile: profile ?? expected.profile) { return nil }
         revealPane(proposal.paneID)
         guard let tab = selectedTab, tab.allPaneIDs.contains(proposal.paneID) else { return nil }
         switch proposal.action {
@@ -348,12 +571,14 @@ extension WorkspaceModel {
         case .terminal:
             expected.nativeConversationVisible = false
         case .newTab:
-            newTabInActiveSession(profile: profile ?? expected.profile)
+            // An approval route captures its scope at admission (outer wins).
+            newTabInActiveSession(profile: profile ?? expected.profile, directory: proposal.directory,
+                                  origin: .agent(sourcePane: proposal.paneID))
             guard let newTab = selectedTab, let newPane = activePaneID,
                   newTab.id != tab.id else { return nil }
             return (newTab.id, newPane)
-        case .splitRight: splitActive(axis: .horizontal, profile: profile ?? expected.profile)
-        case .splitDown: splitActive(axis: .vertical, profile: profile ?? expected.profile)
+        case .splitRight: splitActive(axis: .horizontal, profile: profile ?? expected.profile, directory: proposal.directory)
+        case .splitDown: splitActive(axis: .vertical, profile: profile ?? expected.profile, directory: proposal.directory)
         case .zoom:
             if zoomedPaneID != proposal.paneID { togglePaneZoom(proposal.paneID) }
         case .unzoom:
@@ -368,6 +593,7 @@ extension WorkspaceModel {
             closeActivePane()
             guard panes[proposal.paneID] == nil else { return nil }
             return (tab.id, proposal.paneID)
+        case .overview, .back, .forward, .up: break
         }
         return (tab.id, activePaneID ?? proposal.paneID)
     }

@@ -43,6 +43,66 @@ func TestStockCodexProxyRequiresConfirmedExactResume(t *testing.T) {
 	}
 }
 
+func TestStockCodexManagedProxyFollowsOnlyConfirmedFrontendSelections(t *testing.T) {
+	s := codexProxySelection{trackPrimary: true}
+	proxyRPC(t, &s, true, `{"id":"new","method":"thread/start","params":{}}`)
+	if s.session != "" {
+		t.Fatal("unconfirmed new thread bound")
+	}
+	proxyRPC(t, &s, false, `{"method":"thread/started","params":{"thread":{"id":"background"}}}`)
+	if s.session != "" {
+		t.Fatal("background notification selected a primary")
+	}
+	proxyRPC(t, &s, false, `{"id":"new","result":{"thread":{"id":"fresh","path":"/owned/fresh"}}}`)
+	if s.session != "fresh" {
+		t.Fatal("fresh frontend thread not bound")
+	}
+	proxyRPC(t, &s, true, `{"id":"read","method":"thread/read","params":{"threadId":"other"}}`)
+	proxyRPC(t, &s, false, `{"id":"read","result":{"thread":{"id":"other"}}}`)
+	if s.session != "fresh" {
+		t.Fatal("background read changed primary")
+	}
+	proxyRPC(t, &s, true, `{"id":"old","method":"thread/resume","params":{"threadId":"older"}}`)
+	proxyRPC(t, &s, true, `{"id":"clear","method":"thread/start","params":{}}`)
+	proxyRPC(t, &s, false, `{"id":"old","result":{"thread":{"id":"older"}}}`)
+	if s.session != "" {
+		t.Fatal("stale resume response rebound an old conversation")
+	}
+	proxyRPC(t, &s, false, `{"id":"clear","result":{"thread":{"id":"after-clear"}}}`)
+	if s.session != "after-clear" {
+		t.Fatal("clear did not bind the new confirmed thread")
+	}
+	proxyRPC(t, &s, true, `{"id":"fork","method":"thread/fork","params":{"threadId":"after-clear"}}`)
+	proxyRPC(t, &s, false, `{"id":"fork","result":{"thread":{"id":"forked"}}}`)
+	if s.session != "forked" {
+		t.Fatal("explicit frontend fork was not bound")
+	}
+}
+
+func TestStockCodexManagedProxyReconfirmsOnlyItsConfirmedPrimaryTurn(t *testing.T) {
+	s := codexProxySelection{trackPrimary: true}
+	proxyRPC(t, &s, true, `{"id":1,"method":"thread/start","params":{}}`)
+	proxyRPC(t, &s, false, `{"id":1,"result":{"thread":{"id":"fresh","path":"/owned/fresh"}}}`)
+	proxyRPC(t, &s, true, `{"method":"thread/unsubscribe","params":{"threadId":"fresh"}}`)
+	if s.session != "" {
+		t.Fatal("unsubscribed primary remained live")
+	}
+	proxyRPC(t, &s, true, `{"id":2,"method":"turn/start","params":{"threadId":"fresh"}}`)
+	if s.session != "" {
+		t.Fatal("unconfirmed turn restored identity")
+	}
+	proxyRPC(t, &s, false, `{"id":2,"result":{"turn":{"id":"turn-a"}}}`)
+	if s.session != "fresh" || s.path != "/owned/fresh" {
+		t.Fatal("confirmed primary turn did not restore identity")
+	}
+	proxyRPC(t, &s, true, `{"id":3,"method":"thread/start","params":{}}`)
+	proxyRPC(t, &s, true, `{"id":4,"method":"turn/start","params":{"threadId":"fresh"}}`)
+	proxyRPC(t, &s, false, `{"id":4,"result":{"turn":{"id":"stale-turn"}}}`)
+	if s.session != "" {
+		t.Fatal("old thread turn overrode an explicit new conversation")
+	}
+}
+
 func TestStockCodexProxyRefusesOtherSessionAndStaleResponse(t *testing.T) {
 	s := codexProxySelection{wanted: "chosen"}
 	proxyRPC(t, &s, true, `{"id":"first","method":"thread/resume","params":{"threadId":"chosen"}}`)

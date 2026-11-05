@@ -1,0 +1,620 @@
+[
+  {
+    "mask": 0,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 0,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 0,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 1,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 1,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 1,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 2,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 2,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 2,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 3,
+    "args": [],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 3,
+    "args": [
+      "--http"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--http"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 3,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--print-http-headers"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 4,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 4,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 4,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 5,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 5,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 5,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 6,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 6,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 6,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 7,
+    "args": [],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 7,
+    "args": [
+      "--http"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--http"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 7,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--print-http-headers"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 8,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 8,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 8,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 9,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 9,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 9,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 10,
+    "args": [],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 10,
+    "args": [
+      "--http"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 10,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": "Native Relay messaging helpers are unavailable",
+    "result": {}
+  },
+  {
+    "mask": 11,
+    "args": [],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 11,
+    "args": [
+      "--http"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--http"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 11,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--print-http-headers"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 12,
+    "args": [],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 12,
+    "args": [
+      "--http"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--http"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 12,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--print-http-headers"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 13,
+    "args": [],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 13,
+    "args": [
+      "--http"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--http"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 13,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--print-http-headers"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 14,
+    "args": [],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 14,
+    "args": [
+      "--http"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--http"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 14,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/.local/share/relay/bin/relay-mcp-verified",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--print-http-headers"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/.local/share/relay/bin/relayd-verified",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 15,
+    "args": [],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 15,
+    "args": [
+      "--http"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--http"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  },
+  {
+    "mask": 15,
+    "args": [
+      "--print-http-headers"
+    ],
+    "exit": 0,
+    "result": {
+      "executable": "$HOME/App/relay-mcp",
+      "args": [
+        "relay-mcp",
+        "--use-relay-token",
+        "--print-http-headers"
+      ],
+      "environment": {
+        "RELAY_MCP_CALLER_TOKEN": "same-existing-fixture",
+        "RELAY_MCP_BACKEND": "daemon",
+        "RELAY_MCP_DAEMON": "$HOME/App/relayd",
+        "RELAY_MCP_OWNER_PID": "42"
+      }
+    }
+  }
+]

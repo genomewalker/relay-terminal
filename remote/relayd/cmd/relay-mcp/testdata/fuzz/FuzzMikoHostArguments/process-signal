@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"operation\":\"process_signal\",\"process_pid\":42,\"process_start\":\"123\",\"signal\":\"terminate\"}")

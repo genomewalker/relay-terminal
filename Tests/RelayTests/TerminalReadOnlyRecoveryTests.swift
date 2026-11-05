@@ -71,10 +71,13 @@ struct TerminalReadOnlyRecoveryTests {
         view.synchronizeAndRedraw()
         view.remoteTerminalStateWasRestored()
         view.setShellPromptActive(true)
+        // Command-A selects locally; the edit that replaces the selection
+        // starts the exact inspection and is queued behind it.
         try #require(view.handleApplicationClipboardAction(.selectAll))
-        try #require(view.promptInspectionBlocksInput)
+        try #require(!view.promptInspectionBlocksInput)
         let retained = "Keep  double spaces 🧬"
         view.insertText(retained, replacementRange: NSRange(location: NSNotFound, length: 0))
+        try #require(view.promptInspectionBlocksInput)
         try #require(window.makeFirstResponder(nil))
         await view.waitForPendingPromptInspection()
         try #require(view.promptInspectionBlocksInput)
@@ -166,10 +169,12 @@ struct TerminalReadOnlyRecoveryTests {
             try #require(view.beginNativePasteConfirmation() != nil)
         } else if scenario == "files" {
             try #require(view.handleApplicationClipboardAction(.selectAll))
-            try #require(view.promptInspectionBlocksInput)
+            try #require(!view.promptInspectionBlocksInput)
             NSPasteboard.general.clearContents()
             NSPasteboard.general.writeObjects([URL(fileURLWithPath: "/private/tmp/retained-file.png") as NSURL])
+            // Pasting over the local selection starts inspection and queues the files.
             try #require(view.handleApplicationClipboardAction(.paste))
+            try #require(view.promptInspectionBlocksInput)
             try #require(window.makeFirstResponder(nil))
             await view.waitForPendingPromptInspection()
             view.setSurfaceVisible(true)

@@ -276,12 +276,7 @@ enum RelaydRemoteClient {
             case "aarch64", "arm64": goArchitecture = "arm64"
             default: throw RelaydManagementError.unsupportedArchitecture(architecture)
             }
-            let name = "relayd-linux-\(goArchitecture)"
-            guard let url = Bundle.main.resourceURL?.appendingPathComponent(name),
-                  FileManager.default.isReadableFile(atPath: url.path),
-                  let binary = try? Data(contentsOf: url), !binary.isEmpty else {
-                throw RelaydManagementError.bundledBinaryMissing(goArchitecture)
-            }
+            let binary = try installationArchive(architecture: goArchitecture)
             let hash = SHA256.hash(data: binary).map { String(format: "%02x", $0) }.joined()
             let script = installScript(expectedHash: hash, architecture: goArchitecture)
             // Replacing a supervisor is normally immediate, but a loaded HPC
@@ -289,7 +284,7 @@ enum RelaydRemoteClient {
             // and answer its authenticated probe. Keep the UI operation
             // bounded without turning a successful handoff into a false
             // installation failure.
-            let result = try runSSH(profile: profile, script: script, input: binary, timeout: 60)
+            let result = try runSSH(profile: profile, script: script, input: binary, timeout: 300)
             guard result.status == 0 else {
                 let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
                 throw RelaydManagementError.commandFailed(
@@ -297,6 +292,51 @@ enum RelaydRemoteClient {
                 )
             }
         }.value
+    }
+
+    // Kept equal to the native helperbundle catalogue by its Go integration check.
+    static let nativeHelperNames: [String] = [
+        "relay-connection",
+        "relay-workspace",
+        "relay-codex-session",
+        "relay-mcp-desktop",
+        "relay-settings",
+        "relay-check-website",
+        "relay-provider-setup",
+        "relay-install-shell-ui",
+        "relay-repair-chitta-failure",
+        "relay-codex-mcp-health",
+        "relay-remote-mcp-bridge",
+        "relay-build-codehost",
+        "relay-install-codex",
+        "relay-repair-codehost",
+        "relay-client",
+    ]
+
+    private static func installationArchive(architecture: String) throws -> Data {
+        let names = ["relayd-linux-\(architecture)", "relay-mcp-linux-\(architecture)",
+                     "relay-peer-link-linux-\(architecture)", "relay-release.json"] + nativeHelperNames.map { "\($0)-linux-\(architecture)" }
+        guard let resources = Bundle.main.resourceURL else {
+            throw RelaydManagementError.bundledBinaryMissing(architecture)
+        }
+        for name in names {
+            guard FileManager.default.isReadableFile(atPath: resources.appendingPathComponent(name).path) else {
+                throw RelaydManagementError.bundledBinaryMissing(name)
+            }
+        }
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        process.arguments = ["-cf", "-", "-C", resources.path] + names
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let archive = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0, !archive.isEmpty else {
+            throw RelaydManagementError.commandFailed("Could not package the bundled Relay helpers.")
+        }
+        return archive
     }
 
     private static let statusScript = #"""
@@ -369,6 +409,15 @@ relay_root="$HOME/.local/share/relay"
 payload_dir="$relay_root/bin"
 shim_dir="$HOME/.local/share/relay/shims"
 lock_dir="$relay_root/install.lock"
+case "$(uname -s 2>/dev/null || printf unknown)" in
+    Linux) shim_move_flag=-fT ;;
+    Darwin) shim_move_flag=-fh ;;
+    *) printf 'Relay installation: unsupported host operating system\n' >&2; exit 1 ;;
+esac
+if [ -d "$shim_dir/relay-native-tool" ] && [ ! -L "$shim_dir/relay-native-tool" ]; then
+    printf 'Relay native tool path is a directory; leaving it unchanged.\n' >&2
+    exit 1
+fi
 mkdir -p "$bin_dir" "$payload_dir" "$shim_dir"
 lock_wait=0
 while ! mkdir "$lock_dir" 2>/dev/null; do
@@ -380,10 +429,11 @@ while ! mkdir "$lock_dir" 2>/dev/null; do
     sleep 0.1
 done
 temporary=
+stage_dir=
 launcher_temporary=
-claude_shim_temporary=
-codex_shim_temporary=
-trap 'rm -f "$temporary" "$launcher_temporary" "$claude_shim_temporary" "$codex_shim_temporary"; rmdir "$lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
+tool_launcher_temporary=
+link_temporary=
+trap 'rm -f "$temporary" "$launcher_temporary" "$tool_launcher_temporary" "$link_temporary"; if [ -n "$stage_dir" ]; then rm -rf "$stage_dir"; fi; rmdir "$lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
 temporary="$(mktemp "$payload_dir/.relayd-install-\#(architecture).XXXXXX")"
 launcher_temporary="$(mktemp "$bin_dir/.relayd-launcher.XXXXXX")"
 cat > "$temporary"
@@ -396,11 +446,86 @@ else
     exit 1
 fi
 if [ "$actual" != "\#(expectedHash)" ]; then
-    printf 'Uploaded relayd checksum did not match the signed application resource.\n' >&2
+    printf 'Uploaded Relay helpers checksum did not match the signed application resources.\n' >&2
     exit 1
 fi
-chmod 700 "$temporary"
-mv -f "$temporary" "$payload_dir/relayd-linux-\#(architecture)"
+stage_dir="$(mktemp -d "$payload_dir/.relay-install.XXXXXX")"
+tar -xf "$temporary" -C "$stage_dir"
+for helper in relayd relay-mcp relay-peer-link \#(nativeHelperNames.joined(separator: " ")); do
+    payload="$helper-linux-\#(architecture)"
+    if [ ! -f "$stage_dir/$payload" ] || [ ! -s "$stage_dir/$payload" ] || [ -L "$stage_dir/$payload" ]; then
+        printf 'The bundled %s payload is missing or invalid.\n' "$helper" >&2
+        exit 1
+    fi
+done
+if [ ! -f "$stage_dir/relay-release.json" ] || [ ! -s "$stage_dir/relay-release.json" ] || [ -L "$stage_dir/relay-release.json" ]; then
+    printf 'The bundled Relay release manifest is missing or invalid.\n' >&2
+    exit 1
+fi
+# Validate every final publication entry before replacing any payload. A
+# symlink is replaced as an entry; its target is never a publication directory.
+relay_check_destination() {
+    if [ ! -L "$1" ] && { [ -d "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; }; then
+        printf 'Relay installation destination is not a file or symlink: %s\n' "$1" >&2
+        return 1
+    fi
+}
+for helper in relayd relay-mcp relay-peer-link \#(nativeHelperNames.joined(separator: " ")); do
+    relay_check_destination "$payload_dir/$helper-linux-\#(architecture)"
+done
+for relay_destination in "$relay_root/relay-release.json" "$bin_dir/relayd" "$shim_dir/relay-native-tool" \
+    "$payload_dir/relayd-communication" "$payload_dir/relayd-verified" \
+    "$payload_dir/relay-mcp-communication" "$payload_dir/relay-mcp" "$payload_dir/relay-peer-link"; do
+    relay_check_destination "$relay_destination"
+done
+for helper in relayd relay-mcp relay-peer-link \#(nativeHelperNames.joined(separator: " ")); do
+    payload="$helper-linux-\#(architecture)"
+    chmod 700 "$stage_dir/$payload"
+    mv "$shim_move_flag" "$stage_dir/$payload" "$payload_dir/$payload"
+done
+mv "$shim_move_flag" "$stage_dir/relay-release.json" "$relay_root/relay-release.json"
+relay_publish_link() {
+    link_temporary="$(mktemp "$payload_dir/.relay-link.XXXXXX")"
+    rm -f "$link_temporary"
+    ln -s "$1" "$link_temporary"
+    mv "$shim_move_flag" "$link_temporary" "$2"
+    link_temporary=
+}
+relay_publish_link "relayd-linux-\#(architecture)" "$payload_dir/relayd-communication"
+relay_publish_link "relayd-linux-\#(architecture)" "$payload_dir/relayd-verified"
+relay_publish_link "relay-mcp-linux-\#(architecture)" "$payload_dir/relay-mcp-communication"
+relay_publish_link "relay-mcp-linux-\#(architecture)" "$payload_dir/relay-mcp"
+relay_publish_link "relay-peer-link-linux-\#(architecture)" "$payload_dir/relay-peer-link"
+# A shared home can be mounted by different CPU architectures. Administrative
+# commands select this node's payload at invocation, as the daemon launcher does.
+tool_launcher_temporary="$(mktemp "$shim_dir/.relay-native-tool.XXXXXX")"
+cat > "$tool_launcher_temporary" <<'RELAY_NATIVE_TOOL'
+#!/bin/sh
+set -eu
+case "$(uname -m 2>/dev/null || printf unknown)" in
+    x86_64|amd64) relay_arch=amd64 ;;
+    aarch64|arm64) relay_arch=arm64 ;;
+    *) printf 'Relay tool: unsupported architecture\n' >&2; exit 1 ;;
+esac
+relay_tool="$(basename "$0")"
+case "$relay_tool" in
+    \#(nativeHelperNames.joined(separator: "|"))) ;;
+    *) printf 'Unknown Relay tool\n' >&2; exit 1 ;;
+esac
+exec "$HOME/.local/share/relay/bin/$relay_tool-linux-$relay_arch" "$@"
+RELAY_NATIVE_TOOL
+chmod 700 "$tool_launcher_temporary"
+mv "$shim_move_flag" "$tool_launcher_temporary" "$shim_dir/relay-native-tool"
+for helper in \#(nativeHelperNames.joined(separator: " ")); do
+    command_path="$bin_dir/$helper"
+    if [ ! -e "$command_path" ] && [ ! -L "$command_path" ]; then
+        ln -s "$shim_dir/relay-native-tool" "$command_path"
+    elif [ -L "$command_path" ] && [ "$(readlink "$command_path")" = "$shim_dir/relay-native-tool" ]; then
+        ln -sfn "$shim_dir/relay-native-tool" "$command_path"
+    else
+        printf 'Relay left the existing %s command unchanged.\n' "$helper" >&2
+    fi
+done
 cat > "$launcher_temporary" <<'RELAY_LAUNCHER'
 #!/bin/sh
 set -eu
@@ -419,26 +544,12 @@ export RELAY_INVOKED_AS
 exec "$relay_payload" "$@"
 RELAY_LAUNCHER
 chmod 700 "$launcher_temporary"
-mv -f "$launcher_temporary" "$bin_dir/relayd"
-claude_shim_temporary="$(mktemp "$shim_dir/.claude-shim.XXXXXX")"
-codex_shim_temporary="$(mktemp "$shim_dir/.codex-shim.XXXXXX")"
-cat > "$claude_shim_temporary" <<'RELAY_CLAUDE_SHIM'
-#!/bin/sh
-set -eu
-RELAY_INVOKED_AS=claude
-export RELAY_INVOKED_AS
-exec "$HOME/.local/bin/relayd" "$@"
-RELAY_CLAUDE_SHIM
-cat > "$codex_shim_temporary" <<'RELAY_CODEX_SHIM'
-#!/bin/sh
-set -eu
-RELAY_INVOKED_AS=codex
-export RELAY_INVOKED_AS
-exec "$HOME/.local/bin/relayd" "$@"
-RELAY_CODEX_SHIM
-chmod 700 "$claude_shim_temporary" "$codex_shim_temporary"
-mv -f "$claude_shim_temporary" "$shim_dir/claude"
-mv -f "$codex_shim_temporary" "$shim_dir/codex"
+mv "$shim_move_flag" "$launcher_temporary" "$bin_dir/relayd"
+# relayd installs or repairs its own claude/codex launchers: missing ones are
+# written, stale Relay ones fixed, and any file Relay did not write is kept.
+if ! "$bin_dir/relayd" agent-launchers --repair >/dev/null; then
+    printf 'Relay could not install its claude/codex launchers on this host; Settings > Agent Accounts shows why.\n' >&2
+fi
 printf 'relay-managed-v1\n' > "$relay_root/managed-v1"
 if [ ! -e "$bin_dir/rcode" ] && [ ! -L "$bin_dir/rcode" ]; then
     ln -s "$bin_dir/relayd" "$bin_dir/rcode"
@@ -453,10 +564,18 @@ else
     printf 'Relay left the existing ~/.local/bin/rcode command unchanged.\n' >&2
 fi
 "$bin_dir/relayd" --version
-if ! "$bin_dir/relayd" upgrade-supervisor --force; then
+if ! "$bin_dir/relayd" upgrade-supervisor --force --archive-host-jobs; then
     sleep 1
     "$bin_dir/relayd" upgrade-supervisor
 fi
+# Move live pane workers onto the new relayd in place (same PID, shell and
+# PTY), detached so a host with many panes does not hold this install open.
+# Workers already on it and legacy workers are left as they are; busy panes
+# (mid-edit or mid-rotation) are retried 10 times, 30 s apart. The receipt
+# lists each pane's result.
+receipt="$relay_root/upgrade-workers-last.json"
+( nohup sh -c '"$1" upgrade-workers > "$2.tmp" 2>&1; mv -f "$2.tmp" "$2"' upgrade-workers "$bin_dir/relayd" "$receipt" \
+    </dev/null >/dev/null 2>&1 & )
 """#
     }
 
@@ -486,6 +605,14 @@ fi
             captured.standardOutput,
             String(decoding: captured.standardError, as: UTF8.self)
         )
+    }
+
+    /// Runs `script` in its own SSH session, outside relayd's host jobs, so it
+    /// can restart the supervisor those jobs run under.
+    static func runDirect(profile: ConnectionProfile, script: String, timeout: TimeInterval)
+        throws -> (status: Int32, output: String, error: String) {
+        let result = try runSSH(profile: profile, script: script, timeout: timeout)
+        return (result.status, String(decoding: result.output, as: UTF8.self), result.error)
     }
 
 }
@@ -1044,7 +1171,7 @@ struct RelaydManagerView: View {
                 VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
                     Text(installationTitle(for: report))
                         .font(RelayTheme.font(size: 12, weight: .semibold))
-                    Text("Installs an architecture-selecting launcher, this node’s signed payload, and Relay-owned Claude/Codex shims. An existing rcode command is preserved. No sudo, service, or network port.")
+                    Text("Installs an architecture-selecting launcher, this node’s signed payload, and Relay-owned Claude/Codex launchers. An existing rcode command, and any launcher Relay did not write, is preserved. No sudo, service, or network port.")
                         .font(RelayTheme.font(size: 10.5))
                         .foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)

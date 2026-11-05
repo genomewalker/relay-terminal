@@ -1956,7 +1956,7 @@ private func exerciseExactProviderInspectionReplacement(paste: Bool, keyboard: B
 }
 
 @MainActor
-@Test("A failed Select All without queued input releases the keyboard", .timeLimit(.minutes(1)))
+@Test("Select All alone never starts inspection or blocks the keyboard", .timeLimit(.minutes(1)))
 func failedPromptInspectionReleasesEmptyInputQueue() async throws {
     try await exerciseFailedPromptInspection(preserve: false)
 }
@@ -1993,9 +1993,13 @@ private func exerciseFailedPromptInspection(preserve: Bool) async throws {
     view.synchronizeAndRedraw(); view.remoteTerminalStateWasRestored(); view.setShellPromptActive(true)
     let original = try #require(view.currentGridMetrics())
     #expect(view.handleApplicationClipboardAction(.selectAll))
-    #expect(view.promptInspectionBlocksInput)
+    // Command-A is local; only an edit of the selection starts inspection.
+    #expect(!view.promptInspectionBlocksInput)
     let retained = "Saved  double spaces 🧬"
-    if preserve { view.insertText(retained, replacementRange: NSRange(location: NSNotFound, length: 0)) }
+    if preserve {
+        view.insertText(retained, replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(view.promptInspectionBlocksInput)
+    }
     #expect(window.makeFirstResponder(nil))
     await view.waitForPendingPromptInspection()
     #expect(view.promptInspectionBlocksInput == preserve)
@@ -2124,6 +2128,225 @@ func restoredRemoteSelectAllDoesNotDisappear() async throws {
     #expect(view.handleApplicationClipboardAction(.copy))
     #expect(pasteboard.string(forType: .string)?.contains("remote restored output") == true)
     #expect(recorder.data == before)
+}
+
+// MARK: - Local agent Select All (no PTY bytes, editor bridge or resize)
+
+private final class ResizeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+    var count: Int { lock.lock(); defer { lock.unlock() }; return storage }
+    func increment() { lock.lock(); storage += 1; lock.unlock() }
+}
+
+@MainActor
+private struct LocalSelectAllFixture {
+    let pane: PaneModel
+    let view: RelayGhosttyView
+    let window: NSWindow
+    let session: InMemoryTerminalSession
+    let recorder: TerminalInputRecorder
+    let resizes: ResizeCounter
+    let release: @MainActor () -> Void
+
+    var commandA: NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+            characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)!
+    }
+
+    func key(_ characters: String, keyCode: UInt16) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+            characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: keyCode)!
+    }
+}
+
+@MainActor
+private func localSelectAllFixture(kind: AgentKind?, screen: String, restored: Bool = true) async throws -> LocalSelectAllFixture {
+    _ = NSApplication.shared
+    let recorder = TerminalInputRecorder()
+    let resizes = ResizeCounter()
+    let session = InMemoryTerminalSession(write: { recorder.append($0) }, resize: { _ in resizes.increment() })
+    let pane = PaneModel(profile: terminalTestProfile)
+    if let kind { pane.setAgentKind(kind) }
+    let view = pane.runtime.view
+    view.frame = NSRect(x: 0, y: 0, width: 800, height: 400)
+    view.configuration = TerminalSurfaceOptions(backend: .inMemory(session))
+    let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.contentView = view
+    let releasePresentation = presentInputFixture(pane)
+    window.makeKeyAndOrderFront(nil)
+    view.fitToSize()
+    #expect(window.makeFirstResponder(view))
+    session.receive(screen)
+    await Task.detached { session.waitForPendingOutput() }.value
+    view.synchronizeAndRedraw()
+    if restored { view.remoteTerminalStateWasRestored() }
+    view.setShellPromptActive(true)
+    // Let the initial fit's native resizes settle before counting.
+    try await Task.sleep(for: .milliseconds(200))
+    return LocalSelectAllFixture(pane: pane, view: view, window: window, session: session, recorder: recorder,
+        resizes: resizes, release: { releasePresentation(); window.orderOut(nil); window.contentView = nil })
+}
+
+@MainActor
+private func withClipboard(_ body: () async throws -> Void) async rethrows {
+    let pasteboard = NSPasteboard.general
+    let saved = (pasteboard.pasteboardItems ?? []).map { item in
+        item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
+    }
+    defer {
+        let items = saved.map { entries in
+            let item = NSPasteboardItem()
+            for (type, data) in entries { item.setData(data, forType: type) }
+            return item
+        }
+        pasteboard.clearContents(); pasteboard.writeObjects(items)
+    }
+    try await body()
+}
+
+/// Asserts the Command-A was local: no PTY bytes (including Ctrl+G), no
+/// editor or inspection lease, no blocked input and no native resize.
+@MainActor
+private func expectNoSideEffects(_ f: LocalSelectAllFixture, bytes: Data, resizes: Int, columns: UInt16?) async throws {
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(f.recorder.data == bytes)
+    #expect(!f.recorder.data.dropFirst(bytes.count).contains(0x07))
+    #expect(f.resizes.count == resizes)
+    #expect(f.view.currentGridMetrics()?.columns == columns)
+    #expect(!f.view.promptInspectionBlocksInput)
+    #expect(!f.pane.runtime.holdsConversationInputLease)
+}
+
+@MainActor
+@Test("Agent Command-A over the rendered composer is local and copies only the composer",
+      .timeLimit(.minutes(1)), arguments: [AgentKind.claude, .codex])
+func agentSelectAllRenderedComposerIsLocal(kind: AgentKind) async throws {
+    let f = try await localSelectAllFixture(kind: kind,
+        screen: "old transcript must stay unselected\r\n❯ composer first row\r\n  continuation at the live caret")
+    defer { f.release() }
+    let bytes = f.recorder.data, resizes = f.resizes.count, columns = f.view.currentGridMetrics()?.columns
+    #expect(f.view.handleApplicationClipboardShortcut(f.commandA))
+    try await expectNoSideEffects(f, bytes: bytes, resizes: resizes, columns: columns)
+    try await withClipboard {
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString("sentinel", forType: .string)
+        #expect(f.view.handleApplicationClipboardAction(.copy))
+        let copied = try #require(NSPasteboard.general.string(forType: .string))
+        #expect(copied.contains("composer first row") && copied.contains("continuation at the live caret"))
+        #expect(!copied.contains("old transcript"))
+    }
+    try await expectNoSideEffects(f, bytes: bytes, resizes: resizes, columns: columns)
+}
+
+@MainActor
+@Test("Agent Command-A with a trusted mirror selects and copies the exact draft locally")
+func agentSelectAllMirrorIsLocal() async throws {
+    let f = try await localSelectAllFixture(kind: .codex, screen: "old transcript must stay unselected\r\n", restored: false)
+    defer { f.release() }
+    f.view.insertText("alpha  beta", replacementRange: NSRange(location: NSNotFound, length: 0))
+    try await Task.sleep(for: .milliseconds(30))
+    let bytes = f.recorder.data, resizes = f.resizes.count, columns = f.view.currentGridMetrics()?.columns
+    #expect(f.view.handleApplicationClipboardAction(.selectAll))
+    try await expectNoSideEffects(f, bytes: bytes, resizes: resizes, columns: columns)
+    try await withClipboard {
+        #expect(f.view.handleApplicationClipboardAction(.copy))
+        #expect(NSPasteboard.general.string(forType: .string) == "alpha  beta")
+    }
+    #expect(f.recorder.data == bytes)
+}
+
+@MainActor
+@Test("Agent Command-A without a recognisable composer selects nothing, never the transcript")
+func agentSelectAllUnknownSelectsNothing() async throws {
+    let f = try await localSelectAllFixture(kind: .claude, screen: "transcript line one\r\ntranscript line two")
+    defer { f.release() }
+    let bytes = f.recorder.data, resizes = f.resizes.count, columns = f.view.currentGridMetrics()?.columns
+    #expect(f.view.handleApplicationClipboardAction(.selectAll))
+    try await expectNoSideEffects(f, bytes: bytes, resizes: resizes, columns: columns)
+    #expect((f.view.selectedText() ?? "").isEmpty)
+    try await withClipboard {
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString("sentinel", forType: .string)
+        _ = f.view.handleApplicationClipboardAction(.copy)
+        #expect(NSPasteboard.general.string(forType: .string) == "sentinel")
+    }
+    // A following edit has no local selection to replace and is ordinary input.
+    f.view.keyDown(with: f.key("x", keyCode: 7))
+    #expect(!f.view.promptInspectionBlocksInput)
+}
+
+@MainActor
+@Test("Agent Command-A sends no mouse report while the TUI captures the mouse")
+func agentSelectAllUnderMouseCaptureIsLocal() async throws {
+    let f = try await localSelectAllFixture(kind: .claude,
+        screen: "old transcript\r\n❯ composer first row\r\n  continuation at the live caret")
+    defer { f.release() }
+    f.view.setShellPromptActive(false)
+    f.session.receive("\u{001B}[?1003h\u{001B}[?1006h")
+    await Task.detached { f.session.waitForPendingOutput() }.value
+    f.view.synchronizeAndRedraw()
+    #expect(f.view.applicationIsCapturingMouse)
+    let bytes = f.recorder.data, resizes = f.resizes.count, columns = f.view.currentGridMetrics()?.columns
+    #expect(f.view.handleApplicationClipboardAction(.selectAll))
+    try await expectNoSideEffects(f, bytes: bytes, resizes: resizes, columns: columns)
+}
+
+@MainActor
+@Test("An edit after a local agent Command-A starts exact inspection and queues the edit",
+      .timeLimit(.minutes(1)), arguments: ["text", "delete", "paste", "cut"])
+func editAfterLocalSelectAllStartsExactInspection(edit: String) async throws {
+    let f = try await localSelectAllFixture(kind: .claude,
+        screen: "old transcript must stay unselected\r\n❯ composer first row\r\n  continuation at the live caret")
+    defer { f.release() }
+    let bytes = f.recorder.data
+    #expect(f.view.handleApplicationClipboardAction(.selectAll))
+    #expect(!f.view.promptInspectionBlocksInput)
+    try await withClipboard {
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString("pasted", forType: .string)
+        switch edit {
+        case "text": f.view.keyDown(with: f.key("x", keyCode: 7))
+        case "delete": f.view.keyDown(with: f.key("\u{007F}", keyCode: 51))
+        case "paste": #expect(f.view.handleApplicationClipboardAction(.paste))
+        default: #expect(f.view.handleApplicationClipboardAction(.cut))
+        }
+        // The edit waits for the exact draft; nothing reached the PTY yet.
+        #expect(f.view.promptInspectionBlocksInput)
+        #expect(!String(decoding: f.recorder.data.dropFirst(bytes.count), as: UTF8.self).contains("x"))
+        #expect(!f.recorder.data.dropFirst(bytes.count).contains(0x7F))
+        #expect(f.window.makeFirstResponder(nil))
+        await f.view.waitForPendingPromptInspection()
+        if f.view.promptInspectionBlocksInput { _ = f.view.discardPreservedPromptInput() }
+    }
+}
+
+@MainActor
+@Test("Navigation after a local agent Command-A ends the selection without inspection")
+func navigationAfterLocalSelectAllDoesNotInspect() async throws {
+    let f = try await localSelectAllFixture(kind: .claude,
+        screen: "old transcript\r\n❯ composer first row\r\n  continuation at the live caret")
+    defer { f.release() }
+    #expect(f.view.handleApplicationClipboardAction(.selectAll))
+    f.view.keyDown(with: f.key("\u{F702}", keyCode: 123))
+    #expect(!f.view.promptInspectionBlocksInput)
+    f.view.keyDown(with: f.key("x", keyCode: 7))
+    #expect(!f.view.promptInspectionBlocksInput)
+}
+
+@MainActor
+@Test("Shell Command-A still uses the terminal's own select-all")
+func shellSelectAllUnchanged() async throws {
+    let f = try await localSelectAllFixture(kind: nil, screen: "shell history line\r\n$ ")
+    defer { f.release() }
+    f.view.setShellPromptActive(false)
+    let bytes = f.recorder.data
+    #expect(f.view.handleApplicationClipboardAction(.selectAll))
+    #expect(!f.view.promptInspectionBlocksInput)
+    try await withClipboard {
+        #expect(f.view.handleApplicationClipboardAction(.copy))
+        #expect(NSPasteboard.general.string(forType: .string)?.contains("shell history line") == true)
+    }
+    #expect(f.recorder.data == bytes)
 }
 
 }

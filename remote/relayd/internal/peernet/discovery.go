@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,18 +32,38 @@ type Discovery struct {
 func Discover(home string) (Discovery, error) {
 	result := Discovery{Peers: []DiscoveredPeer{}, Links: []DiscoveredLink{}}
 	records := []Record{}
-	dir := filepath.Join(home, ".claude", "sessions")
+	// Each Claude account publishes in its own sessions directory. A peer is
+	// listed only after Resolve re-reads it from its process's own account.
+	for index, config := range claudeConfigs(home) {
+		if err := discoverSessions(home, filepath.Join(config, "sessions"), &result, &records); err != nil && index == 0 {
+			return result, err
+		}
+	}
+	sort.Slice(result.Peers, func(i, j int) bool {
+		if result.Peers[i].Name == result.Peers[j].Name {
+			return result.Peers[i].PID < result.Peers[j].PID
+		}
+		return result.Peers[i].Name < result.Peers[j].Name
+	})
+	result.Links = discoverTopology(home, records, time.Now())
+	var partial bool
+	result.Teams, partial = discoverClaudeTeams(home, records)
+	result.Truncated = result.Truncated || partial
+	return result, nil
+}
+
+func discoverSessions(home, dir string, result *Discovery, records *[]Record) error {
 	f, err := os.Open(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return result, nil
+		return nil
 	}
 	if err != nil {
-		return result, err
+		return err
 	}
 	defer f.Close()
 	entries, err := f.ReadDir(1025)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return result, err
+		return err
 	}
 	if len(entries) > 1024 {
 		result.Truncated = true
@@ -71,21 +92,11 @@ func Discover(home string) (Discovery, error) {
 			continue
 		}
 		live, err := Resolve(home, record.Name, record.Session, pid)
-		if err != nil {
+		if err != nil || slices.ContainsFunc(*records, func(r Record) bool { return r.PID == live.PID }) {
 			continue
 		}
 		result.Peers = append(result.Peers, DiscoveredPeer{live.Name, live.Session, live.PID, live.Start})
-		records = append(records, live)
+		*records = append(*records, live)
 	}
-	sort.Slice(result.Peers, func(i, j int) bool {
-		if result.Peers[i].Name == result.Peers[j].Name {
-			return result.Peers[i].PID < result.Peers[j].PID
-		}
-		return result.Peers[i].Name < result.Peers[j].Name
-	})
-	result.Links = discoverTopology(home, records, time.Now())
-	var partial bool
-	result.Teams, partial = discoverClaudeTeams(home, records)
-	result.Truncated = result.Truncated || partial
-	return result, nil
+	return nil
 }

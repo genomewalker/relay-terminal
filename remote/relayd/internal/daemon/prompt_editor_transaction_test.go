@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"strings"
 	"testing"
+	"time"
 )
 
 func promptEditorTestOwner() PromptOwnerBinding {
@@ -211,5 +212,62 @@ func TestPromptEditorApplicationFailureAndCancellation(t *testing.T) {
 				t.Fatal("failed edit reported applied")
 			}
 		})
+	}
+}
+
+// A finished edit stays attached to the session; only one in progress, or a
+// delivered draft whose application receipt is still due, holds a worker
+// upgrade. The 1630 check refused every pane that had ever been edited.
+func TestPromptEditInProgressHoldsWorkerUpgradeOnlyUntilFinished(t *testing.T) {
+	owner := promptEditorTestOwner()
+	read := func() (PromptOwnerBinding, error) { return owner, nil }
+	now := time.Now()
+	session := &Session{}
+	if session.promptEditOpen(now) {
+		t.Fatal("a pane without an edit is held")
+	}
+
+	transaction, err := newPromptEditorTransaction(owner, read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.promptEditor = &promptEditorPending{id: "edit", transaction: transaction}
+	if !session.promptEditOpen(now) {
+		t.Fatal("an armed edit does not hold the upgrade")
+	}
+	if err := transaction.capture(owner, []byte("draft")); err != nil {
+		t.Fatal(err)
+	}
+	_, digest, _ := transaction.snapshot()
+	if err := transaction.commit(digest, []byte("edited")); err != nil {
+		t.Fatal(err)
+	}
+	if !session.promptEditOpen(now) {
+		t.Fatal("a committed, undelivered edit does not hold the upgrade")
+	}
+	if _, err := transaction.completedResult(); err != nil {
+		t.Fatal(err)
+	}
+	if !session.promptEditOpen(time.Now()) {
+		t.Fatal("a delivered draft awaiting its application receipt does not hold the upgrade")
+	}
+	if session.promptEditOpen(time.Now().Add(promptEditorReceiptWindow + time.Second)) {
+		t.Fatal("a delivered draft holds the upgrade after its receipt window")
+	}
+	if err := transaction.recordApplication(owner, sha256.Sum256([]byte("edited")), true); err != nil {
+		t.Fatal(err)
+	}
+	if session.promptEditOpen(time.Now()) {
+		t.Fatal("an applied edit still holds the upgrade")
+	}
+
+	cancelled, err := newPromptEditorTransaction(owner, read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled.cancel()
+	session.promptEditor = &promptEditorPending{id: "cancelled", transaction: cancelled}
+	if session.promptEditOpen(time.Now()) {
+		t.Fatal("a cancelled edit holds the upgrade")
 	}
 }

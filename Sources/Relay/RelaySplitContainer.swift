@@ -128,7 +128,7 @@ struct RelaySplitContainer: View {
     private func splitDivider(total: CGFloat) -> some View {
         let visual = AnyView(
             Rectangle()
-                .fill(RelayTheme.canvas)
+                .fill(RelayTheme.terminalCanvas)
                 .overlay {
                     Capsule()
                         .fill(dividerFocused ? RelayTheme.accent.opacity(0.85) : RelayTheme.line.opacity(0.8))

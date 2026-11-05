@@ -36,6 +36,25 @@ enum RelayAgentAttachmentSnapshot {
             } catch { return false }
         }
 
+        func withVerifiedFile<T>(_ body: (Int32) throws -> T) throws -> T {
+            try Task.checkCancellation()
+            guard isValid else { throw Failure.unsuitable }
+            let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+            guard fd >= 0 else { throw Failure.unsuitable }
+            defer { Darwin.close(fd) }
+            var before = stat()
+            guard fstat(fd, &before) == 0, matches(before), before.st_uid == geteuid(),
+                  before.st_mode & 0o077 == 0 else { throw Failure.changed }
+            let actual = try RelayAgentAttachmentSnapshot.copyAndHash(source: fd, destination: nil, limit: bytes)
+            var after = stat()
+            guard fstat(fd, &after) == 0, RelayAgentAttachmentSnapshot.sameSource(before, after),
+                  actual.bytes == bytes, actual.digest == digest,
+                  lseek(fd, 0, SEEK_SET) == 0 else { throw Failure.changed }
+            let result = try body(fd)
+            guard fstat(fd, &after) == 0, RelayAgentAttachmentSnapshot.sameSource(before, after) else { throw Failure.changed }
+            return result
+        }
+
         /// Read and authenticate the same open descriptor, never reopen a path
         /// after verification. Used by previews of the captured attachment.
         func verifiedData() throws -> Data {
@@ -82,7 +101,7 @@ enum RelayAgentAttachmentSnapshot {
         var errorDescription: String? {
             switch self {
             case .unsuitable: "Choose a readable regular file to attach."
-            case .tooLarge: "Attachments can be up to 64 MB."
+            case .tooLarge: "This attachment has an invalid file length."
             case .changed: "The file changed while being prepared. Attach it again."
             }
         }

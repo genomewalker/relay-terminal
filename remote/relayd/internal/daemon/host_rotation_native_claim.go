@@ -97,6 +97,8 @@ func decodeHostNativeLedgerResponse(raw []byte) (json.RawMessage, error) {
 func callHostNativeLedger(ctx context.Context, operation string, args any) (json.RawMessage, error) {
 	switch operation {
 	case "rotation_native_claim", "rotation_native_release", "rotation_native_intent", "rotation_native_register", "rotation_native_ack", "rotation_native_abort", "rotation_status", "session_get":
+	case "session_bind", "lease_claim", "lease_release", "question_events", "question_state":
+		// Question-thread ops are fenced by questionLedger callers, not generic rotation.
 	default:
 		return nil, errors.New("unsupported native ledger operation")
 	}

@@ -261,6 +261,9 @@ func copyAgentMetadata(input map[string]any) map[string]any {
 		"progress_percent": true, "artifact_type": true, "input_tokens": true,
 		"cached_input_tokens": true, "output_tokens": true,
 		"task_id": true, "task_subject": true, "task_status": true,
+		// Conversation identity, not content: host rotation matches a Stop to
+		// the enrolled session and skips subagent (parented) completions.
+		"session_id": true, "parent_session_id": true,
 	}
 	result := make(map[string]any)
 	for key, value := range input {

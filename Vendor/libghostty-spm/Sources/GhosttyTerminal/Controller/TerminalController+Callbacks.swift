@@ -57,7 +57,7 @@ private enum TerminalCallbacks {
     }
 
     static func writeClipboard(
-        userdata _: UnsafeMutableRawPointer?,
+        userdata: UnsafeMutableRawPointer?,
         clipboard _: ghostty_clipboard_e,
         contents: UnsafePointer<ghostty_clipboard_content_s>?,
         contentsLen: Int,
@@ -68,10 +68,13 @@ private enum TerminalCallbacks {
         guard let data = content.data else { return }
         let string = String(cString: data)
 
+        let bridge = userdata.map { Unmanaged<TerminalCallbackBridge>.fromOpaque($0).takeUnretainedValue() }
+        if let bridge, bridge.capturedClipboardWrite.consume(string) { return }
+
         #if canImport(UIKit)
             UIPasteboard.general.string = string
         #elseif canImport(AppKit)
-            let pasteboard = NSPasteboard.general
+            let pasteboard = bridge?.pasteboard ?? NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(string, forType: .string)
         #endif
@@ -97,7 +100,7 @@ private enum TerminalCallbacks {
             #if canImport(UIKit)
                 string = UIPasteboard.general.string
             #elseif canImport(AppKit)
-                string = NSPasteboard.general.string(forType: .string)
+                string = (bridge.pasteboard ?? NSPasteboard.general).string(forType: .string)
             #endif
         }
 

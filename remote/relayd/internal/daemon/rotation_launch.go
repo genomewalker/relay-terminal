@@ -43,15 +43,17 @@ func validateClaudeRotationArgs(fresh, planned []string, sessionID string) error
 	if suffix[0] != "--session-id" || suffix[1] != sessionID || suffix[2] != "--allowedTools" {
 		return errors.New("rotation launch selector or receipt permission is invalid")
 	}
-	const prefix = "Bash(python3 "
-	const tail = " receipt *)"
+	// The only tool the new session may run before its first turn is this
+	// an absolute relayd's receipt subcommand (RotationReceipt).
+	const prefix = "Bash("
+	const tail = " rotation-receipt *)"
 	rule := suffix[3]
 	if !strings.HasPrefix(rule, prefix) || !strings.HasSuffix(rule, tail) {
 		return errors.New("rotation receipt permission is invalid")
 	}
 	helper := strings.TrimSuffix(strings.TrimPrefix(rule, prefix), tail)
 	if !filepath.IsAbs(helper) || filepath.Clean(helper) != helper ||
-		filepath.Base(helper) != "claude_backend.py" || filepath.Base(filepath.Dir(helper)) != "rotation-decision" ||
+		filepath.Base(helper) != "relayd" ||
 		strings.ContainsAny(helper, " \t\r\n'\";|&$`(){}[]<>\\") {
 		return errors.New("rotation receipt helper is invalid")
 	}

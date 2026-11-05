@@ -38,6 +38,12 @@ struct RelaySubscriptionQuota: Equatable, Sendable {
     let observedAt: Date
     let windows: [Window]
     let credits: [Credits]
+    var planDisplayName: String? {
+        guard let planType, !planType.isEmpty else { return nil }
+        if planType == "self_serve_business_prolite" { return "Business Pro Lite" }
+        return planType.replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ").capitalized
+    }
     let planType: String?
     let availableResets: Int?
     var extraUsageEnabled: Bool? = nil

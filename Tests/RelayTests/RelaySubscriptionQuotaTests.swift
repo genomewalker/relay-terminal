@@ -236,3 +236,31 @@ private actor SubscriptionQuotaReadCounter {
     let missing = RelaySubscriptionQuotaStore.Entry(id: "missing", hosts: ["remote"], provider: .claude, accountScope: nil, quota: nil)
     #expect(missing.glance(now: now).value == "Unavailable")
 }
+
+@Test func subscriptionQuotaPlanLabelUsesReadableWords() throws {
+    let quota = try RelaySubscriptionQuota.codex(response: Data(#"{"rateLimits":{"limitId":"codex","planType":"self_serve_business_prolite","primary":{"usedPercent":20,"windowDurationMins":300}}}"#.utf8))
+    #expect(quota.planDisplayName == "Business Pro Lite")
+}
+
+@MainActor @Test func subscriptionQuotaKeepsConfiguredTeamSeparateFromDefaultAndUnscopedReports() throws {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let personal = String(repeating: "a", count: 64), team = String(repeating: "b", count: 64)
+    let rows: [[String: Any]] = [
+        ["provider": "claude", "identity_only": true, "account_scope": personal],
+        ["provider": "claude", "identity_only": true, "account_scope": team, "account_label": "business", "configured_plan": "Team"],
+        ["provider": "claude", "account_scope": team, "observation": ["session_id": "team-session", "captured_at": "2027-01-15T08:00:00Z", "rate_limits": ["five_hour": ["used_percentage": 20]]]],
+        ["provider": "claude", "observation": ["session_id": "unscoped", "captured_at": "2027-01-15T08:00:00Z", "rate_limits": ["five_hour": ["used_percentage": 99]]]]
+    ]
+    let entries = try RelaySubscriptionQuotaStore.entries(from: .init(data: JSONSerialization.data(withJSONObject: rows), observedAt: now), key: "local", host: "This Mac")
+    let business = try #require(entries.first { $0.accountLabel == "business" })
+    #expect(business.accountScope == team)
+    #expect(business.configuredPlan == "Team")
+    #expect(business.quota?.windows.first?.remainingPercent == 80)
+    #expect(entries.first { $0.accountScope == personal }?.quota == nil)
+    #expect(RelaySubscriptionQuotaStore.Entry.grouped(entries).count == 3)
+    let unavailable: [[String: Any]] = [["provider": "claude", "identity_only": true, "account_label": "business", "configured_plan": "Team"], rows.last!]
+    let missing = try RelaySubscriptionQuotaStore.entries(from: .init(data: JSONSerialization.data(withJSONObject: unavailable), observedAt: now), key: "local", host: "This Mac")
+    let missingBusiness = try #require(missing.first { $0.accountLabel == "business" })
+    #expect(missingBusiness.quota == nil)
+    #expect(missingBusiness.glance(now: now).value == "Unavailable")
+}

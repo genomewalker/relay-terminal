@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "canonical_source_sha256": {
+    "agent_conversation.py": "dc7b08a4e2cca4dd77709ca9b9fe963efed42997313c3a48dff4aa1431a38b1b",
+    "pane_messaging.py": "4270f1a094fa12c4f8458c2acfc5d7a3454c5f8d9b28d8eea280e844373b4007"
+  },
+  "original_differential_test_sha256": "b3303089bfd1cc1007c0f9c358ba2f54375e81c408dc8bfd4e955f3a2da464de",
+  "original_fixture_test_sha256": "51f7392649c54c7330d2c10fd3692aeb50c149307908563310452d52be20eaae",
+  "reference_sha256": "4abee95a181dd099cad14572f7c72dc6d7a4d0bd35fa9dd53c794bc4d9c2d90f",
+  "calls_by_platform": {
+    "darwin": 142,
+    "linux": 144
+  },
+  "unique_cases_by_platform": {
+    "darwin": 105,
+    "linux": 107
+  },
+  "capture_logs": {
+    "darwin": "713e349c6368de18d0060236d152f42e52900a4d549f81cfc8e64f3b99ed427e",
+    "linux": "95cfe4efafef7d54a03acdb606c4d1081db69cf99541d548d5d2058b01c1e678"
+  },
+  "linux_archive_sha256": "2aafa2bb916df28e420b7336f74a3b3a8c2e3616cd5e3d8aee899c237cc58444",
+  "substitution_rules": [
+    "Only explicit fixture-root path fragments, fixture process IDs, independently observed process starts, and stat device/inode identities are instantiated.",
+    "Current expected socketStart retained after intentional socketPID corruption is associated with its original captured baseline endpoint.",
+    "Platform-specific errno/error bytes remain separate; there is no error/status/frame/whitespace normalization.",
+    "Actual Go outputs and socket records are never normalized. Literal bytes are compared exactly after independent expected-reference instantiation."
+  ],
+  "evidence_location": "work/go-only-relay-20261025/nativemsg-evidence (raw captures, reversible substitution audit, original logs and archive hashes); original sources in legacy-evidence/nativemsg-oracle",
+  "fixture_properties": "Original test bodies unchanged except oracle routing; all real process/socket fixtures and required result fragments retained; initial discover expectation also checked through Go; original two Linux-only skips retained, missing-Python skip removed."
+}

@@ -3,9 +3,6 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	_ "embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,20 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
-
-// The release copy is byte-identical to Sources/Relay/Resources/Rotation/policy.py.
-// Keep the digest synchronized with RelayPinnedContextRotationPolicy.
-//
-//go:embed host_rotation_policy.py
-var hostRotationPolicy []byte
-
-const hostRotationPolicySHA = "cb6cf0ee65b4d0110354196733f8fedc004e3c64cfb480e10e201e62cbc32d3a"
 
 type hostRotationEnrollment struct {
 	SessionID   string `json:"session_id"`
@@ -106,6 +95,34 @@ type hostRotationSupervisor struct {
 	updated               chan struct{}
 	once                  sync.Once
 	cancel                context.CancelFunc
+	// Root completed turns seen by this worker, enrolled or not. In memory
+	// only: it explains status and never schedules an evaluation itself.
+	observation hostRotationObservation
+}
+
+type hostRotationObservation struct {
+	CompletedTurns     uint64     `json:"observed_completed_turns"`
+	LastCompletedAt    *time.Time `json:"last_completed_turn_at,omitempty"`
+	LastCompletedAgent string     `json:"last_completed_turn_agent,omitempty"`
+}
+
+// hostRotationStatusReply is the status record plus the worker's observation
+// of completed turns, so a pane can show why management is idle.
+type hostRotationStatusReply struct {
+	hostRotationRecord
+	hostRotationObservation
+}
+
+func (s *hostRotationSupervisor) status() hostRotationStatusReply {
+	record := s.snapshot()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	observation := s.observation
+	if observation.LastCompletedAt != nil {
+		at := *observation.LastCompletedAt
+		observation.LastCompletedAt = &at
+	}
+	return hostRotationStatusReply{record, observation}
 }
 
 func newHostRotationSupervisor(path string, evaluate hostRotationEvaluate, prepare ...hostRotationPrepare) *hostRotationSupervisor {
@@ -193,6 +210,38 @@ func (s *hostRotationSupervisor) close() {
 	<-s.stopped
 }
 
+// closeIfQuiescent stops the supervisor for a worker re-exec, unless an
+// evaluation or a native transaction is in flight. The record on disk is then
+// complete, and the next worker image resumes it as after any restart.
+func (s *hostRotationSupervisor) closeIfQuiescent() error {
+	s.mu.Lock()
+	r := s.record
+	switch {
+	case s.cancel != nil || r.State == "pending_evaluation" || r.State == "revalidating":
+		s.mu.Unlock()
+		return errWorkerEvaluating
+	case r.NativeTransition != nil && !r.NativeTransition.Finalized,
+		r.NativeAbortTransition != nil && !r.NativeAbortTransition.Finalized:
+		s.mu.Unlock()
+		return errWorkerCompleting
+	}
+	// Close while still holding mu: run re-checks done under mu before it
+	// starts an evaluation, so none can begin after this check.
+	s.once.Do(func() { close(s.done) })
+	s.mu.Unlock()
+	<-s.stopped
+	return nil
+}
+
+func (s *hostRotationSupervisor) closed() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *hostRotationSupervisor) snapshot() hostRotationRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -213,6 +262,11 @@ func (s *hostRotationSupervisor) snapshot() hostRotationRecord {
 // Called before a human input write, under Session.inputMu. Invalidation is
 // immediate in memory and durable before a later scheduling attempt can run.
 func (s *hostRotationSupervisor) humanInput() {
+	// This is native input invalidation, not process quiescence or permission.
+	pane := strings.TrimSuffix(filepath.Base(s.path), ".json")
+	if validSessionID.MatchString(pane) {
+		_ = capacityRevokeHumanInput(filepath.Dir(filepath.Dir(s.path)), pane)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.record.Enabled {
@@ -234,12 +288,47 @@ func (s *hostRotationSupervisor) humanInput() {
 	s.notify()
 }
 
+// Called before Relay's own automation input write, under Session.inputMu.
+// The prompt is about to change, so any decision or preparation based on the
+// current screen is discarded, but enrollment stays enabled: this is not a
+// human takeover. A new evaluation waits for the next root completion.
+func (s *hostRotationSupervisor) automationInput() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.record.Enabled {
+		return
+	}
+	if s.record.State == "awaiting_completed_turn" && s.record.NextEvaluationMS == 0 &&
+		s.record.Fingerprint == "" && len(s.record.Decision) == 0 && s.record.Preparation == nil {
+		return
+	}
+	s.record.Generation++
+	s.record.NextEvaluationMS = 0
+	s.record.Fingerprint = ""
+	s.record.Decision = nil
+	s.record.Preparation = nil
+	s.record.State = "awaiting_completed_turn"
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if err := s.saveLocked(); err != nil {
+		s.record.State = "persistence_failed"
+	}
+	s.notify()
+}
+
 // All authenticated agent activity invalidates an outstanding evaluation.
 // Only a matching root Stop/completed event asks for a new evaluation.
 // This callback runs after journal append, never from viewport/replay text.
 func (s *hostRotationSupervisor) event(payload []byte, journalOK bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if agent, ok := hostRotationRootCompletion(payload); journalOK && ok {
+		now := time.Now().UTC()
+		s.observation.CompletedTurns++
+		s.observation.LastCompletedAt = &now
+		s.observation.LastCompletedAgent = agent
+	}
 	if !s.record.Enabled {
 		return
 	}
@@ -271,6 +360,34 @@ func (s *hostRotationSupervisor) event(payload []byte, journalOK bool) {
 		s.record.State = "persistence_failed"
 	}
 	s.notify()
+}
+
+// hostRotationRootCompletion recognizes a root (non-subagent) completed turn
+// from any supported harness, without requiring an enrollment. It counts only
+// completions carrying the session identity hostRotationCompletedEvent matches,
+// so a pane whose events lack it reports no observed turns rather than turns
+// that can never start an evaluation.
+func hostRotationRootCompletion(payload []byte) (string, bool) {
+	var v struct {
+		Agent string `json:"agent"`
+		Event struct {
+			HookEventName   string `json:"hook_event_name"`
+			SessionID       string `json:"session_id"`
+			ThreadID        string `json:"thread_id"`
+			ParentSessionID string `json:"parent_session_id"`
+		} `json:"event"`
+	}
+	if len(payload) > 262144 || json.Unmarshal(payload, &v) != nil || v.Event.ParentSessionID != "" ||
+		(v.Agent != "claude" && v.Agent != "codex") {
+		return "", false
+	}
+	if v.Event.HookEventName == "Stop" && v.Event.SessionID != "" {
+		return v.Agent, true
+	}
+	if v.Agent == "codex" && v.Event.HookEventName == "turn/completed" && v.Event.ThreadID != "" {
+		return v.Agent, true
+	}
+	return "", false
 }
 
 func hostRotationCompletedEvent(payload []byte, e hostRotationEnrollment) bool {
@@ -466,9 +583,12 @@ func (s *hostRotationSupervisor) run() {
 		} else if r.State != "pending_evaluation" && r.State != "revalidating" {
 			continue
 		}
+		if rebound, ok := s.rebindResumedAgent(r); ok {
+			r = rebound
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		s.mu.Lock()
-		if s.record.Generation != r.Generation || !s.record.Enabled {
+		if s.record.Generation != r.Generation || !s.record.Enabled || s.closed() {
 			s.mu.Unlock()
 			cancel()
 			continue
@@ -604,21 +724,13 @@ func readHostRotationLedgerStatus(ctx context.Context, e hostRotationEnrollment)
 	return status, nil
 }
 
+// evaluateHostRotationStatus runs the Go port of policy.py (see
+// host_rotation_policy.go); its parity goldens were produced by the Python.
 func evaluateHostRotationStatus(ctx context.Context, status json.RawMessage, now time.Time) (json.RawMessage, error) {
-	digest := sha256.Sum256(hostRotationPolicy)
-	if hex.EncodeToString(digest[:]) != hostRotationPolicySHA {
-		return nil, errors.New("host rotation policy changed")
-	}
-	python, err := exec.LookPath("python3")
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	decision, err := hostRotationCommand(ctx, python, []string{"-I", "-S", "-c", string(hostRotationPolicy),
-		"--now-ms", strconv.FormatInt(now.UnixMilli(), 10)}, status)
-	if err != nil {
-		return nil, err
-	}
-	return decision, nil
+	return evaluateHostRotationPolicy(status, now.UnixMilli())
 }
 
 func evaluateHostRotation(ctx context.Context, e hostRotationEnrollment, now time.Time) (json.RawMessage, error) {
@@ -642,6 +754,57 @@ func evaluateHostRotation(ctx context.Context, e hostRotationEnrollment, now tim
 func verifyHostRotationEnrollment(e hostRotationEnrollment) error {
 	_, err := readHostRotationEnrollmentBinding(e)
 	return err
+}
+
+// readHostRotationResumedBinding returns the pane's current verified native
+// binding when it is the same worker, provider and conversation as the
+// enrollment, whatever its process. Replaced in tests.
+var readHostRotationResumedBinding = func(e hostRotationEnrollment) (AgentBindingRecord, error) {
+	var empty AgentBindingRecord
+	if !validSessionID.MatchString(e.PaneID) || !validSessionID.MatchString(e.SessionID) ||
+		(e.Client != "claude" && e.Client != "codex") || e.WorkerPID <= 1 || e.WorkerStart == 0 || e.NodeBootID == "" {
+		return empty, errors.New("invalid host rotation enrollment")
+	}
+	manifest, err := loadManifest(NewServer().manifestPath(e.PaneID))
+	if err != nil || manifest.SessionID != e.PaneID || manifest.WorkerPID != e.WorkerPID ||
+		manifest.WorkerStartTime != e.WorkerStart || manifest.NodeBootID != e.NodeBootID || validateWorkerIdentity(manifest) != nil {
+		return empty, errors.New("host rotation worker identity changed")
+	}
+	binding, err := ReadNativeAgentBinding(e.PaneID)
+	if err != nil || binding.SessionID != e.SessionID || binding.Producer.Provider != e.Client {
+		return empty, errors.New("host rotation conversation changed")
+	}
+	return binding, nil
+}
+
+// rebindResumedAgent follows the enrolled conversation into a new agent
+// process. A native maintenance restart (/exit, then --resume of the same
+// session in the same pane and worker) replaces the process; without this the
+// enrollment would stay enabled but every evaluation would fail on the old
+// process identity. A different conversation or worker is never adopted.
+func (s *hostRotationSupervisor) rebindResumedAgent(r hostRotationRecord) (hostRotationRecord, bool) {
+	e := r.Enrollment
+	binding, err := readHostRotationResumedBinding(e)
+	if err != nil || binding.Producer.ProcessID <= 1 || binding.Producer.ProcessStart == 0 ||
+		binding.Producer.ProcessID == e.AgentPID && binding.Producer.ProcessStart == e.AgentStart {
+		return r, false
+	}
+	s.mu.Lock()
+	if s.record.Generation != r.Generation || !s.record.Enabled || s.record.Enrollment != e || s.closed() {
+		s.mu.Unlock()
+		return r, false
+	}
+	s.record.Enrollment.AgentPID = binding.Producer.ProcessID
+	s.record.Enrollment.AgentStart = binding.Producer.ProcessStart
+	s.record.Generation++
+	if err := s.saveLocked(); err != nil {
+		s.record.State = "persistence_failed"
+		s.record.Enabled = false
+		s.mu.Unlock()
+		return r, false
+	}
+	s.mu.Unlock()
+	return s.snapshot(), true
 }
 
 // Return the association from the same worker/provider observation. Source
@@ -702,6 +865,9 @@ func decodeHostRotationRequest(data []byte) (hostRotationRequest, error) {
 		valid = request.ID == "" && emptyNative && len(request.TextSettings) == 0 && validPromptEditorID(request.TextOperationID)
 	case "text_credential_list":
 		valid = request.ID == "" && emptyNative && emptyText
+	case "text_vault_unlock":
+		valid = request.ID == "" && emptyNative && len(request.TextSettings) == 0 && request.TextOperationID == "" &&
+			request.CredentialReference == "" && request.CredentialAccountID == "" && validHostVaultPassword(request.CredentialSecret)
 	case "text_credential_save", "text_credential_status", "text_credential_delete":
 		valid = request.ID == "" && emptyNative && len(request.TextSettings) == 0 &&
 			request.TextOperationID == "" && validPromptEditorID(request.CredentialReference) &&
@@ -710,7 +876,7 @@ func decodeHostRotationRequest(data []byte) (hostRotationRequest, error) {
 				(request.Operation != "text_credential_save" && request.CredentialAccountID == ""))
 	}
 	if request.Operation != "text_credential_save" && request.Operation != "text_credential_status" &&
-		request.Operation != "text_credential_delete" && request.Operation != "text_credential_list" && !emptyCredential {
+		request.Operation != "text_credential_delete" && request.Operation != "text_credential_list" && request.Operation != "text_vault_unlock" && !emptyCredential {
 		valid = false
 	}
 	if !valid {
@@ -751,7 +917,7 @@ func serveHostRotationRequestWithServices(connection net.Conn, writer *protocol.
 		return
 	}
 	if req.Operation == "status" {
-		reply(supervisor.snapshot())
+		reply(supervisor.status())
 		return
 	}
 	textReply := func(operation string, args any) {
@@ -795,7 +961,7 @@ func serveHostRotationRequestWithServices(connection net.Conn, writer *protocol.
 	// Native directory discovery is read-only and runs outside the input mutex.
 	// Enroll derives its directory independently of the UI's shell working directory.
 	var candidate hostRotationNativeCandidate
-	var inputRevision uint64
+	var inputRevision, automationRevision uint64
 	if req.Operation == "enroll" {
 		if !validPromptEditorID(req.ID) || !session.promptEditorControlIsCurrent(hello.ClientID) {
 			reply(map[string]any{"state": "refused", "message": "current terminal input lease and operation identity required"})
@@ -803,6 +969,7 @@ func serveHostRotationRequestWithServices(connection net.Conn, writer *protocol.
 		}
 		session.inputMu.Lock()
 		inputRevision = session.humanInputRevision
+		automationRevision = session.automationInputRevision
 		session.inputMu.Unlock()
 	}
 	if req.Operation == "native_candidate" || req.Operation == "enroll" {
@@ -880,6 +1047,10 @@ func serveHostRotationRequestWithServices(connection net.Conn, writer *protocol.
 
 	if req.Operation == "enroll" && session.humanInputRevision != inputRevision {
 		reply(map[string]any{"state": "refused", "message": "human input arrived during enrollment; read status before enabling again"})
+		return
+	}
+	if req.Operation == "enroll" && session.automationInputRevision != automationRevision {
+		reply(map[string]any{"state": "refused", "message": "Relay maintenance input arrived during enrollment; retry after it completes"})
 		return
 	}
 

@@ -89,20 +89,19 @@ struct RelayCodexRotationLifecycleTests {
         await #expect(throws: RelayRotationAdapterError.self) { try await adapter.validate(admission()) }
         #expect(!(await transport.operations).contains("start"))
     }
-    @Test func realProcessTransportDeliversJSONOnStandardInput() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let script = directory.appendingPathComponent("probe.py")
-        try Data("import sys,json;print(json.dumps(json.load(sys.stdin)))".utf8).write(to: script)
+    @Test func processTransportRunsTheNativeAppServerAdapter() async throws {
+        let server = try FakeAppServer(handler: RelayCodexRotationBackendTests.appServer())
+        let (device, inode) = server.identity
         let transport = RelayRotationProcessTransport(chittaExecutable: URL(fileURLWithPath: "/unused"),
-            pythonExecutable: URL(fileURLWithPath: "/usr/bin/python3"), backendScript: script,
-            socketPath: "/unused", socketDevice: 1, socketInode: 1)
-        let request = Data(#"{"thread_id":"exact-destination","probe":"stdin-received"}"#.utf8)
+            socketPath: server.path, socketDevice: device, socketInode: inode)
+        let request = try JSONSerialization.data(withJSONObject: ["thread_id": RelayCodexRotationBackendTests.thread,
+                                                                  "cwd": RelayCodexRotationBackendTests.cwd])
         let response = try await transport.backend("inspect", arguments: request)
-        let value = try JSONSerialization.jsonObject(with: response) as? [String: String]
-        #expect(value?["thread_id"] == "exact-destination")
-        #expect(value?["probe"] == "stdin-received")
+        let value = try JSONSerialization.jsonObject(with: response) as? [String: Bool]
+        #expect(value == ["idle": true, "root": true, "no_descendants": true])
+        let stale = RelayRotationProcessTransport(chittaExecutable: URL(fileURLWithPath: "/unused"),
+            socketPath: server.path, socketDevice: device, socketInode: inode &+ 1)
+        await #expect(throws: RelayRotationAdapterError.self) { try await stale.backend("inspect", arguments: request) }
     }
 
 }

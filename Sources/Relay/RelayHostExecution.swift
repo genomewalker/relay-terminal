@@ -80,6 +80,25 @@ enum RelayHostExecution {
             }
         }
     }
+    /// Runs a relayd communication request through the installed helper, as
+    /// an ordinary exactly-once host job. The node daemon's own `communication`
+    /// RPC is not used: it resolves state roots from the daemon's environment,
+    /// not the login shell the helper runs under.
+    @MainActor static func communicationRequest(profile: ConnectionProfile, packet: [String: Any]) async throws -> (value: [String: Any]?, stderr: Data) {
+        let verb = communicationVerb(packet)
+        let fallback = daemonCommand(profile: profile, arguments: [verb])
+        let command = "if [ -x \"$HOME/.local/share/relay/bin/relayd-communication\" ]; then \"$HOME/.local/share/relay/bin/relayd-communication\" " + verb + "; else " + fallback + "; fi"
+        let result = try await capture(profile: profile, command: command,
+            input: JSONSerialization.data(withJSONObject: packet, options: .sortedKeys), timeout: 60, maximumBytes: 128 << 10)
+        guard result.exitCode == 0 else { return (nil, result.stderr) }
+        return (try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any], result.stderr)
+    }
+    static func communicationVerb(_ packet: [String: Any]) -> String {
+        // A legacy helper must refuse before I/O, rather than ignore the new
+        // link-revision field and accidentally deliver an unpinned report.
+        packet["shepherd_report"] as? Bool == true ? "communication-shepherd" : "communication"
+    }
+
     static func daemonCommand(profile: ConnectionProfile, arguments: [String]) -> String {
         let binary = profile.kind == .local
             ? Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/relayd").path

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"io"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -141,4 +144,87 @@ func runClaudeStatusCapture(arguments []string) {
 	if err := captureClaudeStatus(*pane, raw, home); err != nil {
 		fatal(err.Error())
 	}
+}
+
+// runClaudeStatusLine is the status line in Relay's claude-hooks.json. It
+// records this pane's status for Relay, then shows the account's own status
+// line with the same input, so Relay's settings never replace the user's footer.
+func runClaudeStatusLine(arguments []string) {
+	if len(arguments) != 0 {
+		fatal("invalid Claude status line")
+	}
+	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 65537))
+	if err != nil || len(raw) > 65536 {
+		fatal("Claude status input exceeds bound")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fatal("private home unavailable")
+	}
+	if pane := os.Getenv("RELAY_SESSION"); pane != "" {
+		// Capture failure never hides the footer; rotation then reports stale status.
+		_ = captureClaudeStatus(pane, raw, home)
+	}
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if configDir == "" {
+		configDir = filepath.Join(home, ".claude")
+	}
+	command := accountClaudeStatusCommand(filepath.Join(configDir, "settings.json"))
+	if command == "" {
+		return
+	}
+	// The footer runs in its own process group so a timeout also stops its helpers.
+	child := exec.Command("/bin/sh", "-c", command)
+	child.Stdin = bytes.NewReader(raw)
+	child.Stdout, child.Stderr = os.Stdout, os.Stderr
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := child.Start(); err != nil {
+		os.Exit(1)
+	}
+	// Claude cancels an in-flight status line when a newer update arrives:
+	// the footer's group stops with this command, never outliving it.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	select {
+	case err = <-done:
+	case <-stop:
+		_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
+		<-done
+		os.Exit(1)
+	case <-time.After(8 * time.Second):
+		_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
+		<-done
+		os.Exit(1)
+	}
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() > 0 {
+			os.Exit(exit.ExitCode())
+		}
+		os.Exit(1)
+	}
+}
+
+// accountClaudeStatusCommand returns the account's own command status line,
+// or "" when there is none. Relay's own status line is never run recursively.
+func accountClaudeStatusCommand(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	var settings struct {
+		StatusLine struct {
+			Type    string `json:"type"`
+			Command string `json:"command"`
+		} `json:"statusLine"`
+	}
+	if json.NewDecoder(io.LimitReader(file, 1<<20)).Decode(&settings) != nil ||
+		settings.StatusLine.Type != "command" || strings.TrimSpace(settings.StatusLine.Command) == "" ||
+		strings.Contains(settings.StatusLine.Command, "claude-statusline") {
+		return ""
+	}
+	return settings.StatusLine.Command
 }

@@ -33,6 +33,11 @@ func descendantAgentProcesses(rootPID int) map[int]string {
 		// Native Claude installs a version-named binary behind ~/.local/bin/claude.
 		if agent == "" && len(command) > 0 && command[0] >= '0' && command[0] <= '9' {
 			executable, err := darwinKernelExecutable(pid)
+			if err != nil {
+				// proc_pidpath cannot name a deleted image; the exec path saved
+				// in the process arguments still does.
+				executable, err = darwinExecPath(pid)
+			}
 			home, homeErr := os.UserHomeDir()
 			if err == nil && homeErr == nil {
 				agent = classifyDarwinAgentExecutable(command, executable, home)
@@ -151,10 +156,18 @@ func classifyDarwinAgentExecutable(command, executable, home string) string {
 	}
 	resolved, err := filepath.EvalSymlinks(executable)
 	if err != nil {
-		return ""
-	}
-	info, err := os.Stat(resolved)
-	if err != nil || !info.Mode().IsRegular() {
+		// Claude's updater deletes superseded versions while they still run.
+		// The kernel's vnode path still names the original image; accept it
+		// only when that exact file is gone and its directory is the install.
+		if _, statErr := os.Lstat(executable); !errors.Is(statErr, os.ErrNotExist) || !claudeVersionName(command) {
+			return ""
+		}
+		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(executable))
+		if parentErr != nil {
+			return ""
+		}
+		resolved = filepath.Join(parent, filepath.Base(executable))
+	} else if info, err := os.Stat(resolved); err != nil || !info.Mode().IsRegular() {
 		return ""
 	}
 	if filepath.Dir(resolved) == filepath.Join(canonicalHome, ".local", "share", "claude", "versions") && filepath.Base(resolved) == command {
@@ -182,4 +195,22 @@ func darwinKernelExecutable(pid int) (string, error) {
 		return "", errors.New("kernel executable path unavailable")
 	}
 	return string(buffer[:end]), nil
+}
+
+// claudeVersionName accepts the native installer's version file names (2.1.295).
+func claudeVersionName(name string) bool {
+	parts := 0
+	digits := 0
+	for _, c := range name {
+		switch {
+		case c >= '0' && c <= '9':
+			digits++
+		case c == '.' && digits > 0:
+			parts++
+			digits = 0
+		default:
+			return false
+		}
+	}
+	return parts == 2 && digits > 0 && len(name) <= 32
 }

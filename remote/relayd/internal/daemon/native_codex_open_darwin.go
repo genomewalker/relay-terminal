@@ -111,7 +111,7 @@ func darwinOpenCodexTranscript(ctx context.Context, pid int) (string, string, st
 	}
 	candidates := map[string]nativeCodexTranscriptCandidate{}
 	for _, descriptor := range descriptors {
-		path, err := rotationSourcePath(descriptor.path, "codex")
+		path, err := processSourcePath(pid, descriptor.path, "codex")
 		if err != nil {
 			continue
 		}

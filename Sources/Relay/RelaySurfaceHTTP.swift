@@ -5,7 +5,7 @@ import Foundation
 enum RelaySurfaceHTTP {
     static func handle(_ request: RelaySidePanelHTTPRequest, installationToken: String,
                        callerControl: RelayCallerControl, publication: RelaySurfacePublication,
-                       layoutGranted: Bool, resolvePane: (UUID) -> (UUID, UUID)?,
+                       layoutGranted: Bool, assistantIdentity: Bool = false, resolvePane: (UUID) -> (UUID, UUID)?,
                        refreshPane: (UUID) -> Void) -> RelaySidePanelHTTPResponse? {
         guard ["/api/surfaces/publish", "/api/surfaces/status", "/api/surfaces/content"].contains(request.path) else { return nil }
         guard request.isAuthorized(token: installationToken) else {
@@ -14,9 +14,19 @@ enum RelaySurfaceHTTP {
         guard request.method == "POST" else {
             return .text("POST required", status: 405, reason: "Method Not Allowed")
         }
-        guard let principal = try? callerControl.identity(token: request.headers["x-relay-caller-token"]),
-              UUID(uuidString: principal) != nil else {
-            return .text("Registered publisher required", status: 403, reason: "Forbidden")
+        let principal: String
+        if assistantIdentity {
+            guard request.headers["x-relay-caller-token"] == nil,
+                  callerControl.permitted(RelayCallerControl.assistantPublisher) else {
+                return .text("Miko publisher is paused or has an invalid caller credential", status: 403, reason: "Forbidden")
+            }
+            principal = RelayCallerControl.assistantPublisher
+        } else {
+            guard let registered = try? callerControl.identity(token: request.headers["x-relay-caller-token"]),
+                  UUID(uuidString: registered) != nil else {
+                return .text("Registered publisher required", status: 403, reason: "Forbidden")
+            }
+            principal = registered
         }
         if request.path != "/api/surfaces/publish" {
             guard request.body.count <= 4096,

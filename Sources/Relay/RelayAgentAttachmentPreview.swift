@@ -9,9 +9,8 @@ private actor RelayAgentAttachmentThumbnailer {
     static let shared = RelayAgentAttachmentThumbnailer()
 
     func render(_ snapshot: RelayAgentAttachmentSnapshot.Record) -> Data? {
-        guard let bytes = try? snapshot.verifiedData(), !Task.isCancelled,
-              let source = CGImageSourceCreateWithData(bytes as CFData,
-                [kCGImageSourceShouldCache: false] as CFDictionary),
+        return try? RelayAttachmentImageSource.read(snapshot) { source in
+        guard !Task.isCancelled,
               let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
@@ -23,23 +22,42 @@ private actor RelayAgentAttachmentThumbnailer {
         CGImageDestinationAddImage(destination, thumbnail, nil)
         guard CGImageDestinationFinalize(destination), !Task.isCancelled else { return nil }
         return output as Data
+        }
     }
 }
 
 struct RelayAgentAttachmentPreview: View {
     let attachment: RelayAgentDraftAttachment
+    var pane: PaneModel? = nil
     @State private var thumbnail: NSImage?
 
+    /// Previews the captured, digest-verified snapshot (what will be sent), never the mutable
+    /// source; the draft itself is untouched.
+    private var previewKind: RelayFilePreviewKind? {
+        guard attachment.snapshot != nil else { return nil }
+        return RelayFilePreviewKind.from(path: attachment.name) ?? (attachment.kind == .image ? .image : nil)
+    }
+
     var body: some View {
-        Group {
-            if let thumbnail {
-                Image(nsImage: thumbnail).resizable().scaledToFit()
-            } else {
-                Image(systemName: attachment.kind == .image ? "photo" : "doc")
+        Button {
+            guard let pane, let previewKind, let snapshot = attachment.snapshot else { return }
+            pane.openAttachmentPreview(snapshot: snapshot, name: attachment.name, kind: previewKind)
+        } label: {
+            Group {
+                if let thumbnail {
+                    Image(nsImage: thumbnail).resizable().scaledToFit()
+                } else {
+                    Image(systemName: attachment.kind == .image ? "photo" : previewKind?.symbol ?? "doc")
+                }
             }
+            .frame(width: 36, height: 36)
+            .contentShape(Rectangle())
         }
-        .frame(width: 36, height: 36)
-        .accessibilityLabel(attachment.kind == .image ? "Image preview" : "Attached file")
+        .buttonStyle(.plain)
+        .disabled(pane == nil || previewKind == nil)
+        .help(previewKind == nil ? attachment.name : "Preview " + attachment.name)
+        .accessibilityLabel(previewKind == nil ? "Attached file " + attachment.name : "Preview " + attachment.name)
+        .accessibilityIdentifier("relay.file-card")
         .task(id: attachment.snapshot) {
             thumbnail = nil
             guard attachment.kind == .image, let snapshot = attachment.snapshot else { return }
