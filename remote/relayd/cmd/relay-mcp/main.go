@@ -407,6 +407,18 @@ func (s *server) handle(r request) (any, int, string) {
 				return nil, -32602, "The requested name is not in the current Relay tool catalog"
 			}
 			p.Name, p.Arguments = targetName, targetArguments
+			// The unwrapped tool takes the same daemon path as a direct call, so a
+			// cross-host message still gets this node's sender signature,
+			// attestation or proof error rather than reaching the desktop without one.
+			// Intended scope: exactly daemonCommunication's tools (relay_link_panes,
+			// relay_unlink_panes, relay_list_pane_links, relay_message_pane,
+			// relay_pane_message_receipt, relay_bind/unbind_question_thread);
+			// every other tool, including relay_work_*, is unaffected.
+			if s.daemonHelper != "" {
+				if result, handled := s.daemonCommunication(p.Name, p.Arguments); handled {
+					return result, 0, ""
+				}
+			}
 		}
 		if p.Name == "relay_request_r_setup" {
 			var root string

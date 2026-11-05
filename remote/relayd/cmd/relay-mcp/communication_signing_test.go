@@ -138,3 +138,48 @@ func TestMessageToolForwardsMintedSignatureToDesktop(t *testing.T) {
 		t.Fatalf("a client-supplied signature reached the desktop: code %d", code)
 	}
 }
+
+// A provider that reaches relay_message_pane through relay_call_tool must get
+// the same sender proof as a direct call; before this, the generic dispatcher
+// unwrapped the tool after the daemon path and posted to the desktop unsigned.
+func TestCallToolMessageCarriesMintedSignatureToDesktop(t *testing.T) {
+	t.Setenv("RELAY_SESSION", fallbackPane)
+	var body map[string]string
+	posts := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/api/panes/129286a2-6e69-4d1a-9c83-91a0a2dec1e9/message" {
+			posts++
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+		}
+		w.Write([]byte(`{"status":"accepted_by_provider"}`))
+	}))
+	defer ts.Close()
+	s, _ := signHelper(t, `{"source_signature":"`+fixtureSignature+`","authority":"relayd"}`, 0)
+	s.endpoint, s.client = ts.URL, ts.Client()
+	params, _ := json.Marshal(map[string]any{"name": "relay_call_tool", "arguments": map[string]any{
+		"tool_name": "relay_message_pane", "arguments": map[string]string{
+			"source_pane_id": fallbackPane, "pane_id": "129286a2-6e69-4d1a-9c83-91a0a2dec1e9",
+			"message_id": "0c9d4e6b-7a21-4f83-b5e9-2d8f1a6c3e57", "text": "fixture only"}}})
+	if _, code, msg := s.handle(request{Method: "tools/call", Params: params}); code != 0 {
+		t.Fatal(code, msg)
+	}
+	if posts != 1 || body["sourceSignature"] != fixtureSignature || body["sourceAttestation"] != "0123456789abcdef0123456789abcdef" || body["sourcePaneID"] != fallbackPane {
+		t.Fatalf("posts=%d desktop body = %v", posts, body)
+	}
+
+	// A client-supplied signature is refused through the dispatcher as well.
+	params, _ = json.Marshal(map[string]any{"name": "relay_call_tool", "arguments": map[string]any{
+		"tool_name": "relay_message_pane", "arguments": map[string]string{
+			"source_pane_id": fallbackPane, "pane_id": "129286a2-6e69-4d1a-9c83-91a0a2dec1e9",
+			"message_id": "1c9d4e6b-7a21-4f83-b5e9-2d8f1a6c3e57", "text": "fixture only", "source_signature": fixtureSignature}}})
+	result, code, _ := s.handle(request{Method: "tools/call", Params: params})
+	if code == 0 {
+		if m, ok := result.(map[string]any); !ok || m["isError"] != true {
+			t.Fatalf("a client-supplied signature passed through relay_call_tool: %v", result)
+		}
+	}
+	if posts != 1 {
+		t.Fatal("a client-supplied signature reached the desktop through relay_call_tool")
+	}
+}
