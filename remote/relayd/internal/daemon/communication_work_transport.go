@@ -262,8 +262,11 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 }
 
 func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (map[string]any, error) {
-	if m.Fingerprint == "" || m.Fingerprint != workFingerprint(m) || !remoteDigest(peerCert) || (m.Operation != "send" && m.Operation != "receipt" && m.Operation != "observe") {
+	if m.Fingerprint == "" || m.Fingerprint != workFingerprint(m) || !remoteDigest(peerCert) || (m.Operation != "send" && m.Operation != "receipt" && m.Operation != "observe" && m.Operation != "repin") {
 		return nil, errors.New("invalid Work peer request")
+	}
+	if m.Operation == "repin" {
+		return workReceiveRepin(ctx, root, node, peerCert, m)
 	}
 	if m.Operation == "observe" {
 		return workObserveOutbound(ctx, root, node, peerCert, m)

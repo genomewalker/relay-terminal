@@ -568,3 +568,16 @@ func (d *nativeDesktop) persistSelectedWork(ctx context.Context, r workReference
 // ValidWorkThread reports whether a thread can be used as a single registry
 // filename and Work conversation identifier.
 func ValidWorkThread(thread string) bool { return identifier.MatchString(thread) }
+
+// PrepareSelectedWork re-observes the exact Work conversation and commits its
+// current native reference, exactly as `desktop-route task-prepare` does on the
+// legacy control socket. It never selects a different conversation.
+func PrepareSelectedWork(ctx context.Context, thread string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	d := &nativeDesktop{home: home, inspect: inspectProcess}
+	_, err = d.Inspect(ctx, d.legacySocket(), thread, true)
+	return err
+}

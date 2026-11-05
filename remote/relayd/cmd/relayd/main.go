@@ -406,6 +406,14 @@ func main() {
 		if err := daemon.RunWorkLinkSelection(os.Stdin, os.Stdout); err != nil {
 			fatal(err.Error())
 		}
+	case "communication-work-repin":
+		watch := len(os.Args) == 4 && os.Args[2] == "--watch"
+		if len(os.Args) != 3 && !watch {
+			fatal("usage: relayd communication-work-repin [--watch] <link_id>")
+		}
+		if err := daemon.RunWorkRepin(os.Args[len(os.Args)-1], watch, os.Stdout); err != nil {
+			fatal(err.Error())
+		}
 	case "communication-work-inspect":
 		if len(os.Args) != 3 {
 			fatal("exact Work thread required")
