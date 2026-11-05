@@ -21,7 +21,7 @@ func mikoExcluded(name string) bool {
 		return true
 	}
 	switch name {
-	case "relay_ask_miko", "relay_register_caller", "relay_control_caller", "relay_begin_terminal_control", "relay_authorize_r_session", "relay_available_tools", "relay_call_tool",
+	case "relay_ask_miko", "relay_register_caller", "relay_control_caller", "relay_begin_terminal_control", "relay_authorize_r_session", "relay_available_tools", "relay_call_tool", "relay_research_capability",
 		// Miko does not broadcast yet; its catalog and card policy would need it first.
 		"relay_broadcast_message":
 		return true
