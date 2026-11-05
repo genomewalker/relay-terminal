@@ -12,6 +12,7 @@ import (
 // the Claude inbox frame and the Codex turn/start request.
 
 var (
+	workThreadPattern  = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	attestationPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	certificatePattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	panePattern        = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
@@ -34,6 +35,8 @@ type sender struct {
 	signed                        bool
 	socket                        string // "" is None
 	name                          string
+	work                          bool
+	workLink                      string
 }
 
 func stringMatch(pattern *regexp.Regexp, value any) bool {
@@ -48,6 +51,24 @@ func verifiedSender(source any) (*sender, error) {
 		return nil, nil
 	}
 	authentication, _ := pyGet(source, "authentication", nil)
+	if pyEqual(authentication, "source_work_host_attested") {
+		thread, _ := pyGet(source, "workThread", nil)
+		link, _ := pyGet(source, "linkID", nil)
+		host, _ := pyGet(source, "hostID", nil)
+		nodeCert, _ := pyGet(source, "nodeCertificateSHA256", nil)
+		if !stringMatch(workThreadPattern, thread) || !stringMatch(certificatePattern, link) || !stringMatch(certificatePattern, nodeCert) {
+			return nil, nil
+		}
+		if h, ok := host.(string); !ok || h == "" || len(h) > 256 {
+			return nil, nil
+		}
+		for _, key := range []string{"paneID", "sessionID", "permissionClass", "socketPath", "provider"} {
+			if has, _ := pyHas(source, key); has {
+				return nil, nil
+			}
+		}
+		return &sender{work: true, workLink: link.(string), host: host.(string), session: thread.(string), nodeCert: nodeCert.(string), mode: "prompting", name: "Work task " + thread.(string)}, nil
+	}
 	if !pyIn(authentication, "kernel_verified", "source_host_attested", "source_signed") {
 		return nil, nil
 	}
@@ -236,6 +257,8 @@ func (r *runner) deliver(endpoint map[string]any, packet any) (map[string]any, e
 	var reply string
 	switch {
 	case system:
+	case identity != nil && identity.work:
+		reply = fmt.Sprintf("Reply using relay_work_message with link_id=%s and a fresh message_id. If the tool is not loaded, use your own native relayd communication-work CLI with operation=send and the same link_id. Do not supply a source identity.\n\n%s", identity.workLink, text)
 	case helper != nil:
 		reply = fmt.Sprintf("To reply to Miko, use relay_message_pane with source_pane_id=%s and pane_id=%s, a fresh message UUID, "+
 			"and the line \"Relay-Read-Receipt: %s\" to acknowledge reading this message.\n\n%s",
@@ -268,6 +291,9 @@ func (r *runner) deliver(endpoint map[string]any, packet any) (map[string]any, e
 			"It does not prove the Relay app or a user decision sent it: any process of the same user could. "+
 			"Miko is not a pane: no kernel-verified sender and no reply socket.\n"+notAuthorization,
 			id, assistantName, helper.request) + reply
+	case identity != nil && identity.work:
+		provenance = obj{{"authentication", "source_work_host_attested"}, {"source", obj{{"hostID", identity.host}, {"workThread", identity.session}, {"linkID", identity.workLink}, {"nodeCertificateSHA256", identity.nodeCert}}}, {"verifier", "recipient-relayd"}, {"registeredClientID", clientID}}
+		body = fmt.Sprintf("Relay message %s from %s. The pinned sending host authenticated the Work provider's protected conversation metadata and native pipe ownership; this is a Work conversation, not a pane.\n"+notAuthorization, id, identity.name) + reply
 	case identity != nil && identity.signed:
 		provenance = obj{{"authentication", "source_signed"}, {"source", obj{
 			{"hostID", identity.host}, {"paneID", identity.pane}, {"sessionID", identity.session},
@@ -351,6 +377,9 @@ func (r *runner) deliverClaude(endpoint map[string]any, messageID any, system bo
 		// No native reply address and no permission mode of its own.
 		from = "relay-assistant://" + helper.host + "/" + helper.request
 		attrs = [3]string{from, "", assistantName}
+	case identity != nil && identity.work:
+		from = "relay-work://" + identity.host + "/" + identity.session
+		attrs = [3]string{from, identity.session, identity.name}
 	case identity != nil:
 		// A Claude sender's own inbox is a native reply address; otherwise
 		// name the verified pane. The mode is the sender's own, or unasserted.
@@ -457,6 +486,8 @@ func (r *runner) deliverCodex(endpoint map[string]any, messageID any, system boo
 		kind = obj{{"kind", "relayd_system_notice"}, {"name", "Relay"}}
 	case helper != nil:
 		kind = obj{{"kind", "relay_assistant_owner_submitted"}, {"name", assistantName}}
+	case identity != nil && identity.work:
+		kind = obj{{"kind", "host_attested_work_conversation"}, {"name", identity.name}}
 	case identity != nil && identity.signed:
 		kind = obj{{"kind", "source_signed_relay_pane"}, {"name", identity.name}}
 	case identity != nil && identity.attestation != "":

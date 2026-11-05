@@ -1446,6 +1446,13 @@ func relayTokenFromDefaults() (string, error) {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--work-request" {
+		if err := runWorkRequest(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "Work MCP request failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	// Pure catalog/request compilation: never load live credentials or state.
 	if len(os.Args) == 2 && (os.Args[1] == "--miko-catalog" || os.Args[1] == "--miko-plan") {
 		if err := mikoCLI(os.Args[1], os.Stdin, os.Stdout); err != nil {

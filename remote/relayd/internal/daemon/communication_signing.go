@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/relay-terminal/relayd/internal/nativemsg"
 )
 
 // Signed pane messages let the receiving host check, by itself, which pane and
@@ -28,14 +30,15 @@ import (
 // supervisor's memory without changing this protocol.
 
 const (
-	communicationSessionCertTTL  = 24 * time.Hour
-	communicationSessionRenew    = 30 * time.Minute
-	communicationStatementTTL    = 10 * time.Minute
-	communicationClockSkew       = 2 * time.Minute
-	communicationEnvelopeLimit   = 16 << 10
-	communicationTrustedNodeCap  = 64
-	communicationCertDomain      = "relay-session-cert-v1\x00"
-	communicationStatementDomain = "relay-pane-message-v1\x00"
+	communicationSessionCertTTL      = 24 * time.Hour
+	communicationSessionRenew        = 30 * time.Minute
+	communicationStatementTTL        = 10 * time.Minute
+	communicationClockSkew           = 2 * time.Minute
+	communicationEnvelopeLimit       = 16 << 10
+	communicationTrustedNodeCap      = 64
+	communicationCertDomain          = "relay-session-cert-v1\x00"
+	communicationStatementDomain     = "relay-pane-message-v1\x00"
+	communicationWorkStatementDomain = "relay-work-message-v1\x00"
 )
 
 var communicationHexID = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -133,19 +136,24 @@ type communicationSessionCert struct {
 
 // communicationSignedStatement is the exact message the session key signs.
 type communicationSignedStatement struct {
-	Version         int       `json:"v"`
-	Purpose         string    `json:"purpose"`
-	MessageID       string    `json:"message_id"`
-	SourceNodeID    string    `json:"source_node_id"`
-	SourcePaneID    string    `json:"source_pane_id"`
-	SourceSessionID string    `json:"source_session_id"`
-	CertID          string    `json:"cert_id"`
-	PermissionClass string    `json:"permission_class,omitempty"`
-	TargetPaneID    string    `json:"target_pane_id"`
-	TextSHA256      string    `json:"text_sha256"`
-	ClientID        string    `json:"client_id,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	ExpiresAt       time.Time `json:"expires_at"`
+	Version            int                     `json:"v"`
+	Purpose            string                  `json:"purpose"`
+	MessageID          string                  `json:"message_id"`
+	SourceNodeID       string                  `json:"source_node_id"`
+	SourcePaneID       string                  `json:"source_pane_id"`
+	SourceSessionID    string                  `json:"source_session_id"`
+	CertID             string                  `json:"cert_id"`
+	PermissionClass    string                  `json:"permission_class,omitempty"`
+	TargetPaneID       string                  `json:"target_pane_id"`
+	WorkTarget         *nativemsg.WorkEndpoint `json:"work_target,omitempty"`
+	TargetNodeID       string                  `json:"target_node_id,omitempty"`
+	WorkLinkID         string                  `json:"work_link_id,omitempty"`
+	WorkSourceRevision uint64                  `json:"work_source_revision,omitempty"`
+	WorkTargetRevision uint64                  `json:"work_target_revision,omitempty"`
+	TextSHA256         string                  `json:"text_sha256"`
+	ClientID           string                  `json:"client_id,omitempty"`
+	CreatedAt          time.Time               `json:"created_at"`
+	ExpiresAt          time.Time               `json:"expires_at"`
 }
 
 // The signed bytes travel base64-encoded, so brokers may re-serialize the
@@ -338,6 +346,14 @@ type communicationVerifiedSource struct {
 // communicationVerifyEnvelope checks the whole chain against this host's
 // pinned nodes. It trusts nothing in the envelope that it did not verify.
 func communicationVerifyEnvelope(encoded string, trusted []communicationTrustedNode, now time.Time) (communicationVerifiedSource, error) {
+	return communicationVerifyEnvelopeKind(encoded, trusted, now, false)
+}
+
+func communicationVerifyWorkEnvelope(encoded string, trusted []communicationTrustedNode, now time.Time) (communicationVerifiedSource, error) {
+	return communicationVerifyEnvelopeKind(encoded, trusted, now, true)
+}
+
+func communicationVerifyEnvelopeKind(encoded string, trusted []communicationTrustedNode, now time.Time, work bool) (communicationVerifiedSource, error) {
 	var empty communicationVerifiedSource
 	if encoded == "" || len(encoded) > communicationEnvelopeLimit*2 {
 		return empty, errors.New("signed envelope required")
@@ -346,8 +362,12 @@ func communicationVerifyEnvelope(encoded string, trusted []communicationTrustedN
 	if err != nil || len(data) > communicationEnvelopeLimit {
 		return empty, errors.New("malformed signed envelope")
 	}
+	decode := communicationStrictJSON
+	if work {
+		decode = communicationStrictWorkJSON
+	}
 	var envelope communicationSignedEnvelope
-	if err := communicationStrictJSON(data, &envelope); err != nil || envelope.Version != 1 {
+	if err := decode(data, &envelope); err != nil || envelope.Version != 1 {
 		return empty, errors.New("malformed signed envelope")
 	}
 	// 1. The host certificate must be one this receiver pinned.
@@ -381,7 +401,7 @@ func communicationVerifyEnvelope(encoded string, trusted []communicationTrustedN
 		return empty, errors.New("session certificate signature invalid")
 	}
 	var cert communicationSessionCert
-	if err := communicationStrictJSON(certRaw, &cert); err != nil || cert.Version != 1 || cert.Purpose != "relay-session-cert" {
+	if err := decode(certRaw, &cert); err != nil || cert.Version != 1 || cert.Purpose != "relay-session-cert" {
 		return empty, errors.New("session certificate malformed")
 	}
 	if cert.NodeID != pinned.NodeID || cert.NodeCertSHA256 != fingerprint || !communicationHexID.MatchString(cert.CertID) {
@@ -398,13 +418,27 @@ func communicationVerifyEnvelope(encoded string, trusted []communicationTrustedN
 	// 3. The statement must be signed by that session key.
 	statementRaw, err := base64.StdEncoding.DecodeString(envelope.Statement)
 	signature, sigErr := base64.StdEncoding.DecodeString(envelope.Signature)
+	domain := communicationStatementDomain
+	if work {
+		domain = communicationWorkStatementDomain
+	}
 	if err != nil || sigErr != nil ||
-		!ed25519.Verify(ed25519.PublicKey(sessionPublic), append([]byte(communicationStatementDomain), statementRaw...), signature) {
+		!ed25519.Verify(ed25519.PublicKey(sessionPublic), append([]byte(domain), statementRaw...), signature) {
 		return empty, errors.New("message signature invalid")
 	}
 	var statement communicationSignedStatement
-	if err := communicationStrictJSON(statementRaw, &statement); err != nil || statement.Version != 1 || statement.Purpose != "relay-pane-message" {
+	if err := decode(statementRaw, &statement); err != nil || statement.Version != 1 {
 		return empty, errors.New("signed statement malformed")
+	}
+	if work {
+		if statement.Purpose != "relay-work-message" || statement.TargetPaneID != "" || statement.WorkTarget == nil || !canonicalRouteToken(statement.TargetNodeID) || !remoteDigest(statement.WorkLinkID) || statement.WorkSourceRevision == 0 || statement.WorkTargetRevision == 0 {
+			return empty, errors.New("signed Work target malformed")
+		}
+		if _, err := (nativemsg.Target{Kind: "work", Work: statement.WorkTarget}).IdentityKey(); err != nil {
+			return empty, errors.New("signed Work target malformed")
+		}
+	} else if statement.Purpose != "relay-pane-message" || statement.WorkTarget != nil || statement.TargetNodeID != "" || statement.WorkLinkID != "" || statement.WorkSourceRevision != 0 || statement.WorkTargetRevision != 0 {
+		return empty, errors.New("signed pane target malformed")
 	}
 	// 4. The statement's source must be exactly the certified session.
 	if statement.SourceNodeID != cert.NodeID || statement.SourcePaneID != cert.PaneID ||

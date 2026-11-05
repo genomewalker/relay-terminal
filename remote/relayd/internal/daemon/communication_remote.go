@@ -173,15 +173,37 @@ func communicationRemoteLinkOperation(root, node string, r CommunicationRequest)
 			return nil, errors.New("remote pair catalogue exceeds limit")
 		}
 		links := []CommunicationRemoteLink{}
+		typed := []communicationTypedRemoteLink{}
 		for _, path := range paths {
 			id := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), "remote-link-"), ".json")
-			link, err := readRemoteLink(root, node, id)
-			if err != nil {
+			var header struct {
+				Version int `json:"version"`
+			}
+			if err := communicationRead(path, &header); err != nil {
 				return nil, err
 			}
-			links = append(links, link)
+			switch header.Version {
+			case 1:
+				link, err := readRemoteLink(root, node, id)
+				if err != nil {
+					return nil, err
+				}
+				links = append(links, link)
+			case 2:
+				link, err := readTypedRemoteLink(root, node, id)
+				if err != nil {
+					return nil, err
+				}
+				typed = append(typed, link)
+			default:
+				return nil, errors.New("unknown remote pair version")
+			}
 		}
-		return map[string]any{"links": links, "authority": "relayd", "desktop_required": false}, nil
+		result := map[string]any{"links": links, "authority": "relayd", "desktop_required": false}
+		if len(typed) != 0 {
+			result["typed_links"] = typed
+		}
+		return result, nil
 	}
 	id := strings.ToLower(r.LinkID)
 	var requested CommunicationRemoteLink
@@ -483,6 +505,10 @@ func peerHandler(root, node string, hooks communicationGroupNative) http.Handler
 			return
 		}
 		data, err := io.ReadAll(io.LimitReader(r.Body, 128<<10+1))
+		if err == nil && len(data) <= 128<<10 && workWireVersion(data) {
+			handleWorkWire(w, r, root, node, peerFingerprint(r.TLS.PeerCertificates[0]), data)
+			return
+		}
 		var message communicationRemoteMessage
 		if err != nil || len(data) > 128<<10 || json.Unmarshal(data, &message) != nil {
 			http.Error(w, "invalid request", http.StatusBadRequest)

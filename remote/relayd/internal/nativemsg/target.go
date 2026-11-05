@@ -25,7 +25,7 @@ func (t Target) IdentityKey() (string, error) {
 		}
 		return "pane:" + t.PaneID, nil
 	case "work":
-		if t.PaneID != "" || t.Work == nil || !desktoproute.ValidWorkThread(t.Work.Thread) || t.Work.Owner == "" || t.Work.Incarnation == "" {
+		if t.PaneID != "" || t.Work == nil || !t.Work.Valid() {
 			return "", errors.New("invalid Work target")
 		}
 		return "work:" + t.Work.Thread, nil

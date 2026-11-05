@@ -395,6 +395,28 @@ func main() {
 		if err := daemon.EncodeJSON(os.Stdout, map[string]string{"class": class, "reason": reason}); err != nil {
 			fatal(err.Error())
 		}
+	case "communication-work-provision":
+		if len(os.Args) != 3 {
+			fatal("exact pane required")
+		}
+		if err := daemon.ProvisionWorkPaneCredential(os.Args[2], os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "communication-work-select":
+		if err := daemon.RunWorkLinkSelection(os.Stdin, os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "communication-work-inspect":
+		if len(os.Args) != 3 {
+			fatal("exact Work thread required")
+		}
+		if err := daemon.InspectWorkSelection(os.Args[2], os.Stdout); err != nil {
+			fatal(err.Error())
+		}
+	case "communication-work":
+		if err := daemon.RunCommunicationWork(os.Stdin, os.Stdout); err != nil {
+			fatal(err.Error())
+		}
 	case "communication", "communication-shepherd":
 		request, decodeErr := daemon.DecodeCommunicationRequest(os.Stdin)
 		if decodeErr != nil {
