@@ -60,7 +60,7 @@ struct RelayPaneLinkPrompt: Equatable {
         "Target pane: \(target.displayName)\nTarget host: \(target.hostLabel)\n\n" +
         "Allow lets these two panes send messages to each other through Relay (saved messaging link). " +
         "It does not restart either agent or grant any other permission. " +
-        "Deny is the default; with no answer this request expires as denied in \(Int(timeout)) seconds."
+        "Click Allow or Deny; the keyboard cannot answer. With no answer this request expires as denied in \(Int(timeout)) seconds."
     }
 }
 
@@ -75,22 +75,124 @@ protocol RelayPaneLinkConfirming: AnyObject {
     func confirm(_ prompt: RelayPaneLinkPrompt, timeout: TimeInterval) async -> RelayPaneLinkDecision
 }
 
-/// The native confirmation: a sheet with Deny (the default button) and Allow.
+/// A button of the link panel: answers only a mouse click, never a key, and
+/// takes no keyboard focus. It accepts the first click, since its window is
+/// never key.
+@MainActor
+final class RelayPaneLinkPanelButton: NSButton {
+    override var acceptsFirstResponder: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// The native confirmation: a non-activating floating panel with Deny and
+/// Allow. It can never become key or main, so keys keep going to whatever the
+/// user is typing in, and clicking it does not activate Relay. Neither button
+/// has a key equivalent, and both stay disabled until `arm()`.
+@MainActor
+final class RelayPaneLinkPanel: NSPanel {
+    let denyButton = RelayPaneLinkPanelButton(title: "Deny", target: nil, action: nil)
+    let allowButton = RelayPaneLinkPanelButton(title: "Allow", target: nil, action: nil)
+    var onAnswer: ((RelayPaneLinkDecision) -> Void)?
+    private(set) var armed = false
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    init(prompt: RelayPaneLinkPrompt) {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 460, height: 10),
+                   styleMask: [.titled, .nonactivatingPanel, .utilityWindow],
+                   backing: .buffered, defer: true)
+        title = "Relay"
+        isFloatingPanel = true
+        level = .floating
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = true
+        isReleasedWhenClosed = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        RelayTheme.configureAppearance(self)
+
+        let heading = NSTextField(wrappingLabelWithString: prompt.title)
+        heading.font = .boldSystemFont(ofSize: NSFont.systemFontSize + 1)
+        let body = NSTextField(wrappingLabelWithString: prompt.text)
+        body.font = .systemFont(ofSize: NSFont.smallSystemFontSize + 1)
+        for label in [heading, body] {
+            label.isSelectable = false
+            label.refusesFirstResponder = true
+            label.preferredMaxLayoutWidth = 420
+        }
+        for (button, action) in [(denyButton, #selector(deny)), (allowButton, #selector(allow))] {
+            button.target = self
+            button.action = action
+            button.bezelStyle = .rounded
+            button.keyEquivalent = ""
+            button.keyEquivalentModifierMask = []
+            button.refusesFirstResponder = true
+            button.isEnabled = false
+        }
+        let buttons = NSStackView(views: [denyButton, allowButton])
+        buttons.orientation = .horizontal
+        buttons.spacing = 12
+        let stack = NSStackView(views: [heading, body, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+        contentView = stack
+        defaultButtonCell = nil
+        initialFirstResponder = nil
+        setContentSize(stack.fittingSize)
+    }
+
+    /// Enables both buttons; called only after the disarm delay.
+    func arm() {
+        armed = true
+        denyButton.isEnabled = true
+        allowButton.isEnabled = true
+    }
+
+    /// Disables the buttons, drops the answer handler and hides the panel.
+    func dismiss() {
+        armed = false
+        denyButton.isEnabled = false
+        allowButton.isEnabled = false
+        onAnswer = nil
+        orderOut(nil)
+    }
+
+    /// No key, combination or not, can answer this panel.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool { false }
+
+    @objc private func deny() { answer(.deny) }
+    @objc private func allow() { answer(.allow) }
+
+    private func answer(_ decision: RelayPaneLinkDecision) {
+        guard armed, let onAnswer else { return }
+        onAnswer(decision)
+    }
+}
+
+/// Shows the link panel at once, without activating Relay or taking keyboard
+/// focus, arms its buttons after `armDelay`, and resolves on a click or expiry.
 @MainActor
 final class RelayPaneLinkAlertConfirmer: RelayPaneLinkConfirming {
-    typealias Presenter = (NSAlert, @escaping (NSApplication.ModalResponse) -> Void) -> Bool
-    private let present: Presenter
+    typealias Presenter = (RelayPaneLinkPanel) -> Bool
 
-    init(present: Presenter? = nil) {
-        self.present = present ?? { alert, completion in
-            guard let window = NSApp.keyWindow ?? NSApp.mainWindow ??
-                    NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }),
-                  window.attachedSheet == nil else { return false }
-            NSApp.activate(ignoringOtherApps: true)
-            window.makeKeyAndOrderFront(nil)
-            alert.beginSheetModal(for: window, completionHandler: completion)
+    static let armDelay: TimeInterval = 1.0
+
+    private let present: Presenter
+    private let armDelay: TimeInterval
+
+    init(present: Presenter? = nil, armDelay: TimeInterval = RelayPaneLinkAlertConfirmer.armDelay) {
+        self.present = present ?? { panel in
+            guard let screen = NSApp.mainWindow?.screen ?? NSScreen.main else { return false }
+            let frame = screen.visibleFrame
+            panel.setFrameOrigin(NSPoint(x: frame.midX - panel.frame.width / 2,
+                                         y: frame.midY - panel.frame.height / 2 + frame.height / 6))
+            panel.orderFrontRegardless()  // never makeKey, never activate
+            if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
             return true
         }
+        self.armDelay = armDelay
     }
 
     private final class Once {
@@ -99,29 +201,26 @@ final class RelayPaneLinkAlertConfirmer: RelayPaneLinkConfirming {
 
     func confirm(_ prompt: RelayPaneLinkPrompt, timeout: TimeInterval) async -> RelayPaneLinkDecision {
         guard timeout > 0 else { return .timedOut }
-        let alert = RelayTheme.alert()
-        alert.alertStyle = .warning
-        alert.messageText = prompt.title
-        alert.informativeText = prompt.text
-        alert.addButton(withTitle: "Deny")   // first button: the default (Return)
-        alert.addButton(withTitle: "Allow")
-        alert.buttons[1].keyEquivalent = ""  // Allow is never a key equivalent
+        let panel = RelayPaneLinkPanel(prompt: prompt)
         let once = Once()
+        let armDelay = self.armDelay
         return await withCheckedContinuation { (continuation: CheckedContinuation<RelayPaneLinkDecision, Never>) in
             let finish: @MainActor (RelayPaneLinkDecision) -> Void = { decision in
                 guard !once.done else { return }
                 once.done = true
+                panel.dismiss()
                 continuation.resume(returning: decision)
             }
-            let shown = present(alert) { response in
-                Task { @MainActor in finish(response == .alertSecondButtonReturn ? .allow : .deny) }
+            panel.onAnswer = { finish($0) }
+            guard present(panel) else { finish(.unavailable); return }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(armDelay * 1_000_000_000))
+                guard !once.done else { return }
+                panel.arm()
             }
-            guard shown else { finish(.unavailable); return }
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                guard !once.done else { return }
                 finish(.timedOut)
-                if let parent = alert.window.sheetParent { parent.endSheet(alert.window, returnCode: .abort) }
             }
         }
     }

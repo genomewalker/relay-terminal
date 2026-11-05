@@ -313,7 +313,7 @@ private final class Fixture {
         _ = await f.propose()
         for _ in 0..<20 { await Task.yield() }
         let text = f.confirmer.prompts.first?.text ?? ""
-        for needle in ["claude-A", "codex-B", "dandy-07", "This Mac", "send messages to each other", "Deny is the default"] {
+        for needle in ["claude-A", "codex-B", "dandy-07", "This Mac", "send messages to each other", "the keyboard cannot answer"] {
             #expect(text.contains(needle), "\(needle)")
         }
         await f.drain()
