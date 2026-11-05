@@ -117,21 +117,86 @@ func decodeWorkWireFile(m workWire) ([]byte, error) {
 	return content, nil
 }
 
-// saveWorkFile writes verified bytes to <root>/<message_id>/<name> with mode
-// 0600 and never replaces an existing file.
-func saveWorkFile(messageID, name string, content []byte) (string, error) {
+// Bounds on what a pinned peer can leave in the save root. A var so tests can
+// lower them. The check is made before each save and is not atomic across
+// concurrent saves, so the limits can be overshot by a few in-flight files.
+var (
+	workFileMaxCount = 512
+	workFileMaxBytes = int64(64 << 20)
+)
+
+// workFileUsage counts saved files (not markers or temporaries) under root.
+func workFileUsage(root string) (count int, size int64) {
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || strings.HasPrefix(d.Name(), ".") {
+			return nil
+		}
+		if info, e := d.Info(); e == nil {
+			count++
+			size += info.Size()
+		}
+		return nil
+	})
+	return
+}
+
+// workSaveDir returns the per-message directory for one sending node. The
+// plain message ID is used first; a different node that reuses the same ID gets
+// its own suffixed directory instead of colliding. A node's own repeat is
+// still refused by the no-replace link in saveWorkFile.
+func workSaveDir(root, messageID, owner string) (string, error) {
+	sum := sha256.Sum256([]byte(owner))
+	tag := hex.EncodeToString(sum[:8])
+	for _, name := range []string{messageID, messageID + "-" + tag} {
+		dir := filepath.Join(root, name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+		marker := filepath.Join(dir, ".owner")
+		data, err := os.ReadFile(marker)
+		if errors.Is(err, os.ErrNotExist) {
+			f, e := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if e != nil {
+				return "", errors.New("Work file directory is in use")
+			}
+			_, e = f.WriteString(tag)
+			if c := f.Close(); e == nil {
+				e = c
+			}
+			if e != nil {
+				return "", e
+			}
+			return dir, nil
+		}
+		if err == nil && string(data) == tag {
+			return dir, nil
+		}
+	}
+	return "", errors.New("Work file directory is in use")
+}
+
+// saveWorkFile writes verified bytes to <root>/<message_id>/<name> (or the
+// sender-scoped directory on an ID collision) with mode 0600 and never
+// replaces an existing file.
+func saveWorkFile(owner, messageID, name string, content []byte) (string, error) {
 	root, err := workFileRoot()
 	if err != nil {
 		return "", err
 	}
-	if !validSessionID.MatchString(messageID) || !validWorkFileName(name) {
+	if owner == "" || !validSessionID.MatchString(messageID) || !validWorkFileName(name) {
 		return "", errors.New("invalid Work file identity")
 	}
-	dir := filepath.Join(root, messageID)
-	if err = os.MkdirAll(dir, 0o700); err != nil {
+	if err = os.MkdirAll(root, 0o700); err != nil {
 		return "", err
 	}
 	if err = os.Chmod(root, 0o700); err != nil {
+		return "", err
+	}
+	if count, size := workFileUsage(root); count >= workFileMaxCount || size+int64(len(content)) > workFileMaxBytes {
+		return "", errors.New("Work file storage limit reached")
+	}
+	dir, err := workSaveDir(root, messageID, owner)
+	if err != nil {
 		return "", err
 	}
 	final := filepath.Join(dir, name)
@@ -166,12 +231,14 @@ func saveWorkFile(messageID, name string, content []byte) (string, error) {
 	return final, nil
 }
 
+// The file name is chosen by the peer, so it and the path are quoted and
+// ASCII-escaped: it cannot add lines, brackets or look-alike text to the note.
 func workFileNotice(m workWire, saved string) string {
-	return "\n\n[Relay file] " + m.FileName + ", " + strconv.FormatInt(m.FileSize, 10) + " bytes, SHA-256 " + m.FileSHA256 + ", verified and saved on this host at " + saved
+	return "\n\n[Relay file] " + strconv.QuoteToASCII(m.FileName) + ", " + strconv.FormatInt(m.FileSize, 10) + " bytes, SHA-256 " + m.FileSHA256 + ", verified and saved on this host at " + strconv.QuoteToASCII(saved)
 }
 
 func workDefaultFileText(a *workAttachment) string {
-	return "Sending file " + a.name + " (" + strconv.Itoa(len(a.content)) + " bytes, SHA-256 " + a.sha256 + ")."
+	return "Sending file " + strconv.QuoteToASCII(a.name) + " (" + strconv.Itoa(len(a.content)) + " bytes, SHA-256 " + a.sha256 + ")."
 }
 
 // workOutboxRoot is the only directory a sender may send files from. Callers

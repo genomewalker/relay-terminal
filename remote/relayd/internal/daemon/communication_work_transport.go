@@ -31,12 +31,15 @@ type workWire struct {
 	Target         communicationEndpoint `json:"target"`
 	SourceRevision uint64                `json:"source_revision"`
 	TargetRevision uint64                `json:"target_revision"`
-	Caller         string                `json:"caller"`
-	MessageID      string                `json:"message_id"`
-	Text           string                `json:"text,omitempty"`
-	TextSHA256     string                `json:"text_sha256"`
-	Fingerprint    string                `json:"fingerprint"`
-	PaneSignature  string                `json:"pane_signature,omitempty"`
+	// PinGeneration is set only on a re-pin: the new generation of the Work
+	// endpoint pin. It is covered by the fingerprint.
+	PinGeneration uint64 `json:"pin_generation,omitempty"`
+	Caller        string `json:"caller"`
+	MessageID     string `json:"message_id"`
+	Text          string `json:"text,omitempty"`
+	TextSHA256    string `json:"text_sha256"`
+	Fingerprint   string `json:"fingerprint"`
+	PaneSignature string `json:"pane_signature,omitempty"`
 	// Optional file: name, size and digest are fingerprinted; the base64
 	// content travels only on the wire and is never stored in a receipt.
 	FileName    string `json:"file_name,omitempty"`
@@ -387,7 +390,7 @@ func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (
 	text := m.Text
 	var fileResult map[string]any
 	if fileContent != nil {
-		saved, saveErr := saveWorkFile(m.MessageID, m.FileName, fileContent)
+		saved, saveErr := saveWorkFile(m.Source.NodeID, m.MessageID, m.FileName, fileContent)
 		if saveErr != nil {
 			receipt.Result = map[string]any{"status": "not_sent", "error": "Work file could not be saved; not delivered", "peer_authentication": "mutual_tls_pinned_node"}
 			err = communicationFanoutLocked(root, func() error { return communicationAtomic(path, receipt) })

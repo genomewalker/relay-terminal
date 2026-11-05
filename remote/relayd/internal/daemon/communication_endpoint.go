@@ -77,9 +77,12 @@ type communicationTypedRemoteLink struct {
 	AllowedPeerCallers    []string              `json:"allowed_peer_callers"`
 	PeerRevision          uint64                `json:"peer_revision"`
 	Revision              uint64                `json:"revision"`
-	Retired               bool                  `json:"retired"`
-	CreatedAt             time.Time             `json:"created_at"`
-	UpdatedAt             time.Time             `json:"updated_at"`
+	// PinGeneration counts re-pins of the Work endpoint of this relationship.
+	// It is monotonic on both hosts; zero means the pin was never repaired.
+	PinGeneration uint64    `json:"pin_generation,omitempty"`
+	Retired       bool      `json:"retired"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 func validTypedRemoteLink(link communicationTypedRemoteLink, localNode string) bool {
