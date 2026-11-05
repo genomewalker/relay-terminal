@@ -156,3 +156,64 @@ func TestLinkProposalProofCannotBeAMikoProof(t *testing.T) {
 		t.Fatal("operations must be distinguishable in the proof")
 	}
 }
+
+// The Mac's own relay-mcp (darwin) reaches POST /api/pane-links, where a cross-host
+// link is a pending proposal (HTTP 202), not a saved link.
+func macLinkCall(t *testing.T, status int, reply string, args string) (string, []string, []map[string]string) {
+	t.Helper()
+	var paths []string
+	var bodies []map[string]string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]string
+		_ = json.Unmarshal(raw, &body)
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		bodies = append(bodies, body)
+		w.WriteHeader(status)
+		io.WriteString(w, reply)
+	}))
+	t.Cleanup(ts.Close)
+	s := server{token: "t", client: ts.Client(), endpoint: ts.URL}
+	var out strings.Builder
+	line := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"relay_link_panes","arguments":` + args + `}}` + "\n"
+	if err := s.run(strings.NewReader(line), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out.String(), paths, bodies
+}
+
+func TestMacCrossHostPendingProposalIsSurfacedAsSuccess(t *testing.T) {
+	reply := `{"proposal_id":"` + linkOwnID + `","source_pane_id":"` + fallbackPane + `","target_pane_id":"` + linkTarget + `","status":"pending"}`
+	out, paths, bodies := macLinkCall(t, 202, reply, `{"source_pane_id":"`+fallbackPane+`","pane_id":"`+linkTarget+`"}`)
+	if strings.Contains(out, `\"isError\":true`) || strings.Contains(out, `"isError":true`) {
+		t.Fatalf("a 202 pending proposal must be a success: %s", out)
+	}
+	if len(paths) != 1 || paths[0] != "POST /api/pane-links" || bodies[0]["sourcePaneID"] != fallbackPane {
+		t.Fatalf("%v %v", paths, bodies)
+	}
+	for _, want := range []string{"pending", linkOwnID, "proposal_id=" + linkOwnID, "Allow or Deny"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in %s", want, out)
+		}
+	}
+}
+
+func TestMacProposalIdAloneReadsStatusAndNeverLinks(t *testing.T) {
+	out, paths, bodies := macLinkCall(t, 200, `{"proposal_id":"`+linkOwnID+`","status":"approved"}`, `{"proposal_id":"`+linkOwnID+`"}`)
+	if !strings.Contains(out, "approved") || strings.Contains(out, `"isError":true`) {
+		t.Fatal(out)
+	}
+	if len(paths) != 1 || len(bodies[0]) != 1 || bodies[0]["proposalID"] != linkOwnID {
+		t.Fatalf("status read must send only proposalID: %v", bodies)
+	}
+}
+
+func TestMacLinkStillRefusesOtherHTTPStatuses(t *testing.T) {
+	out, _, _ := macLinkCall(t, 201, `{"status":"pending"}`, `{"source_pane_id":"`+fallbackPane+`","pane_id":"`+linkTarget+`"}`)
+	if !strings.Contains(out, "HTTP 201") {
+		t.Fatalf("only 200 and the pane-links 202 are success: %s", out)
+	}
+	if strings.Contains(out, "next") {
+		t.Fatal("no hint on an error")
+	}
+}

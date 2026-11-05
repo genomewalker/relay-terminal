@@ -74,7 +74,7 @@ private final class Fixture {
     }
 
     /// Every proposal id sent through `propose`, so `drain` can await its resolution task.
-    private(set) var proposed: [UUID] = []
+    var proposed: [UUID] = []
 
     func propose(_ id: UUID = UUID(), source: UUID? = nil, target: UUID? = nil, caller: String = "caller-a") async -> (status: Int, value: [String: Any]) {
         proposed.append(id)
@@ -316,6 +316,61 @@ private final class Fixture {
         for needle in ["claude-A", "codex-B", "dandy-07", "This Mac", "send messages to each other", "Deny is the default"] {
             #expect(text.contains(needle), "\(needle)")
         }
+        await f.drain()
+    }
+
+    // MARK: Mac-route proposals (POST /api/pane-links across hosts)
+
+    @Test func macRouteCrossHostRequestIsPendingAndSavesNothing() async {
+        let f = Fixture(); f.confirmer.hold = true
+        let id = UUID()
+        let a = f.panes[f.sourceID]!, b = f.panes[f.targetID]!
+        #expect(RelayPaneLinkProposals.crossesHosts(a, b))
+        let r = f.proposals.proposeLocal(proposalID: id, sourceID: f.sourceID, targetID: f.targetID, caller: "caller-a")
+        #expect(r.status == 202 && r.value["status"] as? String == "pending" && r.value["proposal_id"] as? String == id.uuidString.lowercased())
+        for _ in 0..<20 { await Task.yield() }
+        #expect(f.connected.isEmpty && f.redeemed.isEmpty && f.confirmer.prompts.count == 1)
+        f.proposed.append(id)
+        await f.drain()
+    }
+
+    @Test func macRouteAllowSavesExactlyOneLinkAndDenySavesNone() async {
+        let allowed = Fixture(); allowed.confirmer.decision = .allow
+        let id = UUID(); allowed.proposed.append(id)
+        _ = allowed.proposals.proposeLocal(proposalID: id, sourceID: allowed.sourceID, targetID: allowed.targetID, caller: "caller-a")
+        await allowed.proposals.resolution(of: id)
+        #expect(allowed.proposals.statusLocal(proposalID: id, caller: "caller-a").value["status"] as? String == "approved")
+        // An identical retry returns the same proposal and does not link again.
+        _ = allowed.proposals.proposeLocal(proposalID: id, sourceID: allowed.sourceID, targetID: allowed.targetID, caller: "caller-a")
+        #expect(allowed.connected == [[allowed.sourceID, allowed.targetID]] && allowed.confirmer.prompts.count == 1)
+        await allowed.drain()
+
+        let denied = Fixture(); denied.confirmer.decision = .deny
+        let did = UUID(); denied.proposed.append(did)
+        _ = denied.proposals.proposeLocal(proposalID: did, sourceID: denied.sourceID, targetID: denied.targetID, caller: "caller-a")
+        await denied.proposals.resolution(of: did)
+        #expect(denied.proposals.statusLocal(proposalID: did, caller: "caller-a").value["status"] as? String == "denied" && denied.connected.isEmpty)
+        await denied.drain()
+    }
+
+    @Test func macRouteExpiryNeverLinksAndStatusIsProposerOnly() async {
+        let f = Fixture(); f.confirmer.hold = true
+        let id = UUID(); f.proposed.append(id)
+        _ = f.proposals.proposeLocal(proposalID: id, sourceID: f.sourceID, targetID: f.targetID, caller: "caller-a")
+        #expect(f.proposals.statusLocal(proposalID: id, caller: "caller-b").status == 404)
+        f.clock = f.clock.addingTimeInterval(RelayPaneLinkProposals.expiry + 1)
+        #expect(f.proposals.statusLocal(proposalID: id, caller: "caller-a").value["status"] as? String == "expired")
+        await f.drain()
+        #expect(f.connected.isEmpty)
+    }
+
+    @Test func macRouteSameHostPairIsNotAProposalCandidateAndPausedCallerIsRefused() async {
+        let f = Fixture()
+        let t = f.panes[f.targetID]!, o = f.panes[f.otherID]!
+        #expect(!RelayPaneLinkProposals.crossesHosts(t, o))   // same host: the handler links directly
+        f.policy = false
+        let r = f.proposals.proposeLocal(proposalID: UUID(), sourceID: f.sourceID, targetID: f.targetID, caller: "caller-a")
+        #expect(r.status == 403 && f.connected.isEmpty && f.confirmer.prompts.isEmpty)
         await f.drain()
     }
 }

@@ -68,6 +68,11 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 		if proposalID != "" && !hasSource && !hasTarget && desktopFallback && linkProposalRemote() {
 			return s.linkProposalStatus(proposalID), true
 		}
+		if proposalID != "" && !linkProposalRemote() {
+			// Not a remote client: only the Mac's own route serves proposals, by id.
+			arguments["proposal_id"], _ = json.Marshal(proposalID)
+			return nil, false
+		}
 	}
 	if desktopFallback && operation == "list" {
 		return nil, false

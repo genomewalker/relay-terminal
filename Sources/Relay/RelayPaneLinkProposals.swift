@@ -51,7 +51,7 @@ struct RelayPaneLinkPrompt: Equatable {
     let target: RelayPaneLinkPane
     let timeout: TimeInterval
 
-    var title: String { "Allow a remote agent to link two panes?" }
+    var title: String { "Allow an agent to link two panes across hosts?" }
 
     /// Names both panes and both hosts, and what the link allows.
     var text: String {
@@ -254,14 +254,55 @@ final class RelayPaneLinkProposals {
         }
         // The pane may have closed or been replaced during the round trip.
         guard lookup(sourceID) == source else { throw Refusal(status: 403, message: "The source pane changed during verification.") }
-        expireStale()
-        if op == "status" {
-            guard let entry = entries[proposalID], entry.source.id == sourceID, entry.caller == caller else {
-                throw Refusal(status: 404, message: "No pane-link proposal from this pane has that id.")
-            }
-            return Self.reply(entry)
-        }
+        if op == "status" { return try statusReply(proposalID: proposalID, sourceID: sourceID, caller: caller) }
         guard let targetID else { throw Refusal(status: 400, message: "A proposal needs a target pane.") }
+        return try admit(proposalID: proposalID, source: source, targetID: targetID, caller: caller)
+    }
+
+    private func statusReply(proposalID: UUID, sourceID: UUID, caller: String) throws -> [String: Any] {
+        expireStale()
+        guard let entry = entries[proposalID], entry.source.id == sourceID, entry.caller == caller else {
+            throw Refusal(status: 404, message: "No pane-link proposal from this pane has that id.")
+        }
+        return Self.reply(entry)
+    }
+
+    /// Whether linking these two panes crosses hosts, the same condition under which
+    /// RelayPaneMessaging.connect leaves the same-daemon path for the legacy cross-host one.
+    static func crossesHosts(_ a: RelayPaneLinkPane, _ b: RelayPaneLinkPane) -> Bool {
+        a.profile.connectionKey != b.profile.connectionKey
+    }
+
+    /// A cross-host link requested through the Mac's own pane-link route. The caller token
+    /// is the proposer's identity; there is no relayd attestation. Same table, rate limit,
+    /// confirmation and commit guard as a remote proposal. Nothing is saved here.
+    func proposeLocal(proposalID: UUID, sourceID: UUID, targetID: UUID, caller: String) -> (status: Int, value: [String: Any]) {
+        do {
+            guard sourceID != targetID else { throw Refusal(status: 400, message: "A proposal needs two distinct panes.") }
+            guard policyPermits(caller) else { throw Refusal(status: 403, message: "This Relay caller is paused.") }
+            guard let source = lookup(sourceID), source.isAgentTerminal else {
+                throw Refusal(status: 403, message: "The source pane is not an open agent terminal in this Relay window.")
+            }
+            return (202, try admit(proposalID: proposalID, source: source, targetID: targetID, caller: caller))
+        } catch let refusal as Refusal { return (refusal.status, ["error": refusal.message]) }
+        catch { return (403, ["error": "The pane-link proposal could not be created."]) }
+    }
+
+    /// The proposer reads its own proposal's status; nobody else's.
+    func statusLocal(proposalID: UUID, caller: String) -> (status: Int, value: [String: Any]) {
+        do {
+            expireStale()
+            guard let entry = entries[proposalID], entry.caller == caller else {
+                throw Refusal(status: 404, message: "No pane-link proposal from this caller has that id.")
+            }
+            return (200, Self.reply(entry))
+        } catch let refusal as Refusal { return (refusal.status, ["error": refusal.message]) }
+        catch { return (403, ["error": "The pane-link proposal could not be read."]) }
+    }
+
+    private func admit(proposalID: UUID, source: RelayPaneLinkPane, targetID: UUID, caller: String) throws -> [String: Any] {
+        let sourceID = source.id
+        expireStale()
         if let existing = entries[proposalID] {
             guard existing.source.id == sourceID, existing.caller == caller else {
                 throw Refusal(status: 403, message: "That proposal id belongs to another caller.")

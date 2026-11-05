@@ -112,3 +112,22 @@ func takeProposalID(arguments map[string]json.RawMessage) (string, bool) {
 	}
 	return id, true
 }
+
+// annotatePendingLink adds the follow-up hint to a pending proposal that the Mac
+// desktop returned (HTTP 202) for a cross-host link requested through its own route.
+func annotatePendingLink(content string) string {
+	var reply map[string]any
+	if json.Unmarshal([]byte(content), &reply) != nil || reply == nil {
+		return content
+	}
+	id, _ := reply["proposal_id"].(string)
+	if status, _ := reply["status"].(string); id == "" || status != "pending" {
+		return content
+	}
+	reply["next"] = "Waiting for the user to Allow or Deny on the Mac. Read the outcome with relay_link_panes proposal_id=" + id + "; the proposal expires to denied."
+	out, err := json.Marshal(reply)
+	if err != nil {
+		return content
+	}
+	return string(out)
+}

@@ -1125,6 +1125,18 @@ final class RelaySidePanelServer: ObservableObject {
         return response
     }
 
+    static func paneLinkProposalResponse(status: Int, value: [String: Any]) -> RelaySidePanelHTTPResponse {
+        guard let response = try? RelaySidePanelHTTPResponse.jsonObject(value) else {
+            return .text("Pane-link proposal reply could not be encoded", status: 500, reason: "Internal Server Error")
+        }
+        switch status {
+        case 200: return response
+        case 202: return RelaySidePanelHTTPResponse(status: 202, reason: "Accepted", contentType: response.contentType, body: response.body)
+        default: return RelaySidePanelHTTPResponse(status: status, reason: status == 403 ? "Forbidden" : "Conflict",
+                                                   contentType: response.contentType, body: response.body)
+        }
+    }
+
     /// `caller` is the audited identity of a mutating request.
     private func dispatch(_ request: RelaySidePanelHTTPRequest, caller: String? = nil) async -> RelaySidePanelHTTPResponse {
         if request.path == RelayPaneLinkProposals.path {
@@ -1860,7 +1872,24 @@ final class RelaySidePanelServer: ObservableObject {
         if request.method == "POST", request.path == "/api/pane-links" {
             guard mcpWorkspaceGrant.permits(.layout) else { return .text("Pane links require existing layout permission", status: 403, reason: "Forbidden") }
             do {
-                let input = try JSONDecoder().decode(PaneLinkRequest.self, from: request.body)
+                // Cross-host links are never saved here. `proposalID` alone reads a proposal's
+                // status; beside a pane pair it makes a retry idempotent.
+                var linkBody = request.body
+                var proposalID: UUID?
+                if var object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any],
+                   let raw = object.removeValue(forKey: "proposalID") {
+                    guard let text = raw as? String, let id = UUID(uuidString: text), text == id.uuidString.lowercased() else {
+                        return .text("proposalID must be a lowercase UUID", status: 400, reason: "Bad Request")
+                    }
+                    proposalID = id
+                    if object.isEmpty {
+                        guard let caller else { return .text("Unknown caller", status: 403, reason: "Forbidden") }
+                        let (status, value) = paneLinkProposals.statusLocal(proposalID: id, caller: caller)
+                        return Self.paneLinkProposalResponse(status: status, value: value)
+                    }
+                    linkBody = (try? JSONSerialization.data(withJSONObject: object)) ?? request.body
+                }
+                let input = try JSONDecoder().decode(PaneLinkRequest.self, from: linkBody)
                 let ids: [UUID]
                 if let source = input.sourcePaneID, let target = input.paneID {
                     ids = [source, target]
@@ -1872,6 +1901,14 @@ final class RelaySidePanelServer: ObservableObject {
                         return .text("Choose two exact pane IDs; the current tab does not identify a unique pair", status: 409, reason: "Conflict")
                     }
                     ids = terminals
+                }
+                if ids.count == 2, let first = RelayPaneLinkPane(workspace.panes[ids[0]]),
+                   let second = RelayPaneLinkPane(workspace.panes[ids[1]]),
+                   RelayPaneLinkProposals.crossesHosts(first, second) {
+                    guard let caller else { return .text("Unknown caller", status: 403, reason: "Forbidden") }
+                    let (status, value) = paneLinkProposals.proposeLocal(
+                        proposalID: proposalID ?? UUID(), sourceID: ids[0], targetID: ids[1], caller: caller)
+                    return Self.paneLinkProposalResponse(status: status, value: value)
                 }
                 return .json(try await paneMessaging.connect(panes: ids, workspace: workspace))
             } catch { return .text(error.localizedDescription, status: 409, reason: "Conflict") }

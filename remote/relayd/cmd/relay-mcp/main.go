@@ -119,7 +119,7 @@ func (s *server) exchange(method, path string, body []byte) (string, error) {
 		return "", fmt.Errorf("Relay request failed; submission outcome may be unknown. Never retry input automatically; inspect its receipt")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != 200 && !(resp.StatusCode == 202 && method == "POST" && path == "/api/pane-links") {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		detail := strings.TrimSpace(strings.ReplaceAll(string(data), s.token, "[redacted]"))
 		if s.callerToken != "" {
@@ -266,7 +266,7 @@ func (s *server) handle(r request) (any, int, string) {
 			// Legacy per-action approval calls remain routable for already connected clients,
 			// but are not advertised to new MCP sessions.
 			tool("relay_control_info", "Get the running Relay instance identity and approval policy.", map[string]any{}, []string{}),
-			tool("relay_link_panes", "For a natural-language request to connect or link agents, set up the pair directly without asking the user to operate the linking UI. With desktop Relay, omit IDs to link the current tab when it contains exactly two terminals; ambiguous tabs require exact IDs from relay_list_panes. With a provider-local daemon client, supply the recipient pane_id; the sender is inferred from its own pane. Save an explicitly authorized messaging pair between two existing live Claude/Codex terminal panes, across any configured local or remote hosts. Resolves exact provider ancestry and pins process and session identities. Requires layout permission. Does not send an introduction, assign work, restart providers or change permissions. Use relay_list_pane_links to discover pairs and relay_message_pane to deliver through the recipient provider’s native socket, independently of its terminal prompt.", map[string]any{"source_pane_id": map[string]string{"type": "string"}, "pane_id": map[string]string{"type": "string"}, "proposal_id": map[string]string{"type": "string", "description": "Remote hosts only. A cross-host link is a proposal the user must Allow on the Mac; the call returns a pending proposal_id. Call again with only proposal_id to read pending, approved, denied or expired. Reuse the same proposal_id to retry; never start a second proposal for the same pair."}}, []string{}),
+			tool("relay_link_panes", "For a natural-language request to connect or link agents, set up the pair directly without asking the user to operate the linking UI. With desktop Relay, omit IDs to link the current tab when it contains exactly two terminals; ambiguous tabs require exact IDs from relay_list_panes. With a provider-local daemon client, supply the recipient pane_id; the sender is inferred from its own pane. Save an explicitly authorized messaging pair between two existing live Claude/Codex terminal panes, across any configured local or remote hosts. Resolves exact provider ancestry and pins process and session identities. Requires layout permission. A link between panes on different hosts is never saved directly: the call returns a pending proposal_id and the link is saved only if the user clicks Allow on the Mac (Deny or expiry saves nothing); read the outcome with proposal_id. Same-host links save immediately. Does not send an introduction, assign work, restart providers or change permissions. Use relay_list_pane_links to discover pairs and relay_message_pane to deliver through the recipient provider’s native socket, independently of its terminal prompt.", map[string]any{"source_pane_id": map[string]string{"type": "string"}, "pane_id": map[string]string{"type": "string"}, "proposal_id": map[string]string{"type": "string", "description": "A cross-host link is a proposal the user must Allow on the Mac; the call returns a pending proposal_id. Call again with only proposal_id to read pending, approved, denied or expired. Reuse the same proposal_id to retry; never start a second proposal for the same pair."}}, []string{}),
 			tool("relay_bind_question_thread", "Bind this calling pane to one chitta question thread so the daemon posts to it when a job finishes or fails, the question closes, or a correction is noted. Requires the caller's registered credential. The daemon holds the chitta lease, renews it, and records the binding across restarts. Refuses while another live owner holds the thread; there is no override. Notices are recorded by relayd and delivered by the Relay app while it is running, only into a pane with no draft; they are relayd system messages, not sender identity.", map[string]any{"pane_id": map[string]string{"type": "string"}, "source_pane_id": map[string]string{"type": "string"}, "thread_id": map[string]any{"type": "string", "maxLength": 128}, "realm": map[string]any{"type": "string", "maxLength": 128}, "ttl": map[string]any{"type": "string", "description": "Lease seconds, 30 to 86400. Default 900."}}, []string{"pane_id", "source_pane_id", "thread_id", "realm"}),
 			tool("relay_unbind_question_thread", "Release this calling pane's chitta question-thread lease and remove its classifier opt-in. Idempotent. Retains any notices already recorded.", map[string]any{"pane_id": map[string]string{"type": "string"}, "source_pane_id": map[string]string{"type": "string"}}, []string{"pane_id", "source_pane_id"}),
 			tool("relay_unlink_panes", "Retire one exact saved pane link by its ID from relay_list_pane_links. Requires existing layout permission. Retains link history and all message receipts; leaves other links between the same panes intact. Refuses while a message between the panes is in flight. A not_found result does not prove prior removal; inspect current links after uncertain outcomes and never replay automatically.", map[string]any{"link_id": map[string]string{"type": "string"}}, []string{"link_id"}),
@@ -800,9 +800,16 @@ func (s *server) handle(r request) (any, int, string) {
 			path, method = "/api/workspace/new-stacked-pane", "POST"
 			body, _ = json.Marshal(map[string]string{"instance": instance, "requestID": id, "targetPaneID": target, "host": host})
 		case "relay_link_panes":
-			var target, source string
+			var target, source, proposal string
 			for key, raw := range p.Arguments {
 				var id string
+				if key == "proposal_id" {
+					if json.Unmarshal(raw, &id) != nil || !strictProposalID.MatchString(id) {
+						return nil, -32602, "proposal_id must be a lowercase UUID"
+					}
+					proposal = id
+					continue
+				}
 				if (key != "pane_id" && key != "source_pane_id") || json.Unmarshal(raw, &id) != nil || !paneID.MatchString(id) {
 					return nil, -32602, "Use exact pane IDs or omit them for the current tab's unique pair"
 				}
@@ -822,6 +829,9 @@ func (s *server) handle(r request) (any, int, string) {
 			}
 			if target != "" {
 				pair["paneID"] = target
+			}
+			if proposal != "" {
+				pair["proposalID"] = proposal
 			}
 			body, _ = json.Marshal(pair)
 		case "relay_list_pane_links":
@@ -1245,6 +1255,8 @@ func (s *server) handle(r request) (any, int, string) {
 		}
 		if err != nil {
 			content = err.Error()
+		} else if p.Name == "relay_link_panes" {
+			content = annotatePendingLink(content)
 		}
 		return map[string]any{"content": []any{map[string]string{"type": "text", "text": content}}, "isError": err != nil}, 0, ""
 	default:
