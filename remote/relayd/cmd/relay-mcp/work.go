@@ -34,6 +34,7 @@ func workTools() []any {
 		{"relay_work_link_status", "Inspect the exact saved pane/Work relationship and its connected, stale, recoverable or blocked state. Does not change a conversation.", true, map[string]any{"link_id": map[string]any{"type": "string"}}, []string{"link_id"}},
 		{"relay_repair_work_link", "Repair only the same exact saved conversations using fresh native evidence and the expected link revision. Refuse replacements. Reconcile the original request receipt after uncertainty.", false, map[string]any{"link_id": map[string]any{"type": "string"}, "expected_revision": map[string]any{"type": "integer", "minimum": 1}, "request_id": map[string]any{"type": "string"}}, []string{"link_id", "expected_revision", "request_id"}},
 		{"relay_work_message", "Send through the user's exact saved pane/Work link. Native provider metadata or kernel pane ownership establishes the sender; never supply a source identity. Keep message_id after uncertainty; never replay blindly.", false, map[string]any{"link_id": map[string]any{"type": "string"}, "message_id": map[string]any{"type": "string"}, "text": map[string]any{"type": "string", "minLength": 1, "maxLength": 16384}}, []string{"link_id", "message_id", "text"}},
+		{"relay_work_send_file", "Send one small regular file (1-65536 bytes) from this host through the user's exact saved pane/Work link. Give the absolute path and its SHA-256; the sender refuses a mismatch, and the receiving host saves the file only after recomputing the SHA-256, then delivers a note with the saved path. Keep message_id after uncertainty; read relay_work_receipt instead of resending.", false, map[string]any{"link_id": map[string]any{"type": "string"}, "message_id": map[string]any{"type": "string"}, "path": map[string]any{"type": "string", "minLength": 1, "maxLength": 4096}, "sha256": map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$"}, "text": map[string]any{"type": "string", "minLength": 1, "maxLength": 16384}}, []string{"link_id", "message_id", "path", "sha256"}},
 		{"relay_work_receipt", "Read the original durable pane/Work message receipt. An admitted request is not proof of processing or reading.", true, map[string]any{"link_id": map[string]any{"type": "string"}, "message_id": map[string]any{"type": "string"}}, []string{"link_id", "message_id"}},
 	}
 	result := make([]any, 0, len(defs))
@@ -43,7 +44,7 @@ func workTools() []any {
 	return result
 }
 func workPacket(name string, args map[string]json.RawMessage) (map[string]any, error) {
-	operation := map[string]string{"relay_work_message": "send", "relay_work_receipt": "receipt", "relay_work_link_status": "status", "relay_repair_work_link": "repair"}[name]
+	operation := map[string]string{"relay_work_message": "send", "relay_work_send_file": "send_file", "relay_work_receipt": "receipt", "relay_work_link_status": "status", "relay_repair_work_link": "repair"}[name]
 	if operation == "" {
 		return nil, errors.New("unknown Work tool")
 	}
@@ -52,13 +53,30 @@ func workPacket(name string, args map[string]json.RawMessage) (map[string]any, e
 	case "send":
 		allowed["message_id"] = true
 		allowed["text"] = true
+	case "send_file":
+		allowed["message_id"] = true
+		allowed["path"] = true
+		allowed["sha256"] = true
+		allowed["text"] = true
 	case "receipt":
 		allowed["message_id"] = true
 	case "repair":
 		allowed["expected_revision"] = true
 		allowed["request_id"] = true
 	}
-	if len(args) != len(allowed) {
+	required := len(allowed)
+	if operation == "send_file" {
+		for _, k := range []string{"link_id", "message_id", "path", "sha256"} {
+			if _, ok := args[k]; !ok {
+				return nil, errors.New("invalid Work tool arguments")
+			}
+		}
+		required = 4
+		if _, ok := args["text"]; ok {
+			required = 5
+		}
+	}
+	if len(args) != required {
 		return nil, errors.New("invalid Work tool arguments")
 	}
 	p := map[string]any{"operation": operation}
@@ -87,6 +105,15 @@ func workPacket(name string, args map[string]json.RawMessage) (map[string]any, e
 			if !workUUID.MatchString(v) {
 				return nil, errors.New("invalid request identity")
 			}
+		case "path":
+			if len(v) == 0 || len(v) > 4096 || !utf8.ValidString(v) || !strings.HasPrefix(v, "/") {
+				return nil, errors.New("path must be absolute")
+			}
+		case "sha256":
+			if !workLinkID.MatchString(v) {
+				return nil, errors.New("sha256 must be 64 lowercase hex characters")
+			}
+			k = "file_sha256"
 		case "text":
 			if len(v) == 0 || len(v) > 16384 || !utf8.ValidString(v) || strings.TrimSpace(v) == "" {
 				return nil, errors.New("invalid message text")

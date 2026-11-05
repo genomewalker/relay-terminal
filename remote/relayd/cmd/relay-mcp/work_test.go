@@ -45,7 +45,7 @@ func TestWorkCatalogAndOneShotDoNotRequireLiveState(t *testing.T) {
 			Tools []json.RawMessage `json:"tools"`
 		} `json:"result"`
 	}
-	if json.Unmarshal([]byte(out.String()), &response) != nil || len(response.Result.Tools) != 4 {
+	if json.Unmarshal([]byte(out.String()), &response) != nil || len(response.Result.Tools) != 5 {
 		t.Fatal(out.String())
 	}
 }
@@ -94,5 +94,32 @@ func TestWorkThreadComesOnlyFromVerifiedProviderMetadata(t *testing.T) {
 	call(`{"name":"relay_work_link_status","arguments":{"link_id":"` + link + `"},"_meta":{"threadId":"` + thread + `"}}`)
 	if calls != before {
 		t.Fatal("changed transport reached daemon")
+	}
+}
+
+func TestWorkSendFileArguments(t *testing.T) {
+	link := strings.Repeat("a", 64)
+	id := "01a18b32-f284-7220-91a2-6a81cde6db14"
+	sum := strings.Repeat("b", 64)
+	base := `"link_id":"` + link + `","message_id":"` + id + `","path":"/tmp/draft.txt","sha256":"` + sum + `"`
+	p, err := workPacket("relay_work_send_file", workArgs(t, `{`+base+`}`))
+	if err != nil || p["operation"] != "send_file" || p["file_sha256"] != sum || p["path"] != "/tmp/draft.txt" || p["sha256"] != nil {
+		t.Fatal(p, err)
+	}
+	if p, err = workPacket("relay_work_send_file", workArgs(t, `{`+base+`,"text":"note"}`)); err != nil || p["text"] != "note" {
+		t.Fatal(p, err)
+	}
+	for _, bad := range []string{
+		`{"link_id":"` + link + `","message_id":"` + id + `","path":"/tmp/x","text":"no digest"}`,
+		`{"link_id":"` + link + `","message_id":"` + id + `","path":"relative","sha256":"` + sum + `"}`,
+		`{"link_id":"` + link + `","message_id":"` + id + `","path":"/tmp/x","sha256":"ABC"}`,
+		`{` + base + `,"source":"x"}`,
+	} {
+		if _, err := workPacket("relay_work_send_file", workArgs(t, bad)); err == nil {
+			t.Fatal("accepted", bad)
+		}
+	}
+	if _, err := workPacket("relay_work_message", workArgs(t, `{"link_id":"`+link+`","message_id":"`+id+`","text":"x","path":"/tmp/x"}`)); err == nil {
+		t.Fatal("path on plain message accepted")
 	}
 }

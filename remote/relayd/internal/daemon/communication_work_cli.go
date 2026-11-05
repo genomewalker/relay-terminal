@@ -25,6 +25,11 @@ type WorkRequest struct {
 	RequestID         string `json:"request_id,omitempty"`
 	ProtectedThreadID string `json:"protected_thread_id,omitempty"`
 	ClientToken       string `json:"client_token,omitempty"`
+	// send_file only: the sender's own absolute file path and its declared digest.
+	Path       string `json:"path,omitempty"`
+	FileSHA256 string `json:"file_sha256,omitempty"`
+
+	file *workAttachment
 }
 
 type workRequestOrigin struct {
@@ -100,6 +105,18 @@ func executeWorkRequest(ctx context.Context, root, node string, r WorkRequest, o
 	}
 	if err := origin.revalidate(); err != nil {
 		return nil, err
+	}
+	if r.Operation == "send_file" {
+		a, err := readWorkAttachment(r.Path, r.FileSHA256)
+		if err != nil {
+			return nil, err
+		}
+		if r.Text == "" {
+			r.Text = workDefaultFileText(a)
+		}
+		r.file, r.Operation, r.Path = a, "send", ""
+	} else if r.Path != "" || r.FileSHA256 != "" {
+		return nil, errors.New("file fields require send_file")
 	}
 	var link communicationTypedRemoteLink
 	var caller string

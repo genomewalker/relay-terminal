@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,12 @@ type workWire struct {
 	TextSHA256     string                `json:"text_sha256"`
 	Fingerprint    string                `json:"fingerprint"`
 	PaneSignature  string                `json:"pane_signature,omitempty"`
+	// Optional file: name, size and digest are fingerprinted; the base64
+	// content travels only on the wire and is never stored in a receipt.
+	FileName    string `json:"file_name,omitempty"`
+	FileSize    int64  `json:"file_size,omitempty"`
+	FileSHA256  string `json:"file_sha256,omitempty"`
+	FileContent string `json:"file_content,omitempty"`
 }
 
 type workTransportReceipt struct {
@@ -50,11 +57,12 @@ type workTransportReceipt struct {
 }
 
 func workFingerprint(m workWire) string {
-	if m.Version != 3 || !m.Source.valid() || !m.Target.valid() || m.Source.Kind == m.Target.Kind || m.Source.NodeID == m.Target.NodeID || !remoteDigest(m.LinkID) || m.LinkID != communicationEndpointPairID(m.Source, m.Target) || m.SourceRevision == 0 || m.TargetRevision == 0 || !canonicalRouteToken(m.Caller) || !validSessionID.MatchString(m.MessageID) || !remoteDigest(m.TextSHA256) {
+	if m.Version != 3 || !m.Source.valid() || !m.Target.valid() || m.Source.Kind == m.Target.Kind || m.Source.NodeID == m.Target.NodeID || !remoteDigest(m.LinkID) || m.LinkID != communicationEndpointPairID(m.Source, m.Target) || m.SourceRevision == 0 || m.TargetRevision == 0 || !canonicalRouteToken(m.Caller) || !validSessionID.MatchString(m.MessageID) || !remoteDigest(m.TextSHA256) || !workWireFileValid(m) {
 		return ""
 	}
 	m.Operation = ""
 	m.Text = ""
+	m.FileContent = ""
 	m.Fingerprint = ""
 	m.PaneSignature = ""
 	b, e := json.Marshal(m)
@@ -71,7 +79,7 @@ func workInboundPath(root, node, id string) string {
 	return filepath.Join(root, "work-inbound-"+node+"-"+id+".json")
 }
 func validWorkTransportReceipt(r workTransportReceipt) bool {
-	return r.Version == 3 && r.Node != "" && r.Wire.Text == "" && r.Wire.Fingerprint != "" && r.Wire.Fingerprint == workFingerprint(r.Wire) && r.RouteRevision > 0 && remoteDigest(r.PeerCertificateSHA256) && !r.Created.IsZero() && r.Result != nil
+	return r.Version == 3 && r.Node != "" && r.Wire.Text == "" && r.Wire.FileContent == "" && r.Wire.Fingerprint != "" && r.Wire.Fingerprint == workFingerprint(r.Wire) && r.RouteRevision > 0 && remoteDigest(r.PeerCertificateSHA256) && !r.Created.IsZero() && r.Result != nil
 }
 func workReceiptResult(r workTransportReceipt) map[string]any {
 	result := map[string]any{}
@@ -127,6 +135,9 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 			if r.Operation == "send" && communicationTextDigest(r.Text) != receipt.Wire.TextSHA256 {
 				return errors.New("message identity conflicts with prior text")
 			}
+			if r.Operation == "send" && (r.file == nil) != (receipt.Wire.FileSHA256 == "") || r.file != nil && r.file.sha256 != receipt.Wire.FileSHA256 {
+				return errors.New("message identity conflicts with prior file")
+			}
 			existing = true
 			return nil
 		} else if !errors.Is(e, os.ErrNotExist) {
@@ -155,7 +166,21 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 			return nil, e
 		}
 		m := workWire{Version: 3, Operation: "send", LinkID: link.ID, Source: link.Local, Target: link.Peer, SourceRevision: link.Revision, TargetRevision: link.PeerRevision, Caller: caller, MessageID: r.MessageID, TextSHA256: communicationTextDigest(r.Text)}
+		if r.file != nil {
+			m.FileName, m.FileSize, m.FileSHA256 = r.file.name, int64(len(r.file.content)), r.file.sha256
+		}
 		m.Fingerprint = workFingerprint(m)
+		// Refuse before claiming an outbound receipt if the complete encoded
+		// request cannot fit the peer transport; a claimed ID would be burned.
+		if r.file != nil {
+			sized := m
+			sized.Text = r.Text
+			sized.FileContent = base64.StdEncoding.EncodeToString(r.file.content)
+			sized.PaneSignature = strings.Repeat("x", 4096)
+			if body, e := json.Marshal(sized); e != nil || len(body) > 128<<10 {
+				return nil, errors.New("file and note exceed the 128 KiB Work transfer limit; shorten the note or send a smaller file; no request submitted")
+			}
+		}
 		if link.Local.Kind == "pane" {
 			m.PaneSignature, e = workSignPane(root, node, caller, r, origin, link)
 			if e != nil {
@@ -198,6 +223,9 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 	wire := receipt.Wire
 	if r.Operation == "send" {
 		wire.Text = r.Text
+		if r.file != nil {
+			wire.FileContent = base64.StdEncoding.EncodeToString(r.file.content)
+		}
 	} else {
 		wire.Operation = "receipt"
 	}
@@ -291,6 +319,14 @@ func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (
 	if len(m.Text) == 0 || len(m.Text) > 16384 || !utf8.ValidString(m.Text) || strings.TrimSpace(m.Text) == "" || communicationTextDigest(m.Text) != m.TextSHA256 {
 		return nil, errors.New("invalid Work text")
 	}
+	var fileContent []byte
+	if m.FileSHA256 != "" {
+		if fileContent, err = decodeWorkWireFile(m); err != nil {
+			return nil, err
+		}
+	} else if m.FileContent != "" {
+		return nil, errors.New("invalid Work file")
+	}
 	if m.Source.Kind == "pane" {
 		typed := communicationTypedWorkMessage{Version: 2, LinkID: m.LinkID, Source: m.Source, Target: m.Target, SourceLinkRevision: m.SourceRevision, TargetLinkRevision: m.TargetRevision, CallerID: m.Caller, MessageID: m.MessageID, Text: m.Text, SourceSignature: m.PaneSignature}
 		typed.Fingerprint = communicationTypedWorkFingerprint(typed)
@@ -323,6 +359,7 @@ func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (
 		}
 		saved := m
 		saved.Text = ""
+		saved.FileContent = ""
 		receipt = workTransportReceipt{Version: 3, Node: node, RouteID: link.RouteID, RouteRevision: link.RouteRevision, PeerCertificateSHA256: peerCert, Wire: saved, Created: time.Now().UTC(), Result: map[string]any{"status": "outcome_unknown"}}
 		if e := communicationAtomic(path, receipt); e != nil {
 			return e
@@ -344,18 +381,33 @@ func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (
 	}
 	var result map[string]any
 	var deliverErr error
+	text := m.Text
+	var fileResult map[string]any
+	if fileContent != nil {
+		saved, saveErr := saveWorkFile(m.MessageID, m.FileName, fileContent)
+		if saveErr != nil {
+			receipt.Result = map[string]any{"status": "not_sent", "error": "Work file could not be saved; not delivered", "peer_authentication": "mutual_tls_pinned_node"}
+			err = communicationFanoutLocked(root, func() error { return communicationAtomic(path, receipt) })
+			return workReceiptResult(receipt), err
+		}
+		text += workFileNotice(m, saved)
+		fileResult = map[string]any{"name": m.FileName, "size": m.FileSize, "sha256": m.FileSHA256, "saved_path": saved, "verified": true}
+	}
 	if target.Kind == "work" {
-		result, deliverErr = workRunNativeTarget(ctx, nativemsg.Host{}, nativemsg.Target{Kind: "work", Work: target.Work}, nil, &nativemsg.WorkMessage{Envelope: desktoproute.Envelope{ID: m.MessageID, Sender: "Relay pane " + m.Source.NodeID + "/" + m.Source.PaneID + " (session " + m.Source.SessionID + ")", Content: m.Text}, Authorize: guard})
+		result, deliverErr = workRunNativeTarget(ctx, nativemsg.Host{}, nativemsg.Target{Kind: "work", Work: target.Work}, nil, &nativemsg.WorkMessage{Envelope: desktoproute.Envelope{ID: m.MessageID, Sender: "Relay pane " + m.Source.NodeID + "/" + m.Source.PaneID + " (session " + m.Source.SessionID + ")", Content: text}, Authorize: guard})
 	} else {
 		observed := workPaneObserve(target.PaneID)
 		if observed.Endpoint == nil || observed.Provider != target.Provider || observed.SessionID != target.SessionID {
 			deliverErr = errors.New("target conversation changed")
 		} else if deliverErr = guard(ctx); deliverErr == nil {
-			result, deliverErr = workPaneSend(target.PaneID, map[string]any{"operation": "send", "expected": observed.Endpoint, "messageID": m.MessageID, "targetPaneID": target.PaneID, "text": m.Text, "submittingClientID": m.Caller, "source": map[string]any{"authentication": "source_work_host_attested", "hostID": m.Source.NodeID, "workThread": m.Source.Work.Thread, "linkID": m.LinkID, "nodeCertificateSHA256": peerCert}})
+			result, deliverErr = workPaneSend(target.PaneID, map[string]any{"operation": "send", "expected": observed.Endpoint, "messageID": m.MessageID, "targetPaneID": target.PaneID, "text": text, "submittingClientID": m.Caller, "source": map[string]any{"authentication": "source_work_host_attested", "hostID": m.Source.NodeID, "workThread": m.Source.Work.Thread, "linkID": m.LinkID, "nodeCertificateSHA256": peerCert}})
 		}
 	}
 	receipt.Result = communicationNativeOutcome(result, deliverErr)
 	receipt.Result["peer_authentication"] = "mutual_tls_pinned_node"
+	if fileResult != nil {
+		receipt.Result["file"] = fileResult
+	}
 	err = communicationFanoutLocked(root, func() error { return communicationAtomic(path, receipt) })
 	return workReceiptResult(receipt), err
 }
@@ -421,6 +473,7 @@ func workCheckPeerSource(ctx context.Context, root, node string, link communicat
 	}
 	m.Operation = "observe"
 	m.Text = ""
+	m.FileContent = ""
 	body, _ := json.Marshal(m)
 	data, err := remotePeerPost(ctx, root, node, binding, body)
 	if err != nil {
