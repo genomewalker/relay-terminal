@@ -455,3 +455,48 @@ func TestWorkNativeConcurrentClaimSendsOnce(t *testing.T) {
 		t.Fatal("text dispatched", sends, "times")
 	}
 }
+
+func TestWorkNativeBindingTransportSwitchKeepsPinAndRoundTrips(t *testing.T) {
+	a, b, al, _, paneCalls, _ := workTransportFixture(t, false)
+	var before CommunicationPeerBinding
+	_ = communicationRead(filepath.Join(a, "peer-binding-binding.json"), &before)
+	httpsEndpoint := before.Endpoint
+	switchTo := func(root, node, endpoint string) error {
+		_, err := communicationRouteOperation(root, node, CommunicationRequest{Operation: "route_binding_transport_set", TransportBindingID: "binding", PeerBinding: &CommunicationPeerBinding{ID: "binding", Endpoint: endpoint}})
+		return err
+	}
+	// Owner only.
+	if _, err := communicationRouteOperation(a, "node-a", CommunicationRequest{Operation: "route_binding_transport_set", ClientToken: workTestToken, TransportBindingID: "binding", PeerBinding: &CommunicationPeerBinding{ID: "binding", Endpoint: workNativeEndpoint}}); err == nil {
+		t.Fatal("scoped caller switched transport")
+	}
+	// Only the native marker or the saved HTTPS endpoint are accepted.
+	if err := switchTo(a, "node-a", "203.0.113.9:443"); err == nil {
+		t.Fatal("retargeted HTTPS endpoint accepted")
+	}
+	if err := switchTo(a, "node-a", workNativeEndpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := switchTo(b, "node-b", workNativeEndpoint); err != nil {
+		t.Fatal(err)
+	}
+	var after CommunicationPeerBinding
+	_ = communicationRead(filepath.Join(a, "peer-binding-binding.json"), &after)
+	if after.CertificatePEM != before.CertificatePEM || after.PeerNodeID != before.PeerNodeID || after.Endpoint != workNativeEndpoint {
+		t.Fatal("switch changed more than the endpoint", after)
+	}
+	// The existing link works over the host channel without re-linking.
+	workNativeQueueSend(t, a, al, signedMessage, "after switch")
+	if got := workNativeCarry(t, a, "node-a", b, "node-b"); len(got) != 1 || got[0]["status"] != "accepted_by_provider" || paneCalls.Load() != 1 {
+		t.Fatal("switched link", got)
+	}
+	if err := switchTo(a, "node-a", "203.0.113.9:443"); err == nil {
+		t.Fatal("restore to an unsaved endpoint accepted")
+	}
+	if err := switchTo(a, "node-a", httpsEndpoint); err != nil {
+		t.Fatal("rollback", err)
+	}
+	_ = communicationRead(filepath.Join(a, "peer-binding-binding.json"), &after)
+	if after != before {
+		t.Fatal("rollback did not restore the binding", after)
+	}
+}

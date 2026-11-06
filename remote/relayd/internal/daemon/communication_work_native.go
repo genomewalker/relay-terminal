@@ -432,3 +432,51 @@ func workNativeSettle(ctx context.Context, root, node, id, text string) (map[str
 	}
 	return workNativeReceiptResult(receipt), nil
 }
+
+// communicationBindingTransportSet moves an existing peer binding between the
+// HTTPS peer listener and the Relay host channel. Only the endpoint changes:
+// the binding identity, peer node and pinned certificate stay the same, so
+// routes, links, pins and receipts are untouched. Switching back restores the
+// HTTPS endpoint saved when the binding moved to the host channel.
+// Owner administration; the communication lock is held by the caller.
+func communicationBindingTransportSet(root, node string, r CommunicationRequest) (map[string]any, error) {
+	if r.ClientToken != "" || r.ActorPaneID != "" {
+		return nil, errors.New("owner administration required")
+	}
+	id := strings.ToLower(r.TransportBindingID)
+	previous, cert, err := peerBinding(root, node, id)
+	if err != nil {
+		return nil, err
+	}
+	if r.PeerBinding == nil || strings.ToLower(r.PeerBinding.ID) != id {
+		return nil, errors.New("binding identity and target endpoint required")
+	}
+	target := r.PeerBinding.Endpoint
+	if target == previous.Endpoint {
+		return map[string]any{"binding": previous, "certificate_sha256": peerFingerprint(cert), "changed": false, "authority": "relayd"}, nil
+	}
+	saved := filepath.Join(root, "peer-binding-https-"+id+".json")
+	next := previous
+	next.Endpoint = target
+	if target == workNativeEndpoint {
+		if e := communicationAtomic(saved, previous); e != nil {
+			return nil, e
+		}
+	} else {
+		var https CommunicationPeerBinding
+		if previous.Endpoint != workNativeEndpoint || communicationRead(saved, &https) != nil || https.Endpoint != target ||
+			https.ID != id || https.PeerNodeID != previous.PeerNodeID || https.CertificatePEM != previous.CertificatePEM {
+			return nil, errors.New("only the saved HTTPS endpoint of this binding can be restored")
+		}
+	}
+	if _, e := validPeerBinding(next, node); e != nil {
+		return nil, e
+	}
+	if e := communicationAtomic(filepath.Join(root, "peer-binding-"+id+".json"), next); e != nil {
+		return nil, e
+	}
+	if e := communicationEvent(root, node, "communication_peer_binding_transport_changed", []map[string]string{{"binding_id": id, "transport": map[bool]string{true: "relay_host_channel", false: "https_peer"}[target == workNativeEndpoint]}}); e != nil {
+		return nil, errors.New("binding transport changed but event append failed; inspect before recovery")
+	}
+	return map[string]any{"binding": next, "certificate_sha256": peerFingerprint(cert), "changed": true, "authority": "relayd"}, nil
+}

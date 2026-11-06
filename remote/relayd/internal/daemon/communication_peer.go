@@ -224,6 +224,8 @@ func communicationPeerConfiguration(root, node string, r CommunicationRequest) (
 			}
 		}
 		return map[string]any{"binding": b, "certificate_sha256": peerFingerprint(cert), "authority": "relayd", "connectivity": "unverified"}, nil
+	case "route_binding_transport_set":
+		return communicationBindingTransportSet(root, node, r)
 	case "route_binding_get":
 		b, cert, err := peerBinding(root, node, strings.ToLower(r.TransportBindingID))
 		if err != nil {

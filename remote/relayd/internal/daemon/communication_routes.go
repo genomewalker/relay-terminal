@@ -56,7 +56,7 @@ func communicationRouteOperation(root, nodeID string, r CommunicationRequest) (m
 	if strings.HasPrefix(r.Operation, "route_link_") {
 		return communicationRemoteLinkOperation(root, nodeID, r)
 	}
-	if r.Operation == "route_identity_create" || r.Operation == "route_identity_get" || r.Operation == "route_identity_rotate" || r.Operation == "route_binding_set" || r.Operation == "route_binding_get" {
+	if r.Operation == "route_identity_create" || r.Operation == "route_identity_get" || r.Operation == "route_identity_rotate" || r.Operation == "route_binding_set" || r.Operation == "route_binding_get" || r.Operation == "route_binding_transport_set" {
 		return communicationPeerConfiguration(root, nodeID, r)
 	}
 	if r.Operation == "route_list" {
