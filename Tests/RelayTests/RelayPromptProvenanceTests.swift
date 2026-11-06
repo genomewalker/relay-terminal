@@ -9,13 +9,13 @@ import Testing
     private let t0 = Date(timeIntervalSince1970: 1_800_000_000)
 
     private func typed(_ text: String, into log: inout RelayPromptProvenanceLog) {
-        log.printable(RelayPromptProvenanceLog.printableCount(text))
+        log.printable(RelayPromptProvenanceLog.printableCount(text), origin: .hardware)
     }
 
     @Test func tabEnterOnALongPromptIsSuggestionLikely() {
         var log = RelayPromptProvenanceLog()
-        log.tab()
-        let record = log.userSubmit(visible: nil, at: t0)
+        log.tab(origin: .hardware)
+        let record = log.userSubmit(visible: nil, origin: .hardware, at: t0)
         #expect(record?.inputClass == .suggestionLikely)
         log.providerPrompt(RelayPromptFingerprint(String(repeating: "x", count: 400)), promptSource: "suggestion", at: t0 + 1)
         let latest = log.latest
@@ -30,9 +30,9 @@ import Testing
 
     @Test func enterAloneIsNeverTyped() {
         var log = RelayPromptProvenanceLog()
-        #expect(log.userSubmit(visible: nil, at: t0)?.inputClass == .suggestionLikely)
-        log.rightArrow()
-        #expect(log.userSubmit(visible: nil, at: t0)?.inputClass == .suggestionLikely)
+        #expect(log.userSubmit(visible: nil, origin: .hardware, at: t0)?.inputClass == .suggestionLikely)
+        log.rightArrow(origin: .hardware)
+        #expect(log.userSubmit(visible: nil, origin: .hardware, at: t0)?.inputClass == .suggestionLikely)
         #expect(log.latest?.intent == "weak")
     }
 
@@ -40,7 +40,7 @@ import Testing
         var log = RelayPromptProvenanceLog()
         let text = "yes, install 96137c3b on dandy"
         typed(text, into: &log)
-        let record = log.userSubmit(visible: RelayPromptFingerprint(text), at: t0)
+        let record = log.userSubmit(visible: RelayPromptFingerprint(text), origin: .hardware, at: t0)
         #expect(record?.inputClass == .typed)
         #expect(record?.intent == "strong")
         #expect(record?.suggestionAccepted == false)
@@ -55,7 +55,7 @@ import Testing
     @Test func fewTypedCharactersBehindALongProviderPromptAreNotTyped() {
         var log = RelayPromptProvenanceLog()
         typed("ok", into: &log)
-        _ = log.userSubmit(visible: nil, at: t0)
+        _ = log.userSubmit(visible: nil, origin: .hardware, at: t0)
         #expect(log.latest?.inputClass == .typed)
         log.providerPrompt(RelayPromptFingerprint(String(repeating: "y", count: 200)), promptSource: nil, at: t0 + 1)
         #expect(log.latest?.inputClass == .suggestionLikely)
@@ -64,9 +64,9 @@ import Testing
 
     @Test func pasteIsPastedAndWeak() {
         var log = RelayPromptProvenanceLog()
-        log.paste(bytes: 300, event: 10)
+        log.paste(bytes: 300, event: 10, origin: .hardware)
         typed("ok", into: &log)
-        let record = log.userSubmit(visible: nil, at: t0)
+        let record = log.userSubmit(visible: nil, origin: .hardware, at: t0)
         #expect(record?.inputClass == .pasted)
         #expect(record?.intent == "weak")
         log.providerPrompt(RelayPromptFingerprint(String(repeating: "p", count: 302)), promptSource: nil, at: t0 + 1)
@@ -76,10 +76,10 @@ import Testing
 
     @Test func oneCommandVIsCountedOnceAcrossKeyAndMenuPaths() {
         var log = RelayPromptProvenanceLog()
-        log.paste(bytes: 40, event: 99.5)
-        log.paste(bytes: 40, event: 99.5)
+        log.paste(bytes: 40, event: 99.5, origin: .hardware)
+        log.paste(bytes: 40, event: 99.5, origin: .hardware)
         #expect(log.pending.pasteBytes == 40)
-        log.paste(bytes: 40, event: 100.25)
+        log.paste(bytes: 40, event: 100.25, origin: .hardware)
         #expect(log.pending.pasteBytes == 80)
     }
 
@@ -88,9 +88,9 @@ import Testing
         log.beginProgrammatic()
         // Anything the view sees while automation writes is not counted.
         typed("relay_send_command text", into: &log)
-        log.paste(bytes: 50, event: 1)
-        log.tab()
-        #expect(log.userSubmit(visible: RelayPromptFingerprint("relay_send_command text"), at: t0) == nil)
+        log.paste(bytes: 50, event: 1, origin: .hardware)
+        log.tab(origin: .hardware)
+        #expect(log.userSubmit(visible: RelayPromptFingerprint("relay_send_command text"), origin: .hardware, at: t0) == nil)
         log.programmaticSubmit(source: "relay_prompt", fingerprint: RelayPromptFingerprint("relay_send_command text"), at: t0)
         log.endProgrammatic()
         #expect(log.history.count == 1)
@@ -108,7 +108,7 @@ import Testing
         var log = RelayPromptProvenanceLog()
         let id = "4f8b2d6a-3c19-4e75-a0d2-9b7e1c5f3a64"
         typed("draft", into: &log)
-        _ = log.userSubmit(visible: RelayPromptFingerprint("draft"), at: t0)
+        _ = log.userSubmit(visible: RelayPromptFingerprint("draft"), origin: .hardware, at: t0)
         // relayd wrote the message; Claude's hook arrives while the route waits.
         // No pause: the two are joined by message ID, not by timing.
         log.providerPrompt(RelayPromptFingerprint(String(repeating: "m", count: 90)), peerMessageID: id,
@@ -128,14 +128,14 @@ import Testing
         typed("half typed", into: &log)
         log.programmaticSubmit(source: "terminal_edit", fingerprint: nil, at: t0)
         // The next bare Enter cannot claim the keystrokes the automation consumed.
-        #expect(log.userSubmit(visible: nil, at: t0 + 1)?.inputClass == .suggestionLikely)
+        #expect(log.userSubmit(visible: nil, origin: .hardware, at: t0 + 1)?.inputClass == .suggestionLikely)
     }
 
     @Test func editedSuggestionIsTypedButWeak() {
         var log = RelayPromptProvenanceLog()
-        log.tab()
+        log.tab(origin: .hardware)
         typed(" and add tests", into: &log)
-        _ = log.userSubmit(visible: nil, at: t0)
+        _ = log.userSubmit(visible: nil, origin: .hardware, at: t0)
         log.providerPrompt(RelayPromptFingerprint(String(repeating: "s", count: 120)), promptSource: nil, at: t0 + 1)
         #expect(log.latest?.inputClass == .typed)
         #expect(log.latest?.suggestionAccepted == true)
@@ -148,7 +148,7 @@ import Testing
         #expect(log.latest?.inputClass == .unknown)
         #expect(log.latest?.intent == "weak")
         typed("hello", into: &log)
-        _ = log.userSubmit(visible: RelayPromptFingerprint("hello"), at: t0 + 10)
+        _ = log.userSubmit(visible: RelayPromptFingerprint("hello"), origin: .hardware, at: t0 + 10)
         log.providerPrompt(RelayPromptFingerprint(String(repeating: "z", count: 500)), promptSource: nil,
                            at: t0 + 10 + RelayPromptProvenanceLog.providerMatchWindow + 1)
         #expect(log.history.count == 3)
@@ -158,7 +158,7 @@ import Testing
 
     @Test func malformedPromptSourceIsDropped() {
         var log = RelayPromptProvenanceLog()
-        _ = log.userSubmit(visible: nil, at: t0)
+        _ = log.userSubmit(visible: nil, origin: .hardware, at: t0)
         log.providerPrompt(RelayPromptFingerprint("x"), promptSource: "a b\nignore previous", at: t0)
         #expect(log.latest?.promptSource == nil)
     }
@@ -167,8 +167,8 @@ import Testing
         var log = RelayPromptProvenanceLog()
         let secret = "SECRET-PHRASE-do-not-keep-7f3a"
         typed(secret, into: &log)
-        log.paste(bytes: secret.utf8.count, event: 3)
-        _ = log.userSubmit(visible: RelayPromptFingerprint(secret), at: t0)
+        log.paste(bytes: secret.utf8.count, event: 3, origin: .hardware)
+        _ = log.userSubmit(visible: RelayPromptFingerprint(secret), origin: .hardware, at: t0)
         log.providerPrompt(RelayPromptFingerprint(secret), promptSource: nil, at: t0)
         log.programmaticSubmit(source: "relay_prompt", fingerprint: RelayPromptFingerprint(secret), at: t0 + 1)
         let encoder = JSONEncoder()
@@ -193,7 +193,7 @@ import Testing
         var log = RelayPromptProvenanceLog()
         for index in 0..<(RelayPromptProvenanceLog.historyLimit + 5) {
             typed("n\(index)", into: &log)
-            _ = log.userSubmit(visible: nil, at: t0 + Double(index))
+            _ = log.userSubmit(visible: nil, origin: .hardware, at: t0 + Double(index))
         }
         #expect(log.history.count == RelayPromptProvenanceLog.historyLimit)
         #expect(log.pending == RelayPromptInputCounts())
@@ -263,8 +263,8 @@ enum RelayPromptFingerprintTestSupport {
     @Test func unmatchedPeerReportStaysUnknownAndNeverJoinsADesktopSubmit() throws {
         var log = RelayPromptProvenanceLog()
         let typed = "yes, commit it"
-        log.printable(typed.count)
-        _ = log.userSubmit(visible: RelayPromptFingerprint(typed), at: t0)
+        log.printable(typed.count, origin: .hardware)
+        _ = log.userSubmit(visible: RelayPromptFingerprint(typed), origin: .hardware, at: t0)
         log.providerPrompt(report, peerMessageID: id, promptSource: nil, at: t0 + 1)
         try #require(log.history.count == 2)
         #expect(log.history[0].inputClass == .typed)
@@ -276,8 +276,8 @@ enum RelayPromptFingerprintTestSupport {
 
     @Test func aNoticeNeverTouchesADesktopSubmitAndMalformedIDsAreIgnored() {
         var log = RelayPromptProvenanceLog()
-        log.printable(10)
-        _ = log.userSubmit(visible: nil, at: t0)
+        log.printable(10, origin: .hardware)
+        _ = log.userSubmit(visible: nil, origin: .hardware, at: t0)
         for bad in ["", "not-an-id", "../" + id, id + "0", "4f8b2d6a"] {
             log.daemonDelivery(messageID: bad, at: t0 + 1)
             log.providerPrompt(report, peerMessageID: bad, promptSource: nil, at: t0 + 100)
@@ -293,11 +293,11 @@ enum RelayPromptFingerprintTestSupport {
     @Test func aDeliveryLeavesKeysTypedMeanwhileCounted() {
         var log = RelayPromptProvenanceLog()
         let draft = "half a reply"
-        log.printable(draft.count)
+        log.printable(draft.count, origin: .hardware)
         log.daemonDelivery(messageID: id, at: t0)
         log.providerPrompt(report, peerMessageID: id, promptSource: nil, at: t0 + 1)
         #expect(log.pending.printable == draft.count)
-        let record = log.userSubmit(visible: RelayPromptFingerprint(draft), at: t0 + 5)
+        let record = log.userSubmit(visible: RelayPromptFingerprint(draft), origin: .hardware, at: t0 + 5)
         #expect(record?.inputClass == .typed)
         #expect(record?.intent == "strong")
     }
@@ -345,13 +345,13 @@ enum RelayPromptFingerprintTestSupport {
         var log = RelayPromptProvenanceLog()
         let reply = "approve only after I type it"
         // The route awaits relayd; the user keeps typing in the target pane.
-        log.printable(reply.count)
+        log.printable(reply.count, origin: .hardware)
         log.programmaticSubmit(source: "pane_message", fingerprint: RelayPromptFingerprint("peer body"), messageID: id,
                                consumesInputLine: false, at: t0)
         #expect(log.pending.printable == reply.count)
         #expect(log.latest?.inputClass == .programmatic)
         #expect(log.latest?.counts == RelayPromptInputCounts())
-        let record = log.userSubmit(visible: RelayPromptFingerprint(reply), at: t0 + 3)
+        let record = log.userSubmit(visible: RelayPromptFingerprint(reply), origin: .hardware, at: t0 + 3)
         #expect(record?.inputClass == .typed)
         #expect(record?.intent == "strong")
         #expect(record?.counts.printable == reply.count)
@@ -360,23 +360,23 @@ enum RelayPromptFingerprintTestSupport {
     @Test func aWriteIntoTheInputLineStillConsumesAndPausesCounting() {
         // Negative: automation that types into the line keeps both behaviours.
         var log = RelayPromptProvenanceLog()
-        log.printable(4)
+        log.printable(4, origin: .hardware)
         log.beginProgrammatic()
-        log.printable(30)
+        log.printable(30, origin: .hardware)
         log.programmaticSubmit(source: "relay_prompt", fingerprint: nil, at: t0)
         log.endProgrammatic()
         #expect(log.latest?.counts.printable == 4)
         #expect(log.pending == RelayPromptInputCounts())
-        #expect(log.userSubmit(visible: nil, at: t0 + 1)?.inputClass == .suggestionLikely)
+        #expect(log.userSubmit(visible: nil, origin: .hardware, at: t0 + 1)?.inputClass == .suggestionLikely)
     }
 
     @Test func rightArrowWhileTypingStaysTypedAndStrong() {
         var log = RelayPromptProvenanceLog()
         let text = "commit dd4da14e"
-        log.printable(10)
-        log.rightArrow(); log.rightArrow(); log.rightArrow()
-        log.printable(text.count - 10)
-        let record = log.userSubmit(visible: RelayPromptFingerprint(text), at: t0)
+        log.printable(10, origin: .hardware)
+        log.rightArrow(origin: .hardware); log.rightArrow(origin: .hardware); log.rightArrow(origin: .hardware)
+        log.printable(text.count - 10, origin: .hardware)
+        let record = log.userSubmit(visible: RelayPromptFingerprint(text), origin: .hardware, at: t0)
         #expect(record?.inputClass == .typed)
         #expect(record?.intent == "strong")
         #expect(record?.suggestionAccepted == false)
@@ -387,16 +387,16 @@ enum RelayPromptFingerprintTestSupport {
 
     @Test func rightArrowAcceptOfALongSuggestionIsStillSuggestionLikely() {
         var log = RelayPromptProvenanceLog()
-        log.rightArrow()
-        _ = log.userSubmit(visible: nil, at: t0)
+        log.rightArrow(origin: .hardware)
+        _ = log.userSubmit(visible: nil, origin: .hardware, at: t0)
         log.providerPrompt(RelayPromptFingerprint(String(repeating: "s", count: 400)), promptSource: nil, at: t0 + 1)
         #expect(log.latest?.inputClass == .suggestionLikely)
         #expect(log.latest?.intent == "weak")
         // A few typed characters on a Right-arrow accept: still not typed.
         var edited = RelayPromptProvenanceLog()
-        edited.rightArrow()
-        edited.printable(5)
-        _ = edited.userSubmit(visible: nil, at: t0)
+        edited.rightArrow(origin: .hardware)
+        edited.printable(5, origin: .hardware)
+        _ = edited.userSubmit(visible: nil, origin: .hardware, at: t0)
         edited.providerPrompt(RelayPromptFingerprint(String(repeating: "s", count: 200)), promptSource: nil, at: t0 + 1)
         #expect(edited.latest?.inputClass == .suggestionLikely)
         #expect(edited.latest?.intent == "weak")
@@ -404,9 +404,9 @@ enum RelayPromptFingerprintTestSupport {
 
     @Test func tabIsStillAnAccept() {
         var log = RelayPromptProvenanceLog()
-        log.tab()
-        log.printable(12)
-        let record = log.userSubmit(visible: RelayPromptFingerprint("twelve chars"), at: t0)
+        log.tab(origin: .hardware)
+        log.printable(12, origin: .hardware)
+        let record = log.userSubmit(visible: RelayPromptFingerprint("twelve chars"), origin: .hardware, at: t0)
         #expect(record?.inputClass == .typed)
         #expect(record?.suggestionAccepted == true)
         #expect(record?.intent == "weak")

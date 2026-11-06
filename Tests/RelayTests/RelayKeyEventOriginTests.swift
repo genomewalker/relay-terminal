@@ -52,7 +52,7 @@ import Testing
     @Test func synthesizedTypingWithAHardwareEnterIsProgrammatic() {
         var log = RelayPromptProvenanceLog()
         log.printable(40, origin: .synthesized)
-        let record = log.userSubmit(visible: RelayPromptFingerprint(String(repeating: "c", count: 40)), at: t0)
+        let record = log.userSubmit(visible: RelayPromptFingerprint(String(repeating: "c", count: 40)), origin: .hardware, at: t0)
         #expect(record?.inputClass == .programmatic)
         #expect(record?.intent == "weak")
         #expect(record?.programmaticSource == RelayPromptProvenanceLog.synthesizedSource)
@@ -66,7 +66,7 @@ import Testing
     @Test func aSynthesizedEnterIsProgrammaticEvenAfterRealTyping() {
         var log = RelayPromptProvenanceLog()
         let text = "yes, install it"
-        log.printable(text.count)
+        log.printable(text.count, origin: .hardware)
         let record = log.userSubmit(visible: RelayPromptFingerprint(text), origin: .synthesized, at: t0)
         #expect(record?.inputClass == .programmatic)
         #expect(record?.counts.synthesizedEnter == 1)
@@ -75,9 +75,9 @@ import Testing
 
     @Test func aLittleSynthesizedInputMakesTypedInputWeak() {
         var log = RelayPromptProvenanceLog()
-        log.printable(20)
+        log.printable(20, origin: .hardware)
         log.printable(3, origin: .synthesized)
-        let record = log.userSubmit(visible: nil, at: t0)
+        let record = log.userSubmit(visible: nil, origin: .hardware, at: t0)
         #expect(record?.inputClass == .typed)
         #expect(record?.intent == "weak")
         // It stays weak when the provider's length arrives.
@@ -98,7 +98,7 @@ import Testing
         #expect(log.pending.delete == 0)
         #expect(log.pending.synthesized == 303)
         #expect(!log.pending.acceptedSuggestion)
-        #expect(log.userSubmit(visible: nil, at: t0)?.inputClass == .programmatic)
+        #expect(log.userSubmit(visible: nil, origin: .hardware, at: t0)?.inputClass == .programmatic)
     }
 
     @Test func hardwareTypingIsUnchanged() {
@@ -110,5 +110,53 @@ import Testing
         #expect(record?.intent == "strong")
         #expect(record?.counts.synthesized == 0)
         #expect(record?.programmaticSource == nil)
+    }
+
+    // insertText is keyboard input only while that key press is being dispatched.
+    private func keyEvent(_ type: NSEvent.EventType = .keyDown, hardwareLooking: Bool = true) throws -> NSEvent {
+        if type != .keyDown {
+            return try #require(NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0,
+                                                   windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        }
+        let cg = try #require(CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true))
+        if hardwareLooking { cg.setIntegerValueField(.eventSourceUnixProcessID, value: 0) }
+        return try #require(NSEvent(cgEvent: cg))
+    }
+
+    private func insertedTextOrigin(handling: NSEvent?, current: NSEvent?, replaying: Bool = false) -> RelayKeyEventOrigin {
+        RelayKeyEventOrigin.keyPress(forInsertedText: handling, current: current, replaying: replaying)
+            .map(RelayKeyEventOrigin.of) ?? .synthesized
+    }
+
+    @Test func insertTextWithNoKeyPressInProgressIsSynthesized() throws {
+        #expect(insertedTextOrigin(handling: nil, current: nil) == .synthesized)
+        #expect(insertedTextOrigin(handling: nil, current: try keyEvent(.leftMouseDown)) == .synthesized)
+        #expect(insertedTextOrigin(handling: nil, current: nil, replaying: true) == .synthesized)
+    }
+
+    @Test func insertTextWhileAStaleRealKeyPressIsCurrentIsSynthesized() throws {
+        // The stale key press reads as hardware on its own, but this view is
+        // not dispatching it, so text arriving now is an accessibility or
+        // programmatic insert.
+        let stale = try keyEvent()
+        #expect(RelayKeyEventOrigin.of(stale) == .hardware)
+        #expect(insertedTextOrigin(handling: nil, current: stale) == .synthesized)
+        // A different key press in flight does not vouch for the current one.
+        #expect(insertedTextOrigin(handling: try keyEvent(), current: stale) == .synthesized)
+        // A non-key event in flight vouches for nothing, even when current.
+        let click = try keyEvent(.leftMouseDown)
+        #expect(insertedTextOrigin(handling: click, current: click) == .synthesized)
+        #expect(insertedTextOrigin(handling: click, current: click, replaying: true) == .synthesized)
+    }
+
+    @Test func insertTextDuringTheHandledKeyPressTakesThatKeyPressOrigin() throws {
+        let real = try keyEvent()
+        #expect(insertedTextOrigin(handling: real, current: real) == .hardware)
+        // A posted key press being handled stays synthesized.
+        let posted = try keyEvent(hardwareLooking: false)
+        #expect(insertedTextOrigin(handling: posted, current: posted) == .synthesized)
+        // A replayed deferred key press is judged by its own stored event.
+        #expect(insertedTextOrigin(handling: real, current: nil, replaying: true) == .hardware)
+        #expect(insertedTextOrigin(handling: posted, current: real, replaying: true) == .synthesized)
     }
 }

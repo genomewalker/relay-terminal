@@ -7000,6 +7000,10 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     /// unproven. The first edit that needs that text starts exact inspection.
     private var localSelectAllNeedsExactText = false
     private var replayingDeferredPromptText = false
+    /// The key press AppKit is dispatching to this view right now; insertText
+    /// outside it is not keyboard input. A replayed deferred key is not recounted.
+    private var promptKeyDownInFlight: NSEvent?
+    private var replayingDeferredPromptKey = false
     private var quarantinedPromptKeyCodes: Set<UInt16> = []
     private var translatingPromptControlKey = false
     private struct NativePasteConfirmation {
@@ -7403,9 +7407,12 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     override func keyDown(with event: NSEvent) {
+        let enclosingKeyDown = promptKeyDownInFlight
+        promptKeyDownInFlight = event
+        defer { promptKeyDownInFlight = enclosingKeyDown }
         if handleWorkOverviewShortcut(event) { quarantinedPromptKeyCodes.insert(event.keyCode); return }
         quarantinedPromptKeyCodes.remove(event.keyCode)
-        recordPromptProvenanceKey(event)
+        if !replayingDeferredPromptKey { recordPromptProvenanceKey(event) }
         var forwardsOriginalKey = false
         defer {
             if !forwardsOriginalKey { quarantinedPromptKeyCodes.insert(event.keyCode) }
@@ -8684,7 +8691,10 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             return
         }
         switch action {
-        case .key(let event): keyDown(with: event)
+        case .key(let event):
+            replayingDeferredPromptKey = true
+            defer { replayingDeferredPromptKey = false }
+            keyDown(with: event)
         case .text(let text, let range):
             replayingDeferredPromptText = true
             defer { replayingDeferredPromptText = false }
@@ -9515,8 +9525,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     private func recordPromptProvenanceText(_ string: Any) {
         let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
         let printable = RelayPromptProvenanceLog.printableCount(text)
-        // The key event being interpreted; none (an accessibility insert) is synthesized.
-        let origin = RelayKeyEventOrigin.of(NSApp.currentEvent)
+        // Only the key press being dispatched here; any other insert is synthesized.
+        let keyPress = RelayKeyEventOrigin.keyPress(forInsertedText: promptKeyDownInFlight,
+                                                    current: NSApp.currentEvent,
+                                                    replaying: replayingDeferredPromptKey)
+        let origin = keyPress.map(RelayKeyEventOrigin.of) ?? .synthesized
         if printable > 0 { owner?.recordPromptInput { $0.printable(printable, origin: origin) } }
     }
 

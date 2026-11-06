@@ -132,24 +132,24 @@ struct RelayPromptProvenanceLog: Sendable {
         text.unicodeScalars.reduce(0) { $0 + (CharacterSet.controlCharacters.contains($1) ? 0 : 1) }
     }
 
-    mutating func printable(_ characters: Int, origin: RelayKeyEventOrigin = .hardware) {
+    mutating func printable(_ characters: Int, origin: RelayKeyEventOrigin) {
         guard programmaticDepth == 0, characters > 0 else { return }
         if origin == .synthesized { pending.synthesized &+= characters } else { pending.printable &+= characters }
     }
 
     /// One user paste. `event` is the NSEvent timestamp, so the key-equivalent
     /// path and the menu action for the same Cmd+V count once.
-    mutating func paste(bytes: Int, event: TimeInterval?, origin: RelayKeyEventOrigin = .hardware) {
+    mutating func paste(bytes: Int, event: TimeInterval?, origin: RelayKeyEventOrigin) {
         guard programmaticDepth == 0, bytes > 0 else { return }
         if let event, event == lastPasteEvent { return }
         lastPasteEvent = event
         if origin == .synthesized { pending.synthesized &+= bytes } else { pending.pasteBytes &+= bytes }
     }
 
-    mutating func tab(origin: RelayKeyEventOrigin = .hardware) { key(\.tab, origin) }
+    mutating func tab(origin: RelayKeyEventOrigin) { key(\.tab, origin) }
     /// Cursor movement, counted but never an accept.
-    mutating func rightArrow(origin: RelayKeyEventOrigin = .hardware) { key(\.rightArrow, origin) }
-    mutating func delete(origin: RelayKeyEventOrigin = .hardware) { key(\.delete, origin) }
+    mutating func rightArrow(origin: RelayKeyEventOrigin) { key(\.rightArrow, origin) }
+    mutating func delete(origin: RelayKeyEventOrigin) { key(\.delete, origin) }
 
     private mutating func key(_ field: WritableKeyPath<RelayPromptInputCounts, Int>, _ origin: RelayKeyEventOrigin) {
         guard programmaticDepth == 0 else { return }
@@ -159,7 +159,7 @@ struct RelayPromptProvenanceLog: Sendable {
     /// The Enter that submits the input line. `visible` is Relay's own mirror
     /// of the line when it is reliable; it is reduced to a fingerprint here.
     @discardableResult
-    mutating func userSubmit(visible: RelayPromptFingerprint?, origin: RelayKeyEventOrigin = .hardware,
+    mutating func userSubmit(visible: RelayPromptFingerprint?, origin: RelayKeyEventOrigin,
                              at date: Date = Date()) -> RelayPromptSubmitRecord? {
         guard programmaticDepth == 0 else { return nil }
         var counts = pending

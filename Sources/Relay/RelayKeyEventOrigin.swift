@@ -29,6 +29,18 @@ enum RelayKeyEventOrigin: String, Equatable, Sendable {
                         windowServerPID: windowServerPID)
     }
 
+    /// The key press that an insertText belongs to, or nil when it belongs to
+    /// none. Text counts as the keyboard's only while AppKit is still
+    /// dispatching that key press: an accessibility or programmatic insert can
+    /// arrive while an older key press is still NSApp.currentEvent. A replayed
+    /// deferred key press is judged by its own stored event.
+    static func keyPress(forInsertedText handling: NSEvent?, current: NSEvent?, replaying: Bool) -> NSEvent? {
+        guard let handling, handling.type == .keyDown else { return nil }
+        if replaying { return handling }
+        guard let current, current === handling else { return nil }
+        return handling
+    }
+
     /// Found once: WindowServer runs for the whole login session.
     static let windowServerPID: pid_t? = findProcess(named: "WindowServer")
 
