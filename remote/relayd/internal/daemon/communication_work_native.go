@@ -22,10 +22,11 @@ import (
 // envelopes but cannot forge, alter or redirect them.
 //
 // Sender: workSendOrReceipt claims the outbound receipt and queues the text in
-// a private pending record. The carrier lists pending items, claims one
-// (the first claim marks it dispatched and returns the signed send; every
-// later claim returns a signed receipt query, never the text again), delivers
-// it to the peer's relayd and hands the signed reply back to settle.
+// a private pending record. The carrier lists pending items, claims one (a
+// signed send of the same message each time), delivers it to the peer's
+// relayd and hands the signed reply back to settle. The text is deleted when
+// the peer confirms a final outcome, or after 24 h with the receipt saying so.
+// The receiver delivers each message ID at most once.
 const (
 	workNativeEndpoint    = "relay-host-channel"
 	workNativeAuth        = "relay_host_channel_signed_node"
@@ -276,16 +277,17 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 			settled = true
 			return os.Remove(workNativePendingPath(root, id))
 		}
-		if p.Dispatched {
-			// Never send the text again; ask the peer for its receipt.
-			p.Queries++
-			if workNativeNow().Sub(p.Created) > workNativeQueryWindow {
-				if e := os.Remove(workNativePendingPath(root, id)); e != nil {
-					return e
-				}
-				return errors.New("no receipt after 24 h of queries; the outcome stays unknown and is never resent")
+		if workNativeNow().Sub(p.Created) > workNativeQueryWindow {
+			// Say so in the receipt the sender reads, then stop carrying.
+			receipt.Result = map[string]any{"status": "outcome_unknown", "carrier": "relay_host_channel",
+				"error": "the peer did not confirm this message within 24 h; ask the recipient before sending it again under a new ID"}
+			if e := communicationAtomic(workOutboundPath(root, id), receipt); e != nil {
+				return e
 			}
-			return communicationAtomic(workNativePendingPath(root, id), p)
+			if e := os.Remove(workNativePendingPath(root, id)); e != nil {
+				return e
+			}
+			return errors.New("not confirmed by the peer within 24 h; the receipt says so")
 		}
 		return nil
 	})
@@ -295,13 +297,12 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 	if settled {
 		return map[string]any{"status": "settled", "result": workReceiptResult(receipt)}, nil
 	}
+	// The text stays queued until the peer confirms a final outcome, so a
+	// lost hop is repaired by sending the same signed message again. The
+	// receiver records each message ID before delivering and answers a
+	// repeat from that record, so a repeat is never delivered twice.
+	// Attest the source as the HTTPS observe callback would.
 	wire := receipt.Wire
-	if p.Dispatched {
-		wire.Operation = "receipt"
-		return workNativeEnvelopeResult(root, node, link, "receipt", workNativeSend{Wire: wire})
-	}
-	// Attest the source as the HTTPS observe callback would: the caller is
-	// still admitted and the local Work endpoint is the linked one.
 	if err := communicationFanoutLocked(root, func() error { return workSourceCallerAvailable(root, wire.Caller) }); err != nil {
 		return nil, err
 	}
@@ -309,35 +310,20 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 	if err != nil || !communicationEndpointEqual(source, link.Local) {
 		return nil, errors.New("source conversation changed; message not dispatched")
 	}
-	attested := workNativeNow()
-	operation := "send"
 	err = communicationFanoutLocked(root, func() error {
-		current, currentReceipt, _, e := workNativeOutbound(ctx, root, node, id)
+		current, _, _, e := workNativeOutbound(ctx, root, node, id)
 		if e != nil {
 			return e
 		}
-		if current.Dispatched || currentReceipt.Wire.Fingerprint != wire.Fingerprint {
-			// Another carrier dispatched it first.
-			operation = "receipt"
-			return nil
-		}
-		p = current
-		text := p.Text
-		p.Dispatched, p.Text = true, ""
-		if e := communicationAtomic(workNativePendingPath(root, id), p); e != nil {
-			return e
-		}
-		wire.Text = text
-		return nil
+		current.Dispatched = true
+		current.Queries++
+		return communicationAtomic(workNativePendingPath(root, id), current)
 	})
 	if err != nil {
 		return nil, err
 	}
-	if operation == "receipt" {
-		wire.Operation, wire.Text = "receipt", ""
-		return workNativeEnvelopeResult(root, node, link, operation, workNativeSend{Wire: wire})
-	}
-	return workNativeEnvelopeResult(root, node, link, operation, workNativeSend{Wire: wire, SourceCurrentAt: attested})
+	wire.Text = p.Text
+	return workNativeEnvelopeResult(root, node, link, "send", workNativeSend{Wire: wire, SourceCurrentAt: workNativeNow()})
 }
 
 func workNativeEnvelopeResult(root, node string, link communicationTypedRemoteLink, operation string, send workNativeSend) (map[string]any, error) {

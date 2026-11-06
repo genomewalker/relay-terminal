@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,65 +166,56 @@ func TestWorkNativeRoundTripBothDirectionsWithoutHTTPS(t *testing.T) {
 	}
 }
 
-func TestWorkNativeNoResendOnUnknown(t *testing.T) {
+func TestWorkNativeLostHopIsResentAndDeliveredOnce(t *testing.T) {
 	a, b, al, _, paneCalls, _ := workNativeFixture(t)
 	workNativeQueueSend(t, a, al, signedMessage, "lost in carrier")
 	claim, first := workNativeClaimEnvelope(t, a, "node-a", signedMessage)
 	if claim["operation"] != "send" {
-		t.Fatal("first claim must send", claim)
+		t.Fatal("claim must send", claim)
 	}
-	// The carrier loses the envelope. Every later claim is a receipt query.
-	claim, query := workNativeClaimEnvelope(t, a, "node-a", signedMessage)
-	payload, _, err := workNativeVerify(query, "work", "node-a", "")
-	if err != nil || claim["operation"] != "receipt" || bytes.Contains(payload, []byte("lost in carrier")) {
-		t.Fatal("second claim resent text", claim, err)
+	// The hop to the peer is lost. The text is still queued, so the next pass
+	// sends the same message again.
+	data, _ := os.ReadFile(workNativePendingPath(a, signedMessage))
+	if !bytes.Contains(data, []byte("lost in carrier")) {
+		t.Fatal("text dropped before the peer confirmed")
 	}
-	if data, _ := os.ReadFile(workNativePendingPath(a, signedMessage)); bytes.Contains(data, []byte("lost in carrier")) {
-		t.Fatal("dispatched pending record still holds text")
+	settled := workNativeCarry(t, a, "node-a", b, "node-b")
+	if len(settled) != 1 || settled[0]["status"] != "accepted_by_provider" || paneCalls.Load() != 1 {
+		t.Fatal("lost hop not repaired", settled, paneCalls.Load())
 	}
-	delivered, err := workNativeOp(b, "node-b", CommunicationRequest{Operation: "deliver_signed_work", WorkEnvelope: query})
-	if err != nil || paneCalls.Load() != 0 {
-		t.Fatal("receipt query delivered", err, paneCalls.Load())
+	if _, err := os.Stat(workNativePendingPath(a, signedMessage)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("text kept after final outcome", err)
 	}
-	settled, err := workNativeOp(a, "node-a", CommunicationRequest{Operation: "work_native_settle", MessageID: signedMessage, WorkReply: delivered["work_reply"].(string)})
-	if err != nil || settled["status"] != "outcome_unknown" {
-		t.Fatal("unknown peer outcome must stay unknown", settled, err)
+	// The first envelope arriving late is answered from the record, not
+	// delivered again.
+	late, err := workNativeOp(b, "node-b", CommunicationRequest{Operation: "deliver_signed_work", WorkEnvelope: first})
+	if err != nil || paneCalls.Load() != 1 || late["work_reply"] == nil {
+		t.Fatal("late duplicate delivered", err, paneCalls.Load())
 	}
-	// A send from the same ID never re-queues the text.
+	// A repeat send from the same ID never re-queues the text.
 	got, err := executeWorkRequest(context.Background(), a, "node-a", WorkRequest{Operation: "send", LinkID: al.ID, MessageID: signedMessage, Text: "lost in carrier", ClientToken: workTestToken}, workNativeWorkOrigin())
-	if err != nil || got["status"] != "outcome_unknown" {
+	if err != nil || got["status"] != "accepted_by_provider" {
 		t.Fatal("repeat send", got, err)
 	}
-	if data, _ := os.ReadFile(workNativePendingPath(a, signedMessage)); bytes.Contains(data, []byte("lost in carrier")) {
+	if _, err := os.Stat(workNativePendingPath(a, signedMessage)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("repeat send re-queued text")
 	}
-	// The first envelope, if it later arrives, delivers exactly once and the
-	// reply settles the sender.
-	delivered, err = workNativeOp(b, "node-b", CommunicationRequest{Operation: "deliver_signed_work", WorkEnvelope: first})
-	if err != nil || paneCalls.Load() != 1 {
-		t.Fatal("late envelope", err, paneCalls.Load())
-	}
-	if _, err = workNativeOp(b, "node-b", CommunicationRequest{Operation: "deliver_signed_work", WorkEnvelope: first}); err != nil || paneCalls.Load() != 1 {
-		t.Fatal("idempotent message ID delivered twice", err, paneCalls.Load())
-	}
-	settled, err = workNativeOp(a, "node-a", CommunicationRequest{Operation: "work_native_settle", MessageID: signedMessage, WorkReply: delivered["work_reply"].(string)})
-	if err != nil || settled["status"] != "accepted_by_provider" {
-		t.Fatal("late settle", settled, err)
-	}
-	// Query polling is bounded and never turns into a resend.
+	// A peer that never confirms: after 24 h the receipt says so and the text
+	// is deleted. Nothing was delivered.
 	workNativeQueueSend(t, a, al, workNativeSecondID, "never answered")
 	workNativeClaimEnvelope(t, a, "node-a", workNativeSecondID)
-	for i := 0; i < 100; i++ {
-		workNativeClaimEnvelope(t, a, "node-a", workNativeSecondID)
-	}
 	base := workNativeNow
 	workNativeNow = func() time.Time { return base().Add(workNativeQueryWindow + time.Minute) }
 	defer func() { workNativeNow = base }()
 	if _, err := workNativeOp(a, "node-a", CommunicationRequest{Operation: "work_native_claim", MessageID: workNativeSecondID}); err == nil {
-		t.Fatal("receipt polling unbounded")
+		t.Fatal("carrying unbounded")
 	}
 	if _, err := os.Stat(workNativePendingPath(a, workNativeSecondID)); !errors.Is(err, os.ErrNotExist) || paneCalls.Load() != 1 {
-		t.Fatal("exhausted item kept or delivered", err, paneCalls.Load())
+		t.Fatal("expired item kept or delivered", err, paneCalls.Load())
+	}
+	var expired workTransportReceipt
+	if e := communicationRead(workOutboundPath(a, workNativeSecondID), &expired); e != nil || expired.Result["status"] != "outcome_unknown" || !strings.Contains(fmt.Sprint(expired.Result["error"]), "24 h") {
+		t.Fatal("expiry not visible in the receipt", expired.Result, e)
 	}
 }
 
@@ -418,47 +410,34 @@ func TestWorkNativeWorkOwnerRefusedIsNotSettledAsDelivered(t *testing.T) {
 	}
 }
 
-// Two carriers claiming at once: only one may receive the text.
-func TestWorkNativeConcurrentClaimSendsOnce(t *testing.T) {
-	a, _, al, _, _, _ := workNativeFixture(t)
+// Two carriers claiming at once both get the same signed message; the peer
+// delivers it once.
+func TestWorkNativeConcurrentClaimsDeliverOnce(t *testing.T) {
+	a, b, al, _, paneCalls, _ := workNativeFixture(t)
 	workNativeQueueSend(t, a, al, signedMessage, "claimed twice")
-	base := workObserveEndpoint
-	var nested map[string]any
-	entered := false
-	workObserveEndpoint = func(ctx context.Context, e communicationEndpoint) (communicationEndpoint, error) {
-		if !entered {
-			entered = true
-			// A second carrier completes its claim while the first is
-			// observing the source outside the lock.
-			var err error
-			nested, err = workNativeOp(a, "node-a", CommunicationRequest{Operation: "work_native_claim", MessageID: signedMessage})
-			if err != nil {
-				t.Error("nested claim", err)
-			}
-		}
-		return base(ctx, e)
-	}
-	outer, err := workNativeOp(a, "node-a", CommunicationRequest{Operation: "work_native_claim", MessageID: signedMessage})
-	if err != nil || nested == nil {
-		t.Fatal(err)
-	}
-	sends := 0
-	for _, claim := range []map[string]any{outer, nested} {
-		payload, _, err := workNativeVerify(claim["work_envelope"].(string), "work", "node-a", "")
+	_, one := workNativeClaimEnvelope(t, a, "node-a", signedMessage)
+	_, two := workNativeClaimEnvelope(t, a, "node-a", signedMessage)
+	var replies []string
+	for _, envelope := range []string{one, two, one} {
+		delivered, err := workNativeOp(b, "node-b", CommunicationRequest{Operation: "deliver_signed_work", WorkEnvelope: envelope})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if claim["operation"] == "send" {
-			if !bytes.Contains(payload, []byte("claimed twice")) {
-				t.Fatal("send claim without its text")
-			}
-			sends++
-		} else if bytes.Contains(payload, []byte("claimed twice")) {
-			t.Fatal("receipt query carried text")
-		}
+		replies = append(replies, delivered["work_reply"].(string))
 	}
-	if sends != 1 {
-		t.Fatal("text dispatched", sends, "times")
+	if paneCalls.Load() != 1 {
+		t.Fatal("delivered", paneCalls.Load(), "times")
+	}
+	for _, reply := range replies {
+		got, err := workNativeOp(a, "node-a", CommunicationRequest{Operation: "work_native_settle", MessageID: signedMessage, WorkReply: reply})
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		_ = got
+	}
+	var receipt workTransportReceipt
+	if e := communicationRead(workOutboundPath(a, signedMessage), &receipt); e != nil || receipt.Result["status"] != "accepted_by_provider" {
+		t.Fatal("settled result", receipt.Result, e)
 	}
 }
 
