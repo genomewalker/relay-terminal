@@ -61,6 +61,23 @@ final class RelayFilePreviewTests: XCTestCase {
     }
 
     func testPaneArtifactKinds() {
+        let text = PaneArtifact(remotePath: "/r/b2.txt", data: Data("hello\n".utf8))
+        XCTAssertEqual(text.kind, .log)
+        XCTAssertEqual(text.text, "hello\n")
+        for suffix in ["out", "output", "OUTPUT"] {
+            let path = "/r/job.\(suffix)"
+            XCTAssertEqual(RelayFilePreviewKind.from(path: path), .log)
+            let output = PaneArtifact(remotePath: path, data: Data("job output\n".utf8))
+            XCTAssertEqual(output.kind, .log)
+            XCTAssertEqual(output.text, "job output\n")
+        }
+        let large = PaneArtifact(remotePath: "/r/b2.txt", data: Data(repeating: 65, count: RelayLogTail.defaultMaxBytes + 1))
+        XCTAssertEqual(large.log?.shownBytes, RelayLogTail.defaultMaxBytes)
+        XCTAssertEqual(large.log?.totalBytes, RelayLogTail.defaultMaxBytes + 1)
+        XCTAssertEqual(large.log?.partial, true)
+        XCTAssertEqual(PaneArtifact(remotePath: "/r/data.bin", data: Data([0x00, 0xff])).kind, .image)
+        XCTAssertEqual(PaneArtifact(remotePath: "/r/wrong.txt", data: Data("%PDF-1.7".utf8)).kind, .pdf)
+        XCTAssertEqual(PaneArtifact(remotePath: "/r/NOTE.TXT", data: Data("notes".utf8)).text, "notes")
         XCTAssertEqual(PaneArtifact(remotePath: "/r/p.pdf", data: Data("%PDF-1.7".utf8)).kind, .pdf)
         let image = PaneArtifact(remotePath: "/r/p.png", data: Data([0x89, 0x50]))
         XCTAssertEqual(image.kind, .image)
@@ -74,6 +91,18 @@ final class RelayFilePreviewTests: XCTestCase {
         let failed = PaneArtifact(remotePath: "/r/missing.log", kind: .log, failure: "No such file")
         XCTAssertEqual(failed.failure, "No such file")
         XCTAssertNil(failed.text)
+    }
+
+    func testOutputFilesOpenAsText() async throws {
+        for suffix in ["out", "output"] {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + suffix)
+            try Data("sample output\n".utf8).write(to: url)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let artifact = await RelayFilePreviewLoader.load(path: url.path, profile: .local)
+            XCTAssertEqual(artifact.kind, .log, suffix)
+            XCTAssertEqual(artifact.text, "sample output\n", suffix)
+            XCTAssertNil(artifact.failure, suffix)
+        }
     }
 
     func testLocalLoaderShowsErrorForTheSameMissingPath() async {

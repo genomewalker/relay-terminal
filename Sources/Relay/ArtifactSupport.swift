@@ -6,7 +6,7 @@ import ImageIO
 enum RelayFilePreviewKind: String, Sendable, Equatable {
     case image, pdf, log
     static let imageExtensions: Set = ["png", "jpg", "jpeg", "gif", "tiff", "tif", "bmp", "webp", "heic", "svg"]
-    static let logExtensions: Set = ["log", "txt", "out", "err", "tsv", "csv", "md", "json", "yaml", "yml", "stdout", "stderr"]
+    static let logExtensions: Set = ["log", "txt", "out", "output", "err", "tsv", "csv", "md", "json", "yaml", "yml", "stdout", "stderr"]
 
     static func from(path: String) -> RelayFilePreviewKind? {
         let ext = TerminalPathSyntax.pathExtension(path)
@@ -68,8 +68,14 @@ struct PaneArtifact: Identifiable, Sendable {
 
     init(remotePath: String, data: Data) {
         self.remotePath = remotePath
-        self.data = data
-        kind = data.starts(with: Data("%PDF-".utf8)) ? .pdf : .image
+        if !data.starts(with: Data("%PDF-".utf8)), RelayFilePreviewKind.from(path: remotePath) == .log {
+            self.data = Data()
+            kind = .log
+            log = RelayLogTail(bytes: Data(data.suffix(RelayLogTail.defaultMaxBytes)), totalBytes: data.count)
+        } else {
+            self.data = data
+            kind = data.starts(with: Data("%PDF-".utf8)) ? .pdf : .image
+        }
         contentIdentity = Self.identity(remotePath, data)
     }
 

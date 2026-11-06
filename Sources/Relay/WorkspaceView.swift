@@ -4845,7 +4845,7 @@ private struct InlineArtifactView: View {
     var body: some View {
         VStack(spacing: RelayTheme.spacing(0)) {
             HStack(spacing: RelayTheme.spacing(7)) {
-                Image(systemName: "photo")
+                Image(systemName: artifact.kind.symbol)
                     .foregroundStyle(RelayTheme.blue)
                 Text(artifact.filename)
                     .font(RelayTheme.font(size: 11, weight: .medium))
@@ -4859,12 +4859,21 @@ private struct InlineArtifactView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(RelayTheme.textMuted)
                 .focusEffectDisabled()
-                .accessibilityLabel("Close inline image")
+                .accessibilityLabel(artifact.kind == .log ? "Close inline text" : "Close inline image")
             }
             .padding(.horizontal, RelayTheme.spacing(10))
             .frame(height: 32)
 
-            if artifact.isPDF {
+            if artifact.kind == .log {
+                VStack(spacing: 0) {
+                    if let label = artifact.log?.label {
+                        Text(label).font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(6)
+                    }
+                    RelayLogTextView(text: artifact.text ?? "")
+                        .accessibilityLabel("Log text: \(artifact.filename)")
+                }
+            } else if artifact.isPDF {
                 RelayPDFPreview(data: artifact.data).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let image = artifact.image {
                 Image(nsImage: image)
