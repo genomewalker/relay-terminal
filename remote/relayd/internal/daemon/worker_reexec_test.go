@@ -109,6 +109,9 @@ func buildNextRelaydForReexec(t *testing.T) string {
 }
 
 func TestMain(m *testing.M) {
+	if runClaudeChainHelper() {
+		return
+	}
 	code := m.Run()
 	if reexecBinary != "" {
 		_ = os.RemoveAll(filepath.Dir(reexecBinary))

@@ -3,6 +3,7 @@ package nativemsg
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/relay-terminal/relayd/internal/desktoproute"
 )
@@ -10,9 +11,10 @@ import (
 // Target is an explicit provider endpoint. A Work task is not a terminal pane;
 // both cannot be set. A selected Work owner is rechecked during delivery.
 type Target struct {
-	Kind   string        `json:"kind"`
-	PaneID string        `json:"pane_id,omitempty"`
-	Work   *WorkEndpoint `json:"work,omitempty"`
+	Kind   string               `json:"kind"`
+	PaneID string               `json:"pane_id,omitempty"`
+	Work   *WorkEndpoint        `json:"work,omitempty"`
+	Claude *ClaudeSessionTarget `json:"claude,omitempty"`
 }
 
 // IdentityKey distinguishes the logical target from its mutable process
@@ -20,12 +22,17 @@ type Target struct {
 func (t Target) IdentityKey() (string, error) {
 	switch t.Kind {
 	case "pane":
-		if t.PaneID == "" || t.Work != nil {
+		if t.PaneID == "" || t.Work != nil || t.Claude != nil {
 			return "", errors.New("invalid pane target")
 		}
 		return "pane:" + t.PaneID, nil
+	case "claude_session":
+		if t.PaneID != "" || t.Work != nil || t.Claude == nil || !t.Claude.Valid() {
+			return "", errors.New("invalid Claude session target")
+		}
+		return "claude_session:" + strings.ToLower(t.Claude.SessionID), nil
 	case "work":
-		if t.PaneID != "" || t.Work == nil || !t.Work.Valid() {
+		if t.PaneID != "" || t.Work == nil || t.Claude != nil || !t.Work.Valid() {
 			return "", errors.New("invalid Work target")
 		}
 		return "work:" + t.Work.Thread, nil
@@ -53,6 +60,11 @@ func RunTarget(ctx context.Context, host Host, target Target, packet []byte, wor
 			return nil, errors.New("invalid pane target")
 		}
 		return Run(ctx, host, target.PaneID, packet), nil
+	case "claude_session":
+		if work != nil {
+			return nil, errors.New("invalid Claude session target")
+		}
+		return RunClaudeSession(ctx, host, *target.Claude, packet), nil
 	case "work":
 		if len(packet) != 0 || work == nil || work.Authorize == nil {
 			return nil, errors.New("invalid Work target or authority")

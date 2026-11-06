@@ -84,6 +84,13 @@ func readNativeClaudeRegistration(path string, pid int, identity string) (native
 }
 
 func readNativeClaudeRegistrationKind(path string, pid int, identity, kind string) (nativeClaudeRegistration, []byte, os.FileInfo, error) {
+	return readNativeClaudeRegistrationEntry(path, pid, identity, kind, "cli")
+}
+
+// readNativeClaudeRegistrationEntry reads a registration published by the
+// given entrypoint: "cli" for terminal sessions, "claude-desktop" for the
+// Claude desktop app's background sessions.
+func readNativeClaudeRegistrationEntry(path string, pid int, identity, kind, entrypoint string) (nativeClaudeRegistration, []byte, os.FileInfo, error) {
 	var empty nativeClaudeRegistration
 	for _, item := range []struct {
 		path      string
@@ -115,7 +122,7 @@ func readNativeClaudeRegistrationKind(path string, pid int, identity, kind strin
 		return empty, nil, nil, errors.New("invalid native Claude registration")
 	}
 	if record.PID != pid || record.ProcessStart != identity || !nativeClaudeSessionID.MatchString(record.SessionID) ||
-		record.PeerProtocol != 1 || record.Kind != kind || record.Entrypoint != "cli" || (nativeClaudePIDDomain() == "" || record.PIDDomain != nativeClaudePIDDomain()) || record.RelayProxy ||
+		record.PeerProtocol != 1 || record.Kind != kind || record.Entrypoint != entrypoint || (nativeClaudePIDDomain() == "" || record.PIDDomain != nativeClaudePIDDomain()) || record.RelayProxy ||
 		!filepath.IsAbs(record.Socket) || len(record.Socket) > 4096 || strings.ContainsRune(record.Socket, 0) {
 		return empty, nil, nil, errors.New("native Claude registration does not identify this frontend")
 	}
