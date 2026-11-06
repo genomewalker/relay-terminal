@@ -2660,7 +2660,7 @@ final class TerminalRuntime: NSObject {
             return sendPromptTransport(text) ? .submitted : .submissionUncertain
         }
         let sent = profile.backend == .relay ? io.sendUserInput(Data([13])) : view.performBindingAction("text:\\r")
-        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput(); noteProgrammaticInput("conversation_prompt", text) }
         return sent ? .submitted : .submissionUncertain
     }
 
@@ -2857,6 +2857,7 @@ final class TerminalRuntime: NSObject {
             guard io.sendUserInput(packet) else { return false }
             view.unobservedPromptInput()
             pane.userEnteredInput()
+            noteProgrammaticInput("shell_recovery", nil)
             return true
         } catch { return false }
     }
@@ -3221,7 +3222,7 @@ final class TerminalRuntime: NSObject {
         defer { conversationInputLease = nil }
         let sent = io.sendPromptEditorControlInput(Data((payload + "\r").utf8), expectedControlLease: lease,
             expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
-        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput(); noteProgrammaticInput("agent_maintenance", command) }
         return sent ? .sent : .refused
     }
 
@@ -3264,7 +3265,7 @@ final class TerminalRuntime: NSObject {
         defer { conversationInputLease = nil }
         let sent = io.sendPromptEditorControlInput(Data((payload + "\r").utf8), expectedControlLease: lease,
             expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
-        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput(); noteProgrammaticInput("context_rotation", text) }
         return sent
     }
 
@@ -3334,7 +3335,7 @@ final class TerminalRuntime: NSObject {
         try willSend()
         let sent = io.sendPromptEditorControlInput(Data((payload + "\r").utf8), expectedControlLease: lease,
             expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
-        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput(); noteProgrammaticInput("agent_maintenance", command) }
         return sent
     }
 
@@ -3343,6 +3344,9 @@ final class TerminalRuntime: NSObject {
     private func sendPromptTransport(_ text: String, maximumBytes: Int = 64 << 10, fence: ScreenFence? = nil) -> Bool {
         guard pane?.contentKind == .terminal,
               !text.isEmpty, text.utf8.count <= maximumBytes, maximumBytes <= 128 << 10 else { return false }
+        // Automation, never typing: desktop counting pauses for the write.
+        pane?.promptProvenance.beginProgrammatic()
+        defer { pane?.promptProvenance.endProgrammatic() }
         let prompt = text.replacingOccurrences(of: "\r\n", with: "\n")
         if pane?.profile.backend == .relay {
             guard let payload = TerminalPastePayload.directPayload(
@@ -3355,6 +3359,7 @@ final class TerminalRuntime: NSObject {
             guard sent else { return false }
             view.unobservedPromptInput()
             pane?.userEnteredInput()
+            noteProgrammaticInput("relay_prompt", prompt)
             return true
         }
         guard let payload = TerminalPastePayload.rendererPayload(
@@ -3366,7 +3371,13 @@ final class TerminalRuntime: NSObject {
         // surface_text is clipboard content, not a separate Return key.
         let submitted = view.performBindingAction("text:\\r")
         pane?.userEnteredInput()
+        if submitted { noteProgrammaticInput("relay_prompt", prompt) }
         return submitted
+    }
+
+    /// Records a Relay automation write as a programmatic submit. Content-free.
+    private func noteProgrammaticInput(_ source: String, _ text: String?) {
+        pane?.promptProvenance.programmaticSubmit(source: source, fingerprint: text.map(RelayPromptFingerprint.init))
     }
 
     func beginSidePanelTerminalMirror(
@@ -3536,7 +3547,7 @@ final class TerminalRuntime: NSObject {
             sent = io.sendPromptEditorControlInput(packet, expectedControlLease: control,
                 expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
         }
-        if sent { view.unobservedPromptInput(); pane.userEnteredInput() }
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput(); noteProgrammaticInput("terminal_edit", nil) }
         return sent ? "input_submitted" : "not_sent"
     }
 
@@ -3549,6 +3560,7 @@ final class TerminalRuntime: NSObject {
         view.unobservedPromptInput()
         io.sendUserInput(data)
         pane?.userEnteredInput()
+        noteProgrammaticInput("side_panel_terminal_input", nil)
         return true
     }
 
@@ -3774,6 +3786,12 @@ final class TerminalRuntime: NSObject {
 
     fileprivate func userEnteredInput() {
         pane?.userEnteredInput()
+    }
+
+    /// Desktop input counters for this pane (counts only, never content).
+    fileprivate func recordPromptInput(_ body: (inout RelayPromptProvenanceLog) -> Void) {
+        guard let pane else { return }
+        body(&pane.promptProvenance)
     }
 
     @discardableResult
@@ -7387,6 +7405,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     override func keyDown(with event: NSEvent) {
         if handleWorkOverviewShortcut(event) { quarantinedPromptKeyCodes.insert(event.keyCode); return }
         quarantinedPromptKeyCodes.remove(event.keyCode)
+        recordPromptProvenanceKey(event)
         var forwardsOriginalKey = false
         defer {
             if !forwardsOriginalKey { quarantinedPromptKeyCodes.insert(event.keyCode) }
@@ -7475,6 +7494,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     override func insertText(_ string: Any, replacementRange: NSRange) {
+        if !replayingDeferredPromptText { recordPromptProvenanceText(string) }
         if localSelectAllNeedsExactText, !replayingDeferredPromptText { beginDeferredSelectAllInspection() }
         if promptInspectionPreservesInput {
             consumeCurrentTextInputEvent()
@@ -9477,6 +9497,34 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         resetPromptHistory()
     }
 
+    /// Accept and delete keys for prompt provenance. Command and Control
+    /// chords are shortcuts, not input; Option-Delete still deletes.
+    private func recordPromptProvenanceKey(_ event: NSEvent) {
+        let flags = event.modifierFlags.intersection([.command, .control])
+        guard flags.isEmpty else { return }
+        switch event.keyCode {
+        case 48: owner?.recordPromptInput { $0.tab() }
+        case 124: owner?.recordPromptInput { $0.rightArrow() }
+        case 51, 117: owner?.recordPromptInput { $0.delete() }
+        default: break
+        }
+    }
+
+    /// Printable characters committed by the keyboard or an input method.
+    private func recordPromptProvenanceText(_ string: Any) {
+        let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
+        let printable = RelayPromptProvenanceLog.printableCount(text)
+        if printable > 0 { owner?.recordPromptInput { $0.printable(printable) } }
+    }
+
+    /// The submitting Enter. Relay's mirror of the line, when reliable, gives
+    /// the visible length; it is reduced to a fingerprint immediately.
+    private func recordPromptProvenanceSubmit() {
+        let line = promptBuffer.isReliable ? promptBuffer.text.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        let visible = line.isEmpty ? nil : RelayPromptFingerprint(line)
+        owner?.recordPromptInput { _ = $0.userSubmit(visible: visible) }
+    }
+
     private func trackNonTextKey(_ event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let control = flags.contains(.control)
@@ -9494,6 +9542,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                 return
             }
             setShellPromptActive(false)
+            recordPromptProvenanceSubmit()
             _ = promptBuffer.submit()
             resetPromptHistory()
             hasLocalInputSincePromptBoundary = false
@@ -9505,6 +9554,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         }
         if command && key == "v" {
             if let pasted = NSPasteboard.general.string(forType: .string) {
+                owner?.recordPromptInput { $0.paste(bytes: pasted.utf8.count, event: event.timestamp) }
                 hasLocalInputSincePromptBoundary = true
                 recordPromptEdit(.paste)
                 promptBuffer.insert(pasted)
@@ -10121,6 +10171,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             return true
         }
         guard let text = NSPasteboard.general.string(forType: .string) else { return false }
+        owner?.recordPromptInput { $0.paste(bytes: text.utf8.count, event: NSApp.currentEvent?.timestamp) }
         return pastePromptText(text)
     }
 

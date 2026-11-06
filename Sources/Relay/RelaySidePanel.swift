@@ -2518,8 +2518,18 @@ final class RelaySidePanelServer: ObservableObject {
                 let input = try JSONDecoder().decode(RelayPaneMessaging.Request.self, from: request.body)
                 let callerToken = request.headers["x-relay-caller-token"]
                 let submittingClientID = try callerControl.identity(token: callerToken)
-                return try .jsonObject(await paneMessaging.send(input, targetID: paneID, workspace: workspace,
-                    submittingClientID: submittingClientID, callerToken: callerToken))
+                // A peer message is programmatic input to the target, never typing,
+                // including when relayd writes it outside Relay's key path.
+                let target = workspace.panes[paneID]
+                target?.promptProvenance.beginProgrammatic()
+                defer { target?.promptProvenance.endProgrammatic() }
+                let result = try await paneMessaging.send(input, targetID: paneID, workspace: workspace,
+                    submittingClientID: submittingClientID, callerToken: callerToken)
+                if RelayPromptProvenanceLog.messageMayHaveReachedPane(result), workspace.panes[paneID] === target {
+                    target?.promptProvenance.programmaticSubmit(source: "pane_message",
+                        fingerprint: RelayPromptFingerprint(input.text))
+                }
+                return try .jsonObject(result)
             } catch { return .text(error.localizedDescription, status: 409, reason: "Conflict") }
         case ("POST", "input-recover-shell"):
             guard mcpWorkspaceGrant.permits(.input) else {
@@ -2779,6 +2789,12 @@ final class RelaySidePanelServer: ObservableObject {
             }
             contextRotationResults[input.requestID] = result
             return .json(result)
+        case ("GET", "prompt-provenance"):
+            // Read-only and content-free: counts, classes, lengths, hash prefixes.
+            guard let pane = workspace.panes[paneID] else {
+                return .text("Pane not found", status: 404, reason: "Not Found")
+            }
+            return .json(pane.promptProvenance.snapshot(paneID: paneID))
         case ("GET", "viewport"):
             guard let pane = workspace.panes[paneID], let text = await pane.runtime.backgroundViewportText(),
                   workspace.panes[paneID] === pane else {

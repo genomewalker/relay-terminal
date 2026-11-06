@@ -278,6 +278,7 @@ func (s *server) handle(r request) (any, int, string) {
 			tool("relay_list_panes", "List Relay hosts, tabs, panes and connection state. Does not change focus. An agent pane's account is its provider account label; accountDisplay adds the observed config directory for display only and is never a relay_move_pane_account argument.", map[string]any{}, []string{}),
 			tool("relay_agent_binding", "Read the exact connected pane's currently verified native agent binding on its own host. Rechecks worker/process incarnation and ancestry through relayd; unavailable records include a bounded reason. Does not create, repair, adopt or resume a session. A bound result is an observation, not permission for input.", map[string]any{"pane_id": map[string]string{"type": "string"}}, []string{"pane_id"}),
 			researchCapabilityTool(),
+			tool("relay_prompt_provenance", "Read how input reached one exact pane: per-submit class typed, pasted, suggestion_likely, programmatic or unknown, with intent strong or weak, key and paste counts, submitted length, provider promptSource when known, a 12-hex SHA-256 prefix and a bounded history. Counts only: Relay stores no keystrokes, paste or prompt text. Read-only. Rule: an approval whose submit is suggestion_likely, pasted, programmatic or unknown, or has intent weak, is weak intent; before install, delete, kill, restart or relaying an approval, ask the user to confirm with newly typed text and check that submit reads typed and strong. Known limit: typed means desktop key events reached Relay's window; key events synthesized by computer use or other automation look the same, so typed does not prove a person pressed the keys.", map[string]any{"pane_id": map[string]string{"type": "string"}}, []string{"pane_id"}),
 			tool("relay_read_agent_context", "Read bounded agent context and activity for a pane. Not raw terminal output or R results.", map[string]any{"pane_id": map[string]string{"type": "string"}}, []string{"pane_id"}),
 			tool("relay_available_tools", "Get the current Relay MCP tool catalog, including exact names, descriptions and input schemas. Call when a Relay tool may have been added or changed since this conversation started. This is read-only.", map[string]any{}, []string{}),
 			tool("relay_call_tool", "Call one exact tool from the current Relay catalog when its newer schema is not in this conversation's tool list. First call relay_available_tools, then provide the selected tool name and arguments matching its schema. This generic dispatcher preserves Relay's normal validation and authorization; it does not bypass approvals.", map[string]any{"tool_name": map[string]any{"type": "string", "minLength": 1, "maxLength": 128}, "arguments": map[string]any{"type": "object", "additionalProperties": true}}, []string{"tool_name", "arguments"}),
@@ -1229,7 +1230,7 @@ func (s *server) handle(r request) (any, int, string) {
 				return nil, -32602, "Exact pane ID required"
 			}
 			path = "/api/panes/" + pane + "/agent-binding"
-		case "relay_read_agent_context", "relay_read_viewport", "relay_read_editor", "relay_r_session_status":
+		case "relay_read_agent_context", "relay_read_viewport", "relay_read_editor", "relay_r_session_status", "relay_prompt_provenance":
 			var id string
 			if len(p.Arguments) != 1 || json.Unmarshal(p.Arguments["pane_id"], &id) != nil || !paneID.MatchString(id) {
 				return nil, -32602, "A valid pane_id is required"
@@ -1243,6 +1244,9 @@ func (s *server) handle(r request) (any, int, string) {
 			}
 			if p.Name == "relay_r_session_status" {
 				path += "/r-status"
+			}
+			if p.Name == "relay_prompt_provenance" {
+				path += "/prompt-provenance"
 			}
 		default:
 			return nil, -32602, "Unknown tool"

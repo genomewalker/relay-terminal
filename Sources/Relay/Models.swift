@@ -609,6 +609,8 @@ final class PaneModel: ObservableObject, Identifiable {
     private var programStatusAttention = RelayProgramStatusAttention()
     @Published var terminalProgressPercent: Int?
     @Published var terminalProgressState: String?
+    /// How each submit's input reached this pane, from counts only (no content).
+    var promptProvenance = RelayPromptProvenanceLog()
     private(set) var detector = AgentSignalDetector() {
         didSet {
             // A wait seen in terminal output; agent events name theirs in raiseWait.
@@ -1385,6 +1387,13 @@ final class PaneModel: ObservableObject, Identifiable {
             )
         case "UserPromptSubmit", "turn/started":
             pendingAgentApprovals = 0
+            if eventName == "UserPromptSubmit", agentSnapshotReplayDepth == 0,
+               ((envelope["relay_event_seq"] as? NSNumber)?.uint64Value ?? UInt64.max) > priorCursor,
+               let prompt = event["prompt"] as? String {
+                // The provider's own prompt: keep its length and hash prefix only.
+                promptProvenance.providerPrompt(RelayPromptFingerprint(prompt),
+                    promptSource: (event["prompt_source"] as? String) ?? (event["promptSource"] as? String), at: Date())
+            }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Thinking")
             recordActivity("Thinking", phase: .active)
         case "Stop", "turn/completed":
