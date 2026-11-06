@@ -2518,16 +2518,17 @@ final class RelaySidePanelServer: ObservableObject {
                 let input = try JSONDecoder().decode(RelayPaneMessaging.Request.self, from: request.body)
                 let callerToken = request.headers["x-relay-caller-token"]
                 let submittingClientID = try callerControl.identity(token: callerToken)
-                // A peer message is programmatic input to the target, never typing,
-                // including when relayd writes it outside Relay's key path.
+                // A peer message is programmatic input to the target, never typing.
+                // relayd writes it to the native inbox, not the input line, so desktop
+                // counting keeps running: keys typed during the awaited send count.
+                // The record is matched by message ID, not by timing.
                 let target = workspace.panes[paneID]
-                target?.promptProvenance.beginProgrammatic()
-                defer { target?.promptProvenance.endProgrammatic() }
                 let result = try await paneMessaging.send(input, targetID: paneID, workspace: workspace,
                     submittingClientID: submittingClientID, callerToken: callerToken)
                 if RelayPromptProvenanceLog.messageMayHaveReachedPane(result), workspace.panes[paneID] === target {
                     target?.promptProvenance.programmaticSubmit(source: "pane_message",
-                        fingerprint: RelayPromptFingerprint(input.text), messageID: input.messageID.uuidString)
+                        fingerprint: RelayPromptFingerprint(input.text), messageID: input.messageID.uuidString,
+                        consumesInputLine: false)
                 }
                 return try .jsonObject(result)
             } catch { return .text(error.localizedDescription, status: 409, reason: "Conflict") }

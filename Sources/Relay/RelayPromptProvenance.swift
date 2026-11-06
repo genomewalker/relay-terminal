@@ -33,7 +33,9 @@ struct RelayPromptInputCounts: Codable, Equatable, Sendable {
         case rightArrow = "right_arrow"
     }
 
-    var acceptedSuggestion: Bool { tab + rightArrow > 0 }
+    /// Tab accepts a suggestion. Right-arrow is cursor movement: an accept by
+    /// Right-arrow still reads suggestion_likely through the length rule.
+    var acceptedSuggestion: Bool { tab > 0 }
 }
 
 /// One submit, recorded without content: counts, a length and at most a
@@ -136,6 +138,7 @@ struct RelayPromptProvenanceLog: Sendable {
     }
 
     mutating func tab() { if programmaticDepth == 0 { pending.tab &+= 1 } }
+    /// Cursor movement, counted but never an accept.
     mutating func rightArrow() { if programmaticDepth == 0 { pending.rightArrow &+= 1 } }
     mutating func delete() { if programmaticDepth == 0 { pending.delete &+= 1 } }
 
@@ -165,8 +168,11 @@ struct RelayPromptProvenanceLog: Sendable {
     mutating func endProgrammatic() { programmaticDepth = max(0, programmaticDepth - 1) }
 
     /// A Relay automation path delivered input to this pane.
+    /// `consumesInputLine` is false for a write that bypasses the input line
+    /// (a peer message to the native inbox): keys typed meanwhile still count
+    /// toward the user's own next submit.
     mutating func programmaticSubmit(source: String, fingerprint: RelayPromptFingerprint?, messageID: String? = nil,
-                                     at date: Date = Date()) {
+                                     consumesInputLine: Bool = true, at date: Date = Date()) {
         let id = Self.validMessageID(messageID)
         // relayd's notice or the provider's report for this message came first.
         if let id, let index = recordIndex(peerMessageID: id) {
@@ -180,13 +186,14 @@ struct RelayPromptProvenanceLog: Sendable {
             history[history.count - 1] = last
             return
         }
-        let counts = pending
-        pending = RelayPromptInputCounts()
+        // A write into the input line consumes the keys before it; one that
+        // bypasses the line leaves them for the user's own submit.
+        let counts = consumesInputLine ? pending : RelayPromptInputCounts()
         append(RelayPromptSubmitRecord(inputClass: .programmatic, intent: "weak", counts: counts,
             suggestionAccepted: false, submittedLength: fingerprint?.length,
             lengthSource: fingerprint == nil ? nil : "programmatic_request", promptSource: nil,
             promptSHA256Prefix: fingerprint?.sha256Prefix, programmaticSource: source,
-            submittedAt: date, providerReportedAt: nil, peerMessageID: id))
+            submittedAt: date, providerReportedAt: nil, peerMessageID: id), resetPending: consumesInputLine)
     }
 
     /// relayd wrote peer message `messageID` to this pane's native inbox (its
@@ -305,7 +312,7 @@ struct RelayPromptProvenanceLog: Sendable {
         let human = counts.printable + counts.pasteBytes
         let accepted = counts.acceptedSuggestion
         guard human > 0 else {
-            // Enter or Tab/Right-arrow alone: whatever was submitted, nobody typed it.
+            // Enter, Tab or Right-arrow alone: whatever was submitted, nobody typed it.
             return Verdict(inputClass: .suggestionLikely, intent: "weak", suggestionAccepted: accepted || (submittedLength ?? 0) > 0)
         }
         if let length = submittedLength, length > 2 * human, length - human >= 8 {

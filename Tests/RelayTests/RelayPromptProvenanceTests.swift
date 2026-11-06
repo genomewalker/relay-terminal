@@ -104,16 +104,18 @@ import Testing
         #expect(log.history.count == 1)
     }
 
-    @Test func peerMessageReportedBeforeTheRouteReturnsStaysOneProgrammaticRecord() {
+    @Test func peerMessageReportedBeforeTheRouteReturnsStaysOneProgrammaticRecord() throws {
         var log = RelayPromptProvenanceLog()
+        let id = "4f8b2d6a-3c19-4e75-a0d2-9b7e1c5f3a64"
         typed("draft", into: &log)
         _ = log.userSubmit(visible: RelayPromptFingerprint("draft"), at: t0)
-        log.beginProgrammatic()
         // relayd wrote the message; Claude's hook arrives while the route waits.
-        log.providerPrompt(RelayPromptFingerprint(String(repeating: "m", count: 90)), promptSource: nil, at: t0 + 5)
-        log.programmaticSubmit(source: "pane_message", fingerprint: RelayPromptFingerprint(String(repeating: "m", count: 90)), at: t0 + 6)
-        log.endProgrammatic()
-        #expect(log.history.count == 2)
+        // No pause: the two are joined by message ID, not by timing.
+        log.providerPrompt(RelayPromptFingerprint(String(repeating: "m", count: 90)), peerMessageID: id,
+                           promptSource: nil, at: t0 + 5)
+        log.programmaticSubmit(source: "pane_message", fingerprint: RelayPromptFingerprint(String(repeating: "m", count: 90)),
+                               messageID: id, consumesInputLine: false, at: t0 + 6)
+        try #require(log.history.count == 2)
         // The earlier typed submit did not borrow the message's length.
         #expect(log.history[0].inputClass == .typed)
         #expect(log.history[0].lengthSource == "visible_input")
@@ -330,5 +332,85 @@ enum RelayPromptFingerprintTestSupport {
         #expect(PaneModel.providerPromptFingerprint(["prompt_length": 9, "prompt_sha256_prefix": "0123"]) == nil)
         #expect(PaneModel.providerPromptFingerprint([:]) == nil)
         #expect(PaneModel.providerPromptFingerprint(["prompt": "abc"]) == RelayPromptFingerprint("abc"))
+    }
+}
+
+// bc08 findings 2 and 3: the awaited pane-message send no longer pauses
+// desktop counting, and Right-arrow is cursor movement, not an accept.
+@Suite struct RelayPromptProvenanceFindings23Tests {
+    private let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    private let id = "4f8b2d6a-3c19-4e75-a0d2-9b7e1c5f3a64"
+
+    @Test func keysTypedDuringAPaneMessageSendStillCount() {
+        var log = RelayPromptProvenanceLog()
+        let reply = "approve only after I type it"
+        // The route awaits relayd; the user keeps typing in the target pane.
+        log.printable(reply.count)
+        log.programmaticSubmit(source: "pane_message", fingerprint: RelayPromptFingerprint("peer body"), messageID: id,
+                               consumesInputLine: false, at: t0)
+        #expect(log.pending.printable == reply.count)
+        #expect(log.latest?.inputClass == .programmatic)
+        #expect(log.latest?.counts == RelayPromptInputCounts())
+        let record = log.userSubmit(visible: RelayPromptFingerprint(reply), at: t0 + 3)
+        #expect(record?.inputClass == .typed)
+        #expect(record?.intent == "strong")
+        #expect(record?.counts.printable == reply.count)
+    }
+
+    @Test func aWriteIntoTheInputLineStillConsumesAndPausesCounting() {
+        // Negative: automation that types into the line keeps both behaviours.
+        var log = RelayPromptProvenanceLog()
+        log.printable(4)
+        log.beginProgrammatic()
+        log.printable(30)
+        log.programmaticSubmit(source: "relay_prompt", fingerprint: nil, at: t0)
+        log.endProgrammatic()
+        #expect(log.latest?.counts.printable == 4)
+        #expect(log.pending == RelayPromptInputCounts())
+        #expect(log.userSubmit(visible: nil, at: t0 + 1)?.inputClass == .suggestionLikely)
+    }
+
+    @Test func rightArrowWhileTypingStaysTypedAndStrong() {
+        var log = RelayPromptProvenanceLog()
+        let text = "commit dd4da14e"
+        log.printable(10)
+        log.rightArrow(); log.rightArrow(); log.rightArrow()
+        log.printable(text.count - 10)
+        let record = log.userSubmit(visible: RelayPromptFingerprint(text), at: t0)
+        #expect(record?.inputClass == .typed)
+        #expect(record?.intent == "strong")
+        #expect(record?.suggestionAccepted == false)
+        #expect(record?.counts.rightArrow == 3)
+        log.providerPrompt(RelayPromptFingerprint(text), promptSource: nil, at: t0 + 1)
+        #expect(log.latest?.intent == "strong")
+    }
+
+    @Test func rightArrowAcceptOfALongSuggestionIsStillSuggestionLikely() {
+        var log = RelayPromptProvenanceLog()
+        log.rightArrow()
+        _ = log.userSubmit(visible: nil, at: t0)
+        log.providerPrompt(RelayPromptFingerprint(String(repeating: "s", count: 400)), promptSource: nil, at: t0 + 1)
+        #expect(log.latest?.inputClass == .suggestionLikely)
+        #expect(log.latest?.intent == "weak")
+        // A few typed characters on a Right-arrow accept: still not typed.
+        var edited = RelayPromptProvenanceLog()
+        edited.rightArrow()
+        edited.printable(5)
+        _ = edited.userSubmit(visible: nil, at: t0)
+        edited.providerPrompt(RelayPromptFingerprint(String(repeating: "s", count: 200)), promptSource: nil, at: t0 + 1)
+        #expect(edited.latest?.inputClass == .suggestionLikely)
+        #expect(edited.latest?.intent == "weak")
+    }
+
+    @Test func tabIsStillAnAccept() {
+        var log = RelayPromptProvenanceLog()
+        log.tab()
+        log.printable(12)
+        let record = log.userSubmit(visible: RelayPromptFingerprint("twelve chars"), at: t0)
+        #expect(record?.inputClass == .typed)
+        #expect(record?.suggestionAccepted == true)
+        #expect(record?.intent == "weak")
+        #expect(RelayPromptInputCounts(tab: 1).acceptedSuggestion)
+        #expect(!RelayPromptInputCounts(rightArrow: 5).acceptedSuggestion)
     }
 }
