@@ -134,7 +134,7 @@ import XCTest
             "model": "GPT-6.1", "phase": "waiting", "revision": 5,
             "items": [
                 ["id": "u1", "role": "user", "text": "Check the analysis and explain any changes.", "sequence": 1],
-                ["id": "a1", "role": "assistant", "text": "I found one inconsistent sample label. The source data stays intact; the proposed change updates its display label.", "sequence": 2],
+                ["id": "a1", "role": "assistant", "text": "## Findings\nI found one inconsistent sample label.\n\n```swift\nlet label = \"sample_07\"\n```\nThe source data stays intact.", "sequence": 2],
                 ["id": "t1", "role": "tool", "tool": "File changes", "text": "analysis/labels.json\n- sample_07_old\n+ sample_07", "status": "waiting", "sequence": 3],
             ],
             "requests": [

@@ -2,6 +2,23 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Keep the provider's source intact while bounding rich-text parsing and layout.
+struct RelayNativeItemPresentation {
+    static let maximumPreviewBytes = 65_536
+    let item: RelayNativeItem
+    var isAssistant: Bool { item.role == "assistant" }
+    var isPreviewLimited: Bool { isAssistant && item.text.utf8.count > Self.maximumPreviewBytes }
+    var preview: String {
+        guard isPreviewLimited else { return item.text }
+        var prefix = item.text.utf8.prefix(Self.maximumPreviewBytes)
+        while !prefix.isEmpty {
+            if let result = String(bytes: prefix, encoding: .utf8) { return result }
+            prefix = prefix.dropLast()
+        }
+        return ""
+    }
+}
+
 struct RelayNativeConversationView: View {
     @StateObject private var conversation: RelayNativeConversation
     @State private var text = ""
@@ -68,6 +85,7 @@ struct RelayNativeConversationView: View {
                             Button("Load earlier messages") { Task { await conversation.loadOlder() } }
                         }
                         ForEach(items) { item in
+                            let presentation = RelayNativeItemPresentation(item: item)
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack {
                                     Text(item.role.capitalized).font(.caption.bold())
@@ -75,8 +93,22 @@ struct RelayNativeConversationView: View {
                                     Spacer()
                                     if let status = item.status { Text(status).font(.caption).foregroundStyle(.secondary) }
                                 }
-                                Text(item.text).font(item.role == "tool" ? .system(.callout, design: .monospaced) : .body)
-                                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                if presentation.isAssistant {
+                                    RelayAgentProse(axID: "native.message." + item.id, source: presentation.preview)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    if presentation.isPreviewLimited {
+                                        HStack {
+                                            Text("Long message: showing the first 64 KB.").font(.caption).foregroundStyle(.secondary)
+                                            Button("Copy full message") {
+                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.setString(item.text, forType: .string)
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Text(item.text).font(item.role == "tool" ? .system(.callout, design: .monospaced) : .body)
+                                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                }
                                 if item.truncated == true { Text("Display truncated").font(.caption).foregroundStyle(.secondary) }
                             }
                             .padding(12)
