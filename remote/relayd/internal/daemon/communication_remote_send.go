@@ -294,6 +294,9 @@ func communicationRemoteSourceSignature(root, node string, r CommunicationReques
 }
 
 func remotePeerPost(ctx context.Context, root, node string, binding CommunicationPeerBinding, body []byte) ([]byte, error) {
+	if binding.Endpoint == workNativeEndpoint {
+		return nil, errNativePeerRoute
+	}
 	if len(body) > 128<<10 {
 		return nil, errors.New("remote request exceeds limit")
 	}

@@ -602,6 +602,7 @@ final class RelaySidePanelServer: ObservableObject {
     private var shellRecoveryResults: [UUID: [String: String]] = [:]
     private let paneMessaging = RelayPaneMessaging.shared
     private lazy var questionNoticeDelivery = RelayQuestionNoticeDelivery(workspace: workspace)
+    private lazy var workCarrier = RelayWorkCarrierLoop(workspace: workspace)
     private var directInputResults: [UUID: [String: String]] = [:]
     // MainActor admission gate: an MCP client must not fan out helper processes.
     private var peerDiscoveryInFlight = false
@@ -668,6 +669,7 @@ final class RelaySidePanelServer: ObservableObject {
         }
         start()
         questionNoticeDelivery.start()
+        workCarrier.start()
         Task { @MainActor [weak self] in
             guard let self else { return }
             var seen: Set<String> = []

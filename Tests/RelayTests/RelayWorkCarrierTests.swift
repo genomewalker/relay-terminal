@@ -1,0 +1,44 @@
+import Foundation
+import Testing
+@testable import Relay
+
+@Test func workCarrierPairsEachPendingItemWithThePeerHostInBothDirections() {
+    let mac = RelayWorkCarrier.Outbox(hostKey: "local", nodeID: "node-mac", items: [.init(messageID: "m1", peerNodeID: "node-dandy")])
+    let dandy = RelayWorkCarrier.Outbox(hostKey: "ssh:dandy", nodeID: "node-dandy", items: [.init(messageID: "d1", peerNodeID: "node-mac")])
+    #expect(RelayWorkCarrier.plan([mac, dandy]) == [
+        .init(fromHost: "local", toHost: "ssh:dandy", messageID: "m1"),
+        .init(fromHost: "ssh:dandy", toHost: "local", messageID: "d1"),
+    ])
+}
+
+@Test func workCarrierWaitsWhenThePeerIsMissingSelfOrAmbiguous() {
+    let mac = RelayWorkCarrier.Outbox(hostKey: "local", nodeID: "node-mac", items: [
+        .init(messageID: "absent", peerNodeID: "node-other"),
+        .init(messageID: "self", peerNodeID: "node-mac"),
+        .init(messageID: "twice", peerNodeID: "node-dandy"),
+    ])
+    let dandyA = RelayWorkCarrier.Outbox(hostKey: "ssh:a", nodeID: "node-dandy", items: [])
+    let dandyB = RelayWorkCarrier.Outbox(hostKey: "ssh:b", nodeID: "node-dandy", items: [])
+    #expect(RelayWorkCarrier.plan([mac, dandyA, dandyB]).isEmpty)
+    // A host reporting the same node under two keys is the same ambiguity.
+    let echo = RelayWorkCarrier.Outbox(hostKey: "ssh:a", nodeID: "node-mac", items: [])
+    #expect(RelayWorkCarrier.plan([mac, echo]).isEmpty)
+}
+
+@Test func workCarrierParsesOnlyCompleteOutboxReplies() {
+    #expect(RelayWorkCarrier.outbox(hostKey: "k", reply: nil) == nil)
+    #expect(RelayWorkCarrier.outbox(hostKey: "k", reply: ["items": []]) == nil)
+    let box = RelayWorkCarrier.outbox(hostKey: "k", reply: ["node_id": "n", "items": [
+        ["message_id": "m", "peer_node_id": "p"], ["message_id": "", "peer_node_id": "p"], ["message_id": "x"],
+    ]])
+    #expect(box == .init(hostKey: "k", nodeID: "n", items: [.init(messageID: "m", peerNodeID: "p")]))
+}
+
+@Test func workCarrierPacketsCarryOnlyIdentifiersAndSignedEnvelopes() {
+    #expect(RelayWorkCarrier.pendingPacket as NSDictionary == ["operation": "work_native_pending"] as NSDictionary)
+    #expect(RelayWorkCarrier.claimPacket(messageID: "m") as NSDictionary == ["operation": "work_native_claim", "message_id": "m"] as NSDictionary)
+    #expect(RelayWorkCarrier.deliverPacket(envelope: "e") as NSDictionary == ["operation": "deliver_signed_work", "work_envelope": "e"] as NSDictionary)
+    #expect(RelayWorkCarrier.settlePacket(messageID: "m", reply: "r") as NSDictionary == ["operation": "work_native_settle", "message_id": "m", "work_reply": "r"] as NSDictionary)
+    #expect(RelayWorkCarrier.interval(pending: true) == .seconds(5))
+    #expect(RelayWorkCarrier.interval(pending: false) == .seconds(30))
+}

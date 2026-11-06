@@ -99,6 +99,14 @@ func peerBinding(root, node, id string) (CommunicationPeerBinding, *x509.Certifi
 	return b, cert, err
 }
 func validPeerBinding(b CommunicationPeerBinding, node string) (*x509.Certificate, error) {
+	if b.Endpoint == workNativeEndpoint {
+		// The Relay host channel carries the node-signed envelopes; the pinned
+		// certificate is the same anchor the HTTPS transport would pin.
+		if b.Version != 1 || b.NodeID != node || !canonicalRouteToken(b.ID) || !canonicalRouteToken(b.PeerNodeID) || b.PeerNodeID == node {
+			return nil, errors.New("invalid peer binding")
+		}
+		return peerCertificate(b.CertificatePEM, b.PeerNodeID)
+	}
 	host, port, err := net.SplitHostPort(b.Endpoint)
 	n, numberErr := strconv.Atoi(port)
 	if b.Version != 1 || b.NodeID != node || !canonicalRouteToken(b.ID) || !canonicalRouteToken(b.PeerNodeID) ||
@@ -285,6 +293,9 @@ func communicationPeerProbe(root, node string, r CommunicationRequest) (map[stri
 		}
 		if r.ExpectedRouteRevision != route.Revision {
 			return errors.New("communication route revision conflict")
+		}
+		if b.Endpoint == workNativeEndpoint {
+			return errNativePeerRoute
 		}
 		_, pair, err = peerIdentity(root, node)
 		return err

@@ -184,6 +184,11 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 				return nil, errors.New("file and note exceed the 128 KiB Work transfer limit; shorten the note or send a smaller file; no request submitted")
 			}
 		}
+		if binding.Endpoint == workNativeEndpoint {
+			if e = workNativeSendable(m, r.Text, r.file != nil); e != nil {
+				return nil, e
+			}
+		}
 		if link.Local.Kind == "pane" {
 			m.PaneSignature, e = workSignPane(root, node, caller, r, origin, link)
 			if e != nil {
@@ -210,6 +215,13 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 			} else if !errors.Is(e, os.ErrNotExist) {
 				return e
 			}
+			if binding.Endpoint == workNativeEndpoint {
+				// The carrier reads the text from this private record and clears
+				// it when it dispatches; the receipt below never holds the text.
+				if e = workNativeQueue(root, receipt, link, r.Text); e != nil {
+					return e
+				}
+			}
 			if e = communicationAtomic(path, receipt); e != nil {
 				return e
 			}
@@ -222,6 +234,11 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 		if !claimed {
 			return workReceiptResult(receipt), nil
 		}
+	}
+	if binding.Endpoint == workNativeEndpoint {
+		// The Relay app carries this message over its host channel and settles
+		// the receipt; this call never posts and never resends.
+		return workNativeReceiptResult(receipt), nil
 	}
 	wire := receipt.Wire
 	if r.Operation == "send" {
@@ -265,6 +282,12 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 }
 
 func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (map[string]any, error) {
+	return workReceiveWith(ctx, root, node, peerCert, m, nil, "mutual_tls_pinned_node")
+}
+
+// workReceiveWith takes the source freshness check and the authentication
+// label from the carrier. A nil check asks the source over the HTTPS peer.
+func workReceiveWith(ctx context.Context, root, node, peerCert string, m workWire, fresh func(context.Context) error, auth string) (map[string]any, error) {
 	if m.Fingerprint == "" || m.Fingerprint != workFingerprint(m) || !remoteDigest(peerCert) || (m.Operation != "send" && m.Operation != "receipt" && m.Operation != "observe" && m.Operation != "repin") {
 		return nil, errors.New("invalid Work peer request")
 	}
@@ -343,6 +366,9 @@ func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (
 		return nil, errors.New("Work source cannot claim a pane signature")
 	}
 	sourceFresh := func(c context.Context) error { return workCheckPeerSource(c, root, node, link, m) }
+	if fresh != nil {
+		sourceFresh = fresh
+	}
 	if err = sourceFresh(ctx); err != nil {
 		return nil, err
 	}
@@ -392,7 +418,7 @@ func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (
 	if fileContent != nil {
 		saved, saveErr := saveWorkFile(m.Source.NodeID, m.MessageID, m.FileName, fileContent)
 		if saveErr != nil {
-			receipt.Result = map[string]any{"status": "not_sent", "error": "Work file could not be saved; not delivered", "peer_authentication": "mutual_tls_pinned_node"}
+			receipt.Result = map[string]any{"status": "not_sent", "error": "Work file could not be saved; not delivered", "peer_authentication": auth}
 			err = communicationFanoutLocked(root, func() error { return communicationAtomic(path, receipt) })
 			return workReceiptResult(receipt), err
 		}
@@ -410,7 +436,7 @@ func workReceive(ctx context.Context, root, node, peerCert string, m workWire) (
 		}
 	}
 	receipt.Result = communicationNativeOutcome(result, deliverErr)
-	receipt.Result["peer_authentication"] = "mutual_tls_pinned_node"
+	receipt.Result["peer_authentication"] = auth
 	if fileResult != nil {
 		receipt.Result["file"] = fileResult
 	}
@@ -438,29 +464,7 @@ func workObserveOutbound(ctx context.Context, root, node, peerCert string, m wor
 		if !validWorkTransportReceipt(receipt) || receipt.Wire.Fingerprint != m.Fingerprint {
 			return errors.New("source message unavailable")
 		}
-		var policy communicationPolicy
-		if e = communicationRead(communicationPolicyPath(root), &policy); e != nil {
-			return e
-		}
-		if e = communicationValidatePolicy(policy); e != nil {
-			return e
-		}
-		if m.Caller == "legacy-unattributed" {
-			if policy.LegacyPaused {
-				return errors.New("source caller paused")
-			}
-		} else {
-			found := false
-			for _, c := range policy.Callers {
-				if c.ID == m.Caller && !c.Paused {
-					found = true
-				}
-			}
-			if !found {
-				return errors.New("source caller unavailable")
-			}
-		}
-		return nil
+		return workSourceCallerAvailable(root, m.Caller)
 	})
 	if err != nil {
 		return nil, err
@@ -540,3 +544,27 @@ func workOutcomeUnknown(result map[string]any) bool {
 }
 
 var workReconcilePaneActor = ReconcileCommunicationActor
+
+// workSourceCallerAvailable reports whether the sending caller is still
+// admitted. Called under the communication lock.
+func workSourceCallerAvailable(root, caller string) error {
+	var policy communicationPolicy
+	if e := communicationRead(communicationPolicyPath(root), &policy); e != nil {
+		return e
+	}
+	if e := communicationValidatePolicy(policy); e != nil {
+		return e
+	}
+	if caller == "legacy-unattributed" {
+		if policy.LegacyPaused {
+			return errors.New("source caller paused")
+		}
+		return nil
+	}
+	for _, c := range policy.Callers {
+		if c.ID == caller && !c.Paused {
+			return nil
+		}
+	}
+	return errors.New("source caller unavailable")
+}

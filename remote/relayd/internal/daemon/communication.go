@@ -57,6 +57,8 @@ type CommunicationRequest struct {
 	LinkID                     string                     `json:"link_id,omitempty"`
 	AttestationID              string                     `json:"attestation_id,omitempty"`
 	SourceSignature            string                     `json:"source_signature,omitempty"`
+	WorkEnvelope               string                     `json:"work_envelope,omitempty"`
+	WorkReply                  string                     `json:"work_reply,omitempty"`
 	TrustedNodes               []communicationTrustedNode `json:"trusted_nodes,omitempty"`
 	Scope                      *communicationScopeRecord  `json:"scope,omitempty"`
 	// Relay assistant sends: the approving assistant request, and the recipient
@@ -407,6 +409,9 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 	}
 	if r.Operation == "route_probe" {
 		return communicationPeerProbe(communicationRoot(), currentCommunicationNodeID(), r)
+	}
+	if strings.HasPrefix(r.Operation, "work_native_") || r.Operation == "deliver_signed_work" {
+		return communicationWorkNative(context.Background(), communicationRoot(), currentCommunicationNodeID(), r)
 	}
 	r.SourcePaneID, r.PaneID = strings.ToLower(r.SourcePaneID), strings.ToLower(r.PaneID)
 	r.MessageID, r.LinkID = strings.ToLower(r.MessageID), strings.ToLower(r.LinkID)
