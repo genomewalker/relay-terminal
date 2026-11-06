@@ -17,6 +17,9 @@ func TestMain(m *testing.M) {
 		serveFakeReader(os.Args[len(os.Args)-2])
 		os.Exit(0)
 	}
+	if scenario := os.Getenv("FAKE_WORKER_SCENARIO"); scenario != "" {
+		os.Exit(fakeWorker(scenario))
+	}
 	os.Exit(m.Run())
 }
 

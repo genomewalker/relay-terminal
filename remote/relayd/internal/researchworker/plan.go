@@ -189,7 +189,7 @@ func Plan(p Policy, workerDir string) (Launch, error) {
 	if p.Provider == ProviderClaude {
 		config, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{ReaderServer: map[string]any{"type": "stdio", "command": p.Reader.Command, "args": append([]string{}, p.Reader.Args...)}}})
 		launch.Files[MCPConfigFile] = config
-		launch.Argv = []string{p.Executable, "--print", "--output-format", "json",
+		launch.Argv = []string{p.Executable, "--print", "--output-format", "stream-json", "--verbose",
 			"--model", p.Model, "--effort", p.Effort,
 			"--tools", "",
 			"--allowedTools", strings.Join(allowed, ","),
