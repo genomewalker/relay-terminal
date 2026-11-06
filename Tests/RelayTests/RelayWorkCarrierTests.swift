@@ -49,7 +49,22 @@ import Testing
     #expect(RelayWorkCarrier.nextCheck(after: none) == 600)
     #expect(RelayWorkCarrier.nextCheck(after: idle) == 30)
     #expect(RelayWorkCarrier.nextCheck(after: busy) == 5)
-    #expect(RelayWorkCarrier.nextCheck(after: nil) == 30)
+    #expect(RelayWorkCarrier.nextCheck(after: nil) == 600)
+    #expect(RelayWorkCarrier.nextCheck(after: nil, previous: idle) == 30)
+    #expect(RelayWorkCarrier.nextCheck(after: nil, previous: none) == 600)
     let parsed = RelayWorkCarrier.outbox(hostKey: "k", reply: ["node_id": "n", "items": [], "native_routes": 2])
     #expect(parsed?.nativeRoutes == 2)
+}
+
+@Test func workCarrierRequestsGoOnlyToTheWorkOwningRelayd() {
+    #expect(RelayWorkCarrier.carries(["operation": "work_native_pending"]))
+    #expect(RelayWorkCarrier.carries(["operation": "deliver_signed_work"]))
+    #expect(!RelayWorkCarrier.carries(["operation": "deliver_signed"]))
+    #expect(!RelayWorkCarrier.carries(["operation": "question_notices"]))
+    #expect(!RelayWorkCarrier.carries([:]))
+    let remote = ConnectionProfile(name: "dandy", kind: .ssh, host: "dandy-07")
+    let command = RelayHostExecution.workCarrierCommand(profile: remote, verb: "communication")
+    #expect(command.contains("relayd-work-communication\" communication"))
+    #expect(command.contains("exit 1"))
+    #expect(!command.contains("relayd-communication\""))
 }

@@ -87,11 +87,20 @@ enum RelayHostExecution {
     @MainActor static func communicationRequest(profile: ConnectionProfile, packet: [String: Any]) async throws -> (value: [String: Any]?, stderr: Data) {
         let verb = communicationVerb(packet)
         let fallback = daemonCommand(profile: profile, arguments: [verb])
-        let command = "if [ -x \"$HOME/.local/share/relay/bin/relayd-communication\" ]; then \"$HOME/.local/share/relay/bin/relayd-communication\" " + verb + "; else " + fallback + "; fi"
+        let command = RelayWorkCarrier.carries(packet) ? workCarrierCommand(profile: profile, verb: verb) : "if [ -x \"$HOME/.local/share/relay/bin/relayd-communication\" ]; then \"$HOME/.local/share/relay/bin/relayd-communication\" " + verb + "; else " + fallback + "; fi"
         let result = try await capture(profile: profile, command: command,
             input: JSONSerialization.data(withJSONObject: packet, options: .sortedKeys), timeout: 60, maximumBytes: 128 << 10)
         guard result.exitCode == 0 else { return (nil, result.stderr) }
         return (try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any], result.stderr)
+    }
+    /// Work host-channel requests go to the relayd that owns the Work link on
+    /// each host: the bundled relayd on this Mac, and the Work helper a remote
+    /// host installs for it. A host without that helper refuses rather than
+    /// reaching a relayd that does not know these operations.
+    static func workCarrierCommand(profile: ConnectionProfile, verb: String) -> String {
+        if profile.kind == .local { return daemonCommand(profile: profile, arguments: [verb]) }
+        let helper = "\"$HOME/.local/share/relay/bin/relayd-work-communication\""
+        return "if [ -x " + helper + " ]; then " + helper + " " + verb + "; else echo 'relayd: the Work host-channel helper is not installed on this host' >&2; exit 1; fi"
     }
     static func communicationVerb(_ packet: [String: Any]) -> String {
         // A legacy helper must refuse before I/O, rather than ignore the new

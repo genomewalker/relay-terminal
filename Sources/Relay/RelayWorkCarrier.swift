@@ -27,6 +27,12 @@ enum RelayWorkCarrier {
 
     static var pendingPacket: [String: Any] { ["operation": "work_native_pending"] }
 
+    static let carrierOperations: Set<String> = ["work_native_pending", "work_native_claim", "deliver_signed_work", "work_native_settle"]
+
+    static func carries(_ packet: [String: Any]) -> Bool {
+        (packet["operation"] as? String).map(carrierOperations.contains) ?? false
+    }
+
     static func claimPacket(messageID: String) -> [String: Any] {
         ["operation": "work_native_claim", "message_id": messageID]
     }
@@ -71,9 +77,11 @@ enum RelayWorkCarrier {
     /// When a host is checked next: 5 s while it has queued Work messages, 30 s
     /// while it has a host-channel route, and every 10 min when it has none,
     /// so the carrier costs nothing until a link is switched to this route.
-    /// A host that has not answered is retried after 30 s.
-    static func nextCheck(after box: Outbox?) -> TimeInterval {
-        guard let box else { return 30 }
+    /// A host that did not answer is retried after 30 s if it last reported a
+    /// host-channel route, and after 10 min otherwise (for example a host
+    /// without the Work helper).
+    static func nextCheck(after box: Outbox?, previous: Outbox? = nil) -> TimeInterval {
+        guard let box else { return (previous?.nativeRoutes ?? 0) > 0 ? 30 : 600 }
         if !box.items.isEmpty { return 5 }
         return box.nativeRoutes > 0 ? 30 : 600
     }
@@ -84,6 +92,7 @@ enum RelayWorkCarrier {
     private var task: Task<Void, Never>?
     private var outboxes: [String: RelayWorkCarrier.Outbox] = [:]
     private var due: [String: Date] = [:]
+    private var known: [String: RelayWorkCarrier.Outbox] = [:]
 
     init(workspace: WorkspaceModel?) {
         self.workspace = workspace
@@ -109,6 +118,7 @@ enum RelayWorkCarrier {
         let keys = Set(profiles.map(\.connectionKey))
         outboxes = outboxes.filter { keys.contains($0.key) }
         due = due.filter { keys.contains($0.key) }
+        known = known.filter { keys.contains($0.key) }
         guard profiles.count > 1 else { return }
         var byKey: [String: ConnectionProfile] = [:]
         for profile in profiles {
@@ -117,8 +127,9 @@ enum RelayWorkCarrier {
             guard now >= due[key] ?? .distantPast else { continue }
             let reply = try? await RelayPaneMessaging.shared.daemonRequest(profile: profile, packet: RelayWorkCarrier.pendingPacket, attach: false)
             let box = RelayWorkCarrier.outbox(hostKey: key, reply: reply)
+            due[key] = now.addingTimeInterval(RelayWorkCarrier.nextCheck(after: box, previous: known[key]))
+            if let box { known[key] = box }
             outboxes[key] = box
-            due[key] = now.addingTimeInterval(RelayWorkCarrier.nextCheck(after: box))
         }
         for step in RelayWorkCarrier.plan(Array(outboxes.values)) {
             guard let from = byKey[step.fromHost], let to = byKey[step.toHost] else { continue }
