@@ -16,6 +16,7 @@ enum RelayWorkCarrier {
         let hostKey: String
         let nodeID: String
         let items: [Item]
+        var nativeRoutes = 0
     }
 
     struct Step: Equatable {
@@ -46,7 +47,7 @@ enum RelayWorkCarrier {
                   !id.isEmpty, !peer.isEmpty else { return nil }
             return Item(messageID: id, peerNodeID: peer)
         }
-        return Outbox(hostKey: hostKey, nodeID: node, items: items)
+        return Outbox(hostKey: hostKey, nodeID: node, items: items, nativeRoutes: reply["native_routes"] as? Int ?? 0)
     }
 
     /// Pairs each pending item with the connected host whose relayd reports the
@@ -65,16 +66,24 @@ enum RelayWorkCarrier {
         return steps
     }
 
-    /// 5 s while a host has queued Work messages, 30 s otherwise. A send made
-    /// while the carrier idles waits at most one quiet interval.
-    static func interval(pending: Bool) -> Duration {
-        pending ? .seconds(5) : .seconds(30)
+    static let tick: Duration = .seconds(5)
+
+    /// When a host is checked next: 5 s while it has queued Work messages, 30 s
+    /// while it has a host-channel route, and every 10 min when it has none,
+    /// so the carrier costs nothing until a link is switched to this route.
+    /// A host that has not answered is retried after 30 s.
+    static func nextCheck(after box: Outbox?) -> TimeInterval {
+        guard let box else { return 30 }
+        if !box.items.isEmpty { return 5 }
+        return box.nativeRoutes > 0 ? 30 : 600
     }
 }
 
 @MainActor final class RelayWorkCarrierLoop {
     private weak var workspace: WorkspaceModel?
     private var task: Task<Void, Never>?
+    private var outboxes: [String: RelayWorkCarrier.Outbox] = [:]
+    private var due: [String: Date] = [:]
 
     init(workspace: WorkspaceModel?) {
         self.workspace = workspace
@@ -85,27 +94,33 @@ enum RelayWorkCarrier {
         task = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self, let workspace = self.workspace else { return }
-                let pending = await self.tick(workspace)
-                try? await Task.sleep(for: RelayWorkCarrier.interval(pending: pending))
+                await self.tick(workspace)
+                try? await Task.sleep(for: RelayWorkCarrier.tick)
             }
         }
     }
 
-    /// One pass. Every failure leaves relayd's records as they were; the next
-    /// pass claims again, which yields a receipt query and never a resend.
-    func tick(_ workspace: WorkspaceModel) async -> Bool {
+    /// One pass over the hosts that are due. Every failure leaves relayd's
+    /// records as they were; the next claim yields a receipt query, never a
+    /// resend.
+    func tick(_ workspace: WorkspaceModel, now: Date = Date()) async {
         var seen: Set<String> = []
         let profiles = workspace.panes.values.map(\.profile).filter { $0.backend == .relay && seen.insert($0.connectionKey).inserted }
-        guard profiles.count > 1 else { return false }
+        let keys = Set(profiles.map(\.connectionKey))
+        outboxes = outboxes.filter { keys.contains($0.key) }
+        due = due.filter { keys.contains($0.key) }
+        guard profiles.count > 1 else { return }
         var byKey: [String: ConnectionProfile] = [:]
-        var outboxes: [RelayWorkCarrier.Outbox] = []
         for profile in profiles {
-            byKey[profile.connectionKey] = profile
+            let key = profile.connectionKey
+            byKey[key] = profile
+            guard now >= due[key] ?? .distantPast else { continue }
             let reply = try? await RelayPaneMessaging.shared.daemonRequest(profile: profile, packet: RelayWorkCarrier.pendingPacket, attach: false)
-            if let box = RelayWorkCarrier.outbox(hostKey: profile.connectionKey, reply: reply) { outboxes.append(box) }
+            let box = RelayWorkCarrier.outbox(hostKey: key, reply: reply)
+            outboxes[key] = box
+            due[key] = now.addingTimeInterval(RelayWorkCarrier.nextCheck(after: box))
         }
-        let steps = RelayWorkCarrier.plan(outboxes)
-        for step in steps {
+        for step in RelayWorkCarrier.plan(Array(outboxes.values)) {
             guard let from = byKey[step.fromHost], let to = byKey[step.toHost] else { continue }
             guard let claim = try? await RelayPaneMessaging.shared.daemonRequest(profile: from, packet: RelayWorkCarrier.claimPacket(messageID: step.messageID), attach: false),
                   let envelope = claim["work_envelope"] as? String,
@@ -113,6 +128,12 @@ enum RelayWorkCarrier {
                   let reply = delivered["work_reply"] as? String else { continue }
             _ = try? await RelayPaneMessaging.shared.daemonRequest(profile: from, packet: RelayWorkCarrier.settlePacket(messageID: step.messageID, reply: reply), attach: false)
         }
-        return outboxes.contains { !$0.items.isEmpty }
+        // A carried item is gone from the cached outbox until its host is
+        // checked again; drop the cache so one envelope is not re-claimed
+        // within the same quiet interval.
+        for key in outboxes.keys where !(outboxes[key]?.items.isEmpty ?? true) {
+            outboxes[key] = nil
+            due[key] = now.addingTimeInterval(5)
+        }
     }
 }

@@ -27,15 +27,15 @@ import (
 // later claim returns a signed receipt query, never the text again), delivers
 // it to the peer's relayd and hands the signed reply back to settle.
 const (
-	workNativeEndpoint   = "relay-host-channel"
-	workNativeAuth       = "relay_host_channel_signed_node"
-	workNativeContext    = "relay-work-native/1\n"
-	workNativeWireLimit  = 36 << 10
-	workNativeEnvLimit   = 56 << 10
-	workNativeFreshness  = 2 * time.Minute
-	workNativeClockSkew  = 30 * time.Second
-	workNativeQueryLimit = 32
-	workNativeListLimit  = 64
+	workNativeEndpoint    = "relay-host-channel"
+	workNativeAuth        = "relay_host_channel_signed_node"
+	workNativeContext     = "relay-work-native/1\n"
+	workNativeWireLimit   = 36 << 10
+	workNativeEnvLimit    = 56 << 10
+	workNativeFreshness   = 2 * time.Minute
+	workNativeClockSkew   = 30 * time.Second
+	workNativeQueryWindow = 24 * time.Hour
+	workNativeListLimit   = 64
 )
 
 var errNativePeerRoute = errors.New("this route is carried by the Relay host channel; no HTTPS peer request is made")
@@ -99,7 +99,7 @@ func workNativeSendable(m workWire, text string, file bool) error {
 
 // Called under the communication lock before the outbound receipt is written.
 func workNativeQueue(root string, receipt workTransportReceipt, link communicationTypedRemoteLink, text string) error {
-	return communicationAtomic(workNativePendingPath(root, receipt.Wire.MessageID), workNativePending{Version: 1, MessageID: receipt.Wire.MessageID, LinkID: link.ID, PeerNodeID: link.Peer.NodeID, Fingerprint: receipt.Wire.Fingerprint, Text: text, Created: receipt.Created})
+	return communicationAtomic(workNativePendingPath(root, receipt.Wire.MessageID), workNativePending{Version: 1, MessageID: receipt.Wire.MessageID, LinkID: link.ID, PeerNodeID: link.Peer.NodeID, Fingerprint: receipt.Wire.Fingerprint, Text: text, Created: workNativeNow()})
 }
 
 func workNativeReceiptResult(receipt workTransportReceipt) map[string]any {
@@ -195,10 +195,21 @@ func communicationWorkNative(ctx context.Context, root, node string, r Communica
 
 func workNativeList(root, node string) (map[string]any, error) {
 	items := []map[string]any{}
+	native := 0
 	err := communicationFanoutLocked(root, func() error {
 		paths, e := filepath.Glob(filepath.Join(root, "work-native-pending-*.json"))
 		if e != nil {
 			return e
+		}
+		bindings, e := filepath.Glob(filepath.Join(root, "peer-binding-*.json"))
+		if e != nil {
+			return e
+		}
+		for _, path := range bindings {
+			var b CommunicationPeerBinding
+			if communicationRead(path, &b) == nil && b.Endpoint == workNativeEndpoint {
+				native++
+			}
 		}
 		sort.Strings(paths)
 		for _, path := range paths {
@@ -216,7 +227,7 @@ func workNativeList(root, node string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"node_id": node, "items": items, "authority": "relayd"}, nil
+	return map[string]any{"node_id": node, "items": items, "native_routes": native, "authority": "relayd"}, nil
 }
 
 // workNativeOutbound reads and cross-checks the pending record, the outbound
@@ -268,11 +279,11 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 		if p.Dispatched {
 			// Never send the text again; ask the peer for its receipt.
 			p.Queries++
-			if p.Queries > workNativeQueryLimit {
+			if workNativeNow().Sub(p.Created) > workNativeQueryWindow {
 				if e := os.Remove(workNativePendingPath(root, id)); e != nil {
 					return e
 				}
-				return errors.New("receipt query limit reached; the outcome stays unknown and is never resent")
+				return errors.New("no receipt after 24 h of queries; the outcome stays unknown and is never resent")
 			}
 			return communicationAtomic(workNativePendingPath(root, id), p)
 		}
@@ -455,7 +466,7 @@ func communicationBindingTransportSet(root, node string, r CommunicationRequest)
 	if target == previous.Endpoint {
 		return map[string]any{"binding": previous, "certificate_sha256": peerFingerprint(cert), "changed": false, "authority": "relayd"}, nil
 	}
-	saved := filepath.Join(root, "peer-binding-https-"+id+".json")
+	saved := filepath.Join(root, "saved-https-binding-"+id+".json")
 	next := previous
 	next.Endpoint = target
 	if target == workNativeEndpoint {

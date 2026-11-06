@@ -39,6 +39,17 @@ import Testing
     #expect(RelayWorkCarrier.claimPacket(messageID: "m") as NSDictionary == ["operation": "work_native_claim", "message_id": "m"] as NSDictionary)
     #expect(RelayWorkCarrier.deliverPacket(envelope: "e") as NSDictionary == ["operation": "deliver_signed_work", "work_envelope": "e"] as NSDictionary)
     #expect(RelayWorkCarrier.settlePacket(messageID: "m", reply: "r") as NSDictionary == ["operation": "work_native_settle", "message_id": "m", "work_reply": "r"] as NSDictionary)
-    #expect(RelayWorkCarrier.interval(pending: true) == .seconds(5))
-    #expect(RelayWorkCarrier.interval(pending: false) == .seconds(30))
+    #expect(RelayWorkCarrier.tick == .seconds(5))
+}
+
+@Test func workCarrierCostsNothingUntilARouteUsesTheHostChannel() {
+    let none = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 0)
+    let idle = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 1)
+    let busy = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [.init(messageID: "m", peerNodeID: "p")], nativeRoutes: 1)
+    #expect(RelayWorkCarrier.nextCheck(after: none) == 600)
+    #expect(RelayWorkCarrier.nextCheck(after: idle) == 30)
+    #expect(RelayWorkCarrier.nextCheck(after: busy) == 5)
+    #expect(RelayWorkCarrier.nextCheck(after: nil) == 30)
+    let parsed = RelayWorkCarrier.outbox(hostKey: "k", reply: ["node_id": "n", "items": [], "native_routes": 2])
+    #expect(parsed?.nativeRoutes == 2)
 }

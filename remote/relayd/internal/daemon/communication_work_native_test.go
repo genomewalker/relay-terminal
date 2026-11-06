@@ -60,6 +60,9 @@ func workNativeClaimEnvelope(t *testing.T, root, node, id string) (map[string]an
 func workNativeCarry(t *testing.T, from, fromNode, to, toNode string) []map[string]any {
 	t.Helper()
 	pending, err := workNativeOp(from, fromNode, CommunicationRequest{Operation: "work_native_pending"})
+	if pending["native_routes"] != 1 {
+		t.Fatal("native route count", pending["native_routes"])
+	}
 	if err != nil || pending["node_id"] != fromNode {
 		t.Fatal("pending", pending, err)
 	}
@@ -210,9 +213,12 @@ func TestWorkNativeNoResendOnUnknown(t *testing.T) {
 	// Query polling is bounded and never turns into a resend.
 	workNativeQueueSend(t, a, al, workNativeSecondID, "never answered")
 	workNativeClaimEnvelope(t, a, "node-a", workNativeSecondID)
-	for i := 0; i < workNativeQueryLimit; i++ {
+	for i := 0; i < 100; i++ {
 		workNativeClaimEnvelope(t, a, "node-a", workNativeSecondID)
 	}
+	base := workNativeNow
+	workNativeNow = func() time.Time { return base().Add(workNativeQueryWindow + time.Minute) }
+	defer func() { workNativeNow = base }()
 	if _, err := workNativeOp(a, "node-a", CommunicationRequest{Operation: "work_native_claim", MessageID: workNativeSecondID}); err == nil {
 		t.Fatal("receipt polling unbounded")
 	}
