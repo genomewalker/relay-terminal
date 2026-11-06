@@ -1117,6 +1117,14 @@ final class PaneModel: ObservableObject, Identifiable {
         detector.markExited()
     }
 
+    /// The content-free fingerprint of a UserPromptSubmit hook.
+    static func providerPromptFingerprint(_ event: [String: Any]) -> RelayPromptFingerprint? {
+        if let length = (event["prompt_length"] as? NSNumber)?.intValue, let prefix = event["prompt_sha256_prefix"] as? String {
+            return RelayPromptFingerprint(length: length, sha256Prefix: prefix)
+        }
+        return (event["prompt"] as? String).map(RelayPromptFingerprint.init)
+    }
+
     func userEnteredInput() {
         agentLastInputAt = Date()
         agentInputRevision &+= 1
@@ -1193,6 +1201,15 @@ final class PaneModel: ObservableObject, Identifiable {
         if agentSnapshotReplayDepth == 0,
            ((envelope["relay_event_seq"] as? NSNumber)?.uint64Value ?? UInt64.max) > priorCursor {
             RelayRecoveryStore.shared.recordAgentEvent(paneID: id, profile: profile, event: event)
+        }
+        if agentName == "relay", event["type"] as? String == "peer_message_delivered" {
+            // relayd wrote a peer message to this pane's native inbox, outside the
+            // desktop key path: programmatic input. Content-free; never replayed.
+            guard agentSnapshotReplayDepth == 0,
+                  ((envelope["relay_event_seq"] as? NSNumber)?.uint64Value ?? UInt64.max) > priorCursor,
+                  let messageID = event["message_id"] as? String else { return }
+            promptProvenance.daemonDelivery(messageID: messageID, at: Date())
+            return
         }
         if agentName == "relay",
            event["type"] as? String == "open_file",
@@ -1389,9 +1406,10 @@ final class PaneModel: ObservableObject, Identifiable {
             pendingAgentApprovals = 0
             if eventName == "UserPromptSubmit", agentSnapshotReplayDepth == 0,
                ((envelope["relay_event_seq"] as? NSNumber)?.uint64Value ?? UInt64.max) > priorCursor,
-               let prompt = event["prompt"] as? String {
-                // The provider's own prompt: keep its length and hash prefix only.
-                promptProvenance.providerPrompt(RelayPromptFingerprint(prompt),
+               let fingerprint = Self.providerPromptFingerprint(event) {
+                // relayd reduced the prompt to a length, a hash prefix and any
+                // peer-message ID; a raw prompt is reduced here and dropped.
+                promptProvenance.providerPrompt(fingerprint, peerMessageID: event["prompt_peer_message_id"] as? String,
                     promptSource: (event["prompt_source"] as? String) ?? (event["promptSource"] as? String), at: Date())
             }
             detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Thinking")

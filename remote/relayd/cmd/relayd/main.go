@@ -38,6 +38,7 @@ const supervisorProtocolVersion = 2
 
 func main() {
 	configureRuntime()
+	daemon.PeerDeliveryNotice = sendPeerDeliveryNotice
 	invocation := os.Getenv("RELAY_INVOKED_AS")
 	if invocation == "" {
 		invocation = filepath.Base(os.Args[0])

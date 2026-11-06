@@ -257,6 +257,7 @@ func communicationNative(pane string, packet map[string]any) (map[string]any, er
 	if err := json.Unmarshal(output, &result); err != nil {
 		return nil, err
 	}
+	announcePeerDelivery(pane, packet, result)
 	return result, nil
 }
 

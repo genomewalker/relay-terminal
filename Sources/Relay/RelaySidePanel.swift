@@ -2527,7 +2527,7 @@ final class RelaySidePanelServer: ObservableObject {
                     submittingClientID: submittingClientID, callerToken: callerToken)
                 if RelayPromptProvenanceLog.messageMayHaveReachedPane(result), workspace.panes[paneID] === target {
                     target?.promptProvenance.programmaticSubmit(source: "pane_message",
-                        fingerprint: RelayPromptFingerprint(input.text))
+                        fingerprint: RelayPromptFingerprint(input.text), messageID: input.messageID.uuidString)
                 }
                 return try .jsonObject(result)
             } catch { return .text(error.localizedDescription, status: 409, reason: "Conflict") }

@@ -53,6 +53,8 @@ struct RelayPromptSubmitRecord: Codable, Equatable, Sendable {
     var programmaticSource: String?
     var submittedAt: Date
     var providerReportedAt: Date?
+    /// The Relay message ID of a peer message this submit carried, from relayd.
+    var peerMessageID: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case intent, counts
@@ -65,6 +67,7 @@ struct RelayPromptSubmitRecord: Codable, Equatable, Sendable {
         case programmaticSource = "programmatic_source"
         case submittedAt = "submitted_at"
         case providerReportedAt = "provider_reported_at"
+        case peerMessageID = "peer_message_id"
     }
 }
 
@@ -79,6 +82,14 @@ struct RelayPromptFingerprint: Equatable, Sendable {
         sha256Prefix = String(Self.hexDigest(text).prefix(Self.prefixLength))
     }
 
+    /// A fingerprint relayd computed from the hook, already content-free.
+    init?(length: Int, sha256Prefix: String) {
+        guard (0...(1 << 24)).contains(length),
+              sha256Prefix.range(of: "^[0-9a-f]{12}$", options: .regularExpression) != nil else { return nil }
+        self.length = length
+        self.sha256Prefix = sha256Prefix
+    }
+
     static func hexDigest(_ text: String) -> String {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
@@ -91,6 +102,9 @@ struct RelayPromptProvenanceLog: Sendable {
     /// A provider prompt report this soon after a submit belongs to it.
     static let providerMatchWindow: TimeInterval = 60
     static let promptSourcePattern = #"^[A-Za-z0-9_.:-]{1,32}$"#
+    static let messageIDPattern = #"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"#
+    /// A peer message relayd wrote to the pane's native inbox, outside the desktop.
+    static let daemonSource = "pane_message_daemon"
 
     private(set) var pending = RelayPromptInputCounts()
     private(set) var history: [RelayPromptSubmitRecord] = []
@@ -151,9 +165,16 @@ struct RelayPromptProvenanceLog: Sendable {
     mutating func endProgrammatic() { programmaticDepth = max(0, programmaticDepth - 1) }
 
     /// A Relay automation path delivered input to this pane.
-    mutating func programmaticSubmit(source: String, fingerprint: RelayPromptFingerprint?, at date: Date = Date()) {
+    mutating func programmaticSubmit(source: String, fingerprint: RelayPromptFingerprint?, messageID: String? = nil,
+                                     at date: Date = Date()) {
+        let id = Self.validMessageID(messageID)
+        // relayd's notice or the provider's report for this message came first.
+        if let id, let index = recordIndex(peerMessageID: id) {
+            markProgrammatic(at: index, source: source)
+            return
+        }
         // A provider report that arrived first, while the write was in flight.
-        if var last = history.last, last.programmaticSource == nil, last.inputClass == .programmatic,
+        if id == nil, var last = history.last, last.programmaticSource == nil, last.inputClass == .programmatic,
            date.timeIntervalSince(last.submittedAt) <= Self.providerMatchWindow {
             last.programmaticSource = source
             history[history.count - 1] = last
@@ -165,7 +186,42 @@ struct RelayPromptProvenanceLog: Sendable {
             suggestionAccepted: false, submittedLength: fingerprint?.length,
             lengthSource: fingerprint == nil ? nil : "programmatic_request", promptSource: nil,
             promptSHA256Prefix: fingerprint?.sha256Prefix, programmaticSource: source,
-            submittedAt: date, providerReportedAt: nil))
+            submittedAt: date, providerReportedAt: nil, peerMessageID: id))
+    }
+
+    /// relayd wrote peer message `messageID` to this pane's native inbox (its
+    /// content-free peer_message_delivered event). The submit it caused is
+    /// programmatic. A notice only ever moves a record toward programmatic, and
+    /// only one that names the same message; desktop submits never name one.
+    mutating func daemonDelivery(messageID: String, at date: Date = Date()) {
+        guard let id = Self.validMessageID(messageID) else { return }
+        if let index = recordIndex(peerMessageID: id) {
+            markProgrammatic(at: index, source: Self.daemonSource)
+            return
+        }
+        append(RelayPromptSubmitRecord(inputClass: .programmatic, intent: "weak", counts: RelayPromptInputCounts(),
+            suggestionAccepted: false, submittedLength: nil, lengthSource: nil, promptSource: nil,
+            promptSHA256Prefix: nil, programmaticSource: Self.daemonSource, submittedAt: date,
+            providerReportedAt: nil, peerMessageID: id), resetPending: false)
+    }
+
+    static func validMessageID(_ value: String?) -> String? {
+        guard let value = value?.lowercased(),
+              value.range(of: messageIDPattern, options: .regularExpression) != nil else { return nil }
+        return value
+    }
+
+    private func recordIndex(peerMessageID id: String) -> Int? {
+        history.indices.last { history[$0].peerMessageID == id }
+    }
+
+    private mutating func markProgrammatic(at index: Int, source: String) {
+        var record = history[index]
+        record.inputClass = .programmatic
+        record.intent = "weak"
+        record.suggestionAccepted = false
+        if record.programmaticSource == nil { record.programmaticSource = source }
+        history[index] = record
     }
 
     // MARK: Provider evidence
@@ -173,13 +229,34 @@ struct RelayPromptProvenanceLog: Sendable {
     /// The agent's own record of a submitted prompt (Claude's UserPromptSubmit
     /// hook). The length replaces the visible-line estimate and reclassifies a
     /// desktop submit; it never upgrades a programmatic one.
-    mutating func providerPrompt(_ fingerprint: RelayPromptFingerprint, promptSource: String?, at date: Date = Date()) {
+    mutating func providerPrompt(_ fingerprint: RelayPromptFingerprint, peerMessageID: String? = nil,
+                                 promptSource: String?, at date: Date = Date()) {
         let source = promptSource.flatMap {
             $0.range(of: Self.promptSourcePattern, options: .regularExpression) == nil ? nil : $0
         }
+        if let id = Self.validMessageID(peerMessageID) {
+            // The prompt was a Relay peer message, never a desktop submit. It
+            // joins relayd's delivery record, or stays unknown until one names it.
+            if let index = recordIndex(peerMessageID: id), history[index].providerReportedAt == nil {
+                var record = history[index]
+                record.providerReportedAt = date
+                record.promptSource = source
+                record.submittedLength = fingerprint.length
+                record.lengthSource = "provider"
+                record.promptSHA256Prefix = fingerprint.sha256Prefix
+                history[index] = record
+                return
+            }
+            append(RelayPromptSubmitRecord(inputClass: programmaticDepth > 0 ? .programmatic : .unknown, intent: "weak",
+                counts: RelayPromptInputCounts(), suggestionAccepted: false, submittedLength: fingerprint.length,
+                lengthSource: "provider", promptSource: source, promptSHA256Prefix: fingerprint.sha256Prefix,
+                programmaticSource: nil, submittedAt: date, providerReportedAt: date, peerMessageID: id), resetPending: false)
+            return
+        }
         // While automation is writing, a report belongs to the automation and
-        // must not lend a provider length to an earlier desktop submit.
-        if var last = history.last, last.providerReportedAt == nil,
+        // must not lend a provider length to an earlier desktop submit. A
+        // record that names a peer message waits for that message's own report.
+        if var last = history.last, last.providerReportedAt == nil, last.peerMessageID == nil,
            programmaticDepth == 0 || last.inputClass == .programmatic,
            date.timeIntervalSince(last.submittedAt) <= Self.providerMatchWindow,
            date.timeIntervalSince(last.submittedAt) >= -1 {
@@ -245,9 +322,13 @@ struct RelayPromptProvenanceLog: Sendable {
         return Verdict(inputClass: .typed, intent: accepted ? "weak" : "strong", suggestionAccepted: accepted)
     }
 
-    private mutating func append(_ record: RelayPromptSubmitRecord) {
-        pending = RelayPromptInputCounts()
-        lastPasteEvent = nil
+    /// A peer-message delivery did not touch the input line, so it leaves the
+    /// pending keystroke counts alone (`resetPending: false`).
+    private mutating func append(_ record: RelayPromptSubmitRecord, resetPending: Bool = true) {
+        if resetPending {
+            pending = RelayPromptInputCounts()
+            lastPasteEvent = nil
+        }
         history.append(record)
         if history.count > Self.historyLimit { history.removeFirst(history.count - Self.historyLimit) }
     }

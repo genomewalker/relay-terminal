@@ -57,6 +57,9 @@ func CanonicalAgentEnvelope(provider string, raw []byte, source string) ([]byte,
 func canonicalNativeEvent(provider string, input map[string]any) map[string]any {
 	if input["hook_event_name"] != nil || input["event_type"] != nil {
 		event := copyAgentMetadata(input)
+		if provider == "claude" {
+			addClaudePromptFingerprint(event, input)
+		}
 		if provider == "claude" && input["hook_event_name"] == "PostToolUse" && (input["tool_name"] == "TaskCreate" || input["tool_name"] == "TaskUpdate") {
 			arguments, _ := input["tool_input"].(map[string]any)
 			response, _ := input["tool_response"].(map[string]any)

@@ -218,3 +218,117 @@ enum RelayPromptFingerprintTestSupport {
         RelayPromptFingerprint.hexDigest(text)
     }
 }
+
+// bc08 finding 1: a peer message relayd writes to a pane's native inbox (not
+// the desktop /message route) is programmatic, matched by message ID between
+// relayd's content-free delivery notice and Claude's UserPromptSubmit report.
+@Suite struct RelayPromptProvenanceDaemonDeliveryTests {
+    private let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    private let id = "4f8b2d6a-3c19-4e75-a0d2-9b7e1c5f3a64"
+    private var report: RelayPromptFingerprint { RelayPromptFingerprint(length: 900, sha256Prefix: "0123456789ab")! }
+
+    @Test func noticeThenProviderReportIsOneProgrammaticRecordTheReportCannotUpgrade() throws {
+        var log = RelayPromptProvenanceLog()
+        log.daemonDelivery(messageID: id.uppercased(), at: t0)
+        log.providerPrompt(report, peerMessageID: id, promptSource: "typed", at: t0 + 2)
+        #expect(log.history.count == 1)
+        let record = log.latest
+        #expect(record?.inputClass == .programmatic)
+        #expect(record?.intent == "weak")
+        #expect(record?.programmaticSource == RelayPromptProvenanceLog.daemonSource)
+        #expect(record?.peerMessageID == id)
+        #expect(record?.submittedLength == 900)
+        #expect(record?.lengthSource == "provider")
+        // A second report for the same message changes nothing.
+        log.providerPrompt(report, peerMessageID: id, promptSource: nil, at: t0 + 3)
+        try #require(log.history.count == 2)
+        #expect(log.history[0].inputClass == .programmatic)
+    }
+
+    @Test func providerReportFirstIsUnknownUntilTheNoticeNamesIt() {
+        var log = RelayPromptProvenanceLog()
+        log.providerPrompt(report, peerMessageID: id, promptSource: nil, at: t0)
+        #expect(log.latest?.inputClass == .unknown)
+        log.daemonDelivery(messageID: id, at: t0 + 1)
+        #expect(log.history.count == 1)
+        #expect(log.latest?.inputClass == .programmatic)
+        #expect(log.latest?.programmaticSource == RelayPromptProvenanceLog.daemonSource)
+        // A repeated notice does not add a record.
+        log.daemonDelivery(messageID: id, at: t0 + 2)
+        #expect(log.history.count == 1)
+    }
+
+    @Test func unmatchedPeerReportStaysUnknownAndNeverJoinsADesktopSubmit() throws {
+        var log = RelayPromptProvenanceLog()
+        let typed = "yes, commit it"
+        log.printable(typed.count)
+        _ = log.userSubmit(visible: RelayPromptFingerprint(typed), at: t0)
+        log.providerPrompt(report, peerMessageID: id, promptSource: nil, at: t0 + 1)
+        try #require(log.history.count == 2)
+        #expect(log.history[0].inputClass == .typed)
+        #expect(log.history[0].intent == "strong")
+        #expect(log.history[0].lengthSource == "visible_input")
+        #expect(log.history[1].inputClass == .unknown)
+        #expect(log.history[1].intent == "weak")
+    }
+
+    @Test func aNoticeNeverTouchesADesktopSubmitAndMalformedIDsAreIgnored() {
+        var log = RelayPromptProvenanceLog()
+        log.printable(10)
+        _ = log.userSubmit(visible: nil, at: t0)
+        for bad in ["", "not-an-id", "../" + id, id + "0", "4f8b2d6a"] {
+            log.daemonDelivery(messageID: bad, at: t0 + 1)
+            log.providerPrompt(report, peerMessageID: bad, promptSource: nil, at: t0 + 100)
+        }
+        #expect(log.history.first?.inputClass == .typed)
+        #expect(!log.history.contains { $0.inputClass == .programmatic })
+        // A notice for another message is its own programmatic record.
+        log.daemonDelivery(messageID: id, at: t0 + 200)
+        #expect(log.history.first?.inputClass == .typed)
+        #expect(log.latest?.inputClass == .programmatic)
+    }
+
+    @Test func aDeliveryLeavesKeysTypedMeanwhileCounted() {
+        var log = RelayPromptProvenanceLog()
+        let draft = "half a reply"
+        log.printable(draft.count)
+        log.daemonDelivery(messageID: id, at: t0)
+        log.providerPrompt(report, peerMessageID: id, promptSource: nil, at: t0 + 1)
+        #expect(log.pending.printable == draft.count)
+        let record = log.userSubmit(visible: RelayPromptFingerprint(draft), at: t0 + 5)
+        #expect(record?.inputClass == .typed)
+        #expect(record?.intent == "strong")
+    }
+
+    @Test func aReportWithoutAPeerIDDoesNotJoinADaemonRecord() throws {
+        var log = RelayPromptProvenanceLog()
+        log.daemonDelivery(messageID: id, at: t0)
+        log.providerPrompt(report, promptSource: nil, at: t0 + 1)
+        try #require(log.history.count == 2)
+        #expect(log.history[0].providerReportedAt == nil)
+        #expect(log.history[1].inputClass == .unknown)
+    }
+
+    @Test func desktopRouteAndRelaydNoticeForOneMessageAreOneRecord() {
+        var log = RelayPromptProvenanceLog()
+        log.programmaticSubmit(source: "pane_message", fingerprint: RelayPromptFingerprint("body"), messageID: id, at: t0)
+        log.daemonDelivery(messageID: id, at: t0 + 1)
+        #expect(log.history.count == 1)
+        #expect(log.latest?.programmaticSource == "pane_message")
+        var reversed = RelayPromptProvenanceLog()
+        reversed.daemonDelivery(messageID: id, at: t0)
+        reversed.programmaticSubmit(source: "pane_message", fingerprint: nil, messageID: id, at: t0 + 1)
+        #expect(reversed.history.count == 1)
+        #expect(reversed.latest?.inputClass == .programmatic)
+    }
+
+    @MainActor @Test func hookFieldsBecomeAFingerprintOnlyWhenWellFormed() {
+        let good = PaneModel.providerPromptFingerprint(["prompt_length": 900, "prompt_sha256_prefix": "0123456789ab"])
+        #expect(good == RelayPromptFingerprint(length: 900, sha256Prefix: "0123456789ab"))
+        #expect(PaneModel.providerPromptFingerprint(["prompt_length": 900, "prompt_sha256_prefix": "0123456789AB"]) == nil)
+        #expect(PaneModel.providerPromptFingerprint(["prompt_length": -1, "prompt_sha256_prefix": "0123456789ab"]) == nil)
+        #expect(PaneModel.providerPromptFingerprint(["prompt_length": 9, "prompt_sha256_prefix": "0123"]) == nil)
+        #expect(PaneModel.providerPromptFingerprint([:]) == nil)
+        #expect(PaneModel.providerPromptFingerprint(["prompt": "abc"]) == RelayPromptFingerprint("abc"))
+    }
+}

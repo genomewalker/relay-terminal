@@ -179,6 +179,8 @@ func indexedAgentPayload(payload []byte, sequence uint64) []byte {
 				"status": true, "from_peer_id": true, "to_peer_id": true,
 				"message_type": true, "delivery": true,
 				"session_id": true, "parent_session_id": true,
+				// Content-free prompt provenance (lengths and hash prefixes only).
+				"prompt_length": true, "prompt_sha256_prefix": true, "prompt_peer_message_id": true,
 			}
 			minimal := make(map[string]any, len(event))
 			for key, value := range event {
