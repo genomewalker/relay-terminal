@@ -40,6 +40,7 @@ type CommunicationRequest struct {
 	SourcePaneID               string                     `json:"source_pane_id,omitempty"`
 	PaneID                     string                     `json:"pane_id,omitempty"`
 	TargetSessionID            string                     `json:"target_session_id,omitempty"`
+	ClaudeAccountRoot          string                     `json:"claude_account_root,omitempty"`
 	MessageID                  string                     `json:"message_id,omitempty"`
 	Text                       string                     `json:"text,omitempty"`
 	ClientID                   string                     `json:"client_id,omitempty"`
@@ -244,8 +245,18 @@ func communicationNative(pane string, packet map[string]any) (map[string]any, er
 	defer cancel()
 	// The adapter's sockets end at this deadline. A binding read cannot be
 	// cancelled, so a run past it is abandoned rather than awaited.
+	target, session, err := communicationNativeTarget(communicationRoot(), pane)
+	if err != nil {
+		return nil, err
+	}
 	done := make(chan []byte, 1)
-	go func() { done <- nativemsg.Output(communicationNativeRun(ctx, communicationNativeHost(), pane, data)) }()
+	go func() {
+		if session {
+			done <- nativemsg.Output(communicationClaudeSessionRun(ctx, communicationNativeHost(), target, data))
+			return
+		}
+		done <- nativemsg.Output(communicationNativeRun(ctx, communicationNativeHost(), pane, data))
+	}()
 	var output []byte
 	select {
 	case output = <-done:
@@ -260,7 +271,10 @@ func communicationNative(pane string, packet map[string]any) (map[string]any, er
 	if err := json.Unmarshal(output, &result); err != nil {
 		return nil, err
 	}
-	announcePeerDelivery(pane, packet, result)
+	// The delivery notice goes to a pane worker; a Claude session has none.
+	if !session {
+		announcePeerDelivery(pane, packet, result)
+	}
 	return result, nil
 }
 

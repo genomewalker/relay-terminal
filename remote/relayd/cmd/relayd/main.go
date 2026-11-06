@@ -375,7 +375,7 @@ func main() {
 		} else if len(os.Args) != 2 {
 			fatal("usage: relayd communication-actor [CLIENT_PID]")
 		}
-		actor, err := daemon.ReadCommunicationActor(pid)
+		actor, err := daemon.ReadCommunicationActorOrClaudeSession(pid)
 		if err != nil {
 			fatal(err.Error())
 		}

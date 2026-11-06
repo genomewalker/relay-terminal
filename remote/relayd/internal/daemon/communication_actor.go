@@ -170,7 +170,7 @@ func ReconcileCommunicationActor(r CommunicationRequest, clientPID int) (Communi
 	if r.ActorPaneID == "" {
 		return r, nil
 	}
-	actor, err := ReadCommunicationActor(clientPID)
+	actor, err := ReadCommunicationActorOrClaudeSession(clientPID)
 	if err != nil {
 		return r, err
 	}

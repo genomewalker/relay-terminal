@@ -30,7 +30,7 @@ func (s *server) communicationActor() (string, error) {
 	}
 	if stdout.Len() > 8192 || json.Unmarshal(stdout.Bytes(), &actor) != nil || actor.Version != 1 ||
 		!paneID.MatchString(actor.PaneID) || actor.ClientPID != os.Getpid() || actor.ClientStart == "" ||
-		(actor.Source != "foreground_worker_kernel_ancestry" && actor.Source != "native_parked_job_kernel_owner") {
+		(actor.Source != "foreground_worker_kernel_ancestry" && actor.Source != "native_parked_job_kernel_owner" && actor.Source != "claude_desktop_session_kernel_owner") {
 		return "", fmt.Errorf("invalid native caller pane proof")
 	}
 	return actor.PaneID, nil

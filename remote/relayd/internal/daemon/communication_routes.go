@@ -50,6 +50,9 @@ func communicationRouteOperation(root, nodeID string, r CommunicationRequest) (m
 	if r.ClientToken != "" || r.ActorPaneID != "" {
 		return nil, errors.New("owner administration required")
 	}
+	if strings.HasPrefix(r.Operation, "route_claude_session_") {
+		return communicationClaudeSessionOperation(root, r, time.Now)
+	}
 	if r.Operation == "route_scope_set" {
 		return communicationScopeSet(root, nodeID, r)
 	}
