@@ -22,10 +22,19 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+
+	"github.com/relay-terminal/relayd/internal/evidencereader"
 	"regexp"
 	"strconv"
 	"strings"
 )
+
+// EvidenceReaderFor returns the reader entry for relay-evidence-reader bound to
+// one allowlist file and one research contract.
+func EvidenceReaderFor(binary, allowlistPath, allowlistSHA256, contractSHA256 string) Reader {
+	return Reader{Command: binary, Args: []string{"--allowlist", allowlistPath, "--allowlist-sha256", allowlistSHA256, "--contract-sha256", contractSHA256},
+		Tools: append([]string{}, evidencereader.ToolNames...)}
+}
 
 const (
 	ProviderClaude = "claude"
@@ -149,6 +158,11 @@ func validate(p Policy, workerDir string) error {
 	for _, arg := range p.Reader.Args {
 		if !cleanArgument(arg) {
 			return errors.New("reader arguments must be non-empty printable text")
+		}
+	}
+	for i, arg := range p.Reader.Args {
+		if arg == "--contract-sha256" && (i+1 >= len(p.Reader.Args) || p.Reader.Args[i+1] != p.ContractSHA256) {
+			return errors.New("evidence reader is bound to a different contract than the worker")
 		}
 	}
 	seen := map[string]bool{}
