@@ -76,6 +76,25 @@ type Binding struct {
 	Effort         string `json:"effort"`
 	ArgvSHA256     string `json:"argv_sha256"`
 	PromptSHA256   string `json:"prompt_sha256"`
+	Budget         Budget `json:"budget"`
+}
+
+// USDUnknown is the status when the provider reports no cost.
+const USDUnknown = "unknown, not verified"
+
+// BudgetLine is one limit, what was used, and how that was established.
+type BudgetLine struct {
+	Limit  any    `json:"limit"`
+	Used   any    `json:"used"`
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type BudgetUse struct {
+	Passes      BudgetLine `json:"passes"`
+	Retries     BudgetLine `json:"retries"`
+	WallSeconds BudgetLine `json:"wall_seconds"`
+	USD         BudgetLine `json:"usd"`
 }
 
 type Check struct {
@@ -96,6 +115,7 @@ type Receipt struct {
 	CostUSD          *float64       `json:"cost_usd,omitempty"`
 	Usage            map[string]any `json:"usage,omitempty"`
 	Effective        map[string]any `json:"effective_settings"`
+	Budget           BudgetUse      `json:"budget"`
 	Checks           []Check        `json:"checks"`
 	ScopeEnforcement string         `json:"scope_enforcement"`
 	Verified         bool           `json:"verified"`
@@ -197,7 +217,7 @@ func Run(ctx context.Context, request Request) (Receipt, error) {
 	}
 	argv, _ := json.Marshal(launch.Argv)
 	binding := Binding{Version: 1, RequestID: request.RequestID, ContractSHA256: request.Policy.ContractSHA256, Provider: request.Policy.Provider,
-		Model: request.Policy.Model, Effort: request.Policy.Effort, ArgvSHA256: digestString(string(argv)), PromptSHA256: digestString(request.Prompt)}
+		Model: request.Policy.Model, Effort: request.Policy.Effort, ArgvSHA256: digestString(string(argv)), PromptSHA256: digestString(request.Prompt), Budget: request.Policy.Budget}
 	encoded, _ := json.MarshalIndent(binding, "", "  ")
 
 	if err := os.Mkdir(dir, 0o700); err != nil {
@@ -304,13 +324,41 @@ func start(ctx context.Context, request Request, launch Launch, binding Binding,
 		checks = append(checks, Check{Name: "exit", Status: CheckViolated, Detail: fmt.Sprintf("exit code %d", receipt.ExitCode)})
 	}
 	receipt.Checks = checks
+	receipt.Budget = budgetUse(request.Policy.Budget, receipt)
 	return finish(dir, receipt)
+}
+
+// budgetUse summarises the budget from the checks already made. Retries are
+// always 0: Run starts a request once and never restarts it.
+func budgetUse(budget Budget, receipt Receipt) BudgetUse {
+	line := func(name string, limit, used any) BudgetLine {
+		out := BudgetLine{Limit: limit, Used: used, Status: CheckUnverified}
+		for _, c := range receipt.Checks {
+			if c.Name == name && (out.Status != CheckViolated) {
+				out.Status, out.Detail = c.Status, c.Detail
+			}
+		}
+		return out
+	}
+	elapsed := receipt.EndedAt.Sub(receipt.StartedAt).Seconds()
+	use := BudgetUse{
+		Passes:      line("passes", budget.Passes, 1),
+		Retries:     BudgetLine{Limit: budget.Retries, Used: 0, Status: CheckVerified, Detail: "started once; Run never restarts a request"},
+		WallSeconds: line("wall_seconds", budget.WallSeconds, float64(int(elapsed*1000))/1000),
+		USD:         line("usd", budget.USD, nil),
+	}
+	if receipt.CostUSD != nil {
+		use.USD.Used = *receipt.CostUSD
+	} else {
+		use.USD.Status = USDUnknown
+	}
+	return use
 }
 
 // requiredChecks must all be verified for a receipt to be Verified.
 var requiredChecks = map[string][]string{
-	ProviderClaude: {"model", "tools", "mcp_servers", "permission_mode", "cwd", "result", "exit", "wall_seconds"},
-	ProviderCodex:  {"thread", "items", "model", "approval_policy", "sandbox", "result", "exit", "wall_seconds"},
+	ProviderClaude: {"model", "tools", "mcp_servers", "permission_mode", "cwd", "result", "exit", "wall_seconds", "passes"},
+	ProviderCodex:  {"thread", "items", "model", "approval_policy", "sandbox", "result", "exit", "wall_seconds", "passes"},
 }
 
 func finish(dir string, receipt Receipt) Receipt {
@@ -378,13 +426,18 @@ func compare(name string, got any, want string) Check {
 func verifyClaude(raw []byte, launch Launch, policy Policy, receipt *Receipt) []Check {
 	var checks []Check
 	var init, result map[string]any
+	inits, results := 0, 0
 	for _, event := range eventLines(raw) {
 		switch event["type"] {
 		case "system":
-			if event["subtype"] == "init" && init == nil {
-				init = event
+			if event["subtype"] == "init" {
+				inits++
+				if init == nil {
+					init = event
+				}
 			}
 		case "result":
+			results++
 			result = event
 		case "assistant":
 			message, _ := event["message"].(map[string]any)
@@ -400,8 +453,18 @@ func verifyClaude(raw []byte, launch Launch, policy Policy, receipt *Receipt) []
 			}
 		}
 	}
+	// One --print invocation is one pass: one session start and one result.
+	switch {
+	case inits > 1 || results > 1:
+		checks = append(checks, Check{Name: "passes", Status: CheckViolated, Detail: fmt.Sprintf("%d session starts and %d results in one worker", inits, results)})
+	case results == 1:
+		checks = append(checks, Check{Name: "passes", Status: CheckVerified})
+	default:
+		checks = append(checks, Check{Name: "passes", Status: CheckUnverified, Detail: "the pass did not finish"})
+	}
 	if init == nil {
-		return append(checks, Check{Name: "init", Status: CheckViolated, Detail: "no stream-json init event; effective settings unknown"})
+		return append(checks, Check{Name: "init", Status: CheckViolated, Detail: "no stream-json init event; effective settings unknown"},
+			Check{Name: "usd", Status: CheckUnverified, Detail: USDUnknown + " (no result reported)"})
 	}
 	receipt.SessionID, _ = init["session_id"].(string)
 	for _, key := range []string{"model", "permissionMode", "cwd", "tools", "mcp_servers"} {
@@ -437,7 +500,7 @@ func verifyClaude(raw []byte, launch Launch, policy Policy, receipt *Receipt) []
 	}
 	checks = append(checks, Check{Name: "effort", Status: CheckUnverified, Detail: "Claude does not report effort in its init event"})
 	if result == nil {
-		return append(checks, Check{Name: "result", Status: CheckViolated, Detail: "no result event"})
+		return append(checks, Check{Name: "result", Status: CheckViolated, Detail: "no result event"}, Check{Name: "usd", Status: CheckUnverified, Detail: USDUnknown + " (no result reported)"})
 	}
 	receipt.Result, _ = result["result"].(string)
 	if usage, ok := result["usage"].(map[string]any); ok {
@@ -451,7 +514,7 @@ func verifyClaude(raw []byte, launch Launch, policy Policy, receipt *Receipt) []
 			checks = append(checks, Check{Name: "usd", Status: CheckVerified})
 		}
 	} else {
-		checks = append(checks, Check{Name: "usd", Status: CheckUnverified, Detail: "cost not reported"})
+		checks = append(checks, Check{Name: "usd", Status: CheckUnverified, Detail: USDUnknown + " (Claude reported no cost)"})
 	}
 	if result["is_error"] == true || result["subtype"] != "success" {
 		return append(checks, Check{Name: "result", Status: CheckViolated, Detail: fmt.Sprintf("result %v", result["subtype"])})
@@ -462,6 +525,7 @@ func verifyClaude(raw []byte, launch Launch, policy Policy, receipt *Receipt) []
 func verifyCodex(raw []byte, launch Launch, request Request, receipt *Receipt) []Check {
 	var checks []Check
 	threadID, completed, failure, final := "", false, "", ""
+	turns := 0
 	itemsOK := true
 	for _, event := range eventLines(raw) {
 		switch event["type"] {
@@ -469,6 +533,8 @@ func verifyCodex(raw []byte, launch Launch, request Request, receipt *Receipt) [
 			if threadID == "" {
 				threadID, _ = event["thread_id"].(string)
 			}
+		case "turn.started":
+			turns++
 		case "turn.completed":
 			completed = true
 			if usage, ok := event["usage"].(map[string]any); ok {
@@ -522,7 +588,16 @@ func verifyCodex(raw []byte, launch Launch, request Request, receipt *Receipt) [
 	default:
 		checks = append(checks, Check{Name: "result", Status: CheckVerified})
 	}
-	return append(checks, Check{Name: "usd", Status: CheckUnverified, Detail: "Codex reports tokens, not cost"})
+	// One codex exec run with one prompt is one pass: exactly one turn.
+	switch {
+	case turns > 1:
+		checks = append(checks, Check{Name: "passes", Status: CheckViolated, Detail: fmt.Sprintf("%d turns in one worker", turns)})
+	case turns == 1 && completed:
+		checks = append(checks, Check{Name: "passes", Status: CheckVerified})
+	default:
+		checks = append(checks, Check{Name: "passes", Status: CheckUnverified, Detail: "the pass did not finish"})
+	}
+	return append(checks, Check{Name: "usd", Status: CheckUnverified, Detail: USDUnknown + " (Codex reports tokens, not cost)"})
 }
 
 // codexTurnContext reads the effective settings Codex recorded for the thread.

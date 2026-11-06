@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 
 	"github.com/relay-terminal/relayd/internal/evidencereader"
@@ -80,11 +81,28 @@ type Reader struct {
 }
 
 type Budget struct {
-	Passes      int
-	Retries     int
-	WallSeconds int
-	USD         float64
+	Passes      int     `json:"passes"`
+	Retries     int     `json:"retries"`
+	WallSeconds int     `json:"wall_seconds"`
+	USD         float64 `json:"usd"`
 }
+
+// Research worker budget limits. A worker runs one pass and is never retried
+// (an ambiguous start is never replayed); wall time is enforced by killing the
+// worker's process group; USD is enforced only where the provider reports
+// cost (Claude: --max-budget-usd at launch and total_cost_usd afterwards).
+// These are tighter than relay_research_capability's preflight schema, which
+// only describes requests and never runs them.
+const (
+	MaxPasses      = 1
+	MaxRetries     = 0
+	MaxWallSeconds = 180
+	MaxUSD         = 3.0
+)
+
+// DefaultBudget is the research synthesis budget: passes 1, retries 0,
+// wall 180 s, USD 3.
+var DefaultBudget = Budget{Passes: MaxPasses, Retries: MaxRetries, WallSeconds: MaxWallSeconds, USD: MaxUSD}
 
 type Policy struct {
 	Provider       string
@@ -150,10 +168,14 @@ func validate(p Policy, workerDir string) error {
 		return errors.New("too many reader arguments")
 	case len(p.Reader.Tools) == 0 || len(p.Reader.Tools) > 8:
 		return errors.New("reader needs 1-8 tool names")
-	// Bounds match relay_research_capability's budget schema.
-	case p.Budget.Passes < 1 || p.Budget.Passes > 10, p.Budget.Retries < 0 || p.Budget.Retries > 5,
-		p.Budget.WallSeconds < 1 || p.Budget.WallSeconds > 3600, p.Budget.USD <= 0 || p.Budget.USD > 100:
-		return errors.New("budget is outside passes 1-10, retries 0-5, wall_seconds 1-3600, usd (0,100]")
+	case p.Budget.Passes != MaxPasses:
+		return fmt.Errorf("budget passes must be %d: a worker runs one pass", MaxPasses)
+	case p.Budget.Retries != MaxRetries:
+		return fmt.Errorf("budget retries must be %d: a worker is never retried", MaxRetries)
+	case p.Budget.WallSeconds < 1 || p.Budget.WallSeconds > MaxWallSeconds:
+		return fmt.Errorf("budget wall_seconds must be 1-%d", MaxWallSeconds)
+	case math.IsNaN(p.Budget.USD) || p.Budget.USD <= 0 || p.Budget.USD > MaxUSD:
+		return fmt.Errorf("budget usd must be above 0 and at most %g", MaxUSD)
 	}
 	for _, arg := range p.Reader.Args {
 		if !cleanArgument(arg) {
@@ -200,7 +222,7 @@ func Plan(p Policy, workerDir string) (Launch, error) {
 			"--max-budget-usd", strconv.FormatFloat(p.Budget.USD, 'f', -1, 64),
 		}
 		launch.ScopeEnforcement = EnforcementLaunchFixed
-		launch.Unverified = []string{"effective Claude tool set not observed after launch", "Claude has not parsed this argv; the first approved worker launch is its first run", "passes, retries and wall_seconds are enforced by the caller, not by Claude"}
+		launch.Unverified = []string{"effective Claude tool set not observed after launch", "Claude has not parsed this argv; the first approved worker launch is its first run", "passes, retries and wall_seconds are enforced by Run, not by Claude; usd is also capped by Claude itself (--max-budget-usd)"}
 		return launch, nil
 	}
 	quote := func(value string) string { encoded, _ := json.Marshal(value); return string(encoded) }
@@ -226,6 +248,6 @@ func Plan(p Policy, workerDir string) (Launch, error) {
 	launch.Unverified = []string{"shell is hidden from the model, not proven unrunnable; needs one approved worker turn that tries the shell and is refused",
 		"apply_patch is still offered; only the read-only sandbox blocks its writes",
 		"Codex lists the reader's tools at start-up but prompt-input does not render MCP tools, so enabled_tools filtering is not observed offline",
-		"usd is not enforced by Codex; passes, retries and wall_seconds are enforced by the caller"}
+		"Codex does not report cost: usd is unknown, not verified; passes, retries and wall_seconds are enforced by Run"}
 	return launch, nil
 }

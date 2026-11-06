@@ -81,6 +81,10 @@ func fakeWorker(scenario string) int {
 			return 1
 		}
 		emit(map[string]any{"type": "turn.completed", "usage": map[string]any{"input_tokens": 100, "output_tokens": 20}})
+		if scenario == "two-turns" {
+			emit(map[string]any{"type": "turn.started"})
+			emit(map[string]any{"type": "turn.completed", "usage": map[string]any{"input_tokens": 50}})
+		}
 		return 0
 	}
 	if scenario == "no-init" {
@@ -114,10 +118,16 @@ func fakeWorker(scenario string) int {
 		cost = 3.5
 	}
 	result := map[string]any{"type": "result", "subtype": "success", "is_error": false, "result": "synthesis for " + string(prompt), "session_id": "sess-1", "total_cost_usd": cost, "usage": map[string]any{"input_tokens": 100}}
+	if scenario == "no-cost" {
+		delete(result, "total_cost_usd")
+	}
 	if scenario == "error-result" {
 		result["subtype"], result["is_error"] = "error_max_turns", true
 	}
 	emit(result)
+	if scenario == "two-results" {
+		emit(result)
+	}
 	return 0
 }
 
