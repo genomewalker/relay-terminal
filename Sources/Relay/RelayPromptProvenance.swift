@@ -26,11 +26,18 @@ struct RelayPromptInputCounts: Codable, Equatable, Sendable {
     var rightArrow = 0
     var enter = 0
     var delete = 0
+    /// Key events (characters, keys, paste bytes) not from the hardware keyboard:
+    /// posted by another process, such as computer use or automation.
+    var synthesized = 0
+    /// The submitting Enter itself was synthesized.
+    var synthesizedEnter = 0
 
     enum CodingKeys: String, CodingKey {
         case printable, delete, tab, enter
         case pasteBytes = "paste_bytes"
         case rightArrow = "right_arrow"
+        case synthesized = "synthesized_keys"
+        case synthesizedEnter = "synthesized_enter"
     }
 
     /// Tab accepts a suggestion. Right-arrow is cursor movement: an accept by
@@ -107,6 +114,8 @@ struct RelayPromptProvenanceLog: Sendable {
     static let messageIDPattern = #"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"#
     /// A peer message relayd wrote to the pane's native inbox, outside the desktop.
     static let daemonSource = "pane_message_daemon"
+    /// Key events posted by another process reached the pane's input.
+    static let synthesizedSource = "synthesized_keys"
 
     private(set) var pending = RelayPromptInputCounts()
     private(set) var history: [RelayPromptSubmitRecord] = []
@@ -123,39 +132,46 @@ struct RelayPromptProvenanceLog: Sendable {
         text.unicodeScalars.reduce(0) { $0 + (CharacterSet.controlCharacters.contains($1) ? 0 : 1) }
     }
 
-    mutating func printable(_ characters: Int) {
+    mutating func printable(_ characters: Int, origin: RelayKeyEventOrigin = .hardware) {
         guard programmaticDepth == 0, characters > 0 else { return }
-        pending.printable &+= characters
+        if origin == .synthesized { pending.synthesized &+= characters } else { pending.printable &+= characters }
     }
 
     /// One user paste. `event` is the NSEvent timestamp, so the key-equivalent
     /// path and the menu action for the same Cmd+V count once.
-    mutating func paste(bytes: Int, event: TimeInterval?) {
+    mutating func paste(bytes: Int, event: TimeInterval?, origin: RelayKeyEventOrigin = .hardware) {
         guard programmaticDepth == 0, bytes > 0 else { return }
         if let event, event == lastPasteEvent { return }
         lastPasteEvent = event
-        pending.pasteBytes &+= bytes
+        if origin == .synthesized { pending.synthesized &+= bytes } else { pending.pasteBytes &+= bytes }
     }
 
-    mutating func tab() { if programmaticDepth == 0 { pending.tab &+= 1 } }
+    mutating func tab(origin: RelayKeyEventOrigin = .hardware) { key(\.tab, origin) }
     /// Cursor movement, counted but never an accept.
-    mutating func rightArrow() { if programmaticDepth == 0 { pending.rightArrow &+= 1 } }
-    mutating func delete() { if programmaticDepth == 0 { pending.delete &+= 1 } }
+    mutating func rightArrow(origin: RelayKeyEventOrigin = .hardware) { key(\.rightArrow, origin) }
+    mutating func delete(origin: RelayKeyEventOrigin = .hardware) { key(\.delete, origin) }
+
+    private mutating func key(_ field: WritableKeyPath<RelayPromptInputCounts, Int>, _ origin: RelayKeyEventOrigin) {
+        guard programmaticDepth == 0 else { return }
+        if origin == .synthesized { pending.synthesized &+= 1 } else { pending[keyPath: field] &+= 1 }
+    }
 
     /// The Enter that submits the input line. `visible` is Relay's own mirror
     /// of the line when it is reliable; it is reduced to a fingerprint here.
     @discardableResult
-    mutating func userSubmit(visible: RelayPromptFingerprint?, at date: Date = Date()) -> RelayPromptSubmitRecord? {
+    mutating func userSubmit(visible: RelayPromptFingerprint?, origin: RelayKeyEventOrigin = .hardware,
+                             at date: Date = Date()) -> RelayPromptSubmitRecord? {
         guard programmaticDepth == 0 else { return nil }
         var counts = pending
-        counts.enter &+= 1
+        if origin == .synthesized { counts.synthesizedEnter &+= 1 } else { counts.enter &+= 1 }
         let length = visible.flatMap { $0.length > 0 ? $0.length : nil }
         let verdict = Self.classify(counts, submittedLength: length)
         let record = RelayPromptSubmitRecord(inputClass: verdict.inputClass, intent: verdict.intent, counts: counts,
             suggestionAccepted: verdict.suggestionAccepted, submittedLength: length,
             lengthSource: length == nil ? nil : "visible_input", promptSource: nil,
             promptSHA256Prefix: length == nil ? nil : visible?.sha256Prefix,
-            programmaticSource: nil, submittedAt: date, providerReportedAt: nil)
+            programmaticSource: verdict.inputClass == .programmatic ? Self.synthesizedSource : nil,
+            submittedAt: date, providerReportedAt: nil)
         append(record)
         return record
     }
@@ -275,6 +291,7 @@ struct RelayPromptProvenanceLog: Sendable {
             if last.inputClass != .programmatic {
                 let verdict = Self.classify(last.counts, submittedLength: fingerprint.length)
                 last.inputClass = verdict.inputClass
+                if verdict.inputClass == .programmatic { last.programmaticSource = Self.synthesizedSource }
                 last.intent = verdict.intent
                 last.suggestionAccepted = verdict.suggestionAccepted
             }
@@ -310,6 +327,18 @@ struct RelayPromptProvenanceLog: Sendable {
     /// when known, otherwise the visible line, otherwise nil.
     static func classify(_ counts: RelayPromptInputCounts, submittedLength: Int?) -> Verdict {
         let human = counts.printable + counts.pasteBytes
+        // Synthesized keys never read as typed. A synthesized Enter, or input
+        // that is mostly synthesized, is automation; a little of it makes
+        // otherwise typed input weak.
+        if counts.synthesizedEnter > 0 || (counts.synthesized > 0 && counts.synthesized >= human) {
+            return Verdict(inputClass: .programmatic, intent: "weak", suggestionAccepted: false)
+        }
+        let verdict = hardwareVerdict(counts, human: human, submittedLength: submittedLength)
+        guard counts.synthesized > 0 else { return verdict }
+        return Verdict(inputClass: verdict.inputClass, intent: "weak", suggestionAccepted: verdict.suggestionAccepted)
+    }
+
+    private static func hardwareVerdict(_ counts: RelayPromptInputCounts, human: Int, submittedLength: Int?) -> Verdict {
         let accepted = counts.acceptedSuggestion
         guard human > 0 else {
             // Enter, Tab or Right-arrow alone: whatever was submitted, nobody typed it.
@@ -345,8 +374,10 @@ struct RelayPromptProvenanceLog: Sendable {
     static let rule = "Classes describe how input reached the pane, from counts only; Relay stores no keystrokes, " +
         "paste or prompt text. An approval whose submit is suggestion_likely, pasted, programmatic or unknown, " +
         "or has intent weak, is weak intent: confirm with newly typed text before install, delete, kill, restart " +
-        "or relaying an approval. Known limit: typed means desktop key events reached Relay's window; key events " +
-        "synthesized by computer use or other automation look the same, so typed does not prove a person pressed the keys."
+        "or relaying an approval. Key events posted by another process (computer use or other " +
+        "automation) are counted as synthesized_keys and never read as typed. Known limit: a tool that forges the " +
+        "hardware source fields, or a virtual keyboard device, is not detected, so typed does not prove a person " +
+        "pressed the keys."
 
     struct Snapshot: Encodable {
         let paneID: String

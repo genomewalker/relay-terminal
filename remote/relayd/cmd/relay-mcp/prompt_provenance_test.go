@@ -47,7 +47,7 @@ func TestPromptProvenanceToolStatesWeakIntentRule(t *testing.T) {
 		}
 		description := item["description"].(string)
 		for _, want := range []string{"suggestion_likely", "programmatic", "pasted", "weak intent", "newly typed text",
-			"install", "delete", "kill", "restart", "relaying an approval", "stores no keystrokes", "Read-only", "computer use", "does not prove a person pressed the keys"} {
+			"install", "delete", "kill", "restart", "relaying an approval", "stores no keystrokes", "Read-only", "computer use", "synthesized_keys", "never read as typed", "does not prove a person pressed the keys"} {
 			if !strings.Contains(description, want) {
 				t.Errorf("description lacks %q", want)
 			}

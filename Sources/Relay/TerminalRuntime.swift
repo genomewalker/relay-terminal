@@ -9502,10 +9502,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     private func recordPromptProvenanceKey(_ event: NSEvent) {
         let flags = event.modifierFlags.intersection([.command, .control])
         guard flags.isEmpty else { return }
+        let origin = RelayKeyEventOrigin.of(event)
         switch event.keyCode {
-        case 48: owner?.recordPromptInput { $0.tab() }
-        case 124: owner?.recordPromptInput { $0.rightArrow() }
-        case 51, 117: owner?.recordPromptInput { $0.delete() }
+        case 48: owner?.recordPromptInput { $0.tab(origin: origin) }
+        case 124: owner?.recordPromptInput { $0.rightArrow(origin: origin) }
+        case 51, 117: owner?.recordPromptInput { $0.delete(origin: origin) }
         default: break
         }
     }
@@ -9514,15 +9515,18 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     private func recordPromptProvenanceText(_ string: Any) {
         let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
         let printable = RelayPromptProvenanceLog.printableCount(text)
-        if printable > 0 { owner?.recordPromptInput { $0.printable(printable) } }
+        // The key event being interpreted; none (an accessibility insert) is synthesized.
+        let origin = RelayKeyEventOrigin.of(NSApp.currentEvent)
+        if printable > 0 { owner?.recordPromptInput { $0.printable(printable, origin: origin) } }
     }
 
     /// The submitting Enter. Relay's mirror of the line, when reliable, gives
     /// the visible length; it is reduced to a fingerprint immediately.
-    private func recordPromptProvenanceSubmit() {
+    private func recordPromptProvenanceSubmit(_ event: NSEvent) {
         let line = promptBuffer.isReliable ? promptBuffer.text.trimmingCharacters(in: .whitespacesAndNewlines) : ""
         let visible = line.isEmpty ? nil : RelayPromptFingerprint(line)
-        owner?.recordPromptInput { _ = $0.userSubmit(visible: visible) }
+        let origin = RelayKeyEventOrigin.of(event)
+        owner?.recordPromptInput { _ = $0.userSubmit(visible: visible, origin: origin) }
     }
 
     private func trackNonTextKey(_ event: NSEvent) {
@@ -9542,7 +9546,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                 return
             }
             setShellPromptActive(false)
-            recordPromptProvenanceSubmit()
+            recordPromptProvenanceSubmit(event)
             _ = promptBuffer.submit()
             resetPromptHistory()
             hasLocalInputSincePromptBoundary = false
@@ -9554,7 +9558,9 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         }
         if command && key == "v" {
             if let pasted = NSPasteboard.general.string(forType: .string) {
-                owner?.recordPromptInput { $0.paste(bytes: pasted.utf8.count, event: event.timestamp) }
+                owner?.recordPromptInput {
+                    $0.paste(bytes: pasted.utf8.count, event: event.timestamp, origin: RelayKeyEventOrigin.of(event))
+                }
                 hasLocalInputSincePromptBoundary = true
                 recordPromptEdit(.paste)
                 promptBuffer.insert(pasted)
@@ -10171,7 +10177,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             return true
         }
         guard let text = NSPasteboard.general.string(forType: .string) else { return false }
-        owner?.recordPromptInput { $0.paste(bytes: text.utf8.count, event: NSApp.currentEvent?.timestamp) }
+        // Cmd+V or a menu click: the origin of whichever event triggered it.
+        let current = NSApp.currentEvent
+        owner?.recordPromptInput {
+            $0.paste(bytes: text.utf8.count, event: current?.timestamp, origin: RelayKeyEventOrigin.of(current))
+        }
         return pastePromptText(text)
     }
 
