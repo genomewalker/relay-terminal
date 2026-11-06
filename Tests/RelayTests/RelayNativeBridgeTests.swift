@@ -125,13 +125,15 @@ import XCTest
     }
     func testNativeConversationRendersContent() throws {
         _ = NSApplication.shared
+        let provider = ProcessInfo.processInfo.environment["RELAY_NATIVE_PREVIEW_PROVIDER"] == "claude" ? "claude" : "codex"
+        let identity = RelayNativeIdentity(pane: "pane", instance: "instance", provider: provider)
         let binding = RelayNativeBinding(identity: identity, profile: .local,
-            account: .init(provider: "codex", label: "work", dir: ""))
+            account: .init(provider: provider, label: "work", dir: ""))
         let model = RelayNativeConversation(binding: binding)
         let body: [String: Any] = [
-            "version": 1, "identity": ["pane": "pane", "instance": "instance", "provider": "codex"],
+            "version": 1, "identity": ["pane": "pane", "instance": "instance", "provider": provider],
             "sessionId": "preview-session", "turnId": "preview-turn", "cwd": "/workspace/research",
-            "model": "GPT-6.1", "phase": "waiting", "revision": 5,
+            "model": provider == "claude" ? "Claude" : "GPT-6.1", "phase": "waiting", "revision": 5,
             "items": [
                 ["id": "u1", "role": "user", "text": "Check the analysis and explain any changes.", "sequence": 1],
                 ["id": "a1", "role": "assistant", "text": "## Findings\nI found one inconsistent sample label.\n\n```swift\nlet label = \"sample_07\"\n```\nThe source data stays intact.", "sequence": 2],
@@ -152,15 +154,16 @@ import XCTest
         ]
         model.snapshot = try JSONDecoder().decode(RelayNativeSnapshot.self,
             from: JSONSerialization.data(withJSONObject: body))
+        let width = CGFloat(Double(ProcessInfo.processInfo.environment["RELAY_NATIVE_PREVIEW_WIDTH"] ?? "820") ?? 820)
         let host = NSHostingView(rootView: RelayNativeConversationView(conversation: model, observeLive: false)
-            .frame(width: 820, height: 1000).background(Color(nsColor: .windowBackgroundColor)))
-        host.appearance = NSAppearance(named: .aqua)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 1000),
+            .frame(width: width, height: 1000).background(Color(nsColor: .windowBackgroundColor)))
+        host.appearance = NSAppearance(named: ProcessInfo.processInfo.environment["RELAY_NATIVE_PREVIEW_DARK"] == "1" ? .darkAqua : .aqua)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 1000),
             styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = host
         defer { window.close() }
-        host.frame = NSRect(x: 0, y: 0, width: 820, height: 1000)
+        host.frame = NSRect(x: 0, y: 0, width: width, height: 1000)
         host.layoutSubtreeIfNeeded()
         host.displayIfNeeded()
         let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))

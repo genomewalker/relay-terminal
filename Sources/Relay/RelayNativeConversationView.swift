@@ -48,23 +48,33 @@ struct RelayNativeConversationView: View {
     }
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "text.bubble")
-                Text(conversation.binding.identity.provider == "codex" ? "Codex" : "Claude").font(.headline)
-                Text(conversation.binding.account.label).foregroundStyle(.secondary)
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: "text.bubble.fill")
+                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(Color.accentColor)
+                    .frame(width: 34, height: 34)
+                    .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 7) {
+                        Text(conversation.binding.identity.provider == "codex" ? "Codex" : "Claude").font(.headline)
+                        Text(conversation.binding.account.label).font(.caption).foregroundStyle(.secondary)
+                        if let snapshot = conversation.snapshot, !snapshot.model.isEmpty {
+                            Text(snapshot.model).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    if let cwd = conversation.snapshot?.cwd {
+                        Text(cwd).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            .truncationMode(.middle).textSelection(.enabled)
+                    }
+                }
+                Spacer(minLength: 8)
                 if let snapshot = conversation.snapshot {
-                    Text(snapshot.model).foregroundStyle(.secondary)
-                    Spacer()
-                    Text(snapshot.phase).font(.caption).foregroundStyle(.secondary)
-                } else { Spacer(); ProgressView().controlSize(.small) }
+                    Text(snapshot.phase.capitalized).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        .padding(.horizontal, 9).padding(.vertical, 5)
+                        .background(RelayAgentDesign.wash, in: Capsule())
+                } else { ProgressView().controlSize(.small) }
                 Button("Reconnect", systemImage: "arrow.clockwise") { observation = UUID() }
                     .labelStyle(.iconOnly).help("Read the same worker without replaying actions")
-            }.padding(12)
-            if let cwd = conversation.snapshot?.cwd {
-                Text(cwd).font(.caption.monospaced()).foregroundStyle(.secondary)
-                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12).padding(.bottom, 8)
-            }
+            }.padding(.horizontal, 18).padding(.vertical, 12)
             if conversation.snapshot?.phase == "exited" {
                 HStack {
                     Text("Saved conversation. The original worker is no longer connected.").font(.callout)
@@ -97,41 +107,12 @@ struct RelayNativeConversationView: View {
             }
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
+                    LazyVStack(alignment: .leading, spacing: 20) {
                         if (conversation.snapshot?.olderBefore ?? 0) > 0 {
                             Button("Load earlier messages") { Task { await conversation.loadOlder() } }
                         }
                         ForEach(items) { item in
-                            let presentation = RelayNativeItemPresentation(item: item)
-                            VStack(alignment: .leading, spacing: 5) {
-                                HStack {
-                                    Text(item.role.capitalized).font(.caption.bold())
-                                    if let tool = item.tool { Text(tool).font(.caption.monospaced()) }
-                                    Spacer()
-                                    if let status = item.status { Text(status).font(.caption).foregroundStyle(.secondary) }
-                                }
-                                if presentation.isAssistant {
-                                    RelayAgentProse(axID: "native.message." + item.id, source: presentation.preview)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                    if presentation.isPreviewLimited {
-                                        HStack {
-                                            Text("Long message: showing the first 64 KB.").font(.caption).foregroundStyle(.secondary)
-                                            Button("Copy full message") {
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(item.text, forType: .string)
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    Text(item.text).font(item.role == "tool" ? .system(.callout, design: .monospaced) : .body)
-                                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                if item.truncated == true { Text("Display truncated").font(.caption).foregroundStyle(.secondary) }
-                            }
-                            .padding(12)
-                            .background(item.role == "user" ? Color.accentColor.opacity(0.08) : Color.primary.opacity(0.035),
-                                        in: RoundedRectangle(cornerRadius: 9))
-                            .id(item.id)
+                            RelayNativeMessageRow(item: item).id(item.id)
                         }
                         ForEach(conversation.snapshot?.requests ?? []) { request in
                             RelayNativeRequestView(request: request, disabled: unavailable ||
@@ -140,7 +121,8 @@ struct RelayNativeConversationView: View {
                             }
                         }
                         Color.clear.frame(height: 1).id("native-bottom")
-                    }.padding(14)
+                    }.frame(maxWidth: RelayAgentDesign.columnWidth).frame(maxWidth: .infinity)
+                        .padding(.horizontal, 20).padding(.vertical, 24)
                 }
                 .onChange(of: conversation.snapshot?.items.last?.id) { _, _ in
                     proxy.scrollTo("native-bottom", anchor: .bottom)
@@ -154,9 +136,8 @@ struct RelayNativeConversationView: View {
                         Button("Remove") { images = [] }
                     }
                 }
-                TextEditor(text: $text).font(.body).frame(minHeight: 65, maxHeight: 140)
-                    .scrollContentBackground(.hidden).padding(6)
-                    .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+                TextEditor(text: $text).font(.body).frame(height: 76)
+                    .scrollContentBackground(.hidden).padding(.horizontal, 4)
                     .accessibilityLabel("Message")
                 HStack {
                     Button("Attach image", systemImage: "paperclip", action: selectImages)
@@ -177,7 +158,10 @@ struct RelayNativeConversationView: View {
                         .disabled(unavailable || !(conversation.snapshot?.capabilities.send ?? false) ||
                             (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && images.isEmpty))
                 }
-            }.padding(12)
+            }.padding(12).background(RelayAgentDesign.composerFill, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(RelayAgentDesign.stroke))
+                .frame(maxWidth: RelayAgentDesign.columnWidth).frame(maxWidth: .infinity)
+                .padding(.horizontal, 20).padding(.vertical, 12)
         }
         .task(id: observation) { if observeLive { await conversation.observe() } }
     }
@@ -229,6 +213,47 @@ struct RelayNativeConversationView: View {
                 } catch { conversation.failure = error.localizedDescription }
             }
         }
+    }
+}
+
+private struct RelayNativeMessageRow: View {
+    let item: RelayNativeItem
+    private var presentation: RelayNativeItemPresentation { .init(item: item) }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if item.role == "user" { Spacer(minLength: 32) }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 7) {
+                    if item.role == "tool" {
+                        Image(systemName: "wrench.and.screwdriver").font(.caption)
+                    }
+                    Text(item.role.capitalized).font(.caption.weight(.semibold))
+                    if let tool = item.tool { Text(tool).font(.caption.monospaced()) }
+                    Spacer(minLength: 8)
+                    if let status = item.status { Text(status).font(.caption).foregroundStyle(.secondary) }
+                }.foregroundStyle(.secondary)
+                if presentation.isAssistant {
+                    RelayAgentProse(axID: "native.message." + item.id, source: presentation.preview)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if presentation.isPreviewLimited {
+                        HStack {
+                            Text("Long message: showing the first 64 KB.").font(.caption).foregroundStyle(.secondary)
+                            Button("Copy full message") { RelayAgentClipboard.copy(item.text) }
+                        }
+                    }
+                } else {
+                    Text(item.text).font(item.role == "tool" ? .system(.callout, design: .monospaced) : .body)
+                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if item.truncated == true { Text("Display truncated").font(.caption).foregroundStyle(.secondary) }
+            }
+            .padding(item.role == "assistant" ? 2 : 12)
+            .background(item.role == "user" ? Color.accentColor.opacity(0.09) :
+                (item.role == "assistant" ? Color.clear : RelayAgentDesign.wash),
+                in: RoundedRectangle(cornerRadius: 12))
+            if item.role != "user" { Spacer(minLength: 0).frame(width: 0) }
+        }.frame(maxWidth: .infinity, alignment: item.role == "user" ? .trailing : .leading)
     }
 }
 
