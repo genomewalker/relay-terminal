@@ -339,15 +339,6 @@ func TestWorkNativeRejectsWrongLinkStaleRevisionWrongCallerAndStaleSource(t *tes
 
 func TestWorkNativeSenderRefusals(t *testing.T) {
 	a, _, al, _, _, _ := workNativeFixture(t)
-	// Files are refused before any receipt is claimed.
-	file := &workAttachment{name: "a.txt", sha256: communicationTextDigest("x"), content: []byte("x")}
-	_, err := executeWorkRequest(context.Background(), a, "node-a", WorkRequest{Operation: "send", LinkID: al.ID, MessageID: signedMessage, Text: "with file", ClientToken: workTestToken, file: file}, workNativeWorkOrigin())
-	if err == nil {
-		t.Fatal("file accepted on native route")
-	}
-	if _, e := os.Stat(workOutboundPath(a, signedMessage)); !errors.Is(e, os.ErrNotExist) {
-		t.Fatal("refused file burned the message ID", e)
-	}
 	// Owner-only carrier operations.
 	for _, op := range []string{"work_native_pending", "work_native_claim", "deliver_signed_work", "work_native_settle"} {
 		if _, e := workNativeOp(a, "node-a", CommunicationRequest{Operation: op, ClientToken: workTestToken}); e == nil {

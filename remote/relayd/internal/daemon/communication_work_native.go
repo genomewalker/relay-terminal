@@ -28,15 +28,17 @@ import (
 // the peer confirms a final outcome, or after 24 h with the receipt saying so.
 // The receiver delivers each message ID at most once.
 const (
-	workNativeEndpoint    = "relay-host-channel"
-	workNativeAuth        = "relay_host_channel_signed_node"
-	workNativeContext     = "relay-work-native/1\n"
-	workNativeWireLimit   = 36 << 10
-	workNativeEnvLimit    = 56 << 10
-	workNativeFreshness   = 2 * time.Minute
-	workNativeClockSkew   = 30 * time.Second
-	workNativeQueryWindow = 24 * time.Hour
-	workNativeListLimit   = 64
+	workNativeEndpoint  = "relay-host-channel"
+	workNativeAuth      = "relay_host_channel_signed_node"
+	workNativeContext   = "relay-work-native/1\n"
+	workNativeWireLimit = 130 << 10
+	workNativeEnvLimit  = 192 << 10
+	// A deliver_signed_work request: the envelope plus JSON escaping.
+	communicationSignedWorkInputLimit = 224 << 10
+	workNativeFreshness               = 2 * time.Minute
+	workNativeClockSkew               = 30 * time.Second
+	workNativeQueryWindow             = 24 * time.Hour
+	workNativeListLimit               = 64
 )
 
 var errNativePeerRoute = errors.New("this route is carried by the Relay host channel; no HTTPS peer request is made")
@@ -85,21 +87,46 @@ func workNativePendingPath(root, id string) string {
 
 // workNativeSendable refuses before any receipt is claimed, so an ID is never
 // burned on a message the carrier could not deliver.
-func workNativeSendable(m workWire, text string, file bool) error {
-	if file {
-		return errors.New("files are not carried over the Relay host channel yet; no request submitted")
-	}
+func workNativeSendable(m workWire, text string, file []byte) error {
 	sized := m
 	sized.Text = text
+	if file != nil {
+		sized.FileContent = base64.StdEncoding.EncodeToString(file)
+	}
 	sized.PaneSignature = strings.Repeat("x", 4096)
 	if body, e := json.Marshal(workNativeSend{Wire: sized, SourceCurrentAt: time.Now().UTC()}); e != nil || len(body) > workNativeWireLimit {
-		return errors.New("note exceeds the Relay host channel Work limit; shorten it; no request submitted")
+		return errors.New("file and note exceed the 128 KiB Work transfer limit; shorten the note or send a smaller file; no request submitted")
 	}
 	return nil
 }
 
+// A queued file is kept in its own private record beside the pending text,
+// until the peer confirms the message or the 24 h window ends.
+type workNativeFile struct {
+	Version int    `json:"version"`
+	SHA256  string `json:"sha256"`
+	Content string `json:"content"`
+}
+
+func workNativeFilePath(root, id string) string {
+	return filepath.Join(root, "work-native-file-"+id+".json")
+}
+
+// workNativeDrop removes a message's queued text and file.
+func workNativeDrop(root, id string) error {
+	if e := os.Remove(workNativeFilePath(root, id)); e != nil && !errors.Is(e, os.ErrNotExist) {
+		return e
+	}
+	return os.Remove(workNativePendingPath(root, id))
+}
+
 // Called under the communication lock before the outbound receipt is written.
-func workNativeQueue(root string, receipt workTransportReceipt, link communicationTypedRemoteLink, text string) error {
+func workNativeQueue(root string, receipt workTransportReceipt, link communicationTypedRemoteLink, text string, file []byte) error {
+	if file != nil {
+		if e := communicationAtomic(workNativeFilePath(root, receipt.Wire.MessageID), workNativeFile{Version: 1, SHA256: receipt.Wire.FileSHA256, Content: base64.StdEncoding.EncodeToString(file)}); e != nil {
+			return e
+		}
+	}
 	return communicationAtomic(workNativePendingPath(root, receipt.Wire.MessageID), workNativePending{Version: 1, MessageID: receipt.Wire.MessageID, LinkID: link.ID, PeerNodeID: link.Peer.NodeID, Fingerprint: receipt.Wire.Fingerprint, Text: text, Created: workNativeNow()})
 }
 
@@ -275,7 +302,7 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 		}
 		if !workOutcomeUnknown(receipt.Result) {
 			settled = true
-			return os.Remove(workNativePendingPath(root, id))
+			return workNativeDrop(root, id)
 		}
 		if workNativeNow().Sub(p.Created) > workNativeQueryWindow {
 			// Say so in the receipt the sender reads, then stop carrying.
@@ -284,7 +311,7 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 			if e := communicationAtomic(workOutboundPath(root, id), receipt); e != nil {
 				return e
 			}
-			if e := os.Remove(workNativePendingPath(root, id)); e != nil {
+			if e := workNativeDrop(root, id); e != nil {
 				return e
 			}
 			return errors.New("not confirmed by the peer within 24 h; the receipt says so")
@@ -323,6 +350,18 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 		return nil, err
 	}
 	wire.Text = p.Text
+	if wire.FileSHA256 != "" {
+		// The file travels inside the same signed send; check it against the
+		// fingerprinted size and digest before it leaves this host.
+		var f workNativeFile
+		if e := communicationFanoutLocked(root, func() error { return communicationRead(workNativeFilePath(root, id), &f) }); e != nil || f.Version != 1 || f.SHA256 != wire.FileSHA256 {
+			return nil, errors.New("queued Work file unavailable; message not dispatched")
+		}
+		wire.FileContent = f.Content
+		if _, e := decodeWorkWireFile(wire); e != nil {
+			return nil, e
+		}
+	}
 	return workNativeEnvelopeResult(root, node, link, "send", workNativeSend{Wire: wire, SourceCurrentAt: workNativeNow()})
 }
 
@@ -409,7 +448,7 @@ func workNativeSettle(ctx context.Context, root, node, id, text string) (map[str
 		}
 		receipt = current
 		if !workOutcomeUnknown(current.Result) {
-			return os.Remove(workNativePendingPath(root, id))
+			return workNativeDrop(root, id)
 		}
 		result := communicationNativeOutcome(reply.Result, nil)
 		if workOutcomeUnknown(result) {
@@ -422,7 +461,7 @@ func workNativeSettle(ctx context.Context, root, node, id, text string) (map[str
 			return e
 		}
 		receipt = current
-		return os.Remove(workNativePendingPath(root, id))
+		return workNativeDrop(root, id)
 	})
 	if err != nil {
 		return nil, err

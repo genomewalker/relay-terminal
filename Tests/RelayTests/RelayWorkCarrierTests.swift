@@ -68,3 +68,10 @@ import Testing
     #expect(command.contains("exit 1"))
     #expect(!command.contains("relayd-communication\""))
 }
+
+@Test func workCarrierReadsTheLargestSignedFileEnvelope() {
+    #expect(RelayHostExecution.captureLimit(RelayWorkCarrier.claimPacket(messageID: "m")) == 256 << 10)
+    #expect(RelayHostExecution.captureLimit(RelayWorkCarrier.pendingPacket) == 256 << 10)
+    #expect(RelayHostExecution.captureLimit(["operation": "deliver_signed"]) == 128 << 10)
+    #expect(RelayHostExecution.captureLimit([:]) == 128 << 10)
+}

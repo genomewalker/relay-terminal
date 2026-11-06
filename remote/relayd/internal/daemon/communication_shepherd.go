@@ -16,13 +16,18 @@ const communicationShepherdPrefix = "Relay shepherd report — collaborator inpu
 // fields), and rejects a second/truncated JSON value.
 func DecodeCommunicationRequest(reader io.Reader) (CommunicationRequest, error) {
 	var request CommunicationRequest
-	data, err := io.ReadAll(io.LimitReader(reader, 65537))
-	if err != nil || len(data) > 65536 {
+	data, err := io.ReadAll(io.LimitReader(reader, communicationSignedWorkInputLimit+1))
+	if err != nil || len(data) > communicationSignedWorkInputLimit {
 		return request, errors.New("communication request exceeds input limit")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(&request); err != nil {
 		return request, err
+	}
+	// Only a signed Work delivery, which can carry a file, may exceed the
+	// ordinary 64 KiB request limit.
+	if len(data) > 65536 && request.Operation != "deliver_signed_work" {
+		return CommunicationRequest{}, errors.New("communication request exceeds input limit")
 	}
 	if !request.ShepherdReport {
 		return request, nil

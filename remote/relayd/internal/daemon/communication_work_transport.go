@@ -185,7 +185,11 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 			}
 		}
 		if binding.Endpoint == workNativeEndpoint {
-			if e = workNativeSendable(m, r.Text, r.file != nil); e != nil {
+			var file []byte
+			if r.file != nil {
+				file = r.file.content
+			}
+			if e = workNativeSendable(m, r.Text, file); e != nil {
 				return nil, e
 			}
 		}
@@ -218,7 +222,11 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 			if binding.Endpoint == workNativeEndpoint {
 				// The carrier reads the text from this private record and clears
 				// it when it dispatches; the receipt below never holds the text.
-				if e = workNativeQueue(root, receipt, link, r.Text); e != nil {
+				var file []byte
+				if r.file != nil {
+					file = r.file.content
+				}
+				if e = workNativeQueue(root, receipt, link, r.Text, file); e != nil {
 					return e
 				}
 			}
