@@ -108,6 +108,7 @@ type Receipt struct {
 	WorkerDir        string         `json:"worker_dir"`
 	ExitCode         int            `json:"exit_code"`
 	TimedOut         bool           `json:"timed_out"`
+	Cancelled        bool           `json:"cancelled"`
 	StartedAt        time.Time      `json:"started_at"`
 	EndedAt          time.Time      `json:"ended_at"`
 	SessionID        string         `json:"session_id,omitempty"`
@@ -192,32 +193,49 @@ func (c *cappedFile) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// Run admits, starts and verifies one worker. It returns an error only when
-// nothing was started; once started, the outcome is in the receipt.
-func Run(ctx context.Context, request Request) (Receipt, error) {
+func prepare(request Request) (Launch, Binding, string, error) {
 	if !requestUUID.MatchString(request.RequestID) {
-		return Receipt{}, errors.New("request_id must be a lowercase UUID")
+		return Launch{}, Binding{}, "", errors.New("request_id must be a lowercase UUID")
 	}
 	if request.Prompt == "" || len(request.Prompt) > maxPromptBytes {
-		return Receipt{}, errors.New("prompt must be 1 byte to 256 KiB")
+		return Launch{}, Binding{}, "", errors.New("prompt must be 1 byte to 256 KiB")
 	}
 	if request.CodexHome != "" && !absolute(request.CodexHome) {
-		return Receipt{}, errors.New("codex home must be a clean absolute path")
+		return Launch{}, Binding{}, "", errors.New("codex home must be a clean absolute path")
 	}
 	if request.SQLite3 != "" && !absolute(request.SQLite3) {
-		return Receipt{}, errors.New("sqlite3 must be a clean absolute path")
+		return Launch{}, Binding{}, "", errors.New("sqlite3 must be a clean absolute path")
 	}
 	if err := privateDirectory(request.WorkersRoot); err != nil {
-		return Receipt{}, err
+		return Launch{}, Binding{}, "", err
 	}
 	dir := filepath.Join(request.WorkersRoot, request.RequestID)
 	launch, err := Plan(request.Policy, dir)
 	if err != nil {
-		return Receipt{}, err
+		return Launch{}, Binding{}, "", err
 	}
 	argv, _ := json.Marshal(launch.Argv)
 	binding := Binding{Version: 1, RequestID: request.RequestID, ContractSHA256: request.Policy.ContractSHA256, Provider: request.Policy.Provider,
 		Model: request.Policy.Model, Effort: request.Policy.Effort, ArgvSHA256: digestString(string(argv)), PromptSHA256: digestString(request.Prompt), Budget: request.Policy.Budget}
+	return launch, binding, dir, nil
+}
+
+// BindingFor returns the binding Run would write for request without creating
+// or starting anything, so a job layer can make admission idempotent.
+func BindingFor(request Request) (Binding, error) {
+	_, binding, _, err := prepare(request)
+	return binding, err
+}
+
+// Run admits, starts and verifies one worker. It returns an error only when
+// nothing was started; once started, the outcome is in the receipt. Cancelling
+// ctx kills a running worker (receipt.Cancelled), or, before start, records a
+// cancellation without starting anything.
+func Run(ctx context.Context, request Request) (Receipt, error) {
+	launch, binding, dir, err := prepare(request)
+	if err != nil {
+		return Receipt{}, err
+	}
 	encoded, _ := json.MarshalIndent(binding, "", "  ")
 
 	if err := os.Mkdir(dir, 0o700); err != nil {
@@ -270,6 +288,7 @@ func start(ctx context.Context, request Request, launch Launch, binding Binding,
 	defer stderr.Close()
 
 	wall := time.Duration(request.Policy.Budget.WallSeconds) * time.Second
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, wall)
 	defer cancel()
 	command := exec.Command(launch.Argv[0], launch.Argv[1:]...)
@@ -282,6 +301,12 @@ func start(ctx context.Context, request Request, launch Launch, binding Binding,
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	receipt.StartedAt = time.Now().UTC()
+	if parent.Err() != nil {
+		receipt.EndedAt, receipt.Cancelled = receipt.StartedAt, true
+		receipt.Checks = []Check{{Name: "cancel", Status: CheckViolated, Detail: "cancelled before the worker started; nothing ran"}}
+		receipt.Budget = budgetUse(request.Policy.Budget, receipt)
+		return finish(dir, receipt)
+	}
 	if err := command.Start(); err != nil {
 		receipt.EndedAt = time.Now().UTC()
 		receipt.Checks = []Check{{Name: "start", Status: CheckViolated, Detail: "worker did not start: " + err.Error()}}
@@ -293,7 +318,11 @@ func start(ctx context.Context, request Request, launch Launch, binding Binding,
 	select {
 	case waitErr = <-done:
 	case <-ctx.Done():
-		receipt.TimedOut = true
+		if parent.Err() != nil {
+			receipt.Cancelled = true
+		} else {
+			receipt.TimedOut = true
+		}
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		waitErr = <-done
 	}
@@ -304,6 +333,9 @@ func start(ctx context.Context, request Request, launch Launch, binding Binding,
 	_ = waitErr
 
 	checks := []Check{}
+	if receipt.Cancelled {
+		checks = append(checks, Check{Name: "cancel", Status: CheckViolated, Detail: "cancelled while running; the worker was killed"})
+	}
 	if receipt.TimedOut {
 		checks = append(checks, Check{Name: "wall_seconds", Status: CheckViolated, Detail: fmt.Sprintf("killed after %s", wall)})
 	} else {
