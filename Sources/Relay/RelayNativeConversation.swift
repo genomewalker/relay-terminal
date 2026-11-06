@@ -145,6 +145,13 @@ struct RelayNativeBinding: Codable, Equatable, Sendable {
     }
 }
 
+enum RelayNativeActionOutcome: Equatable {
+    case sent, rejected, uncertain, refused
+    static func receipt(_ state: String) -> Self {
+        switch state { case "sent": .sent; case "rejected": .rejected; default: .uncertain }
+    }
+}
+
 @MainActor final class RelayNativeConversation: ObservableObject {
     let binding: RelayNativeBinding
     @Published var snapshot: RelayNativeSnapshot?
@@ -183,9 +190,9 @@ struct RelayNativeBinding: Codable, Equatable, Sendable {
             }
         }
     }
-    func act(kind: String, text: String = "", images: [String] = [], request: RelayNativeRequest? = nil,
-             decision: String = "", answers: [String: [String]] = [:]) async {
-        guard !busy, uncertainAction == nil, failure == nil, let snapshot else { return }
+    @discardableResult func act(kind: String, text: String = "", images: [String] = [], request: RelayNativeRequest? = nil,
+             decision: String = "", answers: [String: [String]] = [:]) async -> RelayNativeActionOutcome {
+        guard !busy, uncertainAction == nil, failure == nil, let snapshot else { return .refused }
         busy = true
         defer { busy = false }
         let id = UUID().uuidString.lowercased()
@@ -207,16 +214,18 @@ struct RelayNativeBinding: Codable, Equatable, Sendable {
             receipts.append(receipt)
             if receipt.state == "sent" || receipt.state == "rejected" { markPending(nil) }
             if let next = response.snapshot { self.snapshot = next }
-        } catch { failure = error.localizedDescription }
+            return .receipt(receipt.state)
+        } catch { failure = error.localizedDescription; return .uncertain }
     }
-    func inspectReceipt() async {
-        guard let id = uncertainAction else { return }
+    @discardableResult func inspectReceipt() async -> RelayNativeActionOutcome {
+        guard let id = uncertainAction else { return .refused }
         do {
             let response = try await RelayNativeService.call(binding, body: ["operation": "receipt", "receiptId": id])
             guard let receipt = response.receipt, receipt.id == id else { throw RelayNativeService.Failure.invalid }
             receipts.append(receipt)
             if receipt.state == "sent" || receipt.state == "rejected" { markPending(nil); failure = nil }
-        } catch { failure = error.localizedDescription }
+            return .receipt(receipt.state)
+        } catch { failure = error.localizedDescription; return .uncertain }
     }
     func loadOlder() async {
         guard let before = older.first?.sequence ?? snapshot?.olderBefore, before > 0 else { return }

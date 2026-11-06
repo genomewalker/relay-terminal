@@ -19,11 +19,20 @@ struct RelayNativeItemPresentation {
     }
 }
 
+struct RelayNativeDraft: Equatable {
+    var text: String
+    var images: [String]
+    func shouldClear(current: Self, outcome: RelayNativeActionOutcome) -> Bool {
+        outcome == .sent && current == self
+    }
+}
+
 struct RelayNativeConversationView: View {
     @StateObject private var conversation: RelayNativeConversation
     @State private var text = ""
     @State private var images: [String] = []
     @State private var observation = UUID()
+    @State private var pendingDraft: RelayNativeDraft?
     private let observeLive: Bool
     init(binding: RelayNativeBinding) {
         _conversation = StateObject(wrappedValue: RelayNativeConversation(binding: binding))
@@ -75,7 +84,15 @@ struct RelayNativeConversationView: View {
                 HStack {
                     Text("Action outcome is unconfirmed. It will not be sent again.").font(.callout)
                     Spacer()
-                    Button("Check receipt") { Task { await conversation.inspectReceipt() } }
+                    Button("Check receipt") {
+                        Task {
+                            let outcome = await conversation.inspectReceipt()
+                            if let draft = pendingDraft {
+                                clearDraftIfSent(draft, outcome: outcome)
+                                if outcome == .sent || outcome == .rejected { pendingDraft = nil }
+                            }
+                        }
+                    }.disabled(conversation.busy)
                 }.padding(12)
             }
             ScrollViewReader { proxy in
@@ -180,10 +197,17 @@ struct RelayNativeConversationView: View {
         }
     }
     private func submit(_ kind: String) {
-        let submitted = text
-        let attachments = images
-        text = ""; images = []
-        Task { await conversation.act(kind: kind, text: submitted, images: attachments) }
+        let draft = RelayNativeDraft(text: text, images: images)
+        Task {
+            let outcome = await conversation.act(kind: kind, text: draft.text, images: draft.images)
+            clearDraftIfSent(draft, outcome: outcome)
+            if outcome == .uncertain { pendingDraft = draft }
+        }
+    }
+    private func clearDraftIfSent(_ draft: RelayNativeDraft, outcome: RelayNativeActionOutcome) {
+        if draft.shouldClear(current: RelayNativeDraft(text: text, images: images), outcome: outcome) {
+            text = ""; images = []
+        }
     }
     private func selectImages() {
         let panel = NSOpenPanel()
