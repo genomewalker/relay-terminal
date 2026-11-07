@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -60,7 +61,7 @@ func newListenerFixture(t *testing.T) *listenerFixture {
 		owner: peerListenerOwner{PID: os.Getpid(), Start: start, Session: "conversation-1"}}
 	f.writeOwner(f.owner.PID, f.owner.Session, f.owner.Start)
 	previous := peerListenerOwnerRegistry
-	peerListenerOwnerRegistry = func() (string, error) { return f.registry, nil }
+	peerListenerOwnerRegistry = func(int) (string, error) { return f.registry, nil }
 	t.Cleanup(func() { peerListenerOwnerRegistry = previous })
 	return f
 }
@@ -685,9 +686,6 @@ func TestPeerListenerNotResumedWhenOwnerGoneOrChanged(t *testing.T) {
 		},
 		"conversation changed": func(f *listenerFixture, e *peerListenerEntry) {
 			f.writeOwner(e.Owner.PID, "conversation-2", e.Owner.Start)
-		},
-		"owner registration gone": func(f *listenerFixture, e *peerListenerEntry) {
-			os.Remove(filepath.Join(f.registry, strconv.Itoa(e.Owner.PID)+".json"))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1499,5 +1497,183 @@ func TestNativePeerListenerCLIContracts(t *testing.T) {
 				t.Fatal("late sender reached withdrawn mailbox")
 			}
 		})
+	}
+}
+
+// An owner in a non-default account: a child agent stand-in whose own
+// CLAUDE_CONFIG_DIR is the only account it can be registered in.
+// The owner is this test binary re-run as TestPeerListenerOwnerHelper: the
+// kernel withholds the initial environment of platform binaries such as
+// /bin/sh, so an owner that must expose CLAUDE_CONFIG_DIR cannot be one.
+func spawnAccountOwner(t *testing.T, env []string) (int, string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPeerListenerOwnerHelper$")
+	cmd.Env = append(env, peerListenerOwnerHelperEnv+"=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	start, err := processStartIdentity(cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cmd.Process.Pid, start
+}
+
+func writeAccountRegistration(t *testing.T, config string, pid int, session, start string) {
+	t.Helper()
+	dir := filepath.Join(config, "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(map[string]any{"pid": pid, "sessionId": session, "procStart": start})
+	// 0644 is the mode Claude writes; the verifier must accept it.
+	if err := os.WriteFile(filepath.Join(dir, strconv.Itoa(pid)+".json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPeerListenerOwnerVerifiedInItsOwnAccountOnly(t *testing.T) {
+	// The real resolver: HOME is empty, so ~/.claude holds no registration
+	// unless the test writes one there.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	acct := t.TempDir()
+	pid, start := spawnAccountOwner(t, []string{"PATH=/usr/bin:/bin", "CLAUDE_CONFIG_DIR=" + acct})
+	owner := peerListenerOwner{PID: pid, Start: start, Session: "conversation-1"}
+	writeAccountRegistration(t, acct, pid, owner.Session, start)
+	if err := verifyPeerListenerOwner(owner); err != nil {
+		t.Fatalf("owner in its own account refused: %v", err)
+	}
+
+	// A registration in ~/.claude is another account's; it is never searched.
+	writeAccountRegistration(t, home+"/.claude", pid, owner.Session, start)
+	os.Remove(filepath.Join(acct, "sessions", strconv.Itoa(pid)+".json"))
+	if err := verifyPeerListenerOwner(owner); err == nil || errors.Is(err, errPeerListenerOwnerChanged) {
+		t.Fatalf("owner verified from another account's registration: %v", err)
+	}
+
+	// An owner with no CLAUDE_CONFIG_DIR reads only ~/.claude, never the other account.
+	bare, bareStart := spawnAccountOwner(t, []string{"PATH=/usr/bin:/bin"})
+	bareOwner := peerListenerOwner{PID: bare, Start: bareStart, Session: "conversation-2"}
+	writeAccountRegistration(t, acct, bare, bareOwner.Session, bareStart)
+	if err := verifyPeerListenerOwner(bareOwner); err == nil {
+		t.Fatal("owner without CLAUDE_CONFIG_DIR verified from a non-default account")
+	}
+
+	// A relative or unclean account directory is refused outright.
+	for _, value := range []string{"relative/acct", acct + "/."} {
+		rel, relStart := spawnAccountOwner(t, []string{"PATH=/usr/bin:/bin", "CLAUDE_CONFIG_DIR=" + value})
+		relOwner := peerListenerOwner{PID: rel, Start: relStart, Session: "conversation-3"}
+		writeAccountRegistration(t, acct, rel, relOwner.Session, relStart)
+		if err := verifyPeerListenerOwner(relOwner); err == nil {
+			t.Fatalf("invalid account directory %q verified", value)
+		}
+	}
+
+	// An environment that cannot be read (launchd's, not this user's) is refused.
+	launchd, _ := processStartIdentity(1)
+	if err := verifyPeerListenerOwner(peerListenerOwner{PID: 1, Start: launchd, Session: "conversation-4"}); err == nil {
+		t.Fatal("owner with an unreadable environment verified")
+	}
+}
+
+// The handoff with an owner in a non-default account. The fixture's seam is
+// replaced by the real resolver, so resumption must find the registration in
+// the owner's own CLAUDE_CONFIG_DIR.
+func accountOwnerFixture(t *testing.T, env []string) (*listenerFixture, string, int) {
+	t.Helper()
+	realResolver := peerListenerOwnerRegistry
+	f := newListenerFixture(t)
+	peerListenerOwnerRegistry = realResolver
+	t.Setenv("HOME", t.TempDir())
+	acct := t.TempDir()
+	pid, start := spawnAccountOwner(t, append(env, "CLAUDE_CONFIG_DIR="+acct))
+	f.owner = peerListenerOwner{PID: pid, Start: start, Session: "conversation-1"}
+	writeAccountRegistration(t, acct, pid, f.owner.Session, start)
+	return f, acct, pid
+}
+
+func TestHostUpgradeHandoffRestoresInboxOfNonDefaultAccountOwner(t *testing.T) {
+	f, _, _ := accountOwnerFixture(t, []string{"PATH=/usr/bin:/bin"})
+	old := f.server()
+	_, job := f.launch(old, "job-listener", "route-a", drainingListener)
+	if err := old.prepareHostUpgrade(); err != nil {
+		t.Fatalf("verified listener blocked the upgrade: %v", err)
+	}
+	if state := hostJobState(job); state != "exited" {
+		t.Fatalf("listener was not drained before handoff: %s", state)
+	}
+	next := f.server()
+	if resumed := next.resumePeerListeners(); resumed != 1 {
+		t.Fatalf("inbox of a non-default account owner resumed %d times", resumed)
+	}
+	serving := f.servingListeners(next, "route-a")
+	if len(serving) != 1 {
+		t.Fatalf("serving listeners = %v", serving)
+	}
+	value, _ := next.hostJobs.Load(serving[0])
+	f.ready(value.(*hostJob))
+	if entry, err := f.entry(next, "route-a"); err != nil || entry.State != "active" || entry.JobID != serving[0] {
+		t.Fatalf("resumed registry = %+v, %v", entry, err)
+	}
+}
+
+func TestHostUpgradeHandoffKeepsEntryWhileOwnerUnverifiedThenRestores(t *testing.T) {
+	f, acct, pid := accountOwnerFixture(t, []string{"PATH=/usr/bin:/bin"})
+	old := f.server()
+	f.launch(old, "job-listener", "route-a", drainingListener)
+	if err := old.prepareHostUpgrade(); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	registration := filepath.Join(acct, "sessions", strconv.Itoa(pid)+".json")
+	saved, err := os.ReadFile(registration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The live owner's registration is briefly unavailable to the new supervisor.
+	os.Remove(registration)
+	next := f.server()
+	if resumed := next.resumePeerListeners(); resumed != 0 {
+		t.Fatalf("resumed %d listeners without owner verification", resumed)
+	}
+	if entry, err := f.entry(next, "route-a"); err != nil || entry.State != "suspended" || entry.JobID != "job-listener" {
+		t.Fatalf("unverified owner dropped its inbox: %+v, %v", entry, err)
+	}
+	// The registration returns: the next start restores and verifies the inbox.
+	if err := os.WriteFile(registration, saved, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later := f.server()
+	if resumed := later.resumePeerListeners(); resumed != 1 {
+		t.Fatalf("restored owner resumed %d listeners", resumed)
+	}
+	if serving := f.servingListeners(later, "route-a"); len(serving) != 1 {
+		t.Fatalf("serving listeners = %v", serving)
+	}
+}
+
+func TestHostUpgradeHandoffDropsInboxWhenOwnerEndedAfterDrain(t *testing.T) {
+	f, _, _ := accountOwnerFixture(t, []string{"PATH=/usr/bin:/bin"})
+	old := f.server()
+	f.launch(old, "job-listener", "route-a", drainingListener)
+	if err := old.prepareHostUpgrade(); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	owner := f.owner
+	// The owner is this test's own child: reaping it makes its end observable.
+	syscall.Kill(owner.PID, syscall.SIGKILL)
+	if _, err := syscall.Wait4(owner.PID, nil, 0, nil); err != nil {
+		t.Fatalf("owner did not end: %v", err)
+	}
+	if start, err := processStartIdentity(owner.PID); err == nil && start == owner.Start {
+		t.Fatal("owner identity still matches after it ended")
+	}
+	next := f.server()
+	if resumed := next.resumePeerListeners(); resumed != 0 || len(f.servingListeners(next, "route-a")) != 0 {
+		t.Fatalf("inbox of an ended owner resumed %d times", resumed)
+	}
+	if _, err := os.Lstat(next.peerListenerPath("route-a")); !os.IsNotExist(err) {
+		t.Fatalf("entry of an ended owner kept: %v", err)
 	}
 }

@@ -33,14 +33,16 @@ const (
 	peerListenerMaxEntries = 256
 )
 
-// The owner's agent registry, as the listener itself reads it. A variable so
-// tests need not use the real home directory.
-var peerListenerOwnerRegistry = func() (string, error) {
-	home, err := os.UserHomeDir()
+// The registry directory of the owner's own account: the CLAUDE_CONFIG_DIR of
+// that exact process, or ~/.claude when it has none. An unreadable environment
+// is an error, never a fallback to another account. A variable so tests can
+// substitute a registry without spawning agent processes.
+var peerListenerOwnerRegistry = func(pid int) (string, error) {
+	root, err := agentConfigRoot(pid, "claude")
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".claude", "sessions"), nil
+	return filepath.Join(root, "sessions"), nil
 }
 
 type peerListenerSpec struct {
@@ -294,34 +296,50 @@ func (s *Server) reserveSupersededHostJob(r hostRequest, fingerprint, directory,
 	return job.record, nil
 }
 
+// The owner is gone or is no longer the recorded incarnation or conversation.
+// Its entry can never be restored, so resumption drops it.
+var errPeerListenerOwnerChanged = errors.New("peer listener owner process ended or changed")
+
 // The owner must be the same live agent incarnation in the same conversation,
-// checked against the kernel and the agent registry the listener itself uses.
+// checked against the kernel and the owner's own account registry. Only
+// errPeerListenerOwnerChanged proves the owner is gone; any other error means
+// the owner could not be verified now, and the caller must not restore it.
 func verifyPeerListenerOwner(owner peerListenerOwner) error {
-	if start, err := processStartIdentity(owner.PID); err != nil || start != owner.Start {
-		return errors.New("peer listener owner process ended or changed")
+	if start, err := processStartIdentity(owner.PID); err != nil {
+		if errors.Is(syscall.Kill(owner.PID, 0), syscall.ESRCH) {
+			return errPeerListenerOwnerChanged
+		}
+		return errors.New("peer listener owner identity unavailable")
+	} else if start != owner.Start {
+		return errPeerListenerOwnerChanged
 	}
-	registry, err := peerListenerOwnerRegistry()
+	registry, err := peerListenerOwnerRegistry(owner.PID)
 	if err != nil {
 		return err
 	}
 	path := filepath.Join(registry, strconv.Itoa(owner.PID)+".json")
 	info, err := os.Lstat(path)
 	if err != nil {
-		return errors.New("peer listener owner registration is gone")
+		return errors.New("peer listener owner registration is unavailable")
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.Mode().IsRegular() || int(stat.Uid) != os.Getuid() || info.Mode().Perm()&0o022 != 0 || info.Size() > 65536 {
 		return errors.New("unsafe peer listener owner registration")
 	}
 	data, err := os.ReadFile(path)
+	if err != nil {
+		return errors.New("peer listener owner registration is unreadable")
+	}
 	var record struct {
 		PID       int    `json:"pid"`
 		SessionID string `json:"sessionId"`
 		ProcStart string `json:"procStart"`
 	}
-	if err != nil || json.Unmarshal(data, &record) != nil || record.PID != owner.PID ||
-		record.SessionID != owner.Session || record.ProcStart != owner.Start {
-		return errors.New("peer listener owner conversation changed")
+	if json.Unmarshal(data, &record) != nil {
+		return errors.New("peer listener owner registration is unparsable")
+	}
+	if record.PID != owner.PID || record.SessionID != owner.Session || record.ProcStart != owner.Start {
+		return errPeerListenerOwnerChanged
 	}
 	return nil
 }
@@ -332,8 +350,9 @@ func (s *Server) resumePeerListeners() int {
 	return s.resumePeerListenersLocked()
 }
 
-// The caller holds hostJobsMu. Only entries drained by an upgrade resume; an
-// owner that ended or changed removes its entry instead.
+// The caller holds hostJobsMu. Only entries drained by an upgrade resume, and
+// only for an owner verified now. An owner that ended or changed removes its
+// entry; one that cannot be verified leaves it suspended.
 func (s *Server) resumePeerListenersLocked() int {
 	entries, err := os.ReadDir(s.peerListenerDir())
 	if err != nil || len(entries) > peerListenerMaxEntries {
@@ -352,11 +371,17 @@ func (s *Server) resumePeerListenersLocked() int {
 			continue // unverifiable entries are left for inspection, never launched
 		}
 		if err := verifyPeerListenerOwner(entry.Owner); err != nil {
-			s.peerListenersMu.Lock()
-			if current, readErr := s.readPeerListenerFile(path); readErr == nil && current.JobID == entry.JobID {
-				_ = os.Remove(path)
+			// Only a proven change drops the entry. An owner that cannot be
+			// verified now (its account unreadable, its registration briefly
+			// missing) keeps its suspended entry for a later start: the inbox is
+			// not restored, and it is not lost.
+			if errors.Is(err, errPeerListenerOwnerChanged) {
+				s.peerListenersMu.Lock()
+				if current, readErr := s.readPeerListenerFile(path); readErr == nil && current.JobID == entry.JobID {
+					_ = os.Remove(path)
+				}
+				s.peerListenersMu.Unlock()
 			}
-			s.peerListenersMu.Unlock()
 			continue
 		}
 		var id [16]byte
