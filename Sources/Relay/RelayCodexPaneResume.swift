@@ -88,7 +88,7 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                   plan.owner.provider == "codex", plan.owner.paneId == pane.id.uuidString.lowercased(),
                   plan.owner.sessionId == request.expectedSession.uuidString.lowercased(),
                   plan.session_id == request.targetSession.uuidString.lowercased(),
-                  let proof = await pane.runtime.codexResumePromptProof(expected: plan.owner), current() else {
+                  let proof = await pane.runtime.agentResumePromptProof(expected: plan.owner), current() else {
                 try save("refused", "No verified idle empty Codex prompt or exact saved-session plan. " + String(decoding: captured.stderr.prefix(500), as: UTF8.self)); return
             }
             try save("exiting", "Graceful Codex exit requested for the verified original session")
@@ -101,13 +101,13 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             var shell: RelayPromptOwnerBinding?
             let deadline = Date().addingTimeInterval(30)
             while current(), Date() < deadline {
-                if let owner = await pane.runtime.codexResumeOwner(), owner.provider == "shell" {
+                if let owner = await pane.runtime.agentResumeOwner(), owner.provider == "shell" {
                     guard Self.sameRetainedShell(plan.owner, owner) else { break }
                     shell = owner; break
                 }
                 try await Task.sleep(for: .milliseconds(500))
             }
-            guard current(), let shell, let token = await pane.runtime.codexResumePromptProof(expected: shell), current() else {
+            guard current(), let shell, let token = await pane.runtime.agentResumePromptProof(expected: shell), current() else {
                 try save("held", "Exit submitted; the same retained empty shell was not verified. No resume was sent."); return
             }
             try save("launching", "Launching the exact saved session in its original account and project")
@@ -119,7 +119,7 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             try save("verifying", "Resume submitted once; checking the resulting native session")
             let verifyUntil = Date().addingTimeInterval(90)
             while current(), Date() < verifyUntil {
-                if let owner = await pane.runtime.codexResumeOwner(), Self.verified(plan.owner, after: owner, target: request.targetSession) {
+                if let owner = await pane.runtime.agentResumeOwner(), Self.verified(plan.owner, after: owner, target: request.targetSession) {
                     let verifyCommand = RelayHostExecution.daemonCommand(profile: profile, arguments: ["codex-pane-resume-plan", pane.id.uuidString.lowercased(), plan.session_id, plan.session_id])
                     let account = try await RelayHostExecution.capture(profile: profile, command: verifyCommand, timeout: 15, maximumBytes: 16_384)
                     guard current(), account.exitCode == 0,

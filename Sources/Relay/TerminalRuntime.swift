@@ -3481,8 +3481,9 @@ final class TerminalRuntime: NSObject {
 
     /// Same source and kernel fences as terminal editing, without changing focus.
     /// Only a recognized empty native prompt authorizes an operator resume.
-    func codexResumePromptProof(expected: RelayPromptOwnerBinding) async -> UUID? {
-        guard io.maintenanceScreenSnapshot() != nil else { return nil }
+    /// A displayed pane has no ordered worker snapshot; its proof is the
+    /// attached (or retained) native renderer under the same live fence.
+    func agentResumePromptProof(expected: RelayPromptOwnerBinding) async -> UUID? {
         let state = await terminalEditState()
         guard state["status"] == "observed", let proof = preparedTerminalEdit,
               proof.owner.binding == expected else { return nil }
@@ -3490,18 +3491,34 @@ final class TerminalRuntime: NSObject {
         switch proof.screen {
         case .background(let snapshot):
             vt = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport)
-        case .renderer: return nil
+        case .renderer(let fence):
+            // The serialized screen (with SGR, so the faint placeholder stays
+            // distinguishable) of exactly the fenced live key; plain rows are not enough.
+            guard case .screen(let screen, let key) = observeActiveScreen(), ScreenFence.live(key) == fence else { return nil }
+            vt = screen
         }
         guard terminalEditScreenIsCurrent(proof.screen),
               await readPromptOwnerBinding() == proof.owner,
-              pane?.pendingAgentApprovals == 0,
-              pane?.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) != true,
-              expected.provider == "codex" ? RelayAgentMaintenancePrompt.isEmpty(vt, provider: "codex") :
-                expected.provider == "shell" && RelayAgentMaintenancePrompt.retainedShellIsEmpty(vt) else { return nil }
+              let pane, preparedTerminalEdit?.token == proof.token,
+              Self.agentResumePromptAdmits(expected: expected, vt: vt, pendingApprovals: pane.pendingAgentApprovals,
+                  composerBusy: pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true)
+        else { return nil }
         return proof.token
     }
 
-    func codexResumeOwner() async -> RelayPromptOwnerBinding? { await readPromptOwnerBinding()?.binding }
+    /// The screen and local-state half of a resume admission: no approval or
+    /// composer activity, and the exact provider's prompt is idle and empty.
+    nonisolated static func agentResumePromptAdmits(expected: RelayPromptOwnerBinding, vt: String?,
+                                                    pendingApprovals: Int, composerBusy: Bool) -> Bool {
+        guard pendingApprovals == 0, !composerBusy, expected.inputOnly != true else { return false }
+        switch expected.provider {
+        case "codex": return RelayAgentMaintenancePrompt.isEmpty(vt, provider: "codex")
+        case "shell": return RelayAgentMaintenancePrompt.retainedShellIsEmpty(vt)
+        default: return false
+        }
+    }
+
+    func agentResumeOwner() async -> RelayPromptOwnerBinding? { await readPromptOwnerBinding()?.binding }
 
     /// Budget notices may observe the native prompt but never authorize input.
     func budgetPromptEmpty() -> Bool? {
