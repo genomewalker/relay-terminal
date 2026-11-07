@@ -20,6 +20,9 @@ const desktopSessionSource = "claude_desktop_session_kernel_owner"
 // desktopSessionNote states what the sender can expect back.
 const desktopSessionNote = "A reply from the pane is delivered back to this Claude desktop session over the approved link; read this send's receipt with relay_pane_message_receipt."
 
+// peerNodePattern is a relayd node identity: sixteen lowercase hex characters.
+var peerNodePattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
 var canonicalUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // desktopSessionSend sends from a verified Claude desktop session to one pane
@@ -98,15 +101,15 @@ func (s *server) desktopSessionLink(actor string, arguments map[string]json.RawM
 	if targeted {
 		return fail("target_session_id does not apply to a link request. Nothing was requested.")
 	}
-	var source, pane string
+	var source, pane, peerNode string
 	for key := range arguments {
 		switch key {
-		case "source_pane_id", "pane_id":
+		case "source_pane_id", "pane_id", "peer_node_id":
 		default:
 			return fail("Unexpected argument for a Claude desktop session link: " + key + ". Nothing was requested.")
 		}
 	}
-	for key, target := range map[string]*string{"source_pane_id": &source, "pane_id": &pane} {
+	for key, target := range map[string]*string{"source_pane_id": &source, "pane_id": &pane, "peer_node_id": &peerNode} {
 		raw, present := arguments[key]
 		if present && json.Unmarshal(raw, target) != nil {
 			return fail("Communication arguments must be strings. Nothing was requested.")
@@ -119,11 +122,14 @@ func (s *server) desktopSessionLink(actor string, arguments map[string]json.RawM
 	if !canonicalUUIDPattern.MatchString(pane) || strings.EqualFold(pane, actor) {
 		return fail("pane_id must be one other pane UUID. Nothing was requested.")
 	}
+	if !peerNodePattern.MatchString(strings.ToLower(peerNode)) {
+		return fail("peer_node_id must name the host of the pane. Nothing was requested.")
+	}
 	if s.callerToken == "" {
 		return fail("A Claude desktop session link request needs a registered caller credential. Nothing was requested.")
 	}
 	packet := map[string]any{"operation": "desktop_link_request", "source_pane_id": strings.ToLower(actor),
-		"actor_pane_id": strings.ToLower(actor), "pane_id": pane, "client_token": s.callerToken}
+		"actor_pane_id": strings.ToLower(actor), "pane_id": pane, "peer_node_id": strings.ToLower(peerNode), "client_token": s.callerToken}
 	encoded, err := json.Marshal(packet)
 	if err != nil {
 		return fail("Request encoding failed. Nothing was requested.")

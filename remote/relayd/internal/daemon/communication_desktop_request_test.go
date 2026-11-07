@@ -32,7 +32,7 @@ func requestFixture(t *testing.T) (a, b string, proposed CommunicationRemoteLink
 
 func desktopRequest(root string, session string) error {
 	_, err := communicationDesktopLinkRequestOp(root, CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: session,
-		PaneID: testGroupB, ClientToken: remoteSenderToken, ActorPaneID: session, actorVerified: true}, time.Now().UTC())
+		PaneID: testGroupB, PeerNodeID: "node-b", ClientToken: remoteSenderToken, ActorPaneID: session, actorVerified: true}, time.Now().UTC())
 	return err
 }
 
@@ -111,7 +111,7 @@ func TestDesktopLinkRequestIsPendingUntilApproved(t *testing.T) {
 // A request from a session that is not verified, or not registered, is refused.
 func TestDesktopLinkRequestNeedsVerifiedRegisteredSession(t *testing.T) {
 	a, _, _, _, _ := requestFixture(t)
-	unverified := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+	unverified := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias}
 	if _, err := communicationDesktopLinkRequestOp(a, unverified, time.Now().UTC()); err == nil {
 		t.Fatal("an unverified sender made a request")

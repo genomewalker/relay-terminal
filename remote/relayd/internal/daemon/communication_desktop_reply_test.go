@@ -30,7 +30,7 @@ func replyFixture(t *testing.T) (a, b, account string, approved CommunicationRem
 	if err := communicationAtomic(communicationPolicyPath(fixtureB), communicationPolicy{Callers: []communicationCaller{{ID: "receiver", Label: "Reply", TokenHash: hex.EncodeToString(digest[:])}}}); err != nil {
 		t.Fatal(err)
 	}
-	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
 	if _, err := communicationDesktopLinkRequestOp(fixtureA, request, desktopLinkNow()); err != nil {
 		t.Fatal("request", err)
@@ -125,7 +125,7 @@ func TestPaneReplyRefusedForReRegisteredSession(t *testing.T) {
 func TestDesktopLinkRequestExpires(t *testing.T) {
 	a, _, _, _, hooks := requestFixture(t)
 	start := time.Now().UTC()
-	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
 	if _, err := communicationDesktopLinkRequestOp(a, request, start); err != nil {
 		t.Fatal(err)
@@ -163,7 +163,7 @@ func sendsTo(calls *claudeSessionCalls) int {
 // A rejected request is gone: it cannot be approved, and it is not listed.
 func TestDesktopLinkRequestRejectedIsGone(t *testing.T) {
 	a, _, _, _, hooks := requestFixture(t)
-	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
 	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
 		t.Fatal(err)
@@ -189,15 +189,15 @@ func TestDesktopLinkRequestRejectedIsGone(t *testing.T) {
 func TestDesktopLinkApprovalRefusesWithoutPeerPin(t *testing.T) {
 	a, _, _, _, _, hooks := replyFixture(t)
 	const unlinked = "00000000-0000-4000-8000-00000000f00d"
-	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: unlinked,
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: unlinked, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
 	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	_, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"},
 		RequestID: desktopLinkRequestID(desktopAlias, unlinked), SourcePaneID: desktopAlias, PaneID: unlinked}, hooks)
-	if err == nil || !strings.Contains(err.Error(), "pair the pane once from its host first") {
-		t.Fatal("approval without a peer pin was not refused by name", err)
+	if err == nil || !strings.Contains(err.Error(), "does not pin its own certificate") {
+		t.Fatal("approval of an unpinned signer was not refused by name", err)
 	}
 }
 
@@ -205,7 +205,7 @@ func TestDesktopLinkApprovalRefusesWithoutPeerPin(t *testing.T) {
 func TestDesktopLinkRequestPrunesExpiredAtWrite(t *testing.T) {
 	a, _, _, _, _, _ := replyFixture(t)
 	start := time.Now().UTC()
-	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
 	if _, err := communicationDesktopLinkRequestOp(a, request, start); err != nil {
 		t.Fatal(err)
@@ -228,7 +228,7 @@ func TestDesktopLinkRequestPrunesExpiredAtWrite(t *testing.T) {
 func TestDesktopLinkApprovalNeedsTheExactCallers(t *testing.T) {
 	a, _, _, _, hooks := requestFixture(t)
 	id := desktopLinkRequestID(desktopAlias, testGroupB)
-	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
 	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
 		t.Fatal(err)

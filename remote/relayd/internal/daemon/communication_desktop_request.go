@@ -21,13 +21,15 @@ var desktopLinkNow = func() time.Time { return time.Now().UTC() }
 // for a route link to one exact pane. It is only a request: no link exists until
 // the owner approves it through route_desktop_link_approve, before ExpiresAt.
 type communicationDesktopLinkRequest struct {
-	Version     int       `json:"version"`
-	ID          string    `json:"id"`
-	SessionID   string    `json:"session_id"`
-	AccountRoot string    `json:"account_root"`
-	PaneID      string    `json:"pane_id"`
-	CreatedAt   time.Time `json:"created_at"`
-	ExpiresAt   time.Time `json:"expires_at"`
+	Version     int    `json:"version"`
+	ID          string `json:"id"`
+	SessionID   string `json:"session_id"`
+	AccountRoot string `json:"account_root"`
+	PaneID      string `json:"pane_id"`
+	// PeerNodeID is the host of the pane, verified live during approval.
+	PeerNodeID string    `json:"peer_node_id"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 func desktopLinkRequestID(session, pane string) string {
@@ -53,12 +55,16 @@ func communicationDesktopLinkRequestOp(root string, r CommunicationRequest, now 
 	if !validSessionID.MatchString(pane) || pane == session {
 		return nil, errors.New("a desktop link request names one other pane")
 	}
+	peerNode := strings.ToLower(r.PeerNodeID)
+	if !canonicalRouteToken(peerNode) {
+		return nil, errors.New("a desktop link request names the host of its pane")
+	}
 	endpoint, err := readClaudeSessionEndpoint(root, session)
 	if err != nil {
 		return nil, errors.New("this Claude session is not registered as a desktop session")
 	}
 	request := communicationDesktopLinkRequest{Version: 1, ID: desktopLinkRequestID(session, pane), SessionID: session,
-		AccountRoot: endpoint.AccountRoot, PaneID: pane, CreatedAt: now, ExpiresAt: now.Add(desktopLinkRequestTTL)}
+		AccountRoot: endpoint.AccountRoot, PaneID: pane, PeerNodeID: peerNode, CreatedAt: now, ExpiresAt: now.Add(desktopLinkRequestTTL)}
 	err = communicationFanoutLocked(root, func() error {
 		if _, err := communicationAuthorize(root, r); err != nil {
 			return err
@@ -175,7 +181,12 @@ func communicationDesktopLinkApprove(root, node string, r CommunicationRequest, 
 	}
 	peer, err := communicationDesktopLinkPeer(root, node, request)
 	if err != nil {
-		return nil, err
+		// No reviewed pane link to take the pin from: establish the pair from the
+		// owner-signed pair scope, under the capability this click mints.
+		return communicationDesktopLinkApproveScoped(root, node, r, request, hooks)
+	}
+	if request.PeerNodeID != peer.PeerNodeID {
+		return nil, errors.New("the request names another host than the reviewed pair")
 	}
 	if r.AllowedCallers == nil || !sameCallerSet(r.AllowedCallers, peer.AllowedPeerCallers) {
 		return nil, errors.New("approve the exact callers the pair would admit: " + strings.Join(peer.AllowedPeerCallers, ", "))
@@ -256,4 +267,62 @@ func sameCallerSet(a, b []string) bool {
 		seen[value]--
 	}
 	return true
+}
+
+// communicationDesktopLinkApproveScoped is the approval of a pair that no reviewed
+// pane link covers. The owner's click signs this pair's scope for both hosts,
+// mints one capability bound to exactly this request, and spends it to establish
+// the pair over the pinned wire. Anything unverifiable refuses by name first.
+func communicationDesktopLinkApproveScoped(root, node string, r CommunicationRequest, request communicationDesktopLinkRequest, hooks communicationGroupNative) (map[string]any, error) {
+	peerNode := request.PeerNodeID
+	if !canonicalRouteToken(peerNode) || peerNode == node {
+		return nil, errors.New("this request names no other host to establish the pair with")
+	}
+	if len(r.AllowedCallers) != 1 || !canonicalRouteToken(r.AllowedCallers[0]) {
+		return nil, errors.New("approve exactly one caller: a new pair admits one reviewed caller")
+	}
+	route, binding, cert, err := establishRoute(root, node, peerNode, "")
+	if err != nil {
+		return nil, errors.New("no active route to the requested host: " + err.Error())
+	}
+	if binding.PeerNodeID != peerNode {
+		return nil, errors.New("the route to the requested host names another host")
+	}
+	// The host's identity is taken live over the pinned transport, not from files.
+	if _, err := communicationPeerProbe(root, node, CommunicationRequest{Operation: "route_probe", RouteID: route.ID,
+		ExpectedRouteRevision: route.Revision}); err != nil {
+		return nil, errors.New("the requested host's live identity was not verified: " + err.Error())
+	}
+	a := communicationScopeMember{NodeID: node, PaneID: request.SessionID}
+	b := communicationScopeMember{NodeID: peerNode, PaneID: request.PaneID}
+	scopeID := "pair-" + communicationScopePairKey(a, b)
+	revision := uint64(1)
+	if prior, found, err := communicationScopePairLoad(root, node, a, b); err != nil {
+		return nil, err
+	} else if found {
+		revision = prior.Revision + 1
+	}
+	now := desktopLinkNow()
+	recordA, err := communicationSignScope(root, node, communicationPairScopeBody(scopeID, node, node, revision, now, a, b))
+	if err != nil {
+		return nil, err
+	}
+	recordB, err := communicationSignScope(root, node, communicationPairScopeBody(scopeID, peerNode, node, revision, now, a, b))
+	if err != nil {
+		return nil, err
+	}
+	trusted, err := communicationTrustedNodes(root, defaultCommunicationSigningDeps(root, node), node)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := communicationScopeStorePair(root, node, recordA, trusted); err != nil {
+		return nil, errors.New("this host does not pin its own certificate for scope signing: " + err.Error())
+	}
+	capabilityID, err := communicationDesktopCapabilityMint(root, request, r.AllowedCallers, scopeID, recordB, peerFingerprint(cert), now)
+	if err != nil {
+		return nil, err
+	}
+	return communicationDesktopLinkEstablish(root, node, CommunicationRequest{Operation: "route_desktop_link_establish",
+		RequestID: request.ID, SourcePaneID: request.SessionID, PaneID: request.PaneID, PeerNodeID: peerNode,
+		AllowedCallers: r.AllowedCallers, OwnerCapability: capabilityID}, hooks)
 }

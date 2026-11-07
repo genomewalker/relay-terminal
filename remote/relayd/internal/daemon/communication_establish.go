@@ -37,7 +37,10 @@ type communicationEstablishWire struct {
 	CallerID           string                          `json:"caller_id"`
 	SourceConversation communicationPinnedConversation `json:"source_conversation"`
 	ScopeID            string                          `json:"scope_id"`
-	Fingerprint        string                          `json:"fingerprint"`
+	// ScopeRecord carries the holder's owner-signed record of the pair, so the
+	// peer can hold its own copy. Absent for the pre-existing establish shape.
+	ScopeRecord *communicationScopeRecord `json:"scope_record,omitempty"`
+	Fingerprint string                    `json:"fingerprint"`
 }
 
 func establishFingerprint(m communicationEstablishWire) string {
@@ -204,6 +207,11 @@ type establishPlan struct {
 	cert    string
 	scopeID string
 	caller  string
+	// approved marks an establishment authorized by a consumed owner capability,
+	// not by a caller token. desktopAccount is recorded on the saved half.
+	approved       bool
+	scopeRecord    *communicationScopeRecord
+	desktopAccount string
 }
 
 // communicationEstablishPrepare decides, under the caller's metadata lock,
@@ -238,7 +246,7 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 		return empty, err
 	}
 	m := communicationEstablishWire{Version: establishWireVersion, Operation: "establish", MessageID: hex.EncodeToString(id[:]), SourceNodeID: node, TargetNodeID: r.PeerNodeID,
-		SourcePaneID: r.SourcePaneID, TargetPaneID: r.PaneID, CallerID: plan.caller, SourceConversation: local, ScopeID: plan.scopeID}
+		SourcePaneID: r.SourcePaneID, TargetPaneID: r.PaneID, CallerID: plan.caller, SourceConversation: local, ScopeID: plan.scopeID, ScopeRecord: plan.scopeRecord}
 	m.Fingerprint = establishFingerprint(m)
 	body, _ := json.Marshal(m)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -262,9 +270,13 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 	// Re-check everything that could have changed while the request was in flight.
 	var link CommunicationRemoteLink
 	err = communicationFanoutLocked(root, func() error {
-		identity, err := communicationAuthorize(root, r)
-		if err != nil {
-			return err
+		identity := plan.caller
+		var err error
+		if !plan.approved {
+			identity, err = communicationAuthorize(root, r)
+			if err != nil {
+				return err
+			}
 		}
 		if identity != plan.caller {
 			return errors.New("submitting caller identity changed")
@@ -283,7 +295,7 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 			return errors.New("source conversation changed; pair not established")
 		}
 		requested := CommunicationRemoteLink{PeerNodeID: r.PeerNodeID, LocalPaneID: r.SourcePaneID, PeerPaneID: r.PaneID, RouteID: route.ID, RouteRevision: route.Revision,
-			PeerCertificateSHA256: plan.cert, LocalConversation: local, PeerConversation: reply.TargetConversation, AllowedPeerCallers: []string{plan.caller}}
+			PeerCertificateSHA256: plan.cert, LocalConversation: local, PeerConversation: reply.TargetConversation, AllowedPeerCallers: []string{plan.caller}, DesktopAccountRoot: plan.desktopAccount}
 		link, _, err = communicationEstablishCommit(root, node, requested, plan.scopeID, "proposer", m.MessageID)
 		return err
 	})
@@ -298,6 +310,30 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 func communicationReceiveEstablish(root, node, peerCert string, m communicationEstablishWire, hooks communicationGroupNative) (map[string]any, error) {
 	if !validEstablishWire(m, node) || !remoteDigest(peerCert) {
 		return nil, errors.New("invalid establish request")
+	}
+	if m.ScopeRecord != nil {
+		// The holder's own signed record of exactly this pair, verified against this
+		// host's pinned signers before it is stored as this host's copy.
+		if err := communicationFanoutLocked(root, func() error {
+			trusted, err := communicationTrustedNodes(root, defaultCommunicationSigningDeps(root, node), node)
+			if err != nil {
+				return err
+			}
+			body, err := communicationVerifyScope(*m.ScopeRecord, trusted, node)
+			if err != nil {
+				return err
+			}
+			first, second, ok := communicationScopeExactPair(body)
+			source := communicationScopeMember{NodeID: m.SourceNodeID, PaneID: m.SourcePaneID}
+			target := communicationScopeMember{NodeID: node, PaneID: m.TargetPaneID}
+			if !ok || !((first == source && second == target) || (first == target && second == source)) {
+				return errors.New("scope record names another pair")
+			}
+			_, err = communicationScopeStorePair(root, node, *m.ScopeRecord, trusted)
+			return err
+		}); err != nil {
+			return nil, err
+		}
 	}
 	check := func() (communicationRoute, string, error) {
 		scopeID, allowed := communicationScopeAllows(root, node, m.SourceNodeID, m.SourcePaneID, node, m.TargetPaneID)

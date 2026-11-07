@@ -101,7 +101,7 @@ func TestPaneCallerSendUnchanged(t *testing.T) {
 // names only the proven session; it never carries a link or a sender argument.
 func TestDesktopSessionLinkRequestIsOnlyARequest(t *testing.T) {
 	s, wire := desktopHelper(t, desktopSession, desktopSessionSource)
-	value, handled := s.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"pane_id": targetPane}))
+	value, handled := s.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"pane_id": targetPane, "peer_node_id": "e36bb8094237dae4"}))
 	if !handled {
 		t.Fatal("not handled")
 	}
@@ -114,7 +114,7 @@ func TestDesktopSessionLinkRequestIsOnlyARequest(t *testing.T) {
 		t.Fatal(string(data))
 	}
 	s2, wire2 := desktopHelper(t, desktopSession, desktopSessionSource)
-	s2.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"source_pane_id": otherSession, "pane_id": targetPane}))
+	s2.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"source_pane_id": otherSession, "pane_id": targetPane, "peer_node_id": "e36bb8094237dae4"}))
 	if _, err := os.Stat(wire2); !os.IsNotExist(err) {
 		t.Fatal("a claimed source made a request")
 	}
@@ -163,5 +163,19 @@ func TestDesktopInboxReadIsForTheVerifiedSessionOnly(t *testing.T) {
 	}
 	if data, _ := json.Marshal(value); !strings.Contains(string(data), "Only a verified Claude desktop session") {
 		t.Fatal(string(data))
+	}
+}
+
+// A link request names the host of its pane; without it nothing is requested.
+func TestDesktopSessionLinkRequestNeedsThePeerHost(t *testing.T) {
+	s, wire := desktopHelper(t, desktopSession, desktopSessionSource)
+	value, _ := s.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"pane_id": targetPane}))
+	if _, err := os.Stat(wire); !os.IsNotExist(err) {
+		t.Fatal("a request without its host reached the daemon", value)
+	}
+	s2, wire2 := desktopHelper(t, desktopSession, desktopSessionSource)
+	s2.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"pane_id": targetPane, "peer_node_id": "not-a-node"}))
+	if _, err := os.Stat(wire2); !os.IsNotExist(err) {
+		t.Fatal("a malformed host reached the daemon")
 	}
 }

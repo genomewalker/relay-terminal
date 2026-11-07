@@ -78,7 +78,7 @@ func crossHostFixture(t *testing.T) (a, b string, calls *claudeSessionCalls, pan
 		t.Fatal("pane pair", err)
 	}
 	// The owner approves the desktop session's request for node-b's pane.
-	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
 	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
 		t.Fatal("request", err)

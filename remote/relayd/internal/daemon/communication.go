@@ -58,6 +58,7 @@ type CommunicationRequest struct {
 	Cursor                     int64                      `json:"cursor,omitempty"`
 	LinkID                     string                     `json:"link_id,omitempty"`
 	RequestID                  string                     `json:"request_id,omitempty"`
+	OwnerCapability            string                     `json:"owner_capability,omitempty"`
 	AllowedCallers             []string                   `json:"allowed_callers,omitempty"`
 	AttestationID              string                     `json:"attestation_id,omitempty"`
 	SourceSignature            string                     `json:"source_signature,omitempty"`
@@ -416,6 +417,10 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if qualified {
 			return communicationQualifiedGroupReceipt(communicationRoot(), currentCommunicationNodeID(), r)
 		}
+	}
+	if r.Operation == "route_desktop_link_establish" {
+		return communicationDesktopLinkEstablish(communicationRoot(), currentCommunicationNodeID(), r,
+			communicationGroupNative{observe: communicationObserve, send: communicationNative})
 	}
 	if r.Operation == "desktop_inbox_read" {
 		return communicationDesktopInboxRead(communicationRoot(), r)
