@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/relay-terminal/relayd/internal/agentaccounts"
 	"github.com/relay-terminal/relayd/internal/agentlaunch"
 )
 
@@ -379,10 +380,49 @@ func (r *remoteRuntime) identityEvent(registry, session, account string, out io.
 	if e != nil {
 		return emit(out, map[string]string{"type": "identity_changed"})
 	}
+	moved := ""
+	// A Relay account move resumes the same conversation in another account.
+	// Its new process is taken only from a configured Claude account that shares
+	// the recorded account's history, and only when it is the one live match in
+	// every such account: zero stays missing, two or more is a changed identity.
+	if account != "" {
+		for _, root := range agentaccounts.Roots(r.home, "claude") {
+			if filepath.Clean(root) == filepath.Clean(account) || !sharedHistory(account, root) {
+				continue
+			}
+			sessions := filepath.Join(root, "sessions")
+			if privateDirectory(sessions, false) != nil {
+				continue
+			}
+			other, e := r.replacement(sessions, session)
+			if e != nil || (other != nil && replacement != nil) {
+				return emit(out, map[string]string{"type": "identity_changed"})
+			}
+			if other != nil {
+				replacement, moved = other, filepath.Clean(root)
+			}
+		}
+	}
 	if replacement == nil {
 		return emit(out, map[string]string{"type": "identity_missing"})
 	}
-	return emit(out, map[string]any{"type": "identity_replacement", "session": session, "pid": replacement.PID, "start": replacement.Start, "name": replacement.Name})
+	event := map[string]any{"type": "identity_replacement", "session": session, "pid": replacement.PID, "start": replacement.Start, "name": replacement.Name}
+	if moved != "" {
+		event["account"] = moved
+	}
+	return emit(out, event)
+}
+
+// sharedHistory reports whether two account directories resolve their
+// conversation history to the same directory, so a conversation resumed in
+// one is the same conversation the other recorded.
+func sharedHistory(a, b string) bool {
+	x, e := filepath.EvalSymlinks(filepath.Join(a, "projects"))
+	if e != nil {
+		return false
+	}
+	y, f := filepath.EvalSymlinks(filepath.Join(b, "projects"))
+	return f == nil && x == y
 }
 func (r *remoteRuntime) run(ctx context.Context, args []string, in io.Reader, out io.Writer) error {
 	if len(args) != 5 && len(args) != 6 && len(args) != 7 {

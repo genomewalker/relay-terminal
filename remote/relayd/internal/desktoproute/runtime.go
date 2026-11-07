@@ -135,13 +135,40 @@ func adoptConfig(c Config, path string, event routeEvent) (Config, error) {
 	updated.RemoteName = event.Name
 	updated.RemotePID = event.PID
 	updated.RemoteStart = event.Start
+	// The remote helper names another account only for an account move whose
+	// history it verified as shared, and only for a route that recorded one.
+	if event.Account != "" && event.Account != c.RemoteAccount {
+		if c.RemoteAccount == "" {
+			return c, errIdentity
+		}
+		updated.RemoteAccount = event.Account
+	}
 	if e = updated.Validate(); e != nil {
 		return c, e
 	}
 	if e = atomicJSON(path, updated); e != nil {
 		return c, e
 	}
+	recordRepin(path, c, updated)
 	return updated, nil
+}
+
+// recordRepin appends one line naming the old and new owner incarnation and
+// account beside the route. It is evidence only: a failed write never undoes
+// an adoption that the route's own checks accepted.
+func recordRepin(path string, old, updated Config) {
+	line, e := json.Marshal(map[string]any{"time": time.Now().UTC(), "session": updated.RemoteSession,
+		"old_pid": old.RemotePID, "old_start": old.RemoteStart, "old_account": old.RemoteAccount,
+		"new_pid": updated.RemotePID, "new_start": updated.RemoteStart, "new_account": updated.RemoteAccount})
+	if e != nil {
+		return
+	}
+	file, e := os.OpenFile(strings.TrimSuffix(path, ".json")+".repins.jsonl", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
+	if e != nil {
+		return
+	}
+	defer file.Close()
+	_, _ = file.Write(append(line, '\n'))
 }
 
 type routeEvent struct {
