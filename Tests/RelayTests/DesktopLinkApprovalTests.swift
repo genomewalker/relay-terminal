@@ -269,3 +269,28 @@ private func listed(id: String = shownRequest.id, createdAt: String = shownReque
     #expect(resolved == 0)
     #expect(mac.names() == ["route_desktop_link_list", "route_desktop_link_approve"])
 }
+
+/// A peer relayd that predates the operation and refuses it as an older relayd does.
+@MainActor private final class OlderPeer {
+    var operations: [String] = []
+    func request(_ operation: String, _ packet: [String: Any]) async throws -> [String: Any] {
+        operations.append(operation)
+        // The exact stderr a pre-0.5.22 relayd prints for this operation.
+        throw RemoteCatalogError.failed("relayd: unknown daemon communication operation\n")
+    }
+}
+
+// An older peer relayd fails closed at once with a named error; nothing is settled.
+@Test @MainActor func hostChannelApprovalOlderPeerNamesTheUpdate() async throws {
+    let mac = FakeDaemon(listings: [[shownRequest]])
+    mac.replies = ["route_desktop_link_approve": hostChannelDispatch]
+    let older = OlderPeer()
+    let approval = DesktopLinkApproval(requester: mac.request, present: { _, callback in callback(.alertSecondButtonReturn); return true },
+        peer: { _ in older.request })
+    let (decision, failure) = await DesktopLinkWatch.outcome { try await approval.decide(shownRequest, current: [shownRequest]) }
+    #expect(decision == .approved)
+    #expect(failure?.underlying as? DesktopLinkCarrierError == .peerUnsupported("node-b"))
+    #expect(failure?.underlying.localizedDescription.contains("does not support native desktop link approval; update it") == true)
+    #expect(older.operations == ["deliver_signed_desktop_establish"])
+    #expect(!mac.names().contains("route_desktop_link_settle"))
+}

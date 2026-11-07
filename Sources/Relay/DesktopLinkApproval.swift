@@ -70,12 +70,15 @@ enum DesktopLinkDecision: Equatable {
 /// Carrying a host-channel approval failed before the pair was established.
 enum DesktopLinkCarrierError: LocalizedError, Equatable {
     case noConnectedHost(String)
+    case peerUnsupported(String)
     case malformed
 
     var errorDescription: String? {
         switch self {
         case .noConnectedHost(let node):
             "No single connected host reports node \(node), so the approval could not reach it and nothing was sent to it. Open a pane on that host in Relay, then ask the session to request the link again."
+        case .peerUnsupported(let node):
+            "The requested host's relayd (node \(node)) does not support native desktop link approval; update it. Nothing was established."
         case .malformed: "The host-channel approval exchange returned an unexpected reply; nothing was established."
         }
     }
@@ -169,7 +172,13 @@ struct DesktopLinkAnsweredFailure: Error {
             throw DesktopLinkCarrierError.malformed
         }
         guard let peerRequester = try await peer?(node) else { throw DesktopLinkCarrierError.noConnectedHost(node) }
-        let delivered = try await peerRequester("deliver_signed_desktop_establish", ["establish_envelope": envelope])
+        let delivered: [String: Any]
+        do {
+            delivered = try await peerRequester("deliver_signed_desktop_establish", ["establish_envelope": envelope])
+        } catch where error.localizedDescription.contains("unknown daemon communication operation") {
+            // An older relayd answers at once with this refusal; name the fix.
+            throw DesktopLinkCarrierError.peerUnsupported(node)
+        }
         guard let reply = delivered["establish_reply"] as? String, !reply.isEmpty else { throw DesktopLinkCarrierError.malformed }
         let settled = try await requester("route_desktop_link_settle", ["message_id": messageID, "establish_reply": reply])
         guard settled["status"] as? String == "established" else { throw DesktopLinkCarrierError.malformed }
