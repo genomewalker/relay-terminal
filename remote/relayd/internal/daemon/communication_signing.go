@@ -467,7 +467,14 @@ func communicationTrustedNodes(root string, d communicationSigningDeps, node str
 	}
 	nodes := append([]communicationTrustedNode{}, set.Nodes...)
 	if _, cert, err := d.keys.HostKey(); err == nil {
-		nodes = append(nodes, communicationTrustedNode{NodeID: node, CertificateSHA256: peerFingerprint(cert), SignsMessages: true})
+		self := communicationTrustedNode{NodeID: node, CertificateSHA256: peerFingerprint(cert), SignsMessages: true}
+		// This host signs its own scopes only when the owner pinned its certificate for scopes.
+		for _, entry := range set.Nodes {
+			if entry.CertificateSHA256 == self.CertificateSHA256 && entry.SignsScopes {
+				self.SignsScopes = true
+			}
+		}
+		nodes = append(nodes, self)
 	}
 	return nodes, nil
 }

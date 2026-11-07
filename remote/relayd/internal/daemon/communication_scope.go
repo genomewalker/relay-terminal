@@ -136,18 +136,30 @@ func communicationScopeLoad(root, node string) (communicationScopeBody, bool, er
 }
 
 // communicationScopeAllows reports whether the exact pair is in the verified
-// scope held by this host. Any failure to verify means not allowed.
+// scope held by this host. A per-pair record for the exact pair decides; the
+// legacy scope-record.json is read only when no per-pair record exists. Any
+// failure to verify means not allowed.
 func communicationScopeAllows(root, node, nodeA, paneA, nodeB, paneB string) (scopeID string, ok bool) {
-	body, found, err := communicationScopeLoad(root, node)
-	if err != nil || !found || nodeA == nodeB {
+	if nodeA == nodeB {
 		return "", false
 	}
-	a, b := false, false
-	for _, member := range body.Members {
-		a = a || (member.NodeID == nodeA && member.PaneID == paneA)
-		b = b || (member.NodeID == nodeB && member.PaneID == paneB)
+	a := communicationScopeMember{NodeID: nodeA, PaneID: paneA}
+	b := communicationScopeMember{NodeID: nodeB, PaneID: paneB}
+	if pair, found, err := communicationScopePairLoad(root, node, a, b); err != nil {
+		return "", false
+	} else if found {
+		return pair.ScopeID, true
 	}
-	return body.ScopeID, a && b
+	body, found, err := communicationScopeLoad(root, node)
+	if err != nil || !found {
+		return "", false
+	}
+	matchA, matchB := false, false
+	for _, member := range body.Members {
+		matchA = matchA || member == a
+		matchB = matchB || member == b
+	}
+	return body.ScopeID, matchA && matchB
 }
 
 // communicationScopeSet is owner administration (reached only through the
