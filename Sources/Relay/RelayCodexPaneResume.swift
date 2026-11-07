@@ -92,8 +92,10 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
         var inputSent = false
         var protectedInputRevision = pane.agentInputRevision
         func current() -> Bool { authorized() && workspace.panes[pane.id] === pane && pane.profile == profile && pane.connectionState == .connected && pane.agentInputRevision == protectedInputRevision }
+        // Every receipt after a line clear says so: that input reached the shell.
+        var clearNote = ""
         func save(_ state: String, _ detail: String) throws {
-            result.state = state; result.detail = detail; result.updatedAt = Date(); try write(result)
+            result.state = state; result.detail = detail + clearNote; result.updatedAt = Date(); try write(result)
         }
         do {
             let request = result.request, agent = request.agent, name = agent == "claude" ? "Claude" : "Codex"
@@ -132,7 +134,7 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             // under its own fenced shell proof, and must then prove empty.
             var shell: RelayPromptOwnerBinding?, token: UUID?
             var typedPolls = 0, clearsSent = 0
-            var reason = "no shell owner was observed before the deadline or a fence changed"
+            var reason = "no shell owner was observed before the deadline"
             let deadline = Date().addingTimeInterval(30)
             while current(), Date() < deadline {
                 if let owner = await pane.runtime.agentResumeOwner(), owner.provider == "shell" {
@@ -146,11 +148,14 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                         if let key = Self.shellClearKey(typedPolls: typedPolls, clearsSent: clearsSent) {
                             let clear = RelayTerminalEditRequest(instance: request.instance, requestID: UUID(), token: proof,
                                 action: "key", text: nil, key: key, modifiers: ["control"])
-                            guard await pane.runtime.sendTerminalEdit(clear, authorization: current) == "input_submitted" else {
-                                reason = "the shell or screen changed before its input line could be cleared"; break
+                            // not_sent submits nothing: the prompt may just have
+                            // been redrawn, so poll again instead of holding.
+                            if await pane.runtime.sendTerminalEdit(clear, authorization: current) == "input_submitted" {
+                                clearsSent += 1
+                                clearNote = clearsSent == 1 ? " (Control-U cleared the shell line first)" : " (Control-U and Control-K cleared the shell line first)"
+                                protectedInputRevision = pane.agentInputRevision
                             }
-                            clearsSent += 1; typedPolls = 0
-                            protectedInputRevision = pane.agentInputRevision
+                            typedPolls = 0
                         }
                     } else {
                         typedPolls = 0
@@ -159,6 +164,7 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                 }
                 try await Task.sleep(for: .milliseconds(500))
             }
+            if !current() { reason = "the pane, its connection, authorization or input revision changed" }
             guard current(), let shell, let token else {
                 try save("held", "Exit submitted; the same retained empty shell was not verified (\(reason)). No resume was sent."); return
             }

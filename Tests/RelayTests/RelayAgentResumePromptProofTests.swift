@@ -61,7 +61,7 @@ extension RelayTerminalEditTests {
     /// the proof must come from the live native screen under its fence.
     @MainActor
     private func proof(screen: String, owner provider: String = "codex", expected: String = "codex",
-                       change: String = "none") async throws -> Observed {
+                       change: String = "none", admitTypedShell: Bool = false) async throws -> Observed {
         _ = NSApplication.shared
         let profile = ConnectionProfile(name: "Owned resume renderer proof", kind: .local, backend: .relay)
         let pane = PaneModel(profile: profile), writer = ResumeFrameWriter()
@@ -101,7 +101,7 @@ extension RelayTerminalEditTests {
             return .init(hostID: profile.id, binding: change == "owner" && reads > 1 ? successor : original)
         }
         if change == "composer" { pane.composerState.draft = "unsent composer draft" }
-        let token = await runtime.agentResumePromptProof(expected: binding(pane, provider: expected))
+        let token = await runtime.agentResumePromptProof(expected: binding(pane, provider: expected), admitTypedShell: admitTypedShell)
         return Observed(token: token, writer: writer, runtime: runtime) {
             _ = runtime.ioForTesting.removeTransport(); transport.detach(); runtime.stop(); window.contentView = nil; window.close()
         }
@@ -155,6 +155,35 @@ extension RelayTerminalEditTests {
         #expect(packet.range(of: Data("/exit".utf8)) != nil && packet.range(of: Data([0x0d])) != nil)
         #expect(await runtime.sendTerminalEdit(exit, appendShellReturn: submit) == "not_sent")
         #expect(writer.count == 1)
+    }
+
+    /// The retained shell after an agent exits: an empty box prompt proves only
+    /// empty, a typed one proves only for clearing, and Control-U reaches the
+    /// PTY as the single legacy byte readline binds to unix-line-discard.
+    @MainActor
+    @Test("A retained shell with a typed line is provable only for clearing, and Control-U sends 0x15 once", .timeLimit(.minutes(2)))
+    func retainedShellTypedLineIsClearedOnce() async throws {
+        let empty = "╭─ host · ~/work git:main\r\n╰─ ❯ ", typed = empty + "cd -- /Users/example && claude --resume x"
+        for (screen, typedProof, provable) in [(empty, false, true), (empty, true, false), (typed, false, false)] {
+            let observed = try await proof(screen: screen, owner: "shell", expected: "shell", admitTypedShell: typedProof)
+            #expect((observed.token != nil) == provable, "typed=\(typedProof) screen=\(screen)")
+            #expect(observed.writer.count == 0)
+            observed.close()
+        }
+        let observed = try await proof(screen: typed, owner: "shell", expected: "shell", admitTypedShell: true)
+        defer { observed.close() }
+        let token = try #require(observed.token, "a typed retained shell line must be provable for clearing")
+        let clear = RelayTerminalEditRequest(instance: UUID(), requestID: UUID(), token: token, action: "key", text: nil, key: "u", modifiers: ["control"])
+        #expect(await observed.runtime.sendTerminalEdit(clear) == "input_submitted")
+        #expect(observed.writer.count == 1)
+        let packet = try #require(observed.writer.payloads.first)
+        #expect(packet.last == 0x15, "Control-U must be the legacy byte, not a kitty/CSI-u report")
+        #expect(packet.range(of: Data("117;5u".utf8)) == nil)
+        #expect(await observed.runtime.sendTerminalEdit(clear) == "not_sent")
+        #expect(observed.writer.count == 1)
+        // A typed agent prompt is never provable for clearing.
+        let agent = try await proof(screen: ResumeScreen.claude(input: "unsent draft"), owner: "claude", expected: "claude", admitTypedShell: true)
+        #expect(agent.token == nil); #expect(agent.writer.count == 0); agent.close()
     }
 
     @MainActor
