@@ -161,3 +161,29 @@ func TestHostChannelLegacyOutboundIsNotCarried(t *testing.T) {
 		t.Fatal("legacy receipt", got, err)
 	}
 }
+
+// The same signed envelope delivered twice is answered from the receiver's
+// record and reaches the pane once. A receipt query without a credential or a
+// proven pane is not answered from the remote outbound receipt.
+func TestHostChannelRemoteMessageReplayDeliveredOnce(t *testing.T) {
+	f, _ := hostChannelLinked(t)
+	id := "c5c5c5c5-c5c5-4c5c-8c5c-c5c5c5c5c5c5"
+	hostChannelSend(t, f, id)
+	claim, err := hostChannelOp(f.a, "node-a", f.hooksA, CommunicationRequest{Operation: "work_native_claim", MessageID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := f.paneCalls.Load()
+	for i := 0; i < 2; i++ {
+		delivered, err := hostChannelOp(f.b, "node-b", f.hooksB, CommunicationRequest{Operation: "deliver_signed_work", WorkEnvelope: claim["work_envelope"].(string)})
+		if err != nil || delivered["work_reply"] == nil {
+			t.Fatal("deliver", i, delivered, err)
+		}
+	}
+	if f.paneCalls.Load() != before+1 {
+		t.Fatal("a replayed envelope was delivered again", f.paneCalls.Load()-before)
+	}
+	if got, handled, _ := communicationRemoteReceiptLookup(f.a, "node-a", CommunicationRequest{Operation: "receipt", MessageID: id}, f.hooksA); handled {
+		t.Fatal("an unauthenticated receipt query read the remote receipt", got)
+	}
+}

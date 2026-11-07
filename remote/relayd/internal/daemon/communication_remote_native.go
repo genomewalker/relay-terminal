@@ -305,7 +305,9 @@ func remoteNativeSettle(root, node, id, text string) (map[string]any, error) {
 // remote_receipt.
 func communicationRemoteReceiptLookup(root, node string, r CommunicationRequest, hooks communicationGroupNative) (map[string]any, bool, error) {
 	id := strings.ToLower(r.MessageID)
-	if r.Operation != "receipt" || !canonicalRouteToken(id) {
+	// A caller with neither credential nor proven pane keeps the local receipt
+	// only; remote_receipt would treat it as the owner.
+	if r.Operation != "receipt" || !canonicalRouteToken(id) || (r.ClientToken == "" && r.ActorPaneID == "") {
 		return nil, false, nil
 	}
 	if _, err := os.Stat(filepath.Join(root, "message-"+id+".json")); err == nil {
