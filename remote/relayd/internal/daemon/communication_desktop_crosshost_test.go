@@ -121,6 +121,10 @@ func TestDesktopSessionAndRemotePaneExchangeOverTheWire(t *testing.T) {
 	if sendsTo(calls) != sends+1 {
 		t.Fatal("desktop session did not receive the reply")
 	}
+	inbox, err := communicationDesktopInboxRead(a, CommunicationRequest{Operation: "desktop_inbox_read", SourcePaneID: desktopAlias, ActorPaneID: desktopAlias, actorVerified: true})
+	if err != nil || len(inbox["messages"].([]desktopInboxEntry)) != 1 || inbox["messages"].([]desktopInboxEntry)[0].MessageID != reply.MessageID {
+		t.Fatal("reply not readable back by the desktop session", inbox, err)
+	}
 	delivered := calls.packets[len(calls.packets)-1]
 	if delivered["operation"] != "send" || delivered["text"] != "reply from the pane" || calls.targets[len(calls.targets)-1].Claude.SessionID != desktopAlias {
 		t.Fatal("reply delivered to the wrong place", delivered)

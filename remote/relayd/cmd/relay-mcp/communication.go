@@ -54,7 +54,7 @@ const noSenderRefusal = "source_pane_id is required: this helper has no register
 func (s *server) daemonCommunication(name string, arguments map[string]json.RawMessage) (any, bool) {
 	operations := map[string]string{"relay_link_panes": "link", "relay_unlink_panes": "unlink", "relay_list_pane_links": "list",
 		"relay_message_pane": "send", "relay_pane_message_receipt": "receipt",
-		"relay_bind_question_thread": "question_bind", "relay_unbind_question_thread": "question_unbind"}
+		"relay_bind_question_thread": "question_bind", "relay_unbind_question_thread": "question_unbind", "relay_read_desktop_inbox": "desktop_inbox_read"}
 	operation, ok := operations[name]
 	if !ok {
 		return nil, false
@@ -111,6 +111,12 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	// A verified Claude desktop session sends to a pane through its saved link.
 	if actorErr == nil && actorSource == desktopSessionSource && operation == "send" {
 		return s.desktopSessionSend(actor, arguments, targeted)
+	}
+	if actorErr == nil && actorSource == desktopSessionSource && name == "relay_read_desktop_inbox" {
+		return s.desktopSessionInbox(actor, arguments)
+	}
+	if name == "relay_read_desktop_inbox" {
+		return map[string]any{"content": []map[string]any{{"type": "text", "text": "Only a verified Claude desktop session can read its desktop inbox. Nothing was read."}}, "isError": true}, true
 	}
 	if actorErr == nil && actorSource == desktopSessionSource && operation == "link" {
 		return s.desktopSessionLink(actor, arguments, targeted)

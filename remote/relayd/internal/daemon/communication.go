@@ -416,6 +416,9 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 			return communicationQualifiedGroupReceipt(communicationRoot(), currentCommunicationNodeID(), r)
 		}
 	}
+	if r.Operation == "desktop_inbox_read" {
+		return communicationDesktopInboxRead(communicationRoot(), r)
+	}
 	if r.Operation == "route_desktop_link_reject" {
 		return communicationDesktopLinkReject(communicationRoot(), r)
 	}

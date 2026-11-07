@@ -416,7 +416,7 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 		}
 		if link.DesktopAccountRoot != "" {
 			// A desktop session replies only in the account it was approved in.
-			endpoint, err := readClaudeSessionEndpoint(root, link.LocalConversation.SessionID)
+			endpoint, err := readClaudeSessionEndpoint(root, message.TargetConversation.SessionID)
 			if err != nil || endpoint.AccountRoot != link.DesktopAccountRoot {
 				return errors.New("desktop session registration changed; reply refused")
 			}
@@ -468,8 +468,20 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 		if err := communicationAtomic(path, receipt); err != nil {
 			return err
 		}
-		return communicationEvent(root, node, "remote_message_outcome", []map[string]string{{"message_id": message.MessageID, "status": fmtRemoteStatus(receipt.Result)}})
+		if err := communicationEvent(root, node, "remote_message_outcome", []map[string]string{{"message_id": message.MessageID, "status": fmtRemoteStatus(receipt.Result)}}); err != nil {
+			return err
+		}
+		return nil
 	})
+	if err == nil && message.TargetConversation.Provider == "claude" && deliveredToDesktop(receipt.Result) {
+		// A reply the desktop session can read back, under its current registration.
+		if endpoint, eErr := readClaudeSessionEndpoint(root, message.TargetConversation.SessionID); eErr == nil {
+			if iErr := appendDesktopInbox(root, message.TargetConversation.SessionID, desktopInboxEntry{MessageID: message.MessageID,
+				SourceNode: message.SourceNodeID, SourcePane: message.SourcePaneID, Text: message.Text, AccountRoot: endpoint.AccountRoot, ReceivedAt: time.Now().UTC()}); iErr != nil {
+				return remoteReceiptResult(receipt), iErr
+			}
+		}
+	}
 	return remoteReceiptResult(receipt), err
 }
 

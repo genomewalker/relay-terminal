@@ -247,3 +247,64 @@ func TestDesktopLinkApprovalNeedsTheExactCallers(t *testing.T) {
 		}
 	}
 }
+
+// A delivered reply is readable back by the desktop session it was delivered to,
+// and only under the registration it was delivered under.
+func TestDesktopInboxReadsRepliesOnlyUnderTheDeliveredRegistration(t *testing.T) {
+	a, _, account, approved, calls, hooks := replyFixture(t)
+	got, err := communicationReceiveRemote(t.Context(), a, "node-a", approved.PeerCertificateSHA256, paneMessage(approved, "97979797-9797-4979-8979-979797979797"), hooks)
+	if err != nil || sendsTo(calls) == 0 {
+		t.Fatal("reply not delivered", got, err)
+	}
+	read := CommunicationRequest{Operation: "desktop_inbox_read", SourcePaneID: desktopAlias, ActorPaneID: desktopAlias, actorVerified: true}
+	reply, err := communicationDesktopInboxRead(a, read)
+	if err != nil || len(reply["messages"].([]desktopInboxEntry)) != 1 || reply["messages"].([]desktopInboxEntry)[0].Text != "reply from the pane" {
+		t.Fatal("desktop session cannot read its reply", reply, err)
+	}
+	if _, err := communicationDesktopInboxRead(a, CommunicationRequest{Operation: "desktop_inbox_read", SourcePaneID: desktopAlias, ActorPaneID: desktopAlias}); err == nil {
+		t.Fatal("an unverified session read its inbox")
+	}
+	// Re-registered under another account: the old reply does not come with it.
+	if _, err := communicationClaudeSessionOperation(a, CommunicationRequest{Operation: "route_claude_session_retire", TargetSessionID: desktopAlias}, time.Now); err != nil {
+		t.Fatal(err)
+	}
+	other := t.TempDir()
+	registerDesktop(t, a, other)
+	reply, err = communicationDesktopInboxRead(a, read)
+	if err != nil || len(reply["messages"].([]desktopInboxEntry)) != 0 {
+		t.Fatal("reply from the old registration leaked to the new one", reply, err)
+	}
+	_ = account
+}
+
+// The inbox keeps a bounded, de-duplicated list.
+func TestDesktopInboxIsBoundedAndDeduplicated(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		id := strings.Repeat("0", 8) + string(rune('a'+i%26)) + strings.Repeat("0", 3) + string(rune('a'+i/26))
+		if err := appendDesktopInbox(root, desktopAlias, desktopInboxEntry{MessageID: id, Text: "x", AccountRoot: "/a"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	duplicate := desktopInboxEntry{MessageID: strings.Repeat("0", 8) + "a" + strings.Repeat("0", 3) + "a", Text: "x", AccountRoot: "/a"}
+	if err := appendDesktopInbox(root, desktopAlias, duplicate); err != nil {
+		t.Fatal(err)
+	}
+	var inbox desktopInbox
+	if err := communicationRead(desktopInboxPath(root, desktopAlias), &inbox); err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox.Entries) > desktopInboxLimit {
+		t.Fatal("inbox exceeds its bound", len(inbox.Entries))
+	}
+	before := len(inbox.Entries)
+	if err := appendDesktopInbox(root, desktopAlias, duplicate); err != nil {
+		t.Fatal(err)
+	}
+	if err := communicationRead(desktopInboxPath(root, desktopAlias), &inbox); err != nil || len(inbox.Entries) != before {
+		t.Fatal("duplicate message recorded twice", len(inbox.Entries), before)
+	}
+}

@@ -143,3 +143,32 @@ func (s *server) desktopSessionLink(actor string, arguments map[string]json.RawM
 	text := out.String() + "\nThe owner must approve this link in Relay on the Mac before any message can be sent. " + desktopSessionNote
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": false}, true
 }
+
+// desktopSessionInbox returns the replies delivered to this verified desktop
+// session under its current registration. It takes no arguments.
+func (s *server) desktopSessionInbox(actor string, arguments map[string]json.RawMessage) (any, bool) {
+	fail := func(text string) (any, bool) {
+		return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": true}, true
+	}
+	if len(arguments) != 0 {
+		return fail("relay_read_desktop_inbox takes no arguments.")
+	}
+	packet := map[string]any{"operation": "desktop_inbox_read", "source_pane_id": strings.ToLower(actor), "actor_pane_id": strings.ToLower(actor)}
+	encoded, err := json.Marshal(packet)
+	if err != nil {
+		return fail("Request encoding failed.")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, s.daemonHelper, "communication")
+	cmd.Stdin = bytes.NewReader(encoded)
+	var out, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil {
+		return fail(fmt.Sprintf("Daemon communication unavailable: %s.", strings.TrimSpace(stderr.String())))
+	}
+	if out.Len() > 128<<10 || !json.Valid(out.Bytes()) {
+		return fail("Invalid daemon communication response")
+	}
+	return map[string]any{"content": []map[string]any{{"type": "text", "text": out.String()}}, "isError": false}, true
+}

@@ -143,3 +143,25 @@ func TestPaneReplyToDesktopSessionIsAPaneSend(t *testing.T) {
 		t.Fatal("the pane reply was refused", string(data))
 	}
 }
+
+// The desktop inbox is read by the verified desktop session only.
+func TestDesktopInboxReadIsForTheVerifiedSessionOnly(t *testing.T) {
+	s, wire := desktopHelper(t, desktopSession, desktopSessionSource)
+	s.daemonCommunication("relay_read_desktop_inbox", map[string]json.RawMessage{})
+	packet := wirePacket(t, wire)
+	if packet["operation"] != "desktop_inbox_read" || packet["actor_pane_id"] != desktopSession || packet["source_pane_id"] != desktopSession {
+		t.Fatal("inbox read not for the verified session", packet)
+	}
+	if _, has := packet["client_token"]; has {
+		t.Fatal("a caller token was attached to an inbox read", packet)
+	}
+	pane := "800c06ef-203f-4401-bf7a-c67b15985f33"
+	p, paneWire := desktopHelper(t, pane, "native_parked_job_kernel_owner")
+	value, _ := p.daemonCommunication("relay_read_desktop_inbox", map[string]json.RawMessage{})
+	if _, err := os.Stat(paneWire); !os.IsNotExist(err) {
+		t.Fatal("a pane read the desktop inbox", value)
+	}
+	if data, _ := json.Marshal(value); !strings.Contains(string(data), "Only a verified Claude desktop session") {
+		t.Fatal(string(data))
+	}
+}
