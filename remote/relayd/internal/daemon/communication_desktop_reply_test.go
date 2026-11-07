@@ -123,7 +123,7 @@ func TestPaneReplyRefusedForReRegisteredSession(t *testing.T) {
 
 // A request expires after its TTL: it is not listed, and it cannot be approved.
 func TestDesktopLinkRequestExpires(t *testing.T) {
-	a, _, _, _, _, hooks := replyFixture(t)
+	a, _, _, _, hooks := requestFixture(t)
 	start := time.Now().UTC()
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
@@ -162,7 +162,7 @@ func sendsTo(calls *claudeSessionCalls) int {
 
 // A rejected request is gone: it cannot be approved, and it is not listed.
 func TestDesktopLinkRequestRejectedIsGone(t *testing.T) {
-	a, _, _, _, _, hooks := replyFixture(t)
+	a, _, _, _, hooks := requestFixture(t)
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
 	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
@@ -226,7 +226,7 @@ func TestDesktopLinkRequestPrunesExpiredAtWrite(t *testing.T) {
 // The callers a link admits are approved explicitly: an approval without them,
 // or with a different set, is refused; the listing shows the set it would admit.
 func TestDesktopLinkApprovalNeedsTheExactCallers(t *testing.T) {
-	a, _, _, _, _, hooks := replyFixture(t)
+	a, _, _, _, hooks := requestFixture(t)
 	id := desktopLinkRequestID(desktopAlias, testGroupB)
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
@@ -242,8 +242,8 @@ func TestDesktopLinkApprovalNeedsTheExactCallers(t *testing.T) {
 	for _, callers := range [][]string{nil, {"sender"}, {"receiver", "other"}} {
 		attempt := base
 		attempt.AllowedCallers = callers
-		if _, err := communicationDesktopLinkApprove(a, "node-a", attempt, hooks); err == nil {
-			t.Fatal("approval with unreviewed callers accepted", callers)
+		if _, err := communicationDesktopLinkApprove(a, "node-a", attempt, hooks); err == nil || !strings.Contains(err.Error(), "approve the exact callers") {
+			t.Fatal("approval with unreviewed callers not refused by name", callers, err)
 		}
 	}
 }
