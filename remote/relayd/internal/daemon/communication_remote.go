@@ -34,12 +34,12 @@ type CommunicationRemoteLink struct {
 	AllowedPeerCallers    []string                        `json:"allowed_peer_callers"`
 	// DesktopAccountRoot is the Claude account a desktop session was approved in.
 	// Empty for pane links. Replies are refused when the session registers elsewhere.
-	DesktopAccountRoot    string                          `json:"desktop_account_root,omitempty"`
-	PeerRevision          uint64                          `json:"peer_revision"`
-	Revision              uint64                          `json:"revision"`
-	Retired               bool                            `json:"retired"`
-	CreatedAt             time.Time                       `json:"created_at"`
-	UpdatedAt             time.Time                       `json:"updated_at"`
+	DesktopAccountRoot string    `json:"desktop_account_root,omitempty"`
+	PeerRevision       uint64    `json:"peer_revision"`
+	Revision           uint64    `json:"revision"`
+	Retired            bool      `json:"retired"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type communicationRemoteMessage struct {
