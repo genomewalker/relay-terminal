@@ -478,6 +478,12 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 			communicationGroupNative{observe: communicationObserve, send: communicationNative})
 	}
 	root := communicationRoot()
+	// A message sent over a route link has a remote outbound receipt, not a
+	// local one; answer it before the lock, which remote_receipt takes itself.
+	if result, handled, err := communicationRemoteReceiptLookup(root, currentCommunicationNodeID(), r,
+		communicationGroupNative{observe: communicationObserve, send: communicationNative}); handled {
+		return result, err
+	}
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
