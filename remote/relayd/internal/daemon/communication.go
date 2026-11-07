@@ -484,6 +484,16 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		communicationGroupNative{observe: communicationObserve, send: communicationNative}); handled {
 		return result, err
 	}
+	// A pane answering a desktop session goes over the saved pinned link.
+	// communicationSendRemote takes the communication lock itself, so this
+	// runs before the lock below: flock on a second descriptor of the same
+	// file blocks this process on itself until its caller's deadline.
+	if r.Operation == "send" && !strings.EqualFold(r.PaneID, communicationAssistantInboxID) {
+		if result, linked, err := communicationSendToDesktop(root, currentCommunicationNodeID(), r,
+			communicationGroupNative{observe: communicationObserve, send: communicationNative}); linked {
+			return result, err
+		}
+	}
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
@@ -652,13 +662,6 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if r.Operation == "send" && strings.EqualFold(r.PaneID, communicationAssistantInboxID) {
 			return communicationAssistantReply(root, nodeID, r, identity,
 				communicationGroupNative{observe: communicationObserve, send: communicationNative})
-		}
-		if r.Operation == "send" {
-			// A pane answering a desktop session goes over the saved pinned link.
-			if result, linked, err := communicationSendToDesktop(root, nodeID, r,
-				communicationGroupNative{observe: communicationObserve, send: communicationNative}); linked {
-				return result, err
-			}
 		}
 		id, ids, err := communicationPair(r.SourcePaneID, r.PaneID)
 		if err != nil {
