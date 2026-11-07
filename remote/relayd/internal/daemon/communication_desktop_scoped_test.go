@@ -79,7 +79,7 @@ func scopedRequest(t *testing.T, root string) {
 	t.Helper()
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
-	if _, err := communicationDesktopLinkRequestOp(root, request, desktopLinkNow()); err != nil {
+	if _, err := communicationDesktopLinkRequestOp(root, "node-a", request, desktopLinkNow()); err != nil {
 		t.Fatal("request", err)
 	}
 }
@@ -165,7 +165,7 @@ func TestApprovalRefusesWrongPairRegistrationMissingPinAndPeerMismatch(t *testin
 		f := scopedFixture(t, true)
 		request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-c",
 			ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
-		if _, err := communicationDesktopLinkRequestOp(f.a, request, desktopLinkNow()); err != nil {
+		if _, err := communicationDesktopLinkRequestOp(f.a, "node-a", request, desktopLinkNow()); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := scopedApprove(f.a, testGroupB, directionalPairCallers(desktopAlias, testGroupB), f.hooksA); err == nil || !strings.Contains(err.Error(), "no active route") {

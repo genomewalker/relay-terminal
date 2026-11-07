@@ -446,7 +446,7 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 	}
 	if r.Operation == "desktop_link_request" || r.Operation == "route_desktop_link_approve" {
 		if r.Operation == "desktop_link_request" {
-			return communicationDesktopLinkRequestOp(communicationRoot(), r, desktopLinkNow())
+			return communicationDesktopLinkRequestOp(communicationRoot(), currentCommunicationNodeID(), r, desktopLinkNow())
 		}
 		return communicationDesktopLinkApprove(communicationRoot(), currentCommunicationNodeID(), r,
 			communicationGroupNative{observe: communicationObserve, send: communicationNative})

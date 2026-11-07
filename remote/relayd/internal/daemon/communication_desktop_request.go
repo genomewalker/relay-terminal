@@ -43,7 +43,7 @@ func desktopLinkRequestPath(root, id string) string {
 
 // communicationDesktopLinkRequestOp records a pending request. The sender is the
 // kernel-verified session, which must hold an active desktop registration.
-func communicationDesktopLinkRequestOp(root string, r CommunicationRequest, now time.Time) (map[string]any, error) {
+func communicationDesktopLinkRequestOp(root, node string, r CommunicationRequest, now time.Time) (map[string]any, error) {
 	session := strings.ToLower(r.SourcePaneID)
 	pane := strings.ToLower(r.PaneID)
 	if !r.actorVerified || !strings.EqualFold(r.ActorPaneID, r.SourcePaneID) {
@@ -65,6 +65,7 @@ func communicationDesktopLinkRequestOp(root string, r CommunicationRequest, now 
 	}
 	request := communicationDesktopLinkRequest{Version: 1, ID: desktopLinkRequestID(session, pane), SessionID: session,
 		AccountRoot: endpoint.AccountRoot, PaneID: pane, PeerNodeID: peerNode, CreatedAt: now, ExpiresAt: now.Add(desktopLinkRequestTTL)}
+	var linked *CommunicationRemoteLink
 	err = communicationFanoutLocked(root, func() error {
 		if _, err := communicationAuthorize(root, r); err != nil {
 			return err
@@ -72,13 +73,49 @@ func communicationDesktopLinkRequestOp(root string, r CommunicationRequest, now 
 		if err := pruneDesktopLinkRequests(root, now); err != nil {
 			return err
 		}
+		// The owner already approved this exact pair: report it, and clear any
+		// request a repeated call left for a second, redundant approval.
+		if link, ok := desktopSessionActiveLink(root, node, session, peerNode, pane, endpoint.AccountRoot); ok {
+			linked = &link
+			if err := os.Remove(desktopLinkRequestPath(root, request.ID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			return nil
+		}
 		return communicationAtomic(desktopLinkRequestPath(root, request.ID), request)
 	})
 	if err != nil {
 		return nil, err
 	}
+	if linked != nil {
+		return desktopLinkedReply(*linked, request.ID), nil
+	}
 	return map[string]any{"status": "pending_approval", "request_id": request.ID, "expires_at": request.ExpiresAt, "authority": "relayd",
 		"note": "No link exists until the owner approves this request in Relay on the Mac, before it expires."}, nil
+}
+
+// desktopSessionActiveLink returns the active route link that pins this desktop
+// session as its local conversation and names exactly this pane on this host.
+// The link ID is derived from the pair, so nothing is chosen between. A link
+// approved under another Claude account registration is not reported, since
+// replies over it are refused.
+func desktopSessionActiveLink(root, node, session, peerNode, pane, accountRoot string) (CommunicationRemoteLink, bool) {
+	link, err := readRemoteLink(root, node, remotePairID(node, session, peerNode, pane))
+	if err != nil || link.Retired || !strings.EqualFold(link.LocalPaneID, session) || !strings.EqualFold(link.PeerPaneID, pane) ||
+		link.PeerNodeID != peerNode || link.LocalConversation.Provider != "claude" || !strings.EqualFold(link.LocalConversation.SessionID, session) {
+		return CommunicationRemoteLink{}, false
+	}
+	if link.DesktopAccountRoot != "" && link.DesktopAccountRoot != accountRoot {
+		return CommunicationRemoteLink{}, false
+	}
+	return link, true
+}
+
+// desktopLinkedReply is what a desktop session sees for an approved pair.
+func desktopLinkedReply(link CommunicationRemoteLink, requestID string) map[string]any {
+	return map[string]any{"status": "linked", "link_id": link.ID, "request_id": requestID, "session_id": strings.ToLower(link.LocalPaneID),
+		"pane_id": strings.ToLower(link.PeerPaneID), "peer_node_id": link.PeerNodeID, "revision": link.Revision, "authority": "relayd",
+		"note": "The owner approved this link. Send with relay_message_pane naming pane_id."}
 }
 
 // readDesktopLinkRequest returns the live request with this ID. An expired one
@@ -218,6 +255,8 @@ func communicationDesktopLinkApprove(root, node string, r CommunicationRequest, 
 	expected := uint64(0)
 	if prior, priorErr := readRemoteLink(root, node, link.ID); priorErr == nil {
 		if !prior.Retired {
+			// The request is redundant: drop it so it is not offered again.
+			_ = os.Remove(desktopLinkRequestPath(root, request.ID))
 			return nil, errors.New("this pair is already linked")
 		}
 		expected = prior.Revision

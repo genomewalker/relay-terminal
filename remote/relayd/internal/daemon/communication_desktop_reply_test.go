@@ -32,7 +32,7 @@ func replyFixture(t *testing.T) (a, b, account string, approved CommunicationRem
 	}
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
-	if _, err := communicationDesktopLinkRequestOp(fixtureA, request, desktopLinkNow()); err != nil {
+	if _, err := communicationDesktopLinkRequestOp(fixtureA, "node-a", request, desktopLinkNow()); err != nil {
 		t.Fatal("request", err)
 	}
 	result, err := communicationDesktopLinkApprove(fixtureA, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"},
@@ -127,7 +127,7 @@ func TestDesktopLinkRequestExpires(t *testing.T) {
 	start := time.Now().UTC()
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
-	if _, err := communicationDesktopLinkRequestOp(a, request, start); err != nil {
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", request, start); err != nil {
 		t.Fatal(err)
 	}
 	listing, err := communicationDesktopLinkList(a, "node-a", start.Add(time.Minute))
@@ -165,7 +165,7 @@ func TestDesktopLinkRequestRejectedIsGone(t *testing.T) {
 	a, _, _, _, hooks := requestFixture(t)
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
-	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", request, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	id := desktopLinkRequestID(desktopAlias, testGroupB)
@@ -191,7 +191,7 @@ func TestDesktopLinkApprovalRefusesWithoutPeerPin(t *testing.T) {
 	const unlinked = "00000000-0000-4000-8000-00000000f00d"
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: unlinked, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
-	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", request, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	_, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: directionalPairCallers(desktopAlias, unlinked),
@@ -207,7 +207,7 @@ func TestDesktopLinkRequestPrunesExpiredAtWrite(t *testing.T) {
 	start := time.Now().UTC()
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
-	if _, err := communicationDesktopLinkRequestOp(a, request, start); err != nil {
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", request, start); err != nil {
 		t.Fatal(err)
 	}
 	stale := desktopLinkRequestPath(a, desktopLinkRequestID(desktopAlias, testGroupB))
@@ -215,7 +215,7 @@ func TestDesktopLinkRequestPrunesExpiredAtWrite(t *testing.T) {
 	later := start.Add(desktopLinkRequestTTL + time.Minute)
 	const other = "00000000-0000-4000-8000-00000000f00d"
 	request.PaneID = other
-	if _, err := communicationDesktopLinkRequestOp(a, request, later); err != nil {
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", request, later); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
@@ -230,7 +230,7 @@ func TestDesktopLinkApprovalNeedsTheExactCallers(t *testing.T) {
 	id := desktopLinkRequestID(desktopAlias, testGroupB)
 	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
-	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", request, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	listing, _ := communicationDesktopLinkList(a, "node-a", time.Now().UTC())

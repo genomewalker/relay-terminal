@@ -31,7 +31,7 @@ func requestFixture(t *testing.T) (a, b string, proposed CommunicationRemoteLink
 }
 
 func desktopRequest(root string, session string) error {
-	_, err := communicationDesktopLinkRequestOp(root, CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: session,
+	_, err := communicationDesktopLinkRequestOp(root, "node-a", CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: session,
 		PaneID: testGroupB, PeerNodeID: "node-b", ClientToken: remoteSenderToken, ActorPaneID: session, actorVerified: true}, time.Now().UTC())
 	return err
 }
@@ -113,15 +113,15 @@ func TestDesktopLinkRequestNeedsVerifiedRegisteredSession(t *testing.T) {
 	a, _, _, _, _ := requestFixture(t)
 	unverified := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
 		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias}
-	if _, err := communicationDesktopLinkRequestOp(a, unverified, time.Now().UTC()); err == nil {
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", unverified, time.Now().UTC()); err == nil {
 		t.Fatal("an unverified sender made a request")
 	}
 	unregistered := "00000000-0000-4000-8000-00000000d00d"
-	if _, err := communicationDesktopLinkRequestOp(a, CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: unregistered,
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: unregistered,
 		PaneID: testGroupB, ActorPaneID: unregistered, actorVerified: true, ClientToken: remoteSenderToken}, time.Now().UTC()); err == nil {
 		t.Fatal("an unregistered session made a request")
 	}
-	if _, err := communicationDesktopLinkRequestOp(a, CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias,
+	if _, err := communicationDesktopLinkRequestOp(a, "node-a", CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias,
 		PaneID: desktopAlias, ActorPaneID: desktopAlias, actorVerified: true, ClientToken: remoteSenderToken}, time.Now().UTC()); err == nil {
 		t.Fatal("a session requested a link to itself")
 	}
@@ -138,4 +138,44 @@ func desktopLinksIn(root string) int {
 		}
 	}
 	return count
+}
+
+// The live case: the owner approved, the link exists, and the session asks
+// again with the same arguments. It is told the pair is linked, and no new
+// request is recorded for the owner to approve a second time.
+func TestDesktopLinkRequestReportsAnExistingLink(t *testing.T) {
+	a, _, proposed, _, hooks := requestFixture(t)
+	result, err := communicationRemoteLinkSet(a, "node-a", CommunicationRequest{Operation: "route_link_set", RemoteLink: &proposed}, hooks)
+	if err != nil {
+		t.Fatal("link", err)
+	}
+	link := result["link"].(CommunicationRemoteLink)
+	// A request left over from the second, redundant approval.
+	if err := communicationAtomic(desktopLinkRequestPath(a, desktopLinkRequestID(desktopAlias, testGroupB)), communicationDesktopLinkRequest{Version: 1,
+		ID: desktopLinkRequestID(desktopAlias, testGroupB), SessionID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
+		CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := communicationDesktopLinkRequestOp(a, "node-a", CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias,
+		PaneID: testGroupB, PeerNodeID: "node-b", ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["status"] != "linked" || got["link_id"] != link.ID || got["peer_node_id"] != "node-b" || got["pane_id"] != testGroupB || got["session_id"] != desktopAlias {
+		t.Fatal("an existing link was not reported as linked", got)
+	}
+	if pending, _ := filepath.Glob(filepath.Join(a, "desktop-link-request-*.json")); len(pending) != 0 {
+		t.Fatal("a linked pair kept a pending request", pending)
+	}
+	// Another host, another pane, an unverified or another session: never "linked".
+	for _, r := range []CommunicationRequest{
+		{SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-c", ActorPaneID: desktopAlias, actorVerified: true},
+		{SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b", ActorPaneID: desktopAlias},
+		{SourcePaneID: "00000000-0000-4000-8000-00000000d00d", PaneID: testGroupB, PeerNodeID: "node-b", ActorPaneID: "00000000-0000-4000-8000-00000000d00d", actorVerified: true},
+	} {
+		r.Operation, r.ClientToken = "desktop_link_request", remoteSenderToken
+		if got, _ := communicationDesktopLinkRequestOp(a, "node-a", r, time.Now().UTC()); got["status"] == "linked" {
+			t.Fatal("another caller or pair was reported linked", r, got)
+		}
+	}
 }
