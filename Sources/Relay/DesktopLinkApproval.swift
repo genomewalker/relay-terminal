@@ -67,6 +67,20 @@ enum DesktopLinkDecision: Equatable {
     case approved, rejected, cancelled, changed, unavailable
 }
 
+/// Carrying a host-channel approval failed before the pair was established.
+enum DesktopLinkCarrierError: LocalizedError, Equatable {
+    case noConnectedHost(String)
+    case malformed
+
+    var errorDescription: String? {
+        switch self {
+        case .noConnectedHost(let node):
+            "No single connected host reports node \(node), so the approval could not reach it and nothing was sent to it. Open a pane on that host in Relay, then ask the session to request the link again."
+        case .malformed: "The host-channel approval exchange returned an unexpected reply; nothing was established."
+        }
+    }
+}
+
 /// A daemon call failed after the owner had answered. The answer still counts.
 struct DesktopLinkAnsweredFailure: Error {
     let decision: DesktopLinkDecision
@@ -89,12 +103,17 @@ struct DesktopLinkAnsweredFailure: Error {
     /// Sends one owner operation to the daemon and returns its reply.
     typealias Requester = @MainActor (_ operation: String, _ packet: [String: Any]) async throws -> [String: Any]
     typealias Presenter = PeerNetworkApproval.Presenter
+    /// The requester for the one connected host whose relayd reports this node
+    /// ID, or nil when no single connected host does.
+    typealias PeerResolver = @MainActor (_ nodeID: String) async throws -> Requester?
 
     private let requester: Requester
+    private let peer: PeerResolver?
     private let present: Presenter
 
-    init(requester: @escaping Requester, present: Presenter? = nil) {
+    init(requester: @escaping Requester, present: Presenter? = nil, peer: PeerResolver? = nil) {
         self.requester = requester
+        self.peer = peer
         self.present = present ?? { alert, completion in
             guard let window = NSApp.keyWindow ?? NSApp.mainWindow ??
                     NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }),
@@ -130,11 +149,30 @@ struct DesktopLinkAnsweredFailure: Error {
         // it was shown is never approved.
         guard try await afterAnswer(.approved, { try await pending().contains(shown) }) else { return .changed }
         try await afterAnswer(.approved) {
-            _ = try await requester("route_desktop_link_approve", [
+            let reply = try await requester("route_desktop_link_approve", [
                 "request_id": shown.id, "source_pane_id": shown.sessionID, "pane_id": shown.paneID,
                 "allowed_callers": shown.proposedCallers])
+            if reply["status"] as? String == "dispatch" { try await carry(reply) }
         }
         return .approved
+    }
+
+    /// A route carried by the Relay host channel: relayd returned a proposal
+    /// signed with its host key. It is delivered to the peer host's relayd and
+    /// that relayd's signed reply is handed back; this host's relayd checks the
+    /// reply against its pinned key before saving anything. This carrier can
+    /// delay or drop the exchange but cannot forge, alter or redirect it.
+    private func carry(_ dispatch: [String: Any]) async throws {
+        guard let node = dispatch["peer_node_id"] as? String, !node.isEmpty,
+              let messageID = dispatch["message_id"] as? String, !messageID.isEmpty,
+              let envelope = dispatch["establish_envelope"] as? String, !envelope.isEmpty else {
+            throw DesktopLinkCarrierError.malformed
+        }
+        guard let peerRequester = try await peer?(node) else { throw DesktopLinkCarrierError.noConnectedHost(node) }
+        let delivered = try await peerRequester("deliver_signed_desktop_establish", ["establish_envelope": envelope])
+        guard let reply = delivered["establish_reply"] as? String, !reply.isEmpty else { throw DesktopLinkCarrierError.malformed }
+        let settled = try await requester("route_desktop_link_settle", ["message_id": messageID, "establish_reply": reply])
+        guard settled["status"] as? String == "established" else { throw DesktopLinkCarrierError.malformed }
     }
 
     /// A daemon call made after the owner answered. Its failure carries the
@@ -231,14 +269,34 @@ struct DesktopLinkAnsweredFailure: Error {
         }
     }
 
+    static func requester(_ profile: ConnectionProfile) -> DesktopLinkApproval.Requester {
+        { operation, packet in
+            var request = packet
+            request["operation"] = operation
+            return try await RelayPaneMessaging.shared.daemonRequest(profile: profile, packet: request, attach: false)
+        }
+    }
+
+    /// The one other connected relay host whose relayd reports node, found
+    /// through the pinned node_identity path: a host whose key changed since it
+    /// was trusted is not used.
+    static func peerRequester(_ node: String, workspace: WorkspaceModel, excluding own: ConnectionProfile) async throws -> DesktopLinkApproval.Requester? {
+        var seen: Set<String> = [own.connectionKey]
+        let profiles = workspace.panes.values.map(\.profile).filter { $0.backend == .relay && seen.insert($0.connectionKey).inserted }
+        var matches: [ConnectionProfile] = []
+        for profile in profiles {
+            if let pin = try? await RelayNodeTrust.shared.observe(profile), pin.nodeID == node { matches.append(profile) }
+        }
+        guard matches.count == 1 else { return nil }
+        return requester(matches[0])
+    }
+
     /// One pass over the connected hosts. Requests are asked about one at a time.
     func tick(_ workspace: WorkspaceModel, now: Date = Date()) async {
         for host in RelayQuestionNotices.hosts(workspace) {
-            let approval = DesktopLinkApproval { operation, packet in
-                var request = packet
-                request["operation"] = operation
-                return try await RelayPaneMessaging.shared.daemonRequest(profile: host.profile, packet: request, attach: false)
-            }
+            let approval = DesktopLinkApproval(requester: Self.requester(host.profile), peer: { node in
+                try await Self.peerRequester(node, workspace: workspace, excluding: host.profile)
+            })
             guard let listing = try? await approval.pending() else { continue }
             for shown in Self.due(listing, asked: asked, now: now) {
                 let (decision, failure) = await Self.outcome { try await approval.decide(shown, current: listing) }

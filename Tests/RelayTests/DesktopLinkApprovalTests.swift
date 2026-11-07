@@ -13,6 +13,8 @@ private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 
     var listings: [[DesktopLinkRequest]]
     /// Operations that fail, as the owner gate or a pin refusal would.
     var failing: Set<String> = []
+    /// Replies for operations other than the listing.
+    var replies: [String: [String: Any]] = [:]
 
     init(listings: [[DesktopLinkRequest]]) { self.listings = listings }
 
@@ -26,7 +28,7 @@ private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 
             let data = try JSONEncoder().encode(next)
             return ["requests": try JSONSerialization.jsonObject(with: data)]
         }
-        return ["status": "ok"]
+        return replies[operation] ?? ["status": "ok"]
     }
 
     func names() -> [String] { operations.map(\.0) }
@@ -199,4 +201,71 @@ private func listed(id: String = shownRequest.id, createdAt: String = shownReque
     #expect(decision == nil)
     #expect(failure == nil)
     #expect(DesktopLinkWatch.answered(decision, shown: shownRequest, asked: []).isEmpty)
+}
+
+@MainActor private var hostChannelDispatch: [String: Any] { ["status": "dispatch", "carrier": "relay_host_channel", "peer_node_id": "node-b",
+    "message_id": String(repeating: "c", count: 32), "establish_envelope": "signed-proposal"] }
+
+@MainActor private func hostChannelApproval(mac: FakeDaemon, peer: FakeDaemon?, asked: @escaping (String) -> Void) -> DesktopLinkApproval {
+    DesktopLinkApproval(requester: mac.request, present: { _, callback in callback(.alertSecondButtonReturn); return true }, peer: { node in
+        asked(node)
+        return peer.map { $0.request }
+    })
+}
+
+// A route carried by the Relay host channel: the signed proposal goes to the
+// peer host's relayd and its signed reply back to this host's relayd.
+@Test @MainActor func hostChannelApprovalCarriesTheSignedExchange() async throws {
+    let mac = FakeDaemon(listings: [[shownRequest]])
+    mac.replies = ["route_desktop_link_approve": hostChannelDispatch, "route_desktop_link_settle": ["status": "established"]]
+    let peer = FakeDaemon(listings: [])
+    peer.replies = ["deliver_signed_desktop_establish": ["status": "delivered_reply", "establish_reply": "signed-reply"]]
+    var resolved: [String] = []
+    let approval = hostChannelApproval(mac: mac, peer: peer) { resolved.append($0) }
+    #expect(try await approval.decide(shownRequest, current: [shownRequest]) == .approved)
+    #expect(resolved == ["node-b"])
+    #expect(mac.names() == ["route_desktop_link_list", "route_desktop_link_approve", "route_desktop_link_settle"])
+    #expect(peer.names() == ["deliver_signed_desktop_establish"])
+    #expect(peer.operations[0].1["establish_envelope"] as? String == "signed-proposal")
+    let settle = mac.operations[2].1
+    #expect(settle["message_id"] as? String == String(repeating: "c", count: 32))
+    #expect(settle["establish_reply"] as? String == "signed-reply")
+}
+
+// No connected host reports the peer node: nothing is sent, and the failure
+// keeps the owner's answer so it is reported once and not asked again.
+@Test @MainActor func hostChannelApprovalWithoutAConnectedPeerHostIsAnAnsweredFailure() async throws {
+    let mac = FakeDaemon(listings: [[shownRequest]])
+    mac.replies = ["route_desktop_link_approve": hostChannelDispatch]
+    let approval = hostChannelApproval(mac: mac, peer: nil) { _ in }
+    let (decision, failure) = await DesktopLinkWatch.outcome { try await approval.decide(shownRequest, current: [shownRequest]) }
+    #expect(decision == .approved)
+    #expect(failure?.underlying as? DesktopLinkCarrierError == .noConnectedHost("node-b"))
+    #expect(failure?.underlying.localizedDescription.contains("node-b") == true)
+    #expect(!mac.names().contains("route_desktop_link_settle"))
+    #expect(DesktopLinkWatch.answered(decision, shown: shownRequest, asked: []) == [DesktopLinkWatch.askKey(shownRequest)])
+}
+
+// The peer refuses the proposal: nothing is settled and the answer is kept.
+@Test @MainActor func hostChannelApprovalPeerRefusalIsAnAnsweredFailure() async throws {
+    let mac = FakeDaemon(listings: [[shownRequest]])
+    mac.replies = ["route_desktop_link_approve": hostChannelDispatch]
+    let peer = FakeDaemon(listings: [])
+    peer.failing = ["deliver_signed_desktop_establish"]
+    let approval = hostChannelApproval(mac: mac, peer: peer) { _ in }
+    let (decision, failure) = await DesktopLinkWatch.outcome { try await approval.decide(shownRequest, current: [shownRequest]) }
+    #expect(decision == .approved)
+    #expect(failure != nil)
+    #expect(!mac.names().contains("route_desktop_link_settle"))
+}
+
+// An HTTPS route establishes inside approve: no peer lookup and no settle.
+@Test @MainActor func httpsApprovalNeedsNoCarrier() async throws {
+    let mac = FakeDaemon(listings: [[shownRequest]])
+    mac.replies = ["route_desktop_link_approve": ["status": "established"]]
+    var resolved = 0
+    let approval = hostChannelApproval(mac: mac, peer: nil) { _ in resolved += 1 }
+    #expect(try await approval.decide(shownRequest, current: [shownRequest]) == .approved)
+    #expect(resolved == 0)
+    #expect(mac.names() == ["route_desktop_link_list", "route_desktop_link_approve"])
 }
