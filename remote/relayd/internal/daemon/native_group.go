@@ -204,7 +204,10 @@ func (s *nativeGroupService) private(path string) *pyObject {
 }
 func (s *nativeGroupService) resolve(member *pyObject) (*pyObject, string) {
 	pid := phPyInt(member.Get("pid"))
-	directory := filepath.Join(s.home, ".claude/sessions")
+	directory, err := nativeClaudeSessionsDirectory(int(pid))
+	if err != nil {
+		phRaise(phValueError, "Session account unavailable")
+	}
 	record := s.private(filepath.Join(directory, pyStr(pid)+".json"))
 	for _, pair := range [][2]string{{"pid", "pid"}, {"name", "name"}, {"sessionId", "session"}, {"procStart", "processStart"}} {
 		if !pyEqual(record.Get(pair[0]), member.Get(pair[1])) {
@@ -630,4 +633,15 @@ func RunNativeGroup(ctx context.Context, args []string, in io.Reader, out io.Wri
 		return errors.New("native group needs attention; inspect durable receipts before retrying")
 	}
 	return nil
+}
+
+// nativeClaudeSessionsDirectory is the session registry of the member's exact
+// Claude process, in its own account. It is never the daemon user's default
+// account by fallback.
+func nativeClaudeSessionsDirectory(pid int) (string, error) {
+	root, err := nativeClaudeAccountRoot(pid)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "sessions"), nil
 }

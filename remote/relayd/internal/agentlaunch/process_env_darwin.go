@@ -25,6 +25,11 @@ func ProcessEnvironment(pid int, keys ...string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The kernel withholds the environment of platform binaries and serves an
+	// empty block. A real agent always has variables, so an empty block is unread.
+	if !bytes.Contains(block, []byte("=")) {
+		return nil, errors.New("agent environment unavailable")
+	}
 	return selectEnvironment(block, keys)
 }
 

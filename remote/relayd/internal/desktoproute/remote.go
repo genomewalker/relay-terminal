@@ -49,8 +49,9 @@ func (r *remoteRuntime) registry(pid int, start string) (string, error) {
 	if e != nil {
 		return "", e
 	}
-	root := env["CLAUDE_CONFIG_DIR"]
-	if root == "" {
+	// Only an unset variable selects ~/.claude; a set one is the account.
+	root, set := env["CLAUDE_CONFIG_DIR"]
+	if !set {
 		root = filepath.Join(r.home, ".claude")
 	}
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
@@ -353,8 +354,10 @@ func RunRemote(ctx context.Context, args []string, in io.Reader, out io.Writer) 
 	return r.run(ctx, args, in, out)
 }
 func (r *remoteRuntime) identityEvent(registry, session string, out io.Writer) error {
+	// An empty registry means the owner's account could not be resolved, and
+	// the route records none. No replacement is searched for in any account.
 	if registry == "" {
-		registry = filepath.Join(r.home, ".claude/sessions")
+		return emit(out, map[string]string{"type": "identity_missing"})
 	}
 	if e := privateDirectory(registry, false); e != nil {
 		return emit(out, map[string]string{"type": "identity_missing"})

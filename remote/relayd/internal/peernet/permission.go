@@ -34,7 +34,10 @@ func runtimePermissionClass(home string, target Record) string {
 		return ""
 	}
 	codex, _ := filepath.Glob(filepath.Join(codexConfig(home, target.PID), "sessions/*/*/*/rollout-*-"+target.Session+".jsonl"))
-	claude, _ := filepath.Glob(filepath.Join(claudeConfig(home, target.PID), "projects/*/"+target.Session+".jsonl"))
+	var claude []string
+	if config, err := claudeConfig(home, target.PID); err == nil {
+		claude, _ = filepath.Glob(filepath.Join(config, "projects/*/"+target.Session+".jsonl"))
+	}
 	mode := ""
 	hasRuntimeMode := false
 	paths := codex

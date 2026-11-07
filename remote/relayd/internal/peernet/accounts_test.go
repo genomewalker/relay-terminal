@@ -36,7 +36,11 @@ func TestDiscoveryFindsAPeerInItsOwnClaudeAccount(t *testing.T) {
 		_ = command.Wait()
 	}()
 	pid := command.Process.Pid
-	for deadline := time.Now().Add(5 * time.Second); claudeConfig(home, pid) != personal; time.Sleep(20 * time.Millisecond) {
+	ready := func() bool {
+		config, err := claudeConfig(home, pid)
+		return err == nil && config == personal
+	}
+	for deadline := time.Now().Add(5 * time.Second); !ready(); time.Sleep(20 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("helper account never became readable")
 		}

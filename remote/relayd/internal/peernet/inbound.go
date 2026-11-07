@@ -52,7 +52,10 @@ type settingsLayer struct {
 // directory from the working directory up to that root is included. Extra
 // layers can only make the prediction unknown, never definite.
 func claudeSettingsLayers(home string, pid int) ([]settingsLayer, error) {
-	config := claudeConfig(home, pid)
+	config, err := claudeConfig(home, pid)
+	if err != nil {
+		return nil, err
+	}
 	cwd, err := processWorkingDirectory(pid)
 	if err != nil {
 		return nil, err

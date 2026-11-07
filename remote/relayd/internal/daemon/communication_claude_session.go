@@ -50,42 +50,53 @@ func ReadClaudeSessionActor(clientPID int) (ClaudeSessionActor, error) {
 	if err != nil {
 		return empty, err
 	}
-	fallback, err := defaultAgentConfigRoot("claude")
-	if err != nil {
-		return empty, err
-	}
 	for _, pid := range chain {
 		if pid == clientPID || pid <= 1 {
 			continue
 		}
-		config, configErr := agentConfigRoot(pid, "claude")
-		if configErr != nil {
-			config = fallback
-		}
-		path := filepath.Join(config, "sessions", strconv.Itoa(pid)+".json")
-		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		pidStart, err := processStartIdentity(pid)
+		actor, found, err := claudeDesktopSessionAt(pid, clientPID, start)
 		if err != nil {
 			return empty, err
 		}
-		record, _, _, err := readNativeClaudeRegistrationEntry(path, pid, pidStart, "interactive", nativemsg.ClaudeDesktopEntrypoint)
-		if err != nil {
-			return empty, errors.New("the calling process's Claude session is not a Claude desktop session")
+		if found {
+			return actor, nil
 		}
-		actor := ClaudeSessionActor{Version: 1, SessionID: record.SessionID, AccountRoot: config, PID: pid,
-			ProcessStart: pidStart, ClientPID: clientPID, ClientStart: start, Source: claudeDesktopSessionSource}
-		if !actor.Target().Valid() {
-			return empty, errors.New("Claude desktop session account directory is invalid")
-		}
-		if after, err := processStartIdentity(pid); err != nil || after != pidStart {
-			return empty, errors.New("Claude desktop session changed during observation")
-		}
-		if after, err := processStartIdentity(clientPID); err != nil || after != start {
-			return empty, fmt.Errorf("communication client changed during observation")
-		}
-		return actor, nil
 	}
 	return empty, errors.New("no Claude desktop session owns this client")
+}
+
+// claudeDesktopSessionAt observes one ancestor's registration in its own
+// account. found is false when that account publishes none for pid. An
+// account that cannot be resolved refuses the whole observation: no other
+// account is searched for the ancestor.
+func claudeDesktopSessionAt(pid, clientPID int, clientStart string) (ClaudeSessionActor, bool, error) {
+	var empty ClaudeSessionActor
+	config, err := nativeClaudeAccountRoot(pid)
+	if err != nil {
+		return empty, false, err
+	}
+	path := filepath.Join(config, "sessions", strconv.Itoa(pid)+".json")
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return empty, false, nil
+	}
+	pidStart, err := processStartIdentity(pid)
+	if err != nil {
+		return empty, false, err
+	}
+	record, _, _, err := readNativeClaudeRegistrationEntry(path, pid, pidStart, "interactive", nativemsg.ClaudeDesktopEntrypoint)
+	if err != nil {
+		return empty, false, errors.New("the calling process's Claude session is not a Claude desktop session")
+	}
+	actor := ClaudeSessionActor{Version: 1, SessionID: record.SessionID, AccountRoot: config, PID: pid,
+		ProcessStart: pidStart, ClientPID: clientPID, ClientStart: clientStart, Source: claudeDesktopSessionSource}
+	if !actor.Target().Valid() {
+		return empty, false, errors.New("Claude desktop session account directory is invalid")
+	}
+	if after, err := processStartIdentity(pid); err != nil || after != pidStart {
+		return empty, false, errors.New("Claude desktop session changed during observation")
+	}
+	if after, err := processStartIdentity(clientPID); err != nil || after != clientStart {
+		return empty, false, fmt.Errorf("communication client changed during observation")
+	}
+	return actor, true, nil
 }

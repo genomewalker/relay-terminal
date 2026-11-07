@@ -225,14 +225,11 @@ func readNativeClaudeBinding(pane, target string) (AgentBindingRecord, error) {
 	if err != nil {
 		return empty, err
 	}
-	// Claude publishes its session registry in its own account directory. The
-	// registration is verified against this PID below, so an unreadable
-	// environment can only fall back to the default directory, never misbind.
-	config, err := agentConfigRoot(pid, "claude")
+	// Claude publishes its session registry in its own account directory: the
+	// exact process's, never a fallback when its environment is unreadable.
+	config, err := nativeClaudeAccountRoot(pid)
 	if err != nil {
-		if config, err = defaultAgentConfigRoot("claude"); err != nil {
-			return empty, err
-		}
+		return empty, err
 	}
 	path := filepath.Join(config, "sessions", fmt.Sprintf("%d.json", pid))
 	registration, data, file, err := readNativeClaudeRegistration(path, pid, identity)
@@ -293,4 +290,12 @@ func readNativeClaudeBinding(pane, target string) (AgentBindingRecord, error) {
 		return empty, err
 	}
 	return AgentBindingRecord{Version: 1, Producer: agentProducer{PaneID: pane, Provider: "claude", ProcessID: pid, ProcessStart: start, ConfigDir: override}, SessionID: registration.SessionID, TranscriptPath: transcript, ObservedAt: time.Now().UTC(), Lifecycle: "unknown", Revision: hex.EncodeToString(sum[:]), Source: "native_registration_kernel_owner"}, nil
+}
+
+// nativeClaudeAccountRoot is the account directory of one exact Claude process:
+// its own CLAUDE_CONFIG_DIR, or ~/.claude only when that is unset. An unreadable
+// environment, an invalid directory or a process that is gone is an error.
+// No other account is ever tried.
+func nativeClaudeAccountRoot(pid int) (string, error) {
+	return agentConfigRoot(pid, "claude")
 }

@@ -20,7 +20,11 @@ func agentConfigOverride(pid int, provider string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	value := vars[name]
+	value, set := vars[name]
+	// A set but empty variable is not the default account; only an unset one is.
+	if set && value == "" {
+		return "", errors.New("agent account directory is empty")
+	}
 	if value != "" && (!filepath.IsAbs(value) || filepath.Clean(value) != value || len(value) > 4096) {
 		return "", errors.New("agent account directory is invalid")
 	}
