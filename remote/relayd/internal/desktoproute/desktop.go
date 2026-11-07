@@ -318,13 +318,7 @@ func (d *nativeDesktop) tasks(ctx context.Context, path string, details bool) ([
 	verified := map[string]bool{}
 	for _, ref := range refs {
 		registered[ref.Thread] = true
-		c, e := d.openWork(ctx, ref)
-		if e != nil {
-			continue
-		}
-		_, e = c.owner(true)
-		c.close()
-		if e == nil {
+		if d.verifyWork(ctx, ref) || d.repinWork(ctx, path, ref) {
 			verified[ref.Thread] = true
 			rows = append(rows, TaskInfo{ID: ref.Thread, Status: "unknown"})
 		}

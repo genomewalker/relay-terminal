@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -285,6 +287,46 @@ func (d *nativeDesktop) inspectWork(ctx context.Context, thread string) (workRef
 	}
 	return r, d.workProcess(r)
 }
+
+// verifyWork reports whether a saved Work endpoint still answers as pinned:
+// the same app incarnation, kernel socket owner and thread owner.
+func (d *nativeDesktop) verifyWork(ctx context.Context, ref workReference) bool {
+	c, e := d.openWork(ctx, ref)
+	if e != nil {
+		return false
+	}
+	defer c.close()
+	_, e = c.owner(true)
+	return e == nil
+}
+
+// repinWork moves a saved Work endpoint to the app's current incarnation after
+// the Codex app restarted. It applies only on the legacy discovery path that
+// task-prepare also uses, re-checks the same thread with the same evidence a
+// first registration needs (socket peer UID and PID, the Work app executable
+// and start time, the thread's owner and untrusted-input support), and commits
+// only if the saved record is still the one that failed. A different thread,
+// executable or owner without untrusted-input support is never pinned.
+func (d *nativeDesktop) repinWork(ctx context.Context, path string, stale workReference) bool {
+	if filepath.Clean(path) != d.legacySocket() {
+		return false
+	}
+	fresh, e := d.inspectWork(ctx, stale.Thread)
+	if e != nil || fresh.Thread != stale.Thread || fresh.AppPath != stale.AppPath || !laterIncarnation(stale.Start, fresh.Start) {
+		return false
+	}
+	return d.commitWork(fresh, &stale) == nil
+}
+
+// laterIncarnation reports whether the app's new start time is strictly after
+// the pinned one. Both are ps lstart strings; an unparseable time never repins.
+func laterIncarnation(pinned, current string) bool {
+	const layout = "Mon Jan 2 15:04:05 2006"
+	a, e := time.ParseInLocation(layout, strings.Join(strings.Fields(pinned), " "), time.Local)
+	b, f := time.ParseInLocation(layout, strings.Join(strings.Fields(current), " "), time.Local)
+	return e == nil && f == nil && b.After(a)
+}
+
 func (d *nativeDesktop) commitWork(r workReference, expected *workReference) error {
 	if e := d.validateWork(r); e != nil {
 		return e
