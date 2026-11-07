@@ -99,7 +99,7 @@ private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 
         accountRoot: shownRequest.accountRoot, paneID: shownRequest.paneID, createdAt: "2026-11-07T09:00:00Z",
         expiresAt: "2026-11-07T09:10:00Z", proposedCallers: ["receiver"])
     #expect(DesktopLinkWatch.due([live, expired], asked: [], now: now) == [live])
-    #expect(DesktopLinkWatch.due([live], asked: [live.id], now: now).isEmpty)
+    #expect(DesktopLinkWatch.due([live], asked: [DesktopLinkWatch.askKey(live)], now: now).isEmpty)
     #expect(DesktopLinkRequest.parse("2026-11-07T10:10:00.123456Z") != nil)
 }
 
@@ -125,4 +125,39 @@ private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 
     let approve = daemon.operations.last!
     #expect(approve.0 == "route_desktop_link_approve")
     #expect(approve.1["allowed_callers"] as? [String] == request.proposedCallers)
+}
+
+private func listed(id: String = shownRequest.id, createdAt: String = shownRequest.createdAt, refusal: String? = nil,
+                    callers: [String] = ["receiver"]) -> DesktopLinkRequest {
+    DesktopLinkRequest(id: id, sessionID: shownRequest.sessionID, accountRoot: shownRequest.accountRoot, paneID: shownRequest.paneID,
+        createdAt: createdAt, expiresAt: shownRequest.expiresAt, proposedCallers: callers, refusal: refusal)
+}
+
+// A request with a refusal is never offered, even when it is live.
+@Test func watchDoesNotOfferARefusedRequest() throws {
+    let now = ISO8601DateFormatter().date(from: "2026-11-07T10:05:00Z")!
+    #expect(DesktopLinkWatch.due([listed(refusal: "no active route to the requested host")], asked: [], now: now).isEmpty)
+    #expect(DesktopLinkWatch.due([listed(callers: [])], asked: [], now: now).isEmpty)
+    #expect(DesktopLinkWatch.due([listed()], asked: [], now: now).count == 1)
+}
+
+// The same pair requested again is a new request, and is offered again.
+@Test func watchOffersAReRequestedPairAgain() throws {
+    let now = ISO8601DateFormatter().date(from: "2026-11-07T10:05:00Z")!
+    let first = listed()
+    let asked = DesktopLinkWatch.answered(.rejected, shown: first, asked: [])
+    #expect(DesktopLinkWatch.due([first], asked: asked, now: now).isEmpty)
+    let again = listed(createdAt: "2026-11-07T10:04:00Z")
+    #expect(DesktopLinkWatch.due([again], asked: asked, now: now) == [again])
+}
+
+// A sheet that could not be shown, or a listing that changed, is not an answer:
+// the request is offered again on a later pass. A real answer is recorded once.
+@Test func watchRecordsOnlyAnswersTheOwnerGave() throws {
+    let shown = listed()
+    #expect(DesktopLinkWatch.answered(.unavailable, shown: shown, asked: []).isEmpty)
+    #expect(DesktopLinkWatch.answered(.changed, shown: shown, asked: []).isEmpty)
+    #expect(DesktopLinkWatch.answered(nil, shown: shown, asked: []).isEmpty)
+    #expect(DesktopLinkWatch.answered(.approved, shown: shown, asked: []) == [DesktopLinkWatch.askKey(shown)])
+    #expect(DesktopLinkWatch.answered(.cancelled, shown: shown, asked: []) == [DesktopLinkWatch.askKey(shown)])
 }

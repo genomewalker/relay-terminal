@@ -71,6 +71,12 @@ enum DesktopLinkDecision: Equatable {
 /// without the owner's click on the request as it was shown, with the callers it
 /// lists. A request that changed or expired before the click is refused, and the
 /// daemon checks the pair and callers again on its own side.
+///
+/// The real boundary: the daemon refuses owner operations from agent processes
+/// (pane agents and Claude desktop sessions) and from any caller whose ancestry it
+/// cannot read. Agents and desktop sessions cannot approve. Other same-user programs
+/// that are not agents can still run the owner operations; this panel is the
+/// owner's decision, not a defense against them.
 @MainActor final class DesktopLinkApproval {
     /// Sends one owner operation to the daemon and returns its reply.
     typealias Requester = @MainActor (_ operation: String, _ packet: [String: Any]) async throws -> [String: Any]
@@ -146,9 +152,27 @@ enum DesktopLinkDecision: Equatable {
 @MainActor final class DesktopLinkWatch {
     static let interval: Duration = .seconds(5)
 
-    /// The requests to ask about now: live, approvable, and not yet asked about.
+    /// Identity of one request. The same pair requested again is a new request.
+    nonisolated static func askKey(_ request: DesktopLinkRequest) -> String {
+        request.id + "|" + request.createdAt
+    }
+
+    /// The requests to ask about now: live, approvable (no refusal, callers shown), and
+    /// not yet answered.
     nonisolated static func due(_ listing: [DesktopLinkRequest], asked: Set<String>, now: Date) -> [DesktopLinkRequest] {
-        listing.filter { $0.isLive(at: now) && !asked.contains($0.id) }
+        listing.filter { $0.isLive(at: now) && $0.refusal == nil && !$0.proposedCallers.isEmpty && !asked.contains(askKey($0)) }
+    }
+
+    /// Records an answer. Only a decision the owner gave counts; a sheet that could
+    /// not be shown, or a listing that changed, leaves the request to be offered again.
+    nonisolated static func answered(_ decision: DesktopLinkDecision?, shown: DesktopLinkRequest, asked: Set<String>) -> Set<String> {
+        guard let decision else { return asked }
+        switch decision {
+        case .approved, .rejected, .cancelled:
+            return asked.union([askKey(shown)])
+        case .changed, .unavailable:
+            return asked
+        }
     }
 
     private weak var workspace: WorkspaceModel?
@@ -180,8 +204,8 @@ enum DesktopLinkDecision: Equatable {
             }
             guard let listing = try? await approval.pending() else { continue }
             for shown in Self.due(listing, asked: asked, now: now) {
-                asked.insert(shown.id)
-                _ = try? await approval.decide(shown, current: listing)
+                let decision = try? await approval.decide(shown, current: listing)
+                asked = Self.answered(decision, shown: shown, asked: asked)
             }
         }
     }
