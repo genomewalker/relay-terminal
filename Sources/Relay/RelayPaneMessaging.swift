@@ -793,6 +793,88 @@ import CryptoKit
         }
         return try finish(result)
     }
+    /// In-flight caller-sourced messages on this instance. They have no pane
+    /// pair, so they take no shared in-flight marker: the janitor only
+    /// understands two-pane markers and a caller send protects no link.
+    private var activeCallerDeliveries: Set<UUID> = []
+
+    /// Recipient decision for a caller send. Only the recipient's kind matters:
+    /// the host (this Mac or a relayd host) is not a criterion, because the
+    /// delivery below is the same host-channel `nativeRequest` a pane-sourced
+    /// message to that pane already uses.
+    nonisolated static func callerRecipientRefusal(contentKind: PaneContentKind) -> String? {
+        contentKind == .terminal ? nil : "The recipient must be an existing terminal."
+    }
+
+    /// A message from a registered caller that has no pane. Same claim, receipt,
+    /// endpoint recheck and native delivery as `send`; only the sender differs.
+    /// The caller was already resolved and unpaused by the route. Local and
+    /// remote recipients are served alike. The recipient's relayd cannot verify
+    /// where the caller identity came from: it is a claim at the same trust level
+    /// as a claimed pane label.
+    func sendAsCaller(messageID: UUID, text: String, sender: RelayCallerSender.Sender, targetID: UUID,
+                      workspace: WorkspaceModel) async throws -> [String: Any] {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 16384,
+              !text.unicodeScalars.contains(where: { $0.value < 32 && $0.value != 10 && $0.value != 9 }) else {
+            throw RemoteCatalogError.failed("Use a message of 1–16384 bytes.")
+        }
+        guard let target = workspace.panes[targetID], Self.callerRecipientRefusal(contentKind: target.contentKind) == nil else {
+            throw RemoteCatalogError.failed("The recipient must be an existing terminal.")
+        }
+        struct Identity: Codable { let callerID: String; let messageID: UUID; let text: String }
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        let fingerprint = SHA256.hash(data: try encoder.encode(Identity(callerID: sender.id, messageID: messageID, text: text))
+                                      + Data(targetID.uuidString.utf8)).map { String(format: "%02x", $0) }.joined()
+        if let prior = try receipts.read(intent: messageID.uuidString, action: "send") {
+            guard prior.fingerprint == fingerprint else { throw RemoteCatalogError.failed("Message ID conflicts with an existing request.") }
+            return try await receipt(messageID, workspace: workspace) ?? [:]
+        }
+        guard !activeCallerDeliveries.contains(messageID), activeDeliveries[messageID] == nil else {
+            throw RemoteCatalogError.failed("This message is in flight. Check its receipt; do not replay.")
+        }
+        activeCallerDeliveries.insert(messageID)
+        defer { activeCallerDeliveries.remove(messageID) }
+        let targetProfile = target.profile
+        let targetProcess = try await endpoint(target)
+        guard workspace.panes[targetID] === target, target.profile == targetProfile, targetProcess.transport != "unavailable" else {
+            throw RemoteCatalogError.failed("Recipient has no supported native messaging socket. Terminal injection is unavailable for messages.")
+        }
+        guard try receipts.claim(intent: messageID.uuidString, action: "send", fingerprint: fingerprint) else {
+            guard try receipts.read(intent: messageID.uuidString, action: "send")?.fingerprint == fingerprint else {
+                throw RemoteCatalogError.failed("Message ID conflicts with an existing request.")
+            }
+            return try await receipt(messageID, workspace: workspace) ?? [:]
+        }
+        let targetNow = try await endpoint(target)
+        guard targetNow == targetProcess, workspace.panes[targetID] === target, target.profile == targetProfile,
+              target.contentKind == .terminal else {
+            throw RemoteCatalogError.failed("Pane or native recipient session changed. The claimed message will not be replayed.")
+        }
+        let expected = try JSONSerialization.jsonObject(with: JSONEncoder().encode(targetProcess))
+        var result: [String: Any] = ["message_id": messageID.uuidString.lowercased(),
+            "source_caller_id": sender.id, "source_caller_label": sender.label,
+            "pane_id": targetID.uuidString.lowercased(), "provider": targetProcess.provider, "transport": targetProcess.transport,
+            "source_authentication": RelayCallerSender.authentication, "submitting_client_id": sender.id,
+            "status": "outcome_unknown", "replay_permitted": false]
+        do {
+            let delivered = try await nativeRequest(target, packet: ["operation": "send", "expected": expected,
+                "messageID": messageID.uuidString.lowercased(), "targetPaneID": targetID.uuidString.lowercased(),
+                "text": text, "submittingClientID": sender.id,
+                "source": RelayCallerSender.source(sender, hostID: targetProfile.id)])
+            for (key, value) in delivered { result[key] = value }
+        } catch {
+            // The durable claim precedes every write. Transport loss never replays a message.
+            result["error"] = error.localizedDescription
+        }
+        try receipts.complete(intent: messageID.uuidString, action: "send", fingerprint: fingerprint,
+            result: JSONSerialization.data(withJSONObject: result, options: .sortedKeys))
+        RelayRecoveryStore.shared.record(kind: "message_\(result["status"] as? String ?? "outcome_unknown")",
+            paneID: targetID, profile: targetProfile, links: [
+                .init(from: "caller:\(sender.id)", to: "message:\(messageID)", kind: "submitted"),
+                .init(from: "message:\(messageID)", to: "pane:\(targetID)", kind: "addressed_to")
+            ])
+        return result
+    }
 }
 
 /// Question-thread inputs, checked identically by the Miko step and the

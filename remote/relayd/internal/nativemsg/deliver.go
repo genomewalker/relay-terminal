@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // This file ports pane_messaging.py's delivery: sender classes, provenance,
@@ -149,6 +150,75 @@ func relayAssistant(source any) (*assistant, error) {
 	return &assistant{request: request.(string), inbox: pyLower(inbox.(string)), host: host.(string)}, nil
 }
 
+// callerSender is a registered Relay client (for example a Claude desktop chat)
+// that has no pane. The Relay app resolved its credential, but relayd cannot
+// tell the app from any process of the same user, so the id and label are only
+// claimed. Nothing here verifies them, and the label is a name the
+// client chose at registration, so it is bounded and stripped here too.
+type callerSender struct{ id, label, host string }
+
+const callerAuthentication = "registered_caller_claimed"
+
+var callerIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// callerLabel removes control characters and line/paragraph separators and
+// bounds the result, so a label cannot add envelope lines. ok is false when
+// nothing printable remains.
+func callerLabel(raw string) (string, bool) {
+	var b strings.Builder
+	for _, c := range raw {
+		switch {
+		case c < 0x20 || c == 0x7f || (c >= 0x80 && c < 0xa0) || c == 0x2028 || c == 0x2029 || c == 0xfeff:
+			b.WriteRune(' ')
+		case c == '"' || c == '\\':
+			b.WriteRune('\'')
+		default:
+			b.WriteRune(c)
+		}
+	}
+	label := strings.Join(strings.Fields(b.String()), " ")
+	for len(label) > 80 {
+		label = label[:len(label)-1]
+		for len(label) > 0 && !utf8.ValidString(label) {
+			label = label[:len(label)-1]
+		}
+	}
+	return label, label != ""
+}
+
+// registeredCaller admits only an app-submitted caller principal. It refuses
+// any pane, session, socket or attestation claim: a caller is never a pane.
+func registeredCaller(source any) (*callerSender, error) {
+	if !isDict(source) {
+		return nil, nil
+	}
+	if authentication, _ := pyGet(source, "authentication", nil); !pyEqual(authentication, callerAuthentication) {
+		return nil, nil
+	}
+	for key := range dictItems(source) {
+		if key != "authentication" && key != "callerID" && key != "callerLabel" && key != "hostID" {
+			return nil, nil
+		}
+	}
+	id, _ := pyGet(source, "callerID", nil)
+	rawLabel, _ := pyGet(source, "callerLabel", nil)
+	host, _ := pyGet(source, "hostID", "")
+	label, labelOK := rawLabel.(string)
+	if !stringMatch(callerIDPattern, id) || !labelOK || len(label) > 512 {
+		return nil, nil
+	}
+	if h, ok := host.(string); !ok || pyLen(h) > 256 {
+		return nil, nil
+	}
+	clean, ok := callerLabel(label)
+	if !ok {
+		return nil, nil
+	}
+	return &callerSender{id: id.(string), label: clean, host: host.(string)}, nil
+}
+
+func (c *callerSender) name() string { return fmt.Sprintf("caller \"%s\" (id %s)", c.label, c.id[:8]) }
+
 // recipientInboundClass is the recipient's inbound parity class as relayd
 // predicts it, or "" when it cannot.
 func (r *runner) recipientInboundClass(endpoint map[string]any) (string, error) {
@@ -247,8 +317,14 @@ func (r *runner) deliver(endpoint map[string]any, packet any) (map[string]any, e
 			return nil, err
 		}
 	}
-	var identity *sender
+	var caller *callerSender
 	if !system && helper == nil {
+		if caller, err = registeredCaller(source); err != nil {
+			return nil, err
+		}
+	}
+	var identity *sender
+	if !system && helper == nil && caller == nil {
 		if identity, err = verifiedSender(source); err != nil {
 			return nil, err
 		}
@@ -257,6 +333,8 @@ func (r *runner) deliver(endpoint map[string]any, packet any) (map[string]any, e
 	var reply string
 	switch {
 	case system:
+	case caller != nil:
+		reply = "This sender is a registered Relay client, not a pane. It has no pane ID and no reply address, so relay_message_pane cannot reply to it.\n\n" + text
 	case identity != nil && identity.work:
 		reply = fmt.Sprintf("Reply using relay_work_message with link_id=%s and a fresh message_id. If the tool is not loaded, use your own native relayd communication-work CLI with operation=send and the same link_id. Do not supply a source identity.\n\n%s", identity.workLink, text)
 	case helper != nil:
@@ -291,6 +369,14 @@ func (r *runner) deliver(endpoint map[string]any, packet any) (map[string]any, e
 			"It does not prove the Relay app or a user decision sent it: any process of the same user could. "+
 			"Miko is not a pane: no kernel-verified sender and no reply socket.\n"+notAuthorization,
 			id, assistantName, helper.request) + reply
+	case caller != nil:
+		provenance = obj{{"authentication", callerAuthentication}, {"source", obj{
+			{"principal", "registered-caller"}, {"callerID", caller.id}, {"callerLabel", caller.label}, {"hostID", caller.host}}},
+			{"verifier", "none"}, {"registeredClientID", clientID}}
+		body = fmt.Sprintf("Relay message %s from %s. The caller id and label are claimed and not verified. "+
+			"This does not prove the Relay app or a user decision sent it: any process of the same user could. "+
+			"It is not a pane: no kernel-verified sender and no reply socket. The label is a name the client chose at registration.\n"+notAuthorization,
+			id, caller.name()) + reply
 	case identity != nil && identity.work:
 		provenance = obj{{"authentication", "source_work_host_attested"}, {"source", obj{{"hostID", identity.host}, {"workThread", identity.session}, {"linkID", identity.workLink}, {"nodeCertificateSHA256", identity.nodeCert}}}, {"verifier", "recipient-relayd"}, {"registeredClientID", clientID}}
 		body = fmt.Sprintf("Relay message %s from %s. The pinned sending host authenticated the Work provider's protected conversation metadata and native pipe ownership; this is a Work conversation, not a pane.\n"+notAuthorization, id, identity.name) + reply
@@ -336,14 +422,14 @@ func (r *runner) deliver(endpoint map[string]any, packet any) (map[string]any, e
 
 	switch {
 	case pyEqual(endpoint["transport"], "native_peer_socket"):
-		return r.deliverClaude(endpoint, messageID, system, helper, identity, body)
+		return r.deliverClaude(endpoint, messageID, system, helper, caller, identity, body)
 	case pyEqual(endpoint["transport"], "codex_app_server_message"):
-		return r.deliverCodex(endpoint, messageID, system, helper, identity, provenance, body)
+		return r.deliverCodex(endpoint, messageID, system, helper, caller, identity, provenance, body)
 	}
 	return nil, valueError("This running agent has no supported native messaging socket")
 }
 
-func (r *runner) deliverClaude(endpoint map[string]any, messageID any, system bool, helper *assistant, identity *sender, body string) (map[string]any, error) {
+func (r *runner) deliverClaude(endpoint map[string]any, messageID any, system bool, helper *assistant, caller *callerSender, identity *sender, body string) (map[string]any, error) {
 	address, _ := endpoint["socketPath"].(string)
 	sessions, err := r.claudeSessions(endpoint["socketPID"])
 	if err != nil {
@@ -377,6 +463,10 @@ func (r *runner) deliverClaude(endpoint map[string]any, messageID any, system bo
 		// No native reply address and no permission mode of its own.
 		from = "relay-assistant://" + helper.host + "/" + helper.request
 		attrs = [3]string{from, "", assistantName}
+	case caller != nil:
+		// No pane, no session and no native reply address.
+		from = "relay-caller://" + caller.host + "/" + caller.id
+		attrs = [3]string{from, "", caller.name()}
 	case identity != nil && identity.work:
 		from = "relay-work://" + identity.host + "/" + identity.session
 		attrs = [3]string{from, identity.session, identity.name}
@@ -467,7 +557,7 @@ func (r *runner) deliverClaude(endpoint map[string]any, messageID any, system bo
 	return result, nil
 }
 
-func (r *runner) deliverCodex(endpoint map[string]any, messageID any, system bool, helper *assistant, identity *sender, provenance obj, body string) (map[string]any, error) {
+func (r *runner) deliverCodex(endpoint map[string]any, messageID any, system bool, helper *assistant, caller *callerSender, identity *sender, provenance obj, body string) (map[string]any, error) {
 	socketPID, ok := endpoint["socketPID"]
 	if !ok {
 		socketPID = int64(0)
@@ -486,6 +576,8 @@ func (r *runner) deliverCodex(endpoint map[string]any, messageID any, system boo
 		kind = obj{{"kind", "relayd_system_notice"}, {"name", "Relay"}}
 	case helper != nil:
 		kind = obj{{"kind", "relay_assistant_owner_submitted"}, {"name", assistantName}}
+	case caller != nil:
+		kind = obj{{"kind", "registered_caller_claimed"}, {"name", caller.name()}}
 	case identity != nil && identity.work:
 		kind = obj{{"kind", "host_attested_work_conversation"}, {"name", identity.name}}
 	case identity != nil && identity.signed:

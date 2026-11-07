@@ -2505,8 +2505,28 @@ final class RelaySidePanelServer: ObservableObject {
                 return .text("Pane messaging requires existing terminal input permission", status: 403, reason: "Forbidden")
             }
             do {
-                let input = try JSONDecoder().decode(RelayPaneMessaging.Request.self, from: request.body)
                 let callerToken = request.headers["x-relay-caller-token"]
+                // No source pane: only a registered, unpaused caller may send, as itself.
+                // A legacy or unknown credential keeps the pane requirement below.
+                if !RelayCallerSender.namesSourcePane(request.body) {
+                    if RelayCallerSender.namesSession(request.body) {
+                        return .text(RelayCallerSender.sessionRefusal, status: 409, reason: "Conflict")
+                    }
+                    guard let submission = RelayCallerSender.Submission.decode(request.body) else {
+                        return .text("A pane-less message carries only messageID and text, and a registered caller credential", status: 409, reason: "Conflict")
+                    }
+                    let sender = try RelayCallerSender.resolve(token: callerToken, control: callerControl)
+                    let target = workspace.panes[paneID]
+                    let result = try await paneMessaging.sendAsCaller(messageID: submission.messageID, text: submission.text,
+                        sender: sender, targetID: paneID, workspace: workspace)
+                    if RelayPromptProvenanceLog.messageMayHaveReachedPane(result), workspace.panes[paneID] === target {
+                        target?.promptProvenance.programmaticSubmit(source: "pane_message",
+                            fingerprint: RelayPromptFingerprint(submission.text), messageID: submission.messageID.uuidString,
+                            consumesInputLine: false)
+                    }
+                    return try .jsonObject(result)
+                }
+                let input = try JSONDecoder().decode(RelayPaneMessaging.Request.self, from: request.body)
                 let submittingClientID = try callerControl.identity(token: callerToken)
                 // A peer message is programmatic input to the target, never typing.
                 // relayd writes it to the native inbox, not the input line, so desktop

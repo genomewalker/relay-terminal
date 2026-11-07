@@ -36,6 +36,13 @@ func (s *server) communicationActor() (string, error) {
 	return actor.PaneID, nil
 }
 
+// noSenderRefusal is the local answer to relay_message_pane with neither a source
+// pane nor a registered caller credential. Nothing is sent.
+// callerSessionRefusal is the answer to a pane-less send that names a session.
+const callerSessionRefusal = "a registered caller cannot address a session; omit target_session_id"
+
+const noSenderRefusal = "source_pane_id is required: this helper has no registered caller token (RELAY_MCP_CALLER_TOKEN), so the message has no sender. Nothing was sent."
+
 // Only communication is redirected here. UI/editor tools retain their existing
 // client transport; none of those tools are advertised as server automation.
 func (s *server) daemonCommunication(name string, arguments map[string]json.RawMessage) (any, bool) {
@@ -120,6 +127,24 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 		"thread_id": true, "realm": true, "ttl": true, "target_session_id": true}
 	result := func(text string, failed bool) any {
 		return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": failed}
+	}
+	// A send with no source pane and no pane identity of its own can only come from
+	// a registered caller, and only the Relay app can resolve a caller's credential
+	// and label. relayd cannot take a pane-less send, so it goes to the desktop
+	// route, which also checks the credential; with no credential there is no sender.
+	if operation == "send" && actor == "" {
+		if _, hasSource := arguments["source_pane_id"]; !hasSource {
+			if s.callerToken == "" {
+				return result("source_pane_id is required: this helper has no registered caller token. Nothing was sent.", true), true
+			}
+			if targeted {
+				return result(callerSessionRefusal+". Nothing was sent.", true), true
+			}
+			if !desktopFallback {
+				return result("A message from a registered caller needs the Relay desktop route. Nothing was sent.", true), true
+			}
+			return nil, false
+		}
 	}
 	for key, raw := range arguments {
 		if !allowed[key] {
