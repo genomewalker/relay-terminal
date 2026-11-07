@@ -178,7 +178,7 @@ func communicationDesktopLinkApprove(root, node string, r CommunicationRequest, 
 		return nil, err
 	}
 	if r.AllowedCallers == nil || !sameCallerSet(r.AllowedCallers, peer.AllowedPeerCallers) {
-		return nil, errors.New("approve the exact callers the pair would admit: "+strings.Join(peer.AllowedPeerCallers, ", "))
+		return nil, errors.New("approve the exact callers the pair would admit: " + strings.Join(peer.AllowedPeerCallers, ", "))
 	}
 	link := peer
 	link.Version = 1
