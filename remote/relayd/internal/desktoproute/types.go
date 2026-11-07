@@ -132,7 +132,12 @@ type Config struct {
 	// so a replacement after the owner exits is searched only there. Empty for
 	// routes not yet verified; it is then backfilled from the live owner.
 	RemoteAccount string `json:"remoteAccount,omitempty"`
-	Socket        string `json:"socket"`
+	// RemoteAccountAccepted records that the remote's ready frame has carried its
+	// owner account, so it takes the recorded account as a listen argument. It
+	// survives reconnects and restarts and is cleared only when a remote
+	// explicitly refuses that argument.
+	RemoteAccountAccepted bool   `json:"remoteAccountAccepted,omitempty"`
+	Socket                string `json:"socket"`
 }
 
 func (c Config) Validate() error {

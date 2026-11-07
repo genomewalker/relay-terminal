@@ -263,6 +263,20 @@ func waitContext(ctx context.Context, d time.Duration) error {
 		return nil
 	}
 }
+
+// oldRemoteListenRefusal is the exact diagnostic a relayd from before the
+// recorded-account listen argument exits with when given that argument: its
+// desktop-remote accepts only five or seven arguments, so a six-argument
+// listen fails its first count check.
+const oldRemoteListenRefusal = "relayd: desktop-remote requires exact mode and process identity"
+
+var errAccountArgumentRefused = errors.New("remote relayd refused the recorded account argument")
+
+// errOwnerAbsent is a listener's final report that the owner is gone. The
+// event is consumed, so the next attempt launches a new listener that searches
+// again instead of rereading this stale report from the exited one.
+var errOwnerAbsent = errors.New("remote session absent; waiting for same session")
+
 func listenHost(ctx context.Context, t hostAPI, c *listenerCheckpoint, spec map[string]any, handle func([]byte) error) error {
 	if spec == nil {
 		return errors.New("unrecognized native listener arguments")
@@ -338,7 +352,7 @@ func listenHost(ctx context.Context, t hostAPI, c *listenerCheckpoint, spec map[
 		}
 	}
 	offset, errorOffset := c.state.Out, c.state.Err
-	var pending []byte
+	var pending, diagnostics []byte
 	failures := 0
 	for {
 		result, e := t.request(ctx, c.state.Job, "status", map[string]any{"stdout_offset": offset, "stderr_offset": errorOffset, "wait_millis": 15000})
@@ -373,6 +387,10 @@ func listenHost(ctx context.Context, t hostAPI, c *listenerCheckpoint, spec map[
 			return e
 		}
 		offset, errorOffset = result.OutOffset, result.ErrOffset
+		diagnostics = append(diagnostics, errs...)
+		if len(diagnostics) > 4096 {
+			diagnostics = diagnostics[len(diagnostics)-4096:]
+		}
 		pending = append(pending, output...)
 		for {
 			line, rest, ok := bytes.Cut(pending, []byte{'\n'})
@@ -383,6 +401,13 @@ func listenHost(ctx context.Context, t hostAPI, c *listenerCheckpoint, spec map[
 				return errors.New("listener event exceeds limit")
 			}
 			if e = handle(line); e != nil {
+				if errors.Is(e, errOwnerAbsent) {
+					c.state.Out = offset - int64(len(rest))
+					c.state.Err = errorOffset
+					if se := c.save(); se != nil {
+						return se
+					}
+				}
 				return e
 			}
 			pending = rest
@@ -405,6 +430,9 @@ func listenHost(ctx context.Context, t hostAPI, c *listenerCheckpoint, spec map[
 				}
 				offset, errorOffset = 0, 0
 				continue
+			}
+			if bytes.Contains(diagnostics, []byte(oldRemoteListenRefusal)) {
+				return errAccountArgumentRefused
 			}
 			return errors.New("listener ended")
 		}

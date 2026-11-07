@@ -184,13 +184,43 @@ func parseEvent(raw []byte) (routeEvent, error) {
 // readyAccount takes the owner account a remote reports on its ready frame. The
 // frame comes from the listener of the exact owner incarnation the route names,
 // so it is matched to that identity. known reports that this remote sends the
-// account at all, which makes it safe to send the recorded account back.
+// account at all, which makes it safe to send the recorded account back; that
+// acceptance is recorded durably on the route.
 func readyAccount(c Config, path string, event routeEvent) (Config, bool, error) {
 	if event.Account == "" {
 		return c, false, nil
 	}
 	updated, e := backfillOwnerAccount(c, path, routeEvent{Type: "ready", PID: c.RemotePID, Start: c.RemoteStart, Account: event.Account})
+	if e != nil {
+		return updated, true, e
+	}
+	updated, e = recordAccountAcceptance(updated, path, true)
 	return updated, true, e
+}
+
+// recordAccountAcceptance durably sets whether the remote takes the recorded
+// account as a listen argument. Like backfillOwnerAccount it writes only over
+// the exact configuration this listener holds.
+func recordAccountAcceptance(c Config, path string, accepted bool) (Config, error) {
+	if c.RemoteAccountAccepted == accepted {
+		return c, nil
+	}
+	current, e := readConfig(path)
+	if e != nil {
+		return c, e
+	}
+	if current != c {
+		return c, nil
+	}
+	updated := c
+	updated.RemoteAccountAccepted = accepted
+	if e = updated.Validate(); e != nil {
+		return c, e
+	}
+	if e = atomicJSON(path, updated); e != nil {
+		return c, e
+	}
+	return updated, nil
 }
 
 // listenConfig is the route as a listen argument. The recorded account is sent
@@ -231,17 +261,17 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 	}()
 	seen := map[string]bool{}
 	attempt := 0
-	// remoteAccountKnown: the remote's ready frame has carried its owner account,
-	// so it is new enough to take the recorded account as a listen argument.
-	remoteAccountKnown := false
 	for ctx.Err() == nil {
 		state.State = "connecting"
 		state.Attempt = attempt
 		if e = publish(); e != nil {
 			return e
 		}
-		args := r.remoteArgs(listenConfig(c, remoteAccountKnown), "listen", nil)
-		readySeen := false
+		// The route records whether the remote's ready frame has carried its owner
+		// account, so a remote new enough to take the recorded account keeps
+		// receiving it across reconnects, owner exits and restarts.
+		args := r.remoteArgs(listenConfig(c, c.RemoteAccountAccepted), "listen", nil)
+		sentAccount := len(args) == 8
 		checkpoint, e := openCheckpoint(filepath.Join(r.home, ".local/state/relay/host-adapters"), c.Host, args)
 		if e != nil {
 			return e
@@ -263,7 +293,7 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 			case "identity_changed":
 				return errIdentity
 			case "identity_missing":
-				return errors.New("remote session absent; waiting for same session")
+				return errOwnerAbsent
 			case "identity_replacement":
 				updated, e := adoptConfig(c, path, event)
 				if e != nil {
@@ -284,13 +314,11 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 					if event.Name != c.LocalName || !validStart(c.Host, event.Start) {
 						return errors.New("reply mailbox identity changed")
 					}
-					updated, known, e := readyAccount(c, path, event)
+					updated, _, e := readyAccount(c, path, event)
 					if e != nil {
 						return e
 					}
 					c = updated
-					remoteAccountKnown = remoteAccountKnown || known
-					readySeen = true
 					state.Mailbox = &Mailbox{PID: event.PID, Start: event.Start, Name: event.Name, Drain: event.Drain}
 					state.State = "online"
 					state.Error = ""
@@ -339,11 +367,16 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 			return publish()
 		}
 		e = listenHost(ctx, transport, checkpoint, listenerSpec(args), handle)
-		// Without a ready frame in this attempt the remote has not confirmed the
-		// recorded account (an older remote refuses the extra argument), so it is
-		// sent again only after a ready frame carries it.
-		if !readySeen {
-			remoteAccountKnown = false
+		// Only an explicit refusal of the extra argument, from a remote relayd
+		// older than it, withdraws acceptance; an attempt without a ready frame
+		// (the owner exited) does not. A later ready frame with an account
+		// records acceptance again.
+		if sentAccount && errors.Is(e, errAccountArgumentRefused) {
+			updated, persist := recordAccountAcceptance(c, path, false)
+			if persist != nil {
+				return persist
+			}
+			c = updated
 		}
 		// Cancellation is explicit route shutdown; communication errors detach and
 		// preserve the durable host listener for an exact-ID status reconnection.
