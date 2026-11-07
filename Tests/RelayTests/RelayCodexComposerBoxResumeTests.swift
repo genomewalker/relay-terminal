@@ -23,9 +23,44 @@ struct RelayCodexComposerBoxResumeTests {
         #expect(!RelayAgentMaintenancePrompt.hasTypedText(screen, provider: "codex"))
     }
 
-    @Test func theCapturedTerraScreenProjects() throws {
+    @Test func theCapturedTerraScreenWithoutAContextSegmentIsEmpty() throws {
         let screen = try #require(projected(Box.terraVT, Box.terraText))
+        let status = try #require(Box.terraText.split(separator: "\n").last { $0.contains("GPT-6.1 Terra high") })
+        #expect(!status.localizedCaseInsensitiveContains("context"))
+        #expect(RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex"))
         #expect(!RelayAgentMaintenancePrompt.hasTypedText(screen, provider: "codex"))
+    }
+
+    @Test func aContextFreeStatusLineStillNeedsTheModelAndSeparators() throws {
+        let status = "GPT-6.1 Terra high"
+        #expect(Box.terraVT.components(separatedBy: status).count == 2)
+        for replacement in ["Terra high", "claude-opus high"] {
+            let vt = Box.terraVT.replacingOccurrences(of: status, with: replacement)
+            let text = Box.terraText.replacingOccurrences(of: status, with: replacement)
+            let screen = try #require(projected(vt, text))
+            #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex"), "\(replacement)")
+        }
+        let line = "  GPT-6.1 Terra high · ~/Documents/Claude/Projects/Patent · Clarify FARO’s purpose"
+        #expect(Box.terraText.contains(line))
+        let bare = Box.terraText.replacingOccurrences(of: line, with: "  GPT-6.1 Terra high")
+        let rows = Box.terraVT.components(separatedBy: "\r\n")
+        let index = try #require(rows.lastIndex { $0.contains(status) })
+        var edited = rows; edited[index] = "  " + status
+        let screen = try #require(projected(edited.joined(separator: "\r\n"), bare))
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex"))
+    }
+
+    @Test func aDraftOrRunningTurnOnTheContextFreeScreenIsNotEmpty() throws {
+        let draft = try #require(projected(
+            Box.terraVT.replacingOccurrences(of: Self.placeholder, with: "\u{1b}[48;2;50;52;56mship it"),
+            Box.terraText.replacingOccurrences(of: "› Ask Codex to do anything", with: "› ship it")))
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(draft, provider: "codex"))
+        let box = "\r\n \r\n\u{1b}[0m\u{1b}[48;2;50;52;56m"
+        #expect(Box.terraVT.components(separatedBy: box).count == 2)
+        let running = try #require(projected(
+            Box.terraVT.replacingOccurrences(of: box, with: "\r\n• Working (9s • esc to interrupt)\r\n\u{1b}[0m\u{1b}[48;2;50;52;56m"),
+            Box.terraText.replacingOccurrences(of: "\n \n \n› Ask", with: "\n• Working (9s • esc to interrupt)\n \n› Ask")))
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(running, provider: "codex"))
     }
 
     @Test func thePlaceholderWordsWithoutFaintStyleAreADraft() throws {

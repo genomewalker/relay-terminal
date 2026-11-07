@@ -75,10 +75,12 @@ enum RelayAgentMaintenancePrompt {
         }.filter { !$0.isEmpty }
         if provider == "claude", footer.contains(where: { busy($0, explainedAgents: explainedAgents) }) { return false }
         if provider == "codex" {
-            guard (1...3).contains(footer.count), let first = footer.first,
-                  first.contains("·"), first.localizedCaseInsensitiveContains("context"),
+            // The status line's items are user-configured: it opens with the
+            // model and may omit the context segment ("GPT-6.1 Terra high ·
+            // ~/cwd · thread title"). At most one row may name the context.
+            guard (1...3).contains(footer.count), let first = footer.first, first.contains(" · "),
                   (first.lowercased().hasPrefix("gpt-") || first.lowercased().hasPrefix("openai")),
-                  footer.filter({ $0.localizedCaseInsensitiveContains("context") }).count == 1,
+                  footer.filter({ $0.localizedCaseInsensitiveContains("context") }).count <= 1,
                   footer.dropFirst().allSatisfy({ value in
                       codexIdleHints.contains { value.hasPrefix($0) } || codexSegmentedIdleHint(value) })
             else { return false }
