@@ -367,3 +367,20 @@ func daemonDeclinedBeforeWrite(operation, stderr string) bool {
 	}
 	return false
 }
+
+// desktopLinkShadowHint is appended when a server without the daemon backend
+// forwards a recipient-only link to the app. A Code session's own server would
+// infer the sender; here the app answers with an unrelated pair error.
+const desktopLinkShadowHint = " If this came from a Claude desktop Code session: a recipient-only link needs the daemon-backed Relay MCP server the session starts for itself. Claude desktop's \"relay\" entry in claude_desktop_config.json is probably answering in its place; rename that entry (for example to \"relay-desktop\") and restart Claude desktop."
+
+// linkPanesError leaves the app's error unchanged except for a recipient-only
+// link on a server without the daemon backend. The no-ID and two-ID forms are
+// valid desktop uses and keep the app's own error.
+func linkPanesError(message string, arguments map[string]json.RawMessage, daemonBacked bool) string {
+	_, pane := arguments["pane_id"]
+	_, source := arguments["source_pane_id"]
+	if daemonBacked || !pane || source {
+		return message
+	}
+	return message + desktopLinkShadowHint
+}

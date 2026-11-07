@@ -194,7 +194,10 @@ In Claude desktop's `claude_desktop_config.json`, do not name this entry
 and a desktop entry named `relay` can answer in place of the Code session's own
 daemon-backed `relay` server. Desktop-session linking and
 `relay_read_desktop_inbox` then fail, because only the session's own server can
-prove which session is calling.
+prove which session is calling. Renaming an existing `relay` entry changes the
+tool names in ordinary desktop chats to `mcp__relay-desktop__*`, so per-tool
+approvals saved under the old name are asked for again, and prompts or skills
+that name `mcp__relay__` tools there need the new name.
 
 Codex's HTTP connection asks the server for `tools/list` during MCP setup. When
 Relay restarts or updates, the MCP listener comes back with the app, so its

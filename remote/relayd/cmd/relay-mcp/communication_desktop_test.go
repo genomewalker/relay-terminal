@@ -201,3 +201,26 @@ func TestDesktopInboxWithoutDaemonNamesTheShadowingConnector(t *testing.T) {
 		}
 	}
 }
+
+// A recipient-only link on a server without the daemon backend is the shadowed
+// desktop entry; the app's pair error alone misleads. The no-ID and two-ID forms
+// are valid desktop uses and keep the app's error unchanged, as does a
+// daemon-backed server.
+func TestRecipientOnlyLinkWithoutDaemonNamesTheShadowingConnector(t *testing.T) {
+	const appError = "HTTP 409: Choose two distinct pane IDs"
+	pane := json.RawMessage(`"1652a003-70e9-4614-addb-68564fa8383b"`)
+	source := json.RawMessage(`"5a30d83a-5222-48f3-93c7-42fa687d901b"`)
+	if got := linkPanesError(appError, map[string]json.RawMessage{"pane_id": pane}, false); !strings.HasPrefix(got, appError) || !strings.Contains(got, "claude_desktop_config.json") {
+		t.Fatalf("recipient-only without daemon: %q", got)
+	}
+	for name, args := range map[string]map[string]json.RawMessage{
+		"no IDs": {}, "two IDs": {"pane_id": pane, "source_pane_id": source},
+	} {
+		if got := linkPanesError(appError, args, false); got != appError {
+			t.Fatalf("%s: %q", name, got)
+		}
+	}
+	if got := linkPanesError(appError, map[string]json.RawMessage{"pane_id": pane}, true); got != appError {
+		t.Fatalf("daemon-backed: %q", got)
+	}
+}

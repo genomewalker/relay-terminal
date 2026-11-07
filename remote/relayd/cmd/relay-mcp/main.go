@@ -1299,6 +1299,9 @@ func (s *server) handle(r request) (any, int, string) {
 		}
 		if err != nil {
 			content = err.Error()
+			if p.Name == "relay_link_panes" {
+				content = linkPanesError(content, p.Arguments, s.daemonHelper != "")
+			}
 		} else if p.Name == "relay_link_panes" {
 			content = annotatePendingLink(content)
 		}
