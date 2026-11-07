@@ -90,4 +90,17 @@ struct RelayClaudePaneResumeTests {
         let shell = owner("shell", session: session.uuidString.lowercased())
         #expect(!RelayCodexPaneResume.verified(shell, after: owner("shell", session: session.uuidString.lowercased(), process: 21), target: session))
     }
+
+    /// relayd's real plan output (snake_case, including the nested owner).
+    /// A plain decoder cannot read the owner, which refused every resume.
+    @Test func hostPlanOutputDecodesWithItsNestedOwner() throws {
+        let json = #"{"owner":{"version":1,"pane_id":"5c1d5455-3dc5-498f-a600-87cd325b6bf6","node_boot_id":"darwin:FE75E508-8443-44D6-B9D3-28BE8CA6DBD2","worker_pid":2059,"worker_start":1793657772073452,"shell_pid":2153,"shell_start":1793657772304410,"provider":"claude","process_id":40162,"process_start":1793940321860445,"session_id":"2545b07e-aabb-44df-8753-c6a019dd8a3f","transcript_identity":"16777231:1005594247"},"session_id":"2545b07e-aabb-44df-8753-c6a019dd8a3f","directory":"/Users/example/work","command":"cd -- '/Users/example/work' && env -u CLAUDE_CONFIG_DIR '/Users/example/.local/share/relay/shims/claude' --resume '2545b07e-aabb-44df-8753-c6a019dd8a3f'","config_dir":""}"#
+        let plan = try #require(RelayCodexPaneResume.decodePlan(Data(json.utf8)))
+        #expect(plan.owner.paneId == "5c1d5455-3dc5-498f-a600-87cd325b6bf6")
+        #expect(plan.owner.sessionId == "2545b07e-aabb-44df-8753-c6a019dd8a3f")
+        #expect(plan.owner.transcriptIdentity == "16777231:1005594247")
+        #expect(plan.owner.isValid(for: UUID(uuidString: "5c1d5455-3dc5-498f-a600-87cd325b6bf6")!))
+        #expect(plan.sessionId == "2545b07e-aabb-44df-8753-c6a019dd8a3f" && plan.configDir == "")
+        #expect(RelayCodexPaneResume.decodePlan(Data(#"{"owner":{},"session_id":"x"}"#.utf8)) == nil)
+    }
 }

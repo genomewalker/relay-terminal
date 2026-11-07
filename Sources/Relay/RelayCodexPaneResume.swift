@@ -22,10 +22,17 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
     static let shared = RelayCodexPaneResume()
     struct Plan: Codable {
         let owner: RelayPromptOwnerBinding
-        let session_id: String
+        let sessionId: String
         let directory: String
         let command: String
-        let config_dir: String
+        let configDir: String
+    }
+    /// relayd writes the plan, including its owner binding, in snake_case;
+    /// the binding's synthesized decoder expects the converted keys.
+    nonisolated static func decodePlan(_ data: Data) -> Plan? {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try? decoder.decode(Plan.self, from: data)
     }
     struct Receipt: Codable {
         let paneID: UUID
@@ -93,14 +100,23 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             let command = RelayHostExecution.daemonCommand(profile: profile, arguments: Self.planArguments(pane: pane.id, provider: agent,
                 expected: request.expectedSession.uuidString.lowercased(), target: request.targetSession.uuidString.lowercased()))
             let captured = try await RelayHostExecution.capture(profile: profile, command: command, timeout: 15, maximumBytes: 16_384)
-            guard current(), captured.exitCode == 0,
-                  let plan = try? JSONDecoder().decode(Plan.self, from: captured.stdout),
-                  request.isAdmissible, plan.owner.provider == agent, plan.owner.paneId == pane.id.uuidString.lowercased(),
-                  plan.owner.sessionId == request.expectedSession.uuidString.lowercased(),
-                  plan.session_id == request.targetSession.uuidString.lowercased(),
-                  let proof = await pane.runtime.agentResumePromptProof(expected: plan.owner), current() else {
-                try save("refused", "No verified idle empty \(name) prompt or exact saved-session plan. " + String(decoding: captured.stderr.prefix(500), as: UTF8.self)); return
+            // Each refusal names the fence that held, so an operator or Miko
+            // can decide without re-deriving it; none of them sends input.
+            func refuse(_ reason: String) throws { try save("refused", "Refused before any input: " + reason) }
+            guard current() else { try refuse("the pane, its connection or the authorization changed"); return }
+            guard captured.exitCode == 0 else {
+                try refuse("the host's \(name) resume plan was refused: " + String(decoding: captured.stderr.prefix(500), as: UTF8.self)); return
             }
+            guard let plan = Self.decodePlan(captured.stdout) else { try refuse("the host's resume plan could not be read"); return }
+            guard request.isAdmissible, plan.owner.provider == agent, plan.owner.paneId == pane.id.uuidString.lowercased(),
+                  plan.owner.sessionId == request.expectedSession.uuidString.lowercased(),
+                  plan.sessionId == request.targetSession.uuidString.lowercased() else {
+                try refuse("the host's plan names a different provider, pane or session"); return
+            }
+            guard let proof = await pane.runtime.agentResumePromptProof(expected: plan.owner) else {
+                try refuse("no verified idle empty \(name) prompt (busy, draft, approval, background work, or the screen or owner changed)"); return
+            }
+            guard current() else { try refuse("the pane, its connection or the authorization changed"); return }
             try save("exiting", "Graceful \(name) exit requested for the verified original session")
             let (exit, submit) = Self.exitEdit(provider: agent, instance: request.instance, requestID: request.requestID, token: proof)
             guard await pane.runtime.sendTerminalEdit(exit, appendShellReturn: submit, authorization: current) == "input_submitted" else {
@@ -130,11 +146,11 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             let verifyUntil = Date().addingTimeInterval(90)
             while current(), Date() < verifyUntil {
                 if let owner = await pane.runtime.agentResumeOwner(), Self.verified(plan.owner, after: owner, target: request.targetSession) {
-                    let verifyCommand = RelayHostExecution.daemonCommand(profile: profile, arguments: Self.planArguments(pane: pane.id, provider: agent, expected: plan.session_id, target: plan.session_id))
+                    let verifyCommand = RelayHostExecution.daemonCommand(profile: profile, arguments: Self.planArguments(pane: pane.id, provider: agent, expected: plan.sessionId, target: plan.sessionId))
                     let account = try await RelayHostExecution.capture(profile: profile, command: verifyCommand, timeout: 15, maximumBytes: 16_384)
                     guard current(), account.exitCode == 0,
-                          let verified = try? JSONDecoder().decode(Plan.self, from: account.stdout),
-                          verified.owner == owner, verified.config_dir == plan.config_dir else {
+                          let verified = Self.decodePlan(account.stdout),
+                          verified.owner == owner, verified.configDir == plan.configDir else {
                         try save("outcome_unknown", "The requested session is bound but its original account was not reverified. Do not replay."); return
                     }
                     try save("verified", "Exact saved \(name) session resumed; pane, account, worker and shell preserved"); return
