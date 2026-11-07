@@ -1,10 +1,34 @@
 package peernet
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// An unresolvable Claude account leaves the runtime mode unknown; a stale
+// launch-time bypass must not be reported in its place. The resolved case
+// is the control showing the same launch flags do yield bypass.
+func TestUnresolvedClaudeAccountDoesNotUseLaunchFlags(t *testing.T) {
+	start, err := processStart(os.Getpid())
+	if err != nil {
+		t.Skip("process start unavailable:", err)
+	}
+	oldConfig, oldArgs := claudeConfigFor, processArgs
+	defer func() { claudeConfigFor, processArgs = oldConfig, oldArgs }()
+	processArgs = func(int) []string { return []string{"claude", "--dangerously-skip-permissions"} }
+	target := Record{PID: os.Getpid(), Start: start, Session: "unresolved"}
+	home := t.TempDir()
+	claudeConfigFor = func(string, int) (string, error) { return "", errors.New("account unresolved") }
+	if got := runtimePermissionClass(home, target); got != "" {
+		t.Fatalf("unresolved account: got %q, want unknown", got)
+	}
+	claudeConfigFor = func(home string, _ int) (string, error) { return filepath.Join(home, ".claude"), nil }
+	if got := runtimePermissionClass(home, target); got != "bypass" {
+		t.Fatalf("resolved account control: got %q, want bypass", got)
+	}
+}
 
 func TestLaunchPermissionClassRecognisesNativeClaudeAndCodexBypass(t *testing.T) {
 	home := t.TempDir()

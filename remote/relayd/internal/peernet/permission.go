@@ -35,8 +35,11 @@ func runtimePermissionClass(home string, target Record) string {
 	}
 	codex, _ := filepath.Glob(filepath.Join(codexConfig(home, target.PID), "sessions/*/*/*/rollout-*-"+target.Session+".jsonl"))
 	var claude []string
-	if config, err := claudeConfig(home, target.PID); err == nil {
+	var claudeErr error
+	if config, err := claudeConfigFor(home, target.PID); err == nil {
 		claude, _ = filepath.Glob(filepath.Join(config, "projects/*/"+target.Session+".jsonl"))
+	} else {
+		claudeErr = err
 	}
 	mode := ""
 	hasRuntimeMode := false
@@ -102,24 +105,40 @@ func runtimePermissionClass(home string, target Record) string {
 		}
 	}
 	if mode == "" && !hasRuntimeMode {
-		var args []string
-		if runtime.GOOS == "linux" {
-			data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(target.PID), "cmdline"))
-			if err == nil {
-				args = strings.Split(string(data), "\x00")
-			}
-		} else {
-			data, err := exec.Command("/bin/ps", "-p", strconv.Itoa(target.PID), "-o", "args=").Output()
-			if err == nil {
-				args = strings.Fields(string(data))
-			}
+		// With the Claude account unresolved, the runtime mode is unknown and
+		// the harness may be Claude: its launch flags could be a stale bypass
+		// that the session has since left, so report unknown.
+		if claudeErr != nil && len(codex) != 1 {
+			return ""
 		}
-		mode = launchPermissionClass(home, args)
+		mode = launchPermissionClass(home, processArgs(target.PID))
 	}
 	if start, err := processStart(target.PID); err != nil || start != target.Start {
 		return ""
 	}
 	return mode
+}
+
+// Seams for tests: the Claude account lookup and the process argv read.
+var (
+	claudeConfigFor = claudeConfig
+	processArgs     = readProcessArgs
+)
+
+func readProcessArgs(pid int) []string {
+	var args []string
+	if runtime.GOOS == "linux" {
+		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+		if err == nil {
+			args = strings.Split(string(data), "\x00")
+		}
+	} else {
+		data, err := exec.Command("/bin/ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+		if err == nil {
+			args = strings.Fields(string(data))
+		}
+	}
+	return args
 }
 
 // launchPermissionClass reads only explicit launch flags. The native
