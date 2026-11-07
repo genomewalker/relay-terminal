@@ -37,6 +37,17 @@ type remoteRuntime struct {
 }
 
 func (r *remoteRuntime) registry(pid int, start string) (string, error) {
+	root, err := r.accountRoot(pid, start)
+	if err != nil {
+		return "", err
+	}
+	sessions := filepath.Join(root, "sessions")
+	return sessions, privateDirectory(sessions, false)
+}
+
+// accountRoot is the Claude account directory of the exact process incarnation:
+// its own CLAUDE_CONFIG_DIR, or ~/.claude only when unset.
+func (r *remoteRuntime) accountRoot(pid int, start string) (string, error) {
 	before, e := r.inspect(pid)
 	if e != nil || before.Start != start {
 		return "", errIdentity
@@ -57,8 +68,7 @@ func (r *remoteRuntime) registry(pid int, start string) (string, error) {
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return "", errors.New("invalid account path")
 	}
-	root = filepath.Join(root, "sessions")
-	return root, privateDirectory(root, false)
+	return root, nil
 }
 func (r *remoteRuntime) endpoint(registry string, pid int, session, start string) (peerRecord, error) {
 	var p peerRecord
@@ -279,6 +289,11 @@ func (r *remoteRuntime) listen(ctx context.Context, registry string, target peer
 	if e = emit(out, Mailbox{Type: "ready", PID: ownPID, Start: own.Start, Name: name, Peer: target.Name, Drain: 1}); e != nil {
 		return e
 	}
+	// After the ready frame, which the supervisor requires first: the live owner's
+	// account, for the route to record when it has none.
+	if e = emit(out, map[string]any{"type": "owner_account", "pid": target.PID, "start": target.Start, "account": filepath.Dir(registry)}); e != nil {
+		return e
+	}
 	last := time.Time{}
 	draining := false
 	for {
@@ -353,11 +368,14 @@ func RunRemote(ctx context.Context, args []string, in io.Reader, out io.Writer) 
 	r := &remoteRuntime{home, inspectProcess, agentlaunch.ProcessEnvironment}
 	return r.run(ctx, args, in, out)
 }
-func (r *remoteRuntime) identityEvent(registry, session string, out io.Writer) error {
-	// An empty registry means the owner's account could not be resolved, and
-	// the route records none. No replacement is searched for in any account.
+func (r *remoteRuntime) identityEvent(registry, session, account string, out io.Writer) error {
+	// An empty registry means the live owner could not be resolved. Only the
+	// account the route recorded is searched, and never the default by fallback.
 	if registry == "" {
-		return emit(out, map[string]string{"type": "identity_missing"})
+		if account == "" {
+			return emit(out, map[string]string{"type": "identity_missing"})
+		}
+		registry = filepath.Join(account, "sessions")
 	}
 	if e := privateDirectory(registry, false); e != nil {
 		return emit(out, map[string]string{"type": "identity_missing"})
@@ -372,7 +390,7 @@ func (r *remoteRuntime) identityEvent(registry, session string, out io.Writer) e
 	return emit(out, map[string]any{"type": "identity_replacement", "session": session, "pid": replacement.PID, "start": replacement.Start, "name": replacement.Name})
 }
 func (r *remoteRuntime) run(ctx context.Context, args []string, in io.Reader, out io.Writer) error {
-	if len(args) != 5 && len(args) != 7 {
+	if len(args) != 5 && len(args) != 6 && len(args) != 7 {
 		return errors.New("desktop-remote requires exact mode and process identity")
 	}
 	mode := args[0]
@@ -380,20 +398,28 @@ func (r *remoteRuntime) run(ctx context.Context, args []string, in io.Reader, ou
 	if e != nil || pid <= 1 || !identifier.MatchString(args[2]) || !identifier.MatchString(args[4]) {
 		return errors.New("invalid remote identity")
 	}
-	if (mode == "send" && len(args) != 7) || (mode == "listen" && len(args) != 5) || (mode != "send" && mode != "listen") {
+	if (mode == "send" && len(args) != 7) || (mode == "listen" && len(args) != 5 && len(args) != 6) || (mode != "send" && mode != "listen") {
 		return errors.New("invalid remote mode")
+	}
+	// The optional sixth listen argument is the owner account the route recorded.
+	account := ""
+	if mode == "listen" && len(args) == 6 {
+		account = args[5]
+		if !filepath.IsAbs(account) || filepath.Clean(account) != account || len(account) > 4096 || strings.ContainsRune(account, 0) {
+			return errors.New("invalid recorded owner account")
+		}
 	}
 	registry, e := r.registry(pid, args[3])
 	if e != nil {
 		if mode == "listen" && errors.Is(e, errIdentity) {
-			return r.identityEvent(registry, args[2], out)
+			return r.identityEvent(registry, args[2], account, out)
 		}
 		return e
 	}
 	target, e := r.endpoint(registry, pid, args[2], args[3])
 	if e != nil {
 		if mode == "listen" && errors.Is(e, errIdentity) {
-			return r.identityEvent(registry, args[2], out)
+			return r.identityEvent(registry, args[2], account, out)
 		}
 		return e
 	}
@@ -406,7 +432,7 @@ func (r *remoteRuntime) run(ctx context.Context, args []string, in io.Reader, ou
 	}
 	e = r.listen(ctx, registry, target, args[4], out)
 	if errors.Is(e, errIdentity) {
-		return r.identityEvent(registry, args[2], out)
+		return r.identityEvent(registry, args[2], account, out)
 	}
 	return e
 }

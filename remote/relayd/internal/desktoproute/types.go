@@ -128,6 +128,10 @@ type Config struct {
 	RemoteSession string `json:"remoteSession"`
 	RemotePID     int    `json:"remotePID"`
 	RemoteStart   string `json:"remoteStart"`
+	// RemoteAccount is the owner process's own Claude account directory, recorded
+	// so a replacement after the owner exits is searched only there. Empty for
+	// routes not yet verified; it is then backfilled from the live owner.
+	RemoteAccount string `json:"remoteAccount,omitempty"`
 	Socket        string `json:"socket"`
 }
 
@@ -142,6 +146,9 @@ func (c Config) Validate() error {
 	}
 	if !filepath.IsAbs(c.Socket) || strings.ContainsRune(c.Socket, 0) {
 		return errors.New("desktop socket must be absolute")
+	}
+	if c.RemoteAccount != "" && (!filepath.IsAbs(c.RemoteAccount) || filepath.Clean(c.RemoteAccount) != c.RemoteAccount || len(c.RemoteAccount) > 4096 || strings.ContainsRune(c.RemoteAccount, 0)) {
+		return errors.New("recorded owner account must be absolute and clean")
 	}
 	return nil
 }

@@ -37,6 +37,17 @@ func (a ClaudeSessionActor) Target() nativemsg.ClaudeSessionTarget {
 // desktop session's, whatever is further up. A client with no Claude ancestor
 // (for example an MCP server the Claude chat app itself started) has no
 // session. The caller tries the pane actor first.
+// claudeAncestorIsClaude recognises a Claude ancestor by process identity only.
+// A variable so tests can name their own Claude processes.
+var claudeAncestorIsClaude = ancestorIsClaude
+
+// ReadClaudeSessionActor observes which Claude desktop session owns clientPID.
+// The nearest Claude ancestor publishing a registration decides: when that is
+// a terminal session, a background job or a Relay proxy, the client is not a
+// desktop session's, whatever is further up. Non-Claude ancestors, such as a
+// shell wrapper whose environment the kernel withholds, are skipped without
+// reading their environment. A client with no Claude ancestor has no session.
+// The caller tries the pane actor first.
 func ReadClaudeSessionActor(clientPID int) (ClaudeSessionActor, error) {
 	var empty ClaudeSessionActor
 	if clientPID <= 1 {
@@ -50,11 +61,17 @@ func ReadClaudeSessionActor(clientPID int) (ClaudeSessionActor, error) {
 	if err != nil {
 		return empty, err
 	}
+	return readClaudeSessionActorFrom(chain, clientPID, start)
+}
+
+// readClaudeSessionActorFrom is ReadClaudeSessionActor over a known ancestor chain.
+func readClaudeSessionActorFrom(chain []int, clientPID int, clientStart string) (ClaudeSessionActor, error) {
+	var empty ClaudeSessionActor
 	for _, pid := range chain {
-		if pid == clientPID || pid <= 1 {
+		if pid == clientPID || pid <= 1 || !claudeAncestorIsClaude(pid) {
 			continue
 		}
-		actor, found, err := claudeDesktopSessionAt(pid, clientPID, start)
+		actor, found, err := claudeDesktopSessionAt(pid, clientPID, clientStart)
 		if err != nil {
 			return empty, err
 		}

@@ -317,6 +317,9 @@ func (r *runtime) remember(ctx context.Context, c Config, connect, rebind bool) 
 		}
 		path = filepath.Join(r.root(), key+".json")
 		c.LocalName = "relay-" + key
+		// A local owner's account is recorded now, from the exact live process. An
+		// unresolved one is backfilled from the owner when its listener verifies it.
+		c = recordLocalOwnerAccount(localOwnerRuntime(r.home), c)
 	} else {
 		old, e = readConfig(path)
 		if e != nil {

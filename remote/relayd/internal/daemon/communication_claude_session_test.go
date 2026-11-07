@@ -55,6 +55,7 @@ func claudeChain(t *testing.T, config string) (outer, inner, client int) {
 	if client <= 1 || inner <= 1 || inner == outer {
 		t.Fatalf("unexpected process tree outer=%d inner=%d client=%d", outer, inner, client)
 	}
+	markClaudeTestProcesses(t, outer, inner)
 	return outer, inner, client
 }
 

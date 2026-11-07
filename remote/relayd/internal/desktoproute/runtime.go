@@ -50,18 +50,24 @@ func (r *runtime) remoteArgs(c Config, mode string, box *Mailbox) []string {
 	args := []string{exe, "desktop-remote", mode, strconv.Itoa(c.RemotePID), c.RemoteSession, c.RemoteStart, c.LocalName}
 	if box != nil {
 		args = append(args, strconv.Itoa(box.PID), box.Start)
+	} else if mode == "listen" && c.RemoteAccount != "" {
+		args = append(args, c.RemoteAccount)
 	}
 	return args
 }
 func listenerSpec(args []string) map[string]any {
-	if len(args) != 7 || filepath.Base(args[0]) != "relayd" || args[1] != "desktop-remote" || args[2] != "listen" || !identifier.MatchString(args[4]) || !identifier.MatchString(args[6]) || !(numericStart.MatchString(args[5]) || validStart("laptop", args[5])) {
+	if (len(args) != 7 && len(args) != 8) || filepath.Base(args[0]) != "relayd" || args[1] != "desktop-remote" || args[2] != "listen" || !identifier.MatchString(args[4]) || !identifier.MatchString(args[6]) || !(numericStart.MatchString(args[5]) || validStart("laptop", args[5])) {
 		return nil
 	}
 	pid, err := strconv.Atoi(args[3])
 	if err != nil || pid <= 1 || pid > 1<<31-1 {
 		return nil
 	}
-	return map[string]any{"executable": args[0], "owner_pid": pid, "owner_session": args[4], "owner_start": args[5], "route": args[6]}
+	spec := map[string]any{"executable": args[0], "owner_pid": pid, "owner_session": args[4], "owner_start": args[5], "route": args[6]}
+	if len(args) == 8 {
+		spec["owner_account"] = args[7]
+	}
+	return spec
 }
 func (r *runtime) send(ctx context.Context, c Config, path string, m Envelope) (Delivery, error) {
 	result := Delivery{MessageID: m.ID, Receipt: "not_sent"}
@@ -148,6 +154,7 @@ type routeEvent struct {
 	Session string `json:"session"`
 	PID     int    `json:"pid"`
 	Start   string `json:"start"`
+	Account string `json:"account,omitempty"`
 	Name    string `json:"name"`
 	Drain   int    `json:"drain"`
 }
@@ -167,7 +174,7 @@ func parseEvent(raw []byte) (routeEvent, error) {
 		if !messageID.MatchString(e.ID) || !identifier.MatchString(e.Sender) {
 			return e, errors.New("invalid message event")
 		}
-	case "heartbeat", "identity_missing", "identity_changed", "identity_replacement", "transport_status", "rejected":
+	case "heartbeat", "identity_missing", "identity_changed", "identity_replacement", "owner_account", "transport_status", "rejected":
 	default:
 		return e, errors.New("unknown route event")
 	}
@@ -231,6 +238,16 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 				return errIdentity
 			case "identity_missing":
 				return errors.New("remote session absent; waiting for same session")
+			case "owner_account":
+				updated, e := backfillOwnerAccount(c, path, event)
+				if e != nil {
+					return e
+				}
+				if updated != c {
+					// The recorded account is a new listener argument: restart the listener.
+					c = updated
+					return errRecovered
+				}
 			case "identity_replacement":
 				updated, e := adoptConfig(c, path, event)
 				if e != nil {
@@ -499,4 +516,29 @@ func (r *runtime) runSend(ctx context.Context, config string, in io.Reader, out 
 		return e
 	}
 	return sendErr
+}
+
+// backfillOwnerAccount records the live owner's account on a route that has
+// none. Only the owner incarnation the route names is accepted, and the config
+// must still be the one this listener loaded.
+func backfillOwnerAccount(c Config, path string, event routeEvent) (Config, error) {
+	if c.RemoteAccount != "" || event.PID != c.RemotePID || event.Start != c.RemoteStart {
+		return c, nil
+	}
+	current, e := readConfig(path)
+	if e != nil {
+		return c, e
+	}
+	if current != c {
+		return c, nil
+	}
+	updated := c
+	updated.RemoteAccount = event.Account
+	if e = updated.Validate(); e != nil {
+		return c, e
+	}
+	if e = atomicJSON(path, updated); e != nil {
+		return c, e
+	}
+	return updated, nil
 }

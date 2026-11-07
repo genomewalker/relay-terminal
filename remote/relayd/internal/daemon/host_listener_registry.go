@@ -53,9 +53,15 @@ type peerListenerSpec struct {
 	OwnerPID     int    `json:"owner_pid"`
 	OwnerStart   string `json:"owner_start"`
 	OwnerSession string `json:"owner_session"`
+	// OwnerAccount is the owner's own Claude account directory, the replacement
+	// search's only account. Empty for a spec that records none.
+	OwnerAccount string `json:"owner_account,omitempty"`
 }
 
 func (spec *peerListenerSpec) validate() error {
+	if spec.OwnerAccount != "" && (!filepath.IsAbs(spec.OwnerAccount) || filepath.Clean(spec.OwnerAccount) != spec.OwnerAccount || len(spec.OwnerAccount) > 4096 || strings.ContainsRune(spec.OwnerAccount, 0)) {
+		return errors.New("invalid peer listener owner account")
+	}
 	if spec.Executable != "" {
 		if spec.Interpreter != "" || spec.Script != "" || len(spec.Executable) > 4096 || strings.ContainsAny(spec.Executable, "\x00\r\n") ||
 			(spec.Executable != ".local/bin/relayd" && (!filepath.IsAbs(spec.Executable) || filepath.Clean(spec.Executable) != spec.Executable)) {
@@ -85,7 +91,11 @@ func (spec *peerListenerSpec) validate() error {
 // The listener's positional contract (relay-desktop-remote.py listen).
 func (spec *peerListenerSpec) argv() []string {
 	if spec.Executable != "" {
-		return []string{spec.Executable, "desktop-remote", "listen", strconv.Itoa(spec.OwnerPID), spec.OwnerSession, spec.OwnerStart, spec.Route}
+		argv := []string{spec.Executable, "desktop-remote", "listen", strconv.Itoa(spec.OwnerPID), spec.OwnerSession, spec.OwnerStart, spec.Route}
+		if spec.OwnerAccount != "" {
+			argv = append(argv, spec.OwnerAccount)
+		}
+		return argv
 	}
 	return []string{spec.Interpreter, "-u", "-c", spec.Script, "listen",
 		strconv.Itoa(spec.OwnerPID), spec.OwnerSession, spec.OwnerStart, spec.Route}
@@ -118,10 +128,11 @@ func (spec *peerListenerSpec) binding() *peerListenerBinding {
 }
 
 type peerListenerLaunch struct {
-	Executable  string `json:"executable,omitempty"`
-	Interpreter string `json:"interpreter"`
-	Script      string `json:"script"`
-	Cwd         string `json:"cwd,omitempty"`
+	Executable   string `json:"executable,omitempty"`
+	Interpreter  string `json:"interpreter"`
+	Script       string `json:"script"`
+	Cwd          string `json:"cwd,omitempty"`
+	OwnerAccount string `json:"owner_account,omitempty"`
 }
 
 type peerListenerEntry struct {
@@ -138,7 +149,7 @@ type peerListenerEntry struct {
 
 func (entry peerListenerEntry) spec() *peerListenerSpec {
 	return &peerListenerSpec{Executable: entry.Launch.Executable, Interpreter: entry.Launch.Interpreter, Script: entry.Launch.Script, Route: entry.Route,
-		OwnerPID: entry.Owner.PID, OwnerStart: entry.Owner.Start, OwnerSession: entry.Owner.Session}
+		OwnerPID: entry.Owner.PID, OwnerStart: entry.Owner.Start, OwnerSession: entry.Owner.Session, OwnerAccount: entry.Launch.OwnerAccount}
 }
 
 func (s *Server) peerListenerDir() string { return filepath.Join(s.stateDir, "peer-listeners") }
@@ -228,7 +239,7 @@ func (s *Server) recordPeerListener(spec *peerListenerSpec, cwd, jobID string) e
 	defer s.peerListenersMu.Unlock()
 	return s.writePeerListenerEntry(peerListenerEntry{Route: spec.Route, JobID: jobID, State: "active",
 		Owner:  peerListenerOwner{PID: spec.OwnerPID, Start: spec.OwnerStart, Session: spec.OwnerSession},
-		Launch: peerListenerLaunch{Executable: spec.Executable, Interpreter: spec.Interpreter, Script: spec.Script, Cwd: cwd}})
+		Launch: peerListenerLaunch{Executable: spec.Executable, Interpreter: spec.Interpreter, Script: spec.Script, Cwd: cwd, OwnerAccount: spec.OwnerAccount}})
 }
 
 // A natural exit ends the registration; a suspended entry awaits resume.
