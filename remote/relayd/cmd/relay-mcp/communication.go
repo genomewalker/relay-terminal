@@ -47,6 +47,12 @@ func (s *server) communicationActorProof() (string, string, error) {
 // callerSessionRefusal is the answer to a pane-less send that names a session.
 const callerSessionRefusal = "a registered caller cannot address a session; omit target_session_id"
 
+// desktopInboxWithoutDaemon explains the usual cause: Claude desktop's own
+// connector (an mcpServers "relay" entry in claude_desktop_config.json, started
+// without RELAY_MCP_BACKEND) shares the name of a Code session's daemon-backed
+// "relay" server and answers in its place.
+const desktopInboxWithoutDaemon = "relay_read_desktop_inbox needs the daemon-backed Relay MCP server that a Claude Code session starts for itself; this Relay server runs without that backend. In a Claude desktop Code session this usually means the \"relay\" entry in Claude desktop's claude_desktop_config.json is answering instead of the session's own \"relay\" server, because both have the same name. Rename that desktop entry (for example to \"relay-desktop\") and restart Claude desktop. Nothing was read."
+
 const noSenderRefusal = "source_pane_id is required: this helper has no registered caller token (RELAY_MCP_CALLER_TOKEN), so the message has no sender. Nothing was sent."
 
 // Only communication is redirected here. UI/editor tools retain their existing

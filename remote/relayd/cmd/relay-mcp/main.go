@@ -1277,6 +1277,10 @@ func (s *server) handle(r request) (any, int, string) {
 			if p.Name == "relay_prompt_provenance" {
 				path += "/prompt-provenance"
 			}
+		case "relay_read_desktop_inbox":
+			// Reached only without the daemon backend; with it, daemonCommunication
+			// always answers. A Code session's own "relay" server has the backend.
+			return toolText(desktopInboxWithoutDaemon, true), 0, ""
 		default:
 			return nil, -32602, "Unknown tool"
 		}

@@ -179,3 +179,25 @@ func TestDesktopSessionLinkRequestNeedsThePeerHost(t *testing.T) {
 		t.Fatal("a malformed host reached the daemon")
 	}
 }
+
+// A relay-mcp without the daemon backend (the Claude desktop config's own
+// connector) must say why it cannot read a desktop inbox, not "Unknown tool".
+// Such a server can shadow a Code session's daemon-backed "relay" server.
+func TestDesktopInboxWithoutDaemonNamesTheShadowingConnector(t *testing.T) {
+	s := &server{}
+	for _, call := range []map[string]any{
+		{"name": "relay_read_desktop_inbox", "arguments": map[string]any{}},
+		{"name": "relay_call_tool", "arguments": map[string]any{"tool_name": "relay_read_desktop_inbox", "arguments": map[string]any{}}},
+	} {
+		params, _ := json.Marshal(call)
+		value, code, detail := s.handle(request{JSONRPC: "2.0", ID: json.RawMessage("1"), Method: "tools/call", Params: params})
+		if code != 0 || detail != "" {
+			t.Fatalf("%v: protocol error %d %q", call["name"], code, detail)
+		}
+		data, _ := json.Marshal(value)
+		text := string(data)
+		if !strings.Contains(text, `"isError":true`) || !strings.Contains(text, "claude_desktop_config.json") || !strings.Contains(text, "Nothing was read") {
+			t.Fatalf("%v: %s", call["name"], text)
+		}
+	}
+}

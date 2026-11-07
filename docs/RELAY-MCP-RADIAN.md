@@ -186,8 +186,15 @@ http_headers_helper = "/Applications/Relay.app/Contents/MacOS/relay-mcp --print-
 For stdio-only MCP clients, the existing adapter remains available:
 
 ```json
-{"relay":{"command":"/Applications/Relay.app/Contents/MacOS/relay-mcp","args":["--use-relay-token"]}}
+{"relay-desktop":{"command":"/Applications/Relay.app/Contents/MacOS/relay-mcp","args":["--use-relay-token"]}}
 ```
+
+In Claude desktop's `claude_desktop_config.json`, do not name this entry
+`relay`. Claude desktop also offers its configured servers to Code sessions,
+and a desktop entry named `relay` can answer in place of the Code session's own
+daemon-backed `relay` server. Desktop-session linking and
+`relay_read_desktop_inbox` then fail, because only the session's own server can
+prove which session is calling.
 
 Codex's HTTP connection asks the server for `tools/list` during MCP setup. When
 Relay restarts or updates, the MCP listener comes back with the app, so its
