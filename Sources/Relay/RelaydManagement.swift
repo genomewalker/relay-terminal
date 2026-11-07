@@ -400,7 +400,7 @@ tail -n 80 "$(dirname "$relay_socket")/relayd.log" 2>/dev/null || true
 printf 'RELAYD_LOG_END\t%s\n' "$nonce"
 """#
 
-    private static func installScript(expectedHash: String, architecture: String) -> String {
+    static func installScript(expectedHash: String, architecture: String) -> String {
         #"""
 set -eu
 umask 077
@@ -492,6 +492,7 @@ relay_publish_link() {
     link_temporary=
 }
 relay_publish_link "relayd-linux-\#(architecture)" "$payload_dir/relayd-communication"
+relay_publish_link "relayd-linux-\#(architecture)" "$payload_dir/relayd-work-communication"
 relay_publish_link "relayd-linux-\#(architecture)" "$payload_dir/relayd-verified"
 relay_publish_link "relay-mcp-linux-\#(architecture)" "$payload_dir/relay-mcp-communication"
 relay_publish_link "relay-mcp-linux-\#(architecture)" "$payload_dir/relay-mcp"
