@@ -67,9 +67,7 @@ final class RelayCallerControl: ObservableObject {
     private var policyRevision = 0
     /// Replaceable in tests: the daemon transport and its incarnation.
     var policyTransport: @MainActor (ConnectionProfile, [String: Any]) async throws -> [String: Any] = { profile, packet in
-        let result = try await RelayHostExecution.communicationRequest(profile: profile, packet: packet)
-        guard let value = result.value else { throw RelayHostRPCError.invalidRequest }
-        return value
+        try await RelayCallerAdminProof.send(profile: profile, packet: packet)
     }
     var transportIncarnation: (ConnectionProfile) -> String? = { RelayNodeTransportPool.shared.incarnation(profile: $0) }
     static let auditLimit = 2000

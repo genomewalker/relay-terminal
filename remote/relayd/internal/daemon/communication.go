@@ -53,6 +53,7 @@ type CommunicationRequest struct {
 	CallerID                   string                     `json:"caller_id,omitempty"`
 	Paused                     *bool                      `json:"paused,omitempty"`
 	Policy                     *communicationPolicy       `json:"policy,omitempty"`
+	AdminProof                 *communicationAdminProof   `json:"admin_proof,omitempty"`
 	Cursor                     int64                      `json:"cursor,omitempty"`
 	LinkID                     string                     `json:"link_id,omitempty"`
 	AttestationID              string                     `json:"attestation_id,omitempty"`
@@ -439,7 +440,8 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 	}
 	defer communicationUnlock(lock)
 	if strings.HasPrefix(r.Operation, "caller_") {
-		return communicationPolicyAdmin(root, r)
+		nodeID, _ := currentNodeIdentity()
+		return communicationCallerRequest(root, nodeID, r)
 	}
 	identity, err := communicationAuthorize(root, r)
 	if err != nil {

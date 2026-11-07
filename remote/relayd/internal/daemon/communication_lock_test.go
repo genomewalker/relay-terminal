@@ -139,7 +139,7 @@ func TestCommunicationLockGrantedImportsPolicy(t *testing.T) {
 	root := communicationRoot()
 	communicationLockRoot(t, root, "lock")
 	fake := useCommunicationLockFake(t, nil)
-	result, err := ExecuteCommunication(CommunicationRequest{Operation: "caller_policy_import", Policy: communicationLockPolicy()})
+	result, err := ExecuteCommunication(communicationLockSignedImport(t))
 	if err != nil || result["status"] != "imported" {
 		t.Fatalf("granted lock: %v %v", result, err)
 	}
@@ -218,7 +218,7 @@ func TestCommunicationENOLCKTransientRecovers(t *testing.T) {
 		root := communicationRoot()
 		communicationLockRoot(t, root, "lock")
 		fake := useCommunicationLockFake(t, syscall.ENOLCK, syscall.ENOLCK, nil)
-		result, err := ExecuteCommunication(CommunicationRequest{Operation: "caller_policy_import", Policy: communicationLockPolicy()})
+		result, err := ExecuteCommunication(communicationLockSignedImport(t))
 		if err != nil || result["status"] != "imported" {
 			t.Fatalf("transient ENOLCK was not recovered: %v %v", result, err)
 		}
@@ -226,8 +226,8 @@ func TestCommunicationENOLCKTransientRecovers(t *testing.T) {
 		if err := communicationRead(communicationPolicyPath(root), &saved); err != nil || !reflect.DeepEqual(saved, *communicationLockPolicy()) {
 			t.Fatalf("imported policy %+v %v", saved, err)
 		}
-		if names := communicationLockEntries(t, root); !reflect.DeepEqual(names, []string{"caller-policy.json", "lock"}) {
-			t.Fatalf("root holds %v, want caller-policy.json and lock", names)
+		if names := communicationLockEntries(t, root); !reflect.DeepEqual(names, []string{"caller-admin.json", "caller-policy.json", "lock"}) {
+			t.Fatalf("root holds %v, want caller-admin.json, caller-policy.json and lock", names)
 		}
 		if fake.exclusive != 3 || fake.unlocks != 1 || !reflect.DeepEqual(fake.pauses, communicationLockRetryPauses) {
 			t.Fatalf("flock calls %d, unlocks %d, pauses %v; want 3, 1, %v", fake.exclusive, fake.unlocks, fake.pauses, communicationLockRetryPauses)
@@ -278,4 +278,11 @@ func TestCommunicationLockNonENOLCKNotRetried(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A caller-policy import that carries a valid app proof (mutations are fenced).
+func communicationLockSignedImport(t *testing.T) CommunicationRequest {
+	t.Helper()
+	node, _ := currentNodeIdentity()
+	return newCallerAdminKey(t).signed(CommunicationRequest{Operation: "caller_policy_import", Policy: communicationLockPolicy()}, node, time.Now().Add(time.Minute).Unix())
 }
