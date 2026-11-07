@@ -440,12 +440,12 @@ func TestScopeEstablishNeverReplacesExistingLinkOrSubstitutesConversation(t *tes
 		other := CommunicationRemoteLink{PeerNodeID: "node-b", LocalPaneID: testGroupA, PeerPaneID: testGroupB, RouteID: "route", RouteRevision: route.Revision, PeerCertificateSHA256: peerFingerprint(c),
 			LocalConversation: communicationPinnedConversation{Provider: "codex", SessionID: "source-conversation"}, PeerConversation: communicationPinnedConversation{Provider: "claude", SessionID: "other-target"},
 			AllowedPeerCallers: []string{"receiver"}}
-		if _, _, err := communicationEstablishCommit(f.a, "node-a", other, "scope-one", "proposer", "x"); err != nil {
+		if _, _, err := communicationEstablishCommit(f.a, "node-a", other, "scope-one", "proposer", "x", false); err != nil {
 			t.Fatal(err)
 		}
 		before, _ := os.ReadFile(remoteLinkPath(f.a, id))
 		other.AllowedPeerCallers = []string{"sender"}
-		if _, _, err := communicationEstablishCommit(f.a, "node-a", other, "scope-one", "proposer", "x"); err == nil {
+		if _, _, err := communicationEstablishCommit(f.a, "node-a", other, "scope-one", "proposer", "x", false); err == nil {
 			t.Fatal("link with different pins replaced")
 		}
 		after, _ := os.ReadFile(remoteLinkPath(f.a, id))

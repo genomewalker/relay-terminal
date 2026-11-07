@@ -150,11 +150,15 @@ func remoteLinkSamePins(a, b CommunicationRemoteLink) bool {
 // communicationEstablishCommit saves a new revision-1 half under the metadata
 // lock, applying the same validation route_link_set applies. An existing link is
 // never replaced: identical pins are idempotent success, anything else refuses.
-func communicationEstablishCommit(root, node string, requested CommunicationRemoteLink, scopeID, side, messageID string) (CommunicationRemoteLink, string, error) {
+func communicationEstablishCommit(root, node string, requested CommunicationRemoteLink, scopeID, side, messageID string, revive bool) (CommunicationRemoteLink, string, error) {
 	requested.Version, requested.NodeID = 1, node
 	requested.Revision, requested.PeerRevision = 1, 1
 	requested.ID = remotePairID(node, requested.LocalPaneID, requested.PeerNodeID, requested.PeerPaneID)
 	previous, err := readRemoteLink(root, node, requested.ID)
+	if err == nil && previous.Retired && !revive {
+		// A retired half stays retired unless an owner approval proves this pair again.
+		return previous, "", errors.New("retired link is not revived by an unapproved establish")
+	}
 	if err == nil && !previous.Retired {
 		if remoteLinkSamePins(previous, requested) {
 			return previous, "current", nil
@@ -302,7 +306,7 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 		}
 		requested := CommunicationRemoteLink{PeerNodeID: r.PeerNodeID, LocalPaneID: r.SourcePaneID, PeerPaneID: r.PaneID, RouteID: route.ID, RouteRevision: route.Revision,
 			PeerCertificateSHA256: plan.cert, LocalConversation: local, PeerConversation: reply.TargetConversation, AllowedPeerCallers: establishReplyAllowed(plan), DesktopAccountRoot: plan.desktopAccount}
-		link, _, err = communicationEstablishCommit(root, node, requested, plan.scopeID, "proposer", m.MessageID)
+		link, _, err = communicationEstablishCommit(root, node, requested, plan.scopeID, "proposer", m.MessageID, plan.approved)
 		return err
 	})
 	if err != nil {
@@ -371,7 +375,7 @@ func communicationReceiveEstablish(root, node, peerCert string, m communicationE
 		}
 		requested := CommunicationRemoteLink{PeerNodeID: m.SourceNodeID, LocalPaneID: m.TargetPaneID, PeerPaneID: m.SourcePaneID, RouteID: route.ID, RouteRevision: route.Revision,
 			PeerCertificateSHA256: peerCert, LocalConversation: local, PeerConversation: m.SourceConversation, AllowedPeerCallers: []string{m.CallerID}}
-		link, status, err = communicationEstablishCommit(root, node, requested, scopeID, "acceptor", m.MessageID)
+		link, status, err = communicationEstablishCommit(root, node, requested, scopeID, "acceptor", m.MessageID, m.ScopeRecord != nil)
 		return err
 	})
 	if err != nil {
