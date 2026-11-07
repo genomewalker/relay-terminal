@@ -552,6 +552,7 @@ final class RelaySidePanelServer: ObservableObject {
     /// among them: only Relay's native Settings sends it.
     nonisolated static let toolHostOperations: Set<String> = ["exec", "status", "input", "cancel", "plugin", "capabilities",
         "file_stat", "file_list", "file_read", "file_write", "file_verify", "process_list", "process_signal"]
+    nonisolated static var toolHostOperationList: String { toolHostOperations.sorted().joined(separator: ", ") }
 
     private weak var workspace: WorkspaceModel?
     private let agentInputRequests = AgentInputRequests()
@@ -2085,8 +2086,13 @@ final class RelaySidePanelServer: ObservableObject {
                     return try .jsonObject(["host": context.host, "path": path, "mime_type": "image/png", "data": image.base64EncodedString()])
                 }
                 guard let nested = input["request"] as? [String: Any] else { throw RelayHostRPCError.invalidRequest }
-                guard let operation = nested["operation"] as? String, Self.toolHostOperations.contains(operation) else {
-                    return .text("This host operation is not available to tools", status: 403, reason: "Forbidden")
+                // A malformed request is a caller error, not a refused grant:
+                // say which field is wrong and what the tool may send.
+                guard let operation = nested["operation"] as? String, !operation.isEmpty else {
+                    return .text("request.operation is required; tools may use: \(Self.toolHostOperationList)", status: 400, reason: "Bad Request")
+                }
+                guard Self.toolHostOperations.contains(operation) else {
+                    return .text("Host operation \"\(operation)\" is not available to tools; tools may use: \(Self.toolHostOperationList)", status: 400, reason: "Bad Request")
                 }
                 input = nested
                 if ["process_signal", "account_force_commit"].contains(input["operation"] as? String ?? ""), !mcpWorkspaceGrant.permits(.terminate) {
