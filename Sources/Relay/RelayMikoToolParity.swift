@@ -22,7 +22,7 @@ enum RelayMikoToolCatalog {
     }
     static func catalogDataMatchesBuild(_ data: Data) -> Bool {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() ==
-            "dc4180a6f8a8c40616b969319a1bbc9a4ee4f724ba4df05b7a9bd1cd53034e6f"
+            "8d28638cb7b8c51e1ec580b39022de7256f35c25470a649357e1b58e325aab5e"
     }
     static let definitions: [RelayPaneHealthJSON] = {
         guard let url = Bundle.module.url(forResource: "miko_tool_catalog", withExtension: "json", subdirectory: "Rotation"),
