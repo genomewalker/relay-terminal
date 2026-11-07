@@ -57,6 +57,7 @@ type CommunicationRequest struct {
 	AdminProof                 *communicationAdminProof   `json:"admin_proof,omitempty"`
 	Cursor                     int64                      `json:"cursor,omitempty"`
 	LinkID                     string                     `json:"link_id,omitempty"`
+	RequestID                  string                     `json:"request_id,omitempty"`
 	AttestationID              string                     `json:"attestation_id,omitempty"`
 	SourceSignature            string                     `json:"source_signature,omitempty"`
 	WorkEnvelope               string                     `json:"work_envelope,omitempty"`
@@ -413,6 +414,13 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if qualified {
 			return communicationQualifiedGroupReceipt(communicationRoot(), currentCommunicationNodeID(), r)
 		}
+	}
+	if r.Operation == "desktop_link_request" || r.Operation == "route_desktop_link_approve" {
+		if r.Operation == "desktop_link_request" {
+			return communicationDesktopLinkRequestOp(communicationRoot(), r, time.Now().UTC())
+		}
+		return communicationDesktopLinkApprove(communicationRoot(), currentCommunicationNodeID(), r,
+			communicationGroupNative{observe: communicationObserve, send: communicationNative})
 	}
 	if r.Operation == "remote_send" || r.Operation == "remote_receipt" {
 		return communicationSendRemote(communicationRoot(), currentCommunicationNodeID(), r,

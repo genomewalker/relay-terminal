@@ -110,11 +110,12 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 		if r.Operation == "remote_send" && r.LinkID == "" {
 			// A verified desktop session names its pane, not a link: resolve the one
 			// saved route link that pairs them, before any receipt is read.
-			linkID, err := communicationDesktopRemoteLink(root, node, r)
+			linkID, revision, err := communicationDesktopRemoteLink(root, node, r)
 			if err != nil {
 				return err
 			}
-			r.LinkID = linkID
+			// Resolved under the lock now, so the pinned revision is the current one.
+			r.LinkID, r.ExpectedRemoteLinkRevision = linkID, revision
 		}
 		if err := communicationRead(path, &receipt); err == nil {
 			if !remoteOutboundRequestMatches(receipt, node, caller, r) {

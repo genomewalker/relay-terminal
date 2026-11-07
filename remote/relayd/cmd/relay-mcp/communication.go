@@ -13,13 +13,19 @@ import (
 )
 
 func (s *server) communicationActor() (string, error) {
+	pane, _, err := s.communicationActorProof()
+	return pane, err
+}
+
+// communicationActorProof returns the proven caller pane and the proof source.
+func (s *server) communicationActorProof() (string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, s.daemonHelper, "communication-actor")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("native caller pane unavailable: %s", strings.TrimSpace(stderr.String()))
+		return "", "", fmt.Errorf("native caller pane unavailable: %s", strings.TrimSpace(stderr.String()))
 	}
 	var actor struct {
 		Version     int    `json:"version"`
@@ -31,9 +37,9 @@ func (s *server) communicationActor() (string, error) {
 	if stdout.Len() > 8192 || json.Unmarshal(stdout.Bytes(), &actor) != nil || actor.Version != 1 ||
 		!paneID.MatchString(actor.PaneID) || actor.ClientPID != os.Getpid() || actor.ClientStart == "" ||
 		(actor.Source != "foreground_worker_kernel_ancestry" && actor.Source != "native_parked_job_kernel_owner" && actor.Source != "claude_desktop_session_kernel_owner") {
-		return "", fmt.Errorf("invalid native caller pane proof")
+		return "", "", fmt.Errorf("invalid native caller pane proof")
 	}
-	return actor.PaneID, nil
+	return actor.PaneID, actor.Source, nil
 }
 
 // noSenderRefusal is the local answer to relay_message_pane with neither a source
@@ -101,7 +107,14 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	// relayd re-derives it independently. Harnesses such as Codex scrub
 	// RELAY_SESSION from MCP servers, so its absence only means an unowned
 	// client keeps the unattributed path instead of failing.
-	actor, actorErr := s.communicationActor()
+	actor, actorSource, actorErr := s.communicationActorProof()
+	// A verified Claude desktop session sends to a pane through its saved link.
+	if actorErr == nil && actorSource == desktopSessionSource && operation == "send" {
+		return s.desktopSessionSend(actor, arguments, targeted)
+	}
+	if actorErr == nil && actorSource == desktopSessionSource && operation == "link" {
+		return s.desktopSessionLink(actor, arguments, targeted)
+	}
 	if actorErr != nil {
 		actor = ""
 		if os.Getenv("RELAY_SESSION") != "" {
