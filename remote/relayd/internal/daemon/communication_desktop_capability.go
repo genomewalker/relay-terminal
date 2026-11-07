@@ -78,12 +78,14 @@ func communicationDesktopLinkEstablish(root, node string, r CommunicationRequest
 		return nil, errors.New("an owner capability is required")
 	}
 	var capability communicationDesktopCapability
-	if err := communicationRead(desktopCapabilityPath(root, r.OwnerCapability), &capability); err != nil {
-		return nil, errors.New("no owner capability")
-	}
 	callers := append([]string(nil), r.AllowedCallers...)
 	sort.Strings(callers)
+	// The record is read and spent under the same lock: a concurrent spend that read
+	// before the first commit must not get past the consumed check.
 	err := communicationFanoutLocked(root, func() error {
+		if err := communicationRead(desktopCapabilityPath(root, r.OwnerCapability), &capability); err != nil {
+			return errors.New("no owner capability")
+		}
 		if capability.Version != 1 || capability.ID != r.OwnerCapability {
 			return errors.New("invalid owner capability")
 		}

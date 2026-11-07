@@ -115,3 +115,41 @@ func TestCapabilityOperationRefusesClientCallers(t *testing.T) {
 		t.Fatal("an incomplete request established a pair")
 	}
 }
+
+// Concurrent spends of one capability: exactly one establishes the pair, and every
+// other spend is refused as already used, never by a later check.
+func TestConcurrentSpendsOfOneCapabilityEstablishOnce(t *testing.T) {
+	f := scopedFixture(t, true)
+	now := time.Now().UTC()
+	original := desktopLinkNow
+	desktopLinkNow = func() time.Time { return now }
+	defer func() { desktopLinkNow = original }()
+	id := mintCapability(t, f, now)
+	const spends = 8
+	type outcome struct{ err error }
+	results := make(chan outcome, spends)
+	start := make(chan struct{})
+	for i := 0; i < spends; i++ {
+		go func() {
+			<-start
+			_, err := spend(f, id, nil)
+			results <- outcome{err}
+		}()
+	}
+	close(start)
+	successes, used := 0, 0
+	for i := 0; i < spends; i++ {
+		result := <-results
+		switch {
+		case result.err == nil:
+			successes++
+		case strings.Contains(result.err.Error(), "already used"):
+			used++
+		default:
+			t.Fatal("a concurrent spend failed for another reason", result.err)
+		}
+	}
+	if successes != 1 || used != spends-1 {
+		t.Fatalf("successes=%d already_used=%d; want 1 and %d", successes, used, spends-1)
+	}
+}
