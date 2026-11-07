@@ -165,8 +165,10 @@ final class RelayAgentMaintenancePromptTests: XCTestCase {
         XCTAssertTrue(RelayAgentMaintenancePrompt.retainedShellIsEmpty(fresh))
         XCTAssertTrue(RelayAgentMaintenancePrompt.retainedShellIsEmpty(
             "\u{1b}[2m╭─ dandycomp07fl · ~\u{1b}[0m\n\u{1b}[35m╰─ ❯\u{1b}[0m "))
-        // A faint autosuggestion after the marker is not typed input.
-        XCTAssertTrue(RelayAgentMaintenancePrompt.retainedShellIsEmpty(fresh + "\u{1b}[2mcodex --sandbox read-only\u{1b}[0m"))
+        // Faint text after the marker is typed input drawn faint, or a
+        // suggestion that only follows typed input: never empty.
+        XCTAssertFalse(RelayAgentMaintenancePrompt.retainedShellIsEmpty(fresh + "\u{1b}[2mcodex --sandbox read-only\u{1b}[0m"))
+        XCTAssertTrue(RelayAgentMaintenancePrompt.retainedShellHasTypedText(fresh + "\u{1b}[2mcodex --sandbox read-only\u{1b}[0m"))
         XCTAssertTrue(RelayAgentMaintenancePrompt.retainedShellIsEmpty("╭─ host · ~/x\n└─ $ "))
         XCTAssertTrue(RelayAgentMaintenancePrompt.retainedShellIsEmpty("╭─ host · ~/x\n╰─ % "))
         // Real drafts stay drafts, including text ending in a marker character.

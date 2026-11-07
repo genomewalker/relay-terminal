@@ -274,13 +274,12 @@ enum RelayAgentMaintenancePrompt {
         }
         // The prompt prints one separator after its marker; the export keeps
         // written cells, so any further blank was typed (as for Codex, a
-        // draft of spaces is not empty). Beyond the separator only the faint
-        // suggestion style is empty; any other character is typed input.
+        // draft of spaces is not empty). Anything beyond the separator is
+        // typed, whatever its style: shells show a suggestion only after
+        // typed text, and themes may draw typed text grey or dim.
         let after = cells[(marker + 1)...]
         guard let separator = after.first else { return .empty }
-        guard blank(separator) else { return .typed }
-        let rest = after.dropFirst()
-        return rest.isEmpty || rest.allSatisfy(\.faint) && !rest.allSatisfy(blank) ? .empty : .typed
+        return blank(separator) && after.count == 1 ? .empty : .typed
     }
 
     private static func parse(_ vt: String) -> [[Cell]]? {

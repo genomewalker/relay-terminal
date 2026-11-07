@@ -46,8 +46,13 @@ struct RelayRetainedShellBoxPromptTests {
         #expect(try await classify(styled) == .empty)
     }
 
-    @MainActor @Test func aFaintSuggestionAfterTheMarkerIsEmpty() async throws {
-        #expect(try await classify(Self.live + "\u{1b}[90mcd ~/dev\u{1b}[39m") == .empty)
+    /// A shell shows a suggestion only after typed text, and a theme may draw
+    /// typed text grey or dim: anything after the separator is a draft.
+    @MainActor @Test func faintOrGreyTextAfterTheMarkerIsTyped() async throws {
+        for styled in ["\u{1b}[90mcd ~/dev\u{1b}[39m", "\u{1b}[38;2;128;128;128mrm -rf build\u{1b}[39m",
+                       "\u{1b}[38;5;8mrm -rf build\u{1b}[39m", "\u{1b}[2mrm -rf build\u{1b}[22m"] {
+            #expect(try await classify(Self.live + styled) == .typed, "\(String(reflecting: styled))")
+        }
     }
 
     @MainActor @Test func aTypedCommandIsTyped() async throws {
