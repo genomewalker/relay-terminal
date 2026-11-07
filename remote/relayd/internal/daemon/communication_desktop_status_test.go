@@ -72,3 +72,27 @@ func TestDesktopLinkStatusExpired(t *testing.T) {
 		t.Fatal("expired status", got, err)
 	}
 }
+
+// The list for a desktop session holds its own approved links, and only for
+// that verified session.
+func TestDesktopSessionListsOwnLinks(t *testing.T) {
+	a, _, proposed, _, hooks := requestFixture(t)
+	result, err := communicationRemoteLinkSet(a, "node-a", CommunicationRequest{Operation: "route_link_set", RemoteLink: &proposed}, hooks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := result["link"].(CommunicationRemoteLink)
+	own, ok := desktopSessionOwnLinks(a, "node-a", CommunicationRequest{Operation: "list", ActorPaneID: desktopAlias, actorVerified: true})
+	if !ok || len(own) != 1 || own[0].LinkID != link.ID || own[0].PaneID != testGroupB || own[0].PeerNodeID != "node-b" {
+		t.Fatal("own link not listed", own, ok)
+	}
+	for _, r := range []CommunicationRequest{
+		{Operation: "list", ActorPaneID: desktopAlias},
+		{Operation: "list", ActorPaneID: "00000000-0000-4000-8000-00000000d00d", actorVerified: true},
+		{Operation: "list", ActorPaneID: testGroupB, actorVerified: true},
+	} {
+		if own, ok := desktopSessionOwnLinks(a, "node-a", r); ok || len(own) != 0 {
+			t.Fatal("another caller listed the session's links", r, own)
+		}
+	}
+}

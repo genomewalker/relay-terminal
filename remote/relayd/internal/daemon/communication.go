@@ -607,6 +607,12 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A verified desktop session sends only over its own route links, so it
+		// sees those, not every pane pair on this host.
+		if own, ok := desktopSessionOwnLinks(root, nodeID, r); ok {
+			return map[string]any{"node_id": nodeID, "desktop_session_links": own, "other_saved_links": len(paths), "authority": "relayd",
+				"note": "desktop_session_links are this Claude desktop session's approved links; send with relay_message_pane naming pane_id. Pane-to-pane pairs on this host are counted, not listed."}, nil
+		}
 		links := []communicationLink{}
 		for _, path := range paths {
 			var link communicationLink

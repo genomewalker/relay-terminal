@@ -92,3 +92,39 @@ func clearDesktopLinkRejection(root, id string) error {
 	}
 	return nil
 }
+
+// desktopSessionLinkEntry is one approved link as its desktop session sees it.
+type desktopSessionLinkEntry struct {
+	LinkID     string    `json:"link_id"`
+	PaneID     string    `json:"pane_id"`
+	PeerNodeID string    `json:"peer_node_id"`
+	RouteID    string    `json:"route_id"`
+	Revision   uint64    `json:"revision"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// desktopSessionOwnLinks returns the active route links whose local side is the
+// calling verified, registered desktop session. ok is false for any other caller.
+func desktopSessionOwnLinks(root, node string, r CommunicationRequest) ([]desktopSessionLinkEntry, bool) {
+	session := strings.ToLower(r.ActorPaneID)
+	if !r.actorVerified || !nativeClaudeSessionID.MatchString(session) {
+		return nil, false
+	}
+	endpoint, err := readClaudeSessionEndpoint(root, session)
+	if err != nil {
+		return nil, false
+	}
+	paths, _ := filepath.Glob(filepath.Join(root, "remote-link-*.json"))
+	own := []desktopSessionLinkEntry{}
+	for _, path := range paths {
+		var known CommunicationRemoteLink
+		if communicationRead(path, &known) != nil || known.NodeID != node || !strings.EqualFold(known.LocalPaneID, session) {
+			continue
+		}
+		if link, ok := desktopSessionActiveLink(root, node, session, known.PeerNodeID, strings.ToLower(known.PeerPaneID), endpoint.AccountRoot); ok {
+			own = append(own, desktopSessionLinkEntry{LinkID: link.ID, PaneID: strings.ToLower(link.PeerPaneID), PeerNodeID: link.PeerNodeID,
+				RouteID: link.RouteID, Revision: link.Revision, CreatedAt: link.CreatedAt})
+		}
+	}
+	return own, true
+}
