@@ -177,6 +177,8 @@ func workerRuntimeDir(supervisorSocket string) string {
 
 func (server *Server) serveConnection(connection net.Conn) {
 	defer connection.Close()
+	// The socket's peer process: owner operations are refused when it is an agent,
+	// or when it cannot be identified.
 	first, err := protocol.ReadFrame(connection)
 	if err != nil || first.Type != protocol.Hello {
 		return
@@ -458,6 +460,9 @@ func (session *multiplexedSession) compatibilityManifest(path string) (workerMan
 // so authentication, replay, compatibility, and worker isolation retain one
 // implementation instead of growing a parallel code path.
 func (server *Server) serveNodeMultiplex(connection net.Conn) {
+	// The socket's peer process: owner operations are refused when it is an agent,
+	// or when it cannot be identified.
+	_, peerPID, peerErr := PeerCredentials(connection)
 	writer := protocol.NewScheduledWriter(connection)
 	reader := protocol.NewFragmentReader(connection)
 	ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
@@ -521,7 +526,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 			continue
 		}
 		if envelope.Type == protocol.HostRequest {
-			go server.serveHostRPC(writer, envelope)
+			go server.serveHostRPCFrom(writer, envelope, hostCaller{pid: peerPID, err: peerErr})
 			continue
 		}
 		sessionID, inner, err := protocol.ParseHostEvent(envelope)

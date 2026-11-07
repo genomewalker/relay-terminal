@@ -449,6 +449,10 @@ func main() {
 		if actorErr != nil {
 			fatal(actorErr.Error())
 		}
+		// Owner administration never runs for an agent or an unprovable caller.
+		if gateErr := daemon.CheckCommunicationOwner(request, os.Getppid()); gateErr != nil {
+			fatal(gateErr.Error())
+		}
 		result, err := daemon.ExecuteCommunication(request)
 		if err != nil {
 			fatal(err.Error())

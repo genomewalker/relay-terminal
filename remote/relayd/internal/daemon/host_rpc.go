@@ -654,3 +654,34 @@ func (s *Server) serveHostRPC(writer *protocol.Writer, frame protocol.Frame) {
 		writer.Write(answer)
 	}
 }
+
+// hostCaller is the process on the other end of a host RPC connection.
+type hostCaller struct {
+	pid int
+	err error
+}
+
+// serveHostRPCFrom serves one host request from a known caller. An owner
+// communication operation is refused unless its caller passes the owner gate.
+func (s *Server) serveHostRPCFrom(writer *protocol.Writer, frame protocol.Frame, caller hostCaller) {
+	var request hostRequest
+	if json.Unmarshal(frame.Payload, &request) == nil && request.Operation == "communication" && request.Communication != nil {
+		if caller.err != nil {
+			s.writeHostRPCError(writer, request.RequestID, errors.New("owner administration refused: the caller is not identifiable"))
+			return
+		}
+		if err := communicationOwnerGate(*request.Communication, caller.pid); err != nil {
+			s.writeHostRPCError(writer, request.RequestID, err)
+			return
+		}
+	}
+	s.serveHostRPC(writer, frame)
+}
+
+func (s *Server) writeHostRPCError(writer *protocol.Writer, requestID string, err error) {
+	response := map[string]any{"request_id": requestID, "error": err.Error()}
+	answer, e := protocol.JSONFrame(protocol.HostResponse, response)
+	if e == nil {
+		writer.Write(answer)
+	}
+}
