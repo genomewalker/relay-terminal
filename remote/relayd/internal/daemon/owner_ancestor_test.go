@@ -16,7 +16,7 @@ func markClaudeTestProcesses(t *testing.T, pids ...int) {
 		named[pid] = true
 	}
 	previous := claudeAncestorIsClaude
-	claudeAncestorIsClaude = func(pid int) bool { return named[pid] }
+	claudeAncestorIsClaude = func(pid int) (bool, error) { return named[pid], nil }
 	t.Cleanup(func() { claudeAncestorIsClaude = previous })
 }
 
