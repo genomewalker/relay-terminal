@@ -3512,7 +3512,8 @@ final class TerminalRuntime: NSObject {
                                                     pendingApprovals: Int, composerBusy: Bool) -> Bool {
         guard pendingApprovals == 0, !composerBusy, expected.inputOnly != true else { return false }
         switch expected.provider {
-        case "codex": return RelayAgentMaintenancePrompt.isEmpty(vt, provider: "codex")
+        // No Claude footer agent is explained here, so any "← N agent" holds.
+        case "codex", "claude": return RelayAgentMaintenancePrompt.isEmpty(vt, provider: expected.provider)
         case "shell": return RelayAgentMaintenancePrompt.retainedShellIsEmpty(vt)
         default: return false
         }
@@ -3531,7 +3532,11 @@ final class TerminalRuntime: NSObject {
     func sendTerminalEdit(_ request: RelayTerminalEditRequest, appendShellReturn: Bool = false,
                           authorization: @MainActor () -> Bool = { true }) async -> String {
         guard request.isValid, let proof = preparedTerminalEdit, proof.token == request.token else { return "not_sent" }
-        guard !appendShellReturn || (proof.owner.binding.provider == "shell" && request.action == "insert_text") else { return "not_sent" }
+        // Return is appended only to a retained shell's launch text, or to
+        // Claude's fixed exit command; never to other agent prompt text.
+        guard !appendShellReturn || request.action == "insert_text" && (proof.owner.binding.provider == "shell" ||
+            proof.owner.binding.provider == "claude" && request.text == RelayAgentMaintenancePolicy.exitCommand(provider: "claude"))
+        else { return "not_sent" }
         preparedTerminalEdit = nil
         let pane = proof.pane
         guard let inputLease = acquirePromptInspectionInputLease() else { return "not_sent" }

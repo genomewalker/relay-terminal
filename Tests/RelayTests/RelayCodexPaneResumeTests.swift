@@ -42,3 +42,52 @@ struct RelayCodexPaneResumeTests {
         #expect(try Data(contentsOf: path) == data)
     }
 }
+
+@Suite("Same-pane Claude resume")
+struct RelayClaudePaneResumeTests {
+    private func owner(_ provider: String, session: String, process: Int = 20) -> RelayPromptOwnerBinding {
+        .init(version: 1, paneId: "pane", nodeBootId: "boot", workerPid: 10, workerStart: 100,
+              shellPid: 11, shellStart: 101, provider: provider, processId: process, processStart: 200,
+              sessionId: session, transcriptIdentity: "transcript")
+    }
+
+    @Test func legacyRequestsStayCodexAndClaudeResumesOnlyItsOwnSession() throws {
+        let id = UUID(), other = UUID()
+        let legacy = try JSONDecoder().decode(RelayCodexPaneResumeRequest.self, from: Data(
+            #"{"instance":"\#(id)","requestID":"\#(id)","expectedSession":"\#(id)","targetSession":"\#(other)"}"#.utf8))
+        #expect(legacy.agent == "codex" && legacy.isAdmissible)
+        let claude = RelayCodexPaneResumeRequest(instance: id, requestID: id, expectedSession: id, targetSession: id, provider: "claude")
+        #expect(claude.isAdmissible)
+        #expect(try JSONDecoder().decode(RelayCodexPaneResumeRequest.self, from: JSONEncoder().encode(claude)) == claude)
+        #expect(!RelayCodexPaneResumeRequest(instance: id, requestID: id, expectedSession: id, targetSession: other, provider: "claude").isAdmissible)
+        for provider in ["gemini", "Claude", "", "shell"] {
+            #expect(!RelayCodexPaneResumeRequest(instance: id, requestID: id, expectedSession: id, targetSession: id, provider: provider).isAdmissible)
+        }
+        // A receipt request differing only by provider is a different request.
+        #expect(RelayCodexPaneResumeRequest(instance: id, requestID: id, expectedSession: id, targetSession: id) != claude)
+    }
+
+    @Test @MainActor func planAndExitAreProviderExact() {
+        let pane = UUID(), session = "01a18b32-f284-7220-91a2-6a81cde6db14"
+        #expect(RelayCodexPaneResume.planArguments(pane: pane, provider: "claude", expected: session, target: session)
+            == ["claude-pane-resume-plan", pane.uuidString.lowercased(), session])
+        #expect(RelayCodexPaneResume.planArguments(pane: pane, provider: "codex", expected: session, target: "t")
+            == ["codex-pane-resume-plan", pane.uuidString.lowercased(), session, "t"])
+        let (claudeExit, claudeSubmit) = RelayCodexPaneResume.exitEdit(provider: "claude", instance: pane, requestID: pane, token: pane)
+        #expect(claudeExit.isValid && claudeSubmit && claudeExit.action == "insert_text" && claudeExit.text == "/exit")
+        let (codexExit, codexSubmit) = RelayCodexPaneResume.exitEdit(provider: "codex", instance: pane, requestID: pane, token: pane)
+        #expect(codexExit.isValid && !codexSubmit && codexExit.key == "d" && codexExit.modifiers == ["control"])
+    }
+
+    @Test @MainActor func claudeVerificationRequiresTheSameSessionInANewClaudeProcess() {
+        let session = UUID(), before = owner("claude", session: session.uuidString.lowercased())
+        #expect(RelayCodexPaneResume.verified(before, after: owner("claude", session: session.uuidString.lowercased(), process: 21), target: session))
+        #expect(!RelayCodexPaneResume.verified(before, after: owner("claude", session: session.uuidString.lowercased()), target: session))
+        #expect(!RelayCodexPaneResume.verified(before, after: owner("codex", session: session.uuidString.lowercased(), process: 21), target: session))
+        #expect(!RelayCodexPaneResume.verified(before, after: owner("claude", session: UUID().uuidString.lowercased(), process: 21), target: session))
+        var inputOnly = owner("claude", session: session.uuidString.lowercased(), process: 21); inputOnly.inputOnly = true
+        #expect(!RelayCodexPaneResume.verified(before, after: inputOnly, target: session))
+        let shell = owner("shell", session: session.uuidString.lowercased())
+        #expect(!RelayCodexPaneResume.verified(shell, after: owner("shell", session: session.uuidString.lowercased(), process: 21), target: session))
+    }
+}

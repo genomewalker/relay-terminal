@@ -50,3 +50,42 @@ func TestCodexPaneResumeCompilerRejectsMissingOrInjectedSession(t *testing.T) {
 		}
 	}
 }
+
+func TestPaneResumeCompilerCarriesOnlyAKnownProvider(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	compile := func(extra map[string]any) (*mikoPlan, error) {
+		args := map[string]any{"instance": id, "request_id": id, "pane_id": id, "expected_session": id, "target_session": id}
+		for key, value := range extra {
+			args[key] = value
+		}
+		raw, _ := json.Marshal(map[string]any{"tool_name": "relay_codex_resume_pane", "arguments": args})
+		return compileMikoPlan(raw)
+	}
+	legacy, err := compile(nil)
+	var body map[string]string
+	if err != nil || json.Unmarshal(legacy.Body, &body) != nil {
+		t.Fatal("legacy Codex request no longer compiles", err)
+	}
+	if _, ok := body["provider"]; ok {
+		t.Fatal("legacy request gained a provider")
+	}
+	for _, provider := range []string{"codex", "claude"} {
+		plan, err := compile(map[string]any{"provider": provider})
+		body = nil
+		if err != nil || json.Unmarshal(plan.Body, &body) != nil || body["provider"] != provider ||
+			plan.Path != "/api/panes/"+id+"/codex-resume" || plan.Tier != "change" {
+			t.Fatalf("%s: %+v %v", provider, plan, err)
+		}
+	}
+	for _, provider := range []any{"gemini", "Claude", "claude; rm", "", nil, 1} {
+		if _, err := compile(map[string]any{"provider": provider}); err == nil {
+			t.Fatalf("accepted provider %v", provider)
+		}
+	}
+	if _, err := compile(map[string]any{"provider": "claude", "target_session": "22222222-2222-4222-8222-222222222222"}); err == nil {
+		t.Fatal("Claude resume accepted another session")
+	}
+	if _, err := compile(map[string]any{"provider": "codex", "extra": "x"}); err == nil {
+		t.Fatal("accepted an unknown argument")
+	}
+}

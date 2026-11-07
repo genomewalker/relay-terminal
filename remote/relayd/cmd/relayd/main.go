@@ -353,6 +353,17 @@ func main() {
 		if err := daemon.EncodeJSON(os.Stdout, plan); err != nil {
 			fatal(err.Error())
 		}
+	case "claude-pane-resume-plan":
+		if len(os.Args) != 4 {
+			fatal("usage: relayd claude-pane-resume-plan PANE EXPECTED_SESSION")
+		}
+		plan, err := daemon.ReadClaudePaneResumePlan(os.Args[2], os.Args[3])
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, plan); err != nil {
+			fatal(err.Error())
+		}
 	case "resume-plan":
 		if len(os.Args) != 3 {
 			fatal("usage: relayd resume-plan PANE")

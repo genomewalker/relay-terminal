@@ -24,7 +24,7 @@ private enum ResumeScreen {
     static func claude(input: String = "", footerSuffix: String = "") -> String {
         var footer = claudeFooter
         footer[footer.count - 1] += footerSuffix
-        return (["● Done.", " ", "────────────────────────────────────────", "❯ " + input] + footer).joined(separator: "\r\n")
+        return (["● Done.", " ", "────────────────────────────────────────", "❯\u{a0}" + input] + footer).joined(separator: "\r\n")
     }
 }
 
@@ -37,6 +37,7 @@ private final class ResumeFrameWriter: RelayFrameWriting, @unchecked Sendable {
         lock.lock(); inputs.append(payload); lock.unlock()
     }
     var count: Int { lock.lock(); defer { lock.unlock() }; return inputs.count }
+    var payloads: [Data] { lock.lock(); defer { lock.unlock() }; return inputs }
 }
 
 @MainActor private struct Observed {
@@ -53,8 +54,9 @@ private final class ResumeFrameWriter: RelayFrameWriting, @unchecked Sendable {
         processId: process, processStart: 3, sessionId: session, transcriptIdentity: "1:2", inputOnly: inputOnly)
 }
 
-@Suite("Same-pane agent resume prompt proof", .serialized)
-struct RelayAgentResumePromptProofTests {
+/// Same-pane agent resume prompt proof. These drive real native windows, so they
+/// join the serialized terminal-editing suite rather than run beside it.
+extension RelayTerminalEditTests {
     /// Drives the real attached-renderer path: no ordered worker snapshot, so
     /// the proof must come from the live native screen under its fence.
     @MainActor
@@ -129,7 +131,59 @@ struct RelayAgentResumePromptProofTests {
             ("owner change", ResumeScreen.codex(), "codex", "codex", "owner"),
             ("composer draft", ResumeScreen.codex(), "codex", "codex", "composer"),
             ("owner is another provider", ResumeScreen.codex(), "claude", "codex", "none"),
-            ("expected is another provider", ResumeScreen.codex(), "claude", "claude", "none"),
+            ("Codex screen read as Claude", ResumeScreen.codex(), "claude", "claude", "none"),
+        ]
+        for (name, screen, owner, expected, change) in cases {
+            let observed = try await proof(screen: screen, owner: owner, expected: expected, change: change)
+            #expect(observed.token == nil, "must refuse: \(name)")
+            #expect(observed.writer.count == 0, "no input for: \(name)")
+            observed.close()
+        }
+    }
+
+    @MainActor
+    @Test("A displayed idle Claude prompt yields a proof that submits only /exit, once", .timeLimit(.minutes(2)))
+    func displayedIdleClaudePromptIsProvenAndExitsOnce() async throws {
+        let observed = try await proof(screen: ResumeScreen.claude(), owner: "claude", expected: "claude")
+        defer { observed.close() }
+        let runtime = observed.runtime, writer = observed.writer
+        let proven = try #require(observed.token, "an idle empty Claude prompt on screen must be provable")
+        let (exit, submit) = RelayCodexPaneResume.exitEdit(provider: "claude", instance: UUID(), requestID: UUID(), token: proven)
+        #expect(await runtime.sendTerminalEdit(exit, appendShellReturn: submit) == "input_submitted")
+        #expect(writer.count == 1)
+        let packet = try #require(writer.payloads.first)
+        #expect(packet.range(of: Data("/exit".utf8)) != nil && packet.range(of: Data([0x0d])) != nil)
+        #expect(await runtime.sendTerminalEdit(exit, appendShellReturn: submit) == "not_sent")
+        #expect(writer.count == 1)
+    }
+
+    @MainActor
+    @Test("Return is appended to agent text only for Claude's exact exit command", .timeLimit(.minutes(2)))
+    func returnIsAppendedOnlyToClaudesExitCommand() async throws {
+        for (name, screen, provider, text) in [("claude other text", ResumeScreen.claude(), "claude", "hello"),
+                                               ("claude exit variant", ResumeScreen.claude(), "claude", "/exit now"),
+                                               ("codex exit text", ResumeScreen.codex(), "codex", "/exit")] {
+            let observed = try await proof(screen: screen, owner: provider, expected: provider)
+            let token = try #require(observed.token, "precondition for \(name)")
+            let request = RelayTerminalEditRequest(instance: UUID(), requestID: UUID(), token: token, action: "insert_text", text: text, key: nil, modifiers: nil)
+            #expect(await observed.runtime.sendTerminalEdit(request, appendShellReturn: true) == "not_sent", "must refuse: \(name)")
+            #expect(observed.writer.count == 0, "no input for: \(name)")
+            observed.close()
+        }
+    }
+
+    @MainActor
+    @Test("Displayed Claude panes that are busy, drafted, re-owned or another provider are refused", .timeLimit(.minutes(3)))
+    func displayedClaudeRefusals() async throws {
+        let cases: [(String, String, String, String, String)] = [
+            ("draft", ResumeScreen.claude(input: "unsent draft"), "claude", "claude", "none"),
+            ("background agent", ResumeScreen.claude(footerSuffix: " · ← 1 agent"), "claude", "claude", "none"),
+            ("background shells", ResumeScreen.claude(footerSuffix: " · 2 shells"), "claude", "claude", "none"),
+            ("owner change", ResumeScreen.claude(), "claude", "claude", "owner"),
+            ("composer draft", ResumeScreen.claude(), "claude", "claude", "composer"),
+            ("Claude screen as Codex", ResumeScreen.claude(), "codex", "codex", "none"),
+            ("Codex screen as Claude", ResumeScreen.codex(), "claude", "claude", "none"),
+            ("owner is another provider", ResumeScreen.claude(), "codex", "claude", "none"),
         ]
         for (name, screen, owner, expected, change) in cases {
             let observed = try await proof(screen: screen, owner: owner, expected: expected, change: change)

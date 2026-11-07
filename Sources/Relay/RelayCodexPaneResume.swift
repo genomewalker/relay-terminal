@@ -5,10 +5,19 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
     let requestID: UUID
     let expectedSession: UUID
     let targetSession: UUID
+    /// "codex" when absent, so receipts and requests written before Claude
+    /// support keep their meaning. "claude" resumes the expected session itself.
+    var provider: String? = nil
+
+    var agent: String { provider ?? "codex" }
+    var isAdmissible: Bool {
+        agent == "codex" || agent == "claude" && expectedSession == targetSession
+    }
 }
 
-/// Operator-requested recovery. Every input is fenced by the same native
-/// owner and ordered screen proof used by background terminal editing.
+/// Operator-requested same-pane resume of a Codex or Claude session. Every
+/// input is fenced by the same native owner and screen proof (ordered worker
+/// snapshot or live renderer) used by background terminal editing.
 @MainActor final class RelayCodexPaneResume {
     static let shared = RelayCodexPaneResume()
     struct Plan: Codable {
@@ -56,7 +65,7 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             }
             return prior
         }
-        guard active.isEmpty, authorized(), pane.profile.backend == .relay, pane.connectionState == .connected,
+        guard request.isAdmissible, active.isEmpty, authorized(), pane.profile.backend == .relay, pane.connectionState == .connected,
               pane.contentKind == .terminal else {
             throw NSError(domain: "RelayCodexResume", code: 409, userInfo: [NSLocalizedDescriptionKey: "Resume target or authorization unavailable"])
         }
@@ -80,20 +89,21 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             result.state = state; result.detail = detail; result.updatedAt = Date(); try write(result)
         }
         do {
-            let request = result.request
-            let command = RelayHostExecution.daemonCommand(profile: profile, arguments: ["codex-pane-resume-plan", pane.id.uuidString.lowercased(), request.expectedSession.uuidString.lowercased(), request.targetSession.uuidString.lowercased()])
+            let request = result.request, agent = request.agent, name = agent == "claude" ? "Claude" : "Codex"
+            let command = RelayHostExecution.daemonCommand(profile: profile, arguments: Self.planArguments(pane: pane.id, provider: agent,
+                expected: request.expectedSession.uuidString.lowercased(), target: request.targetSession.uuidString.lowercased()))
             let captured = try await RelayHostExecution.capture(profile: profile, command: command, timeout: 15, maximumBytes: 16_384)
             guard current(), captured.exitCode == 0,
                   let plan = try? JSONDecoder().decode(Plan.self, from: captured.stdout),
-                  plan.owner.provider == "codex", plan.owner.paneId == pane.id.uuidString.lowercased(),
+                  request.isAdmissible, plan.owner.provider == agent, plan.owner.paneId == pane.id.uuidString.lowercased(),
                   plan.owner.sessionId == request.expectedSession.uuidString.lowercased(),
                   plan.session_id == request.targetSession.uuidString.lowercased(),
                   let proof = await pane.runtime.agentResumePromptProof(expected: plan.owner), current() else {
-                try save("refused", "No verified idle empty Codex prompt or exact saved-session plan. " + String(decoding: captured.stderr.prefix(500), as: UTF8.self)); return
+                try save("refused", "No verified idle empty \(name) prompt or exact saved-session plan. " + String(decoding: captured.stderr.prefix(500), as: UTF8.self)); return
             }
-            try save("exiting", "Graceful Codex exit requested for the verified original session")
-            let exit = RelayTerminalEditRequest(instance: request.instance, requestID: request.requestID, token: proof, action: "key", text: nil, key: "d", modifiers: ["control"])
-            guard await pane.runtime.sendTerminalEdit(exit, authorization: current) == "input_submitted" else {
+            try save("exiting", "Graceful \(name) exit requested for the verified original session")
+            let (exit, submit) = Self.exitEdit(provider: agent, instance: request.instance, requestID: request.requestID, token: proof)
+            guard await pane.runtime.sendTerminalEdit(exit, appendShellReturn: submit, authorization: current) == "input_submitted" else {
                 try save("not_sent", "The original owner or screen changed; no exit input was submitted"); return
             }
             inputSent = true
@@ -120,14 +130,14 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             let verifyUntil = Date().addingTimeInterval(90)
             while current(), Date() < verifyUntil {
                 if let owner = await pane.runtime.agentResumeOwner(), Self.verified(plan.owner, after: owner, target: request.targetSession) {
-                    let verifyCommand = RelayHostExecution.daemonCommand(profile: profile, arguments: ["codex-pane-resume-plan", pane.id.uuidString.lowercased(), plan.session_id, plan.session_id])
+                    let verifyCommand = RelayHostExecution.daemonCommand(profile: profile, arguments: Self.planArguments(pane: pane.id, provider: agent, expected: plan.session_id, target: plan.session_id))
                     let account = try await RelayHostExecution.capture(profile: profile, command: verifyCommand, timeout: 15, maximumBytes: 16_384)
                     guard current(), account.exitCode == 0,
                           let verified = try? JSONDecoder().decode(Plan.self, from: account.stdout),
                           verified.owner == owner, verified.config_dir == plan.config_dir else {
                         try save("outcome_unknown", "The requested session is bound but its original account was not reverified. Do not replay."); return
                     }
-                    try save("verified", "Exact saved Codex session resumed; pane, account, worker and shell preserved"); return
+                    try save("verified", "Exact saved \(name) session resumed; pane, account, worker and shell preserved"); return
                 }
                 try await Task.sleep(for: .seconds(1))
             }
@@ -139,7 +149,22 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
     static func sameRetainedShell(_ before: RelayPromptOwnerBinding, _ after: RelayPromptOwnerBinding) -> Bool {
         before.paneId == after.paneId && before.nodeBootId == after.nodeBootId && before.workerPid == after.workerPid && before.workerStart == after.workerStart && before.shellPid == after.shellPid && before.shellStart == after.shellStart
     }
+    /// The relayd plan for one provider. Claude resumes the expected session itself.
+    static func planArguments(pane: UUID, provider: String, expected: String, target: String) -> [String] {
+        provider == "claude" ? ["claude-pane-resume-plan", pane.uuidString.lowercased(), expected]
+            : ["codex-pane-resume-plan", pane.uuidString.lowercased(), expected, target]
+    }
+    /// The provider's graceful exit: Codex's Control-D, or Claude's fixed /exit
+    /// command submitted with Return (the only agent text that may carry one).
+    static func exitEdit(provider: String, instance: UUID, requestID: UUID, token: UUID) -> (RelayTerminalEditRequest, submit: Bool) {
+        if provider == "claude" {
+            return (.init(instance: instance, requestID: requestID, token: token, action: "insert_text",
+                          text: RelayAgentMaintenancePolicy.exitCommand(provider: "claude"), key: nil, modifiers: nil), true)
+        }
+        return (.init(instance: instance, requestID: requestID, token: token, action: "key", text: nil, key: "d", modifiers: ["control"]), false)
+    }
+    /// `before` is the admitted plan owner, whose provider equals the request's.
     static func verified(_ before: RelayPromptOwnerBinding, after: RelayPromptOwnerBinding, target: UUID) -> Bool {
-        sameRetainedShell(before, after) && after.provider == "codex" && after.inputOnly != true && after.sessionId == target.uuidString.lowercased() && (before.processId != after.processId || before.processStart != after.processStart)
+        sameRetainedShell(before, after) && ["codex", "claude"].contains(before.provider) && after.provider == before.provider && after.inputOnly != true && after.sessionId == target.uuidString.lowercased() && (before.processId != after.processId || before.processStart != after.processStart)
     }
 }
