@@ -190,10 +190,17 @@ cp "$relayd_version_check" "$app_path/Contents/MacOS/relayd"
 (
     cd "$project_root/remote/relayd"
     go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-mcp" ./cmd/relay-mcp
+    # Work threads start this frontend from the installed bundle, and relayd's
+    # Work origin proof names its path, so the bundle must always carry it.
+    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-work-mcp" ./cmd/relay-work-mcp
     go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-peer-link" ./cmd/relay-peer-link
     go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-connection" ./cmd/relay-connection
     go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-workspace" ./cmd/relay-workspace
 )
+if [[ ! -f "$app_path/Contents/MacOS/relay-work-mcp" || ! -x "$app_path/Contents/MacOS/relay-work-mcp" ]]; then
+    echo "relay-work-mcp was not built into the bundle" >&2
+    exit 1
+fi
 while IFS= read -r relay_helper; do
     [[ -n "$relay_helper" ]] || continue
     (cd "$project_root/remote/relayd" && go build -trimpath -ldflags="-s -w" \
