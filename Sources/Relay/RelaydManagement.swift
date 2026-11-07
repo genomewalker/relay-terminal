@@ -473,9 +473,12 @@ relay_check_destination() {
 for helper in relayd relay-mcp relay-peer-link \#(nativeHelperNames.joined(separator: " ")); do
     relay_check_destination "$payload_dir/$helper-linux-\#(architecture)"
 done
+# The app runs the peer helper from peer-network/; nothing else updates it.
+peer_dir="$relay_root/peer-network"
+mkdir -p "$peer_dir"
 for relay_destination in "$relay_root/relay-release.json" "$bin_dir/relayd" "$shim_dir/relay-native-tool" \
     "$payload_dir/relayd-communication" "$payload_dir/relayd-verified" \
-    "$payload_dir/relay-mcp-communication" "$payload_dir/relay-mcp" "$payload_dir/relay-peer-link"; do
+    "$payload_dir/relay-mcp-communication" "$payload_dir/relay-mcp" "$payload_dir/relay-peer-link" "$peer_dir/relay-peer-link"; do
     relay_check_destination "$relay_destination"
 done
 for helper in relayd relay-mcp relay-peer-link \#(nativeHelperNames.joined(separator: " ")); do
@@ -497,6 +500,10 @@ relay_publish_link "relayd-linux-\#(architecture)" "$payload_dir/relayd-verified
 relay_publish_link "relay-mcp-linux-\#(architecture)" "$payload_dir/relay-mcp-communication"
 relay_publish_link "relay-mcp-linux-\#(architecture)" "$payload_dir/relay-mcp"
 relay_publish_link "relay-peer-link-linux-\#(architecture)" "$payload_dir/relay-peer-link"
+if [ -f "$peer_dir/relay-peer-link" ] && [ ! -L "$peer_dir/relay-peer-link" ]; then
+    cp -p "$peer_dir/relay-peer-link" "$peer_dir/relay-peer-link.before-install"
+fi
+relay_publish_link "../bin/relay-peer-link-linux-\#(architecture)" "$peer_dir/relay-peer-link"
 # A shared home can be mounted by different CPU architectures. Administrative
 # commands select this node's payload at invocation, as the daemon launcher does.
 tool_launcher_temporary="$(mktemp "$shim_dir/.relay-native-tool.XXXXXX")"
