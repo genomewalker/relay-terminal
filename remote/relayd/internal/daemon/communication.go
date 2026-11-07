@@ -415,6 +415,9 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 			return communicationQualifiedGroupReceipt(communicationRoot(), currentCommunicationNodeID(), r)
 		}
 	}
+	if r.Operation == "route_desktop_link_reject" {
+		return communicationDesktopLinkReject(communicationRoot(), r)
+	}
 	if r.Operation == "route_desktop_link_list" {
 		if r.ClientToken != "" || r.ActorPaneID != "" {
 			return nil, errors.New("owner administration required")

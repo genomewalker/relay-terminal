@@ -53,7 +53,7 @@ func communicationAuthorize(root string, r CommunicationRequest) (string, error)
 	mutation = mutation || r.Operation == "route_identity_rotate"
 	mutation = mutation || r.Operation == "route_claude_session_set" || r.Operation == "route_claude_session_retire"
 	mutation = mutation || r.Operation == "route_link_set" || r.Operation == "route_link_retire" || r.Operation == "remote_receive" || r.Operation == "remote_send"
-	mutation = mutation || r.Operation == "desktop_link_request"
+	mutation = mutation || r.Operation == "desktop_link_request" || r.Operation == "route_desktop_link_approve" || r.Operation == "route_desktop_link_reject"
 	mutation = mutation || r.Operation == "assistant_send" || r.Operation == "question_bind" || r.Operation == "question_unbind" || r.Operation == "question_notices" || r.Operation == "question_notice_send" || r.Operation == "question_notice_ack"
 	if r.ActorPaneID != "" && (!validSessionID.MatchString(strings.ToLower(r.ActorPaneID)) ||
 		(mutation && !strings.EqualFold(r.SourcePaneID, r.ActorPaneID))) {

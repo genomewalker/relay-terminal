@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -156,4 +157,45 @@ func sendsTo(calls *claudeSessionCalls) int {
 		}
 	}
 	return count
+}
+
+// A rejected request is gone: it cannot be approved, and it is not listed.
+func TestDesktopLinkRequestRejectedIsGone(t *testing.T) {
+	a, _, _, _, _, hooks := replyFixture(t)
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
+	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	id := desktopLinkRequestID(desktopAlias, testGroupB)
+	if _, err := communicationDesktopLinkReject(a, CommunicationRequest{Operation: "route_desktop_link_reject", RequestID: id}); err != nil {
+		t.Fatal("reject", err)
+	}
+	if _, err := communicationDesktopLinkReject(a, CommunicationRequest{Operation: "route_desktop_link_reject", RequestID: id, ClientToken: remoteSenderToken}); err == nil {
+		t.Fatal("a client rejected a request")
+	}
+	if _, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", RequestID: id,
+		SourcePaneID: desktopAlias, PaneID: testGroupB}, hooks); err == nil {
+		t.Fatal("a rejected request was approved")
+	}
+	listing, _ := communicationDesktopLinkList(a, time.Now().UTC())
+	if len(listing["requests"].([]communicationDesktopLinkRequest)) != 0 {
+		t.Fatal("rejected request still listed")
+	}
+}
+
+// Peer discovery refuses by name when no reviewed link supplies the pane's pin.
+func TestDesktopLinkApprovalRefusesWithoutPeerPin(t *testing.T) {
+	a, _, _, _, _, hooks := replyFixture(t)
+	const unlinked = "00000000-0000-4000-8000-00000000f00d"
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: unlinked,
+		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
+	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve",
+		RequestID: desktopLinkRequestID(desktopAlias, unlinked), SourcePaneID: desktopAlias, PaneID: unlinked}, hooks)
+	if err == nil || !strings.Contains(err.Error(), "pair the pane once from its host first") {
+		t.Fatal("approval without a peer pin was not refused by name", err)
+	}
 }

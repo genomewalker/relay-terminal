@@ -179,3 +179,21 @@ func communicationDesktopLinkApprove(root, node string, r CommunicationRequest, 
 	result["desktop_request_id"] = request.ID
 	return result, nil
 }
+
+// communicationDesktopLinkReject removes a pending request, so it can never be
+// approved. Only the owner's authenticated route may reject.
+func communicationDesktopLinkReject(root string, r CommunicationRequest) (map[string]any, error) {
+	if r.ClientToken != "" || r.ActorPaneID != "" {
+		return nil, errors.New("owner administration required")
+	}
+	if !remoteDigest(r.RequestID) {
+		return nil, errors.New("no pending desktop link request")
+	}
+	if err := os.Remove(desktopLinkRequestPath(root, r.RequestID)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, errors.New("no pending desktop link request")
+		}
+		return nil, err
+	}
+	return map[string]any{"status": "rejected", "request_id": r.RequestID, "authority": "relayd"}, nil
+}
