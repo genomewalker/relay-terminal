@@ -186,6 +186,33 @@ extension RelayTerminalEditTests {
         #expect(agent.token == nil); #expect(agent.writer.count == 0); agent.close()
     }
 
+    /// Relay 0.5.18 held pane 5408bcd5: the retained box prompt had info rows
+    /// between its header and "╰─ ❯ ". The proof reads the live native screen.
+    @MainActor
+    @Test("A retained shell box prompt with info rows is provable only when empty", .timeLimit(.minutes(3)))
+    func retainedShellMultiRowBoxPromptIsProven() async throws {
+        let live = "╭─ SUN1028888 · ~/dev/term\r\ngit:main ~ ↑18\r\nenv:bioinfo\r\n╰─ ❯ "
+        let oneRow = "╭─ SUN1028888 · ~/dev/term git:main ~ ↑18 env:bioinfo\r\n╰─ ❯ "
+        let cases: [(String, String, Bool, Bool)] = [
+            ("live four-row prompt", live, false, true),
+            ("info on the header row", oneRow, false, true),
+            ("live prompt is not typed", live, true, false),
+            ("typed command", live + "codex resume x", false, false),
+            ("typed command, clearable", live + "codex resume x", true, true),
+            ("spaces typed", live + "   ", false, false),
+            ("spaces typed, clearable", live + "   ", true, true),
+            ("output below", live + "\r\noutput", false, false),
+            ("top row missing", "git:main ~ ↑18\r\nenv:bioinfo\r\n╰─ ❯ ", false, false),
+            ("seven info rows", "╭─ h · ~/w\r\n" + (1...7).map { "info \($0)" }.joined(separator: "\r\n") + "\r\n╰─ ❯ ", false, false),
+        ]
+        for (name, screen, typedProof, provable) in cases {
+            let observed = try await proof(screen: screen, owner: "shell", expected: "shell", admitTypedShell: typedProof)
+            #expect((observed.token != nil) == provable, "\(name)")
+            #expect(observed.writer.count == 0, "no input for: \(name)")
+            observed.close()
+        }
+    }
+
     @MainActor
     @Test("Return is appended to agent text only for Claude's exact exit command", .timeLimit(.minutes(2)))
     func returnIsAppendedOnlyToClaudesExitCommand() async throws {

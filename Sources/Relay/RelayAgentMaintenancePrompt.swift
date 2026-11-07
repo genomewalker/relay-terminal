@@ -238,24 +238,49 @@ enum RelayAgentMaintenancePrompt {
 
     enum RetainedShellPrompt { case empty, typed, unrecognized }
 
+    /// Info rows (git, env, ...) a box prompt may print between its header
+    /// and its closing row. A soft-wrapped header is one exported row.
+    static let maximumRetainedShellInfoRows = 6
+
     static func retainedShellPrompt(_ vt: String?) -> RetainedShellPrompt {
-        guard let vt, vt.utf8.count <= maximumScreenBytes, let parsed = parse(vt) else { return .unrecognized }
+        guard let vt, vt.utf8.count <= maximumScreenBytes, var rows = parse(vt) else { return .unrecognized }
         func blank(_ cell: Cell) -> Bool { CharacterSet.whitespaces.contains(cell.character) }
         func box(_ scalar: Unicode.Scalar) -> Bool { (0x2500...0x257F).contains(scalar.value) }
-        let rows = parsed.filter { !$0.allSatisfy(blank) }
+        func text(_ row: [Cell]) -> String {
+            String(String.UnicodeScalarView(row.map(\.character))).trimmingCharacters(in: .whitespaces)
+        }
+        // Only the unused grid below the prompt is ignored; the box itself
+        // must be contiguous, so a blank row inside it is not this prompt.
+        while let row = rows.last, row.allSatisfy(blank) { rows.removeLast() }
         guard rows.count >= 2, let last = rows.last else { return .unrecognized }
-        // The box-drawing prompt family: a header row opening the box, then a
+        // The box-drawing prompt family: a header row opening the box, at
+        // most `maximumRetainedShellInfoRows` non-blank info rows, then a
         // closing row of box-drawing characters and one ❯, $ or % marker.
-        // Anything after the marker must be blank or the faint suggestion
-        // style; any other character is typed input, so it is not empty.
         let cells = Array(last.drop(while: blank))
-        let header = String(String.UnicodeScalarView(rows[rows.count - 2].map(\.character))).trimmingCharacters(in: .whitespaces)
         guard let first = cells.first, ["╰", "└", "╚", "┗"].contains(first.character),
               let marker = cells.firstIndex(where: { ["❯", "$", "%"].contains($0.character) }),
-              cells[..<marker].allSatisfy({ blank($0) || box($0.character) }),
-              let opening = header.unicodeScalars.first, ["╭", "┌", "╔", "┏"].contains(opening),
-              header.contains(" · ") else { return .unrecognized }
-        return cells[(marker + 1)...].allSatisfy({ blank($0) || $0.faint }) ? .empty : .typed
+              cells[..<marker].allSatisfy({ blank($0) || box($0.character) }) else { return .unrecognized }
+        var index = rows.count - 2, info = 0
+        while true {
+            let row = text(rows[index])
+            guard let opening = row.unicodeScalars.first else { return .unrecognized }
+            if ["╭", "┌", "╔", "┏"].contains(opening) {
+                guard row.contains(" · ") else { return .unrecognized }
+                break
+            }
+            // An info row is plain text: never another box row or prompt.
+            guard !box(opening), !row.contains("❯"), info < maximumRetainedShellInfoRows, index > 0 else { return .unrecognized }
+            info += 1; index -= 1
+        }
+        // The prompt prints one separator after its marker; the export keeps
+        // written cells, so any further blank was typed (as for Codex, a
+        // draft of spaces is not empty). Beyond the separator only the faint
+        // suggestion style is empty; any other character is typed input.
+        let after = cells[(marker + 1)...]
+        guard let separator = after.first else { return .empty }
+        guard blank(separator) else { return .typed }
+        let rest = after.dropFirst()
+        return rest.isEmpty || rest.allSatisfy(\.faint) && !rest.allSatisfy(blank) ? .empty : .typed
     }
 
     private static func parse(_ vt: String) -> [[Cell]]? {
