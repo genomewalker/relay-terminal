@@ -6,12 +6,14 @@ import (
 )
 
 // Owner administration is reachable by any same-user process that can run the
-// relayd helper or reach the daemon socket, so the boundary is the caller's
-// process ancestry, not the request's fields. An owner operation is refused when
-// its caller is, or descends from, an agent process: a pane's agent, a Claude
-// desktop session, or any other recognized agent. The Relay application is not
-// an agent, so the owner's own requests pass. Other same-user programs that are
-// not agents can still act as the owner; that is the real boundary.
+// relayd helper or reach the daemon socket. This gate is defense in depth, not a
+// boundary. An owner operation is refused when its caller is, or descends from,
+// an agent process: a pane's agent, a Claude desktop session, or any other
+// recognized agent. The Relay application is not an agent, so the owner's own
+// requests pass. An agent can still reach owner operations through a non-agent
+// process it starts outside its ancestry: a double fork or nohup reparented to
+// init, tmux or screen, launchctl or at, or `ssh <host> relayd communication`,
+// whose ancestry is sshd. Other same-user programs can act as the owner too.
 
 // communicationAgentAncestor reports the agent kind of one process. A variable so
 // tests can name their own agent processes.
