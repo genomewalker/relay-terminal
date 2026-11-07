@@ -60,6 +60,7 @@ func newNativeGroupFixture(t *testing.T, count int) *nativeGroupFixture {
 	f.service = newNativeGroupService(context.Background(), home)
 	f.service.processStart = func(int64) string { return "123" }
 	f.service.permission = func(int, string) string { return "prompting" }
+	f.service.sessions = func(int) (string, error) { return filepath.Join(home, ".claude/sessions"), nil }
 	for i := 0; i < count; i++ {
 		f.addMember(i)
 	}
@@ -539,5 +540,16 @@ func TestNativeGroupOriginalPlanSizeBound(t *testing.T) {
 	}
 	if _, e := decodeNativeGroupPlan(append(at, ' ')); e == nil {
 		t.Fatal("original 65536-byte plan limit exceeded")
+	}
+}
+
+// The default registry lookup is the member's exact process account; a pid
+// whose account cannot be read is refused before any record is trusted.
+func TestNativeGroupRefusesMemberWithoutReadableAccount(t *testing.T) {
+	f := newNativeGroupFixture(t, 2)
+	f.service.sessions = nativeClaudeSessionsDirectory
+	err := nativeGroupAttempt(func() { f.service.resolve(f.members[0]) })
+	if !nativeGroupExpectedException(err, phValueError, false) || !strings.Contains(err.Error(), "Session account unavailable") {
+		t.Fatal("member without a readable account resolved", err)
 	}
 }

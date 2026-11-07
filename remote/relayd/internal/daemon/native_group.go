@@ -137,12 +137,15 @@ type nativeGroupService struct {
 	home         string
 	uid          int
 	processStart func(int64) string
-	permission   func(int, string) string
-	send         func(string, []byte) error
+	// sessions is the exact process's account session registry; tests replace it.
+	sessions   func(int) (string, error)
+	permission func(int, string) string
+	send       func(string, []byte) error
 }
 
 func newNativeGroupService(ctx context.Context, home string) *nativeGroupService {
 	s := &nativeGroupService{ctx: ctx, home: home, uid: os.Getuid()}
+	s.sessions = nativeClaudeSessionsDirectory
 	reader := newPHReader(ctx)
 	s.processStart = func(pid int64) string {
 		identity := reader.identity(pid)
@@ -204,7 +207,7 @@ func (s *nativeGroupService) private(path string) *pyObject {
 }
 func (s *nativeGroupService) resolve(member *pyObject) (*pyObject, string) {
 	pid := phPyInt(member.Get("pid"))
-	directory, err := nativeClaudeSessionsDirectory(int(pid))
+	directory, err := s.sessions(int(pid))
 	if err != nil {
 		phRaise(phValueError, "Session account unavailable")
 	}
