@@ -59,7 +59,7 @@ func TestDesktopLinkRequestIsPendingUntilApproved(t *testing.T) {
 	// The approval is the owner's, and it must name exactly the requested pair.
 	other := proposed
 	other.PeerPaneID = desktopAlias
-	if _, err := communicationDesktopLinkApprove(root, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", RequestID: desktopLinkRequestID(desktopAlias, testGroupB), RemoteLink: &other}, hooks); err == nil {
+	if _, err := communicationDesktopLinkApprove(root, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"}, RequestID: desktopLinkRequestID(desktopAlias, testGroupB), RemoteLink: &other}, hooks); err == nil {
 		t.Fatal("an approval for another pair was accepted")
 	}
 	if desktopLinksIn(root) != 0 {
@@ -67,15 +67,15 @@ func TestDesktopLinkRequestIsPendingUntilApproved(t *testing.T) {
 	}
 	// An approval that names a different pane than the request is refused, even
 	// though the request itself is pending.
-	if _, err := communicationDesktopLinkApprove(root, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve",
+	if _, err := communicationDesktopLinkApprove(root, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"},
 		RequestID: desktopLinkRequestID(desktopAlias, testGroupB), SourcePaneID: desktopAlias, PaneID: "00000000-0000-4000-8000-00000000f00d"}, hooks); err == nil {
 		t.Fatal("an approval naming another pane was accepted")
 	}
-	if _, err := communicationDesktopLinkApprove(root, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", ClientToken: remoteSenderToken,
+	if _, err := communicationDesktopLinkApprove(root, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"}, ClientToken: remoteSenderToken,
 		RequestID: desktopLinkRequestID(desktopAlias, testGroupB), SourcePaneID: desktopAlias, PaneID: testGroupB, RemoteLink: &proposed}, hooks); err == nil {
 		t.Fatal("a client approved its own request")
 	}
-	result, err := communicationDesktopLinkApprove(root, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve",
+	result, err := communicationDesktopLinkApprove(root, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"},
 		RequestID: desktopLinkRequestID(desktopAlias, testGroupB), SourcePaneID: desktopAlias, PaneID: testGroupB, RemoteLink: &proposed}, hooks)
 	if err != nil {
 		t.Fatal("owner approval", err)

@@ -63,6 +63,9 @@ func communicationDesktopLinkRequestOp(root string, r CommunicationRequest, now 
 		if _, err := communicationAuthorize(root, r); err != nil {
 			return err
 		}
+		if err := pruneDesktopLinkRequests(root, now); err != nil {
+			return err
+		}
 		return communicationAtomic(desktopLinkRequestPath(root, request.ID), request)
 	})
 	if err != nil {
@@ -92,21 +95,38 @@ func readDesktopLinkRequest(root, id string, now time.Time) (communicationDeskto
 	return request, nil
 }
 
+// desktopLinkListing is one pending request as the owner sees it: the request
+// and the callers the saved pair would admit. Refusal names why it cannot be
+// approved yet, and nothing is guessed.
+type desktopLinkListing struct {
+	communicationDesktopLinkRequest
+	ProposedCallers []string `json:"proposed_callers"`
+	Refusal         string   `json:"refusal,omitempty"`
+}
+
 // communicationDesktopLinkList returns the owner's pending, unexpired requests.
-func communicationDesktopLinkList(root string, now time.Time) (map[string]any, error) {
+func communicationDesktopLinkList(root, node string, now time.Time) (map[string]any, error) {
 	paths, err := filepath.Glob(filepath.Join(root, "desktop-link-request-*.json"))
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(paths)
-	requests := []communicationDesktopLinkRequest{}
+	listing := []desktopLinkListing{}
 	for _, path := range paths {
 		id := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), "desktop-link-request-"), ".json")
-		if request, err := readDesktopLinkRequest(root, id, now); err == nil {
-			requests = append(requests, request)
+		request, err := readDesktopLinkRequest(root, id, now)
+		if err != nil {
+			continue
 		}
+		item := desktopLinkListing{communicationDesktopLinkRequest: request, ProposedCallers: []string{}}
+		if peer, err := communicationDesktopLinkPeer(root, node, request); err != nil {
+			item.Refusal = err.Error()
+		} else {
+			item.ProposedCallers = append(item.ProposedCallers, peer.AllowedPeerCallers...)
+		}
+		listing = append(listing, item)
 	}
-	return map[string]any{"requests": requests, "authority": "relayd", "desktop_required": false}, nil
+	return map[string]any{"requests": listing, "authority": "relayd", "desktop_required": false}, nil
 }
 
 // communicationDesktopLinkPeer takes the route, certificate, peer revision and
@@ -157,8 +177,12 @@ func communicationDesktopLinkApprove(root, node string, r CommunicationRequest, 
 	if err != nil {
 		return nil, err
 	}
+	if r.AllowedCallers == nil || !sameCallerSet(r.AllowedCallers, peer.AllowedPeerCallers) {
+		return nil, errors.New("approve the exact callers the pair would admit: "+strings.Join(peer.AllowedPeerCallers, ", "))
+	}
 	link := peer
 	link.Version = 1
+	link.AllowedPeerCallers = append([]string(nil), r.AllowedCallers...)
 	link.NodeID, link.LocalPaneID, link.PeerPaneID = node, request.SessionID, request.PaneID
 	link.LocalConversation = communicationPinnedConversation{Provider: "claude", SessionID: request.SessionID}
 	link.DesktopAccountRoot = request.AccountRoot
@@ -196,4 +220,40 @@ func communicationDesktopLinkReject(root string, r CommunicationRequest) (map[st
 		return nil, err
 	}
 	return map[string]any{"status": "rejected", "request_id": r.RequestID, "authority": "relayd"}, nil
+}
+
+// pruneDesktopLinkRequests removes every expired request file. It runs at write
+// time, so expired requests never accumulate, and reads still refuse them.
+func pruneDesktopLinkRequests(root string, now time.Time) error {
+	paths, err := filepath.Glob(filepath.Join(root, "desktop-link-request-*.json"))
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		var request communicationDesktopLinkRequest
+		if communicationRead(path, &request) != nil || !now.Before(request.ExpiresAt) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// sameCallerSet reports whether two caller lists name the same callers, in any order.
+func sameCallerSet(a, b []string) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+	seen := map[string]int{}
+	for _, value := range a {
+		seen[value]++
+	}
+	for _, value := range b {
+		if seen[value] == 0 {
+			return false
+		}
+		seen[value]--
+	}
+	return true
 }

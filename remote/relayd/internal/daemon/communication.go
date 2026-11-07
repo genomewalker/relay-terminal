@@ -58,6 +58,7 @@ type CommunicationRequest struct {
 	Cursor                     int64                      `json:"cursor,omitempty"`
 	LinkID                     string                     `json:"link_id,omitempty"`
 	RequestID                  string                     `json:"request_id,omitempty"`
+	AllowedCallers             []string                   `json:"allowed_callers,omitempty"`
 	AttestationID              string                     `json:"attestation_id,omitempty"`
 	SourceSignature            string                     `json:"source_signature,omitempty"`
 	WorkEnvelope               string                     `json:"work_envelope,omitempty"`
@@ -422,7 +423,7 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if r.ClientToken != "" || r.ActorPaneID != "" {
 			return nil, errors.New("owner administration required")
 		}
-		return communicationDesktopLinkList(communicationRoot(), desktopLinkNow())
+		return communicationDesktopLinkList(communicationRoot(), currentCommunicationNodeID(), desktopLinkNow())
 	}
 	if r.Operation == "desktop_link_request" || r.Operation == "route_desktop_link_approve" {
 		if r.Operation == "desktop_link_request" {

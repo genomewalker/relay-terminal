@@ -3,6 +3,7 @@ package daemon
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -34,7 +35,7 @@ func replyFixture(t *testing.T) (a, b, account string, approved CommunicationRem
 	if _, err := communicationDesktopLinkRequestOp(fixtureA, request, desktopLinkNow()); err != nil {
 		t.Fatal("request", err)
 	}
-	result, err := communicationDesktopLinkApprove(fixtureA, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve",
+	result, err := communicationDesktopLinkApprove(fixtureA, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"},
 		RequestID: desktopLinkRequestID(desktopAlias, testGroupB), SourcePaneID: desktopAlias, PaneID: testGroupB}, hooks)
 	if err != nil {
 		t.Fatal("approve", err)
@@ -129,19 +130,19 @@ func TestDesktopLinkRequestExpires(t *testing.T) {
 	if _, err := communicationDesktopLinkRequestOp(a, request, start); err != nil {
 		t.Fatal(err)
 	}
-	listing, err := communicationDesktopLinkList(a, start.Add(time.Minute))
-	if err != nil || len(listing["requests"].([]communicationDesktopLinkRequest)) != 1 {
+	listing, err := communicationDesktopLinkList(a, "node-a", start.Add(time.Minute))
+	if err != nil || len(listing["requests"].([]desktopLinkListing)) != 1 {
 		t.Fatal("pending request not listed", listing, err)
 	}
 	late := start.Add(desktopLinkRequestTTL + time.Second)
 	original := desktopLinkNow
 	desktopLinkNow = func() time.Time { return late }
 	defer func() { desktopLinkNow = original }()
-	listing, err = communicationDesktopLinkList(a, late)
-	if err != nil || len(listing["requests"].([]communicationDesktopLinkRequest)) != 0 {
+	listing, err = communicationDesktopLinkList(a, "node-a", late)
+	if err != nil || len(listing["requests"].([]desktopLinkListing)) != 0 {
 		t.Fatal("expired request listed", listing, err)
 	}
-	if _, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve",
+	if _, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"},
 		RequestID: desktopLinkRequestID(desktopAlias, testGroupB), SourcePaneID: desktopAlias, PaneID: testGroupB}, hooks); err == nil {
 		t.Fatal("an expired request was approved")
 	}
@@ -174,12 +175,12 @@ func TestDesktopLinkRequestRejectedIsGone(t *testing.T) {
 	if _, err := communicationDesktopLinkReject(a, CommunicationRequest{Operation: "route_desktop_link_reject", RequestID: id, ClientToken: remoteSenderToken}); err == nil {
 		t.Fatal("a client rejected a request")
 	}
-	if _, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", RequestID: id,
+	if _, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"}, RequestID: id,
 		SourcePaneID: desktopAlias, PaneID: testGroupB}, hooks); err == nil {
 		t.Fatal("a rejected request was approved")
 	}
-	listing, _ := communicationDesktopLinkList(a, time.Now().UTC())
-	if len(listing["requests"].([]communicationDesktopLinkRequest)) != 0 {
+	listing, _ := communicationDesktopLinkList(a, "node-a", time.Now().UTC())
+	if len(listing["requests"].([]desktopLinkListing)) != 0 {
 		t.Fatal("rejected request still listed")
 	}
 }
@@ -193,9 +194,56 @@ func TestDesktopLinkApprovalRefusesWithoutPeerPin(t *testing.T) {
 	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	_, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve",
+	_, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"},
 		RequestID: desktopLinkRequestID(desktopAlias, unlinked), SourcePaneID: desktopAlias, PaneID: unlinked}, hooks)
 	if err == nil || !strings.Contains(err.Error(), "pair the pane once from its host first") {
 		t.Fatal("approval without a peer pin was not refused by name", err)
+	}
+}
+
+// Expired requests are pruned when a new request is written, not only on read.
+func TestDesktopLinkRequestPrunesExpiredAtWrite(t *testing.T) {
+	a, _, _, _, _, _ := replyFixture(t)
+	start := time.Now().UTC()
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
+	if _, err := communicationDesktopLinkRequestOp(a, request, start); err != nil {
+		t.Fatal(err)
+	}
+	stale := desktopLinkRequestPath(a, desktopLinkRequestID(desktopAlias, testGroupB))
+	// A second, later request for another pane: the first has expired by then.
+	later := start.Add(desktopLinkRequestTTL + time.Minute)
+	const other = "00000000-0000-4000-8000-00000000f00d"
+	request.PaneID = other
+	if _, err := communicationDesktopLinkRequestOp(a, request, later); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("expired request file kept after a new write")
+	}
+}
+
+// The callers a link admits are approved explicitly: an approval without them,
+// or with a different set, is refused; the listing shows the set it would admit.
+func TestDesktopLinkApprovalNeedsTheExactCallers(t *testing.T) {
+	a, _, _, _, _, hooks := replyFixture(t)
+	id := desktopLinkRequestID(desktopAlias, testGroupB)
+	request := CommunicationRequest{Operation: "desktop_link_request", SourcePaneID: desktopAlias, PaneID: testGroupB,
+		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
+	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	listing, _ := communicationDesktopLinkList(a, "node-a", time.Now().UTC())
+	item := listing["requests"].([]desktopLinkListing)[0]
+	if len(item.ProposedCallers) != 1 || item.ProposedCallers[0] != "receiver" {
+		t.Fatal("listing does not show the callers the pair would admit", item)
+	}
+	base := CommunicationRequest{Operation: "route_desktop_link_approve", RequestID: id, SourcePaneID: desktopAlias, PaneID: testGroupB}
+	for _, callers := range [][]string{nil, {"sender"}, {"receiver", "other"}} {
+		attempt := base
+		attempt.AllowedCallers = callers
+		if _, err := communicationDesktopLinkApprove(a, "node-a", attempt, hooks); err == nil {
+			t.Fatal("approval with unreviewed callers accepted", callers)
+		}
 	}
 }
