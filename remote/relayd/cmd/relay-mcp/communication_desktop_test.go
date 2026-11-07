@@ -238,3 +238,41 @@ func TestDesktopSessionLinkReportsLinked(t *testing.T) {
 		t.Fatal("a linked pair was reported as awaiting approval", string(data))
 	}
 }
+
+// A desktop session polls its own request by request_id; the daemon gets the
+// proven session, never a claimed one, and a malformed ID or another caller is refused.
+func TestDesktopSessionLinkStatusPoll(t *testing.T) {
+	id := strings.Repeat("f9", 32)
+	s, wire := desktopHelper(t, desktopSession, desktopSessionSource)
+	if _, handled := s.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"request_id": id})); !handled {
+		t.Fatal("not handled")
+	}
+	packet := wirePacket(t, wire)
+	if packet["operation"] != "desktop_link_status" || packet["actor_pane_id"] != desktopSession || packet["source_pane_id"] != desktopSession || packet["request_id"] != id {
+		t.Fatal("status poll not dispatched", packet)
+	}
+	for _, args := range []map[string]string{
+		{"request_id": strings.ToUpper(id)},
+		{"request_id": "f998b5d1"},
+		{"request_id": id, "source_pane_id": otherSession},
+		{"request_id": id, "pane_id": targetPane},
+	} {
+		s, wire := desktopHelper(t, desktopSession, desktopSessionSource)
+		value, _ := s.daemonCommunication("relay_link_panes", rawArgs(args))
+		if _, err := os.Stat(wire); !os.IsNotExist(err) {
+			t.Fatal("a refused poll reached the daemon", args)
+		}
+		if data, _ := json.Marshal(value); !strings.Contains(string(data), `"isError":true`) {
+			t.Fatal("not refused", args, string(data))
+		}
+	}
+	pane := "800c06ef-203f-4401-bf7a-c67b15985f33"
+	s2, wire2 := desktopHelper(t, pane, "native_parked_job_kernel_owner")
+	value, _ := s2.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"request_id": id}))
+	if _, err := os.Stat(wire2); !os.IsNotExist(err) {
+		t.Fatal("a pane read a desktop request")
+	}
+	if data, _ := json.Marshal(value); !strings.Contains(string(data), "read only by the verified Claude desktop session") {
+		t.Fatal(string(data))
+	}
+}

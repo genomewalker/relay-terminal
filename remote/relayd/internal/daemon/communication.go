@@ -435,6 +435,9 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		return communicationDesktopNativeReceive(communicationRoot(), currentCommunicationNodeID(), r,
 			communicationGroupNative{observe: communicationObserve, send: communicationNative})
 	}
+	if r.Operation == "desktop_link_status" {
+		return communicationDesktopLinkStatus(communicationRoot(), currentCommunicationNodeID(), r, desktopLinkNow())
+	}
 	if r.Operation == "route_desktop_link_reject" {
 		return communicationDesktopLinkReject(communicationRoot(), r)
 	}

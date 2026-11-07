@@ -107,10 +107,13 @@ func (s *server) desktopSessionLink(actor string, arguments map[string]json.RawM
 	var source, pane, peerNode string
 	for key := range arguments {
 		switch key {
-		case "source_pane_id", "pane_id", "peer_node_id":
+		case "source_pane_id", "pane_id", "peer_node_id", "request_id":
 		default:
 			return fail("Unexpected argument for a Claude desktop session link: " + key + ". Nothing was requested.")
 		}
+	}
+	if raw, present := arguments["request_id"]; present {
+		return s.desktopSessionLinkStatus(actor, arguments, raw)
 	}
 	for key, target := range map[string]*string{"source_pane_id": &source, "pane_id": &pane, "peer_node_id": &peerNode} {
 		raw, present := arguments[key]
@@ -158,6 +161,54 @@ func (s *server) desktopSessionLink(actor string, arguments map[string]json.RawM
 		text = out.String() + "\nThe owner must approve this link in Relay on the Mac before any message can be sent. " + desktopLinkPollNote + " " + desktopSessionNote
 	}
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": false}, true
+}
+
+// desktopRequestIDPattern is a desktop link request ID: 64 lowercase hex.
+var desktopRequestIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// desktopSessionLinkStatus reads the outcome of this session's own link
+// request. The daemon answers only the verified session that made it.
+func (s *server) desktopSessionLinkStatus(actor string, arguments map[string]json.RawMessage, raw json.RawMessage) (any, bool) {
+	fail := func(text string) (any, bool) {
+		return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": true}, true
+	}
+	var id, source string
+	if json.Unmarshal(raw, &id) != nil || !desktopRequestIDPattern.MatchString(id) {
+		return fail("request_id must be 64 lowercase hex characters, as relay_link_panes returned it. Nothing was read.")
+	}
+	for key, value := range arguments {
+		switch key {
+		case "request_id":
+		case "source_pane_id":
+			if json.Unmarshal(value, &source) != nil || !strings.EqualFold(source, actor) {
+				return fail("Sender must be this Claude desktop session. Nothing was read.")
+			}
+		default:
+			return fail("request_id reads a request's outcome; pass it alone. Nothing was read.")
+		}
+	}
+	if s.callerToken == "" {
+		return fail("Reading a desktop link request needs a registered caller credential. Nothing was read.")
+	}
+	packet := map[string]any{"operation": "desktop_link_status", "source_pane_id": strings.ToLower(actor), "actor_pane_id": strings.ToLower(actor),
+		"request_id": id, "client_token": s.callerToken}
+	encoded, err := json.Marshal(packet)
+	if err != nil {
+		return fail("Request encoding failed. Nothing was read.")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, s.daemonHelper, "communication")
+	cmd.Stdin = bytes.NewReader(encoded)
+	var out, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil {
+		return fail(fmt.Sprintf("Daemon communication unavailable: %s. Nothing was read.", strings.TrimSpace(stderr.String())))
+	}
+	if out.Len() > 128<<10 || !json.Valid(out.Bytes()) {
+		return fail("Invalid daemon communication response")
+	}
+	return map[string]any{"content": []map[string]any{{"type": "text", "text": out.String()}}, "isError": false}, true
 }
 
 // desktopSessionInbox returns the replies delivered to this verified desktop

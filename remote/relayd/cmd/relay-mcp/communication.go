@@ -127,6 +127,9 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	if actorErr == nil && actorSource == desktopSessionSource && operation == "link" {
 		return s.desktopSessionLink(actor, arguments, targeted)
 	}
+	if _, polled := arguments["request_id"]; polled && operation == "link" {
+		return map[string]any{"content": []map[string]any{{"type": "text", "text": "request_id is read only by the verified Claude desktop session that made the request. Nothing was read."}}, "isError": true}, true
+	}
 	if actorErr != nil {
 		actor = ""
 		if os.Getenv("RELAY_SESSION") != "" {

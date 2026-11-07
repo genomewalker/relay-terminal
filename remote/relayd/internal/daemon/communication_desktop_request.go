@@ -82,6 +82,9 @@ func communicationDesktopLinkRequestOp(root, node string, r CommunicationRequest
 			}
 			return nil
 		}
+		if err := clearDesktopLinkRejection(root, request.ID); err != nil {
+			return err
+		}
 		return communicationAtomic(desktopLinkRequestPath(root, request.ID), request)
 	})
 	if err != nil {
@@ -283,11 +286,19 @@ func communicationDesktopLinkReject(root string, r CommunicationRequest) (map[st
 	if !remoteDigest(r.RequestID) {
 		return nil, errors.New("no pending desktop link request")
 	}
+	var request communicationDesktopLinkRequest
+	readErr := communicationRead(desktopLinkRequestPath(root, r.RequestID), &request)
 	if err := os.Remove(desktopLinkRequestPath(root, r.RequestID)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, errors.New("no pending desktop link request")
 		}
 		return nil, err
+	}
+	// The session may poll its request; it then reads rejected, not an absence.
+	if readErr == nil && request.ID == r.RequestID && nativeClaudeSessionID.MatchString(request.SessionID) {
+		if err := recordDesktopLinkRejection(root, request, desktopLinkNow()); err != nil {
+			return nil, err
+		}
 	}
 	return map[string]any{"status": "rejected", "request_id": r.RequestID, "authority": "relayd"}, nil
 }
@@ -302,6 +313,18 @@ func pruneDesktopLinkRequests(root string, now time.Time) error {
 	for _, path := range paths {
 		var request communicationDesktopLinkRequest
 		if communicationRead(path, &request) != nil || !now.Before(request.ExpiresAt) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	rejections, err := filepath.Glob(filepath.Join(root, "desktop-link-rejected-*.json"))
+	if err != nil {
+		return err
+	}
+	for _, path := range rejections {
+		var rejection desktopLinkRejection
+		if communicationRead(path, &rejection) != nil || !now.Before(rejection.ExpiresAt) {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
