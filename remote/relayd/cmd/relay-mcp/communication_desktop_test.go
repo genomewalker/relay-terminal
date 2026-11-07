@@ -119,3 +119,27 @@ func TestDesktopSessionLinkRequestIsOnlyARequest(t *testing.T) {
 		t.Fatal("a claimed source made a request")
 	}
 }
+
+// A pane's reply to a desktop session is the pane's own send: the daemon finds
+// the pinned pair and routes it. The pane is the verified sender, and no link
+// ID or sender identity is taken from the arguments.
+func TestPaneReplyToDesktopSessionIsAPaneSend(t *testing.T) {
+	pane := "800c06ef-203f-4401-bf7a-c67b15985f33"
+	s, wire := desktopHelper(t, pane, "native_parked_job_kernel_owner")
+	value, handled := s.daemonCommunication("relay_message_pane", rawArgs(map[string]string{"pane_id": desktopSession,
+		"message_id": "c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3", "text": "reply to the desktop"}))
+	if !handled {
+		t.Fatal("not handled")
+	}
+	packet := wirePacket(t, wire)
+	if packet["operation"] != "send" || packet["actor_pane_id"] != pane || packet["pane_id"] != desktopSession || packet["client_token"] != "fixture-caller" {
+		t.Fatal("pane reply not sent as the pane's own send", packet)
+	}
+	if _, has := packet["link_id"]; has {
+		t.Fatal("a link ID was supplied by the caller", packet)
+	}
+	data, _ := json.Marshal(value)
+	if strings.Contains(string(data), "\"isError\":true") {
+		t.Fatal("the pane reply was refused", string(data))
+	}
+}
