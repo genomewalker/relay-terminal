@@ -174,12 +174,34 @@ func parseEvent(raw []byte) (routeEvent, error) {
 		if !messageID.MatchString(e.ID) || !identifier.MatchString(e.Sender) {
 			return e, errors.New("invalid message event")
 		}
-	case "heartbeat", "identity_missing", "identity_changed", "identity_replacement", "owner_account", "transport_status", "rejected":
+	case "heartbeat", "identity_missing", "identity_changed", "identity_replacement", "transport_status", "rejected":
 	default:
 		return e, errors.New("unknown route event")
 	}
 	return e, nil
 }
+
+// readyAccount takes the owner account a remote reports on its ready frame. The
+// frame comes from the listener of the exact owner incarnation the route names,
+// so it is matched to that identity. known reports that this remote sends the
+// account at all, which makes it safe to send the recorded account back.
+func readyAccount(c Config, path string, event routeEvent) (Config, bool, error) {
+	if event.Account == "" {
+		return c, false, nil
+	}
+	updated, e := backfillOwnerAccount(c, path, routeEvent{Type: "ready", PID: c.RemotePID, Start: c.RemoteStart, Account: event.Account})
+	return updated, true, e
+}
+
+// listenConfig is the route as a listen argument. The recorded account is sent
+// only to a remote known to accept it: an older remote refuses the extra argument.
+func listenConfig(c Config, known bool) Config {
+	if !known {
+		c.RemoteAccount = ""
+	}
+	return c
+}
+
 func reconnectDelay(attempt int) time.Duration {
 	return time.Duration(min(1<<min(max(attempt, 0), 5), 30)) * time.Second
 }
@@ -209,13 +231,17 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 	}()
 	seen := map[string]bool{}
 	attempt := 0
+	// remoteAccountKnown: the remote's ready frame has carried its owner account,
+	// so it is new enough to take the recorded account as a listen argument.
+	remoteAccountKnown := false
 	for ctx.Err() == nil {
 		state.State = "connecting"
 		state.Attempt = attempt
 		if e = publish(); e != nil {
 			return e
 		}
-		args := r.remoteArgs(c, "listen", nil)
+		args := r.remoteArgs(listenConfig(c, remoteAccountKnown), "listen", nil)
+		readySeen := false
 		checkpoint, e := openCheckpoint(filepath.Join(r.home, ".local/state/relay/host-adapters"), c.Host, args)
 		if e != nil {
 			return e
@@ -238,16 +264,6 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 				return errIdentity
 			case "identity_missing":
 				return errors.New("remote session absent; waiting for same session")
-			case "owner_account":
-				updated, e := backfillOwnerAccount(c, path, event)
-				if e != nil {
-					return e
-				}
-				if updated != c {
-					// The recorded account is a new listener argument: restart the listener.
-					c = updated
-					return errRecovered
-				}
 			case "identity_replacement":
 				updated, e := adoptConfig(c, path, event)
 				if e != nil {
@@ -268,6 +284,13 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 					if event.Name != c.LocalName || !validStart(c.Host, event.Start) {
 						return errors.New("reply mailbox identity changed")
 					}
+					updated, known, e := readyAccount(c, path, event)
+					if e != nil {
+						return e
+					}
+					c = updated
+					remoteAccountKnown = remoteAccountKnown || known
+					readySeen = true
 					state.Mailbox = &Mailbox{PID: event.PID, Start: event.Start, Name: event.Name, Drain: event.Drain}
 					state.State = "online"
 					state.Error = ""
@@ -316,6 +339,12 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 			return publish()
 		}
 		e = listenHost(ctx, transport, checkpoint, listenerSpec(args), handle)
+		// Without a ready frame in this attempt the remote has not confirmed the
+		// recorded account (an older remote refuses the extra argument), so it is
+		// sent again only after a ready frame carries it.
+		if !readySeen {
+			remoteAccountKnown = false
+		}
 		// Cancellation is explicit route shutdown; communication errors detach and
 		// preserve the durable host listener for an exact-ID status reconnection.
 		if ctx.Err() != nil || errors.Is(e, errIdentity) || errors.Is(e, errRecovered) {

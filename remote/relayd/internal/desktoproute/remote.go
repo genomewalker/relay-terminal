@@ -286,12 +286,7 @@ func (r *remoteRuntime) listen(ctx context.Context, registry string, target peer
 		return e
 	}
 	defer os.Remove(recordPath)
-	if e = emit(out, Mailbox{Type: "ready", PID: ownPID, Start: own.Start, Name: name, Peer: target.Name, Drain: 1}); e != nil {
-		return e
-	}
-	// After the ready frame, which the supervisor requires first: the live owner's
-	// account, for the route to record when it has none.
-	if e = emit(out, map[string]any{"type": "owner_account", "pid": target.PID, "start": target.Start, "account": filepath.Dir(registry)}); e != nil {
+	if e = emit(out, map[string]any{"type": "ready", "pid": ownPID, "start": own.Start, "name": name, "peer": target.Name, "drain": 1, "account": filepath.Dir(registry)}); e != nil {
 		return e
 	}
 	last := time.Time{}

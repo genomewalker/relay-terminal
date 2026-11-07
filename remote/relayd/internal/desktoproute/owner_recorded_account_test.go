@@ -73,19 +73,22 @@ func TestOwnerAccountBackfilledFromLiveOwner(t *testing.T) {
 	var event routeEvent
 	found := false
 	for _, line := range bytes.Split(out.Bytes(), []byte("\n")) {
-		if parsed, e := parseEvent(line); e == nil && parsed.Type == "owner_account" {
+		if parsed, e := parseEvent(line); e == nil && parsed.Type == "ready" && parsed.Account != "" {
 			event, found = parsed, true
 		}
 	}
-	if !found || event.Account != acct || event.PID != 123 || event.Start != testOwnerStart {
-		t.Fatalf("no account backfill event: %s", out.String())
+	if !found || event.Account != acct {
+		t.Fatalf("no account on ready frame: %s", out.String())
 	}
 	path := filepath.Join(home, "route.json")
 	c := testRoute(home)
 	if err := atomicJSON(path, c); err != nil {
 		t.Fatal(err)
 	}
-	updated, e := backfillOwnerAccount(c, path, event)
+	updated, known, e := readyAccount(c, path, event)
+	if e != nil || !known || updated.RemoteAccount != acct {
+		t.Fatalf("backfill = %+v, known %v, %v", updated, known, e)
+	}
 	if e != nil || updated.RemoteAccount != acct {
 		t.Fatalf("backfill = %+v, %v", updated, e)
 	}
