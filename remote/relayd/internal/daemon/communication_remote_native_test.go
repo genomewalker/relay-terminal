@@ -268,3 +268,41 @@ func TestHostChannelSignedReplyInTimeIsDelivered(t *testing.T) {
 		t.Fatal("a signed reply in time was not delivered as signed", settled)
 	}
 }
+
+// A forged envelope with an expired signed statement, signed by a key the
+// receiver does not pin for the sending node, is refused outright. The
+// receiver never signs a not_delivered answer for it.
+func TestHostChannelForgedExpiredEnvelopeIsRefused(t *testing.T) {
+	f, _ := hostChannelLinked(t)
+	id := "cacacaca-caca-4aca-8aca-cacacacacaca"
+	hostChannelPaneReply(t, f, id)
+	claim, err := hostChannelOp(f.b, "node-b", f.hooksB, CommunicationRequest{Operation: "work_native_claim", MessageID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	impostor, _ := peerFixture(t, "node-b")
+	// The impostor also signs its own statement for the message, so the
+	// statement verifies against the impostor key and reaches its expiry check.
+	deps := defaultCommunicationSigningDeps(impostor, "node-b")
+	deps.observe = func(pane string) communicationMember {
+		m := f.hooksB.observe(pane)
+		m.PID, m.Start = 4242, "fixture"
+		return m
+	}
+	forgedID := "cbcbcbcb-cbcb-4bcb-8bcb-cbcbcbcbcbcb"
+	statement, err := communicationSign(impostor, "node-b", CommunicationRequest{Operation: "sign", SourcePaneID: testGroupB, ActorPaneID: testGroupB,
+		PaneID: desktopAlias, MessageID: forgedID, Text: "late reply", actorVerified: true}, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := nativeResign(t, claim["work_envelope"].(string), remoteNativeKind, "node-b", impostor, func(s *remoteNativeSend) {
+		s.Wire.MessageID = forgedID
+		s.Wire.SourceSignature = statement["source_signature"].(string)
+		s.Wire.Fingerprint = remoteMessageFingerprint(s.Wire)
+	})
+	nativeClock(t, communicationStatementTTL+time.Minute)
+	got, err := hostChannelOp(f.a, "node-a", f.hooksA, CommunicationRequest{Operation: "deliver_signed_work", WorkEnvelope: forged})
+	if err == nil {
+		t.Fatal("a forged envelope was answered", got)
+	}
+}

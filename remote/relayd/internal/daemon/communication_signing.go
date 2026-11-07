@@ -347,6 +347,10 @@ type communicationVerifiedSource struct {
 
 // communicationVerifyEnvelope checks the whole chain against this host's
 // pinned nodes. It trusts nothing in the envelope that it did not verify.
+// errSignedStatementExpired is the verification error of a statement past its
+// validity window, so callers can name a late message by type, not by text.
+var errSignedStatementExpired = errors.New("signed statement expired")
+
 func communicationVerifyEnvelope(encoded string, trusted []communicationTrustedNode, now time.Time) (communicationVerifiedSource, error) {
 	return communicationVerifyEnvelopeKind(encoded, trusted, now, false)
 }
@@ -449,7 +453,7 @@ func communicationVerifyEnvelopeKind(encoded string, trusted []communicationTrus
 	}
 	if now.Add(communicationClockSkew).Before(statement.CreatedAt) || !now.Before(statement.ExpiresAt) ||
 		statement.ExpiresAt.Sub(statement.CreatedAt) > communicationStatementTTL {
-		return empty, errors.New("signed statement expired")
+		return empty, errSignedStatementExpired
 	}
 	if statement.PermissionClass != "" && statement.PermissionClass != "bypass" && statement.PermissionClass != "prompting" {
 		return empty, errors.New("signed statement permission class invalid")

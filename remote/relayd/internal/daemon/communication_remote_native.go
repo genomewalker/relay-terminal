@@ -231,10 +231,16 @@ func remoteNativeDeliver(ctx context.Context, root, node string, env workNativeE
 	if m.SourceNodeID != env.Node || m.TargetNodeID != node || m.Operation != "send" {
 		return nil, errors.New("remote envelope does not match its signer")
 	}
+	tooLate := false
 	err = communicationFanoutLocked(root, func() error {
 		link, e := readRemoteLink(root, node, m.LinkID)
 		if e != nil {
 			return e
+		}
+		// The envelope signer must be the key this link pins for the sending
+		// node, before anything is answered or signed for it.
+		if signer != link.PeerCertificateSHA256 {
+			return errors.New("remote envelope signer is not the pinned peer")
 		}
 		_, binding, _, e := activePeerRoute(root, node, link.RouteID)
 		if e != nil {
@@ -243,21 +249,27 @@ func remoteNativeDeliver(ctx context.Context, root, node string, env workNativeE
 		if binding.Endpoint != workNativeEndpoint {
 			return errors.New("remote route is not carried by the Relay host channel")
 		}
+		// Pair, revisions, conversations, caller and route pin, as the receiver checks.
+		if _, e := authorizeRemoteMessage(root, node, signer, m); e != nil {
+			return e
+		}
+		if !validRemoteMessage(m, node) || remoteMessageFingerprint(m) != m.Fingerprint {
+			return errors.New("invalid remote message scope or fingerprint")
+		}
+		// A signed message whose statement expired in transit is refused by
+		// name, never delivered with a downgraded label. A repeat of a
+		// delivered message is still answered from its receipt.
+		if m.SourceSignature != "" {
+			if _, e := os.Stat(remoteReceiptPath(root, m.SourceNodeID, m.MessageID)); errors.Is(e, os.ErrNotExist) {
+				_, e := communicationVerifyEnvelope(m.SourceSignature,
+					[]communicationTrustedNode{{NodeID: m.SourceNodeID, CertificateSHA256: link.PeerCertificateSHA256}}, workNativeNow())
+				tooLate = errors.Is(e, errSignedStatementExpired)
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-	tooLate := false
-	// A signed message whose statement expired in transit is refused by name,
-	// never delivered with a downgraded label. A repeat of a delivered message
-	// is still answered from its receipt.
-	if m.SourceSignature != "" {
-		if _, e := os.Stat(remoteReceiptPath(root, m.SourceNodeID, m.MessageID)); errors.Is(e, os.ErrNotExist) {
-			if _, _, sigErr := communicationRemoteSourcePacket(m, signer, workNativeNow()); strings.Contains(sigErr, "expired") {
-				tooLate = true
-			}
-		}
 	}
 	var result map[string]any
 	if tooLate {
