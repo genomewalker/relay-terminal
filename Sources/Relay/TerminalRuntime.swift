@@ -3483,7 +3483,9 @@ final class TerminalRuntime: NSObject {
     /// Only a recognized empty native prompt authorizes an operator resume.
     /// A displayed pane has no ordered worker snapshot; its proof is the
     /// attached (or retained) native renderer under the same live fence.
-    func agentResumePromptProof(expected: RelayPromptOwnerBinding) async -> UUID? {
+    /// `admitTypedShell` admits instead only the retained shell's recognized
+    /// prompt holding typed text, so the resume flow can clear that exact line.
+    func agentResumePromptProof(expected: RelayPromptOwnerBinding, admitTypedShell: Bool = false) async -> UUID? {
         let state = await terminalEditState()
         guard state["status"] == "observed", let proof = preparedTerminalEdit,
               proof.owner.binding == expected else { return nil }
@@ -3501,20 +3503,25 @@ final class TerminalRuntime: NSObject {
               await readPromptOwnerBinding() == proof.owner,
               let pane, preparedTerminalEdit?.token == proof.token,
               Self.agentResumePromptAdmits(expected: expected, vt: vt, pendingApprovals: pane.pendingAgentApprovals,
-                  composerBusy: pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true)
+                  composerBusy: pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true,
+                  admitTypedShell: admitTypedShell)
         else { return nil }
         return proof.token
     }
 
     /// The screen and local-state half of a resume admission: no approval or
     /// composer activity, and the exact provider's prompt is idle and empty.
+    /// `admitTypedShell` admits only a retained shell whose recognized prompt
+    /// holds typed text; it never admits an agent owner.
     nonisolated static func agentResumePromptAdmits(expected: RelayPromptOwnerBinding, vt: String?,
-                                                    pendingApprovals: Int, composerBusy: Bool) -> Bool {
+                                                    pendingApprovals: Int, composerBusy: Bool,
+                                                    admitTypedShell: Bool = false) -> Bool {
         guard pendingApprovals == 0, !composerBusy, expected.inputOnly != true else { return false }
         switch expected.provider {
         // No Claude footer agent is explained here, so any "← N agent" holds.
-        case "codex", "claude": return RelayAgentMaintenancePrompt.isEmpty(vt, provider: expected.provider)
-        case "shell": return RelayAgentMaintenancePrompt.retainedShellIsEmpty(vt)
+        case "codex", "claude": return !admitTypedShell && RelayAgentMaintenancePrompt.isEmpty(vt, provider: expected.provider)
+        case "shell":
+            return RelayAgentMaintenancePrompt.retainedShellPrompt(vt) == (admitTypedShell ? .typed : .empty)
         default: return false
         }
     }

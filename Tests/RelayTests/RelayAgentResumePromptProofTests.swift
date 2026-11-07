@@ -209,3 +209,52 @@ extension RelayTerminalEditTests {
         }
     }
 }
+
+/// Same-pane resume after the agent exits: the retained shell's line may be
+/// cleared only when its recognized prompt holds typed text, and the typed
+/// admission never admits an agent owner or an unrecognized screen.
+@Suite("Retained shell line clearing")
+struct RelayRetainedShellClearTests {
+    private let empty = "╭─ host · ~/work git:main\n╰─ ❯ "
+
+    @MainActor @Test func typedAdmissionIsShellOnlyAndDisjointFromEmpty() {
+        let pane = PaneModel(profile: ConnectionProfile(name: "Shell clear", kind: .local, backend: .relay))
+        let shell = binding(pane, provider: "shell", session: nil)
+        // The 2026-11-07 hold: bash showed its recalled launch line.
+        let typed = empty + "cd -- '/Users/example' && claude --resume x"
+        #expect(TerminalRuntime.agentResumePromptAdmits(expected: shell, vt: empty, pendingApprovals: 0, composerBusy: false))
+        #expect(!TerminalRuntime.agentResumePromptAdmits(expected: shell, vt: empty, pendingApprovals: 0, composerBusy: false, admitTypedShell: true))
+        #expect(!TerminalRuntime.agentResumePromptAdmits(expected: shell, vt: typed, pendingApprovals: 0, composerBusy: false))
+        #expect(TerminalRuntime.agentResumePromptAdmits(expected: shell, vt: typed, pendingApprovals: 0, composerBusy: false, admitTypedShell: true))
+        // Unrecognized screens (exit text still in flight) are neither.
+        for vt in ["Resume this session with:\nclaude --resume x", "❯ typed", "unrecognized heading\n╰─ ❯ typed"] {
+            #expect(!TerminalRuntime.agentResumePromptAdmits(expected: shell, vt: vt, pendingApprovals: 0, composerBusy: false))
+            #expect(!TerminalRuntime.agentResumePromptAdmits(expected: shell, vt: vt, pendingApprovals: 0, composerBusy: false, admitTypedShell: true))
+        }
+        #expect(!TerminalRuntime.agentResumePromptAdmits(expected: shell, vt: typed, pendingApprovals: 1, composerBusy: false, admitTypedShell: true))
+        #expect(!TerminalRuntime.agentResumePromptAdmits(expected: shell, vt: typed, pendingApprovals: 0, composerBusy: true, admitTypedShell: true))
+        // An agent owner is never admitted for clearing, even on its own empty prompt.
+        let codex = binding(pane, provider: "codex")
+        let codexEmpty = ResumeScreen.codex().replacingOccurrences(of: "\r\n", with: "\n")
+        #expect(TerminalRuntime.agentResumePromptAdmits(expected: codex, vt: codexEmpty, pendingApprovals: 0, composerBusy: false))
+        #expect(!TerminalRuntime.agentResumePromptAdmits(expected: codex, vt: codexEmpty, pendingApprovals: 0, composerBusy: false, admitTypedShell: true))
+        let claude = binding(pane, provider: "claude")
+        let claudeEmpty = ResumeScreen.claude().replacingOccurrences(of: "\r\n", with: "\n")
+        #expect(!TerminalRuntime.agentResumePromptAdmits(expected: claude, vt: claudeEmpty, pendingApprovals: 0, composerBusy: false, admitTypedShell: true))
+        #expect(!TerminalRuntime.agentResumePromptAdmits(expected: claude, vt: typed, pendingApprovals: 0, composerBusy: false, admitTypedShell: true))
+    }
+
+    @Test func clearingWaitsForAStableTypedLineAndSendsAtMostCtrlUThenCtrlK() {
+        #expect(RelayCodexPaneResume.shellClearKey(typedPolls: 0, clearsSent: 0) == nil)
+        #expect(RelayCodexPaneResume.shellClearKey(typedPolls: 1, clearsSent: 0) == nil)
+        #expect(RelayCodexPaneResume.shellClearKey(typedPolls: 2, clearsSent: 0) == "u")
+        #expect(RelayCodexPaneResume.shellClearKey(typedPolls: 1, clearsSent: 1) == nil)
+        #expect(RelayCodexPaneResume.shellClearKey(typedPolls: 2, clearsSent: 1) == "k")
+        #expect(RelayCodexPaneResume.shellClearKey(typedPolls: 9, clearsSent: 2) == nil)
+        for key in ["u", "k"] {
+            let edit = RelayTerminalEditRequest(instance: UUID(), requestID: UUID(), token: UUID(),
+                action: "key", text: nil, key: key, modifiers: ["control"])
+            #expect(edit.isValid)
+        }
+    }
+}

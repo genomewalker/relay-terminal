@@ -124,17 +124,43 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             }
             inputSent = true
             protectedInputRevision = pane.agentInputRevision
-            var shell: RelayPromptOwnerBinding?
+            // The kernel owner can become the shell before its prompt is on
+            // screen (the agent's restored main screen still shows the old
+            // launch line, or exit text is in flight), so the empty proof is
+            // retried under the same owner until the deadline. A line that
+            // stays typed is cleared at most with Ctrl-U then Ctrl-K, each
+            // under its own fenced shell proof, and must then prove empty.
+            var shell: RelayPromptOwnerBinding?, token: UUID?
+            var typedPolls = 0, clearsSent = 0
+            var reason = "no shell owner was observed before the deadline or a fence changed"
             let deadline = Date().addingTimeInterval(30)
             while current(), Date() < deadline {
                 if let owner = await pane.runtime.agentResumeOwner(), owner.provider == "shell" {
-                    guard Self.sameRetainedShell(plan.owner, owner) else { break }
-                    shell = owner; break
+                    guard Self.sameRetainedShell(plan.owner, owner) else { reason = "a different shell owns the pane"; break }
+                    shell = owner
+                    if let proof = await pane.runtime.agentResumePromptProof(expected: owner), current() { token = proof; break }
+                    guard current() else { reason = "a fence changed while the shell prompt was checked"; break }
+                    if let proof = await pane.runtime.agentResumePromptProof(expected: owner, admitTypedShell: true), current() {
+                        typedPolls += 1
+                        reason = clearsSent == 0 ? "the shell input line was not empty" : "the shell input line was still not empty after clearing"
+                        if let key = Self.shellClearKey(typedPolls: typedPolls, clearsSent: clearsSent) {
+                            let clear = RelayTerminalEditRequest(instance: request.instance, requestID: UUID(), token: proof,
+                                action: "key", text: nil, key: key, modifiers: ["control"])
+                            guard await pane.runtime.sendTerminalEdit(clear, authorization: current) == "input_submitted" else {
+                                reason = "the shell or screen changed before its input line could be cleared"; break
+                            }
+                            clearsSent += 1; typedPolls = 0
+                            protectedInputRevision = pane.agentInputRevision
+                        }
+                    } else {
+                        typedPolls = 0
+                        reason = "the retained shell prompt was not recognized"
+                    }
                 }
                 try await Task.sleep(for: .milliseconds(500))
             }
-            guard current(), let shell, let token = await pane.runtime.agentResumePromptProof(expected: shell), current() else {
-                try save("held", "Exit submitted; the same retained empty shell was not verified. No resume was sent."); return
+            guard current(), let shell, let token else {
+                try save("held", "Exit submitted; the same retained empty shell was not verified (\(reason)). No resume was sent."); return
             }
             try save("launching", "Launching the exact saved session in its original account and project")
             let launch = RelayTerminalEditRequest(instance: request.instance, requestID: UUID(), token: token, action: "insert_text", text: plan.command, key: nil, modifiers: nil)
@@ -161,6 +187,14 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
         } catch {
             try? save(inputSent ? "outcome_unknown" : "refused", error.localizedDescription)
         }
+    }
+    /// The next line-clearing control key for a retained shell whose recognized
+    /// prompt has shown typed text on two consecutive fenced polls: Ctrl-U kills
+    /// to the line start, then Ctrl-K kills what was after the cursor. Never
+    /// more than these two; an agent owner is never admitted for either.
+    nonisolated static func shellClearKey(typedPolls: Int, clearsSent: Int) -> String? {
+        guard typedPolls >= 2, clearsSent < 2 else { return nil }
+        return clearsSent == 0 ? "u" : "k"
     }
     static func sameRetainedShell(_ before: RelayPromptOwnerBinding, _ after: RelayPromptOwnerBinding) -> Bool {
         before.paneId == after.paneId && before.nodeBootId == after.nodeBootId && before.workerPid == after.workerPid && before.workerStart == after.workerStart && before.shellPid == after.shellPid && before.shellStart == after.shellStart
