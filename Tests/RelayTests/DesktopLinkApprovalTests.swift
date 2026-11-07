@@ -4,7 +4,8 @@ import Testing
 
 private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 64), sessionID: "5a30d83a-5222-48f3-93c7-42fa687d901b",
     accountRoot: "/Users/owner/.claude-max", paneID: "1652a003-70e9-4614-addb-68564fa8383b",
-    createdAt: "2026-11-07T10:00:00Z", expiresAt: "2026-11-07T10:10:00Z")
+    createdAt: "2026-11-07T10:00:00Z", expiresAt: "2026-11-07T10:10:00Z",
+    proposedCallers: ["f8b71215-6a42-4f00-808e-35f3f555b7eb"])
 
 /// Records every daemon operation; `pendingReplies` answers the listing in order.
 @MainActor private final class FakeDaemon {
@@ -40,6 +41,7 @@ private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 
     #expect(approve.1["request_id"] as? String == shownRequest.id)
     #expect(approve.1["source_pane_id"] as? String == shownRequest.sessionID)
     #expect(approve.1["pane_id"] as? String == shownRequest.paneID)
+    #expect(approve.1["allowed_callers"] as? [String] == shownRequest.proposedCallers)
 }
 
 @Test @MainActor func approvalRefusesARequestThatChangedBeforeTheClick() async throws {
@@ -76,4 +78,27 @@ private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 
     let unavailable = DesktopLinkApproval(requester: daemon.request) { _, _ in false }
     #expect(try await unavailable.decide(shownRequest, current: [shownRequest]) == .unavailable)
     #expect(!daemon.names().contains("route_desktop_link_approve"))
+}
+
+@Test @MainActor func unapprovableRequestsAreNeverOffered() async throws {
+    let daemon = FakeDaemon(listings: [])
+    let refused = DesktopLinkRequest(id: shownRequest.id, sessionID: shownRequest.sessionID, accountRoot: shownRequest.accountRoot,
+        paneID: shownRequest.paneID, createdAt: shownRequest.createdAt, expiresAt: shownRequest.expiresAt,
+        proposedCallers: [], refusal: "pair the pane once from its host first")
+    var showed = 0
+    let approval = DesktopLinkApproval(requester: daemon.request) { _, _ in showed += 1; return true }
+    #expect(try await approval.decide(refused, current: [refused]) == .unavailable)
+    #expect(showed == 0)
+    #expect(daemon.operations.isEmpty)
+}
+
+@Test func watchAsksOnceAboutEachLiveRequest() throws {
+    let now = ISO8601DateFormatter().date(from: "2026-11-07T10:05:00Z")!
+    let live = shownRequest
+    let expired = DesktopLinkRequest(id: String(repeating: "b", count: 64), sessionID: shownRequest.sessionID,
+        accountRoot: shownRequest.accountRoot, paneID: shownRequest.paneID, createdAt: "2026-11-07T09:00:00Z",
+        expiresAt: "2026-11-07T09:10:00Z", proposedCallers: ["receiver"])
+    #expect(DesktopLinkWatch.due([live, expired], asked: [], now: now) == [live])
+    #expect(DesktopLinkWatch.due([live], asked: [live.id], now: now).isEmpty)
+    #expect(DesktopLinkRequest.parse("2026-11-07T10:10:00.123456Z") != nil)
 }
