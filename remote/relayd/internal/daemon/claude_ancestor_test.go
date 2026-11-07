@@ -41,13 +41,26 @@ func TestAncestorClaudeFromArgv(t *testing.T) {
 // An interpreter ancestor whose argv is unreadable stops the walk: a desktop
 // Claude further up the chain is not attributed in its place.
 func TestClaudeSessionWalkRefusesUnreadableInterpreterAncestor(t *testing.T) {
-	previous := claudeAncestorIsClaude
-	defer func() { claudeAncestorIsClaude = previous }()
+	previous, previousSession := claudeAncestorIsClaude, claudeAncestorSession
+	defer func() { claudeAncestorIsClaude, claudeAncestorSession = previous, previousSession }()
 	claudeAncestorIsClaude = func(pid int) (bool, error) {
 		if pid == 50 {
 			return false, errors.New("interpreter arguments unreadable")
 		}
 		return pid == 60, nil
+	}
+	// pid 60 is a resolvable desktop session, so only the refusal at pid 50
+	// keeps it from becoming the actor.
+	desktop := ClaudeSessionActor{Version: 1, SessionID: "desktop-session", PID: 60, Source: claudeDesktopSessionSource}
+	claudeAncestorSession = func(pid, _ int, _ string) (ClaudeSessionActor, bool, error) {
+		if pid != 60 {
+			t.Errorf("session observed for ancestor %d", pid)
+			return ClaudeSessionActor{}, false, nil
+		}
+		return desktop, true, nil
+	}
+	if actor, err := readClaudeSessionActorFrom([]int{60}, 10, "start"); err != nil || actor.SessionID != desktop.SessionID {
+		t.Fatalf("fixture desktop session did not resolve on its own: %+v, %v", actor, err)
 	}
 	if actor, err := readClaudeSessionActorFrom([]int{50, 60}, 10, "start"); err == nil {
 		t.Fatalf("walk continued past an unreadable ancestor: %+v", actor)

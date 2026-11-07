@@ -41,6 +41,10 @@ func (a ClaudeSessionActor) Target() nativemsg.ClaudeSessionTarget {
 // A variable so tests can name their own Claude processes.
 var claudeAncestorIsClaude = ancestorIsClaude
 
+// claudeAncestorSession observes a Claude ancestor's desktop session. A variable
+// so tests can make an ancestor resolvable without a live registration.
+var claudeAncestorSession = claudeDesktopSessionAt
+
 // An ancestor whose identity cannot be read is refused with an error, not
 // skipped, so a desktop Claude further up cannot become the actor for it.
 
@@ -81,7 +85,7 @@ func readClaudeSessionActorFrom(chain []int, clientPID int, clientStart string) 
 		if !isClaude {
 			continue
 		}
-		actor, found, err := claudeDesktopSessionAt(pid, clientPID, clientStart)
+		actor, found, err := claudeAncestorSession(pid, clientPID, clientStart)
 		if err != nil {
 			return empty, err
 		}
