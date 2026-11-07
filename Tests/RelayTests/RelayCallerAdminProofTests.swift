@@ -32,4 +32,33 @@ import Testing
             operation: "caller_set_paused", nonce: "AQEBAQEBAQEBAQEBAQEBAQ==", expires: 1120,
             packet: ["operation": "caller_set_paused", "caller_id": "Legacy-Unattributed", "paused": true])))
     }
+
+    // After each update the first Keychain read raises a prompt (the partition
+    // list pins each build's cdhash). On the main actor that froze every Relay
+    // API call until the user answered; concurrent first attaches could also
+    // raise it more than once.
+    @MainActor @Test func adminKeyLoadsOnceAndOffTheMainThread() async throws {
+        let seen = OSAllocatedUnfairLockBox()
+        let fixed = Curve25519.Signing.PrivateKey()
+        let store = RelayCallerAdminProof.AdminKeyStore(load: {
+            seen.record(main: Thread.isMainThread)
+            return fixed
+        })
+        // First call from the main actor, as RelayCallerAdminProof.send makes it.
+        let first = try await store.key().rawRepresentation
+        let tasks = (0..<8).map { _ in Task.detached { try await store.key().rawRepresentation } }
+        var keys = [first]
+        for task in tasks { keys.append(try await task.value) }
+        #expect(keys.count == 9 && Set(keys) == [fixed.rawRepresentation])
+        #expect(await store.loads == 1)
+        #expect(seen.calls == 1 && seen.onMain == 0)
+    }
+}
+
+private final class OSAllocatedUnfairLockBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls = 0, _onMain = 0
+    func record(main: Bool) { lock.lock(); _calls += 1; if main { _onMain += 1 }; lock.unlock() }
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
+    var onMain: Int { lock.lock(); defer { lock.unlock() }; return _onMain }
 }

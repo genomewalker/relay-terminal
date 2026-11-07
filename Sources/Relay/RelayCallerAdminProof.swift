@@ -33,6 +33,28 @@ enum RelayCallerAdminProof {
         return key
     }
 
+    /// Reads the key off the main actor and keeps it for the app's lifetime.
+    /// The item's partition list pins each build's cdhash (the signing
+    /// certificate is not Apple-issued), so the first read after an update
+    /// shows a Keychain prompt; on the main actor that froze every Relay API
+    /// call until it was answered. The actor also keeps concurrent first
+    /// attaches from raising more than one prompt.
+    static let adminKey = AdminKeyStore(load: loadOrCreateKey)
+
+    actor AdminKeyStore {
+        private let load: @Sendable () throws -> Curve25519.Signing.PrivateKey
+        private var cached: Curve25519.Signing.PrivateKey?
+        private(set) var loads = 0
+        init(load: @escaping @Sendable () throws -> Curve25519.Signing.PrivateKey) { self.load = load }
+        func key() throws -> Curve25519.Signing.PrivateKey {
+            if let cached { return cached }
+            loads += 1
+            let key = try load()
+            cached = key
+            return key
+        }
+    }
+
     private static func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
     private static func flag(_ v: Bool) -> String { v ? "1" : "0" }
 
@@ -77,7 +99,7 @@ enum RelayCallerAdminProof {
         if let operation = packet["operation"] as? String, mutating.contains(operation) {
             let info = try await RelayHostExecution.communicationRequest(profile: profile, packet: ["operation": "caller_admin_info"])
             guard let node = info.value?["node_id"] as? String, !node.isEmpty else { throw RelayHostRPCError.invalidRequest }
-            let key = try loadOrCreateKey()
+            let key = try await adminKey.key()
             // A host pinned to a different key is not ours to administer.
             if let pinned = info.value?["admin_key_sha256"] as? String, !pinned.isEmpty,
                pinned != SHA256.hash(data: key.publicKey.rawRepresentation).map({ String(format: "%02x", $0) }).joined() {
