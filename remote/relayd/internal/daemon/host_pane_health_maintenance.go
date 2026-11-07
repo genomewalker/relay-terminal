@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -1656,6 +1657,49 @@ func phSubagentLifecycle(path string, ids []string) map[string][]string {
 	return events
 }
 
+// phSubagentSettle is how long a started subagent's own transcript must stay
+// unchanged after an assistant end_turn before it no longer counts as working.
+const phSubagentSettle = 10 * time.Minute
+
+// phSubagentSettled reports whether a subagent whose lifecycle never recorded
+// an end has evidently stopped: its transcript is a regular file, quiet for
+// phSubagentSettle, and its last record is an assistant message that ended
+// its turn. A team teammate is recorded as teammate_spawned and never gets a
+// completion notification, so without this it would hold the pane forever.
+// Any doubt (unreadable, mid tool call, unparseable tail) keeps it working.
+func phSubagentSettled(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || time.Since(info.ModTime()) < phSubagentSettle {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	const tail = 256 << 10
+	offset := info.Size() - tail
+	if offset < 0 {
+		offset = 0
+	}
+	buffer := make([]byte, info.Size()-offset)
+	if _, err := file.ReadAt(buffer, offset); err != nil && err != io.EOF {
+		return false
+	}
+	lines := bytes.Split(bytes.TrimRight(buffer, "\n"), []byte("\n"))
+	last := bytes.TrimSpace(lines[len(lines)-1])
+	if len(last) == 0 || (offset > 0 && len(lines) == 1) {
+		return false
+	}
+	var record struct {
+		Type    string `json:"type"`
+		Message struct {
+			StopReason string `json:"stop_reason"`
+		} `json:"message"`
+	}
+	return json.Unmarshal(last, &record) == nil && record.Type == "assistant" && record.Message.StopReason == "end_turn"
+}
+
 // phSubagentWork is subagent_work(path, session): whether any in-process
 // subagent of the session may still be working; nil when unknown.
 func phSubagentWork(path string, session any) any {
@@ -1714,7 +1758,7 @@ func phSubagentWork(path string, session any) any {
 			switch {
 			case len(history) == 0 || phContains(history, "unknown"):
 				unknown = true
-			case history[len(history)-1] == "start":
+			case history[len(history)-1] == "start" && !phSubagentSettled(phJoin(subagents, "agent-"+agent+".jsonl")):
 				working = true
 			}
 		}
