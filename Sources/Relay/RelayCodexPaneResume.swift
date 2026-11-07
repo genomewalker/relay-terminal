@@ -121,11 +121,12 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             guard current() else { try refuse("the pane, its connection or the authorization changed"); return }
             try save("exiting", "Graceful \(name) exit requested for the verified original session")
             let (exit, submit) = Self.exitEdit(provider: agent, instance: request.instance, requestID: request.requestID, token: proof)
-            guard await pane.runtime.sendTerminalEdit(exit, appendShellReturn: submit, authorization: current) == "input_submitted" else {
+            let exitReceipt = await pane.runtime.sendTerminalEditReceipt(exit, appendShellReturn: submit, authorization: current)
+            guard exitReceipt.status == "input_submitted", let exitRevision = exitReceipt.inputRevision else {
                 try save("not_sent", "The original owner or screen changed; no exit input was submitted"); return
             }
             inputSent = true
-            protectedInputRevision = pane.agentInputRevision
+            protectedInputRevision = exitRevision
             // The kernel owner can become the shell before its prompt is on
             // screen (the agent's restored main screen still shows the old
             // launch line, or exit text is in flight), so the empty proof is
@@ -150,10 +151,11 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                                 action: "key", text: nil, key: key, modifiers: ["control"])
                             // not_sent submits nothing: the prompt may just have
                             // been redrawn, so poll again instead of holding.
-                            if await pane.runtime.sendTerminalEdit(clear, authorization: current) == "input_submitted" {
+                            let clearReceipt = await pane.runtime.sendTerminalEditReceipt(clear, authorization: current)
+                            if clearReceipt.status == "input_submitted", let clearRevision = clearReceipt.inputRevision {
                                 clearsSent += 1
                                 clearNote = clearsSent == 1 ? " (Control-U cleared the shell line first)" : " (Control-U and Control-K cleared the shell line first)"
-                                protectedInputRevision = pane.agentInputRevision
+                                protectedInputRevision = clearRevision
                             }
                             typedPolls = 0
                         }
@@ -170,10 +172,11 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             }
             try save("launching", "Launching the exact saved session in its original account and project")
             let launch = RelayTerminalEditRequest(instance: request.instance, requestID: UUID(), token: token, action: "insert_text", text: plan.command, key: nil, modifiers: nil)
-            guard await pane.runtime.sendTerminalEdit(launch, appendShellReturn: true, authorization: current) == "input_submitted" else {
+            let launchReceipt = await pane.runtime.sendTerminalEditReceipt(launch, appendShellReturn: true, authorization: current)
+            guard launchReceipt.status == "input_submitted", let launchRevision = launchReceipt.inputRevision else {
                 try save("held", "The retained shell changed before the launch text was submitted"); return
             }
-            protectedInputRevision = pane.agentInputRevision
+            protectedInputRevision = launchRevision
             try save("verifying", "Resume submitted once; checking the resulting native session")
             let verifyUntil = Date().addingTimeInterval(90)
             while current(), Date() < verifyUntil {

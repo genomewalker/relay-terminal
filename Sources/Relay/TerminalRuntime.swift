@@ -3538,26 +3538,34 @@ final class TerminalRuntime: NSObject {
 
     func sendTerminalEdit(_ request: RelayTerminalEditRequest, appendShellReturn: Bool = false,
                           authorization: @MainActor () -> Bool = { true }) async -> String {
-        guard request.isValid, let proof = preparedTerminalEdit, proof.token == request.token else { return "not_sent" }
+        await sendTerminalEditReceipt(request, appendShellReturn: appendShellReturn, authorization: authorization).status
+    }
+
+    /// The status of one terminal edit and the input revision the send itself
+    /// produced. The revision is read in the same main-actor step as the write,
+    /// so a caller resuming after the await never adopts input that arrived in between.
+    func sendTerminalEditReceipt(_ request: RelayTerminalEditRequest, appendShellReturn: Bool = false,
+                                 authorization: @MainActor () -> Bool = { true }) async -> (status: String, inputRevision: UInt64?) {
+        guard request.isValid, let proof = preparedTerminalEdit, proof.token == request.token else { return ("not_sent", nil) }
         // Return is appended only to a retained shell's launch text, or to
         // Claude's fixed exit command; never to other agent prompt text.
         guard !appendShellReturn || request.action == "insert_text" && (proof.owner.binding.provider == "shell" ||
             proof.owner.binding.provider == "claude" && request.text == RelayAgentMaintenancePolicy.exitCommand(provider: "claude"))
-        else { return "not_sent" }
+        else { return ("not_sent", nil) }
         preparedTerminalEdit = nil
         let pane = proof.pane
-        guard let inputLease = acquirePromptInspectionInputLease() else { return "not_sent" }
+        guard let inputLease = acquirePromptInspectionInputLease() else { return ("not_sent", nil) }
         defer { releasePromptInspectionInputLease(inputLease) }
-        guard await readPromptOwnerBinding() == proof.owner else { return "not_sent" }
+        guard await readPromptOwnerBinding() == proof.owner else { return ("not_sent", nil) }
         var packet: Data
         switch proof.screen {
         case .background(let snapshot):
             guard let data = await RelayAgentMaintenanceScreen.editingInput(snapshot.data,
-                viewport: snapshot.token.viewport, request: request, identity: snapshot.token.producer) else { return "not_sent" }
+                viewport: snapshot.token.viewport, request: request, identity: snapshot.token.producer) else { return ("not_sent", nil) }
             packet = data
         case .renderer:
             guard terminalEditScreenIsCurrent(proof.screen),
-                  let data = view.collectNativeInput({ view.translateTerminalEdit(request) }) else { return "not_sent" }
+                  let data = view.collectNativeInput({ view.translateTerminalEdit(request) }) else { return ("not_sent", nil) }
             packet = data
         }
         if appendShellReturn { packet.append(0x0d) }
@@ -3566,7 +3574,7 @@ final class TerminalRuntime: NSObject {
               pane.connectionState == .connected, pane.agentInputRevision == proof.revision,
               terminalEditScreenIsCurrent(proof.screen), !view.promptInspectionBlocksExternalInput,
               view.markedRange().location == NSNotFound, authorization(),
-              let control = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id) else { return "not_sent" }
+              let control = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id) else { return ("not_sent", nil) }
         let sent: Bool
         switch proof.screen {
         case .background(let snapshot):
@@ -3577,7 +3585,7 @@ final class TerminalRuntime: NSObject {
                 expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
         }
         if sent { view.unobservedPromptInput(); pane.userEnteredInput(); noteProgrammaticInput("terminal_edit", nil) }
-        return sent ? "input_submitted" : "not_sent"
+        return sent ? ("input_submitted", pane.agentInputRevision) : ("not_sent", nil)
     }
 
     @discardableResult
