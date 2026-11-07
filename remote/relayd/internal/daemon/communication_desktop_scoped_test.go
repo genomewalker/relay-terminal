@@ -94,7 +94,7 @@ func scopedApprove(root string, pane string, callers []string, hooks communicati
 func TestApprovalEstablishesThePairUnderItsOwnSignedScope(t *testing.T) {
 	f := scopedFixture(t, true)
 	scopedRequest(t, f.a)
-	result, err := scopedApprove(f.a, testGroupB, []string{"sender"}, f.hooksA)
+	result, err := scopedApprove(f.a, testGroupB, directionalPairCallers(desktopAlias, testGroupB), f.hooksA)
 	if err != nil {
 		t.Fatal("approve", err)
 	}
@@ -125,7 +125,7 @@ func TestApprovalRefusesWrongPairRegistrationMissingPinAndPeerMismatch(t *testin
 	t.Run("different pane", func(t *testing.T) {
 		f := scopedFixture(t, true)
 		scopedRequest(t, f.a)
-		if _, err := scopedApprove(f.a, "00000000-0000-4000-8000-00000000f00d", []string{"receiver"}, f.hooksA); err == nil {
+		if _, err := scopedApprove(f.a, "00000000-0000-4000-8000-00000000f00d", directionalPairCallers(desktopAlias, testGroupB), f.hooksA); err == nil {
 			t.Fatal("approval for another pane accepted")
 		}
 		if n, _ := filepath.Glob(filepath.Join(f.a, "desktop-capability-*.json")); len(n) != 0 {
@@ -139,7 +139,7 @@ func TestApprovalRefusesWrongPairRegistrationMissingPinAndPeerMismatch(t *testin
 			t.Fatal(err)
 		}
 		registerDesktop(t, f.a, t.TempDir())
-		if _, err := scopedApprove(f.a, testGroupB, []string{"receiver"}, f.hooksA); err == nil {
+		if _, err := scopedApprove(f.a, testGroupB, directionalPairCallers(desktopAlias, testGroupB), f.hooksA); err == nil {
 			t.Fatal("approval for a re-registered session accepted")
 		}
 	})
@@ -156,7 +156,7 @@ func TestApprovalRefusesWrongPairRegistrationMissingPinAndPeerMismatch(t *testin
 			t.Fatal(err)
 		}
 		scopedRequest(t, f.a)
-		if _, err := scopedApprove(f.a, testGroupB, []string{"receiver"}, f.hooksA); err == nil || !strings.Contains(err.Error(), "does not pin its own certificate") {
+		if _, err := scopedApprove(f.a, testGroupB, directionalPairCallers(desktopAlias, testGroupB), f.hooksA); err == nil || !strings.Contains(err.Error(), "does not pin its own certificate") {
 			t.Fatal("approval without this host's scope pin not refused by name", err)
 		}
 	})
@@ -167,7 +167,7 @@ func TestApprovalRefusesWrongPairRegistrationMissingPinAndPeerMismatch(t *testin
 		if _, err := communicationDesktopLinkRequestOp(f.a, request, desktopLinkNow()); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := scopedApprove(f.a, testGroupB, []string{"receiver"}, f.hooksA); err == nil || !strings.Contains(err.Error(), "no active route") {
+		if _, err := scopedApprove(f.a, testGroupB, directionalPairCallers(desktopAlias, testGroupB), f.hooksA); err == nil || !strings.Contains(err.Error(), "no active route") {
 			t.Fatal("a host with no route was approved", err)
 		}
 	})
@@ -178,7 +178,7 @@ func TestApprovalRefusesWrongPairRegistrationMissingPinAndPeerMismatch(t *testin
 func TestApprovalRefusedWhenPeerDoesNotPinTheScopeSigner(t *testing.T) {
 	f := scopedFixture(t, false)
 	scopedRequest(t, f.a)
-	if _, err := scopedApprove(f.a, testGroupB, []string{"receiver"}, f.hooksA); err == nil {
+	if _, err := scopedApprove(f.a, testGroupB, directionalPairCallers(desktopAlias, testGroupB), f.hooksA); err == nil {
 		t.Fatal("a peer without the signer pin accepted the pair")
 	}
 	if links, _ := filepath.Glob(filepath.Join(f.a, "remote-link-*.json")); len(links) != 0 {
@@ -187,5 +187,20 @@ func TestApprovalRefusedWhenPeerDoesNotPinTheScopeSigner(t *testing.T) {
 	caps, _ := filepath.Glob(filepath.Join(f.a, "desktop-capability-*.json"))
 	if len(caps) != 1 {
 		t.Fatal("expected one minted capability", caps)
+	}
+}
+
+// A new pair's listing proposes its two directional callers, so the owner can
+// approve it without a reviewed pane link.
+func TestListingProposesDirectionalCallersForANewPair(t *testing.T) {
+	f := scopedFixture(t, true)
+	scopedRequest(t, f.a)
+	listing, err := communicationDesktopLinkList(f.a, "node-a", desktopLinkNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := listing["requests"].([]desktopLinkListing)[0]
+	if item.Refusal != "" || !sameCallerSet(item.ProposedCallers, directionalPairCallers(desktopAlias, testGroupB)) {
+		t.Fatal("a new pair is not approvable from its listing", item)
 	}
 }

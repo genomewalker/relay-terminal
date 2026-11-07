@@ -40,7 +40,10 @@ type communicationEstablishWire struct {
 	// ScopeRecord carries the holder's owner-signed record of the pair, so the
 	// peer can hold its own copy. Absent for the pre-existing establish shape.
 	ScopeRecord *communicationScopeRecord `json:"scope_record,omitempty"`
-	Fingerprint string                    `json:"fingerprint"`
+	// ReplyCallerID is the caller the proposer admits for replies from the peer's
+	// pane. Empty for a pair established with one caller label.
+	ReplyCallerID string `json:"reply_caller_id,omitempty"`
+	Fingerprint   string `json:"fingerprint"`
 }
 
 func establishFingerprint(m communicationEstablishWire) string {
@@ -53,7 +56,7 @@ func establishFingerprint(m communicationEstablishWire) string {
 func validEstablishWire(m communicationEstablishWire, node string) bool {
 	return m.Version == establishWireVersion && m.Operation == "establish" && canonicalRouteToken(node) && m.TargetNodeID == node &&
 		canonicalRouteToken(m.SourceNodeID) && m.SourceNodeID != node && canonicalRouteToken(m.SourcePaneID) && canonicalRouteToken(m.TargetPaneID) &&
-		canonicalRouteToken(m.CallerID) && m.CallerID != establishLegacyCaller && canonicalRouteToken(m.MessageID) && canonicalRouteToken(m.ScopeID) &&
+		canonicalRouteToken(m.CallerID) && m.CallerID != establishLegacyCaller && (m.ReplyCallerID == "" || canonicalRouteToken(m.ReplyCallerID)) && canonicalRouteToken(m.MessageID) && canonicalRouteToken(m.ScopeID) &&
 		validRemoteConversation(m.SourceConversation) && m.Fingerprint == establishFingerprint(m)
 }
 
@@ -212,6 +215,7 @@ type establishPlan struct {
 	approved       bool
 	scopeRecord    *communicationScopeRecord
 	desktopAccount string
+	replyCaller    string
 }
 
 // communicationEstablishPrepare decides, under the caller's metadata lock,
@@ -246,7 +250,7 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 		return empty, err
 	}
 	m := communicationEstablishWire{Version: establishWireVersion, Operation: "establish", MessageID: hex.EncodeToString(id[:]), SourceNodeID: node, TargetNodeID: r.PeerNodeID,
-		SourcePaneID: r.SourcePaneID, TargetPaneID: r.PaneID, CallerID: plan.caller, SourceConversation: local, ScopeID: plan.scopeID, ScopeRecord: plan.scopeRecord}
+		SourcePaneID: r.SourcePaneID, TargetPaneID: r.PaneID, CallerID: plan.caller, SourceConversation: local, ScopeID: plan.scopeID, ScopeRecord: plan.scopeRecord, ReplyCallerID: plan.replyCaller}
 	m.Fingerprint = establishFingerprint(m)
 	body, _ := json.Marshal(m)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -295,7 +299,7 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 			return errors.New("source conversation changed; pair not established")
 		}
 		requested := CommunicationRemoteLink{PeerNodeID: r.PeerNodeID, LocalPaneID: r.SourcePaneID, PeerPaneID: r.PaneID, RouteID: route.ID, RouteRevision: route.Revision,
-			PeerCertificateSHA256: plan.cert, LocalConversation: local, PeerConversation: reply.TargetConversation, AllowedPeerCallers: []string{plan.caller}, DesktopAccountRoot: plan.desktopAccount}
+			PeerCertificateSHA256: plan.cert, LocalConversation: local, PeerConversation: reply.TargetConversation, AllowedPeerCallers: establishReplyAllowed(plan), DesktopAccountRoot: plan.desktopAccount}
 		link, _, err = communicationEstablishCommit(root, node, requested, plan.scopeID, "proposer", m.MessageID)
 		return err
 	})

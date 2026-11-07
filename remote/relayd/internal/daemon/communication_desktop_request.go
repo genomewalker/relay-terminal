@@ -125,10 +125,14 @@ func communicationDesktopLinkList(root, node string, now time.Time) (map[string]
 			continue
 		}
 		item := desktopLinkListing{communicationDesktopLinkRequest: request, ProposedCallers: []string{}}
-		if peer, err := communicationDesktopLinkPeer(root, node, request); err != nil {
-			item.Refusal = err.Error()
-		} else {
+		if peer, err := communicationDesktopLinkPeer(root, node, request); err == nil {
 			item.ProposedCallers = append(item.ProposedCallers, peer.AllowedPeerCallers...)
+		} else if _, _, _, routeErr := establishRoute(root, node, request.PeerNodeID, ""); routeErr != nil {
+			item.Refusal = "no active route to the requested host: " + routeErr.Error()
+		} else {
+			// No reviewed pane link: the pair is established under its own scope, with
+			// the two directional callers the owner approves as shown.
+			item.ProposedCallers = directionalPairCallers(request.SessionID, request.PaneID)
 		}
 		listing = append(listing, item)
 	}
@@ -278,8 +282,8 @@ func communicationDesktopLinkApproveScoped(root, node string, r CommunicationReq
 	if !canonicalRouteToken(peerNode) || peerNode == node {
 		return nil, errors.New("this request names no other host to establish the pair with")
 	}
-	if len(r.AllowedCallers) != 1 || !canonicalRouteToken(r.AllowedCallers[0]) {
-		return nil, errors.New("approve exactly one caller: a new pair admits one reviewed caller")
+	if !sameCallerSet(r.AllowedCallers, directionalPairCallers(request.SessionID, request.PaneID)) {
+		return nil, errors.New("approve the pair's two callers as shown: the desktop's outbound and the pane's reply caller")
 	}
 	route, binding, cert, err := establishRoute(root, node, peerNode, "")
 	if err != nil {
@@ -318,7 +322,7 @@ func communicationDesktopLinkApproveScoped(root, node string, r CommunicationReq
 	if _, err := communicationScopeStorePair(root, node, recordA, trusted); err != nil {
 		return nil, errors.New("this host does not pin its own certificate for scope signing: " + err.Error())
 	}
-	capabilityID, err := communicationDesktopCapabilityMint(root, request, r.AllowedCallers, scopeID, recordB, peerFingerprint(cert), now)
+	capabilityID, err := communicationDesktopCapabilityMint(root, request, directionalDesktopCaller(request.SessionID), directionalPaneCaller(request.PaneID), scopeID, recordB, peerFingerprint(cert), now)
 	if err != nil {
 		return nil, err
 	}

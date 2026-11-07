@@ -37,7 +37,7 @@ func mintCapability(t *testing.T, f scopedNodes, now time.Time) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, err := communicationDesktopCapabilityMint(f.a, request, []string{"sender"}, scopeID, recordB, peerFingerprint(cert), now)
+	id, err := communicationDesktopCapabilityMint(f.a, request, directionalDesktopCaller(desktopAlias), directionalPaneCaller(testGroupB), scopeID, recordB, peerFingerprint(cert), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func mintCapability(t *testing.T, f scopedNodes, now time.Time) string {
 
 func spend(f scopedNodes, id string, mutate func(*CommunicationRequest)) (map[string]any, error) {
 	r := CommunicationRequest{Operation: "route_desktop_link_establish", RequestID: desktopLinkRequestID(desktopAlias, testGroupB),
-		SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b", AllowedCallers: []string{"sender"}, OwnerCapability: id}
+		SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b", AllowedCallers: directionalPairCallers(desktopAlias, testGroupB), OwnerCapability: id}
 	if mutate != nil {
 		mutate(&r)
 	}
@@ -63,12 +63,14 @@ func TestCapabilityBindsExactlyAndSpendsOnce(t *testing.T) {
 	defer func() { desktopLinkNow = original }()
 	id := mintCapability(t, f, now)
 	mismatches := map[string]func(*CommunicationRequest){
-		"other pane":        func(r *CommunicationRequest) { r.PaneID = "00000000-0000-4000-8000-00000000f00d" },
-		"other session":     func(r *CommunicationRequest) { r.SourcePaneID = scopePaneC },
-		"other peer node":   func(r *CommunicationRequest) { r.PeerNodeID = "node-c" },
-		"other callers":     func(r *CommunicationRequest) { r.AllowedCallers = []string{"receiver"} },
-		"other request":     func(r *CommunicationRequest) { r.RequestID = strings.Repeat("0", 64) },
-		"more callers":      func(r *CommunicationRequest) { r.AllowedCallers = []string{"sender", "receiver"} },
+		"other pane":      func(r *CommunicationRequest) { r.PaneID = "00000000-0000-4000-8000-00000000f00d" },
+		"other session":   func(r *CommunicationRequest) { r.SourcePaneID = scopePaneC },
+		"other peer node": func(r *CommunicationRequest) { r.PeerNodeID = "node-c" },
+		"other callers":   func(r *CommunicationRequest) { r.AllowedCallers = []string{"sender", "receiver"} },
+		"other request":   func(r *CommunicationRequest) { r.RequestID = strings.Repeat("0", 64) },
+		"legacy label": func(r *CommunicationRequest) {
+			r.AllowedCallers = []string{"sender", directionalPaneCaller(testGroupB)}
+		},
 		"client credential": func(r *CommunicationRequest) { r.ClientToken = remoteSenderToken },
 		"actor pane":        func(r *CommunicationRequest) { r.ActorPaneID = desktopAlias },
 	}

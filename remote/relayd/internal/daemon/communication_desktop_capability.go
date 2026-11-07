@@ -19,20 +19,23 @@ const desktopCapabilityTTL = 5 * time.Minute
 // the callers the owner approved. It is consumed before any network use, so a
 // failed attempt cannot be retried with it.
 type communicationDesktopCapability struct {
-	Version     int                      `json:"version"`
-	ID          string                   `json:"id"`
-	RequestID   string                   `json:"request_id"`
-	SessionID   string                   `json:"session_id"`
-	AccountRoot string                   `json:"account_root"`
-	PaneID      string                   `json:"pane_id"`
-	PeerNodeID  string                   `json:"peer_node_id"`
-	PeerCertSHA string                   `json:"peer_certificate_sha256"`
-	Callers     []string                 `json:"callers"`
-	ScopeID     string                   `json:"scope_id"`
-	PeerScope   communicationScopeRecord `json:"peer_scope"`
-	CreatedAt   time.Time                `json:"created_at"`
-	ExpiresAt   time.Time                `json:"expires_at"`
-	Consumed    bool                     `json:"consumed"`
+	Version     int      `json:"version"`
+	ID          string   `json:"id"`
+	RequestID   string   `json:"request_id"`
+	SessionID   string   `json:"session_id"`
+	AccountRoot string   `json:"account_root"`
+	PaneID      string   `json:"pane_id"`
+	PeerNodeID  string   `json:"peer_node_id"`
+	PeerCertSHA string   `json:"peer_certificate_sha256"`
+	Callers     []string `json:"callers"`
+	// Outbound is the desktop's caller; Reply is the pane's caller. Callers is both.
+	Outbound  string                   `json:"outbound_caller"`
+	Reply     string                   `json:"reply_caller"`
+	ScopeID   string                   `json:"scope_id"`
+	PeerScope communicationScopeRecord `json:"peer_scope"`
+	CreatedAt time.Time                `json:"created_at"`
+	ExpiresAt time.Time                `json:"expires_at"`
+	Consumed  bool                     `json:"consumed"`
 }
 
 func desktopCapabilityPath(root, id string) string {
@@ -40,7 +43,7 @@ func desktopCapabilityPath(root, id string) string {
 }
 
 // communicationDesktopCapabilityMint records a new capability for one approved pair.
-func communicationDesktopCapabilityMint(root string, request communicationDesktopLinkRequest, callers []string, scopeID string,
+func communicationDesktopCapabilityMint(root string, request communicationDesktopLinkRequest, outbound, reply string, scopeID string,
 	peerScope communicationScopeRecord, peerCert string, now time.Time) (string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -55,7 +58,7 @@ func communicationDesktopCapabilityMint(root string, request communicationDeskto
 	}
 	capability := communicationDesktopCapability{Version: 1, ID: hex.EncodeToString(raw[:]), RequestID: request.ID,
 		SessionID: request.SessionID, AccountRoot: request.AccountRoot, PaneID: request.PaneID, PeerNodeID: request.PeerNodeID,
-		PeerCertSHA: peerCert, Callers: append([]string(nil), callers...), ScopeID: scopeID, PeerScope: peerScope,
+		PeerCertSHA: peerCert, Callers: []string{outbound, reply}, Outbound: outbound, Reply: reply, ScopeID: scopeID, PeerScope: peerScope,
 		CreatedAt: now.UTC(), ExpiresAt: expires.UTC()}
 	if err := communicationAtomic(desktopCapabilityPath(root, capability.ID), capability); err != nil {
 		return "", err
@@ -112,7 +115,7 @@ func communicationDesktopLinkEstablish(root, node string, r CommunicationRequest
 	}
 	peerScope := capability.PeerScope
 	plan := &establishPlan{route: route, binding: binding, cert: peerFingerprint(cert), scopeID: capability.ScopeID,
-		caller: capability.Callers[0], approved: true, scopeRecord: &peerScope, desktopAccount: capability.AccountRoot}
+		caller: capability.Outbound, replyCaller: capability.Reply, approved: true, scopeRecord: &peerScope, desktopAccount: capability.AccountRoot}
 	run := CommunicationRequest{Operation: "route_desktop_link_establish", SourcePaneID: capability.SessionID, PaneID: capability.PaneID,
 		PeerNodeID: capability.PeerNodeID}
 	link, err := communicationEstablishRun(root, node, run, plan, hooks)

@@ -194,7 +194,7 @@ func TestDesktopLinkApprovalRefusesWithoutPeerPin(t *testing.T) {
 	if _, err := communicationDesktopLinkRequestOp(a, request, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	_, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: []string{"receiver"},
+	_, err := communicationDesktopLinkApprove(a, "node-a", CommunicationRequest{Operation: "route_desktop_link_approve", AllowedCallers: directionalPairCallers(desktopAlias, unlinked),
 		RequestID: desktopLinkRequestID(desktopAlias, unlinked), SourcePaneID: desktopAlias, PaneID: unlinked}, hooks)
 	if err == nil || !strings.Contains(err.Error(), "does not pin its own certificate") {
 		t.Fatal("approval of an unpinned signer was not refused by name", err)

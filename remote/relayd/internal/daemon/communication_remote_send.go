@@ -24,6 +24,9 @@ type communicationRemoteOutbound struct {
 	RouteRevision         uint64                     `json:"route_revision"`
 	PeerCertificateSHA256 string                     `json:"peer_certificate_sha256"`
 	Wire                  communicationRemoteMessage `json:"wire"`
+	// SubmittingCaller is the caller label the request was authorized as. The wire
+	// caller may be a directional name, so retries are matched on this label.
+	SubmittingCaller string `json:"submitting_caller,omitempty"`
 	CreatedAt             time.Time                  `json:"created_at"`
 	PeerConfirmed         bool                       `json:"peer_confirmed"`
 	RequestFinished       bool                       `json:"request_finished"`
@@ -56,7 +59,7 @@ func remoteOutboundResult(receipt communicationRemoteOutbound) map[string]any {
 }
 func remoteOutboundRequestMatches(receipt communicationRemoteOutbound, node, caller string, r CommunicationRequest) bool {
 	ownerRead := r.Operation == "remote_receipt" && r.ClientToken == "" && r.ActorPaneID == ""
-	if !validRemoteOutbound(receipt, node) || receipt.Wire.MessageID != r.MessageID || (receipt.Wire.CallerID != caller && !ownerRead) ||
+	if !validRemoteOutbound(receipt, node) || receipt.Wire.MessageID != r.MessageID || (receiptCaller(receipt) != caller && !ownerRead) ||
 		(r.ActorPaneID != "" && !strings.EqualFold(r.ActorPaneID, receipt.Wire.SourcePaneID)) ||
 		(r.SourcePaneID != "" && r.SourcePaneID != receipt.Wire.SourcePaneID) || (r.PaneID != "" && r.PaneID != receipt.Wire.TargetPaneID) ||
 		(r.LinkID != "" && r.LinkID != receipt.Wire.LinkID) || (r.PeerNodeID != "" && r.PeerNodeID != receipt.Wire.TargetNodeID) {
@@ -199,11 +202,12 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 				return err
 			}
 			wire = communicationRemoteMessage{Version: 1, Operation: "send", LinkID: current.ID, SourceLinkRevision: current.Revision, TargetLinkRevision: current.PeerRevision,
-				SourceNodeID: node, TargetNodeID: current.PeerNodeID, SourcePaneID: current.LocalPaneID, TargetPaneID: current.PeerPaneID, CallerID: caller,
+				SourceNodeID: node, TargetNodeID: current.PeerNodeID, SourcePaneID: current.LocalPaneID, TargetPaneID: current.PeerPaneID,
+				CallerID: wireCallerIf(r, current, caller),
 				SourceConversation: current.LocalConversation, TargetConversation: current.PeerConversation, MessageID: r.MessageID, Text: r.Text,
 				SourceSignature: signature}
 			wire.Fingerprint = remoteMessageFingerprint(wire)
-			receipt = communicationRemoteOutbound{Version: 1, NodeID: node, RouteID: current.RouteID, RouteRevision: current.RouteRevision,
+			receipt = communicationRemoteOutbound{Version: 1, NodeID: node, SubmittingCaller: caller, RouteID: current.RouteID, RouteRevision: current.RouteRevision,
 				PeerCertificateSHA256: current.PeerCertificateSHA256, Wire: wire, CreatedAt: time.Now().UTC(), Result: map[string]any{"status": "outcome_unknown"}}
 			receipt.Wire.Text = ""
 			binding, err = remoteOutboundRoute(root, node, receipt)
@@ -349,4 +353,21 @@ func remotePeerPost(ctx context.Context, root, node string, binding Communicatio
 		return nil, errors.New("invalid remote peer response")
 	}
 	return data, nil
+}
+
+// receiptCaller is the label a stored outbound request was authorized as; older
+// receipts have no label of their own and carry it on the wire.
+func receiptCaller(receipt communicationRemoteOutbound) string {
+	if receipt.SubmittingCaller != "" {
+		return receipt.SubmittingCaller
+	}
+	return receipt.Wire.CallerID
+}
+
+// wireCallerIf names the wire caller only for a kernel-verified local sender.
+func wireCallerIf(r CommunicationRequest, link CommunicationRemoteLink, label string) string {
+	if !r.actorVerified || !strings.EqualFold(r.ActorPaneID, link.LocalPaneID) {
+		return label
+	}
+	return wireCallerFor(link, link.LocalPaneID, label)
 }
