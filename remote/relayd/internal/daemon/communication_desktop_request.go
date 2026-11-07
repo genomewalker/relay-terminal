@@ -108,6 +108,9 @@ type desktopLinkListing struct {
 	communicationDesktopLinkRequest
 	ProposedCallers []string `json:"proposed_callers"`
 	Refusal         string   `json:"refusal,omitempty"`
+	// Carrier names a route the app must carry during approval: the peer host
+	// is then resolved before anything is spent. Empty for an HTTPS route.
+	Carrier string `json:"carrier,omitempty"`
 }
 
 // communicationDesktopLinkList returns the owner's pending, unexpired requests.
@@ -127,9 +130,12 @@ func communicationDesktopLinkList(root, node string, now time.Time) (map[string]
 		item := desktopLinkListing{communicationDesktopLinkRequest: request, ProposedCallers: []string{}}
 		if peer, err := communicationDesktopLinkPeer(root, node, request); err == nil {
 			item.ProposedCallers = append(item.ProposedCallers, peer.AllowedPeerCallers...)
-		} else if _, _, _, routeErr := establishRoute(root, node, request.PeerNodeID, ""); routeErr != nil {
+		} else if _, binding, _, routeErr := establishRoute(root, node, request.PeerNodeID, ""); routeErr != nil {
 			item.Refusal = "no active route to the requested host: " + routeErr.Error()
 		} else {
+			if binding.Endpoint == workNativeEndpoint {
+				item.Carrier = "relay_host_channel"
+			}
 			// No reviewed pane link: the pair is established under its own scope, with
 			// the two directional callers the owner approves as shown.
 			item.ProposedCallers = directionalPairCallers(request.SessionID, request.PaneID)

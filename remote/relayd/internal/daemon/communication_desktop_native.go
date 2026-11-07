@@ -135,6 +135,11 @@ func desktopNativePrune(root string, now time.Time) error {
 // communicationDesktopNativeReceive is the peer's half: it accepts a proposal
 // only from the node its pinned host-channel route names as the signer, and
 // only when the proposal is addressed to this node.
+//
+// Receive is not single-use: within the freshness window a carrier can replay
+// the same signed proposal. That is accepted as idempotent, since the establish
+// receiver answers an identical pair "current" and saves nothing new, and the
+// approving host settles each proposal at most once.
 func communicationDesktopNativeReceive(root, node string, r CommunicationRequest, hooks communicationGroupNative) (map[string]any, error) {
 	if r.ClientToken != "" || r.ActorPaneID != "" {
 		return nil, errors.New("owner administration required")

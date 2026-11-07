@@ -215,3 +215,25 @@ func TestHostChannelEstablishSettleRefusals(t *testing.T) {
 		refused(t, f, dispatch["message_id"].(string), "", "invalid Work envelope")
 	})
 }
+
+// The listing tells the app which requests it must carry, so the peer host is
+// resolved before the approval is spent. An HTTPS route names no carrier.
+func TestListingNamesTheHostChannelCarrier(t *testing.T) {
+	f := scopedFixture(t, true)
+	scopedRequest(t, f.a)
+	carrier := func() (string, string) {
+		listing, err := communicationDesktopLinkList(f.a, "node-a", desktopLinkNow())
+		if err != nil {
+			t.Fatal(err)
+		}
+		item := listing["requests"].([]desktopLinkListing)[0]
+		return item.Carrier, item.PeerNodeID
+	}
+	if got, peer := carrier(); got != "" || peer != "node-b" {
+		t.Fatal("HTTPS route listed with a carrier", got, peer)
+	}
+	workNativeSetEndpoint(t, f.a, workNativeEndpoint)
+	if got, peer := carrier(); got != "relay_host_channel" || peer != "node-b" {
+		t.Fatal("host-channel route listed without its carrier", got, peer)
+	}
+}
