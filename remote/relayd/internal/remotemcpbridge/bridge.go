@@ -540,6 +540,12 @@ func (b *Bridge) route(r *http.Request, caller string) (int, []byte, error) {
 					return 0, nil, e
 				}
 			}
+			if !ok && path != "/api/pane-links" {
+				// relay-mcp started before relay_call_tool went to relayd
+				// still sends here; the direct tool reaches relayd, which
+				// delivers over a saved desktop or remote link.
+				return deny("Cross-host messages require an explicitly saved pane pair. To answer a linked desktop session or a pane on another host, call `relay_message_pane` directly, not through `relay_call_tool`")
+			}
 			if !ok {
 				return deny("Cross-host messages require an explicitly saved pane pair")
 			}
