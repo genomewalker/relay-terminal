@@ -26,11 +26,11 @@ type communicationRemoteOutbound struct {
 	Wire                  communicationRemoteMessage `json:"wire"`
 	// SubmittingCaller is the caller label the request was authorized as. The wire
 	// caller may be a directional name, so retries are matched on this label.
-	SubmittingCaller string `json:"submitting_caller,omitempty"`
-	CreatedAt             time.Time                  `json:"created_at"`
-	PeerConfirmed         bool                       `json:"peer_confirmed"`
-	RequestFinished       bool                       `json:"request_finished"`
-	Result                map[string]any             `json:"result"`
+	SubmittingCaller string         `json:"submitting_caller,omitempty"`
+	CreatedAt        time.Time      `json:"created_at"`
+	PeerConfirmed    bool           `json:"peer_confirmed"`
+	RequestFinished  bool           `json:"request_finished"`
+	Result           map[string]any `json:"result"`
 }
 
 func remoteOutboundPath(root, id string) string {
@@ -209,7 +209,7 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 			}
 			wire = communicationRemoteMessage{Version: 1, Operation: "send", LinkID: current.ID, SourceLinkRevision: current.Revision, TargetLinkRevision: current.PeerRevision,
 				SourceNodeID: node, TargetNodeID: current.PeerNodeID, SourcePaneID: current.LocalPaneID, TargetPaneID: current.PeerPaneID,
-				CallerID: wireCallerIf(r, current, caller),
+				CallerID:           wireCallerIf(r, current, caller),
 				SourceConversation: current.LocalConversation, TargetConversation: current.PeerConversation, MessageID: r.MessageID, Text: r.Text,
 				SourceSignature: signature}
 			wire.Fingerprint = remoteMessageFingerprint(wire)

@@ -67,7 +67,7 @@ func TestNewLocalTabAnchorAndTabMoveForwarding(t *testing.T) {
 		{"instance": id, "request_id": id, "anchor_pane_id": "../bad"},                      // not a UUID
 		{"instance": id, "request_id": id, "anchor_tab_id": ""},                             // empty
 		{"instance": id, "request_id": id, "anchor": other},                                 // unknown key
-		{"instance": id, "request_id": id, "anchor_tab_id": other, "host": "dandy-07"},     // extra key
+		{"instance": id, "request_id": id, "anchor_tab_id": other, "host": "dandy-07"},      // extra key
 		{"instance": id, "anchor_tab_id": other},                                            // missing request_id
 	} {
 		if code := call("relay_new_local_tab", args); code != -32602 {

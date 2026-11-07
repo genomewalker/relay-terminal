@@ -67,7 +67,7 @@ type CommunicationRequest struct {
 	EstablishEnvelope          string                     `json:"establish_envelope,omitempty"`
 	EstablishReply             string                     `json:"establish_reply,omitempty"`
 	TrustedNodes               []communicationTrustedNode `json:"trusted_nodes,omitempty"`
-	TrustPin                   *communicationTrustPin      `json:"trust_pin,omitempty"`
+	TrustPin                   *communicationTrustPin     `json:"trust_pin,omitempty"`
 	Scope                      *communicationScopeRecord  `json:"scope,omitempty"`
 	// Relay assistant sends: the approving assistant request, and the recipient
 	// endpoint the user saw on the Run card.
