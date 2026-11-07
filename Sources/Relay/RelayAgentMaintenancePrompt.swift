@@ -55,6 +55,10 @@ enum RelayAgentMaintenancePrompt {
         if prompt.cells.count > prompt.first,
            prompt.cells.prefix(prompt.first).allSatisfy({ CharacterSet.whitespaces.contains($0.character) }) { return false }
         let input = typed(prompt.cells)
+        // Codex always shows a faint placeholder in an empty composer and
+        // hides it once anything, even a space, is typed: a blank Codex
+        // composer is a draft of whitespace, not an empty prompt.
+        if provider == "codex", input.isEmpty { return false }
         if !input.isEmpty {
             guard input.allSatisfy(\.faint) else { return false }
             let text = String(String.UnicodeScalarView(prompt.cells.map(\.character)))
@@ -78,7 +82,8 @@ enum RelayAgentMaintenancePrompt {
             // The status line's items are user-configured: it opens with the
             // model and may omit the context segment ("GPT-6.1 Terra high ·
             // ~/cwd · thread title"). At most one row may name the context.
-            guard (1...3).contains(footer.count), let first = footer.first, first.contains(" · "),
+            // The model row, then one or two hint rows directly below it.
+            guard (2...3).contains(footer.count), let first = footer.first, first.contains(" · "),
                   (first.lowercased().hasPrefix("gpt-") || first.lowercased().hasPrefix("openai")),
                   footer.filter({ $0.localizedCaseInsensitiveContains("context") }).count <= 1,
                   footer.dropFirst().allSatisfy({ value in

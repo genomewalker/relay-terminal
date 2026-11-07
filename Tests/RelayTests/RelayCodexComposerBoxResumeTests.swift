@@ -11,6 +11,10 @@ import Testing
 @Suite("Codex composer-box resume admission (0.5.17 refusal)")
 struct RelayCodexComposerBoxResumeTests {
     private typealias Box = CapturedCodexComposerBox
+    private static let owner = RelayPromptOwnerBinding(version: 1, paneId: "28711135-7f19-4eec-ad6e-21a2e6071f82",
+        nodeBootId: "8284920b-c5d0-41d4-8e64-9bd95f22886f", workerPid: 1943831, workerStart: 17065417,
+        shellPid: 1943890, shellStart: 17065420, provider: "codex", processId: 1136165, processStart: 23954217,
+        sessionId: "01a191df-fe35-7b50-81b9-975a551bc209", transcriptIdentity: "70:110087718013")
     private static let placeholder = "\u{1b}[2m\u{1b}[48;2;50;52;56mAsk Codex to do anything"
 
     private func projected(_ vt: String, _ text: String) -> String? {
@@ -129,6 +133,40 @@ struct RelayCodexComposerBoxResumeTests {
         #expect(projected("ab\r\nc\r\nd", "c\nx") == nil)
     }
 
+    /// Codex hides its placeholder once anything is typed, so a draft of
+    /// spaces is "›" and blanks: never idle-empty, for resume or for
+    /// maintenance/rotation (`agentEmpty` and `agentEmptyIgnoringAgents`).
+    @Test func aSpaceOnlyDraftInTheCapturedBoxIsNotEmpty() throws {
+        for (vt, text) in [(Box.astraVT, Box.astraText), (Box.terraVT, Box.terraText)] {
+            #expect(vt.contains(Self.placeholder))
+            let spaces = vt.replacingOccurrences(of: Self.placeholder,
+                with: "\u{1b}[48;2;50;52;56m" + String(repeating: " ", count: 3))
+            let blank = text.replacingOccurrences(of: "› Ask Codex to do anything", with: "›    ")
+            let screen = try #require(projected(spaces, blank))
+            #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex"))
+            #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex", explainedAgents: .max))
+            // Also no admission through the agent resume screen check.
+            #expect(!TerminalRuntime.agentResumePromptAdmits(expected: Self.owner, vt: screen,
+                pendingApprovals: 0, composerBusy: false))
+        }
+    }
+
+    @Test func aModelRowWithoutAHintRowIsNotEmpty() throws {
+        let rows = Box.astraVT.components(separatedBy: "\r\n")
+        let hint = try #require(rows.lastIndex { $0.contains("for shortcuts") })
+        #expect(hint == rows.count - 1)
+        let vt = rows.dropLast().joined(separator: "\r\n")
+        let text = Box.astraText.split(separator: "\n", omittingEmptySubsequences: false).dropLast().joined(separator: "\n")
+        let screen = try #require(projected(vt, text))
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex"))
+        // The hint row alone, without the model row above it, is not a footer either.
+        let noModel = rows.enumerated().filter { $0.offset != hint - 1 }.map(\.element).joined(separator: "\r\n")
+        let noModelText = Box.astraText.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.contains("GPT-6-Astra medium") }.joined(separator: "\n")
+        let alone = try #require(projected(noModel, noModelText))
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(alone, provider: "codex"))
+    }
+
     /// The same shape through the real ghostty export and text API: a box
     /// row filled by erase-in-line with a background colour.
     @MainActor
@@ -151,5 +189,9 @@ struct RelayCodexComposerBoxResumeTests {
             Data(frame("rm -rf build").utf8), viewport: viewport))
         #expect(!RelayAgentMaintenancePrompt.isEmpty(draft, provider: "codex"))
         #expect(RelayAgentMaintenancePrompt.hasTypedText(draft, provider: "codex"))
+        let spaces = try #require(await RelayAgentMaintenanceScreen.read(
+            Data(frame("   ").utf8), viewport: viewport))
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(spaces, provider: "codex"), "\(String(reflecting: spaces))")
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(spaces, provider: "codex", explainedAgents: .max))
     }
 }

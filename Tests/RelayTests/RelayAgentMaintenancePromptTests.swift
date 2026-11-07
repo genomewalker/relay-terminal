@@ -12,7 +12,9 @@ final class RelayAgentMaintenancePromptTests: XCTestCase {
     }
 
     func testBlankPromptAndRGBFaintPlaceholder() {
-        XCTAssertTrue(RelayAgentMaintenancePrompt.isEmpty("› " + codexFooter, provider: "codex"))
+        // Codex hides the placeholder once anything is typed, so a bare
+        // marker may hold typed spaces: never empty (review M1, 0517c).
+        XCTAssertFalse(RelayAgentMaintenancePrompt.isEmpty("› " + codexFooter, provider: "codex"))
         XCTAssertTrue(RelayAgentMaintenancePrompt.isEmpty("› \u{1b}[38;2;128;128;128mAsk Codex to do anything\u{1b}[0m" + codexFooter, provider: "codex"))
         XCTAssertFalse(RelayAgentMaintenancePrompt.isEmpty("› \u{1b}[38;2;230;230;230mAsk Codex to do anything\u{1b}[0m" + codexFooter, provider: "codex"))
     }
@@ -20,7 +22,7 @@ final class RelayAgentMaintenancePromptTests: XCTestCase {
     func testTallTerminalEmptyGridTailDoesNotHideTheLivePrompt() {
         let padding = String(repeating: "     \n", count: 100)
         XCTAssertTrue(RelayAgentMaintenancePrompt.isEmpty("❯ " + claudeFooter + padding, provider: "claude"))
-        XCTAssertTrue(RelayAgentMaintenancePrompt.isEmpty("› " + codexFooter + padding, provider: "codex"))
+        XCTAssertTrue(RelayAgentMaintenancePrompt.isEmpty("› \u{1b}[2mAsk Codex to do anything\u{1b}[22m" + codexFooter + padding, provider: "codex"))
         XCTAssertFalse(RelayAgentMaintenancePrompt.isEmpty("❯ unsent draft" + claudeFooter + padding, provider: "claude"))
         XCTAssertFalse(RelayAgentMaintenancePrompt.isEmpty("❯ \n  wrapped draft" + claudeFooter + padding, provider: "claude"))
         XCTAssertFalse(RelayAgentMaintenancePrompt.isEmpty("❯ " + claudeFooter + padding + "unknown dialog", provider: "claude"))
