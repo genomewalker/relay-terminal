@@ -65,12 +65,19 @@ func TestDesktopReplyThroughExecuteCommunicationTakesTheLockOnce(t *testing.T) {
 	}
 	t.Cleanup(func() { communicationFlock = saved })
 
-	_, _ = ExecuteCommunication(CommunicationRequest{Operation: "send", SourcePaneID: pane, ActorPaneID: pane, actorVerified: true,
+	result, err := ExecuteCommunication(CommunicationRequest{Operation: "send", SourcePaneID: pane, ActorPaneID: pane, actorVerified: true,
 		PaneID: session, MessageID: "5d1c2e8a-7f3b-4b9e-9a61-2c0e4f7d8b13", Text: "beacon-2150", ClientToken: token})
 	if nested != 0 {
 		t.Fatalf("desktop reply asked for the communication lock while holding it (%d nested requests)", nested)
 	}
 	if held != 0 {
 		t.Fatalf("communication lock left held: %d", held)
+	}
+	// The fixture link has no route behind it, so the remote path stops at
+	// readRemoteLink's validation, which communicationSendRemote runs under its
+	// own lock. Reaching it proves the reply took the desktop route rather than
+	// the local pane-pair path, so the lock assertions above are not vacuous.
+	if err == nil || err.Error() != "invalid stored remote pair" {
+		t.Fatalf("reply did not reach the desktop route: result=%v err=%v", result, err)
 	}
 }
