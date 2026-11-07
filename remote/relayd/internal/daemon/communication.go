@@ -64,6 +64,7 @@ type CommunicationRequest struct {
 	WorkEnvelope               string                     `json:"work_envelope,omitempty"`
 	WorkReply                  string                     `json:"work_reply,omitempty"`
 	TrustedNodes               []communicationTrustedNode `json:"trusted_nodes,omitempty"`
+	TrustPin                   *communicationTrustPin      `json:"trust_pin,omitempty"`
 	Scope                      *communicationScopeRecord  `json:"scope,omitempty"`
 	// Relay assistant sends: the approving assistant request, and the recipient
 	// endpoint the user saw on the Run card.
@@ -516,6 +517,8 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		return communicationNodeIdentity(root, nodeID, r)
 	case "node_trust_set":
 		return communicationNodeTrustSet(root, nodeID, r)
+	case "route_trust_scope_pin":
+		return communicationTrustScopePin(root, nodeID, r, defaultCommunicationSigningDeps(root, nodeID))
 	case "assistant_send":
 		return communicationAssistantSend(root, nodeID, r,
 			communicationGroupNative{observe: communicationObserve, send: communicationNative})
