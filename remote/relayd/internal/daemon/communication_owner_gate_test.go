@@ -115,3 +115,51 @@ func TestHostSocketOwnerOperationRefusedFromAgent(t *testing.T) {
 		t.Fatal("the socket path ran an owner operation for an agent", response)
 	}
 }
+
+var carrierOperations = []string{"work_native_pending", "work_native_claim", "work_native_settle", "deliver_signed_work", "deliver_signed_desktop_establish"}
+
+// The host-channel carrier operations return queued message text or act as the
+// peer host, so an agent's descendant is refused each of them, and the owner's
+// application passes.
+func TestCarrierOperationsAreOwnerOperations(t *testing.T) {
+	child, _ := spawnAccountOwner(t, nil)
+	withAgentAncestors(t, "claude", func(pid int) bool { return pid == os.Getpid() })
+	for _, operation := range carrierOperations {
+		err := communicationOwnerGate(CommunicationRequest{Operation: operation}, child)
+		if err == nil || !strings.Contains(err.Error(), "not available to agent processes") {
+			t.Fatal("a carrier operation from an agent's descendant was not refused", operation, err)
+		}
+	}
+	withAgentAncestors(t, "claude", func(int) bool { return false })
+	for _, operation := range carrierOperations {
+		if err := communicationOwnerGate(CommunicationRequest{Operation: operation}, child); err != nil {
+			t.Fatal("the owner's carrier operation was refused", operation, err)
+		}
+		if err := communicationOwnerGate(CommunicationRequest{Operation: operation, ClientToken: "x"}, child); err == nil {
+			t.Fatal("a carrier operation with a caller token was allowed", operation)
+		}
+	}
+}
+
+// Every process on the real carrier paths, as traced on 2026-11-07, is not an
+// agent: on the Mac Relay -> relayd node -> /bin/sh -lc -> relayd communication;
+// on dandy sshd -D -> sshd [priv] -> sshd notty -> relayd node -> /bin/sh -lc ->
+// relayd-work-communication. A change that flags any of them would refuse the
+// carrier itself.
+func TestCarrierAncestryIsNotAnAgent(t *testing.T) {
+	for _, hop := range [][2]string{
+		{"Relay", "/Applications/Relay.app/Contents/MacOS/Relay"},
+		{"relayd", "/Applications/Relay.app/Contents/MacOS/relayd\x00node\x00"},
+		{"sh", "/bin/sh\x00-lc\x00'/Applications/Relay.app/Contents/MacOS/relayd' 'communication'\x00"},
+		{"sshd", "/usr/sbin/sshd\x00-D\x00"},
+		{"sshd", "sshd: kbd606 [priv]"},
+		{"sshd", "sshd: kbd606@notty"},
+		{"relayd-linux-am", "/home/kbd606/.local/share/relay/bin/relayd-linux-amd64\x00node\x00"},
+		{"sh", "/bin/sh\x00-lc\x00if [ -x \"$HOME/.local/share/relay/bin/relayd-work-communication\" ]; then \"$HOME/.local/share/relay/bin/relayd-work-communication\" communication; fi\x00"},
+		{"relayd-work-com", "/home/kbd606/.local/share/relay/bin/relayd-work-communication\x00communication\x00"},
+	} {
+		if kind := classifyAgentProcess(hop[0], hop[1]); kind != "" {
+			t.Fatal("a carrier hop is classified as an agent", hop[0], kind)
+		}
+	}
+}

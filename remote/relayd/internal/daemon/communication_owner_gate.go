@@ -20,8 +20,20 @@ import (
 var communicationAgentAncestor = ancestorAgentKind
 
 // communicationOwnerOperation reports whether an operation is owner administration.
+// The host-channel carrier operations are the Relay app's too: a claim returns
+// queued message text, and a delivery acts as the peer host.
 func communicationOwnerOperation(operation string) bool {
-	return strings.HasPrefix(operation, "route_") || operation == "node_trust_set"
+	return strings.HasPrefix(operation, "route_") || operation == "node_trust_set" || communicationCarrierOperation(operation)
+}
+
+// communicationCarrierOperation names the operations only the app's host-channel
+// carrier sends: Work and route-link messages, and desktop link establishment.
+func communicationCarrierOperation(operation string) bool {
+	switch operation {
+	case "work_native_pending", "work_native_claim", "work_native_settle", "deliver_signed_work", "deliver_signed_desktop_establish":
+		return true
+	}
+	return false
 }
 
 // CheckCommunicationOwner refuses an owner operation from an agent or from a
