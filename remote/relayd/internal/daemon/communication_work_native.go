@@ -250,6 +250,16 @@ func workNativeList(root, node string) (map[string]any, error) {
 			}
 			items = append(items, map[string]any{"message_id": p.MessageID, "link_id": p.LinkID, "peer_node_id": p.PeerNodeID, "dispatched": p.Dispatched})
 		}
+		repins, e := workNativeRepinPending(root)
+		if e != nil {
+			return e
+		}
+		for _, r := range repins {
+			if len(items) >= workNativeListLimit {
+				break
+			}
+			items = append(items, map[string]any{"message_id": r.MessageID, "link_id": r.LinkID, "peer_node_id": r.PeerNodeID, "dispatched": r.Fingerprint != "", "kind": "repin"})
+		}
 		return nil
 	})
 	if err != nil {
@@ -290,6 +300,9 @@ func workNativeOutbound(ctx context.Context, root, node, id string) (workNativeP
 }
 
 func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any, error) {
+	if r, ok := workNativeRepinFor(root, id); ok {
+		return workNativeRepinClaim(ctx, root, node, r)
+	}
 	var p workNativePending
 	var receipt workTransportReceipt
 	var link communicationTypedRemoteLink
@@ -391,7 +404,7 @@ func workNativeDeliver(ctx context.Context, root, node, text string) (map[string
 		return nil, errors.New("invalid Work envelope payload")
 	}
 	m := send.Wire
-	if m.Source.NodeID != env.Node || (m.Operation != "send" && m.Operation != "receipt") {
+	if m.Source.NodeID != env.Node || (m.Operation != "send" && m.Operation != "receipt" && !workNativeRepinDeliverable(m)) {
 		return nil, errors.New("Work envelope does not match its signer")
 	}
 	// The pin comparison itself happens in workReceiveWith against the saved
@@ -413,6 +426,13 @@ func workNativeDeliver(ctx context.Context, root, node, text string) (map[string
 		}
 		return nil
 	}
+	if m.Operation == "repin" {
+		// A delayed re-pin is refused like a delayed send; the generation
+		// check in the receiver refuses an old one regardless.
+		if e := fresh(ctx); e != nil {
+			return nil, e
+		}
+	}
 	result, err := workReceiveWith(ctx, root, node, peerCert, m, fresh, workNativeAuth)
 	if err != nil {
 		return nil, err
@@ -429,6 +449,9 @@ func workNativeDeliver(ctx context.Context, root, node, text string) (map[string
 }
 
 func workNativeSettle(ctx context.Context, root, node, id, text string) (map[string]any, error) {
+	if r, ok := workNativeRepinFor(root, id); ok {
+		return workNativeRepinSettle(ctx, root, node, r, text)
+	}
 	var receipt workTransportReceipt
 	err := communicationFanoutLocked(root, func() error {
 		_, current, link, e := workNativeOutbound(ctx, root, node, id)

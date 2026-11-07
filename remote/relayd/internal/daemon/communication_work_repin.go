@@ -96,7 +96,7 @@ func workWatchDelay(failures int) time.Duration {
 // per poll, and backs off while a failure persists.
 func workRepinWatch(root, node, linkID string, out io.Writer, sleep func(time.Duration) bool) error {
 	encoder := json.NewEncoder(out)
-	peerCurrent := false
+	peerCurrent, queued := false, false
 	failures := 0
 	lastError := ""
 	for {
@@ -104,9 +104,28 @@ func workRepinWatch(root, node, linkID string, out io.Writer, sleep func(time.Du
 		stale, err := workLinkStale(ctx, root, node, linkID)
 		if err == nil && (stale || !peerCurrent) {
 			var result map[string]any
-			result, err = repinWorkLink(ctx, root, node, linkID)
+			if queued && !stale {
+				// The local pin is current; only ask whether the carried re-pin settled.
+				result, err = workNativeRepinStatus(ctx, root, node, linkID)
+			} else {
+				result, err = repinWorkLink(ctx, root, node, linkID)
+			}
+			queued = err == nil && result["peer_status"] == "queued"
 			if err == nil {
 				peerCurrent = result["peer_status"] == "repinned" || result["peer_status"] == "current"
+				if result["peer_status"] == "queued" {
+					// Waiting for the Relay app to carry the re-pin: not a failure,
+					// so the watcher keeps its normal interval.
+					if lastError != "queued" {
+						lastError = "queued"
+						_ = encoder.Encode(map[string]any{"link_id": linkID, "time": time.Now().UTC(), "waiting": "peer re-pin queued for the Relay host channel"})
+					}
+					cancel()
+					if !sleep(workWatchInterval) {
+						return nil
+					}
+					continue
+				}
 				if !peerCurrent {
 					// The peer refused or was unreachable: a persistent failure, so
 					// it is reported once and retried with backoff.
@@ -240,6 +259,9 @@ func workRepinPeer(ctx context.Context, root, node string, link communicationTyp
 		return e
 	}); err != nil {
 		return "", err
+	}
+	if binding.Endpoint == workNativeEndpoint {
+		return workNativeRepinQueue(root, link)
 	}
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
