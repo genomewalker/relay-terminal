@@ -204,6 +204,12 @@ func workNativeRouteBinding(root, node string, link communicationTypedRemoteLink
 }
 
 func communicationWorkNative(ctx context.Context, root, node string, r CommunicationRequest) (map[string]any, error) {
+	return communicationWorkNativeWith(ctx, root, node, r, communicationGroupNative{observe: communicationObserve, send: communicationNative})
+}
+
+// communicationWorkNativeWith is the carrier entry point. hooks observe and
+// deliver to local panes for a carried remote-link message.
+func communicationWorkNativeWith(ctx context.Context, root, node string, r CommunicationRequest, hooks communicationGroupNative) (map[string]any, error) {
 	if r.ClientToken != "" || r.ActorPaneID != "" {
 		return nil, errors.New("owner administration required")
 	}
@@ -212,10 +218,20 @@ func communicationWorkNative(ctx context.Context, root, node string, r Communica
 	case "work_native_pending":
 		return workNativeList(root, node)
 	case "work_native_claim":
+		if remoteNativePendingFor(root, r.MessageID) {
+			return remoteNativeClaim(root, node, r.MessageID)
+		}
 		return workNativeClaim(ctx, root, node, r.MessageID)
 	case "deliver_signed_work":
+		var env workNativeEnvelope
+		if len(r.WorkEnvelope) <= workNativeEnvLimit && communicationStrictWorkJSONLimit([]byte(r.WorkEnvelope), &env, workNativeEnvLimit) == nil && env.Kind == remoteNativeKind {
+			return remoteNativeDeliver(ctx, root, node, env, r.WorkEnvelope, hooks)
+		}
 		return workNativeDeliver(ctx, root, node, r.WorkEnvelope)
 	case "work_native_settle":
+		if remoteNativePendingFor(root, r.MessageID) {
+			return remoteNativeSettle(root, node, r.MessageID, r.WorkReply)
+		}
 		return workNativeSettle(ctx, root, node, r.MessageID, r.WorkReply)
 	}
 	return nil, errors.New("unsupported Work carrier operation")
@@ -249,6 +265,13 @@ func workNativeList(root, node string) (map[string]any, error) {
 				continue
 			}
 			items = append(items, map[string]any{"message_id": p.MessageID, "link_id": p.LinkID, "peer_node_id": p.PeerNodeID, "dispatched": p.Dispatched})
+		}
+		if len(items) < workNativeListLimit {
+			remote, e := remoteNativeListItems(root, workNativeListLimit-len(items))
+			if e != nil {
+				return e
+			}
+			items = append(items, remote...)
 		}
 		repins, e := workNativeRepinPending(root)
 		if e != nil {

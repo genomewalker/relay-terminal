@@ -53,6 +53,9 @@ func remoteOutboundResult(receipt communicationRemoteOutbound) map[string]any {
 	result["peer_authentication"] = "not_confirmed"
 	if receipt.PeerConfirmed {
 		result["peer_authentication"] = "mutual_tls_pinned_node"
+		if receipt.Result["peer_authentication"] == workNativeAuth {
+			result["peer_authentication"] = workNativeAuth
+		}
 	}
 	result["request_finished"] = receipt.RequestFinished
 	return result
@@ -165,6 +168,9 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 		return map[string]any{"status": "unknown", "replay_permitted": false, "authority": "relayd"}, nil
 	}
 	if existing && (r.Operation == "remote_send" || (fmtRemoteStatus(receipt.Result) != "outcome_unknown" && fmtRemoteStatus(receipt.Result) != "unknown")) {
+		if remoteNativePendingFor(root, receipt.Wire.MessageID) {
+			return remoteNativeCarried(remoteOutboundResult(receipt)), nil
+		}
 		return remoteOutboundResult(receipt), nil
 	}
 	var binding CommunicationPeerBinding
@@ -214,6 +220,14 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 			if err != nil {
 				return err
 			}
+			if binding.Endpoint == workNativeEndpoint {
+				// The app's carrier takes it from here; the text waits in a private
+				// pending record until the peer confirms.
+				if err := remoteNativeQueue(root, wire, r.Text); err != nil {
+					return err
+				}
+				receipt.Result = remoteNativeCarried(receipt.Result)
+			}
 			if err := communicationAtomic(path, receipt); err != nil {
 				return err
 			}
@@ -232,6 +246,9 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 		if !claimed {
 			return remoteOutboundResult(receipt), nil
 		}
+		if binding.Endpoint == workNativeEndpoint {
+			return remoteNativeCarried(remoteOutboundResult(receipt)), nil
+		}
 	} else {
 		wire.Operation = "receipt"
 		wire.Text = ""
@@ -245,6 +262,10 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 		})
 		if err != nil {
 			return remoteOutboundResult(receipt), err
+		}
+		if binding.Endpoint == workNativeEndpoint {
+			// The carrier settles this receipt; no peer request is made from here.
+			return remoteNativeUnsettled(root, receipt), nil
 		}
 	}
 	body, _ := json.Marshal(wire)
