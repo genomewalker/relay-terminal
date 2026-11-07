@@ -11,11 +11,16 @@ private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 
 @MainActor private final class FakeDaemon {
     var operations: [(String, [String: Any])] = []
     var listings: [[DesktopLinkRequest]]
+    /// Operations that fail, as the owner gate or a pin refusal would.
+    var failing: Set<String> = []
 
     init(listings: [[DesktopLinkRequest]]) { self.listings = listings }
 
     func request(_ operation: String, _ packet: [String: Any]) async throws -> [String: Any] {
         operations.append((operation, packet))
+        if failing.contains(operation) {
+            throw NSError(domain: "FakeDaemon", code: 1, userInfo: [NSLocalizedDescriptionKey: "refused: \(operation)"])
+        }
         if operation == "route_desktop_link_list" {
             let next = listings.isEmpty ? [] : listings.removeFirst()
             let data = try JSONEncoder().encode(next)
@@ -160,4 +165,38 @@ private func listed(id: String = shownRequest.id, createdAt: String = shownReque
     #expect(DesktopLinkWatch.answered(nil, shown: shown, asked: []).isEmpty)
     #expect(DesktopLinkWatch.answered(.approved, shown: shown, asked: []) == [DesktopLinkWatch.askKey(shown)])
     #expect(DesktopLinkWatch.answered(.cancelled, shown: shown, asked: []) == [DesktopLinkWatch.askKey(shown)])
+}
+
+// The owner answered, then the daemon refused to carry the answer out. The answer
+// still counts: the request is not offered again, and the failure is returned to
+// be shown once. Before this, try? dropped the answer and the same sheet came
+// back every pass while the request was live.
+@Test @MainActor func watchKeepsTheOwnersAnswerWhenTheDaemonCallFails() async throws {
+    let now = ISO8601DateFormatter().date(from: "2026-11-07T10:05:00Z")!
+    for (button, failing, expected) in [
+        (NSApplication.ModalResponse.alertFirstButtonReturn, "route_desktop_link_reject", DesktopLinkDecision.rejected),
+        (.alertSecondButtonReturn, "route_desktop_link_approve", .approved),
+        (.alertSecondButtonReturn, "route_desktop_link_list", .approved),
+    ] {
+        let daemon = FakeDaemon(listings: [[shownRequest], [shownRequest]])
+        daemon.failing = [failing]
+        var showed = 0
+        let approval = DesktopLinkApproval(requester: daemon.request) { _, callback in showed += 1; callback(button); return true }
+        let (decision, failure) = await DesktopLinkWatch.outcome { try await approval.decide(shownRequest, current: [shownRequest]) }
+        #expect(decision == expected)
+        #expect(failure?.decision == expected)
+        #expect(failure?.underlying.localizedDescription == "refused: \(failing)")
+        let asked = DesktopLinkWatch.answered(decision, shown: shownRequest, asked: [])
+        #expect(DesktopLinkWatch.due([shownRequest], asked: asked, now: now).isEmpty)
+        #expect(showed == 1)
+    }
+}
+
+// A failure before the owner answered is not an answer: nothing is recorded or
+// reported, and the request is offered again on a later pass.
+@Test @MainActor func watchOffersAgainWhenNothingWasAnswered() async throws {
+    let (decision, failure) = await DesktopLinkWatch.outcome { throw NSError(domain: "listing", code: 2) }
+    #expect(decision == nil)
+    #expect(failure == nil)
+    #expect(DesktopLinkWatch.answered(decision, shown: shownRequest, asked: []).isEmpty)
 }

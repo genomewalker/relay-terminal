@@ -67,16 +67,24 @@ enum DesktopLinkDecision: Equatable {
     case approved, rejected, cancelled, changed, unavailable
 }
 
+/// A daemon call failed after the owner had answered. The answer still counts.
+struct DesktopLinkAnsweredFailure: Error {
+    let decision: DesktopLinkDecision
+    let underlying: Error
+}
+
 /// The owner's decision on one pending desktop link request. Nothing is approved
 /// without the owner's click on the request as it was shown, with the callers it
 /// lists. A request that changed or expired before the click is refused, and the
 /// daemon checks the pair and callers again on its own side.
 ///
-/// The real boundary: the daemon refuses owner operations from agent processes
-/// (pane agents and Claude desktop sessions) and from any caller whose ancestry it
-/// cannot read. Agents and desktop sessions cannot approve. Other same-user programs
-/// that are not agents can still run the owner operations; this panel is the
-/// owner's decision, not a defense against them.
+/// Defense in depth, not a boundary: the daemon refuses owner operations whose
+/// caller is, or descends from, an agent process (pane agents and Claude desktop
+/// sessions), and callers whose ancestry it cannot read. An agent can still reach
+/// the owner operations through a non-agent process it starts outside its own
+/// ancestry: a double fork or nohup reparented to init, tmux or screen, launchctl
+/// or at, or `ssh <host> relayd communication`. Any other same-user program can
+/// run them too. This panel is the owner's decision, not a defense against them.
 @MainActor final class DesktopLinkApproval {
     /// Sends one owner operation to the daemon and returns its reply.
     typealias Requester = @MainActor (_ operation: String, _ packet: [String: Any]) async throws -> [String: Any]
@@ -114,17 +122,37 @@ enum DesktopLinkDecision: Equatable {
         guard let answer else { return .unavailable }
         if answer == .alertFirstButtonReturn {
             // Reject needs no fresh check: removing a request is always safe.
-            _ = try await requester("route_desktop_link_reject", ["request_id": shown.id])
+            try await afterAnswer(.rejected) { _ = try await requester("route_desktop_link_reject", ["request_id": shown.id]) }
             return .rejected
         }
         guard answer == .alertSecondButtonReturn else { return .cancelled }
         // Re-read the owner's listing: a request that changed or expired after
         // it was shown is never approved.
-        guard try await pending().contains(shown) else { return .changed }
-        _ = try await requester("route_desktop_link_approve", [
-            "request_id": shown.id, "source_pane_id": shown.sessionID, "pane_id": shown.paneID,
-            "allowed_callers": shown.proposedCallers])
+        guard try await afterAnswer(.approved, { try await pending().contains(shown) }) else { return .changed }
+        try await afterAnswer(.approved) {
+            _ = try await requester("route_desktop_link_approve", [
+                "request_id": shown.id, "source_pane_id": shown.sessionID, "pane_id": shown.paneID,
+                "allowed_callers": shown.proposedCallers])
+        }
         return .approved
+    }
+
+    /// A daemon call made after the owner answered. Its failure carries the
+    /// answer, so the request is not asked about again.
+    private func afterAnswer<T>(_ decision: DesktopLinkDecision, _ body: () async throws -> T) async throws -> T {
+        do { return try await body() } catch { throw DesktopLinkAnsweredFailure(decision: decision, underlying: error) }
+    }
+
+    /// Tells the owner once that the daemon did not carry out their answer.
+    func report(_ failure: DesktopLinkAnsweredFailure) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = failure.decision == .rejected ? "The desktop link request was not rejected"
+            : "The desktop link request was not approved"
+        alert.informativeText = "Relay could not complete your answer: \(failure.underlying.localizedDescription)\n\n" +
+            "This request will not be shown again. If the session asks again, it appears as a new request."
+        alert.addButton(withTitle: "OK")
+        _ = present(alert) { _ in }
     }
 
     private func ask(_ request: DesktopLinkRequest) async -> NSApplication.ModalResponse? {
@@ -175,6 +203,15 @@ enum DesktopLinkDecision: Equatable {
         }
     }
 
+    /// The decision to record for one ask. A daemon failure after the owner's
+    /// answer keeps the answer and is returned to be shown; any earlier failure
+    /// is no answer, and the request is offered again.
+    static func outcome(_ decide: () async throws -> DesktopLinkDecision) async -> (DesktopLinkDecision?, DesktopLinkAnsweredFailure?) {
+        do { return (try await decide(), nil) }
+        catch let failure as DesktopLinkAnsweredFailure { return (failure.decision, failure) }
+        catch { return (nil, nil) }
+    }
+
     private weak var workspace: WorkspaceModel?
     private var task: Task<Void, Never>?
     private var asked: Set<String> = []
@@ -204,8 +241,9 @@ enum DesktopLinkDecision: Equatable {
             }
             guard let listing = try? await approval.pending() else { continue }
             for shown in Self.due(listing, asked: asked, now: now) {
-                let decision = try? await approval.decide(shown, current: listing)
+                let (decision, failure) = await Self.outcome { try await approval.decide(shown, current: listing) }
                 asked = Self.answered(decision, shown: shown, asked: asked)
+                if let failure { approval.report(failure) }
             }
         }
     }
