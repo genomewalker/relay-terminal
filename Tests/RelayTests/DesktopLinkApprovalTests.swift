@@ -102,3 +102,27 @@ private let shownRequest = DesktopLinkRequest(id: String(repeating: "a", count: 
     #expect(DesktopLinkWatch.due([live], asked: [live.id], now: now).isEmpty)
     #expect(DesktopLinkRequest.parse("2026-11-07T10:10:00.123456Z") != nil)
 }
+
+// A new pair has no reviewed pane link. Its listing proposes the two directional
+// callers, and Approve sends exactly them: the decision path is not a dead end.
+@Test @MainActor func newPairWithoutPaneLinkIsApprovedWithItsDirectionalCallers() async throws {
+    let json = """
+    {"id":"\(String(repeating: "c", count: 64))","session_id":"5a30d83a-5222-48f3-93c7-42fa687d901b",\
+    "account_root":"/Users/owner/.claude-max","pane_id":"1652a003-70e9-4614-addb-68564fa8383b",\
+    "created_at":"2026-11-07T10:00:00Z","expires_at":"2026-11-07T10:10:00Z",\
+    "proposed_callers":["desktop-5a30d83a-5222-48f3-93c7-42fa687d901b","pane-1652a003-70e9-4614-addb-68564fa8383b"]}
+    """
+    let request = try JSONDecoder().decode(DesktopLinkRequest.self, from: Data(json.utf8))
+    #expect(request.refusal == nil)
+    #expect(request.proposedCallers.count == 2)
+    let daemon = FakeDaemon(listings: [[request], [request]])
+    let approval = DesktopLinkApproval(requester: daemon.request) { alert, callback in
+        #expect(alert.informativeText.contains("pane-1652a003-70e9-4614-addb-68564fa8383b"))
+        callback(.alertSecondButtonReturn)
+        return true
+    }
+    #expect(try await approval.decide(request, current: [request]) == .approved)
+    let approve = daemon.operations.last!
+    #expect(approve.0 == "route_desktop_link_approve")
+    #expect(approve.1["allowed_callers"] as? [String] == request.proposedCallers)
+}
