@@ -224,3 +224,17 @@ func TestRecipientOnlyLinkWithoutDaemonNamesTheShadowingConnector(t *testing.T) 
 		t.Fatalf("daemon-backed: %q", got)
 	}
 }
+
+// A pair the owner already approved comes back linked, without telling the
+// session that approval is still needed.
+func TestDesktopSessionLinkReportsLinked(t *testing.T) {
+	wire := filepath.Join(t.TempDir(), "wire.json")
+	helper := nativeMCPFixture(t, nativeFixtureConfig{Pane: desktopSession, ClientPID: os.Getpid(), Source: desktopSessionSource, Wire: wire,
+		Default: nativeFixtureReply{Out: `{"status":"linked","link_id":"c8b2","authority":"relayd"}`, Record: true}})
+	s := server{daemonHelper: helper, callerToken: "fixture-caller"}
+	value, _ := s.daemonCommunication("relay_link_panes", rawArgs(map[string]string{"pane_id": targetPane, "peer_node_id": "e36bb8094237dae4"}))
+	data, _ := json.Marshal(value)
+	if !strings.Contains(string(data), `\"status\":\"linked\"`) || strings.Contains(string(data), "must approve") || strings.Contains(string(data), `"isError":true`) {
+		t.Fatal("a linked pair was reported as awaiting approval", string(data))
+	}
+}

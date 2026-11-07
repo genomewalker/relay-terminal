@@ -20,6 +20,9 @@ const desktopSessionSource = "claude_desktop_session_kernel_owner"
 // desktopSessionNote states what the sender can expect back.
 const desktopSessionNote = "A reply from the pane is delivered back to this Claude desktop session over the approved link; read this send's receipt with relay_pane_message_receipt."
 
+// desktopLinkPollNote tells a desktop session how to learn the outcome itself.
+const desktopLinkPollNote = "Poll the outcome with relay_link_panes request_id=<request_id>. Repeating the same relay_link_panes call is safe and returns status linked once approved."
+
 // peerNodePattern is a relayd node identity: sixteen lowercase hex characters.
 var peerNodePattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
@@ -146,7 +149,14 @@ func (s *server) desktopSessionLink(actor string, arguments map[string]json.RawM
 	if out.Len() > 128<<10 || !json.Valid(out.Bytes()) {
 		return fail("Invalid daemon communication response")
 	}
-	text := out.String() + "\nThe owner must approve this link in Relay on the Mac before any message can be sent. " + desktopSessionNote
+	var reply struct {
+		Status string `json:"status"`
+	}
+	_ = json.Unmarshal(out.Bytes(), &reply)
+	text := out.String() + "\n" + desktopSessionNote
+	if reply.Status != "linked" {
+		text = out.String() + "\nThe owner must approve this link in Relay on the Mac before any message can be sent. " + desktopLinkPollNote + " " + desktopSessionNote
+	}
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": false}, true
 }
 
