@@ -85,13 +85,25 @@ enum RelayHostExecution {
     /// RPC is not used: it resolves state roots from the daemon's environment,
     /// not the login shell the helper runs under.
     @MainActor static func communicationRequest(profile: ConnectionProfile, packet: [String: Any]) async throws -> (value: [String: Any]?, stderr: Data) {
-        let verb = communicationVerb(packet)
-        let fallback = daemonCommand(profile: profile, arguments: [verb])
-        let command = RelayWorkCarrier.carries(packet) ? workCarrierCommand(profile: profile, verb: verb) : "if [ -x \"$HOME/.local/share/relay/bin/relayd-communication\" ]; then \"$HOME/.local/share/relay/bin/relayd-communication\" " + verb + "; else " + fallback + "; fi"
+        let command = communicationCommand(profile: profile, packet: packet)
         let result = try await capture(profile: profile, command: command,
             input: JSONSerialization.data(withJSONObject: packet, options: .sortedKeys), timeout: 60, maximumBytes: captureLimit(packet))
         guard result.exitCode == 0 else { return (nil, result.stderr) }
         return (try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any], result.stderr)
+    }
+    /// The relayd that answers a communication request. On this Mac it is the
+    /// app's own bundled relayd, which an app update replaces: a leftover
+    /// `relayd-communication` helper in the home directory is not managed by
+    /// updates and can be too old to know newer operations (caller_admin_info
+    /// refused every caller policy import and Miko supervisor proof). A remote
+    /// host keeps its installed helper, which relay_install_relayd links to the
+    /// installed payload, and falls back to its relayd.
+    static func communicationCommand(profile: ConnectionProfile, packet: [String: Any]) -> String {
+        let verb = communicationVerb(packet)
+        if RelayWorkCarrier.carries(packet) { return workCarrierCommand(profile: profile, verb: verb) }
+        let fallback = daemonCommand(profile: profile, arguments: [verb])
+        if profile.kind == .local { return fallback }
+        return "if [ -x \"$HOME/.local/share/relay/bin/relayd-communication\" ]; then \"$HOME/.local/share/relay/bin/relayd-communication\" " + verb + "; else " + fallback + "; fi"
     }
     /// A Work claim carries a signed envelope with up to 128 KiB of file and
     /// note, base64-encoded; other replies stay under 128 KiB.

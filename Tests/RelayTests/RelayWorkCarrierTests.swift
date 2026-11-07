@@ -69,6 +69,26 @@ import Testing
     #expect(!command.contains("relayd-communication\""))
 }
 
+/// A stale home-directory helper on this Mac (relayd 0.5.6) refused
+/// caller_admin_info, so every attach, caller policy import and Miko
+/// supervisor proof failed with "Invalid host request".
+@Test func localCommunicationUsesTheBundledRelaydNotAHomeHelper() {
+    let local = ConnectionProfile(name: "This Mac", kind: .local)
+    for packet: [String: Any] in [["operation": "caller_admin_info"], ["operation": "attest_consume"],
+                                  ["operation": "caller_policy_import"], ["shepherd_report": true]] {
+        let command = RelayHostExecution.communicationCommand(profile: local, packet: packet)
+        #expect(!command.contains("relayd-communication"), "local must not use the home helper: \(packet)")
+        #expect(command.hasPrefix("'") && command.contains("/Contents/MacOS/relayd' "), "bundled relayd: \(command)")
+    }
+    #expect(RelayHostExecution.communicationCommand(profile: local, packet: ["operation": "x"]).hasSuffix(" 'communication'"))
+    #expect(RelayHostExecution.communicationCommand(profile: local, packet: ["shepherd_report": true]).hasSuffix(" 'communication-shepherd'"))
+    let remote = ConnectionProfile(name: "dandy", kind: .ssh, host: "dandy-07")
+    let command = RelayHostExecution.communicationCommand(profile: remote, packet: ["operation": "caller_admin_info"])
+    #expect(command.contains("relayd-communication\" communication; else \"$HOME/.local/bin/relayd\" 'communication'; fi"))
+    #expect(RelayHostExecution.communicationCommand(profile: local, packet: ["operation": "work_native_pending"])
+        == RelayHostExecution.workCarrierCommand(profile: local, verb: "communication"))
+}
+
 @Test func workCarrierReadsTheLargestSignedFileEnvelope() {
     #expect(RelayHostExecution.captureLimit(RelayWorkCarrier.claimPacket(messageID: "m")) == 256 << 10)
     #expect(RelayHostExecution.captureLimit(RelayWorkCarrier.pendingPacket) == 256 << 10)
