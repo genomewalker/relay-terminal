@@ -27,8 +27,7 @@ enum TerminalScreenViewportProjection {
                 position += 1
             }
         }
-        guard plain.count >= visible.count, plain.suffix(visible.count).elementsEqual(visible) else { return nil }
-        let prefixCount = plain.count - visible.count
+        guard let prefixCount = visibleStart(plain: plain, visible: visible) else { return nil }
         var styles = [UInt8](), consumed = 0
         position = 0
         while position < bytes.count {
@@ -48,6 +47,31 @@ enum TerminalScreenViewportProjection {
             }
         }
         return nil
+    }
+
+    /// The plain-byte offset where the viewport begins. Rows are compared
+    /// from the bottom and must be equal except for trailing spaces: the VT
+    /// export spells background-filled blank cells (a composer box) as
+    /// spaces, the text API omits them. The first visible row may be the tail
+    /// of a longer logical row from scrollback. Any other difference, a
+    /// leading or inner space included, is a mismatch.
+    private static func visibleStart(plain: [UInt8], visible: [UInt8]) -> Int? {
+        let plainRows = plain.split(separator: 0x0a, omittingEmptySubsequences: false)
+        let visibleRows = visible.split(separator: 0x0a, omittingEmptySubsequences: false)
+        guard plainRows.count >= visibleRows.count else { return nil }
+        func trimmed(_ row: ArraySlice<UInt8>) -> ArraySlice<UInt8> {
+            var end = row.endIndex
+            while end > row.startIndex, row[end - 1] == 0x20 { end -= 1 }
+            return row[row.startIndex..<end]
+        }
+        let first = plainRows.count - visibleRows.count
+        for offset in 1..<max(1, visibleRows.count) {
+            guard trimmed(plainRows[first + offset]).elementsEqual(trimmed(visibleRows[offset])) else { return nil }
+        }
+        let head = trimmed(plainRows[first]), tail = trimmed(visibleRows[0])
+        guard head.count >= tail.count, head.suffix(tail.count).elementsEqual(tail) else { return nil }
+        // Row slices index into `plain`, so the row's start is its plain offset.
+        return plainRows[first].startIndex + head.count - tail.count
     }
 
     private static func escapeEnd(_ bytes: [UInt8], from start: Int) -> Int? {
