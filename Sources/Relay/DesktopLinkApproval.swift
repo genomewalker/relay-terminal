@@ -13,6 +13,11 @@ struct DesktopLinkRequest: Codable, Equatable {
     let proposedCallers: [String]
     /// Why this request cannot be approved yet, when it cannot.
     let refusal: String?
+    /// The host of the pane. Absent from an older listing.
+    let peerNodeID: String?
+    /// "relay_host_channel" when the app must carry the approval to the peer
+    /// host; absent for an HTTPS route and from an older listing.
+    let carrier: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -23,10 +28,12 @@ struct DesktopLinkRequest: Codable, Equatable {
         case expiresAt = "expires_at"
         case proposedCallers = "proposed_callers"
         case refusal
+        case peerNodeID = "peer_node_id"
+        case carrier
     }
 
     init(id: String, sessionID: String, accountRoot: String, paneID: String, createdAt: String, expiresAt: String,
-         proposedCallers: [String] = [], refusal: String? = nil) {
+         proposedCallers: [String] = [], refusal: String? = nil, peerNodeID: String? = nil, carrier: String? = nil) {
         self.id = id
         self.sessionID = sessionID
         self.accountRoot = accountRoot
@@ -35,6 +42,8 @@ struct DesktopLinkRequest: Codable, Equatable {
         self.expiresAt = expiresAt
         self.proposedCallers = proposedCallers
         self.refusal = refusal
+        self.peerNodeID = peerNodeID
+        self.carrier = carrier
     }
 
     init(from decoder: Decoder) throws {
@@ -47,6 +56,15 @@ struct DesktopLinkRequest: Codable, Equatable {
         expiresAt = try values.decode(String.self, forKey: .expiresAt)
         proposedCallers = try values.decodeIfPresent([String].self, forKey: .proposedCallers) ?? []
         refusal = try values.decodeIfPresent(String.self, forKey: .refusal)
+        peerNodeID = try values.decodeIfPresent(String.self, forKey: .peerNodeID)
+        carrier = try values.decodeIfPresent(String.self, forKey: .carrier)
+    }
+
+    /// The peer node the app must reach before approving, when the route is
+    /// carried by the Relay host channel.
+    var hostChannelPeer: String? {
+        guard carrier == "relay_host_channel", let node = peerNodeID, !node.isEmpty else { return nil }
+        return node
     }
 
     /// True until the daemon's expiry time has passed. Unparseable times are not live.
@@ -70,6 +88,7 @@ enum DesktopLinkDecision: Equatable {
 /// Carrying a host-channel approval failed before the pair was established.
 enum DesktopLinkCarrierError: LocalizedError, Equatable {
     case noConnectedHost(String)
+    case identityChanged(String)
     case peerUnsupported(String)
     case malformed
 
@@ -77,6 +96,8 @@ enum DesktopLinkCarrierError: LocalizedError, Equatable {
         switch self {
         case .noConnectedHost(let node):
             "No single connected host reports node \(node), so the approval could not reach it and nothing was sent to it. Open a pane on that host in Relay, then ask the session to request the link again."
+        case .identityChanged(let node):
+            "The signing key of the host for node \(node) changed since it was trusted. Confirm the new key in Relay before approving; nothing was sent to it."
         case .peerUnsupported(let node):
             "The requested host's relayd (node \(node)) does not support native desktop link approval; update it. Nothing was established."
         case .malformed: "The host-channel approval exchange returned an unexpected reply; nothing was established."
@@ -152,10 +173,19 @@ struct DesktopLinkAnsweredFailure: Error {
         // it was shown is never approved.
         guard try await afterAnswer(.approved, { try await pending().contains(shown) }) else { return .changed }
         try await afterAnswer(.approved) {
+            // A host-channel route needs the peer host to carry the exchange. Find it
+            // before approve spends the owner capability and starts the freshness
+            // window; with no single connected host, nothing is spent. An HTTPS
+            // route (no carrier listed) needs no lookup.
+            var carrier: Requester?
+            if let node = shown.hostChannelPeer {
+                guard let found = try await peer?(node) else { throw DesktopLinkCarrierError.noConnectedHost(node) }
+                carrier = found
+            }
             let reply = try await requester("route_desktop_link_approve", [
                 "request_id": shown.id, "source_pane_id": shown.sessionID, "pane_id": shown.paneID,
                 "allowed_callers": shown.proposedCallers])
-            if reply["status"] as? String == "dispatch" { try await carry(reply) }
+            if reply["status"] as? String == "dispatch" { try await carry(reply, expected: shown.hostChannelPeer, via: carrier) }
         }
         return .approved
     }
@@ -165,13 +195,17 @@ struct DesktopLinkAnsweredFailure: Error {
     /// that relayd's signed reply is handed back; this host's relayd checks the
     /// reply against its pinned key before saving anything. This carrier can
     /// delay or drop the exchange but cannot forge, alter or redirect it.
-    private func carry(_ dispatch: [String: Any]) async throws {
+    private func carry(_ dispatch: [String: Any], expected: String?, via carrier: Requester?) async throws {
         guard let node = dispatch["peer_node_id"] as? String, !node.isEmpty,
               let messageID = dispatch["message_id"] as? String, !messageID.isEmpty,
               let envelope = dispatch["establish_envelope"] as? String, !envelope.isEmpty else {
             throw DesktopLinkCarrierError.malformed
         }
-        guard let peerRequester = try await peer?(node) else { throw DesktopLinkCarrierError.noConnectedHost(node) }
+        if let expected, expected != node { throw DesktopLinkCarrierError.malformed }
+        // A route that became host-channel after the listing is resolved here.
+        var resolved = carrier
+        if resolved == nil { resolved = try await peer?(node) }
+        guard let peerRequester = resolved else { throw DesktopLinkCarrierError.noConnectedHost(node) }
         let delivered: [String: Any]
         do {
             delivered = try await peerRequester("deliver_signed_desktop_establish", ["establish_envelope": envelope])
@@ -286,18 +320,15 @@ struct DesktopLinkAnsweredFailure: Error {
         }
     }
 
-    /// The one other connected relay host whose relayd reports node, found
-    /// through the pinned node_identity path: a host whose key changed since it
-    /// was trusted is not used.
+    /// The one other connected relay host whose relayd reports node. Nothing is
+    /// pinned or saved: see DesktopLinkPeerLookup.
     static func peerRequester(_ node: String, workspace: WorkspaceModel, excluding own: ConnectionProfile) async throws -> DesktopLinkApproval.Requester? {
         var seen: Set<String> = [own.connectionKey]
         let profiles = workspace.panes.values.map(\.profile).filter { $0.backend == .relay && seen.insert($0.connectionKey).inserted }
-        var matches: [ConnectionProfile] = []
-        for profile in profiles {
-            if let pin = try? await RelayNodeTrust.shared.observe(profile), pin.nodeID == node { matches.append(profile) }
-        }
-        guard matches.count == 1 else { return nil }
-        return requester(matches[0])
+        let trust = RelayNodeTrust.shared
+        let lookup = DesktopLinkPeerLookup(hosts: profiles, pins: trust.pins, mismatches: trust.mismatches,
+                                           identify: { try await trust.identify($0) })
+        return try await lookup.resolve(node).map(requester)
     }
 
     /// One pass over the connected hosts. Requests are asked about one at a time.
@@ -313,5 +344,79 @@ struct DesktopLinkAnsweredFailure: Error {
                 if let failure { approval.report(failure) }
             }
         }
+    }
+}
+
+/// Selects the connected host that carries a host-channel approval to a peer
+/// node. It only selects a carrier: the relayds verify every signed frame
+/// against their own pins, so a wrong choice can fail the exchange but never
+/// forge it. It pins, saves and records nothing.
+///
+/// Saved pins are matched first, without contacting any host. Only hosts with
+/// no saved pin are asked for their node identity, all at once, and the answer
+/// is whatever arrived within `timeout`, so one slow host cannot hold it up.
+/// A host whose recorded key changed for this node is reported as such.
+@MainActor struct DesktopLinkPeerLookup {
+    typealias Identify = @MainActor (ConnectionProfile) async throws -> RelayNodeTrust.Pin
+
+    let hosts: [ConnectionProfile]
+    let pins: [UUID: RelayNodeTrust.Pin]
+    let mismatches: [UUID: RelayNodeTrust.Mismatch]
+    let identify: Identify
+    var timeout: Duration = .seconds(10)
+
+    func resolve(_ node: String) async throws -> ConnectionProfile? {
+        if hosts.contains(where: { host in
+            mismatches[host.id].map { $0.pinned.nodeID == node || $0.offered.nodeID == node } ?? false
+        }) {
+            throw DesktopLinkCarrierError.identityChanged(node)
+        }
+        let pinned = hosts.filter { pins[$0.id]?.nodeID == node }
+        if !pinned.isEmpty { return pinned.count == 1 ? pinned[0] : nil }
+        let unpinned = hosts.filter { pins[$0.id] == nil }
+        guard !unpinned.isEmpty else { return nil }
+        let answers = await Self.collect(unpinned, timeout: timeout, identify: identify)
+        let matches = unpinned.filter { answers[$0.id] == node }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    /// Asks every host at once and returns the node IDs that answered before
+    /// the timeout. A host that has not answered by then is left out.
+    private static func collect(_ hosts: [ConnectionProfile], timeout: Duration, identify: @escaping Identify) async -> [UUID: String] {
+        let box = DesktopLinkLookupBox(remaining: hosts.count)
+        return await withCheckedContinuation { (continuation: CheckedContinuation<[UUID: String], Never>) in
+            box.continuation = continuation
+            for host in hosts {
+                Task { @MainActor in
+                    let pin = try? await identify(host)
+                    box.answer(host.id, pin?.nodeID)
+                }
+            }
+            box.timer = Task { @MainActor in
+                try? await Task.sleep(for: timeout)
+                box.finish()
+            }
+        }
+    }
+}
+
+@MainActor private final class DesktopLinkLookupBox {
+    var remaining: Int
+    var answers: [UUID: String] = [:]
+    var continuation: CheckedContinuation<[UUID: String], Never>?
+    var timer: Task<Void, Never>?
+
+    init(remaining: Int) { self.remaining = remaining }
+
+    func answer(_ id: UUID, _ node: String?) {
+        remaining -= 1
+        if let node, continuation != nil { answers[id] = node }
+        if remaining == 0 { finish() }
+    }
+
+    func finish() {
+        timer?.cancel()
+        continuation?.resume(returning: answers)
+        continuation = nil
     }
 }

@@ -89,14 +89,8 @@ import Foundation
     /// or throws `identityChanged` if it differs from the pinned key.
     @discardableResult
     func observe(_ profile: ConnectionProfile) async throws -> Pin {
-        let reply = try await request(profile, ["operation": "node_identity"])
-        guard reply["authority"] as? String == "relayd" else { throw TrustError.invalidIdentity("not answered by relayd") }
-        guard let node = reply["node_id"] as? String, Self.validNodeID(node) else { throw TrustError.invalidIdentity("host ID") }
-        guard let pem = reply["certificate_pem"] as? String, let computed = Self.certificateFingerprint(pem),
-              reply["certificate_sha256"] as? String == computed else {
-            throw TrustError.invalidIdentity("certificate does not match its fingerprint")
-        }
-        let offered = Pin(hostID: profile.id, nodeID: node, certificatePEM: pem, certificateSHA256: computed, pinnedAt: now())
+        let offered = try await identify(profile)
+        let node = offered.nodeID, computed = offered.certificateSHA256
         if let pinned = pins[profile.id] {
             guard pinned.certificateSHA256 == computed, pinned.nodeID == node else {
                 mismatches[profile.id] = Mismatch(pinned: pinned, offered: offered)
@@ -108,6 +102,19 @@ import Foundation
         pins[profile.id] = offered
         try save()
         return offered
+    }
+
+    /// Fetches and validates the host's identity without pinning, saving or
+    /// recording anything. The returned pin is only what the host offered.
+    func identify(_ profile: ConnectionProfile) async throws -> Pin {
+        let reply = try await request(profile, ["operation": "node_identity"])
+        guard reply["authority"] as? String == "relayd" else { throw TrustError.invalidIdentity("not answered by relayd") }
+        guard let node = reply["node_id"] as? String, Self.validNodeID(node) else { throw TrustError.invalidIdentity("host ID") }
+        guard let pem = reply["certificate_pem"] as? String, let computed = Self.certificateFingerprint(pem),
+              reply["certificate_sha256"] as? String == computed else {
+            throw TrustError.invalidIdentity("certificate does not match its fingerprint")
+        }
+        return Pin(hostID: profile.id, nodeID: node, certificatePEM: pem, certificateSHA256: computed, pinnedAt: now())
     }
 
     /// Owner action: adopt a host's changed key after reviewing it.

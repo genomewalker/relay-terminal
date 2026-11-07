@@ -294,3 +294,108 @@ private func listed(id: String = shownRequest.id, createdAt: String = shownReque
     #expect(older.operations == ["deliver_signed_desktop_establish"])
     #expect(!mac.names().contains("route_desktop_link_settle"))
 }
+
+/// The same request as listed for a route carried by the Relay host channel.
+private let nativeRequest = DesktopLinkRequest(id: shownRequest.id, sessionID: shownRequest.sessionID, accountRoot: shownRequest.accountRoot,
+    paneID: shownRequest.paneID, createdAt: shownRequest.createdAt, expiresAt: shownRequest.expiresAt,
+    proposedCallers: shownRequest.proposedCallers, peerNodeID: "node-b", carrier: "relay_host_channel")
+
+// F1: the peer host is resolved before anything is spent. With no connected
+// host for the node, approve is never called and the answer is kept.
+@Test @MainActor func hostChannelApprovalResolvesThePeerBeforeSpendingTheApproval() async throws {
+    let mac = FakeDaemon(listings: [[nativeRequest]])
+    mac.replies = ["route_desktop_link_approve": hostChannelDispatch]
+    let approval = hostChannelApproval(mac: mac, peer: nil) { _ in }
+    let (decision, failure) = await DesktopLinkWatch.outcome { try await approval.decide(nativeRequest, current: [nativeRequest]) }
+    #expect(decision == .approved)
+    #expect(failure?.underlying as? DesktopLinkCarrierError == .noConnectedHost("node-b"))
+    #expect(mac.names() == ["route_desktop_link_list"])
+}
+
+// The peer is resolved before approve, then the exchange is carried.
+@Test @MainActor func hostChannelApprovalResolvesThenApprovesThenCarries() async throws {
+    let mac = FakeDaemon(listings: [[nativeRequest]])
+    mac.replies = ["route_desktop_link_approve": hostChannelDispatch, "route_desktop_link_settle": ["status": "established"]]
+    let peer = FakeDaemon(listings: [])
+    peer.replies = ["deliver_signed_desktop_establish": ["status": "delivered_reply", "establish_reply": "signed-reply"]]
+    var callsAtResolution: [String] = []
+    let approval = hostChannelApproval(mac: mac, peer: peer) { _ in callsAtResolution = mac.names() }
+    #expect(try await approval.decide(nativeRequest, current: [nativeRequest]) == .approved)
+    #expect(callsAtResolution == ["route_desktop_link_list"])
+    #expect(mac.names() == ["route_desktop_link_list", "route_desktop_link_approve", "route_desktop_link_settle"])
+    #expect(peer.names() == ["deliver_signed_desktop_establish"])
+}
+
+@Test func olderListingWithoutPeerNodeStillDecodes() throws {
+    let json = #"[{"id":"\#(String(repeating: "a", count: 64))","session_id":"s","account_root":"/r","pane_id":"p","created_at":"2026-11-07T10:00:00Z","expires_at":"2026-11-07T10:10:00Z","proposed_callers":["c"]}]"#
+    let decoded = try JSONDecoder().decode([DesktopLinkRequest].self, from: Data(json.utf8))
+    #expect(decoded.count == 1)
+    #expect(decoded[0].peerNodeID == nil && decoded[0].carrier == nil && decoded[0].hostChannelPeer == nil)
+    let current = #"[{"id":"x","session_id":"s","account_root":"/r","pane_id":"p","created_at":"t","expires_at":"t","peer_node_id":"node-b","carrier":"relay_host_channel"}]"#
+    #expect(try JSONDecoder().decode([DesktopLinkRequest].self, from: Data(current.utf8))[0].hostChannelPeer == "node-b")
+}
+
+private let lookupPEM = "-----BEGIN CERTIFICATE-----\n" + Data("relay-fixture-certificate".utf8).base64EncodedString() + "\n-----END CERTIFICATE-----"
+
+private func lookupPin(_ host: ConnectionProfile, _ node: String) -> RelayNodeTrust.Pin {
+    RelayNodeTrust.Pin(hostID: host.id, nodeID: node, certificatePEM: lookupPEM,
+                       certificateSHA256: RelayNodeTrust.certificateFingerprint(lookupPEM)!, pinnedAt: Date())
+}
+
+@Test @MainActor func peerLookupPrefersSavedPinsWithoutContactingHosts() async throws {
+    let a = ConnectionProfile(host: "a.invalid"), b = ConnectionProfile(host: "b.invalid")
+    var asked = 0
+    let lookup = DesktopLinkPeerLookup(hosts: [a, b], pins: [a.id: lookupPin(a, "node-a"), b.id: lookupPin(b, "node-b")], mismatches: [:],
+        identify: { host in asked += 1; return lookupPin(host, "node-b") })
+    #expect(try await lookup.resolve("node-b")?.id == b.id)
+    #expect(asked == 0)
+}
+
+@Test @MainActor func peerLookupIsNotHeldUpByASlowHost() async throws {
+    let slow = ConnectionProfile(host: "slow.invalid"), fast = ConnectionProfile(host: "fast.invalid")
+    var lookup = DesktopLinkPeerLookup(hosts: [slow, fast], pins: [:], mismatches: [:], identify: { host in
+        if host.id == slow.id { try await Task.sleep(for: .seconds(30)) }
+        return lookupPin(host, host.id == fast.id ? "node-b" : "node-c")
+    })
+    lookup.timeout = .milliseconds(300)
+    let clock = ContinuousClock()
+    let started = clock.now
+    let found = try await lookup.resolve("node-b")
+    let elapsed = clock.now - started
+    #expect(found?.id == fast.id)
+    #expect(elapsed < .seconds(3))
+}
+
+@Test @MainActor func peerLookupFindsNoSingleHost() async throws {
+    let a = ConnectionProfile(host: "a.invalid"), b = ConnectionProfile(host: "b.invalid")
+    let none = DesktopLinkPeerLookup(hosts: [a], pins: [:], mismatches: [:], identify: { lookupPin($0, "node-c") })
+    #expect(try await none.resolve("node-b") == nil)
+    let two = DesktopLinkPeerLookup(hosts: [a, b], pins: [:], mismatches: [:], identify: { lookupPin($0, "node-b") })
+    #expect(try await two.resolve("node-b") == nil)
+}
+
+// F3: a host whose recorded key changed is reported as an identity change.
+@Test @MainActor func peerLookupNamesAChangedHostKey() async throws {
+    let a = ConnectionProfile(host: "a.invalid")
+    let mismatch = RelayNodeTrust.Mismatch(pinned: lookupPin(a, "node-b"), offered: lookupPin(a, "node-b"))
+    let lookup = DesktopLinkPeerLookup(hosts: [a], pins: [a.id: lookupPin(a, "node-b")], mismatches: [a.id: mismatch],
+        identify: { lookupPin($0, "node-b") })
+    await #expect(throws: DesktopLinkCarrierError.identityChanged("node-b")) { try await lookup.resolve("node-b") }
+    #expect(DesktopLinkCarrierError.identityChanged("node-b").localizedDescription.contains("signing key"))
+    #expect(DesktopLinkCarrierError.identityChanged("node-b").localizedDescription != DesktopLinkCarrierError.noConnectedHost("node-b").localizedDescription)
+}
+
+// F2: selecting the carrier pins and saves nothing, even for an unpinned host.
+@Test @MainActor func peerLookupSavesNoPin() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("relay-lookup-" + UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let trust = RelayNodeTrust(directory: directory, request: { _, _ in
+        ["authority": "relayd", "node_id": "node-b", "certificate_pem": lookupPEM,
+         "certificate_sha256": RelayNodeTrust.certificateFingerprint(lookupPEM)!]
+    })
+    let host = ConnectionProfile(host: "b.invalid")
+    let lookup = DesktopLinkPeerLookup(hosts: [host], pins: trust.pins, mismatches: trust.mismatches, identify: { try await trust.identify($0) })
+    #expect(try await lookup.resolve("node-b")?.id == host.id)
+    #expect(trust.pins.isEmpty && trust.mismatches.isEmpty)
+    #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("pins.json").path))
+}
