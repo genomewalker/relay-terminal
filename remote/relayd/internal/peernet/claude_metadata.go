@@ -35,10 +35,16 @@ func metadataText(s string, limit int) bool {
 // Team membership is descriptive metadata, never liveness or a messaging edge.
 // Decode only whitelisted fields: team configs can also contain private prompts.
 func discoverClaudeTeams(home string, records []Record) ([]ClaudeTeam, bool) {
+	// The app refuses more than 16 teams in total, so the cap is on the sum
+	// across accounts, not only per account.
 	result, truncated := []ClaudeTeam{}, false
 	for _, config := range claudeConfigs(home) {
 		teams, partial := discoverClaudeTeamsIn(filepath.Join(config, "teams"), records)
-		result, truncated = append(result, teams...), truncated || partial
+		truncated = truncated || partial
+		if room := 16 - len(result); len(teams) > room {
+			teams, truncated = teams[:room], true
+		}
+		result = append(result, teams...)
 	}
 	return result, truncated
 }
