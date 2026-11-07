@@ -26,6 +26,15 @@ const (
 	remoteNativeKind      = "remote"
 	remoteNativeReplyKind = "remote_reply"
 	remoteNativeNote      = "carried by the Relay app over the host channel; query this receipt later, never resend"
+	// remoteNativeTooLate names a signed message the carrier could not deliver
+	// while the sender's signed statement was still valid.
+	remoteNativeTooLate = "carried too late: the sender's signed statement would expire before delivery; nothing was sent. Resend under a new message ID"
+	// remoteNativeTooLateDelivery is the receiver's refusal of a signed message
+	// whose statement expired in transit. An earlier copy may have arrived.
+	remoteNativeTooLateDelivery = "carried too late: the sender's signed statement expired before delivery; it was not delivered now. Ask the recipient whether an earlier copy arrived, then resend under a new message ID"
+	// remoteNativeSignedWindow leaves the carrier time to deliver before the
+	// statement expires.
+	remoteNativeSignedWindow = communicationStatementTTL - time.Minute
 )
 
 type remoteNativePending struct {
@@ -155,6 +164,19 @@ func remoteNativeClaim(root, node, id string) (map[string]any, error) {
 			settled = true
 			return os.Remove(remoteNativePendingPath(root, id))
 		}
+		if !p.Dispatched && receipt.Wire.SourceSignature != "" && workNativeNow().Sub(p.Created) > remoteNativeSignedWindow {
+			// Nothing left this host, and the sender's signed statement would have
+			// expired on arrival: say so rather than deliver an unverified label.
+			receipt.Result = map[string]any{"status": "not_sent", "carrier": "relay_host_channel", "error": remoteNativeTooLate}
+			receipt.RequestFinished = true
+			if err := communicationAtomic(remoteOutboundPath(root, id), receipt); err != nil {
+				return err
+			}
+			if err := os.Remove(remoteNativePendingPath(root, id)); err != nil {
+				return err
+			}
+			return errors.New(remoteNativeTooLate)
+		}
 		if workNativeNow().Sub(p.Created) > workNativeQueryWindow {
 			receipt.Result = map[string]any{"status": "outcome_unknown", "carrier": "relay_host_channel",
 				"error": "the peer did not confirm this message within 24 h; ask the recipient before sending it again under a new ID"}
@@ -226,8 +248,24 @@ func remoteNativeDeliver(ctx context.Context, root, node string, env workNativeE
 	if err != nil {
 		return nil, err
 	}
-	result, err := communicationReceiveRemote(ctx, root, node, signer, m, hooks)
-	if err != nil {
+	tooLate := false
+	// A signed message whose statement expired in transit is refused by name,
+	// never delivered with a downgraded label. A repeat of a delivered message
+	// is still answered from its receipt.
+	if m.SourceSignature != "" {
+		if _, e := os.Stat(remoteReceiptPath(root, m.SourceNodeID, m.MessageID)); errors.Is(e, os.ErrNotExist) {
+			if _, _, sigErr := communicationRemoteSourcePacket(m, signer, workNativeNow()); strings.Contains(sigErr, "expired") {
+				tooLate = true
+			}
+		}
+	}
+	var result map[string]any
+	if tooLate {
+		// Answered, signed and unrecorded: the sender settles on this refusal.
+		result = map[string]any{"status": "not_delivered", "error": remoteNativeTooLateDelivery, "message_id": m.MessageID,
+			"source_node_id": m.SourceNodeID, "source_pane_id": m.SourcePaneID, "target_node_id": m.TargetNodeID, "pane_id": m.TargetPaneID,
+			"submitting_client_id": m.CallerID, "fingerprint": m.Fingerprint}
+	} else if result, err = communicationReceiveRemote(ctx, root, node, signer, m, hooks); err != nil {
 		return nil, err
 	}
 	reply, err := json.Marshal(remoteNativeReply{MessageID: m.MessageID, LinkID: m.LinkID, Fingerprint: m.Fingerprint, Result: result})

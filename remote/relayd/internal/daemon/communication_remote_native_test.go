@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"strings"
 	"testing"
@@ -185,5 +187,84 @@ func TestHostChannelRemoteMessageReplayDeliveredOnce(t *testing.T) {
 	}
 	if got, handled, _ := communicationRemoteReceiptLookup(f.a, "node-a", CommunicationRequest{Operation: "receipt", MessageID: id}, f.hooksA); handled {
 		t.Fatal("an unauthenticated receipt query read the remote receipt", got)
+	}
+}
+
+// hostChannelPaneReply queues a signed pane reply to the desktop session on node-b.
+func hostChannelPaneReply(t *testing.T, f scopedNodes, id string) {
+	t.Helper()
+	token := sha256.Sum256([]byte(replyToken))
+	if err := communicationAtomic(communicationPolicyPath(f.b), communicationPolicy{Callers: []communicationCaller{{ID: "receiver", Label: "Pane", TokenHash: hex.EncodeToString(token[:])}}}); err != nil {
+		t.Fatal(err)
+	}
+	reply := CommunicationRequest{Operation: "send", SourcePaneID: testGroupB, PaneID: desktopAlias, MessageID: id,
+		Text: "late reply", ClientToken: replyToken, ActorPaneID: testGroupB, actorVerified: true}
+	// A pane with a process identity, so its host signs the reply.
+	hooks := f.hooksB
+	hooks.observe = func(pane string) communicationMember {
+		m := f.hooksB.observe(pane)
+		m.PID, m.Start = 4242, "fixture"
+		return m
+	}
+	if got, linked, err := communicationSendToDesktop(f.b, "node-b", reply, hooks); !linked || err != nil || got["carrier"] != "relay_host_channel" {
+		t.Fatal("queue reply", got, err)
+	}
+	var receipt communicationRemoteOutbound
+	if err := communicationRead(remoteOutboundPath(f.b, id), &receipt); err != nil || receipt.Wire.SourceSignature == "" {
+		t.Fatal("the pane reply is not signed, so this test proves nothing", err)
+	}
+}
+
+// A signed reply the carrier could not take before its statement would expire
+// is not sent, and its receipt names why.
+func TestHostChannelSignedReplyTooLateIsNotSent(t *testing.T) {
+	f, _ := hostChannelLinked(t)
+	id := "c6c6c6c6-c6c6-4c6c-8c6c-c6c6c6c6c6c6"
+	hostChannelPaneReply(t, f, id)
+	nativeClock(t, communicationStatementTTL)
+	if _, err := hostChannelOp(f.b, "node-b", f.hooksB, CommunicationRequest{Operation: "work_native_claim", MessageID: id}); err == nil || !strings.Contains(err.Error(), "carried too late") {
+		t.Fatal("a late signed reply was claimed", err)
+	}
+	var receipt communicationRemoteOutbound
+	if err := communicationRead(remoteOutboundPath(f.b, id), &receipt); err != nil || receipt.Result["status"] != "not_sent" ||
+		!strings.Contains(receipt.Result["error"].(string), "carried too late") || remoteNativePendingFor(f.b, id) {
+		t.Fatal("late reply receipt", receipt.Result, err)
+	}
+}
+
+// A signed reply whose statement expired in transit is refused by the
+// receiver with a signed, named answer the sender settles on; nothing reaches
+// the desktop inbox.
+func TestHostChannelSignedReplyExpiredInTransitIsRefusedByName(t *testing.T) {
+	f, _ := hostChannelLinked(t)
+	id := "c7c7c7c7-c7c7-4c7c-8c7c-c7c7c7c7c7c7"
+	hostChannelPaneReply(t, f, id)
+	claim, err := hostChannelOp(f.b, "node-b", f.hooksB, CommunicationRequest{Operation: "work_native_claim", MessageID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeClock(t, communicationStatementTTL+time.Minute)
+	delivered, err := hostChannelOp(f.a, "node-a", f.hooksA, CommunicationRequest{Operation: "deliver_signed_work", WorkEnvelope: claim["work_envelope"].(string)})
+	if err != nil {
+		t.Fatal("deliver", err)
+	}
+	settled, err := hostChannelOp(f.b, "node-b", f.hooksB, CommunicationRequest{Operation: "work_native_settle", MessageID: id, WorkReply: delivered["work_reply"].(string)})
+	if err != nil || settled["status"] != "not_delivered" || !strings.Contains(settled["error"].(string), "carried too late") {
+		t.Fatal("expired-in-transit reply", settled, err)
+	}
+	inbox, err := communicationDesktopInboxRead(f.a, CommunicationRequest{Operation: "desktop_inbox_read", SourcePaneID: desktopAlias, ActorPaneID: desktopAlias, actorVerified: true})
+	if err == nil && len(inbox["messages"].([]desktopInboxEntry)) != 0 {
+		t.Fatal("an expired reply reached the desktop inbox", inbox)
+	}
+}
+
+// A signed reply carried in time is delivered as signed.
+func TestHostChannelSignedReplyInTimeIsDelivered(t *testing.T) {
+	f, _ := hostChannelLinked(t)
+	id := "c9c9c9c9-c9c9-4c9c-8c9c-c9c9c9c9c9c9"
+	hostChannelPaneReply(t, f, id)
+	settled := hostChannelCarry(t, f.b, "node-b", f.hooksB, f.a, "node-a", f.hooksA)
+	if len(settled) != 1 || settled[0]["source_authentication"] != "source_signed" || settled[0]["status"] == "not_delivered" {
+		t.Fatal("a signed reply in time was not delivered as signed", settled)
 	}
 }
