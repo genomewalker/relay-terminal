@@ -64,6 +64,8 @@ type CommunicationRequest struct {
 	SourceSignature            string                     `json:"source_signature,omitempty"`
 	WorkEnvelope               string                     `json:"work_envelope,omitempty"`
 	WorkReply                  string                     `json:"work_reply,omitempty"`
+	EstablishEnvelope          string                     `json:"establish_envelope,omitempty"`
+	EstablishReply             string                     `json:"establish_reply,omitempty"`
 	TrustedNodes               []communicationTrustedNode `json:"trusted_nodes,omitempty"`
 	TrustPin                   *communicationTrustPin      `json:"trust_pin,omitempty"`
 	Scope                      *communicationScopeRecord  `json:"scope,omitempty"`
@@ -424,6 +426,14 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 	}
 	if r.Operation == "desktop_inbox_read" {
 		return communicationDesktopInboxRead(communicationRoot(), r)
+	}
+	if r.Operation == "route_desktop_link_settle" {
+		return communicationDesktopNativeSettle(communicationRoot(), currentCommunicationNodeID(), r,
+			communicationGroupNative{observe: communicationObserve, send: communicationNative})
+	}
+	if r.Operation == "deliver_signed_desktop_establish" {
+		return communicationDesktopNativeReceive(communicationRoot(), currentCommunicationNodeID(), r,
+			communicationGroupNative{observe: communicationObserve, send: communicationNative})
 	}
 	if r.Operation == "route_desktop_link_reject" {
 		return communicationDesktopLinkReject(communicationRoot(), r)

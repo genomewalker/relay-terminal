@@ -120,6 +120,11 @@ func communicationDesktopLinkEstablish(root, node string, r CommunicationRequest
 		caller: capability.Outbound, replyCaller: capability.Reply, approved: true, scopeRecord: &peerScope, desktopAccount: capability.AccountRoot}
 	run := CommunicationRequest{Operation: "route_desktop_link_establish", SourcePaneID: capability.SessionID, PaneID: capability.PaneID,
 		PeerNodeID: capability.PeerNodeID}
+	if binding.Endpoint == workNativeEndpoint {
+		// The app carries the signed proposal to the peer and returns its
+		// signed reply to route_desktop_link_settle.
+		return desktopNativeDispatch(root, node, capability.RequestID, run, plan, hooks)
+	}
 	link, err := communicationEstablishRun(root, node, run, plan, hooks)
 	if err != nil {
 		return nil, err

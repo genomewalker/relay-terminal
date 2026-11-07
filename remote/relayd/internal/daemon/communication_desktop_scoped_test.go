@@ -22,6 +22,7 @@ type scopedNodes struct {
 	calls     *claudeSessionCalls
 	paneCalls *atomic.Int32
 	hooksA    communicationGroupNative
+	hooksB    communicationGroupNative
 	certA     string
 	certB     string
 	serverB   string
@@ -70,7 +71,7 @@ func scopedFixture(t *testing.T, pinB bool) scopedNodes {
 	if pinB {
 		pinScopeSigner(t, b, "node-a", certA)
 	}
-	return scopedNodes{a: a, b: b, calls: calls, paneCalls: paneCalls, hooksA: ahooks, certA: certA, certB: certB,
+	return scopedNodes{a: a, b: b, calls: calls, paneCalls: paneCalls, hooksA: ahooks, hooksB: bhooks, certA: certA, certB: certB,
 		serverB: strings.TrimPrefix(serverB.URL, "https://"), account: account}
 }
 

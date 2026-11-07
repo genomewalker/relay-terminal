@@ -251,13 +251,10 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 	if !ok {
 		return empty, errors.New("source conversation unavailable; pair not established")
 	}
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
+	m, err := establishWireFor(node, r, plan, local)
+	if err != nil {
 		return empty, err
 	}
-	m := communicationEstablishWire{Version: establishWireVersion, Operation: "establish", MessageID: hex.EncodeToString(id[:]), SourceNodeID: node, TargetNodeID: r.PeerNodeID,
-		SourcePaneID: r.SourcePaneID, TargetPaneID: r.PaneID, CallerID: plan.caller, SourceConversation: local, ScopeID: plan.scopeID, ScopeRecord: plan.scopeRecord, ReplyCallerID: plan.replyCaller}
-	m.Fingerprint = establishFingerprint(m)
 	body, _ := json.Marshal(m)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -265,21 +262,49 @@ func communicationEstablishRun(root, node string, r CommunicationRequest, plan *
 	if err != nil {
 		return empty, errors.New("peer did not confirm the pair; nothing established here")
 	}
-	var reply struct {
-		Status             string                          `json:"status"`
-		MessageID          string                          `json:"message_id"`
-		LinkID             string                          `json:"link_id"`
-		Fingerprint        string                          `json:"fingerprint"`
-		TargetConversation communicationPinnedConversation `json:"target_conversation"`
+	var reply establishReply
+	if json.Unmarshal(data, &reply) != nil {
+		return empty, errors.New("peer pair confirmation unavailable; nothing established here")
 	}
+	return establishConfirm(root, node, r, plan, m.MessageID, m.Fingerprint, local, reply, hooks)
+}
+
+// establishWireFor builds a fresh establish proposal: a new random message ID
+// and the fingerprint over every field.
+func establishWireFor(node string, r CommunicationRequest, plan *establishPlan, local communicationPinnedConversation) (communicationEstablishWire, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return communicationEstablishWire{}, err
+	}
+	m := communicationEstablishWire{Version: establishWireVersion, Operation: "establish", MessageID: hex.EncodeToString(id[:]), SourceNodeID: node, TargetNodeID: r.PeerNodeID,
+		SourcePaneID: r.SourcePaneID, TargetPaneID: r.PaneID, CallerID: plan.caller, SourceConversation: local, ScopeID: plan.scopeID, ScopeRecord: plan.scopeRecord, ReplyCallerID: plan.replyCaller}
+	m.Fingerprint = establishFingerprint(m)
+	return m, nil
+}
+
+// establishReply is the peer's answer to one establish proposal.
+type establishReply struct {
+	Status             string                          `json:"status"`
+	MessageID          string                          `json:"message_id"`
+	LinkID             string                          `json:"link_id"`
+	Fingerprint        string                          `json:"fingerprint"`
+	TargetConversation communicationPinnedConversation `json:"target_conversation"`
+}
+
+// establishConfirm checks the peer's reply against the proposal it answers and
+// saves this host's half, re-checking everything that could have changed while
+// the proposal was in flight.
+func establishConfirm(root, node string, r CommunicationRequest, plan *establishPlan, messageID, fingerprint string, local communicationPinnedConversation, reply establishReply, hooks communicationGroupNative) (CommunicationRemoteLink, error) {
+	var empty CommunicationRemoteLink
 	linkID := remotePairID(node, r.SourcePaneID, r.PeerNodeID, r.PaneID)
-	if json.Unmarshal(data, &reply) != nil || reply.MessageID != m.MessageID || reply.LinkID != linkID || reply.Fingerprint != m.Fingerprint ||
+	if reply.MessageID != messageID || reply.LinkID != linkID || reply.Fingerprint != fingerprint ||
 		(reply.Status != "established" && reply.Status != "current") || !validRemoteConversation(reply.TargetConversation) {
 		return empty, errors.New("peer pair confirmation unavailable; nothing established here")
 	}
+	m := communicationEstablishWire{MessageID: messageID}
 	// Re-check everything that could have changed while the request was in flight.
 	var link CommunicationRemoteLink
-	err = communicationFanoutLocked(root, func() error {
+	err := communicationFanoutLocked(root, func() error {
 		identity := plan.caller
 		var err error
 		if !plan.approved {

@@ -303,9 +303,14 @@ func communicationDesktopLinkApproveScoped(root, node string, r CommunicationReq
 		return nil, errors.New("the route to the requested host names another host")
 	}
 	// The host's identity is taken live over the pinned transport, not from files.
-	if _, err := communicationPeerProbe(root, node, CommunicationRequest{Operation: "route_probe", RouteID: route.ID,
-		ExpectedRouteRevision: route.Revision}); err != nil {
-		return nil, errors.New("the requested host's live identity was not verified: " + err.Error())
+	// Over the Relay host channel the establish exchange itself is that proof:
+	// a fresh proposal answered by a reply signed with the pinned host key,
+	// checked by route_desktop_link_settle before anything is saved here.
+	if binding.Endpoint != workNativeEndpoint {
+		if _, err := communicationPeerProbe(root, node, CommunicationRequest{Operation: "route_probe", RouteID: route.ID,
+			ExpectedRouteRevision: route.Revision}); err != nil {
+			return nil, errors.New("the requested host's live identity was not verified: " + err.Error())
+		}
 	}
 	a := communicationScopeMember{NodeID: node, PaneID: request.SessionID}
 	b := communicationScopeMember{NodeID: peerNode, PaneID: request.PaneID}
