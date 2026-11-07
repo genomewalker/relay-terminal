@@ -276,3 +276,26 @@ func TestDesktopSessionLinkStatusPoll(t *testing.T) {
 		t.Fatal(string(data))
 	}
 }
+
+// With the desktop route configured, a verified desktop session's list still
+// goes to this node's relayd, which holds its route links; a pane keeps the
+// desktop's list.
+func TestDesktopSessionListReachesRelayd(t *testing.T) {
+	s, wire := desktopHelper(t, desktopSession, desktopSessionSource)
+	s.token = "fixture-installation-token"
+	if _, handled := s.daemonCommunication("relay_list_pane_links", map[string]json.RawMessage{}); !handled {
+		t.Fatal("desktop session list went to the desktop route")
+	}
+	if packet := wirePacket(t, wire); packet["operation"] != "list" || packet["actor_pane_id"] != desktopSession {
+		t.Fatal("desktop session list not sent with its proven identity", packet)
+	}
+	pane := "800c06ef-203f-4401-bf7a-c67b15985f33"
+	s2, wire2 := desktopHelper(t, pane, "native_parked_job_kernel_owner")
+	s2.token = "fixture-installation-token"
+	if _, handled := s2.daemonCommunication("relay_list_pane_links", map[string]json.RawMessage{}); handled {
+		t.Fatal("a pane's list left the desktop route")
+	}
+	if _, err := os.Stat(wire2); !os.IsNotExist(err) {
+		t.Fatal("a pane's list reached relayd")
+	}
+}

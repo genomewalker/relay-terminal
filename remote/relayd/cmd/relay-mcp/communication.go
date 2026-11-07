@@ -93,9 +93,6 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 			return nil, false
 		}
 	}
-	if desktopFallback && operation == "list" {
-		return nil, false
-	}
 	// A named background session is proven by the recipient host's relayd;
 	// the desktop route cannot carry it, so such a send never falls back.
 	_, targeted := arguments["target_session_id"]
@@ -114,6 +111,11 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	// RELAY_SESSION from MCP servers, so its absence only means an unowned
 	// client keeps the unattributed path instead of failing.
 	actor, actorSource, actorErr := s.communicationActorProof()
+	// A verified desktop session lists its own route links on this node's relayd;
+	// every other caller keeps the desktop's full list.
+	if desktopFallback && operation == "list" && (actorErr != nil || actorSource != desktopSessionSource) {
+		return nil, false
+	}
 	// A verified Claude desktop session sends to a pane through its saved link.
 	if actorErr == nil && actorSource == desktopSessionSource && operation == "send" {
 		return s.desktopSessionSend(actor, arguments, targeted)
