@@ -8,7 +8,7 @@ enum RelaySurfaceHTTP {
                        layoutGranted: Bool, assistantIdentity: Bool = false, resolvePane: (UUID) -> (UUID, UUID)?,
                        refreshPane: (UUID) -> Void) -> RelaySidePanelHTTPResponse? {
         guard ["/api/surfaces/publish", "/api/surfaces/status", "/api/surfaces/content"].contains(request.path) else { return nil }
-        guard request.isAuthorized(token: installationToken) else {
+        guard callerControl.authorizes(request, installationToken: installationToken) else {
             return .text("Unauthorized", status: 401, reason: "Unauthorized")
         }
         guard request.method == "POST" else {

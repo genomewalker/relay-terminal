@@ -136,6 +136,28 @@ final class RelayCallerControl: ObservableObject {
         }
         return caller.id.uuidString.lowercased()
     }
+    /// A request is authorized by a registered caller token alone, or by the
+    /// installation token. With both, the caller token decides the identity
+    /// (`identity(token:)` reads the caller header first); with only the
+    /// installation token the identity is `legacy-unattributed`.
+    func authorizes(_ request: RelaySidePanelHTTPRequest, installationToken: String) -> Bool {
+        if let presented = request.headers["x-relay-caller-token"], (try? identity(token: presented)) != nil { return true }
+        return request.isAuthorized(token: installationToken)
+    }
+    /// Paths that register or pause callers. Never served over HTTP.
+    nonisolated static func isAdministrativePath(_ path: String) -> Bool {
+        path == "/api/callers/register" || path == "/api/callers/control"
+    }
+    /// App-UI entry points: only a hardware-origin click or key press admits
+    /// the change. A nil or synthesized event is refused before any state moves.
+    func register(label: String, thread: String?, origin: RelayKeyEventOrigin) async throws -> [String: String] {
+        guard origin == .hardware else { throw RelayHostRPCError.invalidRequest }
+        return try await register(label: label, thread: thread)
+    }
+    func setPaused(id: String, paused: Bool, origin: RelayKeyEventOrigin) async throws {
+        guard origin == .hardware else { throw RelayHostRPCError.invalidRequest }
+        try await setPaused(id: id, paused: paused)
+    }
     func permitted(_ identity: String) -> Bool {
         // The in-app Relay assistant uses the installation credential path, so
         // the installation-level pause also pauses it.

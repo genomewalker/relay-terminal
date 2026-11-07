@@ -87,6 +87,22 @@ func TestCredentialPrivateDescriptorRefusesSymlinkPublicAndSpecialFiles(t *testi
 		t.Fatal("credential changed during read")
 	}
 }
+func TestBootstrapStdioUsesCallerTokenWithoutInstallationFlag(t *testing.T) {
+	credential, candidates := fixture(t)
+	for _, args := range [][]string{nil, {"ignored-user-argument"}} {
+		plan, err := Prepare(credential, candidates, args, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := append([]string{"relay-mcp"}, args...)
+		if !reflect.DeepEqual(plan.Args, want) {
+			t.Fatalf("stdio argv %#v, want %#v", plan.Args, want)
+		}
+		if !reflect.DeepEqual(plan.Environment[:1], []string{"RELAY_MCP_CALLER_TOKEN=same-existing-fixture"}) {
+			t.Fatalf("caller token missing: %#v", plan.Environment)
+		}
+	}
+}
 func TestBootstrapReplacesOnlyOwnedEnvironmentAndPreservesArguments(t *testing.T) {
 	credential, candidates := fixture(t)
 	env := []string{"UNCHANGED=1", "RELAY_MCP_CALLER_TOKEN=stale", "RELAY_MCP_BACKEND=stale", "RELAY_MCP_DAEMON=/stale", "RELAY_MCP_OWNER_PID=42", "RELAY_MCP_CALLER_TOKEN=duplicate"}
@@ -307,7 +323,13 @@ func TestBootstrapMatchesAll48CanonicalOriginalSelections(t *testing.T) {
 			}
 			continue
 		}
-		if err != nil || plan.Executable != rewrite.Replace(record.Result.Executable) || !reflect.DeepEqual(plan.Args, record.Result.Args) {
+		// Deliberate change from the pinned corpus: stdio argv no longer carries
+		// --use-relay-token (the caller token authenticates); the corpus is untouched.
+		wantArgs := record.Result.Args
+		if !needsInstallationToken(record.Args) {
+			wantArgs = append([]string{wantArgs[0]}, wantArgs[2:]...)
+		}
+		if err != nil || plan.Executable != rewrite.Replace(record.Result.Executable) || !reflect.DeepEqual(plan.Args, wantArgs) {
 			t.Fatalf("canonical bootstrap selection/arguments differ: %d %v", i, err)
 		}
 		got := map[string]string{}

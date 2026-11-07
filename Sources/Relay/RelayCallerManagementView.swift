@@ -37,9 +37,11 @@ struct RelayCallerManagementView: View {
                     }
                     Spacer()
                     Toggle("Paused", isOn: Binding(get: { caller.paused }, set: { value in
+                        let origin = RelayKeyEventOrigin.ofUserAction(NSApp.currentEvent)
                         Task {
-                            do { try await control.setPaused(id: caller.id, paused: value); error = nil }
-                            catch { self.error = "The pause setting could not be applied to every communication server." }
+                            do { try await control.setPaused(id: caller.id, paused: value, origin: origin); error = nil }
+                            catch { self.error = origin == .hardware ? "The pause setting could not be applied to every communication server."
+                                : "Pause changes need a click or key press on this Mac." }
                         }
                     })).toggleStyle(.switch).disabled(!control.available)
                         .accessibilityIdentifier("relay.callers.pause." + caller.id)
@@ -102,12 +104,13 @@ struct RelayCallerManagementView: View {
         catch { self.error = "Communication server client controls are unavailable." }
     }
     private func create() {
+        let origin = RelayKeyEventOrigin.ofUserAction(NSApp.currentEvent)
         Task {
         do {
-            let result = try await control.register(label: label.trimmingCharacters(in: .whitespacesAndNewlines), thread: thread.isEmpty ? nil : thread)
+            let result = try await control.register(label: label.trimmingCharacters(in: .whitespacesAndNewlines), thread: thread.isEmpty ? nil : thread, origin: origin)
             credential = result["caller_token"] ?? ""; issuedID = result["caller_id"] ?? ""
             label = ""; thread = ""; error = nil
-        } catch { self.error = "The client credential could not be saved." }
+        } catch { self.error = origin == .hardware ? "The client credential could not be saved." : "Creating a credential needs a click or key press on this Mac." }
         }
     }
 }

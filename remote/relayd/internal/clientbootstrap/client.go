@@ -109,10 +109,25 @@ func Prepare(credential string, candidates []Candidate, args, environment []stri
 			}
 		}
 		env = append(env, "RELAY_MCP_CALLER_TOKEN="+token, "RELAY_MCP_BACKEND=daemon", "RELAY_MCP_DAEMON="+c.Daemon)
-		argv := append([]string{"relay-mcp", "--use-relay-token"}, args...)
+		// The scoped caller token authenticates stdio MCP by itself, so the
+		// installation token is not read from user defaults. The local HTTP
+		// transport and header printing need a bearer token and keep the flag.
+		argv := []string{"relay-mcp"}
+		if needsInstallationToken(args) {
+			argv = append(argv, "--use-relay-token")
+		}
+		argv = append(argv, args...)
 		return Plan{c.MCP, argv, env}, nil
 	}
 	return Plan{}, errors.New("Native Relay messaging helpers are unavailable")
+}
+func needsInstallationToken(args []string) bool {
+	for _, a := range args {
+		if a == "--http" || a == "--print-http-headers" {
+			return true
+		}
+	}
+	return false
 }
 func executable(path string) bool {
 	info, err := os.Stat(path)

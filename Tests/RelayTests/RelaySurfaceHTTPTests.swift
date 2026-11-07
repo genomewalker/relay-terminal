@@ -28,7 +28,8 @@ import Testing
             callerControl: callers, publication: service, layoutGranted: grant,
             resolvePane: { $0 == pane ? (pane, host) : nil }, refreshPane: { _ in refreshes += 1 }))
     }
-    #expect(try call(installation: "wrong").status == 401)
+    // A scoped caller token authorizes without the installation token; neither is a 401.
+    #expect(try call(installation: "wrong", caller: nil).status == 401)
     #expect(try call(caller: nil).status == 403)
     #expect(try call(caller: "unknown").status == 403)
     #expect(try call(grant: false).status == 403)

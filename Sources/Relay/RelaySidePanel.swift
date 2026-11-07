@@ -1064,7 +1064,7 @@ final class RelaySidePanelServer: ObservableObject {
     /// below; network requests can never select it.
     private func route(_ request: RelaySidePanelHTTPRequest,
                        assistantIdentity: Bool = false, assistantActionApproved: Bool = false) async -> RelaySidePanelHTTPResponse {
-        guard request.path.hasPrefix("/api/"), request.isAuthorized(token: token) else {
+        guard request.path.hasPrefix("/api/"), callerControl.authorizes(request, installationToken: token) else {
             return await dispatch(request)
         }
         if request.path == "/api/callers", request.method == "GET" {
@@ -1073,23 +1073,11 @@ final class RelaySidePanelServer: ObservableObject {
         if request.path == "/api/callers/audit", request.method == "GET" {
             return .json(callerControl.audit())
         }
-        if request.path == "/api/callers/register", request.method == "POST" {
-            guard request.headers["x-relay-caller-token"] == nil, mcpWorkspaceGrant.permits(.input),
-                  let body = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
-                  let label = body["label"] as? String else { return .text("Caller registration unavailable", status: 403, reason: "Forbidden") }
-            do { return .json(try await callerControl.register(label: label, thread: (body["thread"] as? String).flatMap { $0.isEmpty ? nil : $0 })) }
-            catch { return .text("Caller registration could not be persisted", status: 409, reason: "Conflict") }
-        }
-        if request.path == "/api/callers/control", request.method == "POST" {
-            // Administrative requests require the installation credential and
-            // existing layout grant; scoped credentials cannot unpause themselves.
-            guard request.headers["x-relay-caller-token"] == nil, mcpWorkspaceGrant.permits(.layout),
-                  let body = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
-                  let id = body["caller_id"] as? String, let paused = body["paused"] as? Bool else {
-                return .text("Administrative caller control required", status: 403, reason: "Forbidden")
-            }
-            do { try await callerControl.setPaused(id: id, paused: paused); return .json(["status": "applied"]) }
-            catch { return .text("Caller control could not be persisted", status: 409, reason: "Conflict") }
+        // Caller registration and pause/unpause are app-UI actions behind a
+        // hardware click (RelayCallerManagementView). No token or grant opens
+        // them over HTTP, and the assistant identity has no side door.
+        if RelayCallerControl.isAdministrativePath(request.path) {
+            return .text("Register or control callers in the Relay app", status: 403, reason: "Forbidden")
         }
         if let response = RelaySurfaceHTTP.handle(request, installationToken: token,
             callerControl: callerControl, publication: .shared,
@@ -1199,7 +1187,7 @@ final class RelaySidePanelServer: ObservableObject {
             }
         }
 
-        guard request.path.hasPrefix("/api/"), request.isAuthorized(token: token) else {
+        guard request.path.hasPrefix("/api/"), callerControl.authorizes(request, installationToken: token) else {
             return .text("Unauthorized", status: 401, reason: "Unauthorized")
         }
         guard let workspace else {

@@ -102,14 +102,18 @@ func (s *server) fetch(path string) (string, error) {
 }
 
 func (s *server) exchange(method, path string, body []byte) (string, error) {
-	if s.token == "" {
-		return "", fmt.Errorf("Relay connection is not configured: set RELAY_MCP_TOKEN")
+	// A scoped caller token alone authenticates (Relay resolves it to that
+	// caller); the installation token is the legacy credential.
+	if s.token == "" && s.callerToken == "" {
+		return "", fmt.Errorf("Relay connection is not configured: set RELAY_MCP_CALLER_TOKEN (preferred) or RELAY_MCP_TOKEN")
 	}
 	req, err := http.NewRequest(method, s.endpoint+path, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("invalid Relay endpoint")
 	}
-	req.Header.Set("x-relay-token", s.token)
+	if s.token != "" {
+		req.Header.Set("x-relay-token", s.token)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if s.callerToken != "" {
 		req.Header.Set("x-relay-caller-token", s.callerToken)
@@ -121,7 +125,10 @@ func (s *server) exchange(method, path string, body []byte) (string, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 && !(resp.StatusCode == 202 && method == "POST" && path == "/api/pane-links") {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		detail := strings.TrimSpace(strings.ReplaceAll(string(data), s.token, "[redacted]"))
+		detail := strings.TrimSpace(string(data))
+		if s.token != "" {
+			detail = strings.TrimSpace(strings.ReplaceAll(detail, s.token, "[redacted]"))
+		}
 		if s.callerToken != "" {
 			detail = strings.ReplaceAll(detail, s.callerToken, "[redacted]")
 		}
@@ -143,6 +150,9 @@ func (s *server) exchange(method, path string, body []byte) (string, error) {
 	}
 	return string(data), nil
 }
+
+// callerAdminRefusal is the fixed reply to the removed caller-admin tools.
+const callerAdminRefusal = "Register or control callers in the Relay app"
 
 func (s *server) handle(r request) (any, int, string) {
 	if s.daemonHelper != "" && r.Method == "tools/list" {
@@ -191,10 +201,10 @@ func (s *server) handle(r request) (any, int, string) {
 		rSetup["annotations"] = proposal["annotations"]
 		return map[string]any{"tools": append([]any{
 			tool("relay_render_content", "Publish Mermaid, LaTeX, Markdown, PNG, JPEG, SVG or PDF to an existing pane's native Rich content viewer. Requires layout grant; does not send terminal input. Opens the Rich content viewer for a visible pane; source is LaTeX/Mermaid/Markdown text or an artifact path on the pane host.", map[string]any{"pane_id": map[string]string{"type": "string"}, "kind": map[string]string{"type": "string"}, "source": map[string]string{"type": "string"}}, []string{"pane_id", "kind", "source"}),
-			tool("relay_register_caller", "Register a labelled client and return a scoped credential once. Requires installation credential and input grant. Thread is a claimed label, not verified identity; never register a replacement to bypass pause.", map[string]any{"label": map[string]string{"type": "string"}, "thread": map[string]string{"type": "string"}}, []string{"label"}),
+			tool("relay_register_caller", "Unavailable to clients: register callers in the Relay app (Clients). Always returns an error.", map[string]any{"label": map[string]string{"type": "string"}, "thread": map[string]string{"type": "string"}}, []string{"label"}),
 			tool("relay_list_callers", "Read registered clients and pause state. Never returns credentials.", map[string]any{}, []string{}),
 			tool("relay_caller_audit", "Read bounded persistent operation audit, including returned tab/pane IDs and caller identity. Legacy callers are unattributed. No command bodies or credentials.", map[string]any{}, []string{}),
-			tool("relay_control_caller", "Pause/resume mutations for an exact registered caller or legacy-unattributed. Requires installation credential and layout grant. Does not cancel jobs or stop native user input.", map[string]any{"caller_id": map[string]string{"type": "string"}, "paused": map[string]string{"type": "boolean"}}, []string{"caller_id", "paused"}),
+			tool("relay_control_caller", "Unavailable to clients: pause or resume callers in the Relay app (Clients). Always returns an error.", map[string]any{"caller_id": map[string]string{"type": "string"}, "paused": map[string]string{"type": "boolean"}}, []string{"caller_id", "paused"}),
 			tool("relay_workspace_organization", "Read nested workspace groups, saved views, current navigation, visible layouts and pane stacks. Pane IDs, session owners and execution hosts retain their canonical identity. Does not navigate or start terminals.", map[string]any{}, []string{}),
 			tool("relay_workspace_migration_preview", "Read the workspace migration preview open in Relay (every tab's old and new workspace, pane moves, refusals, collisions, and the preview id and checksum that relay_workspace_migration_apply requires), the migration log, and the plans in Relay's plan folder (names, sizes, modified times).", map[string]any{}, []string{}),
 			tool("relay_workspace_migration_stage_plan", "Stage a workspace migration plan: Relay validates it like its migration sheet, saves it in its plan folder, opens it as the preview and shows the user a review banner. Supply exactly one of plan (the JSON object) or path (an absolute path on This Mac to a regular .json file of at most 1 MB). Requires the workspace layout grant. Does not apply anything. Refused while a different preview is open unless replace is true. Returns preview_id and checksum.", map[string]any{"plan": map[string]any{"type": "object", "additionalProperties": true, "description": "Plan JSON: overrides (tab ID to workspace name), paneMoves (pane ID to tab ID), keepEmptyGroups, optional description, optional scope: \"partial\" changes only the named tabs and panes and leaves every other tab, workspace and sidebar placement as it is; \"global\" is the full reconcile. Without scope, a plan with overrides or paneMoves is partial, otherwise global. Other scope values are rejected."}, "path": map[string]any{"type": "string", "maxLength": 1024, "description": "Absolute path of a .json plan file on This Mac"}, "name": map[string]any{"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$", "description": "File name in the plan folder; .json is added"}, "replace": map[string]string{"type": "boolean"}}, []string{}),
@@ -486,16 +496,9 @@ func (s *server) handle(r request) (any, int, string) {
 			}
 			path, method = "/api/rich-content", "POST"
 			body, _ = json.Marshal(map[string]string{"pane_id": id, "kind": kind, "source": source})
-		case "relay_register_caller":
-			var label, thread string
-			if json.Unmarshal(p.Arguments["label"], &label) != nil || label == "" || len(label) > 120 || len(p.Arguments) > 2 {
-				return nil, -32602, "Bounded label required"
-			}
-			if raw, ok := p.Arguments["thread"]; ok && json.Unmarshal(raw, &thread) != nil {
-				return nil, -32602, "Invalid thread label"
-			}
-			path, method = "/api/callers/register", "POST"
-			body, _ = json.Marshal(map[string]string{"label": label, "thread": thread})
+		case "relay_register_caller", "relay_control_caller":
+			// Registering and pausing callers is a hardware click in the Relay app.
+			return nil, -32602, callerAdminRefusal
 		case "relay_list_callers", "relay_caller_audit":
 			if len(p.Arguments) != 0 {
 				return nil, -32602, "Unexpected arguments"
@@ -504,14 +507,6 @@ func (s *server) handle(r request) (any, int, string) {
 			if p.Name == "relay_caller_audit" {
 				path = "/api/callers/audit"
 			}
-		case "relay_control_caller":
-			var id string
-			var paused bool
-			if len(p.Arguments) != 2 || json.Unmarshal(p.Arguments["caller_id"], &id) != nil || (id != "legacy-unattributed" && !paneID.MatchString(id)) || json.Unmarshal(p.Arguments["paused"], &paused) != nil {
-				return nil, -32602, "Exact caller and paused flag required"
-			}
-			path, method = "/api/callers/control", "POST"
-			body, _ = json.Marshal(map[string]any{"caller_id": id, "paused": paused})
 		case "relay_structured_r_operation":
 			// Structured transport preserves session identity and revision fields.
 		case "relay_intelligence_status", "relay_check_intelligence":

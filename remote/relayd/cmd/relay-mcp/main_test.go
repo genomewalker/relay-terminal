@@ -507,3 +507,44 @@ func TestMovePaneAccountIsExactAndPostsOnce(t *testing.T) {
 		t.Fatal("an invalid move reached Relay")
 	}
 }
+
+func TestCallerAdministrationToolsRefuseWithoutReachingRelay(t *testing.T) {
+	hits := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer ts.Close()
+	s := server{token: "install", callerToken: "scoped", endpoint: ts.URL, client: ts.Client()}
+	for _, call := range []map[string]any{
+		{"name": "relay_register_caller", "arguments": map[string]any{"label": "x"}},
+		{"name": "relay_register_caller", "arguments": map[string]any{}},
+		{"name": "relay_control_caller", "arguments": map[string]any{"caller_id": "legacy-unattributed", "paused": false}},
+		{"name": "relay_control_caller", "arguments": map[string]any{"bad": 1}},
+	} {
+		params, _ := json.Marshal(call)
+		_, code, msg := s.handle(request{Method: "tools/call", Params: params})
+		if code == 0 || msg != "Register or control callers in the Relay app" {
+			t.Fatalf("%v: code %d msg %q", call["name"], code, msg)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("caller administration reached Relay %d times", hits)
+	}
+}
+
+func TestCallerTokenOnlySendsNoInstallationHeader(t *testing.T) {
+	hits := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if _, present := r.Header["X-Relay-Token"]; present || r.Header.Get("x-relay-caller-token") != "scoped-only" {
+			t.Errorf("headers: %v", r.Header)
+		}
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer ts.Close()
+	s := server{callerToken: "scoped-only", endpoint: ts.URL, client: ts.Client()}
+	if _, err := s.fetch("/api/callers"); err != nil || hits != 1 {
+		t.Fatalf("err %v hits %d", err, hits)
+	}
+	if _, err := (&server{endpoint: ts.URL, client: ts.Client()}).fetch("/api/callers"); err == nil || hits != 1 {
+		t.Fatalf("unconfigured server must not send: %v hits %d", err, hits)
+	}
+}

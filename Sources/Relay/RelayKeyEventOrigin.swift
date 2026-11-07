@@ -29,6 +29,13 @@ enum RelayKeyEventOrigin: String, Equatable, Sendable {
                         windowServerPID: windowServerPID)
     }
 
+    /// A click or key press that triggers a UI action. Same rule as `of`; any
+    /// other event type (or none) is synthesized.
+    static func ofUserAction(_ event: NSEvent?) -> Self {
+        guard let event, [.leftMouseDown, .leftMouseUp, .keyDown, .keyUp].contains(event.type) else { return .synthesized }
+        return of(event)
+    }
+
     /// The key press that an insertText belongs to, or nil when it belongs to
     /// none. Text counts as the keyboard's only while AppKit is still
     /// dispatching that key press: an accessibility or programmatic insert can
