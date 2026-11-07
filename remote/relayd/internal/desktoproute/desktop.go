@@ -394,6 +394,7 @@ func (d *nativeDesktop) Verify(ctx context.Context, path, thread string) error {
 		return e
 	}
 	if ref != nil {
+		ref = d.liveWork(ctx, path, ref)
 		c, e := d.openWork(ctx, *ref)
 		if e != nil {
 			return e
@@ -432,6 +433,7 @@ func (d *nativeDesktop) Deliver(ctx context.Context, path, thread string, m Enve
 		return
 	}
 	if ref != nil {
+		ref = d.liveWork(ctx, path, ref)
 		return d.deliverWork(ctx, *ref, m, payload)
 	}
 	a, e := openApp(ctx, path)

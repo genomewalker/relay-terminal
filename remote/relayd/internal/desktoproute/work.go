@@ -318,6 +318,21 @@ func (d *nativeDesktop) repinWork(ctx context.Context, path string, stale workRe
 	return d.commitWork(fresh, &stale) == nil
 }
 
+// liveWork returns the saved endpoint, re-pinned first when the Work app has
+// restarted, so a send or check right after a restart does not depend on a
+// discovery call having run first. Only a changed app process triggers it, so
+// a send to a live endpoint opens no extra connection. An unverifiable re-pin
+// leaves the old record, and the caller then fails on it as before.
+func (d *nativeDesktop) liveWork(ctx context.Context, path string, ref *workReference) *workReference {
+	if d.workProcess(*ref) == nil || !d.repinWork(ctx, path, *ref) {
+		return ref
+	}
+	if fresh, e := d.workRef(path, ref.Thread); e == nil && fresh != nil {
+		return fresh
+	}
+	return ref
+}
+
 // laterIncarnation reports whether the app's new start time is strictly after
 // the pinned one. Both are ps lstart strings; an unparseable time never repins.
 func laterIncarnation(pinned, current string) bool {
