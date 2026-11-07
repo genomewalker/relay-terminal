@@ -88,7 +88,7 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 	if !canonicalRouteToken(node) || !canonicalRouteToken(r.MessageID) || (r.Operation != "remote_send" && r.Operation != "remote_receipt") {
 		return nil, errors.New("valid outbound message identity required")
 	}
-	if r.Operation == "remote_send" && (!canonicalRouteToken(r.SourcePaneID) || !canonicalRouteToken(r.PaneID) || !remoteDigest(r.LinkID) ||
+	if r.Operation == "remote_send" && (!canonicalRouteToken(r.SourcePaneID) || !canonicalRouteToken(r.PaneID) || (r.LinkID != "" && !remoteDigest(r.LinkID)) ||
 		!utf8.ValidString(r.Text) || len(r.Text) == 0 || len(r.Text) > 16384 || strings.TrimSpace(r.Text) == "") {
 		return nil, errors.New("valid reviewed remote pair and 1-16384 text bytes required")
 	}
@@ -106,6 +106,15 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 		caller, err = communicationAuthorize(root, r)
 		if err != nil {
 			return err
+		}
+		if r.Operation == "remote_send" && r.LinkID == "" {
+			// A verified desktop session names its pane, not a link: resolve the one
+			// saved route link that pairs them, before any receipt is read.
+			linkID, err := communicationDesktopRemoteLink(root, node, r)
+			if err != nil {
+				return err
+			}
+			r.LinkID = linkID
 		}
 		if err := communicationRead(path, &receipt); err == nil {
 			if !remoteOutboundRequestMatches(receipt, node, caller, r) {
