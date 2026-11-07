@@ -116,3 +116,21 @@ func TestWithoutRelayClaudeSettingsAddsNoDefaults(t *testing.T) {
 		t.Fatalf("chooser arguments kept Relay settings or gained defaults: %q", got)
 	}
 }
+
+// A Claude desktop Code session runs in auto mode, and Claude holds
+// cross-session messages between sessions whose modes differ, so a Relay
+// default may select auto. Unknown modes stay refused.
+func TestClaudeLaunchDefaultsAcceptAutoAndRefuseUnknownModes(t *testing.T) {
+	home := t.TempDir()
+	launchDefaults(t, home, `{"version":1,"permission_mode":"auto"}`)
+	got, err := ManagedClaudeLaunchArguments(home, "/h/claude-hooks.json", []string{"--resume", "s"})
+	if err != nil || !reflect.DeepEqual(got, []string{"--permission-mode", "auto", "--resume", "s"}) {
+		t.Fatalf("auto default not applied: %q %v", got, err)
+	}
+	for _, mode := range []string{"dontAsk", "manual", "Auto", "auto ", ""} {
+		launchDefaults(t, home, `{"version":1,"permission_mode":"`+mode+`"}`)
+		if got, err := ManagedClaudeLaunchArguments(home, "/h/claude-hooks.json", nil); err == nil {
+			t.Fatalf("mode %q accepted: %q", mode, got)
+		}
+	}
+}

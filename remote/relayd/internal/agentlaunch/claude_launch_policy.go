@@ -12,7 +12,7 @@ import (
 )
 
 // Claude's own --permission-mode values that a Relay default may select.
-var claudePermissionModes = map[string]bool{"default": true, "acceptEdits": true, "plan": true, "bypassPermissions": true}
+var claudePermissionModes = map[string]bool{"default": true, "acceptEdits": true, "plan": true, "auto": true, "bypassPermissions": true}
 
 // ClaudeLaunchDefaults reads the user-owned <account>/relay-launch-defaults.json.
 // Absence leaves Claude's own configuration in charge; a malformed policy
