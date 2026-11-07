@@ -204,3 +204,32 @@ func TestListingProposesDirectionalCallersForANewPair(t *testing.T) {
 		t.Fatal("a new pair is not approvable from its listing", item)
 	}
 }
+
+// After the pair is unlinked, the owner can approve it again: the retired half is
+// replaced, the peer's half is still current, and the pair delivers again.
+func TestRelinkAfterUnlinkIsAccepted(t *testing.T) {
+	f := scopedFixture(t, true)
+	scopedRequest(t, f.a)
+	approved, err := scopedApprove(f.a, testGroupB, directionalPairCallers(desktopAlias, testGroupB), f.hooksA)
+	if err != nil {
+		t.Fatal("first approve", err)
+	}
+	link := approved["link"].(CommunicationRemoteLink)
+	if _, err := communicationRemoteLinkSet(f.a, "node-a", CommunicationRequest{Operation: "route_link_retire", LinkID: link.ID, RemoteLink: &link,
+		ExpectedRemoteLinkRevision: link.Revision}, f.hooksA); err != nil {
+		t.Fatal("unlink", err)
+	}
+	scopedRequest(t, f.a)
+	again, err := scopedApprove(f.a, testGroupB, directionalPairCallers(desktopAlias, testGroupB), f.hooksA)
+	if err != nil {
+		t.Fatal("re-approve after unlink refused", err)
+	}
+	relinked := again["link"].(CommunicationRemoteLink)
+	before := f.paneCalls.Load()
+	send := CommunicationRequest{Operation: "remote_send", SourcePaneID: desktopAlias, PaneID: testGroupB, PeerNodeID: "node-b",
+		MessageID: "b3b3b3b3-b3b3-4b3b-8b3b-b3b3b3b3b3b3", ExpectedRemoteLinkRevision: relinked.Revision, Text: "relinked",
+		ClientToken: remoteSenderToken, ActorPaneID: desktopAlias, actorVerified: true}
+	if got, err := communicationSendRemote(f.a, "node-a", send, f.hooksA); err != nil || got["status"] != "accepted" || f.paneCalls.Load() != before+1 {
+		t.Fatal("relinked pair did not deliver", got, err)
+	}
+}

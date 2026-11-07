@@ -155,13 +155,15 @@ func communicationEstablishCommit(root, node string, requested CommunicationRemo
 	requested.Revision, requested.PeerRevision = 1, 1
 	requested.ID = remotePairID(node, requested.LocalPaneID, requested.PeerNodeID, requested.PeerPaneID)
 	previous, err := readRemoteLink(root, node, requested.ID)
-	if err == nil {
+	if err == nil && !previous.Retired {
 		if remoteLinkSamePins(previous, requested) {
 			return previous, "current", nil
 		}
 		return previous, "", errors.New("relationship changed; verified transition required")
 	}
-	if !errors.Is(err, os.ErrNotExist) {
+	// A retired half of the same pair is replaced by a fresh revision 1: the owner
+	// approved the pair again, and the peer's half keeps revision 1 as before.
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return requested, "", err
 	}
 	paths, err := filepath.Glob(filepath.Join(root, "remote-link-*.json"))

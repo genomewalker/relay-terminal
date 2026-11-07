@@ -208,7 +208,17 @@ func communicationDesktopLinkApprove(root, node string, r CommunicationRequest, 
 		r.RemoteLink.LocalConversation != link.LocalConversation) {
 		return nil, errors.New("the reviewed link names another pair than the request")
 	}
-	result, err := communicationRemoteLinkSet(root, node, CommunicationRequest{Operation: "route_link_set", RemoteLink: &link}, hooks)
+	// An active link for this pair is refused; a retired one is re-established from its revision.
+	expected := uint64(0)
+	if prior, priorErr := readRemoteLink(root, node, link.ID); priorErr == nil {
+		if !prior.Retired {
+			return nil, errors.New("this pair is already linked")
+		}
+		expected = prior.Revision
+	} else if !errors.Is(priorErr, os.ErrNotExist) {
+		return nil, priorErr
+	}
+	result, err := communicationRemoteLinkSet(root, node, CommunicationRequest{Operation: "route_link_set", RemoteLink: &link, ExpectedRemoteLinkRevision: expected}, hooks)
 	if err != nil {
 		return nil, err
 	}
