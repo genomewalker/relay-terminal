@@ -350,6 +350,13 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 	if err != nil || !communicationEndpointEqual(source, link.Local) {
 		return nil, errors.New("source conversation changed; message not dispatched")
 	}
+	if link.Local.Kind == "pane" {
+		signature, e := workNativeAttestPane(root, node, link, wire.Caller, wire.MessageID, p.Text)
+		if e != nil {
+			return nil, e
+		}
+		wire.PaneSignature = signature
+	}
 	err = communicationFanoutLocked(root, func() error {
 		current, _, _, e := workNativeOutbound(ctx, root, node, id)
 		if e != nil {
@@ -538,4 +545,41 @@ func communicationBindingTransportSet(root, node string, r CommunicationRequest)
 		return nil, errors.New("binding transport changed but event append failed; inspect before recovery")
 	}
 	return map[string]any{"binding": next, "certificate_sha256": peerFingerprint(cert), "changed": true, "authority": "relayd"}, nil
+}
+
+// workNativeAttestPane signs a queued pane message again when the carrier
+// dispatches it. The pane's statement from send time is valid for only
+// communicationStatementTTL, while a host-channel message can wait in the queue
+// much longer (an offline peer, a slow carrier), so the peer would refuse the
+// old statement as expired. The pane proved its authorship when the message
+// was queued: only a kernel-verified actor gets a receipt. Here the source host
+// observes that the same pane still runs the same provider session and
+// attests it again for the same message ID, text, link revisions and target.
+// The fingerprint does not cover the signature, so the message is unchanged.
+// A pane whose session has changed is refused, never re-signed.
+func workNativeAttestPane(root, node string, link communicationTypedRemoteLink, caller, messageID, text string) (string, error) {
+	if link.Local.Kind != "pane" || link.Peer.Work == nil || !validSessionID.MatchString(link.Local.PaneID) || !validSessionID.MatchString(link.Local.SessionID) {
+		return "", errors.New("Work relationship changed")
+	}
+	d := defaultCommunicationSigningDeps(root, node)
+	d.observe = workPaneObserve
+	request := CommunicationRequest{Operation: "remote_send", SourcePaneID: link.Local.PaneID, ActorPaneID: link.Local.PaneID,
+		MessageID: messageID, Text: text, ClientID: caller, actorVerified: true}
+	var signature string
+	if err := communicationFanoutLocked(root, func() error {
+		var e error
+		signature, e = communicationSignWork(root, node, request, link.Peer.NodeID, link.ID, link.Revision, link.PeerRevision, *link.Peer.Work, d)
+		return e
+	}); err != nil {
+		return "", errors.New("the sending pane has no verified native session; message not dispatched")
+	}
+	_, hostCert, err := d.keys.HostKey()
+	if err != nil || hostCert == nil {
+		return "", errors.New("source host identity unavailable")
+	}
+	if _, err := communicationVerifyWorkMessage(signature, []communicationTrustedNode{{NodeID: node, CertificateSHA256: peerFingerprint(hostCert)}}, d.now().UTC(),
+		link.Local.NodeID, link.Local.PaneID, link.Local.Provider, link.Local.SessionID, link.Peer.NodeID, messageID, link.ID, link.Revision, link.PeerRevision, []byte(text), *link.Peer.Work); err != nil {
+		return "", errors.New("the sending pane could not be attested again; message not dispatched: " + err.Error())
+	}
+	return signature, nil
 }
