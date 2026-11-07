@@ -55,7 +55,7 @@ func TestDesktopSessionSendDispatchesRemoteSend(t *testing.T) {
 		t.Fatal("desktop session send not dispatched as remote_send", packet)
 	}
 	data, _ := json.Marshal(value)
-	if !strings.Contains(string(data), "not routed back to this Claude desktop session") {
+	if !strings.Contains(string(data), "delivered back to this Claude desktop session") {
 		t.Fatal("reply limitation not stated", string(data))
 	}
 }

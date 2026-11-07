@@ -415,9 +415,15 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 			return communicationQualifiedGroupReceipt(communicationRoot(), currentCommunicationNodeID(), r)
 		}
 	}
+	if r.Operation == "route_desktop_link_list" {
+		if r.ClientToken != "" || r.ActorPaneID != "" {
+			return nil, errors.New("owner administration required")
+		}
+		return communicationDesktopLinkList(communicationRoot(), desktopLinkNow())
+	}
 	if r.Operation == "desktop_link_request" || r.Operation == "route_desktop_link_approve" {
 		if r.Operation == "desktop_link_request" {
-			return communicationDesktopLinkRequestOp(communicationRoot(), r, time.Now().UTC())
+			return communicationDesktopLinkRequestOp(communicationRoot(), r, desktopLinkNow())
 		}
 		return communicationDesktopLinkApprove(communicationRoot(), currentCommunicationNodeID(), r,
 			communicationGroupNative{observe: communicationObserve, send: communicationNative})
@@ -608,6 +614,13 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		if r.Operation == "send" && strings.EqualFold(r.PaneID, communicationAssistantInboxID) {
 			return communicationAssistantReply(root, nodeID, r, identity,
 				communicationGroupNative{observe: communicationObserve, send: communicationNative})
+		}
+		if r.Operation == "send" {
+			// A pane answering a desktop session goes over the saved pinned link.
+			if result, linked, err := communicationSendToDesktop(root, nodeID, r,
+				communicationGroupNative{observe: communicationObserve, send: communicationNative}); linked {
+				return result, err
+			}
 		}
 		id, ids, err := communicationPair(r.SourcePaneID, r.PaneID)
 		if err != nil {

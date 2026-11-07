@@ -32,6 +32,9 @@ type CommunicationRemoteLink struct {
 	LocalConversation     communicationPinnedConversation `json:"local_conversation"`
 	PeerConversation      communicationPinnedConversation `json:"peer_conversation"`
 	AllowedPeerCallers    []string                        `json:"allowed_peer_callers"`
+	// DesktopAccountRoot is the Claude account a desktop session was approved in.
+	// Empty for pane links. Replies are refused when the session registers elsewhere.
+	DesktopAccountRoot    string                          `json:"desktop_account_root,omitempty"`
 	PeerRevision          uint64                          `json:"peer_revision"`
 	Revision              uint64                          `json:"revision"`
 	Retired               bool                            `json:"retired"`
@@ -410,6 +413,13 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 			return nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
+		}
+		if link.DesktopAccountRoot != "" {
+			// A desktop session replies only in the account it was approved in.
+			endpoint, err := readClaudeSessionEndpoint(root, link.LocalConversation.SessionID)
+			if err != nil || endpoint.AccountRoot != link.DesktopAccountRoot {
+				return errors.New("desktop session registration changed; reply refused")
+			}
 		}
 		if !communicationPinMatches(link.LocalConversation, target) {
 			return errors.New("reviewed recipient conversation changed or is unavailable")

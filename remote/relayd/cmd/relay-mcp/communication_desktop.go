@@ -18,7 +18,7 @@ import (
 const desktopSessionSource = "claude_desktop_session_kernel_owner"
 
 // desktopSessionNote states what the sender can expect back.
-const desktopSessionNote = "Replies from the pane are not routed back to this Claude desktop session yet; read this send's receipt with relay_pane_message_receipt."
+const desktopSessionNote = "A reply from the pane is delivered back to this Claude desktop session over the approved link; read this send's receipt with relay_pane_message_receipt."
 
 var canonicalUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
