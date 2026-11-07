@@ -522,8 +522,6 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 		return communicationNodeIdentity(root, nodeID, r)
 	case "node_trust_set":
 		return communicationNodeTrustSet(root, nodeID, r)
-	case "route_trust_scope_pin":
-		return communicationTrustScopePin(root, nodeID, r, defaultCommunicationSigningDeps(root, nodeID))
 	case "assistant_send":
 		return communicationAssistantSend(root, nodeID, r,
 			communicationGroupNative{observe: communicationObserve, send: communicationNative})

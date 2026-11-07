@@ -53,6 +53,12 @@ func communicationRouteOperation(root, nodeID string, r CommunicationRequest) (m
 	if strings.HasPrefix(r.Operation, "route_claude_session_") {
 		return communicationClaudeSessionOperation(root, r, time.Now)
 	}
+	// The scope-signing pin names a host certificate, not a route. Every
+	// route_ operation arrives here, so it is dispatched before the route
+	// identity is required.
+	if r.Operation == "route_trust_scope_pin" {
+		return communicationTrustScopePin(root, nodeID, r, defaultCommunicationSigningDeps(root, nodeID))
+	}
 	if r.Operation == "route_scope_set" {
 		return communicationScopeSet(root, nodeID, r)
 	}
