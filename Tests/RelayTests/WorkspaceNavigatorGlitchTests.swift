@@ -108,7 +108,7 @@ struct WorkspaceNavigatorGlitchTests {
         workspace.holdNavigatorOrder(inbox: store)
         let held = workspace.shownAttentionInbox(inbox: store).map(\.paneID)
         workspace.selectTab(closed.tab.id)
-        workspace.selectPane(closed.pane.id)
+        workspace.selectPane(closed.pane.id, origin: .user)
         workspace.closeActivePane()
         #expect(workspace.panes[closed.pane.id] == nil)
         #expect(workspace.shownAttentionInbox(inbox: store).map(\.paneID) == held)

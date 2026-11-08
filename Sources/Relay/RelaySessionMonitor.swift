@@ -141,7 +141,7 @@ struct RelaySessionMonitor: View {
                 Spacer()
                 switch row.category {
                 case .open:
-                    Button("Show") { workspace.revealPane(row.paneID) }
+                    Button("Show") { workspace.revealPane(row.paneID, origin: .user) }
                 case .detached:
                     Button("Open") { open(row) }.disabled(busy || !row.pane.recoverable)
                     Button("End", role: .destructive) {

@@ -20,7 +20,7 @@ import Testing
         let tabB = try #require(workspace.tabID(containingPane: paneB.id))
         let ownerB = workspace.createWorkspace(named: "Review B")
         try workspace.moveTab(tabB, toWorkspace: ownerB)
-        workspace.revealPane(paneA.id)
+        workspace.revealPane(paneA.id, origin: .user)
         let routing = RelayAgentAccountRouting.shared
         routing.setWorkspace(ownerA, provider: "claude", label: "work")
         routing.setWorkspace(ownerB, provider: "claude", label: "personal")

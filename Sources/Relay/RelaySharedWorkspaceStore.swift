@@ -123,7 +123,9 @@ final class RelaySharedWorkspaceStore {
             selectedTabID: local.selectedTabID.flatMap { tabIDs.contains($0) ? $0 : nil },
             activePaneID: local.activePaneID.flatMap { paneIDs.contains($0) ? $0 : nil },
             recoveryWindow: current.recoveryWindow, rPresentations: presentations,
-            sidebarVisible: local.sidebarVisible)
+            sidebarVisible: local.sidebarVisible,
+            paneVisits: local.paneVisits == nil && current.paneVisits == nil ? nil
+                : PaneVisitHistory.merged(local.paneVisits ?? [], current.paneVisits ?? [], keeping: paneIDs))
         try validate(merged)
         return merged
     }

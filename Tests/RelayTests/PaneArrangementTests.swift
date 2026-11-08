@@ -13,7 +13,7 @@ import Testing
     #expect(workspace.panes[pane.id] === pane)
     #expect(workspace.selectedTab!.floatingPanes[0].isMinimized)
     #expect(workspace.activePaneID != pane.id)
-    workspace.selectPane(pane.id)
+    workspace.selectPane(pane.id, origin: .user)
     #expect(!workspace.selectedTab!.floatingPanes[0].isMinimized)
     #expect(workspace.selectedTab!.floatingPanes[0].width == placement.width)
 }
@@ -110,7 +110,7 @@ import Testing
     let editor = workspace.activePaneID!
     workspace.newFloatingPane()
     let other = workspace.activePaneID!
-    workspace.selectPane(editor)
+    workspace.selectPane(editor, origin: .user)
     let tab = workspace.selectedTab!
     let before = tab.layout
     let beforeFloating = tab.floatingPanes

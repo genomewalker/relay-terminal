@@ -778,7 +778,8 @@ final class TerminalRuntime: NSObject {
     private var pendingFocusOnPresentation = false
     private var focusIntentGeneration: UInt64 = 0
     private var keyboardFocusEligible = false
-    var onPaneSelection: (() -> Void)?
+    /// `.user` only for a pointer click; focus repair and pre-action selection are programmatic.
+    var onPaneSelection: ((PaneSelectionOrigin) -> Void)?
     private var readlineShellIdentity: String?
     private var promptEditorProbeTask: Task<Void, Never>?
 
@@ -3765,10 +3766,11 @@ final class TerminalRuntime: NSObject {
         return hash == 0 ? 1 : hash
     }
 
-    fileprivate func selectPane() {
+    fileprivate func selectPane(origin: PaneSelectionOrigin = .programmatic) {
         guard let pane else { return }
-        if let onPaneSelection { onPaneSelection(); return }
-        NotificationCenter.default.post(name: .relaySelectPane, object: pane.id)
+        if let onPaneSelection { onPaneSelection(origin); return }
+        NotificationCenter.default.post(name: .relaySelectPane, object: pane.id,
+                                        userInfo: origin == .user ? [RelaySelectPaneKey.userInitiated: true] : nil)
     }
 
     fileprivate func split(_ axis: SplitAxis) {
@@ -7281,7 +7283,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             "surface_visible": String(relaySurfaceIsVisible),
             "window_key": String(window?.isKeyWindow == true),
         ])
-        owner?.selectPane()
+        owner?.selectPane(origin: .user)
         owner?.focus()
         synchronizePromptMirrorFromRenderer()
         promptSelection = nil
@@ -10112,7 +10114,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     override func rightMouseDown(with event: NSEvent) {
         owner?.prepareForUserInteraction()
         _ = acquireProgrammaticFocus()
-        owner?.selectPane()
+        owner?.selectPane(origin: .user)
         owner?.focus()
         NSMenu.popUpContextMenu(relayContextMenu(), with: event, for: self)
     }
@@ -10677,4 +10679,9 @@ extension TerminalRuntime: RelayAgentSignInPort {
         pane.userEnteredInput()
         return true
     }
+}
+
+/// `.relaySelectPane` userInfo: present and true only for a pointer click.
+enum RelaySelectPaneKey {
+    static let userInitiated = "relay.select-pane.user"
 }

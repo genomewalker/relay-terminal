@@ -256,7 +256,7 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
             // A selection the user made meanwhile is left alone.
             guard workspace.activePaneID == pane.id else { return }
             if let previous = saved.pane, workspace.panes[previous] != nil {
-                workspace.revealPane(previous)
+                workspace.revealPane(previous, origin: .programmatic)
             } else if let tab = saved.tab, workspace.tabs.contains(where: { $0.id == tab }) {
                 workspace.selectTab(tab)
             }

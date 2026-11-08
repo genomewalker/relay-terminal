@@ -175,9 +175,9 @@ func panePinsFollowIdentity() throws {
     workspace.togglePanePin(ids[1])
     #expect(workspace.isPanePinned(ids[1]))
     try workspace.stackPane(ids[1], onto: ids[0])
-    workspace.selectPane(ids[0])
+    workspace.selectPane(ids[0], origin: .user)
     #expect(workspace.isPanePinned(ids[1]) && !workspace.isPanePinned(ids[0]))
-    workspace.selectPane(ids[1])
+    workspace.selectPane(ids[1], origin: .user)
     workspace.closeActivePane()
     #expect(!workspace.isPanePinned(ids[1]))
     let defaults = UserDefaults(suiteName: "relay.pane-pins-test.\(UUID().uuidString)")!
@@ -236,7 +236,7 @@ func selectingHiddenStackMemberShowsIt() throws {
     defer { workspace.shutdown() }
     let tab = workspace.selectedTab!
     try workspace.stackPane(ids[1], onto: ids[0])
-    workspace.selectPane(ids[0])
+    workspace.selectPane(ids[0], origin: .user)
     #expect(tab.layout.paneIDs == [ids[0], ids[2]])
     #expect(tab.stacks[0].selected == ids[0])
     #expect(workspace.activePaneID == ids[0])
@@ -251,7 +251,7 @@ func closingShownStackMemberKeepsSlot() throws {
     defer { workspace.shutdown() }
     let tab = workspace.selectedTab!
     try workspace.stackPane(ids[1], onto: ids[0])
-    workspace.selectPane(ids[1])
+    workspace.selectPane(ids[1], origin: .user)
     workspace.closeActivePane()
     #expect(workspace.panes[ids[1]] == nil)
     #expect(tab.layout.paneIDs == [ids[0], ids[2]])
@@ -266,7 +266,7 @@ func closingStackInSinglePaneTabKeepsTab() throws {
     defer { workspace.shutdown() }
     let tab = workspace.selectedTab!
     try workspace.stackPane(ids[1], onto: ids[0])
-    workspace.selectPane(ids[1])
+    workspace.selectPane(ids[1], origin: .user)
     workspace.closeActivePane()
     #expect(workspace.tabs.contains { $0 === tab })
     #expect(tab.layout == .pane(ids[0]) && workspace.panes[ids[0]] != nil)
@@ -419,8 +419,8 @@ func navigationHistory() throws {
     organization.goForward()
     #expect(organization.current == .tab(tab.id))
     // Pane changes within one tab replace the entry rather than piling up.
-    workspace.selectPane(ids[0])
-    workspace.selectPane(ids[1])
+    workspace.selectPane(ids[0], origin: .user)
+    workspace.selectPane(ids[1], origin: .user)
     #expect(organization.current == .pane(ids[1]))
     organization.goBack()
     #expect(organization.current == .group(group))

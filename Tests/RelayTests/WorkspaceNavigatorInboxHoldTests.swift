@@ -52,7 +52,7 @@ struct WorkspaceNavigatorInboxHoldTests {
         #expect(Set(workspace.shownAttentionInbox(inbox: store).map(\.paneID)) == [dismissed, closed, kept])
         workspace.dismissAttention(dismissed, inbox: store)
         workspace.selectTab(try #require(workspace.tabs.first { $0.allPaneIDs.contains(closed) }).id)
-        workspace.selectPane(closed)
+        workspace.selectPane(closed, origin: .user)
         workspace.closeActivePane()
         #expect(workspace.panes[closed] == nil)
         // The closed pane's row stays (shown as closed) so the rows below

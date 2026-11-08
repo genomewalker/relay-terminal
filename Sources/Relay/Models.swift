@@ -379,22 +379,42 @@ enum AgentKind: String, Codable, CaseIterable, Sendable {
     }
 }
 
-enum AgentPhase: String, Codable, Sendable {
+/// The one set of words for a pane's state, used by the pane chrome, the
+/// navigator, Go to pane and accessibility labels.
+enum PaneDisplayState: CaseIterable, Equatable, Sendable {
+    case working, idle, needsInput, exited, connecting, connectionLost
+
+    var label: String {
+        switch self {
+        case .working: "Working"
+        // Quiet output is all Relay observes; readiness is not confirmed.
+        case .idle: "Idle"
+        case .needsInput: "Needs input"
+        case .exited: "Exited"
+        case .connecting: "Connecting"
+        case .connectionLost: "Connection lost"
+        }
+    }
+
+    init(_ phase: AgentPhase) {
+        switch phase {
+        case .connecting: self = .connecting
+        case .active: self = .working
+        case .quiet: self = .idle
+        case .needsInput: self = .needsInput
+        case .exited: self = .exited
+        }
+    }
+}
+
+enum AgentPhase: String, Codable, CaseIterable, Sendable {
     case connecting
     case active
     case quiet
     case needsInput
     case exited
 
-    var label: String {
-        switch self {
-        case .connecting: "Connecting"
-        case .active: "Working"
-        case .quiet: "Ready"
-        case .needsInput: "Needs input"
-        case .exited: "Exited"
-        }
-    }
+    var label: String { PaneDisplayState(self).label }
 
     var color: Color {
         switch self {
@@ -416,11 +436,11 @@ enum PaneConnectionState: Equatable, Sendable {
 
     var label: String {
         switch self {
-        case .connecting: "Connecting"
+        case .connecting: PaneDisplayState.connecting.label
         case .connected: "Connected"
         case .reconnecting: "Reconnecting"
         case .waitingForNetwork: "VPN required"
-        case .disconnected: "Connection lost"
+        case .disconnected: PaneDisplayState.connectionLost.label
         }
     }
 
@@ -803,13 +823,7 @@ final class PaneModel: ObservableObject, Identifiable {
     var activitySummary: String {
         if let editorStartLabel { return editorStartLabel }
         if let activity = agentActivities.last { return activity.label }
-        return switch phase {
-        case .connecting: "Starting"
-        case .active: "Working"
-        case .quiet: "Ready"
-        case .needsInput: "Needs input"
-        case .exited: "Exited"
-        }
+        return phase.label
     }
 
     func assignRemoteHierarchy(workspaceSessionID: UUID, tabID: UUID) {
@@ -1277,8 +1291,8 @@ final class PaneModel: ObservableObject, Identifiable {
                 occurredAt: occurredAt, sourceID: intelligenceSourceID, alert: .needsInput
             )
         case "Notification" where notificationType == "permission_prompt" || notificationType == "idle_prompt":
-            raiseWait(kind: kind, excerpt: event["message"] as? String ?? "Needs input")
-            recordActivity(event["message"] as? String ?? "Needs input", phase: .needsInput)
+            raiseWait(kind: kind, excerpt: event["message"] as? String ?? PaneDisplayState.needsInput.label)
+            recordActivity(event["message"] as? String ?? PaneDisplayState.needsInput.label, phase: .needsInput)
             announceAgentAttention(event["message"] as? String ?? "Agent needs input")
             recordIntelligenceEvent(
                 provider: kind, agentID: subagentID ?? rootID, eventKind: .attention,
@@ -1427,8 +1441,8 @@ final class PaneModel: ObservableObject, Identifiable {
             lastCompletedAgentTurn = max(lastCompletedAgentTurn ?? occurredAt, occurredAt)
             pendingAgentApprovals = 0
             agentProgressPercent = nil
-            detector.applyStructuredEvent(kind: kind, phase: .quiet, excerpt: "Ready")
-            recordActivity("Ready", phase: .quiet)
+            detector.applyStructuredEvent(kind: kind, phase: .quiet, excerpt: PaneDisplayState.idle.label)
+            recordActivity(PaneDisplayState.idle.label, phase: .quiet)
             recordIntelligenceEvent(
                 provider: kind, agentID: subagentID ?? rootID, eventKind: .completion,
                 title: "\(kind.label) completed a turn",
@@ -1482,10 +1496,10 @@ final class PaneModel: ObservableObject, Identifiable {
                 subagents.removeAll { $0.provider == kind }
             }
             if providerStillRunning {
-                detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: "Working")
+                detector.applyStructuredEvent(kind: kind, phase: .active, excerpt: PaneDisplayState.working.label)
                 structuredAgentRunning = true
             } else if let remaining = activeAgentRoots.values.first {
-                detector.applyStructuredEvent(kind: remaining, phase: .active, excerpt: "Working")
+                detector.applyStructuredEvent(kind: remaining, phase: .active, excerpt: PaneDisplayState.working.label)
                 structuredAgentRunning = true
             } else {
                 detector.resetToShell()

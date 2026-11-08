@@ -3253,7 +3253,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
             if let refusal = navigationRefusal([.navigate]) { return refusal }
             guard admit("select_pane", tab: snapshot.pane(id)?.tabID, pane: id) else { return (unrecorded, true) }
             captureUndo()
-            workspace.revealPane(id)
+            workspace.revealPane(id, origin: .programmatic)
             if let zoomed = workspace.zoomedPaneID, zoomed != id { workspace.zoomedPaneID = nil }
             let ok = workspace.activePaneID == id
             // Bring the pane's window forward, as MCP navigation does.
@@ -3266,7 +3266,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
             if let refusal = navigationRefusal([.navigate, .layout]) { return refusal }
             guard admit(operation, tab: snapshot.pane(id)?.tabID, pane: id) else { return (unrecorded, true) }
             captureUndo()
-            if workspace.activePaneID != id { workspace.revealPane(id) }
+            if workspace.activePaneID != id { workspace.revealPane(id, origin: .programmatic) }
             guard workspace.activePaneID == id else {
                 settle(operation, ok: false)
                 return (["ok": .bool(false), "error": .string("The pane could not be selected.")], true)
@@ -3315,7 +3315,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
         if let tab = undo.tabID, workspace.tabs.contains(where: { $0.id == tab }), workspace.selectedTabID != tab {
             workspace.selectTab(tab)
         }
-        if let pane = undo.paneID, workspace.panes[pane] != nil { workspace.selectPane(pane) }
+        if let pane = undo.paneID, workspace.panes[pane] != nil { workspace.selectPane(pane, origin: .programmatic) }
         workspace.zoomedPaneID = undo.zoomedPaneID.flatMap { workspace.panes[$0] != nil ? $0 : nil }
         exchanges[index].undone = true
         try? audit.recordAssistantAction(operation: "undo", requestID: exchange.requestID, request: exchange.auditedRequest,

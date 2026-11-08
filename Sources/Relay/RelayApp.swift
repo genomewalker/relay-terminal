@@ -634,7 +634,10 @@ struct RelayApp: App {
                 .relaySurface()
                 .tint(RelayTheme.accent)
                 .onReceive(NotificationCenter.default.publisher(for: .relaySelectPane)) { note in
-                    if let id = note.object as? UUID { workspace.selectPane(id) }
+                    if let id = note.object as? UUID {
+                        let user = note.userInfo?[RelaySelectPaneKey.userInitiated] as? Bool == true
+                        workspace.selectPane(id, origin: user ? .user : .programmatic)
+                    }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .relaySplitRight)) { _ in
                     workspace.splitActive(axis: .horizontal)
@@ -706,7 +709,7 @@ struct RelayApp: App {
                     .keyboardShortcut(shortcut(.newTab).keyEquivalent, modifiers: shortcut(.newTab).eventModifiers)
                 Button("New local session") { workspace.newTab(profile: .local) }
                     .keyboardShortcut(shortcut(.newLocalSession).keyEquivalent, modifiers: shortcut(.newLocalSession).eventModifiers)
-                Button("Work overview…") { workspace.presentQuickNavigate() }
+                Button(RelayCommand.quickNavigate.label + "…") { workspace.presentQuickNavigate() }
                     .keyboardShortcut(shortcut(.quickNavigate).keyEquivalent, modifiers: shortcut(.quickNavigate).eventModifiers)
                 Button("Find SSH host…") { workspace.presentHostLauncher() }
                     .keyboardShortcut(shortcut(.findHost).keyEquivalent, modifiers: shortcut(.findHost).eventModifiers)

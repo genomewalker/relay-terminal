@@ -42,7 +42,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .newTab: "New tab in session"
         case .newLocalSession: "New local session"
-        case .quickNavigate: "Work overview"
+        case .quickNavigate: "Go to pane"
         case .findHost: "Find SSH host"
         case .connectHost: "Connect to host"
         case .openEditor: "Open remote editor"

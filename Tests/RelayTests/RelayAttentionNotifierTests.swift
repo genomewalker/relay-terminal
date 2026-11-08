@@ -100,7 +100,7 @@ struct RelayAttentionNotifierTests {
         store.record(event(panel.id, .attention, .needsInput, source: "floating-\(panel.id)"))
         #expect(store.attentionPanes.contains { $0.paneID == panel.id })
 
-        workspace.revealPane(panel.id)
+        workspace.revealPane(panel.id, origin: .user)
         #expect(workspace.selectedTabID == owner)
         #expect(workspace.activePaneID == panel.id)
         #expect(store.marker(for: panel.id) == nil)
@@ -122,7 +122,7 @@ struct RelayAttentionNotifierTests {
         store.record(event(target.id, .attention, .needsInput, source: "target-\(target.id)"))
         store.record(event(remembered.id, .attention, .needsInput, source: "sibling-\(remembered.id)"))
 
-        workspace.revealPane(target.id)
+        workspace.revealPane(target.id, origin: .user)
         #expect(workspace.activePaneID == target.id)
         #expect(store.marker(for: target.id) == nil)
         // Passing through the remembered sibling does not show it.
@@ -261,7 +261,7 @@ struct RelayAttentionNotifierTests {
         let hidden = shownBefore == left ? right : left
         alert(hidden)
         alert(firstPane)
-        workspace.withoutNavigationEffects { workspace.selectPane(hidden) }
+        workspace.withoutNavigationEffects { workspace.selectPane(hidden, origin: .user) }
         workspace.withoutNavigationEffects { workspace.selectTab(first) }
         #expect(workspace.activePaneID == shownBefore)
         #expect(store.marker(for: hidden) == .needsInput)
@@ -284,14 +284,14 @@ struct RelayAttentionNotifierTests {
         // An alert on the pane already in front is read by selecting it again.
         alert(other)
         #expect(store.marker(for: other) == .needsInput)
-        workspace.selectPane(other)
+        workspace.selectPane(other, origin: .user)
         #expect(store.marker(for: other) == nil)
         // While Relay is in the background, an agent's selection or focus
         // moving to a neighbour is not seen: markers stay.
         frontmost = false
         let back = other == left ? right : left
         alert(back)
-        workspace.selectPane(back)
+        workspace.selectPane(back, origin: .user)
         #expect(workspace.activePaneID == back)
         #expect(store.marker(for: back) == .needsInput)
         alert(firstPane)

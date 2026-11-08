@@ -10,6 +10,8 @@ struct RelayQuickNavigate: View {
     @State private var expandedIDs: Set<String> = []
     @FocusState private var searchFocused: Bool
     private typealias Index = RelayWorkOverviewIndex
+    nonisolated static let title = RelayCommand.quickNavigate.label
+    nonisolated static let searchPlaceholder = "Go to a pane, workspace, setting or ask Miko"
 
     init(workspace: WorkspaceModel) {
         self.workspace = workspace
@@ -18,6 +20,8 @@ struct RelayQuickNavigate: View {
 
     private var results: [Index.Entry] {
         _ = activityIndex.revision
+        let now = Date()
+        let visits = workspace.paneVisits
         var entries = Index.navigationEntries(query: query)
         for item in workspace.ownership.orderedWorkspaces {
             entries.append(.init(id: "workspace:\(item.id)", title: item.name,
@@ -46,13 +50,12 @@ struct RelayQuickNavigate: View {
                     return (priority[$0.state] ?? 5) < (priority[$1.state] ?? 5)
                 }
                 let reportCurrent = pane.connectionState == .connected && pane.programStatus.revision != nil
-                let reportLabel = report.map { "Program reported " + $0.state + (reportCurrent ? "" : " (stale)") }
-                // Quiet is only the absence of recent output; it cannot
+                // Idle is only the absence of recent output; it cannot
                 // establish that the worker is ready or its task succeeded.
-                let signalLabel = pane.phase == .quiet ? "Quiet" : pane.phase.label
                 let signalDetail = pane.pendingAgentApprovals == 0 && report == nil && pane.phase == .quiet
                     ? "No recent output; readiness has not been confirmed.\n" : ""
-                let status = pane.pendingAgentApprovals > 0 ? "\(pane.pendingAgentApprovals) approval(s) reported" : (reportLabel ?? signalLabel)
+                let status = Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
+                                              programState: report?.state, programReportCurrent: reportCurrent)
                 let stateSource = pane.pendingAgentApprovals > 0 ? "pending agent approval count"
                     : (report != nil ? "program self-report" : "terminal output and agent signals")
                 let programDetails = pane.programStatus.records.map { record in
@@ -68,7 +71,9 @@ struct RelayQuickNavigate: View {
                     searchFields: [pane.title, pane.profile.name, pane.profile.host, pane.directory ?? "", id.uuidString,
                                    hidden ? "hidden stack" : "", pane.connectionStatusLabel],
                     needsAttention: pane.pendingAgentApprovals > 0 || pane.phase == .needsInput || report?.state == "blocked" || report?.state == "error",
-                    isCurrent: current, changedAt: changedAt))
+                    isCurrent: current, changedAt: changedAt,
+                    lastVisitedAt: id == workspace.activePaneID ? nil : visits.visit(id)?.lastVisitedAt,
+                    frecency: visits.frecency(of: id, at: now), isActivePane: id == workspace.activePaneID))
             }
         }
         return Index.results(entries, query: query)
@@ -78,10 +83,10 @@ struct RelayQuickNavigate: View {
         workspace.networkVisible = false
         switch result.destination {
         case .workspace(let id): workspace.selectWorkspace(id)
-        case .tab(let id): workspace.selectTab(id)
+        case .tab(let id): workspace.selectTab(id, origin: .user)
         case .pane(let id, let tab):
             workspace.selectTab(tab)
-            workspace.selectPane(id)
+            workspace.selectPane(id, origin: .user)
         case .settings(let section):
             workspace.quickNavigateDidChooseAction {
                 RelaySettingsNavigation.shared.section = section
@@ -106,7 +111,7 @@ struct RelayQuickNavigate: View {
     }
 
     private func move(_ offset: Int) {
-        selectionID = Index.movedSelection(selectionID, by: offset, in: results)
+        selectionID = Index.movedSelection(selectionID, by: offset, in: results, query: query)
     }
 
     private func announceSelection(_ row: Index.Entry?) {
@@ -119,15 +124,15 @@ struct RelayQuickNavigate: View {
 
     var body: some View {
         let rows = results
-        let selected = Index.selectedID(selectionID, in: rows)
+        let selected = Index.selectedID(selectionID, in: rows, query: query)
         VStack(alignment: .leading, spacing: 0) {
-            Text("Work overview").font(.headline).padding(.horizontal, 16).padding(.top, 14)
+            Text(Self.title).font(.headline).padding(.horizontal, 16).padding(.top, 14)
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search work, settings, controls or ask Miko", text: $query)
+                TextField(Self.searchPlaceholder, text: $query)
                     .textFieldStyle(.plain).focused($searchFocused)
                     .onSubmit { if let row = rows.first(where: { $0.id == selected }) { open(row) } }
-                    .accessibilityLabel("Search work overview")
+                    .accessibilityLabel(Self.title)
                     .accessibilityHint("Use up and down arrows to select a result, Return to open, Escape to return to the original pane")
                     .accessibilityIdentifier("relay.overview.search")
                     .onKeyPress(.downArrow) { move(1); return .handled }
@@ -144,10 +149,10 @@ struct RelayQuickNavigate: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(Index.Group.allCases, id: \.rawValue) { group in
-                                let members = rows.filter { $0.group == group }
+                            ForEach(Index.sections(rows, query: query)) { section in
+                                let members = section.entries
                                 if !members.isEmpty {
-                                    Text(group.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                    Text(section.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                                         .padding(.horizontal, 12).padding(.top, 10).accessibilityAddTraits(.isHeader)
                                     ForEach(members) { result in
                                         VStack(alignment: .leading, spacing: 4) {
@@ -199,7 +204,7 @@ struct RelayQuickNavigate: View {
         .background(.regularMaterial)
         .onAppear { searchFocused = true }
         .onChange(of: query) { _, _ in selectionID = nil }
-        .onChange(of: rows.map(\.id)) { _, _ in selectionID = Index.selectedID(selectionID, in: rows) }
+        .onChange(of: rows.map(\.id)) { _, _ in selectionID = Index.selectedID(selectionID, in: rows, query: query) }
         .onChange(of: selected) { _, id in announceSelection(rows.first { $0.id == id }) }
         .onMoveCommand { direction in
             switch direction { case .down: move(1); case .up: move(-1); default: break }

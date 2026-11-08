@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import Relay
 
-@Suite("Work overview metadata and keyboard selection")
+@Suite("Go to pane metadata and keyboard selection")
 struct WorkOverviewIndexTests {
     private typealias Index = RelayWorkOverviewIndex
     private func entry(_ id: String, title: String = "Pane", location: String = "Research › Analysis",

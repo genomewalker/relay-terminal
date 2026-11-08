@@ -337,7 +337,7 @@ final class WorkspaceOrganizationController: ObservableObject {
         defer { applying = false }
         switch target {
         case .tab(let id): workspace.selectTab(id)
-        case .pane(let id): workspace.revealPane(id)
+        case .pane(let id): workspace.revealPane(id, origin: .programmatic)
         case .all, .group: break
         }
     }

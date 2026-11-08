@@ -486,7 +486,7 @@ extension WorkspaceModel {
         guard let pane = panes[paneID], let tabID = tabID(containingPane: paneID) else {
             throw PluginError.invalid("Pane no longer exists")
         }
-        revealPane(paneID)
+        revealPane(paneID, origin: .programmatic)
         guard selectedTabID == tabID, activePaneID == pane.id else {
             throw PluginError.invalid("Pane selection failed")
         }
@@ -562,7 +562,7 @@ extension WorkspaceModel {
         // that host or have been resolved there (MCP clients never send one).
         if let directory = proposal.directory,
            !admitsStartingDirectory(directory, profile: profile ?? expected.profile) { return nil }
-        revealPane(proposal.paneID)
+        revealPane(proposal.paneID, origin: .programmatic)
         guard let tab = selectedTab, tab.allPaneIDs.contains(proposal.paneID) else { return nil }
         switch proposal.action {
         case .select: activateSelectedWorkspacePane(expected)
@@ -584,7 +584,7 @@ extension WorkspaceModel {
         case .unzoom:
             if let zoomed = zoomedPaneID {
                 togglePaneZoom(zoomed)
-                selectPane(proposal.paneID)
+                selectPane(proposal.paneID, origin: .programmatic)
             }
         case .float: floatTiledPane(proposal.paneID)
         case .dock: dockFloatingPane(proposal.paneID)

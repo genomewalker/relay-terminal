@@ -798,7 +798,7 @@ struct PeerNetworkTopologyView: View {
                                 detail("Messaging", peer.messagingLabel(now: now))
                                 if let taskState = peer.taskState { detail("Task activity", taskState) }
                                 if let parent = peer.parentID { detail("Owned by session", parent.session) }
-                                if let paneID = peer.paneID { Button("Open pane") { workspace.revealPane(paneID) } }
+                                if let paneID = peer.paneID { Button("Open pane") { workspace.revealPane(paneID, origin: .user) } }
                                 Text("Activity").font(.headline)
                                 detail("Last reported activity", peer.lastEvent ?? "Not reported")
                                 detail("Last completed turn", peer.lastTurnAt?.formatted() ?? "Not observed in this Relay run")
@@ -864,7 +864,7 @@ struct PeerNetworkTopologyView: View {
         }
         return NetworkConnectionEndpoint(id: "\(identity.host)/\(identity.session)",
             name: participant?.name ?? fallbackName, host: identity.host, turn: turn,
-            openSession: pane.map { pane in { workspace.revealPane(pane.id) } })
+            openSession: pane.map { pane in { workspace.revealPane(pane.id, origin: .user) } })
     }
 
     private var routeInspector: some View {

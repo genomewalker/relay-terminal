@@ -15,6 +15,7 @@ import UniformTypeIdentifiers
 /// One flat list of workspaces (search, pinned, hidden) with their tabs
 /// and panes. Every drop is an object-preserving move of the ownership API.
 @MainActor struct WorkspaceNavigator: View {
+    nonisolated static let searchPlaceholder = "Search workspaces, tabs and panes"
     @ObservedObject var workspace: WorkspaceModel
     // Attention order follows pane phases (throttled), alerts and drags.
     @ObservedObject private var activityIndex: WorkspaceActivityIndex
@@ -45,7 +46,7 @@ import UniformTypeIdentifiers
             HStack(spacing: 6) {
                 // The clear button sits beside the text, not over it.
                 HStack(spacing: 2) {
-                    TextField("Search workspaces and tabs", text: $query)
+                    TextField(Self.searchPlaceholder, text: $query)
                         .textFieldStyle(.plain)
                         .font(RelayTheme.font(size: 11))
                         .accessibilityIdentifier("relay.navigator.search")
@@ -408,7 +409,7 @@ private struct WorkspaceFocusBar: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("\(expanded ? "Collapse" : "Expand") \(tab.name) panes")
-                Button { workspace.selectTab(tab.id) } label: {
+                Button { workspace.selectTab(tab.id, origin: .user) } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "rectangle.split.2x1").font(.system(size: 9)).foregroundStyle(RelayTheme.textMuted)
                         Text(workspace.tabDisplayName(tab, fallback: tab.name)).font(RelayTheme.font(size: 11)).lineLimit(1)
@@ -471,7 +472,7 @@ private struct WorkspaceFocusBar: View {
                         .padding(.trailing, 8)
                         .frame(height: 22)
                         .contentShape(Rectangle())
-                        .onTapGesture { workspace.revealPane(id) }
+                        .onTapGesture { workspace.revealPane(id, origin: .user) }
                         .onDrag { WorkspaceDragPayload.paneProvider(id) }
                         .help("Drag onto a tab or workspace to move this pane. It keeps its process, conversation and draft.")
                         .accessibilityIdentifier("relay.navigator.pane.\(id.uuidString.lowercased())")

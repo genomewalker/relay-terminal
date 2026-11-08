@@ -304,7 +304,7 @@ import Combine
         let profile = pane.profile
         defer {
             if workspace.activePaneID == pane.id, previous != pane.id {
-                if let previous, workspace.panes[previous] != nil { workspace.revealPane(previous) }
+                if let previous, workspace.panes[previous] != nil { workspace.revealPane(previous, origin: .programmatic) }
                 else if let tab, workspace.tabs.contains(where: { $0.id == tab }) { workspace.selectTab(tab) }
             }
         }

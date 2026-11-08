@@ -1718,7 +1718,7 @@ final class RelaySidePanelServer: ObservableObject {
                 let attached = workspace.panes[input.paneID] != nil
                 try await RemotePaneControlService.terminate(profile: profile, paneID: input.paneID)
                 if attached {
-                    workspace.revealPane(input.paneID)
+                    workspace.revealPane(input.paneID, origin: .programmatic)
                     workspace.closeActivePane()
                 }
                 let result = ["status": "terminated", "host": input.host,

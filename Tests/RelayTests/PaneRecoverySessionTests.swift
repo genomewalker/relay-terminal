@@ -112,7 +112,7 @@ struct PaneRecoverySessionTests {
                 workspaceID: target.sessionID.uuidString.lowercased(), sessionLabel: "dandy-07")
         }
         workspace.selectTab(target.id)
-        workspace.selectPane(closed)
+        workspace.selectPane(closed, origin: .user)
         workspace.closeActivePane()
         _ = try workspace.movePaneToNewTab(moved)
         // Docking leaves floatingPanes before the layout takes the pane.
