@@ -706,6 +706,7 @@ extension JSONDecoder {
         if let exchange { value["exchange"] = Self.exchangeObject(exchange) }
         // Still terminal "completed" so waiters finish, but the handoff is unconfirmed.
         if state == "completed", exchange?.awaitingConfirmation == true { value["awaiting_confirmation"] = true }
+        if state == "completed", exchange?.typedUnconfirmed == true { value["typed_unconfirmed"] = true }
         return value
     }
 
@@ -848,7 +849,8 @@ extension JSONDecoder {
     /// reported as such, never as completed.
     static func turnStatus(_ exchange: RelayAssistantExchange) -> String {
         if exchange.failed { return "failed" }
-        return exchange.awaitingConfirmation ? "sent_awaiting_confirmation" : "completed"
+        if exchange.awaitingConfirmation { return "sent_awaiting_confirmation" }
+        return exchange.typedUnconfirmed ? "typed_unconfirmed" : "completed"
     }
 
     static func exchangeObject(_ exchange: RelayAssistantExchange) -> [String: Any] {
@@ -861,7 +863,7 @@ extension JSONDecoder {
         }
         return ["request_id": exchange.requestID, "origin": origin, "request": exchange.request, "reply": exchange.reply,
                 "tool_log": exchange.toolLog, "failed": exchange.failed,
-                "awaiting_confirmation": exchange.awaitingConfirmation, "cancelled": exchange.stoppedByUser, "undone": exchange.undone,
+                "awaiting_confirmation": exchange.awaitingConfirmation, "typed_unconfirmed": exchange.typedUnconfirmed, "cancelled": exchange.stoppedByUser, "undone": exchange.undone,
                 "tool_trace": exchange.toolTrace.map { ["name": $0.name, "input": $0.input, "result": $0.result,
                                                          "is_error": $0.isError] as [String: Any] },
                 "charged_microusd": exchange.chargedMicrousd,

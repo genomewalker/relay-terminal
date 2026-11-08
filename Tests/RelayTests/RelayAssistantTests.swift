@@ -135,6 +135,16 @@ fileprivate func stoppedSentAwaitingConfirmation(_ exchange: RelayAssistantExcha
         && exchange.reply.hasPrefix("Sent; waiting for confirmation (not replayed)")
 }
 
+/// The harness stopped on a typed send_command that is not confirmed to have
+/// run: still unresolved (no further model request, never replayed) but
+/// presented as typed, not failed.
+@MainActor
+fileprivate func stoppedTypedUnconfirmed(_ exchange: RelayAssistantExchange?) -> Bool {
+    guard let exchange else { return false }
+    return !exchange.failed && exchange.typedUnconfirmed && !exchange.awaitingConfirmation
+        && exchange.reply == "Typed; not yet confirmed to have run (not replayed). Check the pane before running it again."
+}
+
 /// The harness stopped on `tool`'s unresolved outcome and said it must not be replayed.
 @MainActor
 fileprivate func stoppedUnresolved(_ exchange: RelayAssistantExchange?, after tool: String) -> Bool {
@@ -677,7 +687,7 @@ struct RelayAssistantChangeActionTests {
         // An unresolved outcome is recorded and the task stops: no further model request.
         #expect(tracedResult(exchange, "send_command")?["outcome"]?.string == "unknown")
         #expect(f.model.requests.count == 1)
-        #expect(stoppedUnresolved(exchange, after: "send_command"))
+        #expect(stoppedTypedUnconfirmed(exchange))
         #expect(outcomes(f.audit, "send_command") == ["proposed", "dispatched", "unknown"])
         let record = try #require(f.audit.audit().last { $0.operation == "send_command" })
         #expect(record.actionID == card.id.uuidString.lowercased() && record.argumentsDigest == card.argumentsDigest)
@@ -1767,7 +1777,7 @@ struct RelayAssistantDraftFenceTests {
         #expect(result.sent == ["make test"])
         // The submission is unresolved: recorded in the trace, never returned to or re-requested from the model.
         #expect(tracedResult(result.exchange, "send_command")?["outcome"]?.string == "unknown")
-        #expect(result.modelRequests == 1 && stoppedUnresolved(result.exchange, after: "send_command"))
+        #expect(result.modelRequests == 1 && stoppedTypedUnconfirmed(result.exchange))
         #expect(result.receipts == ["proposed", "dispatched", "unknown"])
     }
 
@@ -3401,6 +3411,58 @@ struct RelayAssistantHandoffPresentationTests {
         awaiting.awaitingConfirmation = false
         let plain = RelayAssistantHarness.modelHistory([awaiting], exchange: &current).last?["content"]?.string
         #expect(plain?.hasPrefix("[Earlier assistant reply; observation only") == true)
+    }
+
+    private func typed(_ outcome: String, _ status: String, error: String? = nil, responseError: String? = nil) -> String {
+        var response: [String: Any] = ["status": status]
+        if let responseError { response["error"] = responseError }
+        var root: [String: Any] = ["outcome": outcome, "http_status": 200,
+            "response": String(decoding: try! JSONSerialization.data(withJSONObject: response), as: UTF8.self)]
+        if let error { root["error"] = error }
+        return content(root)
+    }
+
+    private func toolCall(_ name: String) -> RelayPaneHealthToolCall {
+        RelayPaneHealthToolCall(type: "tool_use", id: "t1", name: name, input: .object([:]))
+    }
+
+    @Test("A submitted plain send_command presents as typed and unconfirmed, while the journal keeps it unresolved")
+    func typedCommandIsNotAFailure() {
+        for status in ["submitted", "submitted_outcome_unknown"] {
+            let result = typed("unknown", status)
+            #expect(RelayAssistantHarness.isTypedUnconfirmed(call: toolCall("send_command"), content: result, isError: false))
+            #expect(RelayMikoTaskJournal.toolOutcome(call: toolCall("send_command"), content: result, isError: false) == .unknown)
+        }
+        #expect(RelayAssistantHarness.typedUnconfirmedReply ==
+            "Typed; not yet confirmed to have run (not replayed). Check the pane before running it again.")
+    }
+
+    @Test("Refusals, fences, partial and plan outcomes and errors keep the failure presentation for typed commands")
+    func otherTypedOutcomesStayFailures() {
+        let send = toolCall("send_command")
+        #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: typed("unknown", "submitted"), isError: true))
+        #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: typed("unknown", "submitted", error: "x"), isError: false))
+        #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: typed("unknown", "submitted", responseError: "x"), isError: false))
+        for status in ["refused", "draft_present", "input_changed", "directory_mismatch"] {
+            #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: typed("refused", status), isError: false), "\(status)")
+            #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: typed("unknown", status), isError: false), "\(status)")
+        }
+        #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: typed("partial", "submitted"), isError: false))
+        #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: content(["outcome": "partial", "steps": []]), isError: false))
+        #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: toolCall("propose_plan"), content: typed("unknown", "submitted"), isError: false))
+        #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: content(["outcome": "unknown"]), isError: false))
+        #expect(!RelayAssistantHarness.isTypedUnconfirmed(call: send, content: "not json", isError: false))
+    }
+
+    @Test("The next turn sees a typed, unconfirmed command as not established")
+    @MainActor
+    func typedHistoryUsesTheUnestablishedWrapper() throws {
+        var typedExchange = RelayAssistantExchange(request: "run the tests", origin: .user)
+        typedExchange.reply = RelayAssistantHarness.typedUnconfirmedReply
+        typedExchange.typedUnconfirmed = true
+        var current = RelayAssistantExchange(request: "did they pass?", origin: .user)
+        let reply = try #require(RelayAssistantHarness.modelHistory([typedExchange], exchange: &current).last?["content"]?.string)
+        #expect(reply.hasPrefix("[Earlier attempt did not establish a completed result.") && !reply.contains("Typed; not yet confirmed"))
     }
 
     @Test("Errors, unknown outcomes and other statuses keep the failure presentation")
