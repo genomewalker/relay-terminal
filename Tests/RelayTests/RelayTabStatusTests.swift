@@ -97,24 +97,49 @@ struct RelayTabStatusTests {
     @Test("The spinner's layer animation runs only while shown in a visible window")
     func spinnerGating() {
         _ = NSApplication.shared
-        func spinning(_ view: RelaySpinnerView) -> Bool {
-            (view.layer?.sublayers ?? []).contains { $0.animation(forKey: "spin") != nil }
-        }
         let view = RelaySpinnerView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
+        var unoccluded = true
+        view.occlusionVisible = { _ in unoccluded }
         view.animating = true
-        #expect(!spinning(view), "no window, no animation")
-        // Never ordered in: nothing appears on screen.
+        #expect(!view.isSpinning, "no window, no animation")
+        // Never ordered in: nothing appears on screen; occlusion is stubbed.
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 40, height: 40),
                               styleMask: [.borderless], backing: .buffered, defer: true)
         window.isReleasedWhenClosed = false
         window.contentView?.addSubview(view)
-        #expect(spinning(view))
+        #expect(view.isSpinning)
         view.animating = false
-        #expect(!spinning(view), "a hidden window stops the animation")
+        #expect(!view.isSpinning, "a hidden window stops the animation")
         view.animating = true
-        #expect(spinning(view))
+        #expect(view.isSpinning)
+        // Fallback outside a visibility scope: the window's own occlusion.
+        unoccluded = false
+        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        #expect(!view.isSpinning, "a covered window stops the animation")
+        unoccluded = true
+        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        #expect(view.isSpinning)
         view.removeFromSuperview()
-        #expect(!spinning(view))
+        #expect(!view.isSpinning)
+        // The real occlusion check: a window never ordered in is not visible.
+        let real = RelaySpinnerView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
+        real.animating = true
+        window.contentView?.addSubview(real)
+        #expect(!real.isSpinning)
+    }
+
+    @Test("The spinner's layers draw at the window's backing scale")
+    func spinnerScale() {
+        _ = NSApplication.shared
+        let view = RelaySpinnerView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 40, height: 40),
+                              styleMask: [.borderless], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.contentView?.addSubview(view)
+        #expect(view.shapeLayers.count == 2)
+        for layer in view.shapeLayers {
+            #expect(layer.contentsScale == window.backingScaleFactor)
+        }
     }
 
     // MARK: Live workspace
