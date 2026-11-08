@@ -627,6 +627,7 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var lastCommandDurationNanos: UInt64?
     @Published var programStatus = RelayProgramStatusSnapshot()
     private var programStatusAttention = RelayProgramStatusAttention()
+    private var programStatusFlush: Task<Void, Never>?
     @Published var terminalProgressPercent: Int?
     @Published var terminalProgressState: String?
     /// How each submit's input reached this pane, from counts only (no content).
@@ -1705,10 +1706,29 @@ final class PaneModel: ObservableObject, Identifiable {
         let transitions = programStatusAttention.consume(previous: previous,
             current: programStatus.records, revision: revision, deliveryEpoch: deliveryEpoch,
             replay: status.programStatusReplay != false, now: now)
+        recordProgramStatus(transitions)
+        scheduleProgramStatusFlush(now: now)
+    }
+
+    private func recordProgramStatus(_ transitions: [RelayProgramStatusAttention.Transition]) {
         for transition in transitions {
             AgentIntelligenceStore.shared.record(transition.inboxEvent(paneID: id,
                 host: profile.kind == .ssh ? profile.host : "This Mac",
                 paneName: displayName, occurredAt: Date()))
+        }
+    }
+
+    /// A transition held by the rate limit lands when the interval passes,
+    /// even if the program sends nothing more.
+    private func scheduleProgramStatusFlush(now: TimeInterval) {
+        guard programStatusFlush == nil, let delay = programStatusAttention.pendingDelay(now: now) else { return }
+        programStatusFlush = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self else { return }
+            self.programStatusFlush = nil
+            let now = ProcessInfo.processInfo.systemUptime
+            self.recordProgramStatus(self.programStatusAttention.flush(now: now, current: self.programStatus.records))
+            self.scheduleProgramStatusFlush(now: now)
         }
     }
 

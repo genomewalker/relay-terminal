@@ -16,7 +16,7 @@ struct JobChurnReviewerTests {
         var imports: [String] = []
         var reconnected = false
         control.transportIncarnation = { _ in incarnation }
-        control.policyTransport = { _, packet in
+        control.policyTransport = { _, packet, _ in
             let operation = packet["operation"] as? String ?? ""
             if operation == "caller_policy_import" { imports.append(incarnation) }
             if operation == "caller_list" {

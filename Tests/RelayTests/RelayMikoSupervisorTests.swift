@@ -130,7 +130,7 @@ struct RelayMikoSupervisorTests {
         let key = Curve25519.Signing.PrivateKey()
         let store = RelayCallerAdminProof.AdminKeyStore(load: { gate.wait(); return key })
         f.audit.transportIncarnation = { _ in nil }
-        f.audit.policyTransport = { _, packet in
+        f.audit.policyTransport = { _, packet, _ in
             if RelayCallerAdminProof.mutating.contains(packet["operation"] as? String ?? "") {
                 _ = try await store.key(within: .milliseconds(50))
             }

@@ -43,8 +43,49 @@ enum RelayCallerAdminProof {
 
     /// How long a request waits for the key. An unanswered Keychain prompt
     /// must not hold request handlers (0.5.30: Miko supervisor calls hung with
-    /// no reply); the load itself keeps waiting for the user.
+    /// no reply); the load itself keeps waiting for the user. HTTP, agent and
+    /// MCP paths use it; an action the user starts in Relay's UI waits
+    /// without it, because that user is the one answering the prompt (U-K1).
     static let keyWait: Duration = .seconds(3)
+
+    /// How a mutation waits for the key.
+    enum KeyWait: Sendable {
+        /// HTTP, agent and MCP paths: refuse after the bound.
+        case bounded(Duration)
+        /// An action the user started: wait until approval or cancellation,
+        /// reporting the wait on that action's own status.
+        case user(KeychainApprovalStatus)
+
+        static var request: KeyWait { .bounded(RelayCallerAdminProof.keyWait) }
+        var bound: Duration? {
+            if case .bounded(let bound) = self { return bound }
+            return nil
+        }
+    }
+
+    /// Whether one user-started action is waiting on the Keychain prompt.
+    /// Each action (or the view running it) owns its own; the key load and
+    /// its single prompt stay shared.
+    @MainActor final class KeychainApprovalStatus: ObservableObject {
+        static let waitingText = "Waiting for Keychain approval…"
+        @Published private(set) var waiting = 0
+        var pending: Bool { waiting > 0 }
+        func begin() { waiting += 1 }
+        func end() { waiting = max(0, waiting - 1) }
+    }
+
+    /// The key for an action the user started: no bound, only cancellation
+    /// ends the wait. Once it outlasts `grace` (when a request would have
+    /// failed) the action is shown as waiting for Keychain approval.
+    @MainActor static func userKey(store: AdminKeyStore = adminKey, status: KeychainApprovalStatus,
+                                   grace: Duration = keyWait) async throws -> Curve25519.Signing.PrivateKey {
+        do { return try await store.key(within: grace) }
+        catch is KeychainApprovalPending {
+            status.begin()
+            defer { status.end() }
+            return try await store.key(within: nil)
+        }
+    }
 
     /// The key load is still waiting on the user's Keychain approval.
     struct KeychainApprovalPending: LocalizedError, Equatable {
@@ -88,6 +129,10 @@ enum RelayCallerAdminProof {
                 return key
             } catch let pending as KeychainApprovalPending {
                 throw pending
+            } catch is CancellationError {
+                // Only this caller stopped waiting; the load (and its one
+                // prompt) stays in flight for the next request.
+                throw CancellationError()
             } catch {
                 if loading == task { loading = nil }
                 throw error
@@ -95,29 +140,44 @@ enum RelayCallerAdminProof {
         }
 
         /// Awaiting a Task's value ignores cancellation, so a task group could
-        /// not stop waiting; the first of the load or the bound resumes once.
+        /// not stop waiting; the first of the load, the bound (if any) or the
+        /// waiter's cancellation resumes once.
         private static func value(of task: Task<Data, Error>, within bound: Duration?) async throws -> Data {
-            guard let bound else { return try await task.value }
             let once = ResumeOnce()
-            return try await withCheckedThrowingContinuation { continuation in
-                once.set(continuation)
-                Task.detached { once.resume(with: await task.result) }
-                Task.detached {
-                    try? await Task.sleep(for: bound)
-                    once.resume(with: .failure(KeychainApprovalPending()))
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    once.set(continuation)
+                    Task.detached { once.resume(with: await task.result) }
+                    if let bound {
+                        Task.detached {
+                            try? await Task.sleep(for: bound)
+                            once.resume(with: .failure(KeychainApprovalPending()))
+                        }
+                    }
                 }
+            } onCancel: {
+                once.resume(with: .failure(CancellationError()))
             }
         }
 
+        /// Resumes its continuation once. A result that arrives before the
+        /// continuation (cancellation before the wait began) is kept for it.
         private final class ResumeOnce: @unchecked Sendable {
             private let lock = NSLock()
             private var continuation: CheckedContinuation<Data, Error>?
+            private var early: Result<Data, Error>?
+            private var done = false
             func set(_ continuation: CheckedContinuation<Data, Error>) {
-                lock.lock(); self.continuation = continuation; lock.unlock()
+                lock.lock()
+                if let early { done = true; self.early = nil; lock.unlock(); continuation.resume(with: early); return }
+                self.continuation = continuation; lock.unlock()
             }
             func resume(with result: Result<Data, Error>) {
-                lock.lock(); let continuation = self.continuation; self.continuation = nil; lock.unlock()
-                continuation?.resume(with: result)
+                lock.lock()
+                guard !done else { lock.unlock(); return }
+                guard let continuation else { if early == nil { early = result }; lock.unlock(); return }
+                done = true; self.continuation = nil; lock.unlock()
+                continuation.resume(with: result)
             }
         }
     }
@@ -160,13 +220,19 @@ enum RelayCallerAdminProof {
     }
 
     /// Default policy transport: signs mutations after asking the host for its
-    /// node ID (readable without proof), then sends the packet.
-    @MainActor static func send(profile: ConnectionProfile, packet: [String: Any]) async throws -> [String: Any] {
+    /// node ID (readable without proof), then sends the packet. `keyWait`
+    /// says how long to wait for the key (`.user` for UI actions only).
+    @MainActor static func send(profile: ConnectionProfile, packet: [String: Any],
+                                keyWait: KeyWait = .request) async throws -> [String: Any] {
         var packet = packet
         if let operation = packet["operation"] as? String, mutating.contains(operation) {
             let info = try await RelayHostExecution.communicationRequest(profile: profile, packet: ["operation": "caller_admin_info"])
             guard let node = info.value?["node_id"] as? String, !node.isEmpty else { throw RelayHostRPCError.invalidRequest }
-            let key = try await adminKey.key(within: keyWait)
+            let key: Curve25519.Signing.PrivateKey
+            switch keyWait {
+            case .bounded(let bound): key = try await adminKey.key(within: bound)
+            case .user(let status): key = try await userKey(status: status)
+            }
             // A host pinned to a different key is not ours to administer.
             if let pinned = info.value?["admin_key_sha256"] as? String, !pinned.isEmpty,
                pinned != SHA256.hash(data: key.publicKey.rawRepresentation).map({ String(format: "%02x", $0) }).joined() {

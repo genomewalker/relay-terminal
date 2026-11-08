@@ -514,6 +514,31 @@ struct RelaySidePanelHTTPResponse: Sendable {
         .text(DesktopPeerRoute.discoveryMessage(error), status: 503, reason: "Service Unavailable")
     }
 
+    /// The standard reason phrase for each status Relay sends.
+    static func reasonPhrase(for status: Int) -> String {
+        switch status {
+        case 200: "OK"
+        case 400: "Bad Request"
+        case 401: "Unauthorized"
+        case 403: "Forbidden"
+        case 404: "Not Found"
+        case 405: "Method Not Allowed"
+        case 409: "Conflict"
+        case 413: "Content Too Large"
+        case 429: "Too Many Requests"
+        case 500: "Internal Server Error"
+        case 503: "Service Unavailable"
+        case 504: "Gateway Timeout"
+        default: status < 400 ? "OK" : status < 500 ? "Bad Request" : "Internal Server Error"
+        }
+    }
+
+    /// A channel handler's JSON reply under its own status and reason phrase.
+    static func channelReply(status: Int, value: [String: Any]) throws -> Self {
+        let response = try jsonObject(value)
+        return Self(status: status, reason: reasonPhrase(for: status), contentType: response.contentType, body: response.body)
+    }
+
     static func text(_ value: String, status: Int, reason: String) -> Self {
         Self(
             status: status, reason: reason,
@@ -1140,11 +1165,10 @@ final class RelaySidePanelServer: ObservableObject {
                 return .text("Pane-link proposals are POST only", status: 405, reason: "Method Not Allowed")
             }
             let (status, value) = await paneLinkProposals.handle(body: request.body, caller: caller)
-            guard let response = try? RelaySidePanelHTTPResponse.jsonObject(value) else {
+            guard let response = try? RelaySidePanelHTTPResponse.channelReply(status: status, value: value) else {
                 return .text("Pane-link proposal reply could not be encoded", status: 500, reason: "Internal Server Error")
             }
-            return status == 200 ? response : RelaySidePanelHTTPResponse(status: status, reason: status == 403 ? "Forbidden" : "Conflict",
-                contentType: response.contentType, body: response.body)
+            return response
         }
         if request.path == RelayMikoSupervisorChannel.path {
             // POST only, after caller identity, pause and admission audit.
@@ -1152,11 +1176,10 @@ final class RelaySidePanelServer: ObservableObject {
                 return .text("Miko supervisor calls are POST only", status: 405, reason: "Method Not Allowed")
             }
             let (status, value) = await mikoSupervisorChannel.handle(body: request.body, caller: caller, workspace: workspace)
-            guard let response = try? RelaySidePanelHTTPResponse.jsonObject(value) else {
+            guard let response = try? RelaySidePanelHTTPResponse.channelReply(status: status, value: value) else {
                 return .text("Miko supervisor reply could not be encoded", status: 500, reason: "Internal Server Error")
             }
-            return status == 200 ? response : RelaySidePanelHTTPResponse(status: status, reason: status == 403 ? "Forbidden" : "Conflict",
-                contentType: response.contentType, body: response.body)
+            return response
         }
         if request.method == "GET", request.path == "/" {
             guard let url = RelayResources.bundle?.url(
