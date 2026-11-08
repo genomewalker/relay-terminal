@@ -14,6 +14,11 @@ enum RelayPalette {
     static let accent = dynamic(dark: 0x8DB7EB, light: .controlAccentColor)
     static let coral = dynamic(dark: 0xDDA398, light: .systemOrange)
     static let red = dynamic(dark: 0xDE827B, light: .systemRed)
+    /// Success/connected state; the side panel's Relay green.
+    static let success = dynamic(dark: 0x73C7A5, light: .systemGreen)
+    static let warning = dynamic(dark: 0xDDA398, light: .systemOrange)
+    static let danger = dynamic(dark: 0xDE827B, light: .systemRed)
+    static let info = dynamic(dark: 0x8DB7EB, light: .controlAccentColor)
 
     static func dynamic(dark: UInt32, light: NSColor) -> NSColor {
         let dark = hex(dark)
@@ -55,6 +60,144 @@ enum RelayTheme {
     static let mint = accent
     static let coral = Color(nsColor: RelayPalette.coral)
     static let red = Color(nsColor: RelayPalette.red)
+    static let success = Color(nsColor: RelayPalette.success)
+    static let warning = Color(nsColor: RelayPalette.warning)
+    static let danger = Color(nsColor: RelayPalette.danger)
+    static let info = Color(nsColor: RelayPalette.info)
+
+    /// Semantic state of a badge, banner or row. Each role pairs a colour with
+    /// its own symbol so colour is never the only signal.
+    enum StatusRole: CaseIterable, Hashable {
+        case neutral, success, warning, danger, info
+
+        var color: Color {
+            switch self {
+            case .neutral: RelayTheme.textMuted
+            case .success: RelayTheme.success
+            case .warning: RelayTheme.warning
+            case .danger: RelayTheme.danger
+            case .info: RelayTheme.info
+            }
+        }
+
+        /// Spoken prefix so assistive technology announces the role, not only the text.
+        var spokenName: String? {
+            switch self {
+            case .neutral: nil
+            case .success: "Success"
+            case .warning: "Warning"
+            case .danger: "Error"
+            case .info: "Info"
+            }
+        }
+
+        func spoken(_ text: String) -> String {
+            guard let name = spokenName else { return text }
+            return "\(name): \(text)"
+        }
+
+        var symbol: String {
+            switch self {
+            case .neutral: "circle"
+            case .success: "checkmark.circle.fill"
+            case .warning: "exclamationmark.triangle.fill"
+            case .danger: "xmark.octagon.fill"
+            case .info: "info.circle.fill"
+            }
+        }
+    }
+
+    /// Corner radii; pills use `Capsule()`.
+    enum Radius {
+        static var pane: CGFloat { cornerRadius(2) }
+        static var control: CGFloat { cornerRadius(6) }
+        static var card: CGFloat { cornerRadius(8) }
+        static var panel: CGFloat { cornerRadius(12) }
+    }
+
+    /// Durations in seconds for control feedback and panel transitions.
+    enum Motion: Double {
+        case fast = 0.12
+        case standard = 0.16
+    }
+
+    /// An ease-out animation for `motion`, or nil when the user asked to reduce motion.
+    static func animation(_ motion: Motion, reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : .easeOut(duration: motion.rawValue)
+    }
+
+    /// Shadows for surfaces above the canvas. The hairline edge is `stroke`.
+    struct Elevation: Equatable {
+        let opacity: Double
+        let radius: CGFloat
+        let y: CGFloat
+        static let floating = Elevation(opacity: 0.25, radius: 8, y: 4)
+        static let popover = Elevation(opacity: 0.32, radius: 16, y: 10)
+    }
+
+    /// Spacing tokens: the 2/4/6/8/12/16/24 set the app already uses, scaled by `spacingScale`.
+    enum Space {
+        /// The named tokens in ascending order, derived from the accessors so the two cannot drift.
+        static var scale: [CGFloat] { [xxs, xs, sm, md, lg, xl, xxl] }
+        static var xxs: CGFloat { spacing(2) }
+        static var xs: CGFloat { spacing(4) }
+        static var sm: CGFloat { spacing(6) }
+        static var md: CGFloat { spacing(8) }
+        static var lg: CGFloat { spacing(12) }
+        static var xl: CGFloat { spacing(16) }
+        static var xxl: CGFloat { spacing(24) }
+    }
+
+    /// Control geometry: standard controls are 28 pt; compact icon buttons in dense rows are 22 pt.
+    enum Control {
+        static let height: CGFloat = 28
+        static let compactIcon: CGFloat = 22
+    }
+
+    /// Smallest text Relay draws; badges and micro labels use exactly this size.
+    static let minimumTextSize: CGFloat = 10
+
+    /// Text roles mapped from today's dominant sizes. None is below `minimumTextSize`.
+    enum TextRole: CaseIterable {
+        case title, heading, body, label, callout, caption, eyebrow, micro, code, codeSmall
+
+        var size: CGFloat {
+            switch self {
+            case .title: 17
+            case .heading: 14
+            case .body: 13
+            case .label, .code: 12
+            // 11.5 is deliberate: existing views use it, so migrating them stays 1:1.
+            case .callout: 11.5
+            case .caption, .codeSmall, .eyebrow: 11
+            case .micro: RelayTheme.minimumTextSize
+            }
+        }
+
+        var weight: Font.Weight {
+            switch self {
+            case .title, .heading, .label: .medium
+            case .eyebrow: .semibold
+            default: .regular
+            }
+        }
+
+        /// Section labels are small caps-style headings: uppercase with open tracking.
+        var isUppercase: Bool { self == .eyebrow }
+        var tracking: CGFloat { self == .eyebrow ? 0.6 : 0 }
+
+        var design: Font.Design {
+            switch self {
+            case .code, .codeSmall: .monospaced
+            default: .default
+            }
+        }
+
+        /// Rendered size: scaled by `typeScale` but never below `minimumTextSize`.
+        var renderedSize: CGFloat { max(size * RelayTheme.typeScale, RelayTheme.minimumTextSize) }
+
+        var font: Font { .system(size: renderedSize, weight: weight, design: design) }
+    }
 
     static let typeScale: CGFloat = 1
     static let spacingScale: CGFloat = 1
@@ -159,6 +302,158 @@ private struct RelaySurfaceAppearanceMarker: NSViewRepresentable {
     }
     func makeNSView(context: Context) -> NSView { Marker(frame: .zero) }
     func updateNSView(_ view: NSView, context: Context) { (view as? Marker)?.schedule() }
+}
+
+// MARK: - Shared components
+
+extension View {
+    /// A card on the canvas: role fill, hairline edge and card radius.
+    func relayCard(fill: Color = RelayTheme.surface, stroke: Bool = true,
+                   radius: CGFloat = RelayTheme.Radius.card) -> some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        return background(fill, in: shape)
+            .overlay(shape.strokeBorder(stroke ? RelayTheme.stroke : .clear))
+    }
+
+    /// Applies a template shadow.
+    func relayElevation(_ elevation: RelayTheme.Elevation) -> some View {
+        shadow(color: .black.opacity(elevation.opacity), radius: elevation.radius, y: elevation.y)
+    }
+
+    /// Applies a text role, including its case and tracking.
+    func relayText(_ role: RelayTheme.TextRole) -> some View {
+        font(role.font).tracking(role.tracking).textCase(role.isUppercase ? .uppercase : nil)
+    }
+}
+
+/// Uppercase section label used above lists and settings groups.
+struct RelaySectionHeader<Accessory: View>: View {
+    let title: String
+    let accessory: Accessory
+
+    init(_ title: String, @ViewBuilder accessory: () -> Accessory) {
+        self.title = title
+        self.accessory = accessory()
+    }
+
+    var body: some View {
+        HStack(spacing: RelayTheme.Space.sm) {
+            Text(title).relayText(.eyebrow).foregroundStyle(RelayTheme.textFaint)
+                .accessibilityAddTraits(.isHeader)
+            Spacer(minLength: 0)
+            accessory
+        }
+    }
+}
+
+extension RelaySectionHeader where Accessory == EmptyView {
+    init(_ title: String) { self.init(title) { EmptyView() } }
+}
+
+/// Small pill with a role symbol and text. Colour is never the only signal.
+struct RelayBadge: View {
+    let text: String
+    let role: RelayTheme.StatusRole
+    var showsSymbol = true
+
+    init(_ text: String, role: RelayTheme.StatusRole = .neutral, showsSymbol: Bool = true) {
+        self.text = text
+        self.role = role
+        self.showsSymbol = showsSymbol
+    }
+
+    var body: some View {
+        HStack(spacing: RelayTheme.Space.xs) {
+            if showsSymbol { Image(systemName: role.symbol).imageScale(.small) }
+            Text(text).lineLimit(1)
+        }
+        .relayText(.micro)
+        .foregroundStyle(role == .neutral ? RelayTheme.textMuted : role.color)
+        .padding(.horizontal, RelayTheme.Space.sm)
+        .padding(.vertical, RelayTheme.Space.xxs)
+        .background(role.color.opacity(0.12), in: Capsule())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(role.spoken(text))
+    }
+}
+
+/// Inline notice with a role symbol, title, optional message and actions.
+struct RelayBanner<Actions: View>: View {
+    let role: RelayTheme.StatusRole
+    let title: String
+    let message: String?
+    let actions: Actions
+
+    init(role: RelayTheme.StatusRole, title: String, message: String? = nil,
+         @ViewBuilder actions: () -> Actions) {
+        self.role = role
+        self.title = title
+        self.message = message
+        self.actions = actions()
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: RelayTheme.Space.md) {
+            Image(systemName: role.symbol).foregroundStyle(role.color).font(RelayTheme.TextRole.body.font)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: RelayTheme.Space.xxs) {
+                Text(title).relayText(.label).foregroundStyle(RelayTheme.text)
+                    .accessibilityLabel(role.spoken(title))
+                if let message, !message.isEmpty {
+                    Text(message).relayText(.caption).foregroundStyle(RelayTheme.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: RelayTheme.Space.sm)
+            HStack(spacing: RelayTheme.Space.sm) { actions }
+        }
+        .padding(RelayTheme.Space.md)
+        .relayCard(fill: role.color.opacity(0.08))
+        .accessibilityElement(children: .contain)
+    }
+}
+
+extension RelayBanner where Actions == EmptyView {
+    init(role: RelayTheme.StatusRole, title: String, message: String? = nil) {
+        self.init(role: role, title: title, message: message) { EmptyView() }
+    }
+}
+
+/// Empty list or area: a symbol, a title and an optional next step.
+struct RelayEmptyState<Action: View>: View {
+    let title: String
+    let symbol: String?
+    let detail: String?
+    let action: Action
+
+    init(_ title: String, symbol: String? = nil, detail: String? = nil, @ViewBuilder action: () -> Action) {
+        self.title = title
+        self.symbol = symbol
+        self.detail = detail
+        self.action = action()
+    }
+
+    var body: some View {
+        VStack(spacing: RelayTheme.Space.sm) {
+            if let symbol {
+                Image(systemName: symbol).font(RelayTheme.TextRole.title.font).foregroundStyle(RelayTheme.textFaint)
+                    .accessibilityHidden(true)
+            }
+            Text(title).relayText(.label).foregroundStyle(RelayTheme.textMuted)
+            if let detail {
+                Text(detail).relayText(.caption).foregroundStyle(RelayTheme.textFaint).multilineTextAlignment(.center)
+            }
+            action
+        }
+        .frame(maxWidth: .infinity)
+        .padding(RelayTheme.Space.xl)
+    }
+}
+
+extension RelayEmptyState where Action == EmptyView {
+    init(_ title: String, symbol: String? = nil, detail: String? = nil) {
+        self.init(title, symbol: symbol, detail: detail) { EmptyView() }
+    }
 }
 
 /// Solid primary action, matching the composer submit treatment.
