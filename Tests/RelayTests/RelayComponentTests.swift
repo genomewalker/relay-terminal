@@ -40,6 +40,13 @@ struct RelayComponentTests {
         #expect(symbols.allSatisfy { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil })
         // Colour is never the only signal: each role has its own symbol.
         #expect(Set(symbols).count == symbols.count)
+        // Assistive technology hears the role too.
+        #expect(RelayTheme.StatusRole.warning.spoken("dandy-07 is reconnecting") == "Warning: dandy-07 is reconnecting")
+        #expect(RelayTheme.StatusRole.danger.spoken("Update failed") == "Error: Update failed")
+        #expect(RelayTheme.StatusRole.neutral.spoken("Idle") == "Idle")
+        for role in RelayTheme.StatusRole.allCases where role != .neutral {
+            #expect(role.spokenName != nil, "\(role)")
+        }
     }
 
     @Test func radiiAndMotionTokens() {

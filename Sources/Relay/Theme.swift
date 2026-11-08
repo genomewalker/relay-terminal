@@ -80,6 +80,22 @@ enum RelayTheme {
             }
         }
 
+        /// Spoken prefix so assistive technology announces the role, not only the text.
+        var spokenName: String? {
+            switch self {
+            case .neutral: nil
+            case .success: "Success"
+            case .warning: "Warning"
+            case .danger: "Error"
+            case .info: "Info"
+            }
+        }
+
+        func spoken(_ text: String) -> String {
+            guard let name = spokenName else { return text }
+            return "\(name): \(text)"
+        }
+
         var symbol: String {
             switch self {
             case .neutral: "circle"
@@ -356,7 +372,8 @@ struct RelayBadge: View {
         .padding(.horizontal, RelayTheme.Space.sm)
         .padding(.vertical, RelayTheme.Space.xxs)
         .background(role.color.opacity(0.12), in: Capsule())
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(role.spoken(text))
     }
 }
 
@@ -381,6 +398,7 @@ struct RelayBanner<Actions: View>: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: RelayTheme.Space.xxs) {
                 Text(title).relayText(.label).foregroundStyle(RelayTheme.text)
+                    .accessibilityLabel(role.spoken(title))
                 if let message, !message.isEmpty {
                     Text(message).relayText(.caption).foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
