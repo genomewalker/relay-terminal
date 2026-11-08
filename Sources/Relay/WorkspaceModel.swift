@@ -169,7 +169,17 @@ final class WorkspaceModel: ObservableObject {
     private var quickNavigateAction: (() -> Void)?
     @Published var isHostLauncherPresented = false
     @Published var isPaneLinkPresented = false
-    @Published var sidebarVisible = false
+    /// What the window shows. Entering full screen may hide it for the
+    /// duration (`sidebarAutoHidden`); that is not the user's choice, so the
+    /// saved workspace keeps the visibility the user set.
+    @Published var sidebarVisible = false {
+        didSet { if !applyingFullScreenSidebar { sidebarAutoHidden = false } }
+    }
+    /// True while full screen hides a sidebar the user left visible.
+    private(set) var sidebarAutoHidden = false
+    private var applyingFullScreenSidebar = false
+    /// The sidebar visibility the user chose, as saved and restored.
+    var savedSidebarVisible: Bool { sidebarVisible || sidebarAutoHidden }
     /// Panes the user opened, for Go to pane. Programmatic selection is not recorded.
     @Published private(set) var paneVisits = PaneVisitHistory()
     @Published var networkVisible = false {
@@ -341,7 +351,6 @@ final class WorkspaceModel: ObservableObject {
     private var workspaceSaveCanClose = true
     @Published private(set) var workspacePersistenceIssue: String?
     @Published private(set) var workspacePendingChanges = 0
-    private var sidebarBeforeFullScreen = true
     private var persistenceTask: Task<Void, Never>?
     /// Committed workspace saves. `persistWorkspace` is a trailing debounce,
     /// so rapid selections (and their visits) share one save.
@@ -1163,11 +1172,18 @@ final class WorkspaceModel: ObservableObject {
 
     func setFullScreen(_ fullScreen: Bool) {
         guard isFullScreen != fullScreen else { return }
-        if fullScreen && RelayPreferences.shared.hideSidebarInFullScreen {
-            sidebarBeforeFullScreen = sidebarVisible
-            sidebarVisible = false
-        } else if !fullScreen && RelayPreferences.shared.hideSidebarInFullScreen {
-            sidebarVisible = sidebarBeforeFullScreen
+        applyingFullScreenSidebar = true
+        defer { applyingFullScreenSidebar = false }
+        if fullScreen {
+            // Hide only a visible sidebar; a restore into full screen keeps
+            // the saved choice, which comes back when full screen ends.
+            if RelayPreferences.shared.hideSidebarInFullScreen && sidebarVisible {
+                sidebarAutoHidden = true
+                sidebarVisible = false
+            }
+        } else if sidebarAutoHidden {
+            sidebarVisible = true
+            sidebarAutoHidden = false
         }
         isFullScreen = fullScreen
     }
@@ -3704,7 +3720,7 @@ final class WorkspaceModel: ObservableObject {
             selectedTabID: selectedTabID,
             activePaneID: activePaneID,
             rPresentations: rPresentations,
-            sidebarVisible: sidebarVisible,
+            sidebarVisible: savedSidebarVisible,
             paneVisits: paneVisits.visits.filter { usedPaneIDs.contains($0.paneID) }
         )
     }
