@@ -846,7 +846,7 @@ extension JSONDecoder {
             origin = ["kind": "agent", "pane_id": paneID.uuidString.lowercased(), "label": label]
         }
         return ["request_id": exchange.requestID, "origin": origin, "request": exchange.request, "reply": exchange.reply,
-                "tool_log": exchange.toolLog, "failed": exchange.failed, "undone": exchange.undone,
+                "tool_log": exchange.toolLog, "failed": exchange.failed, "cancelled": exchange.stoppedByUser, "undone": exchange.undone,
                 "tool_trace": exchange.toolTrace.map { ["name": $0.name, "input": $0.input, "result": $0.result,
                                                          "is_error": $0.isError] as [String: Any] },
                 "charged_microusd": exchange.chargedMicrousd,

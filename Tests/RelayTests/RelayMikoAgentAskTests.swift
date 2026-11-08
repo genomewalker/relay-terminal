@@ -212,6 +212,10 @@ struct RelayMikoAgentAskTests {
         f.harness.cancel()
         let stopped = try await f.waitFor(id, ["stopped", "completed", "failed"])
         #expect(stopped["state"] as? String == "stopped")
+        // bc08 review of 0.5.30: the exchange says it was cancelled, so a
+        // transcript reader can tell a Stop from a genuine failure.
+        let exchange = try #require(stopped["exchange"] as? [String: Any])
+        #expect(exchange["cancelled"] as? Bool == true && exchange["failed"] as? Bool == true)
         #expect(f.executor.dispatched.isEmpty)
     }
 
