@@ -689,6 +689,9 @@ final class PaneModel: ObservableObject, Identifiable {
     /// When this app first saw the pane's program attached after a fresh launch.
     /// nil for restored panes, whose start Relay did not observe.
     private(set) var programAttachedAt: Date?
+    /// Fixed at the first exit report: relayd replays the exited status to a
+    /// reattaching viewer, which must not lengthen the reported run time.
+    private(set) var programExitElapsed: TimeInterval?
     /// The user confirmed Terminate for this pane, so its exit is intentional.
     var userRequestedTermination = false
     @Published var artifacts: [PaneArtifact] = []
@@ -1084,10 +1087,12 @@ final class PaneModel: ObservableObject, Identifiable {
 
     func exited(exitCode: Int? = nil, now: Date = Date()) {
         remoteExitCode = exitCode
+        let elapsed = programExitElapsed ?? programAttachedAt.map { now.timeIntervalSince($0) }
+        programExitElapsed = elapsed
         exitNotice = contentKind == .terminal ? PaneExitNotice.decide(
             program: PaneExitNotice.programName(command: profile.command),
             exitStatus: exitCode,
-            elapsed: programAttachedAt.map { now.timeIntervalSince($0) },
+            elapsed: elapsed,
             userInitiated: userRequestedTermination
         ) : nil
         detector.markExited()

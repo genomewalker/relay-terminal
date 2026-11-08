@@ -135,6 +135,18 @@ struct PaneExitNoticeTests {
         #expect(pane.exitNotice?.title == "ssh exited with status 3")
     }
 
+    @Test func aReplayedExitAfterReconnectKeepsTheOriginalRunTime() {
+        let pane = PaneModel(profile: Self.failingProfile)
+        let start = Date()
+        pane.connected(now: start)
+        pane.exited(exitCode: 1, now: start.addingTimeInterval(2))
+        pane.connectionInterrupted("blip")
+        pane.connected(now: start.addingTimeInterval(300))
+        #expect(pane.exitNotice == nil)
+        pane.exited(exitCode: 1, now: start.addingTimeInterval(300))
+        #expect(pane.exitNotice?.title == "ssh exited with status 1 after 2s")
+    }
+
     @Test func aUserTerminationIsNotAFailure() {
         let pane = PaneModel(profile: Self.failingProfile)
         let start = Date()
@@ -198,8 +210,8 @@ struct PaneExitNoticeTests {
         }
     }
 
-    @Test(arguments: [(NSAppearance.Name.aqua, "light"), (NSAppearance.Name.darkAqua, "dark")])
-    func theBannerRendersOverATerminal(appearance: NSAppearance.Name, label: String) throws {
+    @Test(arguments: [NSAppearance.Name.aqua, .darkAqua])
+    func theBannerRendersOverATerminal(appearance: NSAppearance.Name) throws {
         let quick = try #require(PaneExitNotice.decide(program: "ssh", exitStatus: 255, elapsed: 1.4, userInitiated: false))
         let wide = try RelaySnapshot.render(TerminalLikeArea(notice: quick), name: "failed-pane-wide",
                                             width: 760, appearance: appearance)
@@ -208,6 +220,5 @@ struct PaneExitNoticeTests {
         let narrow = try RelaySnapshot.render(TerminalLikeArea(notice: unknown), name: "failed-pane-narrow",
                                               width: 420, appearance: appearance)
         #expect(narrow.size.height == 240)
-        _ = label
     }
 }
