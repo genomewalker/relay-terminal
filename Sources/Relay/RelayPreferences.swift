@@ -124,9 +124,14 @@ final class RelayPreferences: ObservableObject {
     @Published var mikoHour: Int { didSet { save() } }
     @Published var mikoTargetMinute: Int { didSet { save() } }
     @Published var mikoRepetitions: Int { didSet { save() } }
+    /// User-only (Settings UI): agent panes may ask Miko to run
+    /// relay_update_host_relayd with the user's authority. Absent from
+    /// RelaySettingsPolicy and Miko corrections. Off by default.
+    @Published var agentHostRelaydUpdates: Bool { didSet { save() } }
     var mikoPolicy: RelayMikoPolicySettings {
         .init(autonomy: mikoAutonomy, minute: mikoMinute, hour: mikoHour,
-              targetMinute: mikoTargetMinute, repetitions: mikoRepetitions).bounded
+              targetMinute: mikoTargetMinute, repetitions: mikoRepetitions,
+              agentHostRelaydUpdates: agentHostRelaydUpdates).bounded
     }
     @Published var assistantHotkeyEnabled: Bool { didSet { save() } }
     @Published var assistantHotkey: RelayAssistantHotkey { didSet { save() } }
@@ -150,6 +155,7 @@ final class RelayPreferences: ObservableObject {
         mikoHour = (defaults.object(forKey: "relay.settings.miko-hour") as? Int ?? 600)
         mikoTargetMinute = (defaults.object(forKey: "relay.settings.miko-target-minute") as? Int ?? 12)
         mikoRepetitions = (defaults.object(forKey: "relay.settings.miko-repetitions") as? Int ?? 3)
+        agentHostRelaydUpdates = defaults.object(forKey: "relay.settings.miko-agent-host-relayd-updates") as? Bool ?? false
         fontFamily = defaults.string(forKey: "relay.settings.font-family") ?? "Menlo"
         let storedSize = defaults.double(forKey: "relay.settings.font-size")
         fontSize = storedSize == 0 ? 13.5 : storedSize
@@ -351,6 +357,7 @@ final class RelayPreferences: ObservableObject {
         defaults.set(mikoPolicy.hour, forKey: "relay.settings.miko-hour")
         defaults.set(mikoPolicy.targetMinute, forKey: "relay.settings.miko-target-minute")
         defaults.set(mikoPolicy.repetitions, forKey: "relay.settings.miko-repetitions")
+        defaults.set(agentHostRelaydUpdates, forKey: "relay.settings.miko-agent-host-relayd-updates")
         defaults.set(fontFamily, forKey: "relay.settings.font-family")
         defaults.set(fontSize, forKey: "relay.settings.font-size")
         defaults.set(terminalPadding, forKey: "relay.settings.terminal-padding")

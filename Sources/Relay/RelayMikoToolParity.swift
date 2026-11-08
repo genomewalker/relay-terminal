@@ -192,6 +192,11 @@ struct RelayMikoPolicySettings: Equatable, Sendable {
     var hour = 600
     var targetMinute = 12
     var repetitions = 3
+    /// The user's Settings approval that an agent pane's ask may carry the
+    /// user's authority for relay_update_host_relayd. Off by default. Not in
+    /// RelaySettingsPolicy.definitions and not a correction, so no agent path
+    /// can set it.
+    var agentHostRelaydUpdates = false
     var bounded: Self {
         var x = self
         x.minute = min(600, max(1, minute)); x.hour = min(10_000, max(1, hour))
@@ -268,8 +273,22 @@ enum RelayMikoActionPolicy {
            (body["request"]?["plugin"]?["operation"]?.string ?? body["plugin"]?["operation"]?.string) == "hpcCancel" { return true }
         return rules.contains(operation)
     }
+    /// The one tool an agent pane's ask may run with the user's authority, and
+    /// only when the user turned that on in Settings.
+    static let agentDelegatedTool = "relay_update_host_relayd"
+    /// True only for an exchange whose proven origin is an agent pane (not a
+    /// supervisor, not the user), asking for exactly relay_update_host_relayd,
+    /// with the user's Settings approval on. Keyed off the exchange origin, not
+    /// paneDerived: every tool result taints an agent exchange as pane-derived.
+    static func agentDelegated(tool: String, origin: RelayAssistantOrigin, settings: RelayMikoPolicySettings) -> Bool {
+        guard settings.agentHostRelaydUpdates, case .agent = origin else { return false }
+        return exactName(tool) == agentDelegatedTool
+    }
     static func requiresCard(settings: RelayMikoPolicySettings, tier: Tier, origin: RelayMikoDispatchGate.Origin,
-                             fixed: Bool) -> Bool {
+                             fixed: Bool, delegated: Bool = false) -> Bool {
+        // The user approved this agent request in Settings; it carries the
+        // user's authority in every mode. The tool has no fixed card.
+        if delegated && !fixed { return false }
         // The user delegates routine and high-impact actions to Miko in this
         // mode. Content provenance remains recorded, but reading a pane does
         // not revoke that standing delegation. Miko asks in its reply when a
