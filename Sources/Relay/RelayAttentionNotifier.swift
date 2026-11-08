@@ -262,10 +262,11 @@ final class RelayAttentionNotifier: NSObject, UNUserNotificationCenterDelegate {
         if application.dockTile.badgeLabel != label { application.dockTile.badgeLabel = label }
     }
 
-    private func open(_ paneID: UUID) {
-        NSApp?.activate(ignoringOtherApps: true)
+    /// The user clicked this pane's notification: a user visit.
+    func open(_ paneID: UUID) {
+        if !RelayLaunchMode.isRunningTests { NSApp?.activate(ignoringOtherApps: true) }
         guard let workspace, workspace.panes[paneID] != nil else { return }
-        _ = try? workspace.selectWorkspacePane(paneID)
+        _ = try? workspace.selectWorkspacePane(paneID, origin: .user)
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,

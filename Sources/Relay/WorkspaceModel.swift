@@ -169,6 +169,11 @@ final class WorkspaceModel: ObservableObject {
     private var quickNavigateAction: (() -> Void)?
     @Published var isHostLauncherPresented = false
     @Published var isPaneLinkPresented = false
+    @Published var isFleetBoardPresented = false {
+        didSet { updateTerminalFocusOwnership() }
+    }
+    /// The board's status chip when it opens; set by `presentFleetBoard`.
+    private(set) var fleetBoardInitialFilter: RelayFleetFilter = .all
     /// What the window shows. Entering full screen may hide it for the
     /// duration (`sidebarAutoHidden`); that is not the user's choice, so the
     /// saved workspace keeps the visibility the user set.
@@ -755,6 +760,35 @@ final class WorkspaceModel: ObservableObject {
         quickNavigateChoseDestination = false
         dockWillTakeFocus()
         isQuickNavigatePresented = true
+    }
+
+    /// Opens the fleet board. Opening it acknowledges nothing.
+    func presentFleetBoard(filter: RelayFleetFilter = .all) {
+        fleetBoardInitialFilter = filter
+        guard !isFleetBoardPresented else { return }
+        dockWillTakeFocus()
+        isFleetBoardPresented = true
+    }
+
+    /// The fleet board closed: the chosen (or unchanged) active pane gets
+    /// the keyboard back. Focus repair must not call selectPane.
+    func fleetBoardDidDismiss() {
+        updateTerminalFocusOwnership()
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !self.isFleetBoardPresented, !self.isQuickNavigatePresented,
+                  !self.networkVisible, !self.paneLinkSelection.active,
+                  let id = self.activePaneID else { return }
+            self.panes[id]?.focus()
+        }
+    }
+
+    /// A user's choice of a pane from Go to pane or the fleet board: shows
+    /// its tab and records the visit.
+    func goToPane(_ id: UUID, inTab tab: UUID) {
+        networkVisible = false
+        selectTab(tab)
+        selectPane(id, origin: .user)
     }
 
     func quickNavigateDidChooseDestination() {
@@ -2859,7 +2893,7 @@ final class WorkspaceModel: ObservableObject {
             if self.paneLinkSelection.active { self.paneLinkSelection.toggle(pane.id) }
             else { self.selectPane(pane.id, origin: origin) }
         }
-        pane.runtime.setKeyboardFocusEligible(pane.id == activePaneID && !paneLinkSelection.active && !networkVisible && !isQuickNavigatePresented)
+        pane.runtime.setKeyboardFocusEligible(pane.id == activePaneID && !paneLinkSelection.active && !networkVisible && !isQuickNavigatePresented && !isFleetBoardPresented)
         activityIndex.observe(pane)
         // Restore stores each saved pane here, so restored editors start too.
         if pane.contentKind == .editor { startEditorRuntime(pane) }
@@ -2873,7 +2907,7 @@ final class WorkspaceModel: ObservableObject {
     /// broken in Codex and Claude.
     func updateTerminalFocusOwnership() {
         for (id, pane) in panes {
-            pane.runtime.setKeyboardFocusEligible(id == activePaneID && !paneLinkSelection.active && !networkVisible && !isQuickNavigatePresented)
+            pane.runtime.setKeyboardFocusEligible(id == activePaneID && !paneLinkSelection.active && !networkVisible && !isQuickNavigatePresented && !isFleetBoardPresented)
         }
         if paneLinkSelection.active { NSApp?.keyWindow?.makeFirstResponder(nil) }
     }

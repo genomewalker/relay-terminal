@@ -95,6 +95,12 @@ import UniformTypeIdentifiers
                 .accessibilityIdentifier("relay.navigator.new-workspace")
             }
             .padding(.horizontal, 10)
+            // Same metadata and predicate as the fleet board and Go to pane.
+            let fleet = RelayWorkOverviewIndex.fleet(workspace).counts
+            RelayFleetCountsButton(counts: fleet) {
+                workspace.presentFleetBoard(filter: .initial(for: fleet))
+            }
+            .padding(.horizontal, 6)
             if workspace.isFocusing {
                 WorkspaceFocusBar(workspace: workspace, inbox: .shared)
             }

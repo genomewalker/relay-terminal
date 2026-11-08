@@ -30,6 +30,8 @@ struct WorkOverviewNavigationTests {
         #expect(rows.first?.destination == .settings("keyboard"))
         #expect(rows.last?.destination == .askMiko)
         #expect(Index.movedSelection(rows.first?.id, by: 1, in: rows) == rows.last?.id)
-        #expect(Set(Index.navigationEntries(query: "").map(\.id)).count == 11)
+        // Settings sections, Control Center, Agent fleet and Ask Miko.
+        #expect(Set(Index.navigationEntries(query: "").map(\.id)).count == 12)
+        #expect(destinations("waiting agents").contains(.fleetBoard))
     }
 }

@@ -17,7 +17,7 @@ enum RelayWorkOverviewIndex {
     }
     enum Destination: Equatable, Sendable {
         case workspace(UUID), tab(UUID), pane(UUID, UUID)
-        case settings(String), controlCenter, askMiko
+        case settings(String), controlCenter, askMiko, fleetBoard
     }
     struct Entry: Identifiable, Sendable {
         let id: String
@@ -45,7 +45,7 @@ enum RelayWorkOverviewIndex {
             if listedAsRecent { return .visited }
             if isCurrent { return .current }
             switch destination {
-            case .settings, .controlCenter, .askMiko: return .actions
+            case .settings, .controlCenter, .askMiko, .fleetBoard: return .actions
             default: break
             }
             return changedAt == nil ? .other : .recent
@@ -66,6 +66,11 @@ enum RelayWorkOverviewIndex {
             status: "Open controls", details: "Inspect Miko status, approvals and available controls. Actions retain their existing review and permission checks.",
             symbol: "slider.horizontal.3", destination: .controlCenter,
             searchFields: ["control center monitoring miko approvals tasks pause shepherd supervision"],
+            needsAttention: false, isCurrent: false, changedAt: nil))
+        entries.append(Entry(id: "action:fleet", title: RelayCommand.fleetBoard.label, location: "Every pane on every host",
+            status: "Open board", details: "List every pane by status: waiting on you, disconnected, running, idle. Opening it acknowledges nothing.",
+            symbol: "rectangle.grid.1x2", destination: .fleetBoard,
+            searchFields: ["fleet board agents running waiting disconnected idle hosts overview"],
             needsAttention: false, isCurrent: false, changedAt: nil))
         entries.append(Entry(id: "action:miko", title: "Ask Miko", location: "Workspace assistant",
             status: "Open composer", details: "Open Miko without sending a message. Your existing conversation and draft are preserved; enter your request in the composer.",

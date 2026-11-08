@@ -711,6 +711,8 @@ struct RelayApp: App {
                     .keyboardShortcut(shortcut(.newLocalSession).keyEquivalent, modifiers: shortcut(.newLocalSession).eventModifiers)
                 Button(RelayCommand.quickNavigate.label + "…") { workspace.presentQuickNavigate() }
                     .keyboardShortcut(shortcut(.quickNavigate).keyEquivalent, modifiers: shortcut(.quickNavigate).eventModifiers)
+                Button(RelayCommand.fleetBoard.label + "…") { workspace.presentFleetBoard() }
+                    .keyboardShortcut(shortcut(.fleetBoard).keyEquivalent, modifiers: shortcut(.fleetBoard).eventModifiers)
                 Button("Find SSH host…") { workspace.presentHostLauncher() }
                     .keyboardShortcut(shortcut(.findHost).keyEquivalent, modifiers: shortcut(.findHost).eventModifiers)
                 Button("Connect to host…") { workspace.presentConnectionSheet() }
