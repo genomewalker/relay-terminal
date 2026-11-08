@@ -847,6 +847,12 @@ struct RelayAssistantExchange: Identifiable, Sendable {
     var undo: RelayAssistantUndo?
     var undone = false
     var failed = false
+    /// The user (or a Miko correction) stopped this exchange; distinct from a
+    /// genuine failure, which keeps `failed` alone.
+    var cancelled = false
+    /// Stopped by the user rather than failed. Older saved replies used the
+    /// exact text "Cancelled." without the flag.
+    var stoppedByUser: Bool { failed && (cancelled || reply == "Cancelled.") }
     var chargedMicrousd: UInt64 = 0
     /// Messages Miko sent in this exchange, with their latest receipt state.
     var messages: [RelayAssistantSentMessage] = []
@@ -1452,8 +1458,12 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
                 try journal.checkpoint(taskID, state: saved, detail: exchange.reply.isEmpty ? "Task waiting." : exchange.reply)
             }
         } catch is CancellationError {
-            exchange.reply = "Cancelled. Any in-flight outcome remains tracked."
+            // A pending execution stays tracked under its original handle;
+            // say so only when one exists.
+            exchange.reply = exchange.pendingExecJobs.isEmpty ? "Cancelled."
+                : "Cancelled. The in-flight outcome remains tracked: " + exchange.pendingExecJobs.keys.sorted().joined(separator: ", ") + "."
             exchange.failed = true
+            exchange.cancelled = true
             if let journal, let taskID {
                 do { try journal.cancel(taskID) }
                 catch { exchange.reply += " The cancellation could not be saved: " + error.localizedDescription }

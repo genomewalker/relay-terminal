@@ -385,7 +385,7 @@ struct RelayControlCenterState: Equatable {
     static func status(_ exchange: RelayAssistantExchange, isLast: Bool, cardPending: Bool, busy: Bool) -> String {
         if isLast, cardPending { return "waiting_for_approval" }
         if isLast, busy { return "running" }
-        if exchange.failed { return exchange.reply == "Cancelled." ? "stopped" : "failed" }
+        if exchange.failed { return exchange.stoppedByUser ? "stopped" : "failed" }
         if exchange.reply.range(of: #"(^|\n)Stopped (at|after) "#, options: .regularExpression) != nil { return "stopped" }
         return "completed"
     }

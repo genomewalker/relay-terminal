@@ -678,7 +678,7 @@ extension JSONDecoder {
         let state: String
         if entry.finished {
             if let final = entry.final {
-                state = final.failed ? (final.reply == "Cancelled." ? "stopped" : "failed")
+                state = final.failed ? (final.stoppedByUser ? "stopped" : "failed")
                     : (final.reply.range(of: #"(^|\n)Stopped (at|after) "#, options: .regularExpression) != nil ? "stopped" : "completed")
             } else {
                 state = "failed"

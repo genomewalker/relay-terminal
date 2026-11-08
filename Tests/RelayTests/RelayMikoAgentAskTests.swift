@@ -166,10 +166,18 @@ struct RelayMikoAgentAskTests {
         // The same id for other text is a conflict, not a new run.
         #expect(try await f.ask("Something else", id: id).0 == 409)
         #expect(f.harness.exchanges.count == 1)
-        // A later turn still sees the earlier agent request as labelled.
-        _ = await f.harness.run("And now?")
-        let history = f.model.requests.last?.messages.first?["content"]?.string
-        #expect(history?.hasPrefix("(Earlier request from the coding agent in pane") == true)
+        // History is isolated per caller: a later user turn carries no trace
+        // of the agent's request, its label or its pane. (The agent's own
+        // later asks still see their labelled history; see
+        // RelayMikoToolParityTests.)
+        _ = await f.harness.run("And now?", origin: .user)
+        let userTurn = try #require(f.model.requests.last?.messages)
+        #expect(userTurn.count == 1)
+        let userText = userTurn.map { $0["content"]?.string ?? "\($0)" }.joined(separator: "\n")
+        #expect(userText.hasSuffix("And now?"))
+        #expect(!userText.contains("Which panes are held?"))
+        #expect(!userText.contains("Earlier request from the coding agent"))
+        #expect(!userText.contains(f.paneID))
         // Unknown receipts are not found.
         #expect(try await f.receipt(UUID().uuidString.lowercased()).0 == 404)
     }
