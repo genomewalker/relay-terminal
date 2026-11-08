@@ -14,11 +14,11 @@ import SwiftUI
             self.pane = pane; self.workspace = workspace; seenAt = now
         }
     }
-    private struct Observation {
+    private struct Observation: Equatable {
         let proof: RelayAgentMaintenanceProbe
         let at: Date
     }
-    struct ToolReceipt: Codable, Sendable {
+    struct ToolReceipt: Codable, Equatable, Sendable {
         let id: String
         let operationID: String
         let host: String
@@ -30,14 +30,14 @@ import SwiftUI
         var state: String
         var result: RelayPaneHealthJSON?
     }
-    private struct Pending: Codable {
+    private struct Pending: Codable, Equatable {
         let operationID: String
         let snapshotID: String
         let panes: [RelayPaneHealthFacts]
         let messages: [RelayPaneHealthJSON]
         let step: Int
     }
-    private struct Host: Codable {
+    private struct Host: Codable, Equatable {
         var name: String
         var state = "Waiting for native pane observations"
         var lastAttemptAt: Date?
@@ -58,7 +58,7 @@ import SwiftUI
                 requestedAt: daemonCheckRequestedAt, submitted: daemonCheckSubmitted) }
         }
     }
-    private struct BatchCheck: Codable {
+    private struct BatchCheck: Codable, Equatable {
         let signal: String
         let at: Date
     }
@@ -106,6 +106,40 @@ import SwiftUI
     }
 
     @Published private(set) var revision: UInt64 = 0
+    /// Everything `snapshot()` and `hostOverviews()` expose from this
+    /// coordinator (pane titles and connection state come from the panes).
+    /// A sync bumps `revision` only when this changed.
+    private struct PublishedState: Equatable {
+        struct Controller: Equatable {
+            let processID: Int?
+            let processStart: UInt64?
+            let pendingOperationID: String?
+            let lastTickAt: TimeInterval?
+            let lastModelAt: TimeInterval?
+            let modelOperations: [String]?
+            let report: RelayPaneHealthJSON?
+        }
+        let hosts: [String: Host]
+        let tools: [String: ToolReceipt]
+        let observations: [UUID: Observation]
+        let controllers: [String: Controller]
+        let loadFailed: Bool
+    }
+    /// A routine status sync that changed nothing must not wake observers.
+    func bumpingRevisionIfPublishedStateChanges(_ work: () async -> Void) async {
+        let before = publishedState
+        await work()
+        if publishedState != before { revision &+= 1 }
+    }
+    private var publishedState: PublishedState {
+        PublishedState(hosts: journal.hosts, tools: journal.tools, observations: observations,
+            controllers: controllers.mapValues { status in
+                let state = status.currentState
+                return .init(processID: status.supervisorPid, processStart: status.supervisorStartTime,
+                    pendingOperationID: state?.pending?.operationId, lastTickAt: state?.lastTickAt,
+                    lastModelAt: state?.lastModelAt, modelOperations: state?.modelOperations, report: state?.report)
+            }, loadFailed: loadFailed)
+    }
     private var references: [UUID: Reference] = [:]
     private var observations: [UUID: Observation] = [:]
     private let controllerTasks = RelayPaneHealthControllerTasks()
@@ -383,8 +417,7 @@ import SwiftUI
         guard let desired = desiredController(profile: profile) else { return nil }
         return controllerTasks.start(host: key, scope: desired.digest) { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.revision &+= 1 }
-            await self.syncController(profile: profile)
+            await self.bumpingRevisionIfPublishedStateChanges { await self.syncController(profile: profile) }
         }
     }
 
