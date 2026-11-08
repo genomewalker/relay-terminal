@@ -542,7 +542,7 @@ struct RelayStatusMark: View {
 
     let status: Status?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var windowVisible = true
+    @Environment(\.relayStatusMarkWindowVisible) private var windowVisible
 
     static let size: CGFloat = 12
 
@@ -567,14 +567,8 @@ struct RelayStatusMark: View {
             Group {
                 switch Self.kind(status, reduceMotion: reduceMotion) {
                 case .none: EmptyView()
-                case .staticRunning: RelayRunningArc(angle: .degrees(0))
-                case .spinner:
-                    // Paused while the window is fully covered or minimised.
-                    TimelineView(.animation(paused: !windowVisible)) { context in
-                        let turn = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1)
-                        RelayRunningArc(angle: .degrees(turn * 360))
-                    }
-                    .background(RelayStatusMarkVisibility(visible: $windowVisible).frame(width: 0, height: 0))
+                case .staticRunning: RelayRunningArc()
+                case .spinner: RelaySpinningArc(animating: windowVisible)
                 case let .symbol(name):
                     Image(systemName: name)
                         .font(RelayTheme.font(size: 10, weight: .semibold))
@@ -590,7 +584,7 @@ struct RelayStatusMark: View {
 }
 
 private struct RelayRunningArc: View {
-    let angle: Angle
+    var angle: Angle = .zero
     var body: some View {
         ZStack {
             Circle().stroke(RelayTheme.success.opacity(0.25), lineWidth: 1.75)
@@ -600,6 +594,111 @@ private struct RelayRunningArc: View {
         }
         .padding(1.5)
     }
+}
+
+/// The running arc, turned by a Core Animation layer animation: the render
+/// server draws the frames, so Relay does no per-frame work (a SwiftUI
+/// TimelineView or repeating SwiftUI animation re-renders in-process every
+/// frame). The animation is removed while the window does not show.
+private struct RelaySpinningArc: NSViewRepresentable {
+    let animating: Bool
+
+    func makeNSView(context _: Context) -> RelaySpinnerView { RelaySpinnerView() }
+
+    func updateNSView(_ view: RelaySpinnerView, context _: Context) { view.animating = animating }
+}
+
+final class RelaySpinnerView: NSView {
+    private let track = CAShapeLayer()
+    private let arc = CAShapeLayer()
+    var animating = false { didSet { if animating != oldValue { updateSpin() } } }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        for (layer, end) in [(track, 1.0), (arc, 0.7)] {
+            layer.fillColor = nil
+            layer.lineWidth = 1.75
+            layer.lineCap = .round
+            layer.strokeEnd = end
+            self.layer?.addSublayer(layer)
+        }
+        updateColors()
+    }
+
+    @available(*, unavailable) required init?(coder _: NSCoder) { nil }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: RelayStatusMark.size, height: RelayStatusMark.size) }
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        // Same geometry as the still arc: 1.5 pt inset, stroke centred on the circle.
+        let inset = 1.5 + 1.75 / 2
+        let box = bounds.insetBy(dx: inset, dy: inset)
+        for layer in [track, arc] {
+            layer.frame = bounds
+            layer.path = CGPath(ellipseIn: box, transform: nil)
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateColors()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateSpin()
+    }
+
+    private func updateColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            track.strokeColor = RelayPalette.success.withAlphaComponent(0.25).cgColor
+            arc.strokeColor = RelayPalette.success.cgColor
+        }
+    }
+
+    private func updateSpin() {
+        guard animating, window != nil else {
+            arc.removeAnimation(forKey: "spin")
+            return
+        }
+        guard arc.animation(forKey: "spin") == nil else { return }
+        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+        spin.fromValue = 0
+        spin.toValue = 2 * Double.pi
+        spin.duration = 1
+        spin.repeatCount = .infinity
+        arc.add(spin, forKey: "spin")
+    }
+}
+
+private struct RelayStatusMarkWindowVisibleKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    /// Whether the window holding status marks shows; set once per container.
+    var relayStatusMarkWindowVisible: Bool {
+        get { self[RelayStatusMarkWindowVisibleKey.self] }
+        set { self[RelayStatusMarkWindowVisibleKey.self] = newValue }
+    }
+}
+
+/// One window visibility observer per container (tab strip, navigator,
+/// session list) for all the status marks inside it.
+private struct RelayStatusMarkVisibilityScope: ViewModifier {
+    @State private var visible = true
+    func body(content: Content) -> some View {
+        content
+            .environment(\.relayStatusMarkWindowVisible, visible)
+            .background(RelayStatusMarkVisibility(visible: $visible).frame(width: 0, height: 0))
+    }
+}
+
+extension View {
+    func relayStatusMarkVisibility() -> some View { modifier(RelayStatusMarkVisibilityScope()) }
 }
 
 /// The shared window visibility view (ordered in, not minimised, not fully

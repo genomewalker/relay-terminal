@@ -158,6 +158,7 @@ import UniformTypeIdentifiers
                     }
                 }
                 .padding(.bottom, 8)
+                .relayStatusMarkVisibility()
             }
             Button { workspace.presentWorkspaceMigration() } label: {
                 Label(workspace.migrationPlan?.staged == true ? "Migration plan ready — review"

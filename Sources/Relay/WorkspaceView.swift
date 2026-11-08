@@ -1117,6 +1117,7 @@ struct WorkspaceTabRail: View {
         .frame(height: 36)
         .background(RelayTheme.canvas)
         .overlay(alignment: .bottom) { Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1) }
+        .relayStatusMarkVisibility()
     }
 }
 
@@ -1672,6 +1673,7 @@ struct SessionManager: View {
                     }
                     .padding(.horizontal, RelayTheme.spacing(8))
                     .padding(.vertical, RelayTheme.spacing(6))
+                    .relayStatusMarkVisibility()
                 } else if tabSearchHits.isEmpty {
                     Text("No matching tabs")
                         .font(RelayTheme.font(size: 11.5))

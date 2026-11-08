@@ -94,6 +94,29 @@ struct RelayTabStatusTests {
         #expect(Mark.status(nil, besideAlert: .needsInput) == nil)
     }
 
+    @Test("The spinner's layer animation runs only while shown in a visible window")
+    func spinnerGating() {
+        _ = NSApplication.shared
+        func spinning(_ view: RelaySpinnerView) -> Bool {
+            (view.layer?.sublayers ?? []).contains { $0.animation(forKey: "spin") != nil }
+        }
+        let view = RelaySpinnerView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
+        view.animating = true
+        #expect(!spinning(view), "no window, no animation")
+        // Never ordered in: nothing appears on screen.
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 40, height: 40),
+                              styleMask: [.borderless], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.contentView?.addSubview(view)
+        #expect(spinning(view))
+        view.animating = false
+        #expect(!spinning(view), "a hidden window stops the animation")
+        view.animating = true
+        #expect(spinning(view))
+        view.removeFromSuperview()
+        #expect(!spinning(view))
+    }
+
     // MARK: Live workspace
 
     private func send(_ pane: PaneModel, _ json: String) { pane.receivedAgentEvent(Data(json.utf8)) }
