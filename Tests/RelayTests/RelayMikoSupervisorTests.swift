@@ -19,11 +19,14 @@ private final class SupervisedModel: RelayAssistantModel {
 private final class SupervisedExecutor: RelayAssistantActionExecutor {
     var instance: UUID? = UUID()
     var dispatched: [String] = []
+    /// The host operation of each dispatched request, when its body names one.
+    var operations: [String] = []
     /// Runs inside a dispatch, as a correction landing mid-plan would.
     var onPerform: (() -> Void)?
     func permits(_ capability: MCPWorkspaceCapability) -> Bool { true }
     func perform(method: String, path: String, body: Data) async -> (status: Int, body: Data) {
         dispatched.append(path)
+        operations.append(((try? JSONSerialization.jsonObject(with: body)) as? [String: Any])?["operation"] as? String ?? "")
         onPerform?()
         return (200, Data("{}".utf8))
     }
@@ -225,7 +228,8 @@ struct RelayMikoSupervisorTests {
         #expect(f.supervision.current.revertedTo == 0)
         #expect(f.supervision.history.map(\.version) == [1, 2, 3])
         _ = await f.harness.run("list panes again")
-        #expect(f.model.lastUserText == "list panes again")
+        // After the revert no standing instructions remain; only the fixed settings guidance precedes the request.
+        #expect(f.model.lastUserText == RelaySettingsJourney.instruction + "\n\nRequest:\nlist panes again")
         // Over-long or unknown corrections are refused and change nothing.
         #expect(try await f.call("relay_miko_set_instructions", ["text": String(repeating: "x", count: 4000), "reason": "x"]).0 == 400)
         #expect(try await f.call("relay_miko_set_capabilities", ["disabled_tools": ["send_keys"], "reason": "x"]).0 == 400)
@@ -354,7 +358,8 @@ struct RelayMikoSupervisorTests {
         #expect(f.harness.displayedPendingCard?.blockedReason == nil)
         f.harness.runCard()
         _ = await second.value
-        #expect(f.executor.dispatched.count == 1)
+        // The card ran exactly once; the harness then reads that job's status once, never replaying it.
+        #expect(f.executor.operations == ["exec", "status"])
     }
 
     @Test func aCorrectionAfterRunButBeforeDispatchRefusesTheCard() async throws {
