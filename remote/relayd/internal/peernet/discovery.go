@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/relay-terminal/relayd/internal/agentaccounts"
 )
 
 // Discovery intentionally omits socket paths and authentication material.
@@ -91,7 +93,7 @@ func discoverSessions(home, dir string, result *Discovery, records *[]Record) er
 		if record.RelayProxy {
 			continue
 		}
-		live, err := Resolve(home, record.Name, record.Session, pid)
+		live, err := Resolve(home, agentaccounts.PeerName(record.Name, record.Session, record.Entrypoint), record.Session, pid)
 		if err != nil || slices.ContainsFunc(*records, func(r Record) bool { return r.PID == live.PID }) {
 			continue
 		}

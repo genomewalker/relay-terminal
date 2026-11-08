@@ -18,6 +18,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/relay-terminal/relayd/internal/agentaccounts"
 )
 
 var identifier = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,110}$`)
@@ -30,6 +32,7 @@ type Record struct {
 	Socket     string `json:"messagingSocketPath"`
 	Start      string `json:"procStart"`
 	Cwd        string `json:"cwd"`
+	Entrypoint string `json:"entrypoint"`
 }
 
 func processStart(pid int) (string, error) {
@@ -84,6 +87,7 @@ func Resolve(home, name, session string, pid int) (Record, error) {
 	if e = json.Unmarshal(b, &r); e != nil {
 		return r, e
 	}
+	r.Name = agentaccounts.PeerName(r.Name, r.Session, r.Entrypoint)
 	if r.PID != pid || r.Name != name || r.Session != session || !identifier.MatchString(name) || !identifier.MatchString(session) {
 		return r, errors.New("recipient identity mismatch")
 	}

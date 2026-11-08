@@ -30,6 +30,7 @@ type peerRecord struct {
 	Socket  string `json:"messagingSocketPath"`
 	CWD     string `json:"cwd"`
 	Proxy   bool   `json:"relayProxy"`
+	Entry   string `json:"entrypoint"`
 }
 type remoteRuntime struct {
 	home        string
@@ -80,6 +81,7 @@ func (r *remoteRuntime) endpoint(registry string, pid int, session, start string
 	if e = decodeJSON(b, messageLimit, &p); e != nil {
 		return p, e
 	}
+	p.Name = agentaccounts.PeerName(p.Name, p.Session, p.Entry)
 	if p.PID != pid || p.Session != session || p.Start != start || !identifier.MatchString(p.Name) {
 		return p, errIdentity
 	}
@@ -105,7 +107,11 @@ func (r *remoteRuntime) replacement(registry, session string) (*Mailbox, error) 
 		}
 		var p peerRecord
 		b, e := privateRead(file, messageLimit, 0022)
-		if e != nil || decodeJSON(b, messageLimit, &p) != nil || p.PID != pid || p.Session != session || p.Proxy || len(p.Start) > 64 || !identifier.MatchString(p.Name) {
+		if e != nil || decodeJSON(b, messageLimit, &p) != nil {
+			continue
+		}
+		p.Name = agentaccounts.PeerName(p.Name, p.Session, p.Entry)
+		if p.PID != pid || p.Session != session || p.Proxy || len(p.Start) > 64 || !identifier.MatchString(p.Name) {
 			continue
 		}
 		if _, e = r.endpoint(registry, pid, session, p.Start); e != nil {
