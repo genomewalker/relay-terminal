@@ -289,7 +289,7 @@ private struct WorkspaceFocusBar: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("\(expanded ? "Collapse" : "Expand") \(record.name)")
-                Button { workspace.selectWorkspace(record.id) } label: {
+                Button { workspace.selectWorkspace(record.id, origin: .user) } label: {
                     HStack(spacing: 6) {
                         Image(systemName: record.isInbox ? "tray" : "square.stack")
                             .font(.system(size: 10)).foregroundStyle(RelayTheme.textMuted)

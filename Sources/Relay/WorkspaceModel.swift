@@ -2503,16 +2503,17 @@ final class WorkspaceModel: ObservableObject {
         return sessionDisplayName(id, fallback: host)
     }
 
-    func selectSession(_ id: UUID) {
+    /// `.user` for a sidebar click or key command: the pane shown is a Go to pane visit.
+    func selectSession(_ id: UUID, origin: PaneSelectionOrigin = .programmatic) {
         let candidates = orderedTabs(in: id).map(\.id)
         guard let tabID = navigationState.preferredTab(in: id, available: candidates) else { return }
-        selectTab(tabID)
+        selectTab(tabID, origin: origin)
     }
 
     func selectSession(offset: Int) {
         guard let next = WorkspaceNavigationState.adjacentTab(current: selectedTab?.sessionID,
             ordered: navigationSessionIDs, offset: offset) else { return }
-        selectSession(next)
+        selectSession(next, origin: .user)
     }
 
     func toggleNavigationGroup(_ group: WorkspaceNavigationState.Group, id: UUID) {
@@ -3154,14 +3155,16 @@ final class WorkspaceModel: ObservableObject {
     }
 
     /// Shows a workspace, even an empty one, and selects its last tab if any.
-    func selectWorkspace(_ id: UUID) {
+    /// `.user` for a navigator click, menu command or Go to pane choice: the
+    /// pane shown is a Go to pane visit. Hiding or closing passes `.programmatic`.
+    func selectWorkspace(_ id: UUID, origin: PaneSelectionOrigin = .programmatic) {
         guard ownership.workspace(id) != nil else { return }
         showWorkspace(id)
         guard let tabID = navigationState.preferredTab(in: id, available: railTabs(inWorkspace: id).map(\.id)) else {
             clearSelectionForEmptyWorkspace()
             return
         }
-        selectTab(tabID)
+        selectTab(tabID, origin: origin)
     }
 
     /// Cycles the workspaces that are not hidden, in navigator order; while
@@ -3171,7 +3174,7 @@ final class WorkspaceModel: ObservableObject {
         let ordered = ownership.orderedWorkspaces
             .filter { $0.hidden != true && (focused.isEmpty || focused.contains($0.id)) }.map(\.id)
         guard let next = WorkspaceNavigationState.adjacentTab(current: selectedWorkspaceID, ordered: ordered, offset: offset) else { return }
-        selectWorkspace(next)
+        selectWorkspace(next, origin: .user)
     }
 
     private func editWorkspace(_ id: UUID, _ change: (inout WorkspaceRecord) -> Void) {

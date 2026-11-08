@@ -205,6 +205,45 @@ struct PaneVisitHistoryTests {
     }
 
     @MainActor
+    @Test("Switching workspace or session by the user records the shown pane; programmatic switching does not")
+    func workspaceAndSessionSwitchRecordVisit() throws {
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let home = try #require(workspace.selectedWorkspaceID)
+        let homePane = try #require(workspace.activePaneID)
+        let homeSession = try #require(workspace.selectedTab?.sessionID)
+        let other = workspace.createWorkspace(named: "Second")
+        // A new tab in its own session, on the same (local) profile.
+        workspace.newTab(profile: try #require(workspace.activePane).profile)
+        let otherTab = try #require(workspace.selectedTabID)
+        let otherPane = try #require(workspace.activePaneID)
+        try workspace.moveTab(otherTab, toWorkspace: other)
+        let otherSession = try #require(workspace.tabs.first { $0.id == otherTab }?.sessionID)
+        #expect(otherSession != homeSession)
+        // Creating and moving a tab is not a user visit.
+        let baseline = workspace.paneVisits.visits
+        let recent = { Array(workspace.paneVisits.visits.prefix(2).map(\.paneID)) }
+        // Hiding, closing and restore select a workspace programmatically.
+        workspace.selectWorkspace(home)
+        workspace.selectWorkspace(other)
+        #expect(workspace.paneVisits.visits == baseline)
+        // A navigator click, menu command or Go to pane choice is a visit.
+        workspace.selectWorkspace(home, origin: .user)
+        #expect(workspace.activePaneID == homePane)
+        #expect(workspace.paneVisits.visits.first?.paneID == homePane)
+        workspace.selectWorkspace(offset: 1)
+        #expect(workspace.selectedWorkspaceID == other && workspace.activePaneID == otherPane)
+        #expect(recent() == [otherPane, homePane])
+        // A sidebar session click is a visit too.
+        workspace.selectSession(homeSession, origin: .user)
+        #expect(workspace.activePaneID == homePane)
+        #expect(recent() == [homePane, otherPane])
+        let afterUser = workspace.paneVisits.visits
+        workspace.selectSession(otherSession)
+        #expect(workspace.activePaneID == otherPane && workspace.paneVisits.visits == afterUser)
+    }
+
+    @MainActor
     @Test("Rapid user visits coalesce into one workspace write that holds the last visit")
     func rapidVisitsCoalesce() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("relay-visits-\(UUID())")

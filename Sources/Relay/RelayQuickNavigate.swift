@@ -82,7 +82,7 @@ struct RelayQuickNavigate: View {
     private func open(_ result: Index.Entry) {
         workspace.networkVisible = false
         switch result.destination {
-        case .workspace(let id): workspace.selectWorkspace(id)
+        case .workspace(let id): workspace.selectWorkspace(id, origin: .user)
         case .tab(let id): workspace.selectTab(id, origin: .user)
         case .pane(let id, let tab):
             workspace.selectTab(tab)

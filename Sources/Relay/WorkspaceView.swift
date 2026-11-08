@@ -1020,7 +1020,7 @@ private struct WorkspaceTabRail: View {
         HStack(spacing: RelayTheme.spacing(8)) {
             Menu {
                 ForEach(workspace.navigatorWorkspaces().shown) { record in
-                    Button { workspace.selectWorkspace(record.id) } label: {
+                    Button { workspace.selectWorkspace(record.id, origin: .user) } label: {
                         if record.id == workspace.selectedWorkspaceID {
                             Label(record.name, systemImage: "checkmark")
                         } else { Text(record.name) }
@@ -1790,7 +1790,7 @@ private struct AttachedSessionRow: View {
                 .help(expanded ? "Collapse session" : "Expand session")
                 .accessibilityIdentifier("relay.navigation.session-disclosure." + session.id.uuidString.lowercased())
                 Button {
-                    workspace.selectSession(session.id)
+                    workspace.selectSession(session.id, origin: .user)
                 } label: {
                 HStack(spacing: RelayTheme.spacing(7)) {
                     Capsule()
