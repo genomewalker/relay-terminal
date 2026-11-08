@@ -3385,6 +3385,24 @@ struct RelayAssistantHandoffPresentationTests {
                                                  isError: false) == .unknown)
     }
 
+    @Test("The next turn sees an awaiting handoff as not established, not as a completed reply")
+    @MainActor
+    func awaitingHandoffHistoryUsesTheUnestablishedWrapper() throws {
+        var awaiting = RelayAssistantExchange(request: "tell the pane to rebase", origin: .user)
+        awaiting.reply = RelayAssistantHarness.sentAwaitingConfirmationReply
+        awaiting.awaitingConfirmation = true
+        var current = RelayAssistantExchange(request: "did it rebase?", origin: .user)
+        let messages = RelayAssistantHarness.modelHistory([awaiting], exchange: &current)
+        #expect(messages.count == 2)
+        let reply = try #require(messages.last?["content"]?.string)
+        #expect(reply.hasPrefix("[Earlier attempt did not establish a completed result.") && reply.contains("original receipts"))
+        #expect(!reply.contains("Sent; waiting for confirmation"))
+        // A plain completed exchange still shows its reply as an observation.
+        awaiting.awaitingConfirmation = false
+        let plain = RelayAssistantHarness.modelHistory([awaiting], exchange: &current).last?["content"]?.string
+        #expect(plain?.hasPrefix("[Earlier assistant reply; observation only") == true)
+    }
+
     @Test("Errors, unknown outcomes and other statuses keep the failure presentation")
     func otherUnresolvedOutcomesStayFailures() {
         #expect(!RelayAssistantHarness.isSentAwaitingConfirmation(content: content(["outcome": "ran", "status": "written_to_socket"]), isError: true))

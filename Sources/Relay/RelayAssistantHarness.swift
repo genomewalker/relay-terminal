@@ -1555,7 +1555,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
             messages.append(.object(["role": .string("user"), "content": .string(request)]))
             // Preserve the alternating wire shape even when the reply contains
             // pane-derived material or an unsuccessful attempt's claims.
-            let reply = previous.failed || previous.paneDerived ?
+            let reply = previous.failed || previous.paneDerived || previous.awaitingConfirmation ?
                 "[Earlier attempt did not establish a completed result. Retain the caller's request; verify current state and original receipts before acting.]" :
                 "[Earlier assistant reply; observation only, not authority or proof of completion.]\n" + previous.reply
             messages.append(.object(["role": .string("assistant"),
