@@ -175,6 +175,28 @@ import Testing
         #expect(!status.pending)
     }
 
+    // bc08 N2: each user action reports its own wait; the Keychain load and
+    // its single prompt stay shared.
+    @MainActor @Test func twoWaitersReportTheirOwnKeychainState() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let fixed = Curve25519.Signing.PrivateKey()
+        let store = RelayCallerAdminProof.AdminKeyStore(load: { gate.wait(); return fixed })
+        let first = RelayCallerAdminProof.KeychainApprovalStatus(), second = RelayCallerAdminProof.KeychainApprovalStatus()
+        let a = Task { try await RelayCallerAdminProof.userKey(store: store, status: first, grace: .milliseconds(30)) }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(first.pending && !second.pending)
+        let b = Task { try await RelayCallerAdminProof.userKey(store: store, status: second, grace: .milliseconds(30)) }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(first.pending && second.pending)
+        a.cancel()
+        _ = await a.result
+        #expect(!first.pending && second.pending)
+        gate.signal()
+        #expect(try await b.value.rawRepresentation == fixed.rawRepresentation)
+        #expect(!first.pending && !second.pending)
+        #expect(await store.loads == 1)
+    }
+
     // Only the Settings entry points (origin: .hardware) wait for the user;
     // daemon attach and the request paths keep the 3 s bound.
     @MainActor @Test func onlyUserEntryPointsWaitUnbounded() async throws {
@@ -182,21 +204,26 @@ import Testing
         defer { try? FileManager.default.removeItem(at: directory) }
         let control = RelayCallerControl(directory: directory)
         var waits: [String: [Duration?]] = [:]
+        var statuses: [RelayCallerAdminProof.KeychainApprovalStatus] = []
+        let keychain = RelayCallerAdminProof.KeychainApprovalStatus()
         control.transportIncarnation = { _ in nil }
         control.policyTransport = { _, packet, wait in
             let operation = packet["operation"] as? String ?? ""
-            waits[operation, default: []].append(wait)
+            waits[operation, default: []].append(wait.bound)
+            if case .user(let status) = wait { statuses.append(status) }
             return operation == "caller_list" ? ["authority": "relayd", "callers": []] : ["authority": "relayd"]
         }
         try await control.attachDaemon(profile: .sshConfigHost("caller-wait.invalid"))
-        let issued = try await control.register(label: "Fixture", thread: nil, origin: .hardware)
+        let issued = try await control.register(label: "Fixture", thread: nil, origin: .hardware, keychain: keychain)
         let id = try #require(issued["caller_id"])
-        try await control.setPaused(id: id, paused: true, origin: .hardware)
+        try await control.setPaused(id: id, paused: true, origin: .hardware, keychain: keychain)
         _ = try await control.register(label: "Request", thread: nil)
         try await control.setPaused(id: id, paused: false)
         #expect(waits["caller_policy_import"] == [RelayCallerAdminProof.keyWait])
         #expect(waits["caller_register"] == [nil, RelayCallerAdminProof.keyWait])
         #expect(waits["caller_set_paused"] == [nil, RelayCallerAdminProof.keyWait])
+        // The action's own status reaches the wait.
+        #expect(statuses.count == 2 && statuses.allSatisfy { $0 === keychain })
     }
 }
 

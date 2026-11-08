@@ -6,7 +6,8 @@ import AppKit
 struct RelayCallerManagementView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var control = RelayCallerControl.shared
-    @ObservedObject private var keychain = RelayCallerAdminProof.KeychainApprovalStatus.shared
+    /// This sheet's own Keychain wait; it runs one action at a time.
+    @StateObject private var keychain = RelayCallerAdminProof.KeychainApprovalStatus()
     /// The user's register/pause action in flight; it may be waiting on the
     /// Keychain prompt, and closing the sheet cancels that wait.
     @State private var action: Task<Void, Never>?
@@ -48,7 +49,7 @@ struct RelayCallerManagementView: View {
                     Toggle("Paused", isOn: Binding(get: { caller.paused }, set: { value in
                         let origin = RelayKeyEventOrigin.ofUserAction(NSApp.currentEvent)
                         perform {
-                            do { try await control.setPaused(id: caller.id, paused: value, origin: origin); error = nil }
+                            do { try await control.setPaused(id: caller.id, paused: value, origin: origin, keychain: keychain); error = nil }
                             catch is CancellationError {}
                             catch { self.error = origin == .hardware ? "The pause setting could not be applied to every communication server."
                                 : "Pause changes need a click or key press on this Mac." }
@@ -125,7 +126,7 @@ struct RelayCallerManagementView: View {
         let origin = RelayKeyEventOrigin.ofUserAction(NSApp.currentEvent)
         perform {
         do {
-            let result = try await control.register(label: label.trimmingCharacters(in: .whitespacesAndNewlines), thread: thread.isEmpty ? nil : thread, origin: origin)
+            let result = try await control.register(label: label.trimmingCharacters(in: .whitespacesAndNewlines), thread: thread.isEmpty ? nil : thread, origin: origin, keychain: keychain)
             credential = result["caller_token"] ?? ""; issuedID = result["caller_id"] ?? ""
             label = ""; thread = ""; error = nil
         } catch is CancellationError {

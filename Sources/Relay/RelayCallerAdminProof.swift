@@ -44,14 +44,29 @@ enum RelayCallerAdminProof {
     /// How long a request waits for the key. An unanswered Keychain prompt
     /// must not hold request handlers (0.5.30: Miko supervisor calls hung with
     /// no reply); the load itself keeps waiting for the user. HTTP, agent and
-    /// MCP paths use it; an action the user starts in Relay's UI passes nil,
-    /// because that user is the one answering the prompt (U-K1).
+    /// MCP paths use it; an action the user starts in Relay's UI waits
+    /// without it, because that user is the one answering the prompt (U-K1).
     static let keyWait: Duration = .seconds(3)
 
-    /// Whether a user-started action is waiting on the Keychain prompt, for
-    /// the control that started it.
+    /// How a mutation waits for the key.
+    enum KeyWait: Sendable {
+        /// HTTP, agent and MCP paths: refuse after the bound.
+        case bounded(Duration)
+        /// An action the user started: wait until approval or cancellation,
+        /// reporting the wait on that action's own status.
+        case user(KeychainApprovalStatus)
+
+        static var request: KeyWait { .bounded(RelayCallerAdminProof.keyWait) }
+        var bound: Duration? {
+            if case .bounded(let bound) = self { return bound }
+            return nil
+        }
+    }
+
+    /// Whether one user-started action is waiting on the Keychain prompt.
+    /// Each action (or the view running it) owns its own; the key load and
+    /// its single prompt stay shared.
     @MainActor final class KeychainApprovalStatus: ObservableObject {
-        static let shared = KeychainApprovalStatus()
         static let waitingText = "Waiting for Keychain approval…"
         @Published private(set) var waiting = 0
         var pending: Bool { waiting > 0 }
@@ -62,7 +77,7 @@ enum RelayCallerAdminProof {
     /// The key for an action the user started: no bound, only cancellation
     /// ends the wait. Once it outlasts `grace` (when a request would have
     /// failed) the action is shown as waiting for Keychain approval.
-    @MainActor static func userKey(store: AdminKeyStore = adminKey, status: KeychainApprovalStatus = .shared,
+    @MainActor static func userKey(store: AdminKeyStore = adminKey, status: KeychainApprovalStatus,
                                    grace: Duration = keyWait) async throws -> Curve25519.Signing.PrivateKey {
         do { return try await store.key(within: grace) }
         catch is KeychainApprovalPending {
@@ -206,15 +221,18 @@ enum RelayCallerAdminProof {
 
     /// Default policy transport: signs mutations after asking the host for its
     /// node ID (readable without proof), then sends the packet. `keyWait`
-    /// bounds the wait for the key; nil waits for the user (UI actions only).
+    /// says how long to wait for the key (`.user` for UI actions only).
     @MainActor static func send(profile: ConnectionProfile, packet: [String: Any],
-                                keyWait: Duration? = RelayCallerAdminProof.keyWait) async throws -> [String: Any] {
+                                keyWait: KeyWait = .request) async throws -> [String: Any] {
         var packet = packet
         if let operation = packet["operation"] as? String, mutating.contains(operation) {
             let info = try await RelayHostExecution.communicationRequest(profile: profile, packet: ["operation": "caller_admin_info"])
             guard let node = info.value?["node_id"] as? String, !node.isEmpty else { throw RelayHostRPCError.invalidRequest }
             let key: Curve25519.Signing.PrivateKey
-            if let keyWait { key = try await adminKey.key(within: keyWait) } else { key = try await userKey() }
+            switch keyWait {
+            case .bounded(let bound): key = try await adminKey.key(within: bound)
+            case .user(let status): key = try await userKey(status: status)
+            }
             // A host pinned to a different key is not ours to administer.
             if let pinned = info.value?["admin_key_sha256"] as? String, !pinned.isEmpty,
                pinned != SHA256.hash(data: key.publicKey.rawRepresentation).map({ String(format: "%02x", $0) }).joined() {
