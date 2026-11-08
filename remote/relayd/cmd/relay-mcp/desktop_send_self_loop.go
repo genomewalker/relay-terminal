@@ -27,7 +27,11 @@ type processIdentity struct {
 var desktopSendAncestors = func() []processIdentity {
 	var chain []processIdentity
 	for pid := os.Getppid(); pid > 1 && len(chain) < 64; {
-		out, e := exec.Command("ps", "-o", "ppid=", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
+		// Routes record a Mac process start as ps prints it in UTC (peernet's
+		// processStart); local time would never match and the guard would not fire.
+		command := exec.Command("ps", "-o", "ppid=", "-o", "lstart=", "-p", strconv.Itoa(pid))
+		command.Env = append(os.Environ(), "TZ=UTC", "LC_ALL=C")
+		out, e := command.Output()
 		if e != nil {
 			return nil
 		}
