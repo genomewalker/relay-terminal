@@ -169,6 +169,8 @@ func Layout(value map[string]any) (map[string]any, error) {
 	}
 	delete(m, "activePaneID")
 	delete(m, "selectedTabID")
+	// Go to pane's visit history changes on every pane switch; not layout.
+	delete(m, "paneVisits")
 	if a, ok := m["sessionNames"].([]any); ok {
 		v, e := alternating(a)
 		if e != nil {
