@@ -128,3 +128,50 @@ func promptParseMemoMatchesFreshParse() {
     #expect(memo.parses == before + 2)
     #expect(RelayAgentMaintenancePrompt.isEmpty(first, provider: provider) != RelayAgentMaintenancePrompt.isEmpty("› Ask Codex to do anything" + codexFooter, provider: provider))
 }
+
+/// Releases one pending sleep at a time; records the requested durations.
+private actor ManualSleeper {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var requested: [TimeInterval] = []
+    func sleep(_ seconds: TimeInterval) async {
+        requested.append(seconds)
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func pending() -> Int { waiters.count }
+    func releaseOne() { if !waiters.isEmpty { waiters.removeFirst().resume() } }
+}
+
+@MainActor @Test("An observation going stale bumps revision at the boundary without a new sync")
+func paneHealthObservationExpiryBumpsRevision() async throws {
+    _ = NSApplication.shared
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    let pane = try #require(workspace.activePane)
+    pane.connected()
+    defer { workspace.shutdown() }
+    let coordinator = RelayPaneHealthCoordinator(url: temporaryJournalURL())
+    let start = Date(timeIntervalSince1970: 1_800_000_000)
+    var now = start
+    coordinator.clock = { now }
+    let sleeper = ManualSleeper()
+    coordinator.sleep = { await sleeper.sleep($0) }
+    coordinator.heartbeat(workspace, now: start)
+
+    coordinator.observe(pane, proof: RelayAgentMaintenanceProbe(version: 1, unavailable: "Owned unavailable proof"), now: start)
+    let observed = coordinator.revision
+    #expect(coordinator.freshnessDeadline == start.addingTimeInterval(300))
+    #expect(coordinator.hostOverviews(now: start).first?.livePanes.first?.observationState == "unavailable")
+    while await sleeper.pending() == 0 { await Task.yield() }
+    #expect(await sleeper.requested == [300])
+    #expect(coordinator.revision == observed) // nothing until the boundary
+
+    now = start.addingTimeInterval(300)
+    await sleeper.releaseOne()
+    while coordinator.revision == observed { await Task.yield() }
+    #expect(coordinator.revision == observed &+ 1)
+    #expect(coordinator.hostOverviews(now: now).first?.livePanes.first?.observationState == "stale")
+    // Nothing left to expire: no further wake is armed.
+    #expect(coordinator.freshnessDeadline == nil)
+    for _ in 0..<20 { await Task.yield() }
+    #expect(await sleeper.pending() == 0)
+    #expect(coordinator.revision == observed &+ 1)
+}

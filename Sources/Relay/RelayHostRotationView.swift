@@ -41,7 +41,11 @@ private struct RelayHostRotationPanel: View {
             }
             Text(hostName).font(.caption).foregroundStyle(.secondary)
             if status != nil || textStatus != nil {
-                let summary = RelayContextManagementSummary(rotation: status, text: textStatus, credentials: credentials)
+              // "last N min ago" needs its own clock; the panel otherwise
+              // redraws only when the pane or a status read changes.
+              TimelineView(.periodic(from: .now, by: 30)) { context in
+                let summary = RelayContextManagementSummary(rotation: status, text: textStatus, credentials: credentials,
+                                                            now: context.date)
                 VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
                     ForEach(Array([summary.handoffText, summary.enrollment, summary.completedTurns].enumerated()), id: \.offset) { _, check in
                         Label(check.text, systemImage: check.isOK ? "checkmark.circle.fill" :
@@ -56,6 +60,7 @@ private struct RelayHostRotationPanel: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(summary.line)
                 .accessibilityIdentifier("relay.context-management.summary")
+              }
             }
             if let status {
                 Text(status.title).font(.subheadline.weight(.semibold))

@@ -835,7 +835,9 @@ struct RelayAgentAccountsSettingsView: View {
                             }
                         }
                     }
-                    Text("read " + RelayAgentAccountUsage.age(usage.readDate, now: Date())).foregroundStyle(RelayTheme.textFaint)
+                    TimelineView(.periodic(from: .now, by: 30)) { context in
+                        Text("read " + RelayAgentAccountUsage.age(usage.readDate, now: context.date)).foregroundStyle(RelayTheme.textFaint)
+                    }
                 }
                 .font(RelayTheme.font(size: 10.5))
             } else if let usage, !usage.notSetUp {
