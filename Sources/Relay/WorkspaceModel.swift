@@ -271,8 +271,12 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var recoveringConversationPaneIDs: Set<UUID> = []
     @Published private(set) var paneCloseEvent = 0
     @Published private(set) var lastClosedPaneWasRemote = false
-    @Published private(set) var supervisorRecommendations: [UUID: RelaySupervisorRecommendation] = [:]
-    @Published private(set) var supervisorAdvisories: [UUID: RelaySupervisorAdvisory] = [:]
+    // Rewritten by the 5 s supervisor loop with a fresh `observedAt` each time.
+    // No view reads them, so publishing invalidated every WorkspaceModel
+    // observer twice per tick (the idle-CPU and hitch source in the 0.5.36
+    // profile). Readers (Performance sampler, decision backend) pull on demand.
+    private(set) var supervisorRecommendations: [UUID: RelaySupervisorRecommendation] = [:]
+    private(set) var supervisorAdvisories: [UUID: RelaySupervisorAdvisory] = [:]
     @Published private(set) var supervisorReceipts: [UUID: RelaySupervisorActionReceipt] = [:]
 
     let profileStore = ProfileStore()
