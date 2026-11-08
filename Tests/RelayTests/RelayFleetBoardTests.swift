@@ -154,6 +154,24 @@ struct RelayFleetBoardTests {
         #expect(goToPane.contains { $0.destination == .fleetBoard && $0.group == .actions })
     }
 
+    @Test("A local pane whose session ended reads Exited; a lost connection says so")
+    func exitedDetail() {
+        // A direct (non-relay) local pane: its connection label stays "Connected".
+        let local = PaneModel(profile: ConnectionProfile(name: "Local shell", kind: .local, host: "", user: "",
+                                                         port: 22, command: "", backend: .direct))
+        local.connectionState = .connected
+        local.exited(exitCode: 0)
+        let fact = Index.paneFact(local, tabID: UUID(), workspaceName: "Relay", tabName: "sh", hidden: false)
+        #expect(fact.status == .disconnected)
+        #expect(fact.detail == "Exited")
+        let lost = PaneModel(profile: .sshConfigHost("fleet-exit.invalid"))
+        lost.disconnected("Host unreachable")
+        let lostFact = Index.paneFact(lost, tabID: UUID(), workspaceName: "Relay", tabName: "sh", hidden: false)
+        #expect(lost.phase == .exited)
+        #expect(lostFact.detail == lost.connectionStatusLabel)
+        #expect(lostFact.detail != "Exited")
+    }
+
     @Test("Plain shells are not rows; a shell waiting on the user still is")
     func agentsOnly() {
         func shell(_ name: String, _ status: Index.PaneStatus) -> Index.PaneFact {

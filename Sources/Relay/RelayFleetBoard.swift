@@ -131,7 +131,14 @@ extension RelayWorkOverviewIndex {
         let reportCurrent = pane.connectionState == .connected && pane.programStatus.revision != nil
         let status = paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
                                 programState: report, connection: pane.connectionState)
-        let detail = status == .disconnected ? pane.connectionStatusLabel
+        // A lost connection names itself (disconnecting also marks the phase
+        // exited); a pane whose session ended while connected says Exited.
+        let connectionLost = switch pane.connectionState {
+        case .disconnected, .reconnecting, .waitingForNetwork: true
+        case .connecting, .connected: false
+        }
+        let detail = status == .disconnected
+            ? (!connectionLost && pane.phase == .exited ? PaneDisplayState.exited.label : pane.connectionStatusLabel)
             : paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
                          programState: report, programReportCurrent: reportCurrent)
         let changedAt = [pane.agentActivities.last?.occurredAt, pane.lastCompletedAgentTurn].compactMap { $0 }.max()
