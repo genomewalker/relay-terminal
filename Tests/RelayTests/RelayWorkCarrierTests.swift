@@ -46,14 +46,164 @@ import Testing
     let none = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 0)
     let idle = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 1)
     let busy = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [.init(messageID: "m", peerNodeID: "p")], nativeRoutes: 1)
-    #expect(RelayWorkCarrier.nextCheck(after: none) == 600)
-    #expect(RelayWorkCarrier.nextCheck(after: idle) == 30)
-    #expect(RelayWorkCarrier.nextCheck(after: busy) == 5)
-    #expect(RelayWorkCarrier.nextCheck(after: nil) == 600)
-    #expect(RelayWorkCarrier.nextCheck(after: nil, previous: idle) == 30)
-    #expect(RelayWorkCarrier.nextCheck(after: nil, previous: none) == 600)
+    // Genuinely idle: no routes before, none now, nothing queued.
+    var quiet = RelayWorkCarrier.HostSchedule(routes: 0)
+    #expect(RelayWorkCarrier.nextCheck(after: none, state: &quiet) == 600)
+    #expect(RelayWorkCarrier.nextCheck(after: none, state: &quiet) == 600)
+    var routed = RelayWorkCarrier.HostSchedule()
+    #expect(RelayWorkCarrier.nextCheck(after: idle, state: &routed) == 30)
+    #expect(RelayWorkCarrier.nextCheck(after: busy, state: &routed) == 5)
     let parsed = RelayWorkCarrier.outbox(hostKey: "k", reply: ["node_id": "n", "items": [], "native_routes": 2])
     #expect(parsed?.nativeRoutes == 2)
+}
+
+/// 2026-11-08: after an app restart the first check of dandy-07 failed, the
+/// in-memory record was empty, and the next check came 600 s later, beyond
+/// the 9-minute signed window. A failed check backs off 30, 60, 120, 240 s
+/// and never jumps to 600 s, whatever the host reported before.
+@Test func workCarrierRetriesAFailedCheckWithBackoffUnderTheSignedWindow() {
+    for start in [RelayWorkCarrier.HostSchedule(), RelayWorkCarrier.HostSchedule(routes: 0), RelayWorkCarrier.HostSchedule(routes: 2)] {
+        var state = start
+        let delays = (0..<8).map { _ in RelayWorkCarrier.nextCheck(after: nil, state: &state) }
+        #expect(delays == [30, 60, 120, 240, 240, 240, 240, 240], "from \(start)")
+    }
+    #expect(RelayWorkCarrier.failureBackoff.allSatisfy { $0 < 9 * 60 })
+    // An answer ends the backoff.
+    var state = RelayWorkCarrier.HostSchedule()
+    _ = RelayWorkCarrier.nextCheck(after: nil, state: &state)
+    _ = RelayWorkCarrier.nextCheck(after: nil, state: &state)
+    let routed = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 1)
+    #expect(RelayWorkCarrier.nextCheck(after: routed, state: &state) == 30)
+    #expect(RelayWorkCarrier.nextCheck(after: nil, state: &state) == 30)
+}
+
+/// bc08: mid supervisor swap a host can answer with 0 routes right after
+/// reporting some. That drop is treated like a failed check; only a host that
+/// keeps reporting 0 settles back to the idle 600 s.
+@Test func workCarrierTreatsARouteDropLikeAFailedCheck() {
+    let routed = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 1)
+    let none = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 0)
+    var state = RelayWorkCarrier.HostSchedule()
+    #expect(RelayWorkCarrier.nextCheck(after: routed, state: &state) == 30)
+    let delays = (0..<6).map { _ in RelayWorkCarrier.nextCheck(after: none, state: &state) }
+    #expect(delays == [30, 60, 120, 240, 600, 600])
+    // Routes coming back resume the 30 s schedule.
+    #expect(RelayWorkCarrier.nextCheck(after: routed, state: &state) == 30)
+    // The first answer after launch has no earlier report, so 0 routes is not
+    // yet known to be idle either.
+    var fresh = RelayWorkCarrier.HostSchedule()
+    #expect(RelayWorkCarrier.nextCheck(after: none, state: &fresh) == 30)
+}
+
+@MainActor
+private final class FakeWorkHosts {
+    let mac = ConnectionProfile(name: "mac", kind: .ssh, host: "mac-host")
+    let dandy = ConnectionProfile(name: "dandy", kind: .ssh, host: "dandy-07")
+    var now = Date(timeIntervalSince1970: 1_000_000)
+    let queuedAt: Date
+    var dandyChecks = 0
+    var failFirstChecks = 1
+    var dandyRoutes = 1
+    var queued = true
+    var carriedAt: Date?
+    var tooLate = false
+    var pendingChecks: [String: [Date]] = [:]
+
+    init() { queuedAt = now }
+
+    func request(_ profile: ConnectionProfile, _ packet: [String: Any]) async throws -> [String: Any] {
+        let host = profile.connectionKey
+        switch packet["operation"] as? String {
+        case "work_native_pending":
+            pendingChecks[host, default: []].append(now)
+            if host == mac.connectionKey { return ["node_id": "node-mac", "items": [], "native_routes": 1] }
+            dandyChecks += 1
+            if dandyChecks <= failFirstChecks { throw CancellationError() }
+            let items: [[String: Any]] = queued ? [["message_id": "d1", "peer_node_id": "node-mac"]] : []
+            return ["node_id": "node-dandy", "items": items, "native_routes": dandyRoutes]
+        case "work_native_claim":
+            #expect(host == dandy.connectionKey)
+            return ["work_envelope": "signed"]
+        case "deliver_signed_work":
+            #expect(host == mac.connectionKey)
+            // remoteNativeSignedWindow: the receiving relayd refuses after 9 min.
+            if now.timeIntervalSince(queuedAt) > 9 * 60 { tooLate = true; return ["work_reply": "too_late"] }
+            carriedAt = now
+            return ["work_reply": "delivered"]
+        case "work_native_settle":
+            queued = false
+            return [:]
+        default:
+            Issue.record("unexpected packet \(packet)")
+            return [:]
+        }
+    }
+}
+
+@MainActor
+private func runCarrier(_ hosts: FakeWorkHosts, _ loop: RelayWorkCarrierLoop, for seconds: TimeInterval, untilCarried: Bool) async {
+    let start = hosts.now
+    while hosts.now.timeIntervalSince(start) < seconds, !(untilCarried && hosts.carriedAt != nil) {
+        await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+        hosts.now = hosts.now.addingTimeInterval(5)
+    }
+}
+
+@MainActor
+@Test func workCarrierCarriesAQueuedMessageAfterAFailedFirstCheck() async {
+    let hosts = FakeWorkHosts()
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { [hosts] profile, packet in try await hosts.request(profile, packet) })
+    await runCarrier(hosts, loop, for: 900, untilCarried: true)
+    #expect(hosts.carriedAt.map { $0.timeIntervalSince(hosts.queuedAt) } == 30)
+    #expect(!hosts.tooLate)
+}
+
+@MainActor
+@Test func workCarrierRecoversWithinTheWindowAfterSeveralFailedChecks() async {
+    let hosts = FakeWorkHosts()
+    hosts.failFirstChecks = 3
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { [hosts] profile, packet in try await hosts.request(profile, packet) })
+    await runCarrier(hosts, loop, for: 900, untilCarried: true)
+    // Checks at 0, 30 and 90 s fail; the one at 210 s carries.
+    #expect(hosts.carriedAt.map { $0.timeIntervalSince(hosts.queuedAt) } == 210)
+    #expect(!hosts.tooLate)
+}
+
+@MainActor
+@Test func workCarrierKeepsTheIdleScheduleForAHostWithNoRoutes() async {
+    let hosts = FakeWorkHosts()
+    hosts.failFirstChecks = 0
+    hosts.queued = false
+    hosts.dandyRoutes = 0
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { [hosts] profile, packet in try await hosts.request(profile, packet) })
+    let start = hosts.now
+    await runCarrier(hosts, loop, for: 3600, untilCarried: false)
+    let offsets = (hosts.pendingChecks[hosts.dandy.connectionKey] ?? []).map { $0.timeIntervalSince(start) }
+    // Four settling checks after launch, then every 600 s.
+    #expect(offsets == [0, 30, 90, 210, 450, 1050, 1650, 2250, 2850, 3450])
+}
+
+@MainActor
+@Test func workCarrierChecksAHostAgainWhenItsPaneReconnects() async {
+    let hosts = FakeWorkHosts()
+    hosts.failFirstChecks = 0
+    hosts.queued = false
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { [hosts] profile, packet in try await hosts.request(profile, packet) })
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 1)
+    hosts.now = hosts.now.addingTimeInterval(5)
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 1)
+    // An attached or caught_up pane on dandy makes its host due now.
+    hosts.queued = true
+    RelayWorkCarrier.hostReady(hosts.dandy)
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 2)
+    #expect(hosts.carriedAt == hosts.now)
+    // Another host's reconnect does not.
+    RelayWorkCarrier.hostReady(ConnectionProfile(name: "other", kind: .ssh, host: "other-host"))
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 2)
 }
 
 @Test func workCarrierRequestsGoOnlyToTheWorkOwningRelayd() {

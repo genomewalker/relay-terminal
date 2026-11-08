@@ -1242,7 +1242,9 @@ final class TerminalRuntime: NSObject {
                         if status.outputReset { self.initialAuthoritativeRepaintPending = true }
                         self.pane?.beginTerminalRestore()
                         self.pane?.connected()
+                        if let profile = self.pane?.profile { RelayWorkCarrier.hostReady(profile) }
                     } else if status.state == "caught_up" {
+                        if let profile = self.pane?.profile { RelayWorkCarrier.hostReady(profile) }
                         self.terminalReplayCaughtUp = true
                         self.applyLegacyTerminalModeCompatibilityIfNeeded()
                         self.io.endReplayAfterViewportSettle()

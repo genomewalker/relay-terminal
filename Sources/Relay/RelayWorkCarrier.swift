@@ -74,28 +74,81 @@ enum RelayWorkCarrier {
 
     static let tick: Duration = .seconds(5)
 
+    /// Retry delays after a failed check or a drop to zero routes, each well
+    /// under the 9-minute signed window (remoteNativeSignedWindow).
+    static let failureBackoff: [TimeInterval] = [30, 60, 120, 240]
+
+    /// What the carrier last learned about one host. In memory only, so empty
+    /// after an app restart.
+    struct HostSchedule: Equatable {
+        /// Host-channel routes in the last answer; nil before any answer.
+        var routes: Int?
+        /// Consecutive failed checks or settling checks after a route drop.
+        var retries = 0
+    }
+
     /// When a host is checked next: 5 s while it has queued Work messages, 30 s
     /// while it has a host-channel route, and every 10 min when it has none,
     /// so the carrier costs nothing until a link is switched to this route.
-    /// A host that did not answer is retried after 30 s if it last reported a
-    /// host-channel route, and after 10 min otherwise (for example a host
-    /// without the Work helper).
-    static func nextCheck(after box: Outbox?, previous: Outbox? = nil) -> TimeInterval {
-        guard let box else { return (previous?.nativeRoutes ?? 0) > 0 ? 30 : 600 }
-        if !box.items.isEmpty { return 5 }
-        return box.nativeRoutes > 0 ? 30 : 600
+    /// A check that failed is retried after 30, 60, 120 and then every 240 s,
+    /// never 600 s: a message queued on that host must be carried inside its
+    /// signed window. An answer of zero routes after routes (or after a
+    /// failure, or as the first answer since launch) is treated the same way,
+    /// since a supervisor swap can briefly report none; only a host that keeps
+    /// reporting zero through the backoff settles to the idle 600 s.
+    static func nextCheck(after box: Outbox?, state: inout HostSchedule) -> TimeInterval {
+        guard let box else {
+            defer { state.retries += 1 }
+            return failureBackoff[min(state.retries, failureBackoff.count - 1)]
+        }
+        if !box.items.isEmpty || box.nativeRoutes > 0 {
+            state = HostSchedule(routes: box.nativeRoutes)
+            return box.items.isEmpty ? 30 : 5
+        }
+        let settled = state.routes == 0 && state.retries == 0
+        if !settled, state.retries < failureBackoff.count {
+            defer { state.retries += 1 }
+            state.routes = 0
+            return failureBackoff[state.retries]
+        }
+        state = HostSchedule(routes: 0)
+        return 600
+    }
+
+    /// Posted when a pane on a host attaches or catches up, so the carrier
+    /// checks that host now instead of at its scheduled time.
+    static let hostReadyNotification = Notification.Name("RelayWorkCarrier.hostReady")
+
+    @MainActor static func hostReady(_ profile: ConnectionProfile) {
+        guard profile.backend == .relay else { return }
+        NotificationCenter.default.post(name: hostReadyNotification, object: nil, userInfo: ["key": profile.connectionKey])
     }
 }
 
 @MainActor final class RelayWorkCarrierLoop {
+    typealias Request = @MainActor (ConnectionProfile, [String: Any]) async throws -> [String: Any]
+
     private weak var workspace: WorkspaceModel?
+    private let request: Request
     private var task: Task<Void, Never>?
     private var outboxes: [String: RelayWorkCarrier.Outbox] = [:]
     private var due: [String: Date] = [:]
-    private var known: [String: RelayWorkCarrier.Outbox] = [:]
+    private var schedules: [String: RelayWorkCarrier.HostSchedule] = [:]
+    nonisolated(unsafe) private var readyObserver: NSObjectProtocol?
 
-    init(workspace: WorkspaceModel?) {
+    init(workspace: WorkspaceModel?, request: Request? = nil) {
         self.workspace = workspace
+        self.request = request ?? { profile, packet in
+            try await RelayPaneMessaging.shared.daemonRequest(profile: profile, packet: packet, attach: false)
+        }
+        readyObserver = NotificationCenter.default.addObserver(forName: RelayWorkCarrier.hostReadyNotification, object: nil, queue: nil) { [weak self] note in
+            guard let key = note.userInfo?["key"] as? String else { return }
+            MainActor.assumeIsolated { self?.hostReady(key) }
+        }
+    }
+
+    deinit {
+        if let readyObserver { NotificationCenter.default.removeObserver(readyObserver) }
     }
 
     func start() {
@@ -109,35 +162,46 @@ enum RelayWorkCarrier {
         }
     }
 
+    /// A pane on this host attached or caught up: its relayd (or supervisor)
+    /// may have just come back, so check it on the next pass.
+    func hostReady(_ key: String) {
+        due[key] = nil
+    }
+
+    func tick(_ workspace: WorkspaceModel, now: Date = Date()) async {
+        await tick(profiles: workspace.panes.values.map(\.profile), now: now)
+    }
+
     /// One pass over the hosts that are due. Every failure leaves relayd's
     /// records as they were; the next claim yields a receipt query, never a
     /// resend.
-    func tick(_ workspace: WorkspaceModel, now: Date = Date()) async {
+    func tick(profiles all: [ConnectionProfile], now: Date = Date()) async {
         var seen: Set<String> = []
-        let profiles = workspace.panes.values.map(\.profile).filter { $0.backend == .relay && seen.insert($0.connectionKey).inserted }
+        let profiles = all.filter { $0.backend == .relay && seen.insert($0.connectionKey).inserted }
         let keys = Set(profiles.map(\.connectionKey))
         outboxes = outboxes.filter { keys.contains($0.key) }
         due = due.filter { keys.contains($0.key) }
-        known = known.filter { keys.contains($0.key) }
+        schedules = schedules.filter { keys.contains($0.key) }
         guard profiles.count > 1 else { return }
         var byKey: [String: ConnectionProfile] = [:]
         for profile in profiles {
             let key = profile.connectionKey
             byKey[key] = profile
             guard now >= due[key] ?? .distantPast else { continue }
-            let reply = try? await RelayPaneMessaging.shared.daemonRequest(profile: profile, packet: RelayWorkCarrier.pendingPacket, attach: false)
+            let reply = try? await request(profile, RelayWorkCarrier.pendingPacket)
             let box = RelayWorkCarrier.outbox(hostKey: key, reply: reply)
-            due[key] = now.addingTimeInterval(RelayWorkCarrier.nextCheck(after: box, previous: known[key]))
-            if let box { known[key] = box }
+            var schedule = schedules[key] ?? .init()
+            due[key] = now.addingTimeInterval(RelayWorkCarrier.nextCheck(after: box, state: &schedule))
+            schedules[key] = schedule
             outboxes[key] = box
         }
         for step in RelayWorkCarrier.plan(Array(outboxes.values)) {
             guard let from = byKey[step.fromHost], let to = byKey[step.toHost] else { continue }
-            guard let claim = try? await RelayPaneMessaging.shared.daemonRequest(profile: from, packet: RelayWorkCarrier.claimPacket(messageID: step.messageID), attach: false),
+            guard let claim = try? await request(from, RelayWorkCarrier.claimPacket(messageID: step.messageID)),
                   let envelope = claim["work_envelope"] as? String,
-                  let delivered = try? await RelayPaneMessaging.shared.daemonRequest(profile: to, packet: RelayWorkCarrier.deliverPacket(envelope: envelope), attach: false),
+                  let delivered = try? await request(to, RelayWorkCarrier.deliverPacket(envelope: envelope)),
                   let reply = delivered["work_reply"] as? String else { continue }
-            _ = try? await RelayPaneMessaging.shared.daemonRequest(profile: from, packet: RelayWorkCarrier.settlePacket(messageID: step.messageID, reply: reply), attach: false)
+            _ = try? await request(from, RelayWorkCarrier.settlePacket(messageID: step.messageID, reply: reply))
         }
         // A carried item is gone from the cached outbox until its host is
         // checked again; drop the cache so one envelope is not re-claimed
