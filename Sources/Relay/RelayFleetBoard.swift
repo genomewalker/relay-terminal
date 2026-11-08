@@ -73,6 +73,9 @@ extension RelayWorkOverviewIndex {
         /// Timestamped activity records only; nil when there is none.
         let changedAt: Date?
         let hiddenStackMember: Bool
+        /// An agent has been seen: a harness or detected provider, an agent
+        /// event, a pending approval or a program self-report.
+        var isAgent = true
         var id: UUID { paneID }
     }
 
@@ -132,10 +135,30 @@ extension RelayWorkOverviewIndex {
             : paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
                          programState: report, programReportCurrent: reportCurrent)
         let changedAt = [pane.agentActivities.last?.occurredAt, pane.lastCompletedAgentTurn].compactMap { $0 }.max()
+        let isAgent = pane.harnessIdentity != nil || pane.kind != .shell || !pane.agentActivities.isEmpty
+            || pane.pendingAgentApprovals > 0 || !pane.programStatus.records.isEmpty
         return PaneFact(paneID: pane.id, tabID: tabID, name: pane.displayName, workspaceName: workspaceName,
                         tabName: tabName, host: pane.profile.kind == .ssh ? pane.profile.host : "This Mac",
-                        status: status, detail: detail, changedAt: changedAt, hiddenStackMember: hidden)
+                        status: status, detail: detail, changedAt: changedAt, hiddenStackMember: hidden,
+                        isAgent: isAgent)
     }
+
+    /// The board's rows: agent panes, plus any pane waiting on the user (a
+    /// shell prompt such as "(y/n)" is waiting in Go to pane too, so it stays
+    /// listed and counted). Other plain shells are only counted as not shown.
+    struct Fleet: Equatable, Sendable {
+        let rows: [PaneFact]
+        let shellsNotShown: Int
+        var counts: PaneCounts { PaneCounts(rows) }
+        var hostCount: Int { Set(rows.map(\.host)).count }
+
+        init(_ facts: [PaneFact]) {
+            rows = facts.filter { $0.isAgent || $0.status == .waiting }
+            shellsNotShown = facts.count - rows.count
+        }
+    }
+
+    @MainActor static func fleet(_ workspace: WorkspaceModel) -> Fleet { Fleet(paneFacts(workspace)) }
 
     /// Board order: status, then most recent change, then name.
     static func boardOrder(_ facts: [PaneFact]) -> [PaneFact] {
@@ -198,6 +221,7 @@ enum RelayFleetFilter: String, CaseIterable, Identifiable, Sendable {
 struct RelayFleetBoardHeader: View {
     let counts: RelayWorkOverviewIndex.PaneCounts
     let hostCount: Int
+    var shellsNotShown = 0
     @Binding var filter: RelayFleetFilter
     var onClose: (() -> Void)?
 
@@ -205,7 +229,7 @@ struct RelayFleetBoardHeader: View {
         VStack(alignment: .leading, spacing: RelayTheme.Space.md) {
             HStack(alignment: .firstTextBaseline, spacing: RelayTheme.Space.md) {
                 Text(RelayCommand.fleetBoard.label).relayText(.title).foregroundStyle(RelayTheme.text)
-                Text("\(counts.total) \(counts.total == 1 ? "pane" : "panes") on \(hostCount) \(hostCount == 1 ? "host" : "hosts")")
+                Text(Self.subtitle(total: counts.total, hosts: hostCount, shellsNotShown: shellsNotShown))
                     .relayText(.caption).foregroundStyle(RelayTheme.textMuted)
                 Spacer(minLength: 0)
                 if let onClose {
@@ -219,6 +243,12 @@ struct RelayFleetBoardHeader: View {
                 }
             }
         }
+    }
+
+    static func subtitle(total: Int, hosts: Int, shellsNotShown: Int) -> String {
+        var text = "\(total) \(total == 1 ? "agent" : "agents") on \(hosts) \(hosts == 1 ? "host" : "hosts")"
+        if shellsNotShown > 0 { text += " · \(shellsNotShown) \(shellsNotShown == 1 ? "shell" : "shells") not shown" }
+        return text
     }
 
     private func count(_ option: RelayFleetFilter) -> Int {
@@ -258,15 +288,16 @@ struct RelayFleetBoardHeader: View {
 struct RelayFleetBoardList: View {
     let facts: [RelayWorkOverviewIndex.PaneFact]
     let filter: RelayFleetFilter
-    let now: Date
+    /// A fixed clock for snapshots; nil follows the wall clock.
+    var now: Date? = nil
     let onOpen: (RelayWorkOverviewIndex.PaneFact) -> Void
 
     var body: some View {
         let shown = RelayWorkOverviewIndex.boardOrder(facts.filter(filter.includes))
         if shown.isEmpty {
-            RelayEmptyState(facts.isEmpty ? "No panes" : "Nothing \(filter.title.lowercased())",
+            RelayEmptyState(facts.isEmpty ? "No agents" : "Nothing \(filter.title.lowercased())",
                             symbol: filter == .waiting ? "checkmark.circle" : "rectangle.grid.1x2",
-                            detail: facts.isEmpty ? "Open a tab to see it here." : "No pane has this status right now.")
+                            detail: facts.isEmpty ? "Panes appear here once an agent runs in them." : "No agent has this status right now.")
         } else {
             VStack(alignment: .leading, spacing: RelayTheme.Space.lg) {
                 ForEach(RelayWorkOverviewIndex.PaneStatus.allCases, id: \.self) { status in
@@ -293,7 +324,7 @@ struct RelayFleetBoardList: View {
 /// One pane. The whole row opens the pane; nothing else happens here.
 struct RelayFleetBoardRow: View {
     let fact: RelayWorkOverviewIndex.PaneFact
-    let now: Date
+    var now: Date? = nil
     let open: () -> Void
     @State private var hovering = false
 
@@ -316,10 +347,15 @@ struct RelayFleetBoardRow: View {
                     .frame(width: 170, alignment: .leading)
                 RelayBadge(fact.host, role: .neutral, showsSymbol: false)
                     .frame(width: 96, alignment: .leading)
-                Text(RelayWorkOverviewIndex.changeLabel(fact.changedAt, now: now))
-                    .relayText(.caption).monospacedDigit().foregroundStyle(RelayTheme.textMuted)
-                    .lineLimit(1)
-                    .frame(width: 76, alignment: .trailing)
+                Group {
+                    if let now {
+                        changeText(now)
+                    } else {
+                        // Only the label follows the clock; no model timer.
+                        TimelineView(.periodic(from: .now, by: 60)) { context in changeText(context.date) }
+                    }
+                }
+                .frame(width: 76, alignment: .trailing)
                 Image(systemName: "arrow.right")
                     .font(RelayTheme.TextRole.caption.font)
                     .foregroundStyle(hovering ? RelayTheme.text : RelayTheme.textFaint)
@@ -335,10 +371,16 @@ struct RelayFleetBoardRow: View {
         .onHover { hovering = $0 }
         .help("Go to \(fact.name)")
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(fact.name). \(fact.status.role.spoken(fact.status.label)). \(fact.detail). \(fact.host), \(fact.workspaceName), \(fact.tabName). \(RelayWorkOverviewIndex.changeLabel(fact.changedAt, now: now))")
+        .accessibilityLabel("\(fact.name). \(fact.status.role.spoken(fact.status.label)). \(fact.detail). \(fact.host), \(fact.workspaceName), \(fact.tabName). \(RelayWorkOverviewIndex.changeLabel(fact.changedAt, now: now ?? Date()))")
         .accessibilityHint("Opens the pane")
         .accessibilityAddTraits(.isButton)
         .accessibilityIdentifier("relay.fleet.row.\(fact.paneID)")
+    }
+
+    private func changeText(_ date: Date) -> some View {
+        Text(RelayWorkOverviewIndex.changeLabel(fact.changedAt, now: date))
+            .relayText(.caption).monospacedDigit().foregroundStyle(RelayTheme.textMuted)
+            .lineLimit(1)
     }
 }
 
@@ -410,14 +452,15 @@ struct RelayFleetBoard: View {
 
     var body: some View {
         let _ = activityIndex.revision
-        let facts = RelayWorkOverviewIndex.paneFacts(workspace)
+        let fleet = RelayWorkOverviewIndex.fleet(workspace)
         VStack(alignment: .leading, spacing: 0) {
-            RelayFleetBoardHeader(counts: .init(facts), hostCount: Set(facts.map(\.host)).count,
+            RelayFleetBoardHeader(counts: fleet.counts, hostCount: fleet.hostCount,
+                                  shellsNotShown: fleet.shellsNotShown,
                                   filter: $filter) { workspace.isFleetBoardPresented = false }
                 .padding(RelayTheme.Space.xl)
             Divider()
             ScrollView {
-                RelayFleetBoardList(facts: facts, filter: filter, now: Date()) { fact in
+                RelayFleetBoardList(facts: fleet.rows, filter: filter) { fact in
                     Self.open(fact, in: workspace)
                 }
                 .padding(RelayTheme.Space.xl)

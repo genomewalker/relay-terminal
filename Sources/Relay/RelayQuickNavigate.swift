@@ -103,7 +103,7 @@ struct RelayQuickNavigate: View {
         case .fleetBoard:
             workspace.quickNavigateDidChooseAction { [weak workspace] in
                 guard let workspace else { return }
-                workspace.presentFleetBoard(filter: .initial(for: .init(Index.paneFacts(workspace))))
+                workspace.presentFleetBoard(filter: .initial(for: Index.fleet(workspace).counts))
             }
             return
         case .askMiko:

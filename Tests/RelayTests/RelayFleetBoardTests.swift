@@ -132,6 +132,13 @@ struct RelayFleetBoardTests {
         #expect(byID[lost.id]?.detail == lost.connectionStatusLabel)
         #expect(byID[idle.id]?.status == .idle)
         #expect(byID[waiting.id]?.host == "fleet-waiting.invalid")
+        // A plain shell with no agent signal is not a row, only counted as not shown.
+        #expect(byID[idle.id]?.isAgent == false && byID[lost.id]?.isAgent == false)
+        #expect(byID[waiting.id]?.isAgent == true && byID[running.id]?.isAgent == true)
+        let fleet = Index.fleet(workspace)
+        #expect(Set(fleet.rows.map(\.paneID)) == [waiting.id, running.id])
+        #expect(fleet.shellsNotShown == facts.filter { !$0.isAgent && $0.status != .waiting }.count)
+        #expect(fleet.shellsNotShown >= 2)
 
         let goToPane = RelayQuickNavigate.entries(for: workspace, query: "")
         let attention = Set(goToPane.compactMap { entry -> UUID? in
@@ -141,9 +148,29 @@ struct RelayFleetBoardTests {
         let boardWaiting = Set(facts.filter { RelayFleetFilter.waiting.includes($0) }.map(\.paneID))
         #expect(attention == [waiting.id])
         #expect(boardWaiting == attention)
-        #expect(Index.PaneCounts(facts).waiting == attention.count)
+        #expect(fleet.counts.waiting == attention.count)
+        #expect(fleet.counts.running == 1)
         // Go to pane lists the board as an action.
         #expect(goToPane.contains { $0.destination == .fleetBoard && $0.group == .actions })
+    }
+
+    @Test("Plain shells are not rows; a shell waiting on the user still is")
+    func agentsOnly() {
+        func shell(_ name: String, _ status: Index.PaneStatus) -> Index.PaneFact {
+            Index.PaneFact(paneID: UUID(), tabID: UUID(), name: name, workspaceName: "Relay", tabName: "sh",
+                           host: "This Mac", status: status, detail: status.label, changedAt: nil,
+                           hiddenStackMember: false, isAgent: false)
+        }
+        let agents = fixture
+        let fleet = Index.Fleet(agents + [shell("zsh", .idle), shell("zsh 2", .running),
+                                          shell("ssh", .disconnected), shell("confirm-prompt", .waiting)])
+        #expect(fleet.rows.count == agents.count + 1)
+        #expect(!fleet.rows.contains { $0.name == "zsh" || $0.name == "zsh 2" || $0.name == "ssh" })
+        #expect(fleet.rows.contains { $0.name == "confirm-prompt" })
+        #expect(fleet.shellsNotShown == 3)
+        #expect(fleet.counts == Index.PaneCounts(fleet.rows))
+        #expect(RelayFleetBoardHeader.subtitle(total: 8, hosts: 2, shellsNotShown: 40) == "8 agents on 2 hosts · 40 shells not shown")
+        #expect(RelayFleetBoardHeader.subtitle(total: 1, hosts: 1, shellsNotShown: 0) == "1 agent on 1 host")
     }
 
     @Test("Opening a pane from the board records a user visit and closes the board")
@@ -203,7 +230,7 @@ struct RelayFleetBoardTests {
         let counts = Index.PaneCounts(facts)
         let board = VStack(alignment: .leading, spacing: 0) {
             RelayFleetBoardHeader(counts: counts, hostCount: Set(facts.map(\.host)).count,
-                                  filter: .constant(.all), onClose: {})
+                                  shellsNotShown: 40, filter: .constant(.all), onClose: {})
                 .padding(RelayTheme.Space.xl)
             Divider()
             RelayFleetBoardList(facts: facts, filter: .all, now: now, onOpen: { _ in })

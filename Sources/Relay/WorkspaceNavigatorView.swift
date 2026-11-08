@@ -96,7 +96,7 @@ import UniformTypeIdentifiers
             }
             .padding(.horizontal, 10)
             // Same metadata and predicate as the fleet board and Go to pane.
-            let fleet = RelayWorkOverviewIndex.PaneCounts(RelayWorkOverviewIndex.paneFacts(workspace))
+            let fleet = RelayWorkOverviewIndex.fleet(workspace).counts
             RelayFleetCountsButton(counts: fleet) {
                 workspace.presentFleetBoard(filter: .initial(for: fleet))
             }
