@@ -36,7 +36,7 @@ func TestMessagePaneSchemaMakesSourceOptionalAndSaysWhen(t *testing.T) {
 		}
 		schema := definition["inputSchema"].(map[string]any)
 		required, _ := json.Marshal(schema["required"])
-		if string(required) != `["pane_id","message_id","text"]` {
+		if string(required) != `["pane_id","text"]` {
 			t.Fatal("source_pane_id is still required:", string(required))
 		}
 		if _, ok := schema["properties"].(map[string]any)["source_pane_id"]; !ok {
