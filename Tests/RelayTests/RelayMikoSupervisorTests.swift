@@ -821,6 +821,32 @@ struct RelayMikoSupervisorTurnStatusTests {
         #expect(RelayMikoSupervisorChannel.exchangeObject(exchange)["awaiting_confirmation"] as? Bool == false)
     }
 
+    @Test("A typed, unconfirmed command is typed_unconfirmed to supervisors and completed plus typed_unconfirmed in receipts and the Control Center")
+    func typedUnconfirmedStatusSurfaces() throws {
+        let f = try Fixture()
+        defer { f.workspace.shutdown() }
+        var exchange = RelayAssistantExchange(request: "run the tests", origin: .agent(paneID: f.pane.id, label: "x"))
+        exchange.reply = RelayAssistantHarness.typedUnconfirmedReply
+        exchange.typedUnconfirmed = true
+        #expect(RelayMikoSupervisorChannel.turnStatus(exchange) == "typed_unconfirmed")
+        let object = RelayMikoSupervisorChannel.exchangeObject(exchange)
+        #expect(object["typed_unconfirmed"] as? Bool == true && object["awaiting_confirmation"] as? Bool == false
+            && object["failed"] as? Bool == false)
+        let receipt = f.channel.receiptObject("req-1", RelayMikoSupervisorChannel.AgentAsk(paneID: f.pane.id, digest: "d",
+            exchangeID: exchange.requestID, finished: true, final: exchange), workspace: nil)
+        #expect(receipt["state"] as? String == "completed" && receipt["typed_unconfirmed"] as? Bool == true
+            && receipt["awaiting_confirmation"] == nil)
+        var input = RelayControlCenterState.Inputs(ownership: .empty, tabs: [])
+        input.exchanges = [exchange]
+        let row = try #require(RelayControlCenterState.exchanges(input, pane: f.pane.id).first)
+        #expect(row.status == "completed" && row.typedUnconfirmed && !row.awaitingConfirmation)
+        exchange.typedUnconfirmed = false
+        #expect(RelayMikoSupervisorChannel.turnStatus(exchange) == "completed")
+        let plain = f.channel.receiptObject("req-2", RelayMikoSupervisorChannel.AgentAsk(paneID: f.pane.id, digest: "d",
+            exchangeID: exchange.requestID, finished: true, final: exchange), workspace: nil)
+        #expect(plain["typed_unconfirmed"] == nil)
+    }
+
     @Test("An agent-ask receipt and the Control Center keep completed for an unconfirmed handoff and flag it awaiting confirmation")
     func receiptAndControlCenterFlagUnconfirmedHandoff() throws {
         let f = try Fixture()

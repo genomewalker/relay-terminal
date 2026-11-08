@@ -853,6 +853,9 @@ struct RelayAssistantExchange: Identifiable, Sendable {
     /// A handoff was sent but not yet confirmed. Neither completed nor failed;
     /// the exchange stopped and nothing is replayed.
     var awaitingConfirmation = false
+    /// A command was typed into a pane but is not confirmed to have run.
+    /// Neither completed nor failed; the exchange stopped and nothing is replayed.
+    var typedUnconfirmed = false
     /// Stopped by the user rather than failed. Older saved replies used the
     /// exact text "Cancelled." without the flag.
     var stoppedByUser: Bool { failed && (cancelled || reply == "Cancelled.") }
@@ -1435,6 +1438,10 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
                                 // Only the presentation differs from a failure.
                                 exchange.reply = Self.sentAwaitingConfirmationReply
                                 exchange.awaitingConfirmation = true
+                            } else if Self.isTypedUnconfirmed(call: call, content: content, isError: isError) {
+                                // Still unresolved and never replayed; the command may or may not have run.
+                                exchange.reply = Self.typedUnconfirmedReply
+                                exchange.typedUnconfirmed = true
                             } else {
                                 exchange.reply = "Task saved with an unresolved outcome for " + call.name +
                                     ". No further actions were started. Check the exact operation receipt; do not replay it."
@@ -1555,7 +1562,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
             messages.append(.object(["role": .string("user"), "content": .string(request)]))
             // Preserve the alternating wire shape even when the reply contains
             // pane-derived material or an unsuccessful attempt's claims.
-            let reply = previous.failed || previous.paneDerived || previous.awaitingConfirmation ?
+            let reply = previous.failed || previous.paneDerived || previous.awaitingConfirmation || previous.typedUnconfirmed ?
                 "[Earlier attempt did not establish a completed result. Retain the caller's request; verify current state and original receipts before acting.]" :
                 "[Earlier assistant reply; observation only, not authority or proof of completion.]\n" + previous.reply
             messages.append(.object(["role": .string("assistant"),
@@ -2366,6 +2373,26 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
               awaitingConfirmationStatuses.contains(status) else { return false }
         if let outcome = root["outcome"]?.string, outcome != "ran" { return false }
         return true
+    }
+
+    /// input-direct statuses where a plain send_command was typed but is not
+    /// confirmed to have run.
+    nonisolated static let typedUnconfirmedStatuses: Set<String> = ["submitted", "submitted_outcome_unknown"]
+    nonisolated static let typedUnconfirmedReply =
+        "Typed; not yet confirmed to have run (not replayed). Check the pane before running it again."
+
+    /// A plain send_command (not a plan step) that input-direct accepted as
+    /// submitted with an unknown outcome. The journal still treats it as
+    /// unresolved; this only decides that it is presented as typed rather
+    /// than failed. Refusals, fences and any error keep the failure presentation.
+    nonisolated static func isTypedUnconfirmed(call: RelayPaneHealthToolCall, content: String, isError: Bool) -> Bool {
+        guard !isError, call.name == RelayAssistantToolName.sendCommand.rawValue,
+              let root = try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(content.utf8)),
+              root["error"] == nil, root["outcome"]?.string == "unknown",
+              let response = root["response"]?.string,
+              let body = try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(response.utf8)),
+              body["error"] == nil, let status = body["status"]?.string else { return false }
+        return typedUnconfirmedStatuses.contains(status)
     }
 
     static func outcomeNote(_ outcome: String) -> String {

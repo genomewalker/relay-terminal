@@ -28,6 +28,8 @@ struct RelayControlCenterState: Equatable {
         let status: String
         /// A completed exchange whose handoff was sent but not yet confirmed.
         var awaitingConfirmation = false
+        /// A completed exchange whose typed command is not confirmed to have run.
+        var typedUnconfirmed = false
     }
 
     struct ShepherdNote: Equatable {
@@ -380,7 +382,8 @@ struct RelayControlCenterState: Equatable {
             }
             let state = status(exchange, isLast: exchange.id == lastID, cardPending: input.cardPending, busy: input.busy)
             return MikoExchange(exchangeID: exchange.requestID, requestID: requestID, origin: origin, status: state,
-                awaitingConfirmation: state == "completed" && exchange.awaitingConfirmation)
+                awaitingConfirmation: state == "completed" && exchange.awaitingConfirmation,
+                typedUnconfirmed: state == "completed" && exchange.typedUnconfirmed)
         }.suffix(rememberedPerPane).map { $0 }
     }
 
@@ -782,7 +785,7 @@ struct RelayControlCenterView: View {
                     if let card = pane.card { RelayControlCardView(card: card, actions: actions) }
                     RelayControlPaneActions(pane: pane, actions: actions)
                     ForEach(pane.miko, id: \.exchangeID) { exchange in
-                        Text("      Miko \(exchange.origin): \(exchange.status)\(exchange.awaitingConfirmation ? " (awaiting confirmation)" : "") · request_id \(exchange.requestID ?? "–") · exchange \(exchange.exchangeID)")
+                        Text("      Miko \(exchange.origin): \(exchange.status)\(exchange.awaitingConfirmation ? " (awaiting confirmation)" : "")\(exchange.typedUnconfirmed ? " (typed, not confirmed)" : "") · request_id \(exchange.requestID ?? "–") · exchange \(exchange.exchangeID)")
                             .foregroundStyle(RelayTheme.textMuted)
                     }
                     ForEach(Array(pane.shepherd.enumerated()), id: \.offset) { _, note in
