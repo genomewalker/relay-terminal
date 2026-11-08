@@ -481,12 +481,14 @@ extension WorkspaceModel {
         }
     }
 
-    func selectWorkspacePane(_ paneID: UUID) throws -> (UUID, UUID) {
+    /// Agents and tools select programmatically; only a user's own choice
+    /// (such as clicking an attention notification) passes `.user`.
+    func selectWorkspacePane(_ paneID: UUID, origin: PaneSelectionOrigin = .programmatic) throws -> (UUID, UUID) {
         // Floating R panels belong to a tab without being in its layout.
         guard let pane = panes[paneID], let tabID = tabID(containingPane: paneID) else {
             throw PluginError.invalid("Pane no longer exists")
         }
-        revealPane(paneID, origin: .programmatic)
+        revealPane(paneID, origin: origin)
         guard selectedTabID == tabID, activePaneID == pane.id else {
             throw PluginError.invalid("Pane selection failed")
         }
