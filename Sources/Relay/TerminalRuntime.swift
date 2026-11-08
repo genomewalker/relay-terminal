@@ -2938,7 +2938,7 @@ final class TerminalRuntime: NSObject {
         guard let pane, pane.profile.backend == .relay, pane.connectionState == .connected else { return false }
         let provider = pane.kind == .codex ? "codex" : "claude"
         switch observation {
-        case .screen(let screen, _): return RelayAgentMaintenancePrompt.hasTypedText(screen, provider: provider)
+        case .screen(let screen, _): return promptParseMemo.hasTypedText(screen, provider: provider)
         case .unstable: return false
         case .noSurface: return currentPreparedPrompt(observation)?.agentTyped ?? false
         }
@@ -2988,7 +2988,7 @@ final class TerminalRuntime: NSObject {
         }
         if observation == .unstable { return "the screen is changing, so its prompt cannot be read yet" }
         if let screen = observation.screen {
-            if RelayAgentMaintenancePrompt.isEmpty(screen, provider: provider, explainedAgents: explainedAgents) { return nil }
+            if promptParseMemo.isEmpty(screen, provider: provider, explainedAgents: explainedAgents) { return nil }
             if let work = RelayAgentMaintenancePrompt.backgroundWork(screen, provider: provider, explainedAgents: explainedAgents) {
                 if RelayAgentMaintenancePrompt.backgroundWork(screen, provider: provider, explainedAgents: .max) == nil {
                     return "the footer shows \(RelayAgentMaintenancePrompt.footerAgentCount(screen, provider: provider)) agent(s) but " +
@@ -3024,8 +3024,8 @@ final class TerminalRuntime: NSObject {
         }
         switch observation {
         case .screen(let screen, _):
-            return RelayAgentMaintenancePrompt.isEmpty(screen, provider: pane.kind == .codex ? "codex" : "claude",
-                                                       explainedAgents: explainedAgents)
+            return promptParseMemo.isEmpty(screen, provider: pane.kind == .codex ? "codex" : "claude",
+                                           explainedAgents: explainedAgents)
         case .unstable: return false
         case .noSurface: return currentPreparedPrompt(observation)?.empty(explainedAgents: explainedAgents) ?? false
         }
@@ -3047,6 +3047,7 @@ final class TerminalRuntime: NSObject {
         var claudeOverlay = false
     }
     private var preparedMaintenancePrompt: PreparedMaintenancePrompt?
+    private var promptParseMemo = RelayPromptParseMemo()
 
     /// Uses the provider's editor bridge to read exact bytes, including hard
     /// newlines and expanded pastes. No draft is inferred from a screen and no

@@ -351,3 +351,37 @@ enum RelayAgentMaintenancePrompt {
         return rows
     }
 }
+
+/// Prompt parses of one serialized screen, kept until the screen text changes.
+/// The parses are pure functions of (screen, provider, explained agents), so a
+/// cached answer for byte-identical text is the answer a fresh parse would give.
+/// The 5 s capacity, budget and health ticks re-parsed every pane's unchanged
+/// screen; on a hit this costs a string comparison (identity fast path when the
+/// active-screen cache returns the same string).
+struct RelayPromptParseMemo {
+    private var screen: String?
+    private var results: [String: Bool] = [:]
+    private(set) var parses = 0
+
+    mutating func isEmpty(_ screen: String, provider: String, explainedAgents: Int = 0) -> Bool {
+        value(screen, query: "empty:\(provider):\(explainedAgents)") {
+            RelayAgentMaintenancePrompt.isEmpty(screen, provider: provider, explainedAgents: explainedAgents)
+        }
+    }
+
+    mutating func hasTypedText(_ screen: String, provider: String) -> Bool {
+        value(screen, query: "typed:\(provider)") { RelayAgentMaintenancePrompt.hasTypedText(screen, provider: provider) }
+    }
+
+    private mutating func value(_ screen: String, query: String, _ parse: () -> Bool) -> Bool {
+        if self.screen != screen || results.count >= 32 {
+            self.screen = screen
+            results.removeAll(keepingCapacity: true)
+        }
+        if let cached = results[query] { return cached }
+        parses += 1
+        let result = parse()
+        results[query] = result
+        return result
+    }
+}

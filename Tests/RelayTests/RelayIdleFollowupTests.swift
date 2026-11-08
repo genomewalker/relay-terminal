@@ -93,3 +93,38 @@ func paneHealthUnchangedJournalSkipsWrite() throws {
     coordinator.accountConfigurationChanged(profile: pane.profile)
     #expect(try Data(contentsOf: url) == bytes)
 }
+
+@Test("Prompt parse memo parses once per unchanged screen and re-parses a changed one")
+func promptParseMemoMatchesFreshParse() {
+    let codexFooter = "\n\nGPT-Rosalind Research xhigh · Context 33% left · /exact/cwd\n? for shortcuts\n"
+    let claudeFooter = "\n────────────────\nterm:main | [Opus 5.5] | idle\n$118.19\n◈ v5.73.1\n+ Bash ×8\n⏵⏵ bypass permissions on\n"
+    let screens: [(String, String)] = [
+        ("› \u{1b}[90mAsk Codex to do anything\u{1b}[39m" + codexFooter, "codex"),
+        ("› Ask Codex to do anything" + codexFooter, "codex"),
+        ("❯ " + claudeFooter, "claude"),
+        ("❯ unsent draft" + claudeFooter, "claude"),
+        ("❯ " + claudeFooter.replacingOccurrences(of: "idle", with: "idle · 2 agents"), "claude"),
+    ]
+    var memo = RelayPromptParseMemo()
+    for (screen, provider) in screens {
+        let before = memo.parses
+        for agents in [0, 0, 2, 2] {
+            #expect(memo.isEmpty(screen, provider: provider, explainedAgents: agents) ==
+                RelayAgentMaintenancePrompt.isEmpty(screen, provider: provider, explainedAgents: agents))
+        }
+        #expect(memo.hasTypedText(screen, provider: provider) == RelayAgentMaintenancePrompt.hasTypedText(screen, provider: provider))
+        #expect(memo.hasTypedText(screen, provider: provider) == RelayAgentMaintenancePrompt.hasTypedText(screen, provider: provider))
+        // Unchanged screen: one parse per distinct question, not per call.
+        #expect(memo.parses == before + 3)
+    }
+    // Returning to an earlier screen is a change and is parsed afresh.
+    let (first, provider) = screens[0]
+    let before = memo.parses
+    #expect(memo.isEmpty(first, provider: provider) == RelayAgentMaintenancePrompt.isEmpty(first, provider: provider))
+    #expect(memo.parses == before + 1)
+    // A one-character change to the screen is never served from the cache.
+    let edited = first.replacingOccurrences(of: "anything", with: "anythinG")
+    #expect(memo.isEmpty(edited, provider: provider) == RelayAgentMaintenancePrompt.isEmpty(edited, provider: provider))
+    #expect(memo.parses == before + 2)
+    #expect(RelayAgentMaintenancePrompt.isEmpty(first, provider: provider) != RelayAgentMaintenancePrompt.isEmpty("› Ask Codex to do anything" + codexFooter, provider: provider))
+}
