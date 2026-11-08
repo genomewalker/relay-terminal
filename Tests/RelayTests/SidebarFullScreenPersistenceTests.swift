@@ -23,8 +23,14 @@ struct SidebarFullScreenPersistenceTests {
             workspace.setFullScreen(true)
             #expect(!workspace.sidebarVisible && workspace.sidebarAutoHidden)
             #expect(workspace.savedSidebarVisible)
+            let before = workspace.workspaceSaveCount
             workspace.persistWorkspace()
-            try await Task.sleep(for: .milliseconds(600))
+            // Wait for the debounced save itself, not a fixed delay.
+            let deadline = ContinuousClock.now + .seconds(10)
+            while workspace.workspaceSaveCount == before, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(workspace.workspaceSaveCount > before)
             let saved = try #require(try workspace.sharedWorkspaceStore.restore(legacy: nil))
             #expect(saved.sidebarVisible == true)
             workspace.setFullScreen(false)
