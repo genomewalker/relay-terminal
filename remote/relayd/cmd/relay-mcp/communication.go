@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -68,7 +70,8 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	// Only this process mints source proofs; a client never supplies one.
 	for _, minted := range []string{"source_attestation", "source_signature", "source_proof_error"} {
 		if _, supplied := arguments[minted]; supplied {
-			return map[string]any{"content": []map[string]any{{"type": "text", "text": "Unexpected daemon communication argument"}}, "isError": true}, true
+			return map[string]any{"content": []map[string]any{{"type": "text", "text": "Unexpected daemon communication argument " +
+				communicationArgumentName(minted) + ": source proofs are minted by Relay, never supplied by a client. Nothing was sent."}}, "isError": true}, true
 		}
 	}
 	// With a desktop transport configured, the node daemon serves only pairs
@@ -176,10 +179,10 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 			return nil, false
 		}
 	}
+	if unknown := unknownCommunicationArguments(arguments, allowed); len(unknown) > 0 {
+		return result(unknownCommunicationArgumentText(name, unknown, allowed), true), true
+	}
 	for key, raw := range arguments {
-		if !allowed[key] {
-			return result("Unexpected daemon communication argument", true), true
-		}
 		var value string
 		if json.Unmarshal(raw, &value) != nil {
 			return result("Communication arguments must be strings", true), true
@@ -388,4 +391,51 @@ func linkPanesError(message string, arguments map[string]json.RawMessage, daemon
 		return message
 	}
 	return message + desktopLinkShadowHint
+}
+
+// unknownCommunicationArguments lists the argument names outside allowed, sorted
+// so the refusal is the same on every call.
+func unknownCommunicationArguments(arguments map[string]json.RawMessage, allowed map[string]bool) []string {
+	var unknown []string
+	for key := range arguments {
+		if !allowed[key] {
+			unknown = append(unknown, key)
+		}
+	}
+	sort.Strings(unknown)
+	return unknown
+}
+
+// unknownCommunicationArgumentText names the first unknown argument and the
+// accepted ones, so a caller can correct the call instead of guessing that the
+// route is broken. Nothing is sent.
+func unknownCommunicationArgumentText(tool string, unknown []string, allowed map[string]bool) string {
+	accepted := make([]string, 0, len(allowed))
+	for key := range allowed {
+		accepted = append(accepted, key)
+	}
+	sort.Strings(accepted)
+	text := "Unexpected daemon communication argument " + communicationArgumentName(unknown[0])
+	if len(unknown) > 1 {
+		text += fmt.Sprintf(" (and %d more)", len(unknown)-1)
+	}
+	text += ". Accepted: " + strings.Join(accepted, ", ") + "."
+	if tool == "relay_message_pane" {
+		text += " The message body goes in text; each send needs a new message_id."
+	}
+	return text + " Nothing was sent."
+}
+
+// communicationArgumentName quotes a client-chosen argument name only when it is
+// a short plain identifier; anything else is not echoed.
+func communicationArgumentName(name string) string {
+	if len(name) == 0 || len(name) > 64 {
+		return "(name not shown)"
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			return "(name not shown)"
+		}
+	}
+	return strconv.Quote(name)
 }
