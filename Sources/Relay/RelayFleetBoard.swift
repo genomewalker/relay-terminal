@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - Shared classification
@@ -148,6 +149,26 @@ extension RelayWorkOverviewIndex {
                         tabName: tabName, host: pane.profile.kind == .ssh ? pane.profile.host : "This Mac",
                         status: status, detail: detail, changedAt: changedAt, hiddenStackMember: hidden,
                         isAgent: isAgent)
+    }
+
+    /// The mark a tab, workspace or session row shows: the most urgent status
+    /// among the board's rows (agent panes, plus a waiting shell), nil when
+    /// they are all idle or there is none. Running is dropped for the focused
+    /// tab, where the user already sees the work; waiting and disconnected stay.
+    static func groupStatus(_ facts: [PaneFact], focused: Bool = false) -> PaneStatus? {
+        Fleet(facts).rows.lazy.map(\.status).filter { $0 != .idle && !(focused && $0 == .running) }.min()
+    }
+
+    /// Each tab's mark, from one pass over the pane facts.
+    static func tabStatuses(_ facts: [PaneFact], focusedTabID: UUID?) -> [UUID: PaneStatus] {
+        Dictionary(grouping: facts, by: \.tabID).compactMapValues { group in
+            groupStatus(group, focused: group.first?.tabID == focusedTabID)
+        }
+    }
+
+    /// A row holding several tabs shows the most urgent of their marks.
+    static func mostUrgent(_ tabIDs: some Sequence<UUID>, in marks: [UUID: PaneStatus]) -> PaneStatus? {
+        tabIDs.compactMap { marks[$0] }.min()
     }
 
     /// The board's rows: agent panes, plus any pane waiting on the user (a
@@ -479,4 +500,93 @@ struct RelayFleetBoard: View {
         .onExitCommand { workspace.isFleetBoardPresented = false }
         .accessibilityIdentifier("relay.fleet.board")
     }
+}
+
+// MARK: - Status mark
+
+/// A tab, workspace or session row's status at a glance, from
+/// `RelayWorkOverviewIndex.groupStatus`: a turning arc while an agent runs
+/// (still under reduce motion), the warning symbol when something waits on
+/// the user, the danger symbol when disconnected, nothing when idle. Each
+/// shape differs, so colour is never the only signal.
+struct RelayStatusMark: View {
+    typealias Status = RelayWorkOverviewIndex.PaneStatus
+    enum Kind: Equatable { case none, spinner, staticRunning, symbol(String) }
+
+    let status: Status?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var windowVisible = true
+
+    static let size: CGFloat = 12
+
+    static func kind(_ status: Status?, reduceMotion: Bool) -> Kind {
+        switch status {
+        case nil, .idle?: .none
+        case .running?: reduceMotion ? .staticRunning : .spinner
+        case let status?: .symbol(status.role.symbol)
+        }
+    }
+
+    static func spoken(_ status: Status) -> String { status.role.spoken(status.label) }
+
+    var body: some View {
+        if let status, status != .idle {
+            Group {
+                switch Self.kind(status, reduceMotion: reduceMotion) {
+                case .none: EmptyView()
+                case .staticRunning: RelayRunningArc(angle: .degrees(0))
+                case .spinner:
+                    // Paused while the window is fully covered or minimised.
+                    TimelineView(.animation(paused: !windowVisible)) { context in
+                        let turn = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1)
+                        RelayRunningArc(angle: .degrees(turn * 360))
+                    }
+                    .background(RelayStatusMarkVisibility(visible: $windowVisible).frame(width: 0, height: 0))
+                case let .symbol(name):
+                    Image(systemName: name)
+                        .font(RelayTheme.font(size: 10, weight: .semibold))
+                        .foregroundStyle(status.role.color)
+                }
+            }
+            .frame(width: Self.size, height: Self.size)
+            .help(status.label)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Self.spoken(status))
+        }
+    }
+}
+
+private struct RelayRunningArc: View {
+    let angle: Angle
+    var body: some View {
+        ZStack {
+            Circle().stroke(RelayTheme.success.opacity(0.25), lineWidth: 1.75)
+            Circle().trim(from: 0, to: 0.7)
+                .stroke(RelayTheme.success, style: StrokeStyle(lineWidth: 1.75, lineCap: .round))
+                .rotationEffect(angle)
+        }
+        .padding(1.5)
+    }
+}
+
+/// The shared window visibility view (ordered in, not minimised, not fully
+/// covered), so a spinner in a hidden window stops drawing frames.
+private struct RelayStatusMarkVisibility: NSViewRepresentable {
+    @Binding var visible: Bool
+
+    func makeNSView(context _: Context) -> RelayWindowVisibilityView {
+        let view = RelayWindowVisibilityView()
+        bind(view)
+        return view
+    }
+
+    func updateNSView(_ view: RelayWindowVisibilityView, context _: Context) { bind(view) }
+
+    private func bind(_ view: RelayWindowVisibilityView) {
+        let visible = $visible
+        // Reported from inside view updates; apply on the next turn.
+        view.onChange = { showing in DispatchQueue.main.async { visible.wrappedValue = showing } }
+    }
+
+    static func dismantleNSView(_ view: RelayWindowVisibilityView, coordinator: ()) { view.detach() }
 }

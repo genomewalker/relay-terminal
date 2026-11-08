@@ -42,6 +42,9 @@ import UniformTypeIdentifiers
         let rails = Dictionary(uniqueKeysWithValues: (lists.shown + lists.hidden).map {
             ($0.id, workspace.railTabs(inWorkspace: $0.id, sort: sort))
         })
+        // One pass over the panes gives the counts and every row's mark.
+        let facts = RelayWorkOverviewIndex.paneFacts(workspace)
+        let marks = RelayWorkOverviewIndex.tabStatuses(facts, focusedTabID: workspace.selectedTabID)
         VStack(spacing: 6) {
             HStack(spacing: 6) {
                 // The clear button sits beside the text, not over it.
@@ -96,7 +99,7 @@ import UniformTypeIdentifiers
             }
             .padding(.horizontal, 10)
             // Same metadata and predicate as the fleet board and Go to pane.
-            let fleet = RelayWorkOverviewIndex.fleet(workspace).counts
+            let fleet = RelayWorkOverviewIndex.Fleet(facts).counts
             RelayFleetCountsButton(counts: fleet) {
                 workspace.presentFleetBoard(filter: .initial(for: fleet))
             }
@@ -126,14 +129,14 @@ import UniformTypeIdentifiers
                         NavigatorSectionHeader(title: "Pinned")
                         ForEach(pinned) { record in
                             WorkspaceNavigatorRow(record: record, workspace: workspace, hold: hold, query: query,
-                                                  tabs: rails[record.id] ?? [],
+                                                  tabs: rails[record.id] ?? [], marks: marks,
                                                   failure: $failure, renaming: $renaming)
                         }
                         NavigatorSectionHeader(title: "Workspaces")
                     }
                     ForEach(lists.shown.filter { !$0.favourite || $0.isInbox }) { record in
                         WorkspaceNavigatorRow(record: record, workspace: workspace, hold: hold, query: query,
-                                              tabs: rails[record.id] ?? [],
+                                              tabs: rails[record.id] ?? [], marks: marks,
                                               failure: $failure, renaming: $renaming)
                     }
                     if !lists.hidden.isEmpty {
@@ -148,7 +151,7 @@ import UniformTypeIdentifiers
                         if showingHidden {
                             ForEach(lists.hidden) { record in
                                 WorkspaceNavigatorRow(record: record, workspace: workspace, hold: hold, query: query,
-                                                      tabs: rails[record.id] ?? [],
+                                                      tabs: rails[record.id] ?? [], marks: marks,
                                                       failure: $failure, renaming: $renaming)
                             }
                         }
@@ -275,6 +278,8 @@ private struct WorkspaceFocusBar: View {
     let query: String
     /// In navigator order; the parent sorts them, so a re-sort redraws the row.
     let tabs: [TabModel]
+    /// Each tab's status mark, from the navigator's one pass over the panes.
+    let marks: [UUID: RelayWorkOverviewIndex.PaneStatus]
     @Binding var failure: String?
     @Binding var renaming: WorkspaceRecord?
     @State private var targeted = false
@@ -301,6 +306,9 @@ private struct WorkspaceFocusBar: View {
                             .font(.system(size: 10)).foregroundStyle(RelayTheme.textMuted)
                         Text(record.name).font(RelayTheme.font(size: 11.5, weight: .semibold)).lineLimit(1)
                         Spacer(minLength: 3)
+                        // Every tab of the workspace, also those a search hides.
+                        RelayStatusMark(status: RelayWorkOverviewIndex.mostUrgent(
+                            workspace.tabs(inWorkspace: record.id).map(\.id), in: marks))
                         Text("\(workspace.tabs(inWorkspace: record.id).count)")
                             .font(RelayTheme.font(size: 9)).foregroundStyle(RelayTheme.textFaint)
                     }
@@ -378,7 +386,8 @@ private struct WorkspaceFocusBar: View {
             .accessibilityIdentifier("relay.navigator.workspace.\(record.id.uuidString.lowercased())")
             if expanded {
                 ForEach(tabs) { tab in
-                    WorkspaceNavigatorTab(tab: tab, workspace: workspace, hold: hold, failure: $failure)
+                    WorkspaceNavigatorTab(tab: tab, workspace: workspace, hold: hold, status: marks[tab.id],
+                                          failure: $failure)
                 }
             }
         }
@@ -400,6 +409,7 @@ private struct WorkspaceFocusBar: View {
     @ObservedObject var tab: TabModel
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject var hold: WorkspaceNavigatorHold
+    let status: RelayWorkOverviewIndex.PaneStatus?
     @Binding var failure: String?
     @State private var targeted = false
     @State private var refusal: String?
@@ -421,6 +431,7 @@ private struct WorkspaceFocusBar: View {
                         Text(workspace.tabDisplayName(tab, fallback: tab.name)).font(RelayTheme.font(size: 11)).lineLimit(1)
                         Text(hosts).font(RelayTheme.font(size: 8)).foregroundStyle(RelayTheme.textFaint).lineLimit(1)
                         Spacer(minLength: 3)
+                        RelayStatusMark(status: status)
                         if workspace.isTabPinned(tab.id) {
                             Image(systemName: "pin.fill").font(.system(size: 8)).foregroundStyle(RelayTheme.textMuted)
                                 .accessibilityLabel("Pinned")

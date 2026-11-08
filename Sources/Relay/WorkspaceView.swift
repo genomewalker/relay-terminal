@@ -999,10 +999,17 @@ private struct EmptyWorkspaceView: View {
 
 /// The visible workspace's tabs. Workspaces, not legacy sessions, own tabs;
 /// a pane dropped on a tab joins it as a split, from any workspace or host.
-private struct WorkspaceTabRail: View {
+struct WorkspaceTabRail: View {
     @ObservedObject var workspace: WorkspaceModel
+    // Tab marks follow pane phases, throttled like the fleet board.
+    @ObservedObject private var activityIndex: WorkspaceActivityIndex
     @State private var draggedTabID: UUID?
     @State private var dropFailure: String?
+
+    init(workspace: WorkspaceModel) {
+        self.workspace = workspace
+        activityIndex = workspace.activityIndex
+    }
 
     private var workspaceTabs: [TabModel] {
         guard let workspaceID = workspace.selectedWorkspaceID else { return [] }
@@ -1022,6 +1029,10 @@ private struct WorkspaceTabRail: View {
     }
 
     var body: some View {
+        let _ = activityIndex.revision
+        // Same status as the fleet board; one pass over the panes per revision.
+        let marks = RelayWorkOverviewIndex.tabStatuses(RelayWorkOverviewIndex.paneFacts(workspace),
+                                                       focusedTabID: workspace.selectedTabID)
         HStack(spacing: RelayTheme.spacing(8)) {
             Menu {
                 ForEach(workspace.navigatorWorkspaces().shown) { record in
@@ -1061,6 +1072,7 @@ private struct WorkspaceTabRail: View {
                             label: workspace.tabDisplayName(tab, fallback: fallbackLabel),
                             isSelected: tab.id == workspace.selectedTabID,
                             pinned: workspace.isTabPinned(tab.id),
+                            status: marks[tab.id],
                             select: { workspace.selectTab(tab.id, origin: .user) },
                             togglePin: { workspace.toggleTabPin(tab.id) },
                             rename: { workspace.beginRenameTab(tab.id) },
@@ -1253,6 +1265,7 @@ private struct WorkspaceTab: View {
     let label: String
     let isSelected: Bool
     let pinned: Bool
+    let status: RelayWorkOverviewIndex.PaneStatus?
     let select: () -> Void
     let togglePin: () -> Void
     let rename: () -> Void
@@ -1280,6 +1293,7 @@ private struct WorkspaceTab: View {
                             .font(RelayTheme.font(size: 7.5, weight: .medium))
                             .foregroundStyle(RelayTheme.textFaint)
                     }
+                    RelayStatusMark(status: status)
                     Text(label)
                         .font(RelayTheme.font(size: 11.5, weight: .medium))
                         .lineLimit(1)
@@ -1649,8 +1663,11 @@ private struct SessionManager: View {
                 if tabSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     LazyVStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
                         AttentionInboxSection(workspace: workspace)
+                        // Same status as the fleet board; one pass over the panes per revision.
+                        let marks = RelayWorkOverviewIndex.tabStatuses(RelayWorkOverviewIndex.paneFacts(workspace),
+                                                                       focusedTabID: workspace.selectedTabID)
                         ForEach(nodeGroups) { group in
-                            SessionNodeSection(group: group, workspace: workspace)
+                            SessionNodeSection(group: group, workspace: workspace, marks: marks)
                         }
                     }
                     .padding(.horizontal, RelayTheme.spacing(8))
@@ -1724,6 +1741,7 @@ private struct SessionManager: View {
 private struct SessionNodeSection: View {
     let group: SessionNodeGroup
     @ObservedObject var workspace: WorkspaceModel
+    let marks: [UUID: RelayWorkOverviewIndex.PaneStatus]
     @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
 
     private var nodeConnected: Bool {
@@ -1764,7 +1782,8 @@ private struct SessionNodeSection: View {
                 AttachedSessionRow(
                     session: session,
                     label: workspace.sessionDisplayName(session.id, fallback: fallback),
-                    workspace: workspace
+                    workspace: workspace,
+                    marks: marks
                 )
             }
         }
@@ -1776,6 +1795,7 @@ private struct AttachedSessionRow: View {
     let session: SessionTabGroup
     let label: String
     @ObservedObject var workspace: WorkspaceModel
+    let marks: [UUID: RelayWorkOverviewIndex.PaneStatus]
 
     private var selected: Bool { session.tabs.contains { $0.id == workspace.selectedTabID } }
     private var expanded: Bool { workspace.navigationState.isExpanded(.session, id: session.id) }
@@ -1815,6 +1835,7 @@ private struct AttachedSessionRow: View {
                         .lineLimit(1)
                     Spacer(minLength: 3)
                     RelayAttentionSummary(paneIDs: panes.map(\.id))
+                    RelayStatusMark(status: RelayWorkOverviewIndex.mostUrgent(session.tabs.map(\.id), in: marks))
                     Text("\(session.tabs.count) tab\(session.tabs.count == 1 ? "" : "s")")
                         .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
@@ -1851,7 +1872,8 @@ private struct AttachedSessionRow: View {
                     SessionTabSection(
                         tab: tab,
                         fallbackLabel: tabIndex == 0 ? "Main" : "Tab \(tabIndex + 1)",
-                        workspace: workspace
+                        workspace: workspace,
+                        status: marks[tab.id]
                     )
                 }
             }
@@ -1865,18 +1887,17 @@ private struct SessionTabSection: View {
     @ObservedObject var tab: TabModel
     let fallbackLabel: String
     @ObservedObject var workspace: WorkspaceModel
+    let status: RelayWorkOverviewIndex.PaneStatus?
     private var expanded: Bool { workspace.navigationState.isExpanded(.tab, id: tab.id) }
 
-    init(tab: TabModel, fallbackLabel: String, workspace: WorkspaceModel) {
+    init(tab: TabModel, fallbackLabel: String, workspace: WorkspaceModel, status: RelayWorkOverviewIndex.PaneStatus?) {
         self.tab = tab
         self.fallbackLabel = fallbackLabel
         self.workspace = workspace
+        self.status = status
     }
 
     private var panes: [PaneModel] { tab.allPaneIDs.compactMap { workspace.panes[$0] } }
-    private var activeAgents: Int {
-        panes.filter { $0.contentKind == .terminal && $0.kind != .shell && $0.phase == .active }.count
-    }
     private var displayName: String { workspace.tabDisplayName(tab, fallback: fallbackLabel) }
 
     var body: some View {
@@ -1908,11 +1929,9 @@ private struct SessionTabSection: View {
                             .lineLimit(1)
                         Spacer(minLength: 4)
                         RelayAttentionSummary(paneIDs: panes.map(\.id))
+                        RelayStatusMark(status: status)
                         Text("\(panes.count)")
                             .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
-                        if activeAgents > 0 {
-                            Circle().fill(RelayTheme.mint).frame(width: 5, height: 5)
-                        }
                     }
                     .foregroundStyle(tab.id == workspace.selectedTabID ? RelayTheme.text : RelayTheme.textMuted)
                     .contentShape(Rectangle())
