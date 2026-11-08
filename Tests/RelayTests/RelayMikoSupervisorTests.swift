@@ -815,4 +815,28 @@ struct RelayMikoSupervisorTurnStatusTests {
         #expect(RelayMikoSupervisorChannel.turnStatus(exchange) == "failed")
         #expect(RelayMikoSupervisorChannel.exchangeObject(exchange)["awaiting_confirmation"] as? Bool == false)
     }
+
+    @Test("An agent-ask receipt and the Control Center keep completed for an unconfirmed handoff and flag it awaiting confirmation")
+    func receiptAndControlCenterFlagUnconfirmedHandoff() throws {
+        let f = try Fixture()
+        defer { f.workspace.shutdown() }
+        var exchange = RelayAssistantExchange(request: "tell the pane", origin: .agent(paneID: f.pane.id, label: "x"))
+        exchange.reply = RelayAssistantHarness.sentAwaitingConfirmationReply
+        exchange.awaitingConfirmation = true
+        let ask = RelayMikoSupervisorChannel.AgentAsk(paneID: f.pane.id, digest: "d", exchangeID: exchange.requestID,
+                                                      finished: true, final: exchange)
+        let receipt = f.channel.receiptObject("req-1", ask, workspace: nil)
+        #expect(receipt["state"] as? String == "completed" && receipt["awaiting_confirmation"] as? Bool == true)
+        var input = RelayControlCenterState.Inputs(ownership: .empty, tabs: [])
+        input.exchanges = [exchange]
+        let row = try #require(RelayControlCenterState.exchanges(input, pane: f.pane.id).first)
+        #expect(row.status == "completed" && row.awaitingConfirmation)
+        // An ordinary completed exchange carries no flag.
+        exchange.awaitingConfirmation = false
+        let plain = f.channel.receiptObject("req-2", RelayMikoSupervisorChannel.AgentAsk(paneID: f.pane.id, digest: "d",
+            exchangeID: exchange.requestID, finished: true, final: exchange), workspace: nil)
+        #expect(plain["state"] as? String == "completed" && plain["awaiting_confirmation"] == nil)
+        input.exchanges = [exchange]
+        #expect(RelayControlCenterState.exchanges(input, pane: f.pane.id).first?.awaitingConfirmation == false)
+    }
 }
