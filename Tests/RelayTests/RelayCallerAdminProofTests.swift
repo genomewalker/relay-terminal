@@ -182,11 +182,17 @@ import Testing
         let fixed = Curve25519.Signing.PrivateKey()
         let store = RelayCallerAdminProof.AdminKeyStore(load: { gate.wait(); return fixed })
         let first = RelayCallerAdminProof.KeychainApprovalStatus(), second = RelayCallerAdminProof.KeychainApprovalStatus()
+        // Wait for the 30 ms grace to pass on a loaded machine instead of a
+        // fixed sleep; the assertions are unchanged.
+        func eventually(_ condition: () -> Bool) async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        }
         let a = Task { try await RelayCallerAdminProof.userKey(store: store, status: first, grace: .milliseconds(30)) }
-        try await Task.sleep(for: .milliseconds(300))
+        try await eventually { first.pending }
         #expect(first.pending && !second.pending)
         let b = Task { try await RelayCallerAdminProof.userKey(store: store, status: second, grace: .milliseconds(30)) }
-        try await Task.sleep(for: .milliseconds(300))
+        try await eventually { second.pending }
         #expect(first.pending && second.pending)
         a.cancel()
         _ = await a.result
