@@ -345,7 +345,7 @@ func remoteNativeSettle(root, node, id, text string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return remoteNativeCarried(remoteOutboundResult(receipt)), nil
+	return remoteNativeQueuedResult(root, receipt), nil
 }
 
 // communicationRemoteReceiptLookup answers a plain receipt query for a message
@@ -377,14 +377,65 @@ func communicationRemoteReceiptLookup(root, node string, r CommunicationRequest,
 // (relayd before host-channel route links refused it before any I/O), so its
 // receipt says so instead of promising a carrier that will never come.
 func remoteNativeUnsettled(root string, receipt communicationRemoteOutbound) map[string]any {
-	result := remoteOutboundResult(receipt)
 	if remoteNativePendingFor(root, receipt.Wire.MessageID) {
-		return remoteNativeCarried(result)
+		return remoteNativeQueuedResult(root, receipt)
 	}
+	result := remoteOutboundResult(receipt)
 	result["carrier"] = "relay_host_channel"
 	if stored, _ := receipt.Result["error"].(string); stored != "" && receipt.Result["carrier"] != nil {
 		return result
 	}
 	result["error"] = "this message was never queued for the Relay host channel and no peer request was made; ask the recipient before sending it again under a new ID"
 	return result
+}
+
+// remoteNativeQueuedResult is the outbound result of a message that may be
+// waiting in this host's queue for the Relay app's carrier. Its status stays
+// outcome_unknown for older readers; carrier_state says queued, with
+// queued_at and carry_deadline: queued_at plus remoteNativeSignedWindow for a
+// signed message (later, it is not sent), or plus the 24 h query window for
+// an unsigned one. Once the pending record is gone, the receipt's own final
+// carrier_state stands (see remoteNativeFinalState).
+func remoteNativeQueuedResult(root string, receipt communicationRemoteOutbound) map[string]any {
+	result := remoteNativeCarried(remoteOutboundResult(receipt))
+	if status := fmtRemoteStatus(result); status != "outcome_unknown" && status != "unknown" {
+		return result
+	}
+	var p remoteNativePending
+	if communicationRead(remoteNativePendingPath(root, receipt.Wire.MessageID), &p) != nil || p.Version != 1 || p.MessageID != receipt.Wire.MessageID {
+		return result
+	}
+	window := workNativeQueryWindow
+	if receipt.Wire.SourceSignature != "" {
+		window = remoteNativeSignedWindow
+	}
+	result["carrier_state"] = "queued"
+	result["dispatched"] = p.Dispatched
+	result["queued_at"] = p.Created.UTC()
+	result["carry_deadline"] = p.Created.UTC().Add(window)
+	return result
+}
+
+// remoteNativeFinalState names how a host-channel message ended: too_late
+// (not sent, or refused by the peer because its signed statement expired),
+// refused (the peer answered with an error), or carried. Empty while
+// unsettled or for a message that never used the host channel.
+func remoteNativeFinalState(receipt communicationRemoteOutbound) string {
+	errText, _ := receipt.Result["error"].(string)
+	if strings.HasPrefix(errText, "carried too late") {
+		return "too_late"
+	}
+	if !receipt.PeerConfirmed || receipt.Result["peer_authentication"] != workNativeAuth {
+		return ""
+	}
+	switch fmtRemoteStatus(receipt.Result) {
+	case "outcome_unknown", "unknown":
+		return ""
+	case "not_delivered", "not_sent", "refused", "rejected":
+		return "refused"
+	}
+	if errText != "" {
+		return "refused"
+	}
+	return "carried"
 }

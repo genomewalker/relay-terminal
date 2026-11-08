@@ -58,11 +58,17 @@ func remoteOutboundResult(receipt communicationRemoteOutbound) map[string]any {
 		}
 	}
 	result["request_finished"] = receipt.RequestFinished
+	if state := remoteNativeFinalState(receipt); state != "" {
+		result["carrier_state"] = state
+	}
 	return result
 }
 func remoteOutboundRequestMatches(receipt communicationRemoteOutbound, node, caller string, r CommunicationRequest) bool {
 	ownerRead := r.Operation == "remote_receipt" && r.ClientToken == "" && r.ActorPaneID == ""
-	if !validRemoteOutbound(receipt, node) || receipt.Wire.MessageID != r.MessageID || (receiptCaller(receipt) != caller && !ownerRead) ||
+	// The kernel-proven sending pane reads its own message's receipt, whichever
+	// caller label (token or pane) it sent under. It never resends.
+	paneRead := r.Operation == "remote_receipt" && r.actorVerified && r.ActorPaneID != "" && strings.EqualFold(r.ActorPaneID, receipt.Wire.SourcePaneID)
+	if !validRemoteOutbound(receipt, node) || receipt.Wire.MessageID != r.MessageID || (receiptCaller(receipt) != caller && !ownerRead && !paneRead) ||
 		(r.ActorPaneID != "" && !strings.EqualFold(r.ActorPaneID, receipt.Wire.SourcePaneID)) ||
 		(r.SourcePaneID != "" && r.SourcePaneID != receipt.Wire.SourcePaneID) || (r.PaneID != "" && r.PaneID != receipt.Wire.TargetPaneID) ||
 		(r.LinkID != "" && r.LinkID != receipt.Wire.LinkID) || (r.PeerNodeID != "" && r.PeerNodeID != receipt.Wire.TargetNodeID) {
@@ -169,7 +175,7 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 	}
 	if existing && (r.Operation == "remote_send" || (fmtRemoteStatus(receipt.Result) != "outcome_unknown" && fmtRemoteStatus(receipt.Result) != "unknown")) {
 		if remoteNativePendingFor(root, receipt.Wire.MessageID) {
-			return remoteNativeCarried(remoteOutboundResult(receipt)), nil
+			return remoteNativeQueuedResult(root, receipt), nil
 		}
 		return remoteOutboundResult(receipt), nil
 	}
@@ -247,7 +253,7 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 			return remoteOutboundResult(receipt), nil
 		}
 		if binding.Endpoint == workNativeEndpoint {
-			return remoteNativeCarried(remoteOutboundResult(receipt)), nil
+			return remoteNativeQueuedResult(root, receipt), nil
 		}
 	} else {
 		wire.Operation = "receipt"
