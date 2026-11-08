@@ -179,9 +179,10 @@ done
 relayd_version_check="$stage_root/relayd-version-check"
 # cgo is required on macOS: the supervisor is spawned with a responsibility
 # disclaim so pane programs get relayd's privacy grants, not the launching app's.
+# Pin Apple clang so an activated conda or Homebrew toolchain is never used.
 (
     cd "$project_root/remote/relayd"
-    CGO_ENABLED=1 go build -trimpath -ldflags="-X main.relaydVersion=$relayd_version" \
+    CGO_ENABLED=1 CC=/usr/bin/clang go build -trimpath -ldflags="-X main.relaydVersion=$relayd_version" \
         -o "$relayd_version_check" ./cmd/relayd
 )
 if ! go version -m "$relayd_version_check" | grep -q 'CGO_ENABLED=1'; then
