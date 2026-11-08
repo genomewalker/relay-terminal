@@ -40,7 +40,7 @@ struct RelayProgramStatusAttentionTests {
             deliveryEpoch: other, replay: false, now: 7)
         #expect(coalesced.map(\.record.state) == ["done"])
         // Delivered once: nothing is left to replay.
-        #expect(policy.flush(now: 20).isEmpty)
+        #expect(policy.flush(now: 20, current: [done]).isEmpty)
         let newState = policy.consume(previous: [done], current: [blocked], revision: 3,
             deliveryEpoch: other, replay: false, now: 20)
         #expect(newState.count == 1)
@@ -58,11 +58,60 @@ struct RelayProgramStatusAttentionTests {
         #expect(policy.consume(previous: [done], current: [error], revision: 3,
             deliveryEpoch: epoch, replay: false, now: 3).isEmpty)
         #expect(policy.hasPending)
-        #expect(policy.flush(now: 4).isEmpty)
-        let landed = policy.flush(now: 6)
+        #expect(policy.flush(now: 4, current: [error]).isEmpty)
+        let landed = policy.flush(now: 6, current: [error])
         #expect(landed.map(\.record.state) == ["error"])
         #expect(landed.first?.sourceID.hasSuffix(":3:") == true)
-        #expect(!policy.hasPending && policy.flush(now: 30).isEmpty)
+        #expect(!policy.hasPending && policy.flush(now: 30, current: [error]).isEmpty)
+    }
+
+    // bc08 F1: a held state the pane has already left must not land later.
+    // error (emitted) → blocked (held) → running: nothing is delivered.
+    @Test func aHeldStateThePaneHasLeftIsNotDelivered() {
+        var policy = RelayProgramStatusAttention()
+        let epoch = UUID(), error = record("error", id: "job"), blocked = record("blocked", id: "job"),
+            running = record("running", id: "job")
+        #expect(policy.consume(previous: [], current: [error], revision: 1,
+            deliveryEpoch: epoch, replay: false, now: 0).map(\.record.state) == ["error"])
+        #expect(policy.consume(previous: [error], current: [blocked], revision: 2,
+            deliveryEpoch: epoch, replay: false, now: 1).isEmpty)
+        #expect(policy.consume(previous: [blocked], current: [running], revision: 3,
+            deliveryEpoch: epoch, replay: false, now: 2).isEmpty)
+        #expect(!policy.hasPending)
+        #expect(policy.flush(now: 5, current: [running]).isEmpty)
+        #expect(policy.consume(previous: [running], current: [running], revision: 4,
+            deliveryEpoch: epoch, replay: false, now: 6).isEmpty)
+    }
+
+    // The flush re-checks too: a held state whose record is gone, or whose
+    // state or blocked kind changed, is discarded at window end.
+    @Test func theFlushDiscardsAHeldStateThatNoLongerMatches() {
+        let epoch = UUID(), error = record("error", id: "job")
+        let blocked = record("blocked", id: "job", kind: "permission")
+        for current in [[record("running", id: "job")], [], [record("blocked", id: "job", kind: "auth")],
+                        [record("blocked", id: "other", kind: "permission")]] {
+            var policy = RelayProgramStatusAttention()
+            _ = policy.consume(previous: [], current: [error], revision: 1, deliveryEpoch: epoch, replay: false, now: 0)
+            _ = policy.consume(previous: [error], current: [blocked], revision: 2, deliveryEpoch: epoch, replay: false, now: 1)
+            #expect(policy.hasPending)
+            #expect(policy.flush(now: 5, current: current).isEmpty, "\(current.map(\.state))")
+            #expect(!policy.hasPending)
+        }
+    }
+
+    // A held state still current at window end is delivered, even when only
+    // its message or progress changed meanwhile.
+    @Test func aHeldStateStillCurrentAtWindowEndIsDelivered() {
+        var policy = RelayProgramStatusAttention()
+        let epoch = UUID(), error = record("error", id: "job")
+        let blocked = record("blocked", id: "job", kind: "permission")
+        _ = policy.consume(previous: [], current: [error], revision: 1, deliveryEpoch: epoch, replay: false, now: 0)
+        #expect(policy.consume(previous: [error], current: [blocked], revision: 2,
+            deliveryEpoch: epoch, replay: false, now: 1).isEmpty)
+        let later = record("blocked", id: "job", kind: "permission", message: "still waiting", progress: 40)
+        #expect(policy.flush(now: 4, current: [later]).isEmpty)
+        let landed = policy.flush(now: 5, current: [later])
+        #expect(landed.map(\.record.state) == ["blocked"] && landed.first?.sourceID.hasSuffix(":2:job") == true)
     }
 
     // End to end: a pane that reports Waiting then Done within five seconds

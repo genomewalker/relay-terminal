@@ -1713,7 +1713,7 @@ final class PaneModel: ObservableObject, Identifiable {
             guard let self else { return }
             self.programStatusFlush = nil
             let now = ProcessInfo.processInfo.systemUptime
-            self.recordProgramStatus(self.programStatusAttention.flush(now: now))
+            self.recordProgramStatus(self.programStatusAttention.flush(now: now, current: self.programStatus.records))
             self.scheduleProgramStatusFlush(now: now)
         }
     }

@@ -18,12 +18,22 @@ struct RelayProgramStatusAttention {
         return max(0, (lastEmission ?? now) + Self.minimumInterval - now)
     }
 
-    /// Delivers the pending transition once the interval has passed.
-    mutating func flush(now: TimeInterval) -> [Transition] {
+    /// Delivers the pending transition once the interval has passed, if the
+    /// pane is still in that state (`current` are its records now).
+    mutating func flush(now: TimeInterval, current: [RelayProgramStatusRecord]) -> [Transition] {
+        discardStalePending(current: current)
         guard let pending, now.isFinite, allowed(now: now) else { return [] }
         self.pending = nil
         lastEmission = now
         return [pending]
+    }
+
+    /// A held state the pane has left (its record is gone, or its state or
+    /// blocked kind differs) is no longer the pane's latest state.
+    private mutating func discardStalePending(current: [RelayProgramStatusRecord]) {
+        guard let held = pending?.record else { return }
+        let latest = current.first { ($0.id ?? "") == (held.id ?? "") }
+        if latest?.state != held.state || (held.state == "blocked" && latest?.kind != held.kind) { pending = nil }
     }
 
     private func allowed(now: TimeInterval) -> Bool {
@@ -56,13 +66,14 @@ struct RelayProgramStatusAttention {
     /// Replay refreshes the caller's comparison baseline, without notifying.
     /// One transition per pane per five seconds; one inside the interval is
     /// kept as the pane's latest state (replacing any earlier one) and lands
-    /// when the interval allows: here, or by `flush`. Progress/message churn
-    /// creates no events.
+    /// when the interval allows, here or by `flush`, unless the pane has left
+    /// that state by then. Progress/message churn creates no events.
     mutating func consume(previous: [RelayProgramStatusRecord], current: [RelayProgramStatusRecord],
                           revision: UInt64, deliveryEpoch: UUID, replay: Bool,
                           now: TimeInterval) -> [Transition] {
         let old = self.deliveryEpoch == deliveryEpoch ? previous : []
         self.deliveryEpoch = deliveryEpoch
+        discardStalePending(current: current)
         guard !replay, now.isFinite else { return [] }
         let byID = Dictionary(uniqueKeysWithValues: old.map { ($0.id ?? "", $0) })
         let candidates = current.filter { record in
@@ -80,6 +91,6 @@ struct RelayProgramStatusAttention {
                 sourceID: "program-status:" + deliveryEpoch.uuidString.lowercased() + ":" +
                     String(revision) + ":" + (record.id ?? ""))
         }
-        return flush(now: now)
+        return flush(now: now, current: current)
     }
 }
