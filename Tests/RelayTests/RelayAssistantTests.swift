@@ -131,7 +131,7 @@ fileprivate func tracedResult(_ exchange: RelayAssistantExchange?, _ tool: Strin
 @MainActor
 fileprivate func stoppedSentAwaitingConfirmation(_ exchange: RelayAssistantExchange?) -> Bool {
     guard let exchange else { return false }
-    return !exchange.failed && exchange.reply == RelayAssistantHarness.sentAwaitingConfirmationReply
+    return !exchange.failed && exchange.awaitingConfirmation && exchange.reply == RelayAssistantHarness.sentAwaitingConfirmationReply
         && exchange.reply.hasPrefix("Sent; waiting for confirmation (not replayed)")
 }
 

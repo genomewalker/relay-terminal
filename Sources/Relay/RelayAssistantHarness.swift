@@ -850,6 +850,9 @@ struct RelayAssistantExchange: Identifiable, Sendable {
     /// The user (or a Miko correction) stopped this exchange; distinct from a
     /// genuine failure, which keeps `failed` alone.
     var cancelled = false
+    /// A handoff was sent but not yet confirmed. Neither completed nor failed;
+    /// the exchange stopped and nothing is replayed.
+    var awaitingConfirmation = false
     /// Stopped by the user rather than failed. Older saved replies used the
     /// exact text "Cancelled." without the flag.
     var stoppedByUser: Bool { failed && (cancelled || reply == "Cancelled.") }
@@ -1431,6 +1434,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
                                 // Still unresolved: the loop stops and nothing is replayed.
                                 // Only the presentation differs from a failure.
                                 exchange.reply = Self.sentAwaitingConfirmationReply
+                                exchange.awaitingConfirmation = true
                             } else {
                                 exchange.reply = "Task saved with an unresolved outcome for " + call.name +
                                     ". No further actions were started. Check the exact operation receipt; do not replay it."

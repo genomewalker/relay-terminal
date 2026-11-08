@@ -797,3 +797,22 @@ extension RelayMikoSupervisorTests {
         #expect(!legacy.correctionEligibility(pane, isLocalProfile: true))
     }
 }
+
+@Suite("Miko supervisor turn status")
+@MainActor
+struct RelayMikoSupervisorTurnStatusTests {
+    @Test("A sent-but-unconfirmed handoff is reported as sent_awaiting_confirmation, never completed or failed")
+    func sentHandoffIsNotReportedCompleted() {
+        var exchange = RelayAssistantExchange(request: "tell the pane", origin: .user)
+        #expect(RelayMikoSupervisorChannel.turnStatus(exchange) == "completed")
+        exchange.reply = RelayAssistantHarness.sentAwaitingConfirmationReply
+        exchange.awaitingConfirmation = true
+        #expect(RelayMikoSupervisorChannel.turnStatus(exchange) == "sent_awaiting_confirmation")
+        let object = RelayMikoSupervisorChannel.exchangeObject(exchange)
+        #expect(object["awaiting_confirmation"] as? Bool == true && object["failed"] as? Bool == false)
+        exchange.awaitingConfirmation = false
+        exchange.failed = true
+        #expect(RelayMikoSupervisorChannel.turnStatus(exchange) == "failed")
+        #expect(RelayMikoSupervisorChannel.exchangeObject(exchange)["awaiting_confirmation"] as? Bool == false)
+    }
+}

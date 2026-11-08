@@ -795,7 +795,7 @@ extension JSONDecoder {
         let deadline = now().addingTimeInterval(wait)
         while now() < deadline {
             if let exchange = harness.exchanges.last(where: { $0.requestID == exchangeRequestID }), !harness.isBusy {
-                return (200, ["status": exchange.failed ? "failed" : "completed", "exchange": Self.exchangeObject(exchange)])
+                return (200, ["status": Self.turnStatus(exchange), "exchange": Self.exchangeObject(exchange)])
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
@@ -842,6 +842,13 @@ extension JSONDecoder {
         return value
     }
 
+    /// A finished supervisor turn's status. A sent-but-unconfirmed handoff is
+    /// reported as such, never as completed.
+    static func turnStatus(_ exchange: RelayAssistantExchange) -> String {
+        if exchange.failed { return "failed" }
+        return exchange.awaitingConfirmation ? "sent_awaiting_confirmation" : "completed"
+    }
+
     static func exchangeObject(_ exchange: RelayAssistantExchange) -> [String: Any] {
         var origin: [String: Any] = ["kind": exchange.origin.kind]
         if case .supervisor(let paneID, let label) = exchange.origin {
@@ -851,7 +858,8 @@ extension JSONDecoder {
             origin = ["kind": "agent", "pane_id": paneID.uuidString.lowercased(), "label": label]
         }
         return ["request_id": exchange.requestID, "origin": origin, "request": exchange.request, "reply": exchange.reply,
-                "tool_log": exchange.toolLog, "failed": exchange.failed, "cancelled": exchange.stoppedByUser, "undone": exchange.undone,
+                "tool_log": exchange.toolLog, "failed": exchange.failed,
+                "awaiting_confirmation": exchange.awaitingConfirmation, "cancelled": exchange.stoppedByUser, "undone": exchange.undone,
                 "tool_trace": exchange.toolTrace.map { ["name": $0.name, "input": $0.input, "result": $0.result,
                                                          "is_error": $0.isError] as [String: Any] },
                 "charged_microusd": exchange.chargedMicrousd,
