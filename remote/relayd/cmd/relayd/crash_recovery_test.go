@@ -147,6 +147,15 @@ func TestSupervisorUpgradePreservesPaneWorkerAndShell(t *testing.T) {
 	if newSupervisorPID == oldSupervisor.Process.Pid {
 		t.Fatalf("supervisor pid did not change: %d", newSupervisorPID)
 	}
+	// On macOS the replacement must have been spawned with the responsibility
+	// disclaim; the launcher logs here when it had to fall back.
+	if supervisorLog, err := os.ReadFile(filepath.Join(runtimeDir, "relayd.log")); err == nil {
+		for _, fallback := range []string{"responsibility disclaim unavailable", "disclaimed supervisor spawn failed"} {
+			if strings.Contains(string(supervisorLog), fallback) {
+				t.Fatalf("upgraded supervisor was not disclaimed:\n%s", supervisorLog)
+			}
+		}
+	}
 	assertProcessAlive(t, manifest.WorkerPID, "pane worker")
 	assertProcessAlive(t, manifest.ShellPID, "remote shell")
 	t.Cleanup(func() {
