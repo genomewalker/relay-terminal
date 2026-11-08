@@ -1123,6 +1123,9 @@ func (s *server) handle(r request) (any, int, string) {
 			if len(p.Arguments) != 8 || json.Unmarshal(p.Arguments["reply_name"], &reply) != nil || !peerIdentifier.MatchString(reply) || json.Unmarshal(p.Arguments["thread"], &thread) != nil || !peerIdentifier.MatchString(thread) || json.Unmarshal(p.Arguments["host"], &host) != nil || !peerIdentifier.MatchString(host) || json.Unmarshal(p.Arguments["remote_session"], &session) != nil || !peerIdentifier.MatchString(session) || json.Unmarshal(p.Arguments["remote_pid"], &pid) != nil || pid <= 0 || json.Unmarshal(p.Arguments["remote_start"], &start) != nil || !validDesktopRouteStart(host, start) || json.Unmarshal(p.Arguments["message_id"], &id) != nil || !peerIdentifier.MatchString(id) || json.Unmarshal(p.Arguments["content"], &content) != nil || len(content) > 60000 || strings.TrimSpace(content) == "" {
 				return nil, -32602, "Exact route, fresh message ID and bounded text required"
 			}
+			if desktopSendFromOwner(host, pid, start) {
+				return nil, -32602, desktopSendSelfLoop
+			}
 			path, method = "/api/network/desktop-route/send", "POST"
 			body, _ = json.Marshal(map[string]any{"replyName": reply, "thread": thread, "host": host, "remoteSession": session, "remotePID": pid, "remoteStart": start, "messageID": id, "content": content})
 		case "relay_request_local_pane":
