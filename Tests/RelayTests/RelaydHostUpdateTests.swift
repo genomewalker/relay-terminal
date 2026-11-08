@@ -263,9 +263,9 @@ import Testing
         #expect(row.text == "Updating relayd… still running after 30:00" && row.tone == .muted && row.showsDetails)
     }
 
-    // bc08 N1: finished rows expire 10 minutes after they finish, or when
-    // the host is checked again; updating and still-running rows stay.
-    @Test func finishedRowsExpireAfterTenMinutesOrARecheck() {
+    // bc08 N1: finished rows expire 10 minutes after they finish; updating
+    // and still-running rows stay.
+    @Test func finishedRowsExpireAfterTenMinutes() {
         var now = Date(timeIntervalSince1970: 1_000_000)
         let progress = RelaydHostUpdateProgress(now: { now })
         let ids = (0..<5).map { _ in UUID() }
@@ -283,15 +283,62 @@ import Testing
         now += 3600
         #expect(progress.entry(forKey: "k3")?.phase == .stillRunning(after: .seconds(1800)))
         #expect(progress.entry(forKey: "k4")?.phase == .updating)
-
-        // A recheck of the host clears its finished row at once, only that one.
-        progress.began(key: "a", host: "a", requestID: ids[0]); progress.ended(requestID: ids[0], phase: .failed(message: "x"))
         // Expired rows are removed from the published state on the next write.
+        progress.began(key: "a", host: "a", requestID: UUID())
         #expect(progress.entries["k0"] == nil && progress.entries["k1"] == nil && progress.entries["k2"] == nil)
-        progress.began(key: "b", host: "b", requestID: ids[1]); progress.ended(requestID: ids[1], phase: .installed(version: "v"))
-        for key in ["a", "k3", "k4"] { progress.hostChecked(key: key) }
+    }
+
+    // bc08 N1 follow-up: opening Manage relayd starts a check of the host the
+    // user came to look at; the row (and its Details) must stay until a check
+    // started after the update finished completes, or an install starts.
+    @Test func onlyANewerCompletedCheckOrAnInstallSupersedesAFinishedRow() {
+        var now = Date(timeIntervalSince1970: 1_000_000)
+        let progress = RelaydHostUpdateProgress(now: { now })
+        let failed = UUID(), running = UUID(), other = UUID()
+        progress.began(key: "a", host: "a", requestID: failed)
+        let beforeFinish = now
+        now += 5
+        progress.ended(requestID: failed, phase: .failed(message: "x"))
+        progress.began(key: "r", host: "r", requestID: running)
+        progress.began(key: "b", host: "b", requestID: other)
+        progress.ended(requestID: other, phase: .installed(version: "v"))
+        // A check that started before the update finished (its own recheck) keeps it.
+        progress.checkCompleted(key: "a", startedAt: beforeFinish)
+        #expect(progress.entry(forKey: "a") != nil)
+        // A newer check supersedes only that host's finished row.
+        now += 5
+        for key in ["a", "r"] { progress.checkCompleted(key: key, startedAt: now) }
         #expect(progress.entry(forKey: "a") == nil && progress.entry(forKey: "b") != nil)
-        #expect(progress.entry(forKey: "k3") != nil && progress.entry(forKey: "k4") != nil)
+        #expect(progress.entry(forKey: "r")?.phase == .updating)
+        // An explicit install supersedes a finished row, not a running one.
+        progress.installStarted(key: "b"); progress.installStarted(key: "r")
+        #expect(progress.entry(forKey: "b") == nil && progress.entry(forKey: "r") != nil)
+    }
+
+    // Through RelaydManager: starting the check (as onAppear does) keeps the
+    // row; the check's completion with a fresh report replaces it.
+    @Test func openingManageRelaydKeepsTheRowUntilItsCheckCompletes() async throws {
+        let progress = RelaydHostUpdateProgress()
+        let release = AsyncStream<Void>.makeStream()
+        let manager = RelaydManager(defaults: UserDefaults(suiteName: "relayd-progress-" + UUID().uuidString)!,
+                                    progress: progress, remoteCheck: { _ in
+            for await _ in release.stream { break }
+            return RelaydHostReport(state: .ready, architecture: "amd64", version: "0.5.32")
+        })
+        let profile = ConnectionProfile(host: "progress-check.invalid"), id = UUID()
+        progress.began(key: profile.connectionKey, host: profile.host, requestID: id)
+        progress.ended(requestID: id, phase: .installed(version: "0.5.32"))
+        try await Task.sleep(for: .milliseconds(5))
+        manager.check(profile)
+        #expect(manager.report(for: profile).state == .checking)
+        #expect(progress.entry(forKey: profile.connectionKey)?.phase == .installed(version: "0.5.32"))
+        release.continuation.yield(); release.continuation.finish()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while manager.report(for: profile).state == .checking, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(manager.report(for: profile).state == .ready)
+        #expect(progress.entry(forKey: profile.connectionKey) == nil)
     }
 
     // Refusals run nothing, so they add no row.

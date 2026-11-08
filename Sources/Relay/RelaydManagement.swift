@@ -636,9 +636,15 @@ final class RelaydManager: ObservableObject {
     private let trustedDefaultsKey = "relay.relayd-trusted-hosts.v1"
     private var trustedHostKeys: Set<String>
     private var operations: [String: Task<Void, Never>] = [:]
+    private let updateProgress: RelaydHostUpdateProgress
+    private let remoteCheck: @MainActor (ConnectionProfile) async throws -> RelaydHostReport
 
-    private init(defaults: UserDefaults = .standard) {
+    /// Tests pass their own progress store and remote check.
+    init(defaults: UserDefaults = .standard, progress: RelaydHostUpdateProgress = .shared,
+         remoteCheck: @escaping @MainActor (ConnectionProfile) async throws -> RelaydHostReport = { try await RelaydRemoteClient.check(profile: $0) }) {
         trustedHostKeys = Set(defaults.stringArray(forKey: trustedDefaultsKey) ?? [])
+        updateProgress = progress
+        self.remoteCheck = remoteCheck
     }
 
     func report(for profile: ConnectionProfile) -> RelaydHostReport {
@@ -669,7 +675,7 @@ final class RelaydManager: ObservableObject {
         let key = profile.connectionKey
         RelayHostRegistry.shared.register(profile, origin: "Relay installation manager")
         guard operations[key] == nil else { return }
-        RelaydHostUpdateProgress.shared.hostChecked(key: key)
+        let checkStarted = Date()
         var checking = report(for: profile)
         checking.state = .checking
         checking.message = nil
@@ -684,8 +690,10 @@ final class RelaydManager: ObservableObject {
                 }
             }
             do {
-                let report = try await RelaydRemoteClient.check(profile: profile)
+                guard let check = self?.remoteCheck else { return }
+                let report = try await check(profile)
                 self?.reports[key] = report
+                self?.updateProgress.checkCompleted(key: key, startedAt: checkStarted)
                 RelayHostRegistry.shared.observe(report, profile: profile)
                 self?.append(
                     report.state == .missing ? "relayd is not installed" : "Status received from relayd \(report.version ?? "")",
@@ -704,6 +712,7 @@ final class RelaydManager: ObservableObject {
                     state: state, message: message, checkedAt: Date()
                 )
                 self?.reports[key] = report
+                self?.updateProgress.checkCompleted(key: key, startedAt: checkStarted)
                 RelayHostRegistry.shared.observeFailedCheck(report, profile: profile)
                 self?.append(message, kind: state, for: profile)
             }
@@ -721,6 +730,7 @@ final class RelaydManager: ObservableObject {
         let current = report(for: profile)
         guard current.state == .missing || current.state == .outdated
                 || (retrying && current.state == .failed && current.architecture != "—") else { return }
+        updateProgress.installStarted(key: key)
         var installing = current
         installing.state = .installing
         installing.message = "Uploading and verifying the user-scoped helper…"

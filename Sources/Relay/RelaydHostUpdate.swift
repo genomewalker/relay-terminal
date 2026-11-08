@@ -187,9 +187,10 @@ final class RelaydHostUpdateService {
 }
 
 /// The in-flight and last relayd update per host, observed by the Manage
-/// relayd host rail. Written only by RelaydHostUpdateService. A finished row
-/// stays for `finishedLifetime`, or until the host is checked again; an
-/// update still running (or past the service's limit) stays.
+/// relayd host rail. Written by RelaydHostUpdateService; RelaydManager
+/// reports completed checks and install starts. A finished row stays for
+/// `finishedLifetime`, or until a newer check completes or an install starts;
+/// an update still running (or past the service's limit) stays.
 @MainActor
 final class RelaydHostUpdateProgress: ObservableObject {
     static let shared = RelaydHostUpdateProgress()
@@ -243,8 +244,17 @@ final class RelaydHostUpdateProgress: ObservableObject {
         scheduleExpiry()
     }
 
-    /// The host's status is being checked again: its finished row is stale.
-    func hostChecked(key: String) {
+    /// A check of the host completed with a fresh report. It supersedes the
+    /// finished row only if it started after the update finished: the
+    /// update's own recheck, or one still running when it ended, does not.
+    /// Starting a check (opening Manage relayd) never clears the row.
+    func checkCompleted(key: String, startedAt: Date) {
+        guard let finished = entries[key]?.finishedAt, startedAt >= finished else { return }
+        entries[key] = nil
+    }
+
+    /// An explicit install of the host starts: its finished row is stale.
+    func installStarted(key: String) {
         guard entries[key]?.phase.finished == true else { return }
         entries[key] = nil
     }
