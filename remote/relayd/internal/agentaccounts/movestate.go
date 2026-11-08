@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // A Claude account move resumes the conversation with the target account's
@@ -29,6 +30,9 @@ const (
 type MoveOnboarding struct {
 	Status string `json:"status"`
 	Copied int    `json:"copied"`
+	// Links is the shared configuration linked into the target first
+	// (linkMoveTarget); empty for a move into the main account.
+	Links []LinkResult `json:"links,omitempty"`
 }
 
 // claudeUnanswered are allowlisted answers whose false is Claude's own
@@ -85,7 +89,10 @@ func PrepareClaudeMove(home, source, target, dir string) (MoveOnboarding, error)
 		return MoveOnboarding{}, errors.New("an accounts change is in progress; try the move again when it finishes")
 	}
 	defer unlock()
-	return prepareClaudeMoveFile(claudeAccountFile(home, from), claudeAccountFile(home, to), dir, to.Label)
+	links := linkMoveTarget(home, to, time.Now())
+	result, err := prepareClaudeMoveFile(claudeAccountFile(home, from), claudeAccountFile(home, to), dir, to.Label)
+	result.Links = links
+	return result, err
 }
 
 func registeredClaude(registry Registry, home, dir string) (Account, bool) {
@@ -345,4 +352,27 @@ func adoptAnswer(document, source map[string]json.RawMessage, key string) bool {
 		return true
 	}
 	return false
+}
+
+// linkMoveTarget links the main account's shared configuration (claudeLinks:
+// settings, CLAUDE.md, skills, agents, commands, plugins) into a move's target
+// account, so the moved agent starts with the user's status line, hooks,
+// plugins and permissions. It is the link step of Sync without the reviewed
+// MCP merge: an own file is kept as a timestamped backup, a link the user
+// pointed elsewhere is left alone, and nothing here refuses the move.
+func linkMoveTarget(home string, target Account, now time.Time) []LinkResult {
+	if target.Dir == "" {
+		return nil
+	}
+	main, root := defaultRoot(home, "claude"), target.Root(home)
+	if distinctRoots(main, root) != nil {
+		return nil
+	}
+	stamp := now.UTC().Format("20060102T150405Z")
+	links := make([]LinkResult, 0, len(claudeLinks))
+	for _, name := range claudeLinks {
+		destination := filepath.Join(root, name)
+		links = append(links, linkShared(filepath.Join(main, name), destination, observe(destination), stamp))
+	}
+	return links
 }
