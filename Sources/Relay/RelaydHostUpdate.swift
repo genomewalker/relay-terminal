@@ -125,6 +125,13 @@ final class RelaydHostUpdateService {
     /// this request's check and dispatch) and runs the bundled relayd. The
     /// manager's .ready already requires the installed payload hash to match
     /// the bundled one for an equal version.
+    ///
+    /// Known limits of pid evidence (accepted in bc08's 0.5.31 review): a
+    /// reused supervisor pid, or another actor replacing the supervisor in the
+    /// seconds between the pre-install check and dispatch, reads as
+    /// "installed"; with no supervisor before, any supervisor after counts as
+    /// replaced. A supervisor start time later than dispatch would close these;
+    /// the report does not carry one yet (a check-script change).
     private func settleByRecheck(profile: ConnectionProfile, requestID: UUID, before: RelaydHostReport, ended: String) async {
         let bundled = dependencies.bundledVersion
         guard let after = await dependencies.check(profile) else {
