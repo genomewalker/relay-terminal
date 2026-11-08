@@ -683,6 +683,14 @@ final class PaneModel: ObservableObject, Identifiable {
     }
     @Published private(set) var remoteClientCount: Int?
     @Published var remoteExitCode: Int?
+    /// Set when the program ended quickly or with a failure status; the pane
+    /// shows a danger banner instead of the session-ended notice.
+    @Published private(set) var exitNotice: PaneExitNotice?
+    /// When this app first saw the pane's program attached after a fresh launch.
+    /// nil for restored panes, whose start Relay did not observe.
+    private(set) var programAttachedAt: Date?
+    /// The user confirmed Terminate for this pane, so its exit is intentional.
+    var userRequestedTermination = false
     @Published var artifacts: [PaneArtifact] = []
     @Published var richContents: [RelaySurfaceContent] = []
     @Published var durableSurfaceContents: [RelaySurfaceContent] = []
@@ -1074,8 +1082,14 @@ final class PaneModel: ObservableObject, Identifiable {
         artifactError = nil
     }
 
-    func exited(exitCode: Int? = nil) {
+    func exited(exitCode: Int? = nil, now: Date = Date()) {
         remoteExitCode = exitCode
+        exitNotice = contentKind == .terminal ? PaneExitNotice.decide(
+            program: PaneExitNotice.programName(command: profile.command),
+            exitStatus: exitCode,
+            elapsed: programAttachedAt.map { now.timeIntervalSince($0) },
+            userInitiated: userRequestedTermination
+        ) : nil
         detector.markExited()
     }
 
@@ -1083,8 +1097,11 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var terminalInputDraftMessage: String?
     var terminalInputMessage: String? { terminalInputDraftMessage ?? terminalInputTransportMessage }
 
-    func connected() {
+    func connected(now: Date = Date()) {
         remoteExitCode = nil
+        exitNotice = nil
+        // Reconnects to the same worker keep the original start.
+        if programAttachedAt == nil, !requiresExistingWorker { programAttachedAt = now }
         RelayHostAgentMonitor.shared.expectHarnessChange(profile: profile, sessionID: id.uuidString.lowercased())
         if detector.phase == .connecting {
             detector.applyStructuredEvent(kind: detector.kind, phase: .active, excerpt: "Terminal connected")
@@ -1115,6 +1132,7 @@ final class PaneModel: ObservableObject, Identifiable {
     func reconnecting() {
         connectionRequested = true
         remoteExitCode = nil
+        exitNotice = nil
         connectionState = .connecting
         detector = AgentSignalDetector()
     }

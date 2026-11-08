@@ -3794,6 +3794,25 @@ private struct PaneView: View {
                         .padding(RelayTheme.spacing(12))
                 } else if pane.isRestoringTerminal && !pane.hasTerminalSnapshot {
                     RestoringTerminalOverlay(host: pane.profile.host)
+                } else if pane.remoteExitCode != nil, let notice = pane.exitNotice {
+                    // Bottom edge: a startup error is printed at the top of the
+                    // pane, so the banner leaves it readable.
+                    if !sessionEndedNoticeDismissed {
+                        FailedPaneExitBanner(
+                            notice: notice,
+                            runAgain: {
+                                NotificationCenter.default.post(name: .relayRestartExitedPane, object: pane.id)
+                            },
+                            close: {
+                                select()
+                                if let close { close() }
+                                else { NotificationCenter.default.post(name: .relayClosePane, object: pane.id) }
+                            },
+                            dismiss: { sessionEndedNoticeDismissed = true }
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                        .padding(RelayTheme.spacing(12))
+                    }
                 } else if let exitCode = pane.remoteExitCode, !sessionEndedNoticeDismissed {
                     SessionEndedOverlay(
                         exitCode: exitCode,

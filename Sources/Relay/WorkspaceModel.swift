@@ -908,6 +908,7 @@ final class WorkspaceModel: ObservableObject {
     func confirmTermination() {
         guard let paneID = terminationTargetID, let pane = panes[paneID] else { return }
         terminationTargetID = nil
+        pane.userRequestedTermination = true
         Task {
             do {
                 try await RemotePaneControlService.terminate(profile: pane.profile, paneID: paneID)
@@ -915,6 +916,7 @@ final class WorkspaceModel: ObservableObject {
                 revealPane(paneID, origin: .programmatic)
                 closeActivePane()
             } catch {
+                pane.userRequestedTermination = false
                 operationError = error.localizedDescription
             }
         }
