@@ -12,9 +12,18 @@ struct PaneExitNoticeTests {
         PaneExitNotice.decide(program: "ssh", exitStatus: status, elapsed: elapsed, userInitiated: user)
     }
 
-    @Test func aQuickExitIsExplainedEvenWithStatusZero() {
-        #expect(decide(0, 0)?.title == "ssh exited with status 0 after 0s")
-        #expect(decide(0, 9.9)?.title == "ssh exited with status 0 after 9.9s")
+    @Test func aQuickCleanExitIsInformationWithoutAStatus() {
+        #expect(decide(0, 0)?.title == "ssh exited after 0s")
+        #expect(decide(0, 9.9)?.title == "ssh exited after 9.9s")
+        #expect(decide(0, 9.9)?.role == .info)
+        #expect(decide(0, 9.9)?.isFailure == false)
+    }
+
+    @Test func onlyAFailureStatusOrSignalIsDanger() {
+        #expect(decide(1, 2)?.role == .danger)
+        #expect(decide(1, nil)?.role == .danger)
+        #expect(decide(-1, 2)?.role == .danger)
+        #expect(decide(nil, 2)?.role == .info)
     }
 
     @Test func theWindowEndsAtTenSeconds() {
@@ -189,36 +198,80 @@ struct PaneExitNoticeTests {
 
     // MARK: Snapshot
 
+    /// Magenta marks the final output line so a render can prove it is visible.
+    private static let lastLineMarker = NSColor(srgbRed: 1, green: 0, blue: 1, alpha: 1)
+
+    /// A terminal-like area: bottom-anchored like a real grid, clipped at the
+    /// top, with the banner as its own row underneath (as in WorkspaceView).
     private struct TerminalLikeArea: View {
         let notice: PaneExitNotice
+        let lines: [String]
         var body: some View {
-            ZStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("$ ssh -o BatchMode=yes login.hpc.example")
-                    Text("ssh: connect to host login.hpc.example port 22: Connection refused")
-                }
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(Color(white: 0.85))
-                .padding(10)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .background(Color(white: 0.09))
+            VStack(spacing: 0) {
+                // Like the terminal NSView, the grid takes the height it is
+                // given; the overlay never asks for its content's height.
+                Color(white: 0.09)
+                    .overlay(alignment: lines.count > 4 ? .bottomLeading : .topLeading) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+                                Text(line)
+                                    .background(index == lines.count - 1 ? Color(nsColor: PaneExitNoticeTests.lastLineMarker) : .clear)
+                            }
+                        }
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(Color(white: 0.85))
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(10)
+                    }
+                    .clipped()
                 FailedPaneExitBanner(notice: notice, runAgain: {}, close: {}, dismiss: {})
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    .padding(RelayTheme.spacing(12))
             }
             .frame(height: 240)
         }
     }
 
+    private static let startupError = [
+        "$ ssh -o BatchMode=yes login.hpc.example",
+        "ssh: connect to host login.hpc.example port 22: Connection refused",
+    ]
+
+    private static let fullScreen = (1...40).map { "build step \($0): compiling module \($0)" }
+        + ["error: linker command failed with exit code 1"]
+
+    private func markerPixels(_ bitmap: NSBitmapImageRep) -> Int {
+        var count = 0
+        for y in 0..<bitmap.pixelsHigh { for x in 0..<bitmap.pixelsWide {
+            guard let c = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+            // Tolerates the cached bitmap's colour-space conversion; nothing
+            // else in the scene is close to magenta (danger red has low blue).
+            if c.redComponent > 0.8, c.greenComponent < 0.4, c.blueComponent > 0.8 { count += 1 }
+        } }
+        return count
+    }
+
     @Test(arguments: [NSAppearance.Name.aqua, .darkAqua])
-    func theBannerRendersOverATerminal(appearance: NSAppearance.Name) throws {
-        let quick = try #require(PaneExitNotice.decide(program: "ssh", exitStatus: 255, elapsed: 1.4, userInitiated: false))
-        let wide = try RelaySnapshot.render(TerminalLikeArea(notice: quick), name: "failed-pane-wide",
-                                            width: 760, appearance: appearance)
+    func theBannerRendersUnderATerminal(appearance: NSAppearance.Name) throws {
+        let failed = try #require(PaneExitNotice.decide(program: "ssh", exitStatus: 255, elapsed: 1.4, userInitiated: false))
+        let wide = try RelaySnapshot.render(TerminalLikeArea(notice: failed, lines: Self.startupError),
+                                            name: "failed-pane-wide", width: 760, appearance: appearance)
         #expect(wide.size.height == 240)
         let unknown = try #require(PaneExitNotice.decide(program: "claude", exitStatus: 1, elapsed: nil, userInitiated: false))
-        let narrow = try RelaySnapshot.render(TerminalLikeArea(notice: unknown), name: "failed-pane-narrow",
-                                              width: 420, appearance: appearance)
+        let narrow = try RelaySnapshot.render(TerminalLikeArea(notice: unknown, lines: Self.startupError),
+                                              name: "failed-pane-narrow", width: 420, appearance: appearance)
         #expect(narrow.size.height == 240)
+        let clean = try #require(PaneExitNotice.decide(program: "Shell", exitStatus: 0, elapsed: 3, userInitiated: false))
+        _ = try RelaySnapshot.render(TerminalLikeArea(notice: clean, lines: Self.startupError),
+                                     name: "failed-pane-quick-clean", width: 760, appearance: appearance)
+    }
+
+    @Test(arguments: [NSAppearance.Name.aqua, .darkAqua])
+    func aFullScreenOfOutputKeepsItsLastLineVisible(appearance: NSAppearance.Name) throws {
+        let failed = try #require(PaneExitNotice.decide(program: "make", exitStatus: 2, elapsed: 95, userInitiated: false))
+        let shot = try RelaySnapshot.render(TerminalLikeArea(notice: failed, lines: Self.fullScreen),
+                                            name: "failed-pane-full-screen", width: 760, appearance: appearance)
+        #expect(shot.size.height == 240)
+        // The marked last line is drawn, not hidden under the banner.
+        #expect(markerPixels(shot.bitmap) > 200)
     }
 }

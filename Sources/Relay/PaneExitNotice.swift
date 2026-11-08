@@ -28,12 +28,16 @@ struct PaneExitNotice: Equatable, Sendable {
         return PaneExitNotice(program: program, exitStatus: exitStatus, elapsed: elapsed)
     }
 
+    /// A clean but quick exit is information, not an error.
+    var isFailure: Bool { exitStatus.map { $0 != 0 } ?? false }
+    var role: RelayTheme.StatusRole { isFailure ? .danger : .info }
+
     var title: String {
         let after = elapsed.map { " after \(Self.duration($0))" } ?? ""
         switch exitStatus {
         case .some(-1): return "\(program) was terminated\(after)"
-        case .some(let status): return "\(program) exited with status \(status)\(after)"
-        case .none: return "\(program) exited\(after)"
+        case .some(let status) where status != 0: return "\(program) exited with status \(status)\(after)"
+        default: return "\(program) exited\(after)"
         }
     }
 
@@ -61,7 +65,9 @@ struct PaneExitNotice: Equatable, Sendable {
     }
 }
 
-/// Compact danger banner for a pane that failed soon after starting.
+/// Compact banner for a pane that failed or ended soon after starting. It is
+/// laid out as its own row under the terminal so the last output lines stay
+/// visible.
 struct FailedPaneExitBanner: View {
     let notice: PaneExitNotice
     let runAgain: () -> Void
@@ -69,7 +75,7 @@ struct FailedPaneExitBanner: View {
     let dismiss: () -> Void
 
     var body: some View {
-        RelayBanner(role: .danger, title: notice.title, message: "The output above is kept.") {
+        RelayBanner(role: notice.role, title: notice.title, message: "The output above is kept.") {
             Button("Run again", action: runAgain)
                 .buttonStyle(RelayPrimaryButtonStyle())
                 .lineLimit(1).fixedSize()
@@ -81,8 +87,9 @@ struct FailedPaneExitBanner: View {
                 .accessibilityIdentifier("relay.failed-pane.close")
             RelayIconAction("Hide notice", symbol: "xmark", size: .compact, action: dismiss)
         }
-        .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.Radius.card, style: .continuous))
-        .frame(maxWidth: 560)
+        .padding(RelayTheme.Space.sm)
+        .frame(maxWidth: .infinity)
+        .background(RelayTheme.canvas)
         .accessibilityIdentifier("relay.failed-pane.banner")
     }
 }
