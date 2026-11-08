@@ -214,14 +214,42 @@ enum RelayPaneHealthHostControllerRPC {
         }
         let payload = RelayPaneHealthJSON.object(["request_id": .string("rpc-" + UUID().uuidString.lowercased()),
             "operation": .string("host_accounts"), "host_accounts": .object(["request": .object(request)])])
-        let data = try RelayPaneHealthJSON.data(payload)
+        // Encoding and decoding run off the main actor. A status reply carries
+        // every pane observation; parsing it on the main thread cost ~160-240 ms
+        // per sync in the 0.5.36 idle profile and stalled the UI each time.
+        let data = try await Task.detached(priority: .utility) { try RelayPaneHealthJSON.data(payload) }.value
         let raw = try await RelayNodeTransportPool.shared.request(profile: profile, payload: data,
             requiredCapability: "host_pane_health_controller_v1", timeoutSeconds: 35)
         try Task.checkCancellation()
-        let envelope = try JSONDecoder().decode(RelayPaneHealthJSON.self, from: raw)
-        if let error = envelope["error"]?.string { throw RelayHostRotationRPC.Failure.refused(String(error.prefix(240))) }
-        guard let result = envelope["result"] else { throw RelayHostRotationRPC.Failure.invalidResponse }
+        let reply = try await Task.detached(priority: .utility) { try decodeReply(raw) }.value
+        try Task.checkCancellation()
+        return reply
+    }
+
+    /// One typed pass over the reply envelope. Same outcomes as the former
+    /// generic-JSON decode and re-encode: a string `error` is a refusal (even
+    /// when `result` is malformed), a missing `result` is invalid, and the
+    /// result is decoded with snake_case keys.
+    nonisolated static func decodeReply(_ raw: Data) throws -> RelayPaneHealthHostControllerStatus {
         let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(RelayPaneHealthHostControllerStatus.self, from: RelayPaneHealthJSON.data(result))
+        let envelope = try decoder.decode(ReplyEnvelope.self, from: raw)
+        if let error = envelope.error { throw RelayHostRotationRPC.Failure.refused(String(error.prefix(240))) }
+        guard let result = envelope.result else { throw RelayHostRotationRPC.Failure.invalidResponse }
+        return result
+    }
+
+    private struct ReplyEnvelope: Decodable {
+        let error: String?
+        let result: RelayPaneHealthHostControllerStatus?
+        private enum CodingKeys: String, CodingKey { case error, result }
+        init(from decoder: Decoder) throws {
+            // A non-object reply had no `result` before: invalid, not a DecodingError.
+            guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+                error = nil; result = nil; return
+            }
+            // A non-string `error` was ignored before; keep ignoring it.
+            error = (try? container.decodeIfPresent(String.self, forKey: .error)) ?? nil
+            result = error == nil ? try container.decodeIfPresent(RelayPaneHealthHostControllerStatus.self, forKey: .result) : nil
+        }
     }
 }
