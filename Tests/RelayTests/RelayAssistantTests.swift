@@ -116,6 +116,24 @@ private final class FakeRelayAssistantModel: RelayAssistantModel {
 
 }
 
+/// A tool result as the harness recorded it in the exchange's tool trace.
+/// When a tool's outcome is unresolved (unknown, partial, submitted,
+/// written_to_socket, ...) the harness saves the task, stops and does not hand
+/// the result back to the model, so the trace is where that result is observed.
+@MainActor
+fileprivate func tracedResult(_ exchange: RelayAssistantExchange?, _ tool: String) -> RelayPaneHealthJSON? {
+    guard let trace = exchange?.toolTrace.last, trace.name == tool else { return nil }
+    return try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(trace.result.utf8))
+}
+
+/// The harness stopped on `tool`'s unresolved outcome and said it must not be replayed.
+@MainActor
+fileprivate func stoppedUnresolved(_ exchange: RelayAssistantExchange?, after tool: String) -> Bool {
+    guard let exchange else { return false }
+    return exchange.failed && exchange.reply.contains("Task saved with an unresolved outcome for " + tool)
+        && exchange.reply.contains("do not replay it")
+}
+
 fileprivate extension RelayAssistantModelStep {
     static func tool(_ name: String, _ input: [String: RelayPaneHealthJSON], id: String = UUID().uuidString.prefix(8).description) -> RelayAssistantModelStep {
         let call = RelayPaneHealthToolCall(type: "tool_use", id: "toolu_" + id, name: name, input: .object(input))
@@ -628,7 +646,7 @@ struct RelayAssistantChangeActionTests {
         #expect(exchange.toolLog == ["send_command · cancelled"])
     }
 
-    @Test("Run executes exactly the shown request once and returns the result to the model")
+    @Test("Run executes exactly the shown request once; the unresolved submission is recorded and the model is not asked again")
     func runExecutesOnceWithShownArguments() async throws {
         let f = try fixture([])
         defer { f.workspace.shutdown() }
@@ -637,7 +655,7 @@ struct RelayAssistantChangeActionTests {
         let card = try await waitForCard(f.assistant)
         f.assistant.runCard()
         f.assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         #expect(f.executor.calls.count == 1)
         let call = try #require(f.executor.calls.first)
         #expect(call.method == card.method && call.path == card.path && call.body == card.body)
@@ -647,7 +665,10 @@ struct RelayAssistantChangeActionTests {
         #expect(sent["expectedInputRevision"] as? Int == 7)
         #expect(card.literal == "make test↵\nmake lint")
         // input-direct answers 200 with submitted_outcome_unknown: submitted, not proven to have run.
-        #expect(lastResult(f.model)?["outcome"]?.string == "unknown")
+        // An unresolved outcome is recorded and the task stops: no further model request.
+        #expect(tracedResult(exchange, "send_command")?["outcome"]?.string == "unknown")
+        #expect(f.model.requests.count == 1)
+        #expect(stoppedUnresolved(exchange, after: "send_command"))
         #expect(outcomes(f.audit, "send_command") == ["proposed", "dispatched", "unknown"])
         let record = try #require(f.audit.audit().last { $0.operation == "send_command" })
         #expect(record.actionID == card.id.uuidString.lowercased() && record.argumentsDigest == card.argumentsDigest)
@@ -1404,8 +1425,10 @@ struct RelayAssistantPlanTests {
         let task = Task { await assistant.run("three panes") }
         _ = try await waitForCard(assistant)
         assistant.runCard()
-        _ = await task.value
-        let value = try #require(result(model))
+        let exchange = await task.value
+        // A partial outcome is unresolved: recorded in the trace, the task stops, the model is not asked again.
+        #expect(model.requests.count == 1 && stoppedUnresolved(exchange, after: "new_tab_layout"))
+        let value = try #require(tracedResult(exchange, "new_tab_layout"))
         #expect(value["outcome"]?.string == "partial")
         #expect(value["new_pane_ids"]?.array?.count == 1)
         #expect(value["steps"]?.array?.map { $0["outcome"]?.string ?? "" } == ["ran", "failed"])
@@ -1469,9 +1492,10 @@ struct RelayAssistantPlanTests {
         let task = Task { await assistant.run("plan") }
         _ = try await waitForCard(assistant)
         assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         #expect(executor.mutations.map(\.path) == ["/api/workspace/apply", "/api/workspace/apply"])
-        #expect(result(model)?["outcome"]?.string == "partial")
+        #expect(tracedResult(exchange, "propose_plan")?["outcome"]?.string == "partial")
+        #expect(model.requests.count == 1 && stoppedUnresolved(exchange, after: "propose_plan"))
     }
 
     @Test("Cancel or expiry of a plan card runs no step")
@@ -1679,7 +1703,7 @@ struct RelayAssistantDraftFenceTests {
     }
 
     private func run(after change: @escaping (Box<UInt64>, Box<Bool>) -> Void) async throws
-        -> (sent: [String], outcome: String?, receipts: [String]) {
+        -> (sent: [String], outcome: String?, receipts: [String], exchange: RelayAssistantExchange?, modelRequests: Int) {
         let workspace = WorkspaceModel(restoreSavedWorkspace: false)
         defer { workspace.shutdown() }
         let pane = try #require(workspace.activePaneID).uuidString.lowercased()
@@ -1701,11 +1725,11 @@ struct RelayAssistantDraftFenceTests {
         #expect(shown.rows.contains { $0.label == "Prompt" && $0.value.hasPrefix("empty ✓ (input revision 41") })
         change(revision, empty)
         assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         let text = model.requests.last?.messages.last?["content"]?.array?.first?["content"]?.string ?? "{}"
         let result = try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(text.utf8))
         return (executor.sent, result?["outcome"]?.string,
-                audit.audit().filter { $0.operation == "send_command" }.map(\.outcome))
+                audit.audit().filter { $0.operation == "send_command" }.map(\.outcome), exchange, model.requests.count)
     }
 
     @Test("A draft typed after the card was shown refuses Run; nothing is sent")
@@ -1731,7 +1755,10 @@ struct RelayAssistantDraftFenceTests {
     @Test("An empty, unchanged prompt sends exactly once")
     func emptySendsOnce() async throws {
         let result = try await run { _, _ in }
-        #expect(result.sent == ["make test"] && result.outcome == "unknown")
+        #expect(result.sent == ["make test"])
+        // The submission is unresolved: recorded in the trace, never returned to or re-requested from the model.
+        #expect(tracedResult(result.exchange, "send_command")?["outcome"]?.string == "unknown")
+        #expect(result.modelRequests == 1 && stoppedUnresolved(result.exchange, after: "send_command"))
         #expect(result.receipts == ["proposed", "dispatched", "unknown"])
     }
 
@@ -1990,13 +2017,21 @@ struct RelayAssistantMemoryProfileTests {
             { _ in .tool("read_handoff", ["checkpoint_key": .string("--key:x")]) },
             { _ in .tool("read_handoff", ["memory_id": .string("1"), "checkpoint_key": .string(key)]) },
             { _ in .tool("read_handoff", [:]) },
+            { _ in .text("ok") },
+            // A second request, so each request stays under the 7-tool checkpoint and
+            // every result reaches the model as its own tool_result block.
             { _ in .tool("read_handoff", ["checkpoint_key": .string("s:preview")]) },
             { _ in .text("ok") }])
-        _ = await harness(workspace, model, memory: memory, executor: ScriptedExecutor { _, _, _ in (500, Data()) }).run("read the handoff")
+        let assistant = harness(workspace, model, memory: memory, executor: ScriptedExecutor { _, _, _ in (500, Data()) })
+        _ = await assistant.run("read the handoff")
+        _ = await assistant.run("read the preview checkpoint")
         #expect(memory.exactLookups == [.memory("6746197722732167252"), .checkpoint(key), .checkpoint("s:preview")], "\(memory.exactLookups)")
         // The workflow profile's own recall is not a tool result: no result may carry the fuzzy match.
         #expect(!model.requests.contains { String(describing: $0.messages).contains("a different, fuzzy handoff") })
-        let results = model.requests.dropFirst().map { request -> (RelayPaneHealthJSON?, Bool) in
+        // Requests 0-5 each answer with a call, 6 with text; request 7 starts the second run, 8 answers.
+        try #require(model.requests.count == 9)
+        #expect(!model.requests.contains { String(describing: $0.messages).contains("Continuing the same task") })
+        let results = [1, 2, 3, 4, 5, 6, 8].map { model.requests[$0] }.map { request -> (RelayPaneHealthJSON?, Bool) in
             let block = request.messages.last?["content"]?.array?.first
             return (try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data((block?["content"]?.string ?? "{}").utf8)),
                     block?["is_error"]?.boolean == true)
@@ -2132,7 +2167,8 @@ struct RelayAssistantLaunchAndFolderTests {
         }
     }
 
-    private func startCodexPlan(change: ((Box<String>) -> Void)?) async throws -> (ScriptedExecutor, RelayPaneHealthJSON?, [String]) {
+    private func startCodexPlan(change: ((Box<String>) -> Void)?) async throws
+        -> (ScriptedExecutor, RelayPaneHealthJSON?, [String], RelayAssistantExchange?, Int) {
         let workspace = WorkspaceModel(restoreSavedWorkspace: false)
         defer { workspace.shutdown() }
         let pane = try #require(workspace.activePaneID).uuidString.lowercased()
@@ -2151,15 +2187,15 @@ struct RelayAssistantLaunchAndFolderTests {
         #expect(shown.rows.contains { $0.label == "Step 1 launch" && $0.value.contains("codex --sandbox read-only --ask-for-approval on-request") })
         change?(defaults)
         assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         let text = model.requests.last?.messages.last?["content"]?.array?.first?["content"]?.string ?? "{}"
         return (executor, try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(text.utf8)),
-                audit.audit().filter { $0.operation?.contains("step1") == true }.map(\.outcome))
+                audit.audit().filter { $0.operation?.contains("step1") == true }.map(\.outcome), exchange, model.requests.count)
     }
 
     @Test("A launch-defaults change while the card waits refuses Run; nothing is typed")
     func launchContractChangeRefused() async throws {
-        let (executor, result, receipts) = try await startCodexPlan { defaults in
+        let (executor, result, receipts, _, _) = try await startCodexPlan { defaults in
             defaults.value = #"{"version":1,"sandbox_mode":"danger-full-access","approval_policy":"never"}"#
         }
         #expect(executor.mutations.isEmpty)
@@ -2168,17 +2204,19 @@ struct RelayAssistantLaunchAndFolderTests {
 
     @Test("Unreadable launch defaults at Run refuse as unavailable")
     func launchDefaultsUnavailableAtRun() async throws {
-        let (executor, result, receipts) = try await startCodexPlan { defaults in defaults.value = "not json" }
+        let (executor, result, receipts, _, _) = try await startCodexPlan { defaults in defaults.value = "not json" }
         #expect(executor.mutations.isEmpty && result?["outcome"]?.string == "refused" && receipts == ["unavailable"])
     }
 
     @Test("An unchanged contract types exactly the frozen launch command once")
     func launchContractFrozenCommand() async throws {
-        let (executor, result, _) = try await startCodexPlan(change: nil)
+        let (executor, _, _, exchange, modelRequests) = try await startCodexPlan(change: nil)
         #expect(executor.mutations.count == 1)
         let body = try #require(try JSONSerialization.jsonObject(with: executor.mutations[0].body) as? [String: Any])
         #expect(body["text"] as? String == "env -u CODEX_HOME \"$HOME\"/.local/share/relay/shims/codex --sandbox read-only --ask-for-approval on-request")
-        #expect(result?["outcome"]?.string == "unknown")
+        // The typed launch is unresolved: recorded in the trace, the task stops, the model is not asked again.
+        #expect(tracedResult(exchange, "propose_plan")?["outcome"]?.string == "unknown")
+        #expect(modelRequests == 1 && stoppedUnresolved(exchange, after: "propose_plan"))
     }
 
     private func folderHost() -> ScriptedExecutor {
@@ -2255,7 +2293,7 @@ private final class LossyMemoryStore: RelayAssistantMemoryStore {
 @Suite("RelayAssistantMemoryWriteOutcome", .serialized)
 @MainActor
 struct RelayAssistantMemoryWriteOutcomeTests {
-    private func run(_ store: LossyMemoryStore) async throws -> (String?, [String]) {
+    private func run(_ store: LossyMemoryStore) async throws -> (String?, [String], RelayAssistantExchange?, Int) {
         let workspace = WorkspaceModel(restoreSavedWorkspace: false)
         defer { workspace.shutdown() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("relay-memwrite-" + UUID().uuidString)
@@ -2269,22 +2307,27 @@ struct RelayAssistantMemoryWriteOutcomeTests {
         for _ in 0..<1000 where assistant.pendingCard == nil { try await Task.sleep(nanoseconds: 2_000_000) }
         #expect(store.writes == 0)
         assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         let text = model.requests.last?.messages.last?["content"]?.array?.first?["content"]?.string ?? "{}"
         let result = try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(text.utf8))
-        return (result?["outcome"]?.string, audit.audit().filter { $0.operation == "remember" }.map(\.outcome))
+        return (result?["outcome"]?.string, audit.audit().filter { $0.operation == "remember" }.map(\.outcome),
+                exchange, model.requests.count)
     }
 
     @Test("A write that ran but lost its receipt is unknown, recorded once and never replayed")
     func lostReceiptIsUnknown() async throws {
         let store = LossyMemoryStore(.writesThenLosesReceipt)
-        let (outcome, receipts) = try await run(store)
-        #expect(store.writes == 1 && outcome == "unknown" && receipts == ["proposed", "dispatched", "unknown"])
+        let (_, receipts, exchange, modelRequests) = try await run(store)
+        #expect(store.writes == 1)
+        #expect(receipts == ["proposed", "dispatched", "unknown"])
+        // The unknown outcome is recorded in the trace; the task stops and the model is not asked again.
+        #expect(tracedResult(exchange, "remember")?["outcome"]?.string == "unknown")
+        #expect(modelRequests == 1 && stoppedUnresolved(exchange, after: "remember"))
     }
 
     @Test("A write that never started is failed")
     func notStartedIsFailed() async throws {
-        let (outcome, receipts) = try await run(LossyMemoryStore(.notStarted))
+        let (outcome, receipts, _, _) = try await run(LossyMemoryStore(.notStarted))
         #expect(outcome == "failed" && receipts == ["proposed", "dispatched", "failed"])
     }
 
@@ -2336,7 +2379,7 @@ struct RelayAssistantFreshPaneTests {
     }
 
     private func run(observed: String?, proofs: [RelayAssistantInputFence.Proof?]) async throws
-        -> (typed: [String], result: RelayPaneHealthJSON?, receipts: [String]) {
+        -> (typed: [String], result: RelayPaneHealthJSON?, receipts: [String], exchange: RelayAssistantExchange?, modelRequests: Int) {
         let workspace = WorkspaceModel(restoreSavedWorkspace: false)
         defer { workspace.shutdown() }
         let source = try #require(workspace.activePane)
@@ -2362,31 +2405,33 @@ struct RelayAssistantFreshPaneTests {
         let task = Task { await assistant.run("open fqdup with codex") }
         for _ in 0..<1000 where assistant.pendingCard == nil { try await Task.sleep(nanoseconds: 2_000_000) }
         assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         let text = model.requests.last?.messages.last?["content"]?.array?.first?["content"]?.string ?? "{}"
         return (typed.value, try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(text.utf8)),
-                audit.audit().filter { $0.operation?.contains("step2") == true }.map(\.outcome))
+                audit.audit().filter { $0.operation?.contains("step2") == true }.map(\.outcome), exchange, model.requests.count)
     }
 
     private let empty = RelayAssistantInputFence.Proof(empty: true, inputRevision: 3)
 
     @Test("A new pane whose real cwd is not the requested directory is refused before typing")
     func directoryMismatchRefused() async throws {
-        let (typed, result, receipts) = try await run(observed: "/home/kbd606", proofs: [empty])
+        let (typed, _, receipts, exchange, modelRequests) = try await run(observed: "/home/kbd606", proofs: [empty])
         #expect(typed.isEmpty && receipts == ["directory_mismatch"])
-        #expect(result?["outcome"]?.string == "partial")
+        // The plan is partial (a pane was created, the launch refused): unresolved, so the task stops here.
+        #expect(tracedResult(exchange, "propose_plan")?["outcome"]?.string == "partial")
+        #expect(modelRequests == 1 && stoppedUnresolved(exchange, after: "propose_plan"))
     }
 
     @Test("A new pane in the requested directory proceeds and types the frozen launch command once")
     func directoryMatchProceeds() async throws {
-        let (typed, _, receipts) = try await run(observed: "/maps/projects/fernandezguerra/apps/repos/fqdup", proofs: [empty])
+        let (typed, _, receipts, _, _) = try await run(observed: "/maps/projects/fernandezguerra/apps/repos/fqdup", proofs: [empty])
         #expect(typed == ["env -u CODEX_HOME \"$HOME\"/.local/share/relay/shims/codex --sandbox read-only --ask-for-approval on-request"] && receipts == ["unknown"])
     }
 
     @Test("A fresh prompt still drawing is waited for, then typed")
     func freshPromptWaitedFor() async throws {
         let drawing = RelayAssistantInputFence.Proof(empty: false, inputRevision: 3, draft: false)
-        let (typed, _, _) = try await run(observed: "/maps/projects/fernandezguerra/apps/repos/fqdup",
+        let (typed, _, _, _, _) = try await run(observed: "/maps/projects/fernandezguerra/apps/repos/fqdup",
                                           proofs: [drawing, drawing, empty])
         #expect(typed.count == 1)
     }
@@ -2394,7 +2439,7 @@ struct RelayAssistantFreshPaneTests {
     @Test("A typed draft in the new pane is refused as draft_present, never typed into")
     func draftInNewPaneRefused() async throws {
         let draft = RelayAssistantInputFence.Proof(empty: false, inputRevision: 3, draft: true)
-        let (typed, _, receipts) = try await run(observed: "/maps/projects/fernandezguerra/apps/repos/fqdup", proofs: [draft])
+        let (typed, _, receipts, _, _) = try await run(observed: "/maps/projects/fernandezguerra/apps/repos/fqdup", proofs: [draft])
         #expect(typed.isEmpty && receipts == ["draft_present"])
     }
 
@@ -2505,9 +2550,12 @@ struct RelayAssistantMessagingTests {
                 && !identity.contains("kernel_verified") && !identity.contains("signed"))
         #expect(shown.rows.contains { $0.label == "Recipient handling" && $0.value.contains("may require approval") })
         f.assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         #expect(f.port.sent.count == 1 && f.port.sent[0].messageID == shown.id && f.port.sent[0].text == "Please run the tests\tnow.")
-        #expect(result(f.model)?["outcome"]?.string == "ran" && result(f.model)?["source_authentication"]?.string == "relay_assistant_owner_submitted")
+        // Written to the socket but not yet read is unresolved: recorded in the trace, the task stops there.
+        let sent = tracedResult(exchange, "message_pane")
+        #expect(sent?["outcome"]?.string == "ran" && sent?["source_authentication"]?.string == "relay_assistant_owner_submitted")
+        #expect(f.model.requests.count == 1 && stoppedUnresolved(exchange, after: "message_pane"))
         #expect(receipts(f.audit) == ["proposed", "dispatched", "ran"])
         #expect(f.assistant.exchanges.last?.messages.first?.status == "written_to_socket")
         await f.assistant.refreshReceipt(shown.id)
@@ -2532,9 +2580,11 @@ struct RelayAssistantMessagingTests {
             #expect(shown.tool == .messagePane && shown.path == "relayd:assistant_send" && shown.literal == "Please rebase onto main when you are idle.")
             #expect(shown.rows.contains { $0.label == "Identity" && $0.value.hasPrefix("relay_assistant_owner_submitted") })
             f.assistant.runCard()
-            _ = await task.value
+            let exchange = await task.value
             #expect(f.port.sent.count == 1 && f.port.sent[0].text == "Please rebase onto main when you are idle.")
-            #expect(result(f.model)?["rerouted"]?.string?.contains("message_pane") == true)
+            // The trace keeps the model's tool name; the delivered message is unresolved, so the task stops there.
+            #expect(tracedResult(exchange, "send_command")?["rerouted"]?.string?.contains("message_pane") == true)
+            #expect(f.model.requests.count == 1 && stoppedUnresolved(exchange, after: "send_command"))
             #expect(f.assistant.exchanges.last?.toolLog.last?.hasPrefix("send_command → message_pane") == true)
         }
     }
@@ -2863,10 +2913,12 @@ struct RelayAssistantFreshPaneCwdFenceTests {
         let task = Task { await assistant.run("open fqdup and run the tests") }
         for _ in 0..<1000 where assistant.pendingCard == nil { try await Task.sleep(nanoseconds: 2_000_000) }
         assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         #expect(typed.isEmpty)
-        let text = model.requests.last?.messages.last?["content"]?.array?.first?["content"]?.string ?? "{}"
+        // The plan is partial (pane created, command refused): recorded in the trace, the task stops there.
+        let text = try #require(exchange?.toolTrace.last { $0.name == "propose_plan" }?.result)
         #expect(text.contains("input_changed"))
+        #expect(model.requests.count == 1 && stoppedUnresolved(exchange, after: "propose_plan"))
     }
 }
 
@@ -2992,12 +3044,15 @@ struct RelayAssistantPlanMessagingTests {
         let shown = try await card(f.assistant)
         #expect(shown.planSteps.map(\.op) == [.newTab, .startAgent, .message] && shown.blockedReason == nil)
         f.assistant.runCard()
-        _ = await task.value
+        let exchange = await task.value
         #expect(f.typed.value == ["env -u CLAUDE_CONFIG_DIR \"$HOME\"/.local/share/relay/shims/claude"] && f.port.sent.isEmpty)
-        let steps = result(f.model)?["steps"]?.array ?? []
+        // The plan is partial: recorded in the trace, the task stops and the model is not asked again.
+        let planResult = tracedResult(exchange, "propose_plan")
+        let steps = planResult?["steps"]?.array ?? []
         #expect(steps.last?["op"]?.string == "message" && steps.last?["outcome"]?.string == "refused"
                 && steps.last?["detail"]?.string?.hasPrefix("recipient_unverified") == true)
-        #expect(result(f.model)?["outcome"]?.string == "partial")
+        #expect(planResult?["outcome"]?.string == "partial")
+        #expect(f.model.requests.count == 1 && stoppedUnresolved(exchange, after: "propose_plan"))
     }
 
     @Test("The root's contrast requests become message steps in a plan")
