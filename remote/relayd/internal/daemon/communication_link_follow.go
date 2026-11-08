@@ -89,11 +89,15 @@ func communicationLinkFollowAll(root string, link communicationLink, live map[st
 }
 
 func communicationAppendRepin(root, linkID string, record map[string]any) error {
+	return communicationAppendRepinFile(root, "link-"+linkID+".repins.jsonl", record)
+}
+
+func communicationAppendRepinFile(root, name string, record map[string]any) error {
 	line, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(filepath.Join(root, "link-"+linkID+".repins.jsonl"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
+	file, err := os.OpenFile(filepath.Join(root, name), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
 	if err != nil {
 		return err
 	}

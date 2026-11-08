@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -40,6 +41,19 @@ type CommunicationRemoteLink struct {
 	Retired            bool      `json:"retired"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
+	// LocalPID and LocalStart pin the local member's process, learned from
+	// kernel observation on the first use that matches LocalConversation. A
+	// conversation change in that same process (/clear) is followed.
+	LocalPID   int    `json:"local_pid,omitempty"`
+	LocalStart string `json:"local_start,omitempty"`
+	// LocalFollowedFrom lists earlier conversations of the local member in the
+	// pinned process that the peer may still name, oldest first. It is sent to
+	// the peer with each message and cleared once the peer names the current one.
+	LocalFollowedFrom []communicationPinnedConversation `json:"local_followed_from,omitempty"`
+	// PeerFollowedFrom lists earlier peer conversations this host followed,
+	// oldest first, so a message the peer sent before its change (for example
+	// one the carrier delivers late) is still accepted. Bounded like the above.
+	PeerFollowedFrom []communicationPinnedConversation `json:"peer_followed_from,omitempty"`
 }
 
 type communicationRemoteMessage struct {
@@ -58,6 +72,9 @@ type communicationRemoteMessage struct {
 	MessageID          string                          `json:"message_id"`
 	Fingerprint        string                          `json:"fingerprint"`
 	Text               string                          `json:"text,omitempty"`
+	// SourceFollowedFrom is the sender's LocalFollowedFrom: earlier conversations
+	// of the sending pane in the same process. Covered by the fingerprint.
+	SourceFollowedFrom []communicationPinnedConversation `json:"source_followed_from,omitempty"`
 	// SourceSignature is the sender's session-signed statement for this
 	// message, issued by the sending node's relayd. It is outside the
 	// fingerprint, so older peers ignore it and deliver a claimed label.
@@ -95,7 +112,9 @@ func validRemoteLink(link CommunicationRemoteLink, node string) bool {
 		!canonicalRouteToken(link.LocalPaneID) || !canonicalRouteToken(link.PeerPaneID) || !canonicalRouteToken(link.RouteID) || link.RouteRevision == 0 ||
 		link.ID != remotePairID(node, link.LocalPaneID, link.PeerNodeID, link.PeerPaneID) || !remoteDigest(link.PeerCertificateSHA256) ||
 		!validRemoteConversation(link.LocalConversation) || !validRemoteConversation(link.PeerConversation) || link.PeerRevision == 0 || link.Revision == 0 ||
-		link.CreatedAt.IsZero() || link.UpdatedAt.Before(link.CreatedAt) || len(link.AllowedPeerCallers) == 0 || len(link.AllowedPeerCallers) > 128 {
+		link.CreatedAt.IsZero() || link.UpdatedAt.Before(link.CreatedAt) || len(link.AllowedPeerCallers) == 0 || len(link.AllowedPeerCallers) > 128 ||
+		link.LocalPID < 0 || len(link.LocalStart) > 64 || !validFollowedFrom(link.LocalFollowedFrom, link.LocalConversation) ||
+		!validFollowedFrom(link.PeerFollowedFrom, link.PeerConversation) {
 		return false
 	}
 	previous := ""
@@ -304,7 +323,8 @@ func validRemoteMessage(message communicationRemoteMessage, node string) bool {
 		canonicalRouteToken(message.SourceNodeID) && message.SourceNodeID != node && canonicalRouteToken(message.SourcePaneID) && canonicalRouteToken(message.TargetPaneID) &&
 		canonicalRouteToken(message.CallerID) && canonicalRouteToken(message.MessageID) && remoteDigest(message.Fingerprint) &&
 		message.LinkID == remotePairID(node, message.TargetPaneID, message.SourceNodeID, message.SourcePaneID) &&
-		message.SourceLinkRevision != 0 && message.TargetLinkRevision != 0 && validRemoteConversation(message.SourceConversation) && validRemoteConversation(message.TargetConversation)
+		message.SourceLinkRevision != 0 && message.TargetLinkRevision != 0 && validRemoteConversation(message.SourceConversation) && validRemoteConversation(message.TargetConversation) &&
+		validFollowedFrom(message.SourceFollowedFrom, message.SourceConversation)
 }
 func remoteReceiptPath(root, peer, id string) string {
 	digest := sha256.Sum256([]byte(peer + "\n" + id))
@@ -334,8 +354,14 @@ func authorizeRemoteMessage(root, node, certificateHash string, message communic
 	}
 	if link.Retired || link.Revision != message.TargetLinkRevision || link.PeerRevision != message.SourceLinkRevision ||
 		link.PeerNodeID != message.SourceNodeID || link.PeerPaneID != message.SourcePaneID || link.LocalPaneID != message.TargetPaneID ||
-		link.LocalConversation != message.TargetConversation || link.PeerConversation != message.SourceConversation ||
 		!containsCommunicationPane(link.AllowedPeerCallers, message.CallerID) {
+		return link, errors.New("remote pair permission or reviewed conversation changed")
+	}
+	// A receipt query only reads the durable receipt its fingerprint names, so
+	// a conversation followed since the message was sent does not block it.
+	// A send must name the current conversations, or ones they followed from
+	// in the same process (see communication_remote_follow.go).
+	if message.Operation == "send" && (!remoteAcceptsTarget(link, message.TargetConversation) || !remoteAcceptsSource(link, message)) {
 		return link, errors.New("remote pair permission or reviewed conversation changed")
 	}
 	route, _, cert, err := activePeerRoute(root, node, link.RouteID)
@@ -414,15 +440,38 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		// A recipient pane that ran /clear in the same process keeps the pair;
+		// the message also tells this host which conversation the sender is in.
+		before := link
+		followed, moved, err := remoteLinkFollowLocal(link, target)
+		if err != nil {
+			if err.Error() == communicationLinkRelinkNeeded {
+				return err
+			}
+			return errors.New("reviewed recipient conversation changed or is unavailable")
+		}
+		var audit []map[string]any
+		if moved {
+			audit = append(audit, remoteFollowAudit(followed, link))
+		}
+		followed, learned := remoteLinkLearnFromMessage(followed, message)
+		audit = append(audit, learned...)
+		link = followed
 		if link.DesktopAccountRoot != "" {
 			// A desktop session replies only in the account it was approved in.
-			endpoint, err := readClaudeSessionEndpoint(root, message.TargetConversation.SessionID)
+			endpoint, err := readClaudeSessionEndpoint(root, link.LocalConversation.SessionID)
 			if err != nil || endpoint.AccountRoot != link.DesktopAccountRoot {
 				return errors.New("desktop session registration changed; reply refused")
 			}
 		}
 		if !communicationPinMatches(link.LocalConversation, target) {
 			return errors.New("reviewed recipient conversation changed or is unavailable")
+		}
+		if !reflect.DeepEqual(before, link) {
+			if err := communicationAtomic(remoteLinkPath(root, link.ID), link); err != nil {
+				return err
+			}
+			remoteAppendRepins(root, link.ID, audit...)
 		}
 		receipt = communicationRemoteReceipt{Version: 1, NodeID: node, PeerNodeID: message.SourceNodeID, LinkID: message.LinkID,
 			SourcePaneID: message.SourcePaneID, TargetPaneID: message.TargetPaneID, CallerID: message.CallerID, MessageID: message.MessageID,

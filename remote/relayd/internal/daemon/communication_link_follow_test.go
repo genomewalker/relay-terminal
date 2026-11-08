@@ -32,8 +32,16 @@ func TestLinkFollowsAConversationChangeOnlyInTheSameProcess(t *testing.T) {
 		{"resumed_in_new_process", followMember("old-session", 5151, "linux:200"), true, ""},
 		{"new_process_new_session", followMember("new-session", 5151, "linux:200"), false, "relink needed"},
 		{"pid_reused_by_another_process", followMember("new-session", 4242, "linux:999"), false, "relink needed"},
-		{"other_provider", func() communicationMember { m := followMember("new-session", 4242, "linux:100"); m.Provider = "codex"; return m }(), false, "conversation changed"},
-		{"no_endpoint", func() communicationMember { m := followMember("new-session", 4242, "linux:100"); m.Endpoint = nil; return m }(), false, "conversation changed"},
+		{"other_provider", func() communicationMember {
+			m := followMember("new-session", 4242, "linux:100")
+			m.Provider = "codex"
+			return m
+		}(), false, "conversation changed"},
+		{"no_endpoint", func() communicationMember {
+			m := followMember("new-session", 4242, "linux:100")
+			m.Endpoint = nil
+			return m
+		}(), false, "conversation changed"},
 		{"unavailable", func() communicationMember {
 			m := followMember("new-session", 4242, "linux:100")
 			m.Unavailable = "no verified endpoint"

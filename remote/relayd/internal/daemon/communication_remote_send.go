@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -207,8 +208,21 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 			if err != nil {
 				return err
 			}
-			if current.Retired || current.Revision != link.Revision || !communicationPinMatches(current.LocalConversation, source) {
+			if current.Retired || current.Revision != link.Revision {
 				return errors.New("reviewed source conversation or pair changed")
+			}
+			// A sending pane that ran /clear in the same process keeps the pair;
+			// the message tells the peer which conversation it followed from.
+			followed, moved, err := remoteLinkFollowLocal(current, source)
+			if err != nil {
+				return err
+			}
+			if moved {
+				if err := communicationAtomic(remoteLinkPath(root, current.ID), followed); err != nil {
+					return err
+				}
+				remoteAppendRepins(root, current.ID, remoteFollowAudit(followed, current))
+				current = followed
 			}
 			if err := communicationGroupDispatchGuard(root, node, r, current.PeerNodeID, current.PeerPaneID); err != nil {
 				return err
@@ -217,7 +231,8 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 				SourceNodeID: node, TargetNodeID: current.PeerNodeID, SourcePaneID: current.LocalPaneID, TargetPaneID: current.PeerPaneID,
 				CallerID:           wireCallerIf(r, current, caller),
 				SourceConversation: current.LocalConversation, TargetConversation: current.PeerConversation, MessageID: r.MessageID, Text: r.Text,
-				SourceSignature: signature}
+				SourceFollowedFrom: slices.Clone(current.LocalFollowedFrom),
+				SourceSignature:    signature}
 			wire.Fingerprint = remoteMessageFingerprint(wire)
 			receipt = communicationRemoteOutbound{Version: 1, NodeID: node, SubmittingCaller: caller, RouteID: current.RouteID, RouteRevision: current.RouteRevision,
 				PeerCertificateSHA256: current.PeerCertificateSHA256, Wire: wire, CreatedAt: time.Now().UTC(), Result: map[string]any{"status": "outcome_unknown"}}
