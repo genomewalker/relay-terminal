@@ -163,3 +163,30 @@ func TestCarrierAncestryIsNotAnAgent(t *testing.T) {
 		}
 	}
 }
+
+// attest_consume spends a source attestation as owner administration (no
+// client token, no actor pane), so an agent's descendant is refused it like
+// every other owner operation, and the owner's application still passes.
+func TestAttestConsumeIsAnOwnerOperation(t *testing.T) {
+	if !communicationOwnerOperation("attest_consume") {
+		t.Fatal("attest_consume is not owner administration")
+	}
+	child, _ := spawnAccountOwner(t, nil)
+	withAgentAncestors(t, "claude", func(pid int) bool { return pid == os.Getpid() })
+	err := communicationOwnerGate(CommunicationRequest{Operation: "attest_consume", AttestationID: strings.Repeat("a", 32)}, child)
+	if err == nil || !strings.Contains(err.Error(), "not available to agent processes") {
+		t.Fatal("attest_consume from an agent's descendant was not refused", err)
+	}
+	withAgentAncestors(t, "claude", func(int) bool { return false })
+	if err := communicationOwnerGate(CommunicationRequest{Operation: "attest_consume", AttestationID: strings.Repeat("a", 32)}, child); err != nil {
+		t.Fatal("the owner's attest_consume was refused", err)
+	}
+	if err := communicationOwnerGate(CommunicationRequest{Operation: "attest_consume", ClientToken: "x"}, child); err == nil {
+		t.Fatal("attest_consume with a caller token was allowed")
+	}
+	// Minting an attestation stays a caller operation.
+	withAgentAncestors(t, "claude", func(pid int) bool { return pid == os.Getpid() })
+	if err := communicationOwnerGate(CommunicationRequest{Operation: "attest"}, child); err != nil {
+		t.Fatal("a non-owner attestation operation was gated", err)
+	}
+}

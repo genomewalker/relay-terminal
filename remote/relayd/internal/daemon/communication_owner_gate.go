@@ -21,9 +21,11 @@ var communicationAgentAncestor = ancestorAgentKind
 
 // communicationOwnerOperation reports whether an operation is owner administration.
 // The host-channel carrier operations are the Relay app's too: a claim returns
-// queued message text, and a delivery acts as the peer host.
+// queued message text, and a delivery acts as the peer host. attest_consume
+// spends a pane's source attestation as the app, so it is gated the same way.
 func communicationOwnerOperation(operation string) bool {
-	return strings.HasPrefix(operation, "route_") || operation == "node_trust_set" || communicationCarrierOperation(operation)
+	return strings.HasPrefix(operation, "route_") || operation == "node_trust_set" || operation == "attest_consume" ||
+		communicationCarrierOperation(operation)
 }
 
 // communicationCarrierOperation names the operations only the app's host-channel
