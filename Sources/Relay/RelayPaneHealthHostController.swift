@@ -153,7 +153,7 @@ struct RelayPaneHealthControllerCheck: Sendable {
 
 /// Saved before acknowledging a daemon action. A lost acknowledgement must
 /// reuse the exact result, including its original native evidence and wording.
-struct RelayPaneHealthControllerActionReceipt: Codable, Sendable {
+struct RelayPaneHealthControllerActionReceipt: Codable, Equatable, Sendable {
     let host: String
     let owner: String
     let generation: UInt64
