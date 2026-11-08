@@ -10,6 +10,8 @@ struct RelayQuickNavigate: View {
     @State private var expandedIDs: Set<String> = []
     @FocusState private var searchFocused: Bool
     private typealias Index = RelayWorkOverviewIndex
+    nonisolated static let title = RelayCommand.quickNavigate.label
+    nonisolated static let searchPlaceholder = "Go to a pane, workspace, setting or ask Miko"
 
     init(workspace: WorkspaceModel) {
         self.workspace = workspace
@@ -48,13 +50,12 @@ struct RelayQuickNavigate: View {
                     return (priority[$0.state] ?? 5) < (priority[$1.state] ?? 5)
                 }
                 let reportCurrent = pane.connectionState == .connected && pane.programStatus.revision != nil
-                let reportLabel = report.map { "Program reported " + $0.state + (reportCurrent ? "" : " (stale)") }
-                // Quiet is only the absence of recent output; it cannot
+                // Idle is only the absence of recent output; it cannot
                 // establish that the worker is ready or its task succeeded.
-                let signalLabel = pane.phase == .quiet ? "Quiet" : pane.phase.label
                 let signalDetail = pane.pendingAgentApprovals == 0 && report == nil && pane.phase == .quiet
                     ? "No recent output; readiness has not been confirmed.\n" : ""
-                let status = pane.pendingAgentApprovals > 0 ? "\(pane.pendingAgentApprovals) approval(s) reported" : (reportLabel ?? signalLabel)
+                let status = Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
+                                              programState: report?.state, programReportCurrent: reportCurrent)
                 let stateSource = pane.pendingAgentApprovals > 0 ? "pending agent approval count"
                     : (report != nil ? "program self-report" : "terminal output and agent signals")
                 let programDetails = pane.programStatus.records.map { record in
@@ -125,13 +126,13 @@ struct RelayQuickNavigate: View {
         let rows = results
         let selected = Index.selectedID(selectionID, in: rows, query: query)
         VStack(alignment: .leading, spacing: 0) {
-            Text("Work overview").font(.headline).padding(.horizontal, 16).padding(.top, 14)
+            Text(Self.title).font(.headline).padding(.horizontal, 16).padding(.top, 14)
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search work, settings, controls or ask Miko", text: $query)
+                TextField(Self.searchPlaceholder, text: $query)
                     .textFieldStyle(.plain).focused($searchFocused)
                     .onSubmit { if let row = rows.first(where: { $0.id == selected }) { open(row) } }
-                    .accessibilityLabel("Search work overview")
+                    .accessibilityLabel(Self.title)
                     .accessibilityHint("Use up and down arrows to select a result, Return to open, Escape to return to the original pane")
                     .accessibilityIdentifier("relay.overview.search")
                     .onKeyPress(.downArrow) { move(1); return .handled }

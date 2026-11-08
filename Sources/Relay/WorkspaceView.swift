@@ -911,7 +911,7 @@ private struct AgentInspectorPanel: View {
                     Spacer()
                     HStack(spacing: RelayTheme.spacing(5)) {
                         Circle().fill(agent.phase.color).frame(width: 6, height: 6)
-                        Text(agent.phase == .active ? "Working" : "Finished")
+                        Text(agent.phase == .active ? PaneDisplayState.working.label : "Finished")
                             .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                             .foregroundStyle(agent.phase.color)
                     }

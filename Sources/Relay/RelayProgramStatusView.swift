@@ -11,8 +11,17 @@ struct RelayProgramStatusBadge: View {
     private func priority(_ state: String) -> Int {
         ["blocked": 0, "error": 1, "working": 2, "done": 3, "idle": 4][state] ?? 5
     }
-    private func label(_ state: String) -> String {
-        ["idle": "Idle", "working": "Working", "blocked": "Waiting", "done": "Done", "error": "Failed"][state] ?? "Unknown"
+    private func label(_ state: String) -> String { Self.label(for: state) }
+    /// A program's self-reported state in the shared pane vocabulary.
+    nonisolated static func label(for state: String) -> String {
+        switch state {
+        case "idle": PaneDisplayState.idle.label
+        case "working": PaneDisplayState.working.label
+        case "blocked": PaneDisplayState.needsInput.label
+        case "done": "Done"
+        case "error": "Failed"
+        default: "Unknown"
+        }
     }
     private func symbol(_ state: String) -> String {
         ["idle": "circle", "working": "circle.dotted", "blocked": "hand.raised", "done": "checkmark.circle", "error": "exclamationmark.circle"][state] ?? "questionmark.circle"

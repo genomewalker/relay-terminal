@@ -15,6 +15,7 @@ import UniformTypeIdentifiers
 /// One flat list of workspaces (search, pinned, hidden) with their tabs
 /// and panes. Every drop is an object-preserving move of the ownership API.
 @MainActor struct WorkspaceNavigator: View {
+    nonisolated static let searchPlaceholder = "Search workspaces, tabs and panes"
     @ObservedObject var workspace: WorkspaceModel
     // Attention order follows pane phases (throttled), alerts and drags.
     @ObservedObject private var activityIndex: WorkspaceActivityIndex
@@ -45,7 +46,7 @@ import UniformTypeIdentifiers
             HStack(spacing: 6) {
                 // The clear button sits beside the text, not over it.
                 HStack(spacing: 2) {
-                    TextField("Search workspaces and tabs", text: $query)
+                    TextField(Self.searchPlaceholder, text: $query)
                         .textFieldStyle(.plain)
                         .font(RelayTheme.font(size: 11))
                         .accessibilityIdentifier("relay.navigator.search")

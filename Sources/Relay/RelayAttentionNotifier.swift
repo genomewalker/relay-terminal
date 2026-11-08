@@ -39,7 +39,7 @@ enum RelayAttentionAlert: String, Codable, Sendable {
     var label: String {
         switch self {
         case .done: "Done"
-        case .needsInput: "Needs input"
+        case .needsInput: PaneDisplayState.needsInput.label
         case .error: "Error"
         case .toolFailed: "Tool failed"
         }

@@ -147,7 +147,7 @@ enum AgentLabelFormatter {
         value = value.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         if value == "Subagent finished" { return "Finished" }
         if value.count > 52 { value = String(value.prefix(49)) + "…" }
-        return value.isEmpty ? "Working" : value
+        return value.isEmpty ? PaneDisplayState.working.label : value
     }
 }
 

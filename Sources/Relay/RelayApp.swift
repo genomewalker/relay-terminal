@@ -709,7 +709,7 @@ struct RelayApp: App {
                     .keyboardShortcut(shortcut(.newTab).keyEquivalent, modifiers: shortcut(.newTab).eventModifiers)
                 Button("New local session") { workspace.newTab(profile: .local) }
                     .keyboardShortcut(shortcut(.newLocalSession).keyEquivalent, modifiers: shortcut(.newLocalSession).eventModifiers)
-                Button("Work overview…") { workspace.presentQuickNavigate() }
+                Button(RelayCommand.quickNavigate.label + "…") { workspace.presentQuickNavigate() }
                     .keyboardShortcut(shortcut(.quickNavigate).keyEquivalent, modifiers: shortcut(.quickNavigate).eventModifiers)
                 Button("Find SSH host…") { workspace.presentHostLauncher() }
                     .keyboardShortcut(shortcut(.findHost).keyEquivalent, modifiers: shortcut(.findHost).eventModifiers)

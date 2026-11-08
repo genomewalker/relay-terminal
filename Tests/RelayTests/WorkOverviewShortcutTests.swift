@@ -1,7 +1,7 @@
 import Testing
 @testable import Relay
 
-@Suite("Work overview command shortcut")
+@Suite("Go to pane command shortcut")
 struct WorkOverviewShortcutTests {
     @Test("The overview has an independent Command Shift P binding")
     func defaultBinding() {

@@ -76,6 +76,16 @@ enum RelayWorkOverviewIndex {
 
     static let recentLimit = 8
 
+    /// A pane's state in the shared vocabulary (`PaneDisplayState`). Agent
+    /// approvals and a program's own report take precedence and say so.
+    static func paneStatus(phase: AgentPhase, approvals: Int, programState: String?, programReportCurrent: Bool) -> String {
+        if approvals > 0 {
+            return PaneDisplayState.needsInput.label + " · \(approvals) approval" + (approvals == 1 ? "" : "s")
+        }
+        guard let programState else { return phase.label }
+        return RelayProgramStatusBadge.label(for: programState) + " · program report" + (programReportCurrent ? "" : " (stale)")
+    }
+
     struct Section: Identifiable {
         let title: String
         let entries: [Entry]
