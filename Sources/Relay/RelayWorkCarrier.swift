@@ -105,6 +105,10 @@ enum RelayWorkCarrier {
             state = HostSchedule(routes: box.nativeRoutes)
             return box.items.isEmpty ? 30 : 5
         }
+        // The first 0-route answer after routes, or after failures with no
+        // earlier answer, restarts the backoff: failures may have used it up
+        // while relayd was down, and 600 s would outlast the signed window.
+        if state.routes != 0 { state.retries = 0 }
         let settled = state.routes == 0 && state.retries == 0
         if !settled, state.retries < failureBackoff.count {
             defer { state.retries += 1 }
@@ -166,6 +170,9 @@ enum RelayWorkCarrier {
     /// may have just come back, so check it on the next pass.
     func hostReady(_ key: String) {
         due[key] = nil
+        // Its relayd may have restarted, so what was known about it no longer
+        // holds: a 0-route answer starts the short backoff again.
+        schedules[key] = nil
     }
 
     func tick(_ workspace: WorkspaceModel, now: Date = Date()) async {

@@ -95,6 +95,45 @@ import Testing
     #expect(RelayWorkCarrier.nextCheck(after: none, state: &fresh) == 30)
 }
 
+/// bc08 review of 0.5.30: after an outage long enough to exhaust the failure
+/// backoff (relayd down for a supervisor swap), the first answer reporting 0
+/// routes went straight to 600 s, past the 9 min signed window.
+@Test func workCarrierRestartsTheBackoffWhenAHostAnswersAfterALongOutage() {
+    let routed = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 1)
+    let none = RelayWorkCarrier.Outbox(hostKey: "k", nodeID: "n", items: [], nativeRoutes: 0)
+    var state = RelayWorkCarrier.HostSchedule()
+    #expect(RelayWorkCarrier.nextCheck(after: routed, state: &state) == 30)
+    let failures = (0..<5).map { _ in RelayWorkCarrier.nextCheck(after: nil, state: &state) }
+    #expect(failures == [30, 60, 120, 240, 240])
+    let zeros = (0..<5).map { _ in RelayWorkCarrier.nextCheck(after: none, state: &state) }
+    #expect(zeros == [30, 60, 120, 240, 600])
+    // The same after failures with no earlier answer at all.
+    var unknown = RelayWorkCarrier.HostSchedule()
+    _ = (0..<6).map { _ in RelayWorkCarrier.nextCheck(after: nil, state: &unknown) }
+    #expect(RelayWorkCarrier.nextCheck(after: none, state: &unknown) == 30)
+}
+
+/// A pane that reattaches after the host has settled to the idle schedule may
+/// mean its relayd restarted: the host is checked now and, if it answers 0
+/// routes, on the short backoff again rather than every 600 s.
+@MainActor
+@Test func workCarrierReattachRestartsTheBackoffAfterItWasExhausted() async {
+    let hosts = FakeWorkHosts()
+    hosts.failFirstChecks = 0
+    hosts.queued = false
+    hosts.dandyRoutes = 0
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { [hosts] profile, packet in try await hosts.request(profile, packet) })
+    let start = hosts.now
+    await runCarrier(hosts, loop, for: 1100, untilCarried: false)
+    let settled = (hosts.pendingChecks[hosts.dandy.connectionKey] ?? []).map { $0.timeIntervalSince(start) }
+    #expect(settled == [0, 30, 90, 210, 450, 1050])
+    RelayWorkCarrier.hostReady(hosts.dandy)
+    let reattached = hosts.now
+    await runCarrier(hosts, loop, for: 100, untilCarried: false)
+    let after = (hosts.pendingChecks[hosts.dandy.connectionKey] ?? []).map { $0.timeIntervalSince(reattached) }.filter { $0 >= 0 }
+    #expect(after == [0, 30, 90])
+}
+
 @MainActor
 private final class FakeWorkHosts {
     let mac = ConnectionProfile(name: "mac", kind: .ssh, host: "mac-host")
