@@ -742,6 +742,7 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 			}
 			return nil, communicationUnverifiedEndpoint("a pane has no verified native communication endpoint", source, recipient)
 		}
+		observed := map[string]communicationMember{}
 		for _, saved := range link.Members {
 			live := source
 			if saved.PaneID == r.PaneID {
@@ -755,10 +756,14 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 				}
 				continue
 			}
-			if saved.SessionID != "" && (saved.SessionID != live.SessionID || saved.Provider != live.Provider) {
-				return nil, errors.New("linked conversation changed; review the pair before sending")
-			}
+			observed[strings.ToLower(saved.PaneID)] = live
 		}
+		// A pane that ran /clear in the same process keeps its links.
+		followed, _, err := communicationLinkFollowAll(root, link, observed)
+		if err != nil {
+			return nil, err
+		}
+		link = followed
 		sourcePacket := communicationSourcePacket(r, nodeID, source)
 		// A verified attempt counts as activity before the once-only message
 		// claim. Delivery uncertainty must never trigger an automatic replay.

@@ -159,11 +159,17 @@ func communicationAssistantSend(root, nodeID string, r CommunicationRequest, nat
 	}
 	var link communicationLink
 	var crossHost communicationAssistantLink
-	if communicationRead(filepath.Join(root, "link-"+linkID+".json"), &link) == nil {
-		for _, saved := range link.Members {
-			if saved.PaneID == r.PaneID && saved.SessionID != "" && (saved.SessionID != target.SessionID || saved.Provider != target.Provider) {
-				return nil, errors.New("linked conversation changed; review the pair before sending")
+	if linkPath := filepath.Join(root, "link-"+linkID+".json"); communicationRead(linkPath, &link) == nil {
+		// A recipient that ran /clear in the same process keeps the pair.
+		followed, moved, err := communicationLinkFollowAll(root, link, map[string]communicationMember{strings.ToLower(r.PaneID): target})
+		if err != nil {
+			return nil, err
+		}
+		if moved {
+			if err := communicationAtomic(linkPath, followed); err != nil {
+				return nil, err
 			}
+			link = followed
 		}
 		linkAuthority = "relayd_node_pair"
 		if r.ShepherdReport && r.ExpectedLinkRevision != link.UpdatedAt.Format(time.RFC3339Nano) {
