@@ -91,6 +91,11 @@ type communicationMember struct {
 	SessionID   string         `json:"sessionID,omitempty"`
 	Endpoint    map[string]any `json:"endpoint,omitempty"`
 	Unavailable string         `json:"unavailable,omitempty"`
+	// Account is the agent's account directory (CLAUDE_CONFIG_DIR or
+	// CODEX_HOME, else the default), read by relayd from the exact process
+	// when a link follows or refreshes the member. A restart is followed only
+	// within the same account.
+	Account string `json:"account,omitempty"`
 }
 type communicationLink struct {
 	Version          int                   `json:"version"`

@@ -38,21 +38,27 @@ func communicationLinkFollow(saved, live communicationMember) (communicationMemb
 	sameProcess := saved.PID != 0 && saved.Start != "" && saved.PID == live.PID && saved.Start == live.Start
 	// The pane is the partner: an agent restarted in the same pane keeps its
 	// links when the kernel shows the same pane root (the pane's worker and
-	// shell incarnation) and the same provider. A changed root is a pane
+	// shell incarnation), the same provider and the same account directory, as
+	// recorded at the last use. Moving the pane to another account needs a relink. A changed root is a pane
 	// recovery or another terminal and is not followed.
 	savedRoot, savedRootStart := communicationEndpointRoot(saved.Endpoint)
 	liveRoot, liveRootStart := communicationEndpointRoot(live.Endpoint)
-	sameRoot := savedRoot > 0 && savedRootStart != "" && savedRoot == liveRoot && savedRootStart == liveRootStart
+	sameRoot := savedRoot > 0 && savedRootStart != "" && savedRoot == liveRoot && savedRootStart == liveRootStart &&
+		saved.Account != "" && saved.Account == live.Account
 	if saved.SessionID != live.SessionID && !sameProcess && !sameRoot {
 		return saved, false, errors.New(communicationLinkRelinkNeeded)
 	}
 	// Same conversation (perhaps resumed in a new process) or the same process
 	// in a new conversation: keep the pin current so a later /clear follows.
-	if saved.SessionID == live.SessionID && saved.PID == live.PID && saved.Start == live.Start && (sameRoot || liveRoot == 0) {
+	if saved.SessionID == live.SessionID && saved.PID == live.PID && saved.Start == live.Start && (sameRoot || liveRoot == 0) &&
+		(live.Account == "" || saved.Account == live.Account) {
 		return saved, false, nil
 	}
 	updated := saved
 	updated.SessionID, updated.PID, updated.Start, updated.Endpoint = live.SessionID, live.PID, live.Start, live.Endpoint
+	if live.Account != "" {
+		updated.Account = live.Account
+	}
 	return updated, true, nil
 }
 
@@ -67,6 +73,9 @@ func communicationLinkFollowAll(root string, link communicationLink, live map[st
 		observed, ok := live[strings.ToLower(saved.PaneID)]
 		if !ok {
 			continue
+		}
+		if observed.Account == "" {
+			observed.Account = communicationAgentAccount(observed.PID, observed.Provider)
 		}
 		updated, moved, err := communicationLinkFollow(saved, observed)
 		if err != nil {
@@ -110,6 +119,19 @@ func communicationAppendRepinFile(root, name string, record map[string]any) erro
 		return fmt.Errorf("record link repin: %w", err)
 	}
 	return nil
+}
+
+// communicationAgentAccount is the account directory of one exact agent
+// process, or "" when it cannot be read (then no restart is followed).
+var communicationAgentAccount = func(pid int, provider string) string {
+	if pid <= 1 {
+		return ""
+	}
+	root, err := agentConfigRoot(pid, provider)
+	if err != nil {
+		return ""
+	}
+	return root
 }
 
 // communicationEndpointRoot is the pane root a native observation recorded:

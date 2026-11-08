@@ -49,7 +49,10 @@ func validFollowedFrom(list []communicationPinnedConversation, current communica
 // observation. It returns the link to store and whether it changed.
 func remoteLinkFollowLocal(root string, link CommunicationRemoteLink, live communicationMember) (CommunicationRemoteLink, bool, error) {
 	saved := communicationMember{PaneID: link.LocalPaneID, Provider: link.LocalConversation.Provider, SessionID: link.LocalConversation.SessionID,
-		PID: link.LocalPID, Start: link.LocalStart}
+		PID: link.LocalPID, Start: link.LocalStart, Account: link.LocalAccount}
+	if live.Account == "" {
+		live.Account = communicationAgentAccount(live.PID, live.Provider)
+	}
 	if link.LocalRootPID > 0 {
 		saved.Endpoint = map[string]any{"rootPID": link.LocalRootPID, "rootStart": link.LocalRootStart}
 	}
@@ -85,6 +88,7 @@ func remoteLinkFollowLocal(root string, link CommunicationRemoteLink, live commu
 	}
 	link.LocalConversation, link.LocalPID, link.LocalStart = next, updated.PID, updated.Start
 	link.LocalRootPID, link.LocalRootStart = communicationEndpointRoot(live.Endpoint)
+	link.LocalAccount = updated.Account
 	return link, true, nil
 }
 

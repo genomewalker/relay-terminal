@@ -50,6 +50,9 @@ type CommunicationRemoteLink struct {
 	// worker and shell incarnation): an agent restarted under it is followed.
 	LocalRootPID   int    `json:"local_root_pid,omitempty"`
 	LocalRootStart string `json:"local_root_start,omitempty"`
+	// LocalAccount is the local agent account directory at the last use; a
+	// restart under the pane root is followed only within it.
+	LocalAccount string `json:"local_account,omitempty"`
 	// LocalFollowedFrom lists earlier conversations of the local member in the
 	// pinned process that the peer may still name, oldest first. It is sent to
 	// the peer with each message and cleared once the peer names the current one.
@@ -117,7 +120,7 @@ func validRemoteLink(link CommunicationRemoteLink, node string) bool {
 		link.ID != remotePairID(node, link.LocalPaneID, link.PeerNodeID, link.PeerPaneID) || !remoteDigest(link.PeerCertificateSHA256) ||
 		!validRemoteConversation(link.LocalConversation) || !validRemoteConversation(link.PeerConversation) || link.PeerRevision == 0 || link.Revision == 0 ||
 		link.CreatedAt.IsZero() || link.UpdatedAt.Before(link.CreatedAt) || len(link.AllowedPeerCallers) == 0 || len(link.AllowedPeerCallers) > 128 ||
-		link.LocalPID < 0 || len(link.LocalStart) > 64 || link.LocalRootPID < 0 || len(link.LocalRootStart) > 64 || !validFollowedFrom(link.LocalFollowedFrom, link.LocalConversation) ||
+		link.LocalPID < 0 || len(link.LocalStart) > 64 || link.LocalRootPID < 0 || len(link.LocalRootStart) > 64 || len(link.LocalAccount) > 4096 || !validFollowedFrom(link.LocalFollowedFrom, link.LocalConversation) ||
 		!validFollowedFrom(link.PeerFollowedFrom, link.PeerConversation) {
 		return false
 	}

@@ -175,6 +175,7 @@ func TestLinkFollowsAnAgentRestartedUnderTheSamePaneRoot(t *testing.T) {
 		}
 		endpoint["rootPID"], endpoint["rootStart"] = float64(root), start
 		m.Endpoint = endpoint
+		m.Account = "/home/a/.claude-team"
 		return m
 	}
 	saved := withRoot(followMember("old-session", 4575, "darwin:5"), 39777, "darwin:1")
@@ -194,6 +195,27 @@ func TestLinkFollowsAnAgentRestartedUnderTheSamePaneRoot(t *testing.T) {
 		if _, _, err := communicationLinkFollow(saved, live); err == nil || !strings.Contains(err.Error(), "relink needed") {
 			t.Fatal(name, "was followed", err)
 		}
+	}
+	otherAccount := restarted
+	otherAccount.Account = "/home/a/.claude-personal"
+	if _, _, err := communicationLinkFollow(saved, otherAccount); err == nil || !strings.Contains(err.Error(), "relink needed") {
+		t.Fatal("a restart under another account was followed", err)
+	}
+	unread := restarted
+	unread.Account = ""
+	if _, _, err := communicationLinkFollow(saved, unread); err == nil {
+		t.Fatal("a restart with an unreadable account was followed")
+	}
+	noSavedAccount := saved
+	noSavedAccount.Account = ""
+	if _, _, err := communicationLinkFollow(noSavedAccount, restarted); err == nil {
+		t.Fatal("a restart was followed before any account was recorded")
+	}
+	// The same process changing conversation (/clear) does not depend on it.
+	cleared := saved
+	cleared.SessionID, cleared.Account = "after-clear", ""
+	if _, moved, err := communicationLinkFollow(saved, cleared); err != nil || !moved {
+		t.Fatal("/clear was refused without a readable account", err)
 	}
 	codex := restarted
 	codex.Provider = "codex"
