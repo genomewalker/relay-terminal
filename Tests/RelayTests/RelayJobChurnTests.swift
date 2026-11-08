@@ -7,7 +7,7 @@ import Testing
     var incarnation = "transport-a/1"
 
     func install(_ control: RelayCallerControl) {
-        control.policyTransport = { [unowned self] _, packet in
+        control.policyTransport = { [unowned self] _, packet, _ in
             let operation = packet["operation"] as? String ?? ""
             self.operations.append(operation)
             return operation == "caller_list" ? ["authority": "relayd", "callers": []] : ["authority": "relayd"]
@@ -72,7 +72,7 @@ private let churnHost = ConnectionProfile(name: "churn", kind: .ssh, host: "dand
     var current: String? = nil
     var imported: [String?] = []
     control.transportIncarnation = { _ in current }
-    control.policyTransport = { _, packet in
+    control.policyTransport = { _, packet, _ in
         let operation = packet["operation"] as? String ?? ""
         recorder.operations.append(operation)
         if operation == "caller_policy_import" {
@@ -94,7 +94,7 @@ private let churnHost = ConnectionProfile(name: "churn", kind: .ssh, host: "dand
     let (control, recorder, directory) = callerFixture()
     defer { try? FileManager.default.removeItem(at: directory) }
     var fail = true
-    control.policyTransport = { _, packet in
+    control.policyTransport = { _, packet, _ in
         let operation = packet["operation"] as? String ?? ""
         recorder.operations.append(operation)
         if operation == "caller_list" && fail { throw RelayHostRPCError.invalidRequest }

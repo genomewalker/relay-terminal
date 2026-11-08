@@ -99,6 +99,105 @@ import Testing
         #expect(try await store.key(within: .seconds(2)).rawRepresentation == fixed.rawRepresentation)
         #expect(await store.loads == 2 && seen.calls == 2)
     }
+
+    // U-K1: the user who clicked Register/Pause is the one answering the
+    // Keychain prompt. Their action waits for it; an agent/HTTP request on the
+    // same load still refuses after keyWait with the 0.5.31 message.
+    @Test func userActionsOutwaitTheKeychainPromptWhileRequestsFailFast() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let fixed = Curve25519.Signing.PrivateKey()
+        let store = RelayCallerAdminProof.AdminKeyStore(load: { gate.wait(); return fixed })
+        let clock = ContinuousClock(), begun = clock.now
+        let user = Task.detached { try await store.key(within: nil).rawRepresentation }
+        let request = Task.detached { () -> (Error?, Duration) in
+            do { _ = try await store.key(within: RelayCallerAdminProof.keyWait); return (nil, clock.now - begun) }
+            catch { return (error, clock.now - begun) }
+        }
+        let (error, elapsed) = await request.value
+        #expect(error is RelayCallerAdminProof.KeychainApprovalPending)
+        #expect(error?.localizedDescription == "Keychain approval pending: approve Relay's caller-admin key in the macOS Keychain prompt, then retry with a fresh request.")
+        #expect(elapsed >= RelayCallerAdminProof.keyWait && elapsed < .seconds(5))
+        // The user's wait is still open past the agent bound; approval ends it.
+        try await Task.sleep(for: .milliseconds(300))
+        gate.signal()
+        #expect(try await user.value == fixed.rawRepresentation)
+        #expect(clock.now - begun > .seconds(3))
+        #expect(await store.loads == 1)
+    }
+
+    // Closing the Clients sheet cancels the user's wait; the Keychain load
+    // itself stays in flight so a retry does not raise a second prompt.
+    @Test func cancellingTheUsersWaitEndsItWithoutASecondPrompt() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let fixed = Curve25519.Signing.PrivateKey()
+        let store = RelayCallerAdminProof.AdminKeyStore(load: { gate.wait(); return fixed })
+        let waiting = Task.detached { try await store.key(within: nil) }
+        try await Task.sleep(for: .milliseconds(50))
+        let clock = ContinuousClock(), begun = clock.now
+        waiting.cancel()
+        let outcome = await waiting.result
+        #expect(clock.now - begun < .seconds(1))
+        #expect(throws: CancellationError.self) { try outcome.get() }
+        let retry = Task.detached { try await store.key(within: nil).rawRepresentation }
+        try await Task.sleep(for: .milliseconds(20))
+        gate.signal()
+        #expect(try await retry.value == fixed.rawRepresentation)
+        #expect(await store.loads == 1)
+    }
+
+    // A task cancelled before it reaches the wait still ends promptly.
+    @Test func anAlreadyCancelledUserWaitEndsAtOnce() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let store = RelayCallerAdminProof.AdminKeyStore(load: { gate.wait(); return Curve25519.Signing.PrivateKey() })
+        let waiting = Task.detached { () -> Result<Curve25519.Signing.PrivateKey, Error> in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await Result { try await store.key(within: nil) }
+        }
+        let outcome = await waiting.value
+        #expect(throws: CancellationError.self) { try outcome.get() }
+        gate.signal()
+    }
+
+    // The pending state shows only once the user's action has outlasted the
+    // grace (keyWait in the app), then clears when the key arrives.
+    @MainActor @Test func theUsersWaitShowsAPendingKeychainState() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let fixed = Curve25519.Signing.PrivateKey()
+        let store = RelayCallerAdminProof.AdminKeyStore(load: { gate.wait(); return fixed })
+        let status = RelayCallerAdminProof.KeychainApprovalStatus()
+        let user = Task { try await RelayCallerAdminProof.userKey(store: store, status: status, grace: .milliseconds(50)).rawRepresentation }
+        #expect(!status.pending)
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(status.pending)
+        #expect(RelayCallerAdminProof.KeychainApprovalStatus.waitingText == "Waiting for Keychain approval…")
+        gate.signal()
+        #expect(try await user.value == fixed.rawRepresentation)
+        #expect(!status.pending)
+    }
+
+    // Only the Settings entry points (origin: .hardware) wait for the user;
+    // daemon attach and the request paths keep the 3 s bound.
+    @MainActor @Test func onlyUserEntryPointsWaitUnbounded() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("relay-caller-wait-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let control = RelayCallerControl(directory: directory)
+        var waits: [String: [Duration?]] = [:]
+        control.transportIncarnation = { _ in nil }
+        control.policyTransport = { _, packet, wait in
+            let operation = packet["operation"] as? String ?? ""
+            waits[operation, default: []].append(wait)
+            return operation == "caller_list" ? ["authority": "relayd", "callers": []] : ["authority": "relayd"]
+        }
+        try await control.attachDaemon(profile: .sshConfigHost("caller-wait.invalid"))
+        let issued = try await control.register(label: "Fixture", thread: nil, origin: .hardware)
+        let id = try #require(issued["caller_id"])
+        try await control.setPaused(id: id, paused: true, origin: .hardware)
+        _ = try await control.register(label: "Request", thread: nil)
+        try await control.setPaused(id: id, paused: false)
+        #expect(waits["caller_policy_import"] == [RelayCallerAdminProof.keyWait])
+        #expect(waits["caller_register"] == [nil, RelayCallerAdminProof.keyWait])
+        #expect(waits["caller_set_paused"] == [nil, RelayCallerAdminProof.keyWait])
+    }
 }
 
 private final class OSAllocatedUnfairLockBox: @unchecked Sendable {

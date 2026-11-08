@@ -6,6 +6,10 @@ import AppKit
 struct RelayCallerManagementView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var control = RelayCallerControl.shared
+    @ObservedObject private var keychain = RelayCallerAdminProof.KeychainApprovalStatus.shared
+    /// The user's register/pause action in flight; it may be waiting on the
+    /// Keychain prompt, and closing the sheet cancels that wait.
+    @State private var action: Task<Void, Never>?
     @State private var label = ""
     @State private var thread = ""
     @State private var credential = ""
@@ -26,7 +30,12 @@ struct RelayCallerManagementView: View {
             }
             Text("Registered credentials identify a client. Thread labels are supplied by that client.")
                 .font(RelayAgentDesign.meta).foregroundStyle(.secondary)
-            if let error { Text(error).foregroundStyle(.orange).font(RelayAgentDesign.meta) }
+            if action != nil && keychain.pending {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(RelayCallerAdminProof.KeychainApprovalStatus.waitingText).font(RelayAgentDesign.meta).foregroundStyle(.secondary)
+                }.accessibilityIdentifier("relay.callers.keychainPending")
+            } else if let error { Text(error).foregroundStyle(.orange).font(RelayAgentDesign.meta) }
             if !control.available { Text("The client store could not be read. Changes are unavailable.").foregroundStyle(.orange) }
             List(control.summaries) { caller in
                 HStack(alignment: .top) {
@@ -38,12 +47,13 @@ struct RelayCallerManagementView: View {
                     Spacer()
                     Toggle("Paused", isOn: Binding(get: { caller.paused }, set: { value in
                         let origin = RelayKeyEventOrigin.ofUserAction(NSApp.currentEvent)
-                        Task {
+                        perform {
                             do { try await control.setPaused(id: caller.id, paused: value, origin: origin); error = nil }
+                            catch is CancellationError {}
                             catch { self.error = origin == .hardware ? "The pause setting could not be applied to every communication server."
                                 : "Pause changes need a click or key press on this Mac." }
                         }
-                    })).toggleStyle(.switch).disabled(!control.available)
+                    })).toggleStyle(.switch).disabled(!control.available || action != nil)
                         .accessibilityIdentifier("relay.callers.pause." + caller.id)
                 }.padding(.vertical, 3)
             }.frame(minHeight: 100, maxHeight: 180)
@@ -55,7 +65,7 @@ struct RelayCallerManagementView: View {
                         TextField("Client name", text: $label)
                         TextField("Thread label (optional)", text: $thread)
                         Button("Create credential") { create() }
-                            .disabled(!control.available || !credential.isEmpty || label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || label.utf8.count > 120 || thread.utf8.count > 100)
+                            .disabled(!control.available || action != nil || !credential.isEmpty || label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || label.utf8.count > 120 || thread.utf8.count > 100)
                             .accessibilityIdentifier("relay.callers.create")
                     }
                     if !credential.isEmpty {
@@ -89,7 +99,7 @@ struct RelayCallerManagementView: View {
                 }
             }.frame(minHeight: 120)
         }.padding(20).frame(width: 760, height: 650)
-            .onDisappear { credential = ""; issuedID = "" }
+            .onDisappear { credential = ""; issuedID = ""; action?.cancel(); action = nil }
             .task {
                 // Server pause state is read only while this view is open:
                 // on appear, then every 30 s until it closes.
@@ -103,13 +113,22 @@ struct RelayCallerManagementView: View {
         do { try await control.refreshDaemonPolicies() }
         catch { self.error = "Communication server client controls are unavailable." }
     }
+    /// Runs one user action at a time and keeps it until it ends.
+    private func perform(_ work: @escaping @MainActor () async -> Void) {
+        guard action == nil else { return }
+        action = Task {
+            await work()
+            action = nil
+        }
+    }
     private func create() {
         let origin = RelayKeyEventOrigin.ofUserAction(NSApp.currentEvent)
-        Task {
+        perform {
         do {
             let result = try await control.register(label: label.trimmingCharacters(in: .whitespacesAndNewlines), thread: thread.isEmpty ? nil : thread, origin: origin)
             credential = result["caller_token"] ?? ""; issuedID = result["caller_id"] ?? ""
             label = ""; thread = ""; error = nil
+        } catch is CancellationError {
         } catch { self.error = origin == .hardware ? "The client credential could not be saved." : "Creating a credential needs a click or key press on this Mac." }
         }
     }

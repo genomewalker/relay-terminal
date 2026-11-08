@@ -65,9 +65,11 @@ final class RelayCallerControl: ObservableObject {
     /// Bumped whenever local callers or the installation pause change, so the
     /// next attach to each host imports them again.
     private var policyRevision = 0
-    /// Replaceable in tests: the daemon transport and its incarnation.
-    var policyTransport: @MainActor (ConnectionProfile, [String: Any]) async throws -> [String: Any] = { profile, packet in
-        try await RelayCallerAdminProof.send(profile: profile, packet: packet)
+    /// Replaceable in tests: the daemon transport and its incarnation. The
+    /// third argument bounds the wait for the caller-admin key (nil: the user
+    /// started the action in Relay's UI and answers the Keychain prompt).
+    var policyTransport: @MainActor (ConnectionProfile, [String: Any], Duration?) async throws -> [String: Any] = { profile, packet, keyWait in
+        try await RelayCallerAdminProof.send(profile: profile, packet: packet, keyWait: keyWait)
     }
     var transportIncarnation: (ConnectionProfile) -> String? = { RelayNodeTransportPool.shared.incarnation(profile: $0) }
     static let auditLimit = 2000
@@ -108,7 +110,8 @@ final class RelayCallerControl: ObservableObject {
     private func hash(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
-    func register(label: String, thread: String?) async throws -> [String: String] {
+    func register(label: String, thread: String?,
+                  keyWait: Duration? = RelayCallerAdminProof.keyWait) async throws -> [String: String] {
         guard storageReady, !label.isEmpty, label.utf8.count <= 120,
               thread == nil || (thread!.utf8.count <= 100 && !thread!.isEmpty),
               disk.callers.count < 128 else { throw RelayHostRPCError.invalidRequest }
@@ -116,7 +119,8 @@ final class RelayCallerControl: ObservableObject {
         let caller = Caller(id: id, label: label, thread: thread, tokenHash: hash(token), paused: false)
         let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(caller))
         for profile in disk.daemonOwners ?? [] {
-            _ = try await daemonPolicyRequest(profile: profile, packet: ["operation": "caller_register", "policy": ["callers": [object], "legacyPaused": false]])
+            _ = try await daemonPolicyRequest(profile: profile, packet: ["operation": "caller_register", "policy": ["callers": [object], "legacyPaused": false]],
+                                              keyWait: keyWait)
         }
         disk.callers.append(caller)
         do { try save() } catch { disk.callers.removeLast(); throw error }
@@ -148,13 +152,15 @@ final class RelayCallerControl: ObservableObject {
     }
     /// App-UI entry points: only a hardware-origin click or key press admits
     /// the change. A nil or synthesized event is refused before any state moves.
+    /// The user who clicked answers any Keychain prompt, so these wait for it
+    /// (until cancelled) instead of failing after the request bound.
     func register(label: String, thread: String?, origin: RelayKeyEventOrigin) async throws -> [String: String] {
         guard origin == .hardware else { throw RelayHostRPCError.invalidRequest }
-        return try await register(label: label, thread: thread)
+        return try await register(label: label, thread: thread, keyWait: nil)
     }
     func setPaused(id: String, paused: Bool, origin: RelayKeyEventOrigin) async throws {
         guard origin == .hardware else { throw RelayHostRPCError.invalidRequest }
-        try await setPaused(id: id, paused: paused)
+        try await setPaused(id: id, paused: paused, keyWait: nil)
     }
     func permitted(_ identity: String) -> Bool {
         // The in-app Relay assistant uses the installation credential path, so
@@ -167,8 +173,9 @@ final class RelayCallerControl: ObservableObject {
     func isRegisteredPublisher(_ identity: String) -> Bool {
         identity == Self.assistantPublisher || summaries.contains { $0.id == identity }
     }
-    @discardableResult private func daemonPolicyRequest(profile: ConnectionProfile, packet: [String: Any]) async throws -> [String: Any] {
-        try await policyTransport(profile, packet)
+    @discardableResult private func daemonPolicyRequest(profile: ConnectionProfile, packet: [String: Any],
+                                                        keyWait: Duration? = RelayCallerAdminProof.keyWait) async throws -> [String: Any] {
+        try await policyTransport(profile, packet, keyWait)
     }
     /// Imports the local caller policy into a host's daemon once per transport
     /// incarnation and policy revision; a reconnect or a local policy change
@@ -221,13 +228,14 @@ final class RelayCallerControl: ObservableObject {
         }
         daemonSnapshots[profile.connectionKey] = values
     }
-    func setPaused(id: String, paused: Bool) async throws {
+    func setPaused(id: String, paused: Bool, keyWait: Duration? = RelayCallerAdminProof.keyWait) async throws {
         guard id == "legacy-unattributed" || disk.callers.contains(where: { $0.id.uuidString.lowercased() == id }) else { throw RelayHostRPCError.invalidRequest }
         // All known servers must accept this change. A failed remote update is
         // reported to the user; successful server writes are never hidden.
         do {
             for profile in disk.daemonOwners ?? [] {
-                try await daemonPolicyRequest(profile: profile, packet: ["operation": "caller_set_paused", "caller_id": id, "paused": paused])
+                try await daemonPolicyRequest(profile: profile, packet: ["operation": "caller_set_paused", "caller_id": id, "paused": paused],
+                                              keyWait: keyWait)
             }
         } catch {
             try? await refreshDaemonPolicies()
