@@ -17,7 +17,7 @@ import (
 // Credentials, account state, history, sessions, logs and caches are never
 // in these lists (see neverShared); a test keeps the two lists disjoint.
 var (
-	claudeLinks = []string{"CLAUDE.md", "settings.json", "skills", "agents", "commands", "plugins"}
+	claudeLinks = []string{"CLAUDE.md", "settings.json", "settings.local.json", "skills", "agents", "commands", "plugins"}
 	codexLinks  = []string{"AGENTS.md", "prompts", "skills"}
 	neverShared = []string{".credentials.json", ".claude.json", "auth.json", ".device-keys.json", "history.jsonl",
 		"history", "sessions", "projects", "archived_sessions", "log", "logs", "cache", "debug", "shell-snapshots",

@@ -23,6 +23,7 @@ func TestMoveLinksSharedConfigurationIntoTheTarget(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(main, "settings.json"), `{"statusLine":{"type":"command","command":"x"}}`)
 	writeFile(t, filepath.Join(main, "CLAUDE.md"), "rules")
+	writeFile(t, filepath.Join(main, "settings.local.json"), `{"permissions":{"allow":["Bash"]}}`)
 	// The target's own settings, created by Claude or another tool.
 	writeFile(t, filepath.Join(root, "settings.json"), `{"crossSessionInbound":"accept"}`)
 	// A link the user pointed elsewhere is theirs and stays.
@@ -38,7 +39,7 @@ func TestMoveLinksSharedConfigurationIntoTheTarget(t *testing.T) {
 	if err != nil || result.Status != MoveOnboardingReady {
 		t.Fatalf("result %+v, %v", result, err)
 	}
-	for _, name := range []string{"settings.json", "CLAUDE.md", "plugins"} {
+	for _, name := range []string{"settings.json", "settings.local.json", "CLAUDE.md", "plugins"} {
 		if target, err := os.Readlink(filepath.Join(root, name)); err != nil || target != filepath.Join(main, name) {
 			t.Errorf("%s not linked to the main account: %q %v", name, target, err)
 		}

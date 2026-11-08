@@ -131,7 +131,7 @@ func TestClaudeSyncLinksSharedConfigAndMergesOnlyMCPServers(t *testing.T) {
 	}
 	for _, link := range result.Links {
 		want := LinkLinked
-		if link.Name == "agents" || link.Name == "commands" || link.Name == "plugins" {
+		if link.Name == "agents" || link.Name == "commands" || link.Name == "plugins" || link.Name == "settings.local.json" {
 			want = LinkMissingMain
 		}
 		if link.State != want {

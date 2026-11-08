@@ -355,7 +355,7 @@ func adoptAnswer(document, source map[string]json.RawMessage, key string) bool {
 }
 
 // linkMoveTarget links the main account's shared configuration (claudeLinks:
-// settings, CLAUDE.md, skills, agents, commands, plugins) into a move's target
+// settings, local settings, CLAUDE.md, skills, agents, commands, plugins) into a move's target
 // account, so the moved agent starts with the user's status line, hooks,
 // plugins and permissions. It is the link step of Sync without the reviewed
 // MCP merge: an own file is kept as a timestamped backup, a link the user
