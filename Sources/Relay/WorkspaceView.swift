@@ -3856,6 +3856,13 @@ private struct PaneView: View {
                     },
                     dismiss: { sessionEndedNoticeDismissed = true }
                 )
+            } else if pane.contentKind == .terminal, let held = pane.heldExitNotice, !sessionEndedNoticeDismissed {
+                // Reconnect/replay of an exited pane: keep the row's height so
+                // the terminal does not grow and shrink again.
+                FailedPaneExitBanner(notice: held, runAgain: {}, close: {}, dismiss: {})
+                    .hidden()
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
             if preferences.artifactPresentation == .inline,
                let artifact = pane.artifacts.last, !artifact.userRequested {

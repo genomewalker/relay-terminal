@@ -686,6 +686,10 @@ final class PaneModel: ObservableObject, Identifiable {
     /// Set when the program ended quickly or with a failure status; the pane
     /// shows a danger banner instead of the session-ended notice.
     @Published private(set) var exitNotice: PaneExitNotice?
+    /// The notice from before a reconnect, held until relayd replays the exit
+    /// (or the replay ends without one) so the banner row keeps its height
+    /// instead of collapsing and reappearing.
+    @Published private(set) var heldExitNotice: PaneExitNotice?
     /// When this app first saw the pane's program attached after a fresh launch.
     /// nil for restored panes, whose start Relay did not observe.
     private(set) var programAttachedAt: Date?
@@ -1095,6 +1099,7 @@ final class PaneModel: ObservableObject, Identifiable {
             elapsed: elapsed,
             userInitiated: userRequestedTermination
         ) : nil
+        heldExitNotice = nil
         detector.markExited()
     }
 
@@ -1137,6 +1142,7 @@ final class PaneModel: ObservableObject, Identifiable {
     func reconnecting() {
         connectionRequested = true
         remoteExitCode = nil
+        if let exitNotice { heldExitNotice = exitNotice }
         exitNotice = nil
         connectionState = .connecting
         detector = AgentSignalDetector()
@@ -1150,7 +1156,14 @@ final class PaneModel: ObservableObject, Identifiable {
         connectionState = .waitingForNetwork(message)
     }
 
+    /// relayd replays a finished program's exit before `caught_up`; a replay
+    /// that ends without one releases the held banner space.
+    func terminalReplayCaughtUp() {
+        heldExitNotice = nil
+    }
+
     func disconnected(_ message: String) {
+        heldExitNotice = nil
         connectionState = .disconnected(message)
         detector.markExited()
     }

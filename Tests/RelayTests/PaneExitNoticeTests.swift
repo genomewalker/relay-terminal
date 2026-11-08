@@ -275,3 +275,114 @@ struct PaneExitNoticeTests {
         #expect(markerPixels(shot.bitmap) > 200)
     }
 }
+
+// MARK: - Exited panes and the banner row's resize
+
+private final class RecordingFrameWriter: RelayFrameWriting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var types: [RelayWireType] = []
+    func write(type: RelayWireType, payload: Data) throws { writeAsync(type: type, payload: payload) }
+    func writeAsync(type: RelayWireType, payload: Data) { lock.lock(); types.append(type); lock.unlock() }
+    var written: [RelayWireType] { lock.lock(); defer { lock.unlock() }; return types }
+}
+
+@MainActor @Suite("An exited pane resizes without waiting for relayd")
+struct ExitedPaneResizeTests {
+    private static let profile = ConnectionProfile(
+        name: "exited-resize", kind: .ssh, host: "exited-resize.invalid", backend: .relay)
+
+    /// A started relay pane in an offscreen (never ordered-front) window,
+    /// whose transport advertises acknowledged viewport commits.
+    private func startedPane(exited: Bool) -> (PaneModel, RecordingFrameWriter, NSWindow) {
+        _ = NSApplication.shared
+        let pane = PaneModel(profile: Self.profile)
+        let runtime = pane.runtime
+        let writer = RecordingFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer, profile: Self.profile, paneID: pane.id,
+            capabilities: ["input_ack_v1", "viewport_commit_v1", "viewport_commit_v2"], controlGranted: true)
+        runtime.ioForTesting.seedInitialViewport(.init(columns: 100, rows: 30))
+        runtime.startForTesting(transport: transport)
+        pane.connected()
+        if exited { pane.exited(exitCode: 1) }
+        let view = runtime.view
+        view.frame = NSRect(x: 0, y: 0, width: 640, height: 400)
+        let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = view
+        return (pane, writer, window)
+    }
+
+    /// The banner row's layout change reaches the runtime as a geometry
+    /// transaction (TerminalView.setFrameSize -> beginSurfaceGeometryTransition
+    /// -> beginExplicitGeometryTransition) followed by the frame change. A
+    /// headless surface is never "presented", so the test begins the
+    /// transaction directly, as RelayGeometryLifecycleTests does for zoom.
+    @Test func theBannerRowShrinkOnAnExitedPaneSendsNoCommitAndHoldsNothing() async throws {
+        let (pane, writer, window) = startedPane(exited: true)
+        defer { window.contentView = nil; TerminalSnapshotStore.shared.remove(paneID: pane.id) }
+        let runtime = pane.runtime
+        runtime.beginExplicitGeometryTransition()
+        #expect(!runtime.isGeometryTransitionPending)
+        #expect(!runtime.isBufferingViewportTransition)
+        runtime.view.setFrameSize(NSSize(width: 640, height: 340)) // ~60 pt banner row
+        for _ in 0..<20 { await Task.yield(); try await Task.sleep(for: .milliseconds(5)) }
+        #expect(!runtime.isGeometryTransitionPending)
+        #expect(!runtime.isBufferingViewportTransition)
+        #expect(!runtime.isAwaitingViewportCommit)
+        #expect(!writer.written.contains(.viewportCommit))
+    }
+
+    /// Control: the same begin on a live pane opens the transaction, so the
+    /// checks above are not vacuous.
+    @Test func aLivePaneStillOpensTheCommitTransaction() {
+        let (pane, _, window) = startedPane(exited: false)
+        defer { window.contentView = nil; TerminalSnapshotStore.shared.remove(paneID: pane.id) }
+        pane.runtime.beginExplicitGeometryTransition()
+        #expect(pane.runtime.isGeometryTransitionPending)
+        #expect(pane.runtime.isBufferingViewportTransition)
+    }
+
+    // F2: a reconnect of an exited pane keeps the banner row's height.
+
+    @Test func aReconnectHoldsTheBannerSpaceUntilTheExitIsReplayed() {
+        let pane = PaneModel(profile: Self.profile)
+        let start = Date()
+        pane.connected(now: start)
+        pane.exited(exitCode: 1, now: start.addingTimeInterval(1))
+        let notice = pane.exitNotice
+        #expect(notice != nil)
+        pane.reconnecting()
+        #expect(pane.exitNotice == nil)
+        #expect(pane.heldExitNotice == notice)
+        pane.connected(now: start.addingTimeInterval(60))
+        #expect(pane.heldExitNotice == notice)
+        pane.exited(exitCode: 1, now: start.addingTimeInterval(60))
+        #expect(pane.heldExitNotice == nil)
+        #expect(pane.exitNotice == notice)
+    }
+
+    @Test func aReplayWithoutAnExitOrAFailedReconnectReleasesTheSpace() {
+        let pane = PaneModel(profile: Self.profile)
+        let start = Date()
+        pane.connected(now: start)
+        pane.exited(exitCode: 1, now: start.addingTimeInterval(1))
+        pane.reconnecting()
+        pane.connected()
+        pane.terminalReplayCaughtUp()
+        #expect(pane.heldExitNotice == nil)
+
+        pane.exited(exitCode: 1)
+        pane.reconnecting()
+        #expect(pane.heldExitNotice != nil)
+        pane.disconnected("unreachable")
+        #expect(pane.heldExitNotice == nil)
+    }
+
+    @Test func aCleanSessionReconnectHoldsNothing() {
+        let pane = PaneModel(profile: Self.profile, requiresExistingWorker: true)
+        pane.connected()
+        pane.exited(exitCode: 0)
+        #expect(pane.exitNotice == nil)
+        pane.reconnecting()
+        #expect(pane.heldExitNotice == nil)
+    }
+}

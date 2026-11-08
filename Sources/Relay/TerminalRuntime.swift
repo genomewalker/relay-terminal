@@ -1245,6 +1245,7 @@ final class TerminalRuntime: NSObject {
                         self.pane?.connected()
                         if let profile = self.pane?.profile { RelayWorkCarrier.hostReady(profile) }
                     } else if status.state == "caught_up" {
+                        self.pane?.terminalReplayCaughtUp()
                         if let profile = self.pane?.profile { RelayWorkCarrier.hostReady(profile) }
                         self.terminalReplayCaughtUp = true
                         self.applyLegacyTerminalModeCompatibilityIfNeeded()
@@ -1806,6 +1807,10 @@ final class TerminalRuntime: NSObject {
     }
 
     func beginExplicitGeometryTransition() {
+        // An exited pane has no program to repaint the new grid, and relayd
+        // may never acknowledge a commit on its PTY. Resize it locally like
+        // an unstarted pane instead of holding output for a remote frame.
+        guard pane?.remoteExitCode == nil else { return }
         viewportPresentationEpoch &+= 1
         if viewportPresentationEpoch == 0 { viewportPresentationEpoch = 1 }
         explicitGeometryTransitionPending = true
@@ -1854,6 +1859,7 @@ final class TerminalRuntime: NSObject {
     /// dismantled, or the transaction is abandoned for lack of a geometry change.
     var isGeometryTransitionPending: Bool { explicitGeometryTransitionPending }
     var isBufferingViewportTransition: Bool { io.isViewportTransitionActive }
+    var isAwaitingViewportCommit: Bool { pendingViewportCommitEpoch != nil || viewportCommitFallbackTask != nil }
 
     fileprivate func prepareFinalSurfaceMeasurement() {
         guard explicitGeometryTransitionPending else { return }
