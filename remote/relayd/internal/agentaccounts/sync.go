@@ -409,7 +409,14 @@ func linkShared(source, destination string, before fileState, stamp string) Link
 		result.State = LinkUnsupported
 		return result
 	}
-	if err := os.Symlink(source, destination); err != nil {
+	if err := createLink(source, destination); err != nil {
+		// Put the account's own file back: without it the account's live
+		// agents would lose that configuration.
+		if result.Backup != "" {
+			if os.Rename(filepath.Join(filepath.Dir(destination), result.Backup), destination) == nil {
+				result.Backup = ""
+			}
+		}
 		result.State = LinkUnsupported
 		return result
 	}
@@ -943,3 +950,6 @@ func ownedByUser(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && int(stat.Uid) == os.Getuid()
 }
+
+// createLink is os.Symlink; a test substitutes a failure.
+var createLink = os.Symlink
