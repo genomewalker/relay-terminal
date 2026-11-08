@@ -195,6 +195,34 @@ struct RelayAttentionNotifierTests {
         }
     }
 
+    // A burst from many panes is limited in banners, never in the record:
+    // every pane is still listed as needing attention.
+    @Test func aBurstBannersWithinTheLimitButEveryPaneNeedsAttention() {
+        let notifier = RelayAttentionNotifier()
+        let store = AgentIntelligenceStore(persistenceEnabled: false)
+        var decisions: [RelayAttentionBannerPolicy.Decision] = []
+        store.onRecord = { item in
+            if let decision = notifier.bannerDecision(item, appActive: false) { decisions.append(decision) }
+            return false
+        }
+        let panes = (0..<9).map { _ in UUID() }
+        for pane in panes {
+            var policy = RelayProgramStatusAttention()
+            let record = RelayProgramStatusRecord(id: "job", state: "blocked", kind: nil, app: "fixture",
+                                                  title: "Fixture", message: nil, progress: nil, revision: nil)
+            for transition in policy.consume(previous: [], current: [record], revision: 1, deliveryEpoch: UUID(),
+                                             replay: false, now: 0) {
+                store.record(transition.inboxEvent(paneID: pane, host: "h", paneName: "p", occurredAt: Date()))
+            }
+        }
+        #expect(decisions.count == panes.count)
+        #expect(decisions.filter { $0 == .banner }.count <= RelayAttentionBannerPolicy.burstLimit)
+        #expect(decisions.filter { $0 == .coalesce }.count == panes.count - RelayAttentionBannerPolicy.burstLimit)
+        #expect(Set(store.attentionPanes.map(\.paneID)) == Set(panes))
+        #expect(store.panesNeedingUser == panes.count)
+        #expect(panes.allSatisfy { store.marker(for: $0) == .needsInput })
+    }
+
     @Test func bannersOnlyInTheBackgroundFreshAndRateLimited() {
         var policy = RelayAttentionBannerPolicy()
         let pane = UUID(), now = Date()

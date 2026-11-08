@@ -24,7 +24,10 @@ struct RelayProgramStatusAttentionTests {
         #expect(done.count == 1)
         #expect(done.first?.record.state == "done")
     }
-    @Test func rateLimitSurvivesReconnectAndNeverQueues() {
+    // The rate limit survives a reconnect. A transition inside the window is
+    // no longer dropped: it is held as the pane's latest state and lands once
+    // the window allows (rate limiting reduces alerts, never the record).
+    @Test func rateLimitSurvivesReconnectAndCoalescesInsteadOfDropping() {
         var policy = RelayProgramStatusAttention()
         let epoch = UUID(), other = UUID(), blocked = record("blocked"), done = record("done")
         let initial = policy.consume(previous: [], current: [blocked], revision: 1,
@@ -33,12 +36,54 @@ struct RelayProgramStatusAttentionTests {
         let limited = policy.consume(previous: [blocked], current: [done], revision: 1,
             deliveryEpoch: other, replay: false, now: 2)
         #expect(limited.isEmpty)
-        let notQueued = policy.consume(previous: [done], current: [done], revision: 2,
+        let coalesced = policy.consume(previous: [done], current: [done], revision: 2,
             deliveryEpoch: other, replay: false, now: 7)
-        #expect(notQueued.isEmpty)
+        #expect(coalesced.map(\.record.state) == ["done"])
+        // Delivered once: nothing is left to replay.
+        #expect(policy.flush(now: 20).isEmpty)
         let newState = policy.consume(previous: [done], current: [blocked], revision: 3,
-            deliveryEpoch: other, replay: false, now: 7)
+            deliveryEpoch: other, replay: false, now: 20)
         #expect(newState.count == 1)
+    }
+
+    // Several transitions inside one window collapse into the pane's latest
+    // state, which a flush delivers once the window has passed.
+    @Test func transitionsInsideTheWindowCollapseIntoTheLatestState() {
+        var policy = RelayProgramStatusAttention()
+        let epoch = UUID(), blocked = record("blocked"), done = record("done"), error = record("error")
+        #expect(policy.consume(previous: [], current: [blocked], revision: 1,
+            deliveryEpoch: epoch, replay: false, now: 1).count == 1)
+        #expect(policy.consume(previous: [blocked], current: [done], revision: 2,
+            deliveryEpoch: epoch, replay: false, now: 2).isEmpty)
+        #expect(policy.consume(previous: [done], current: [error], revision: 3,
+            deliveryEpoch: epoch, replay: false, now: 3).isEmpty)
+        #expect(policy.hasPending)
+        #expect(policy.flush(now: 4).isEmpty)
+        let landed = policy.flush(now: 6)
+        #expect(landed.map(\.record.state) == ["error"])
+        #expect(landed.first?.sourceID.hasSuffix(":3:") == true)
+        #expect(!policy.hasPending && policy.flush(now: 30).isEmpty)
+    }
+
+    // End to end: a pane that reports Waiting then Done within five seconds
+    // ends with Done in the inbox, without another status message.
+    @Test @MainActor func aPaneLandsItsCoalescedStateWithoutAnotherMessage() async throws {
+        let pane = PaneModel(profile: .sshConfigHost("program-status-coalesce.invalid"))
+        let store = AgentIntelligenceStore.shared
+        defer { store.markPaneRead(pane.id) }
+        let epoch = UUID()
+        func deliver(_ records: [RelayProgramStatusRecord], _ revision: UInt64) {
+            pane.applyProgramStatus(RelayStatus(state: "program_status", programStatus: records,
+                programStatusRevision: revision, programStatusReplay: false), deliveryEpoch: epoch)
+        }
+        func titles() -> [String] { store.items.filter { $0.paneID == pane.id }.map(\.title) }
+        deliver([record("blocked", id: "job")], 1)
+        deliver([record("done", id: "job")], 2)
+        #expect(titles().count == 1 && titles().first?.contains("Waiting") == true)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(RelayProgramStatusAttention.minimumInterval + 3))
+        while titles().count < 2, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(100)) }
+        #expect(titles().count == 2 && titles().first?.contains("Done") == true, "\(titles())")
+        #expect(store.marker(for: pane.id) == .needsInput)
     }
     @Test func simultaneousStatesChooseOneDeterministicPriority() {
         var policy = RelayProgramStatusAttention()
