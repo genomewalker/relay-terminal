@@ -126,6 +126,15 @@ fileprivate func tracedResult(_ exchange: RelayAssistantExchange?, _ tool: Strin
     return try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(trace.result.utf8))
 }
 
+/// The harness stopped on a sent-but-unconfirmed handoff: still unresolved
+/// (no further model request, never replayed) but presented as sent, not failed.
+@MainActor
+fileprivate func stoppedSentAwaitingConfirmation(_ exchange: RelayAssistantExchange?) -> Bool {
+    guard let exchange else { return false }
+    return !exchange.failed && exchange.reply == RelayAssistantHarness.sentAwaitingConfirmationReply
+        && exchange.reply.hasPrefix("Sent; waiting for confirmation (not replayed)")
+}
+
 /// The harness stopped on `tool`'s unresolved outcome and said it must not be replayed.
 @MainActor
 fileprivate func stoppedUnresolved(_ exchange: RelayAssistantExchange?, after tool: String) -> Bool {
@@ -2552,10 +2561,13 @@ struct RelayAssistantMessagingTests {
         f.assistant.runCard()
         let exchange = await task.value
         #expect(f.port.sent.count == 1 && f.port.sent[0].messageID == shown.id && f.port.sent[0].text == "Please run the tests\tnow.")
-        // Written to the socket but not yet read is unresolved: recorded in the trace, the task stops there.
+        // Written to the socket but not yet read is unresolved: recorded in the trace, the task stops there,
+        // and the panel presents it as sent and awaiting confirmation rather than failed.
         let sent = tracedResult(exchange, "message_pane")
-        #expect(sent?["outcome"]?.string == "ran" && sent?["source_authentication"]?.string == "relay_assistant_owner_submitted")
-        #expect(f.model.requests.count == 1 && stoppedUnresolved(exchange, after: "message_pane"))
+        #expect(sent?["outcome"]?.string == "ran" && sent?["status"]?.string == "written_to_socket"
+            && sent?["source_authentication"]?.string == "relay_assistant_owner_submitted")
+        #expect(f.model.requests.count == 1 && stoppedSentAwaitingConfirmation(exchange))
+        #expect(exchange?.failed == false)
         #expect(receipts(f.audit) == ["proposed", "dispatched", "ran"])
         #expect(f.assistant.exchanges.last?.messages.first?.status == "written_to_socket")
         await f.assistant.refreshReceipt(shown.id)
@@ -2584,7 +2596,7 @@ struct RelayAssistantMessagingTests {
             #expect(f.port.sent.count == 1 && f.port.sent[0].text == "Please rebase onto main when you are idle.")
             // The trace keeps the model's tool name; the delivered message is unresolved, so the task stops there.
             #expect(tracedResult(exchange, "send_command")?["rerouted"]?.string?.contains("message_pane") == true)
-            #expect(f.model.requests.count == 1 && stoppedUnresolved(exchange, after: "send_command"))
+            #expect(f.model.requests.count == 1 && stoppedSentAwaitingConfirmation(exchange))
             #expect(f.assistant.exchanges.last?.toolLog.last?.hasPrefix("send_command → message_pane") == true)
         }
     }
@@ -3351,5 +3363,34 @@ struct RelayMikoAgentAnswerTests {
         #expect(localHealth.contains(#""host":"This Mac""#) && localHealth.contains(#""connection_kind":"local""#), "\(localHealth)")
         #expect(remoteHealth.contains(#""host":"qa-f03.invalid""#) && remoteHealth.contains(#""connection_kind":"ssh""#), "\(remoteHealth)")
         #expect(exchange.undo == nil && executor.calls.isEmpty, "a read only")
+    }
+}
+
+@Suite("RelayAssistantHandoffPresentation")
+struct RelayAssistantHandoffPresentationTests {
+    private func content(_ object: [String: Any]) -> String {
+        String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+    }
+
+    @Test("A written_to_socket or accepted_by_provider handoff presents as sent, while the journal keeps it unresolved")
+    func sentHandoffIsNotAFailure() {
+        for status in ["written_to_socket", "accepted_by_provider"] {
+            let result = content(["outcome": "ran", "status": status])
+            #expect(RelayAssistantHarness.isSentAwaitingConfirmation(content: result, isError: false))
+        }
+        #expect(RelayAssistantHarness.sentAwaitingConfirmationReply.hasPrefix("Sent; waiting for confirmation (not replayed)"))
+        // Semantics unchanged: written_to_socket still stops the exchange as unresolved.
+        let call = RelayPaneHealthToolCall(type: "tool_use", id: "t1", name: "message_pane", input: .object([:]))
+        #expect(RelayMikoTaskJournal.toolOutcome(call: call, content: content(["outcome": "ran", "status": "written_to_socket"]),
+                                                 isError: false) == .unknown)
+    }
+
+    @Test("Errors, unknown outcomes and other statuses keep the failure presentation")
+    func otherUnresolvedOutcomesStayFailures() {
+        #expect(!RelayAssistantHarness.isSentAwaitingConfirmation(content: content(["outcome": "ran", "status": "written_to_socket"]), isError: true))
+        #expect(!RelayAssistantHarness.isSentAwaitingConfirmation(content: content(["outcome": "unknown", "status": "written_to_socket"]), isError: false))
+        #expect(!RelayAssistantHarness.isSentAwaitingConfirmation(content: content(["status": "written_to_socket", "error": "x"]), isError: false))
+        #expect(!RelayAssistantHarness.isSentAwaitingConfirmation(content: content(["outcome": "ran", "status": "submitted"]), isError: false))
+        #expect(!RelayAssistantHarness.isSentAwaitingConfirmation(content: "not json", isError: false))
     }
 }

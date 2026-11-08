@@ -1427,6 +1427,10 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
                             if !exchange.pendingExecJobs.isEmpty {
                                 exchange.reply = "The original job is still pending: " + exchange.pendingExecJobs.keys.sorted().joined(separator: ", ") +
                                     ". Its exact status was checked once. The task and operation receipt are saved; read exec_status on the same host and job ID to reconcile. Do not replay execution."
+                            } else if Self.isSentAwaitingConfirmation(content: content, isError: isError) {
+                                // Still unresolved: the loop stops and nothing is replayed.
+                                // Only the presentation differs from a failure.
+                                exchange.reply = Self.sentAwaitingConfirmationReply
                             } else {
                                 exchange.reply = "Task saved with an unresolved outcome for " + call.name +
                                     ". No further actions were started. Check the exact operation receipt; do not replay it."
@@ -2340,6 +2344,24 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
               let status = ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any])?["status"] as? String,
               ["draft_present", "input_changed", "prompt_unverified"].contains(status) else { return outcome }
         return status
+    }
+
+    /// Delivery states where a message reached the recipient's socket or
+    /// provider but is not yet confirmed.
+    nonisolated static let awaitingConfirmationStatuses: Set<String> = ["written_to_socket", "accepted_by_provider"]
+    nonisolated static let sentAwaitingConfirmationReply =
+        "Sent; waiting for confirmation (not replayed). Check the message receipt; do not resend."
+
+    /// A handoff that was sent but not yet confirmed. The journal still treats
+    /// it as unresolved (the exchange stops and never replays); this only
+    /// decides that the panel presents it as sent rather than failed. Any
+    /// error or non-"ran" outcome keeps the failure presentation.
+    nonisolated static func isSentAwaitingConfirmation(content: String, isError: Bool) -> Bool {
+        guard !isError, let root = try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(content.utf8)),
+              root["error"] == nil, let status = root["status"]?.string,
+              awaitingConfirmationStatuses.contains(status) else { return false }
+        if let outcome = root["outcome"]?.string, outcome != "ran" { return false }
+        return true
     }
 
     static func outcomeNote(_ outcome: String) -> String {

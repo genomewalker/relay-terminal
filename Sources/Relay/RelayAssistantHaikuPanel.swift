@@ -241,7 +241,8 @@ struct RelayAssistantHaikuPanel: View {
                 HStack(spacing: 6) {
                     Image(systemName: message.readAcknowledged ? "checkmark.message" : "paperplane")
                     Text("To " + RelayAssistantActions.q(message.recipientName) + " · " +
-                         (message.readAcknowledged ? "read" : message.status == "written_to_socket" ? "delivered" :
+                         (message.readAcknowledged ? "read" :
+                          RelayAssistantHarness.awaitingConfirmationStatuses.contains(message.status) ? "sent; waiting for confirmation" :
                           RelayAssistantActions.singleLine(message.status)))
                         .font(RelayTheme.font(size: 10.5)).lineLimit(1)
                     Spacer()
