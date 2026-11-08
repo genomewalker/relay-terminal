@@ -665,9 +665,12 @@ private struct AgentInboxRow: View {
                                 .accessibilityHidden(true)
                         }
                         Spacer()
-                        Text(Self.relativeFormatter.localizedString(for: item.occurredAt, relativeTo: Date()))
-                            .font(RelayTheme.font(size: 11, weight: .medium))
-                            .foregroundStyle(RelayTheme.textFaint)
+                        // Own clock: no longer refreshed as a side effect of workspace publishes.
+                        TimelineView(.periodic(from: .now, by: 30)) { context in
+                            Text(Self.relativeFormatter.localizedString(for: item.occurredAt, relativeTo: context.date))
+                                .font(RelayTheme.font(size: 11, weight: .medium))
+                                .foregroundStyle(RelayTheme.textFaint)
+                        }
                     }
                     if !item.detail.isEmpty {
                         Text(item.detail)

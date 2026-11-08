@@ -130,6 +130,36 @@ import SwiftUI
         let before = publishedState
         await work()
         if publishedState != before { revision &+= 1 }
+        scheduleFreshnessWake()
+    }
+
+    /// snapshot(), hostOverviews() and agentVersions() treat an observation as
+    /// fresh for this long. Its expiry changes what they show without any new
+    /// event, so one wake at the earliest expiry bumps `revision` and re-arms.
+    static let observationLifetime: TimeInterval = 300
+    var clock: () -> Date = { Date() }
+    var sleep: @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }
+    private var freshnessWake: Task<Void, Never>?
+    private(set) var freshnessDeadline: Date?
+
+    func scheduleFreshnessWake() {
+        let now = clock()
+        guard let deadline = observations.values.map({ $0.at.addingTimeInterval(Self.observationLifetime) })
+            .filter({ $0 > now }).min() else {
+            freshnessWake?.cancel(); freshnessWake = nil; freshnessDeadline = nil
+            return
+        }
+        if freshnessWake != nil, freshnessDeadline == deadline { return }
+        freshnessWake?.cancel()
+        freshnessDeadline = deadline
+        let sleep = self.sleep
+        freshnessWake = Task { @MainActor [weak self] in
+            do { try await sleep(deadline.timeIntervalSince(now)) } catch { return }
+            guard let self, !Task.isCancelled, self.freshnessDeadline == deadline else { return }
+            self.freshnessWake = nil; self.freshnessDeadline = nil
+            self.revision &+= 1
+            self.scheduleFreshnessWake()
+        }
     }
     private var publishedState: PublishedState {
         PublishedState(hosts: journal.hosts, tools: journal.tools, observations: observations,
@@ -278,6 +308,7 @@ import SwiftUI
     func observe(_ pane: PaneModel, proof: RelayAgentMaintenanceProbe, now: Date = Date()) {
         observations[pane.id] = Observation(proof: proof, at: now)
         revision &+= 1
+        scheduleFreshnessWake()
     }
 
     /// Last native versions per pane; read-only evidence, never an action input.
