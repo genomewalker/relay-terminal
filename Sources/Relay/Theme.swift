@@ -61,7 +61,8 @@ enum RelayTheme {
 
     /// Spacing tokens: the 2/4/6/8/12/16/24 set the app already uses, scaled by `spacingScale`.
     enum Space {
-        static let scale: [CGFloat] = [2, 4, 6, 8, 12, 16, 24]
+        /// The named tokens in ascending order, derived from the accessors so the two cannot drift.
+        static var scale: [CGFloat] { [xxs, xs, sm, md, lg, xl, xxl] }
         static var xxs: CGFloat { spacing(2) }
         static var xs: CGFloat { spacing(4) }
         static var sm: CGFloat { spacing(6) }
@@ -90,6 +91,7 @@ enum RelayTheme {
             case .heading: 14
             case .body: 13
             case .label, .code: 12
+            // 11.5 is deliberate: existing views use it, so migrating them stays 1:1.
             case .callout: 11.5
             case .caption, .codeSmall: 11
             case .micro: RelayTheme.minimumTextSize
@@ -110,7 +112,10 @@ enum RelayTheme {
             }
         }
 
-        var font: Font { RelayTheme.font(size: size, weight: weight, design: design) }
+        /// Rendered size: scaled by `typeScale` but never below `minimumTextSize`.
+        var renderedSize: CGFloat { max(size * RelayTheme.typeScale, RelayTheme.minimumTextSize) }
+
+        var font: Font { .system(size: renderedSize, weight: weight, design: design) }
     }
 
     static let typeScale: CGFloat = 1

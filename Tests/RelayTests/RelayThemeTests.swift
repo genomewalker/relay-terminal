@@ -75,6 +75,7 @@ struct RelayThemeTests {
         #expect(RelayTheme.TextRole.micro.size == RelayTheme.minimumTextSize)
         for role in RelayTheme.TextRole.allCases {
             #expect(role.size >= RelayTheme.minimumTextSize, "\(role)")
+            #expect(role.renderedSize >= RelayTheme.minimumTextSize, "\(role)")
         }
         // Roles keep today's dominant sizes so later migrations stay 1:1.
         #expect(RelayTheme.TextRole.body.size == 13)
