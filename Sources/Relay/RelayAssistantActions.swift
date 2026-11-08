@@ -878,6 +878,8 @@ enum RelayAssistantActions {
         // Completed.
         "applied": "ran", "attached": "ran", "created": "ran", "terminated": "ran", "selected": "ran",
         "published": "ran", "committed": "ran", "retired": "ran", "linked": "ran", "imported": "ran", "staged": "ran", "undone": "ran",
+        // relay_update_host_relayd: the host update finished and relayd rechecked ready.
+        "installed": "ran",
         // Terminal edit transport accepted one native input packet. The caller
         // must observe the screen/receipt before deciding the next interaction.
         "input_submitted": "ran",
@@ -892,7 +894,7 @@ enum RelayAssistantActions {
         "error": "failed", "conflict": "failed",
         // Submitted or in progress; the result cannot be observed here.
         "submitted_outcome_unknown": "unknown", "outcome_unknown": "unknown", "checking_owner": "unknown",
-        "pending": "unknown", "uncertain": "unknown", "resuming": "unknown", "created_session_start_pending": "unknown",
+        "pending": "unknown", "uncertain": "unknown", "resuming": "unknown", "created_session_start_pending": "unknown", "in_progress": "unknown",
     ]
 
     /// Literal rendering: every control, format (Cf), bidi, variation

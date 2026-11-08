@@ -149,7 +149,7 @@ import Testing
     }
 
     @Test func bundledCatalogMatchesRecoverySemantics() {
-        #expect(RelayMikoToolCatalog.names.count == 97)   // source23 adds guarded installed-update request and receipt
+        #expect(RelayMikoToolCatalog.names.count == 98)   // source23 adds guarded installed-update request and receipt; relay_update_host_relayd
         let description = RelayMikoToolCatalog.definition("relay_recover_pane")?["description"]?.string ?? ""
         #expect(description.contains("an identical repeat returns pending"))
         #expect(description.contains("After an app restart reconcile"))
@@ -208,6 +208,32 @@ import Testing
             }
         }
         #expect(cases == 15)
+    }
+
+    @Test func autonomousHostRelaydUpdateRunsWithoutRunClick() async throws {
+        let name = "relay_update_host_relayd"
+        #expect(RelayMikoToolCatalog.definition(name)?["tier"]?.string == "change")
+        // Not in the fixed card set, unlike the arbitrary-build install.
+        #expect(!RelayMikoActionPolicy.fixedCard(name, body: .object([:]), activeAgent: false))
+        #expect(!RelayMikoActionPolicy.fixedCard(name, body: .object([:]), activeAgent: true))
+        #expect(RelayMikoActionPolicy.fixedCard("relay_install_relayd", body: .object([:]), activeAgent: false))
+        let tier = RelayMikoActionPolicy.tier(name)
+        #expect(!RelayMikoActionPolicy.requiresCard(settings: RelayMikoPolicySettings(), tier: tier, origin: .user, fixed: false))
+        // Stricter user-chosen modes still card both tools.
+        let strict = RelayMikoPolicySettings(autonomy: .cardsForWrites)
+        #expect(RelayMikoActionPolicy.requiresCard(settings: strict, tier: tier, origin: .user, fixed: false))
+        #expect(RelayMikoActionPolicy.requiresCard(settings: strict, tier: RelayMikoActionPolicy.tier("relay_install_relayd"), origin: .user, fixed: true))
+        let request = RelayMikoToolRequest(tool: name, tier: "change", method: "POST", path: "/api/host/relayd-update", body: Data("{}".utf8))
+        #expect(request.capabilities == [.input])
+        let f = try MPFixture(); defer { f.close() }
+        var exchange = RelayAssistantExchange(request: "Update relayd on dandy-07", origin: .user)
+        let result = await f.harness.execute(f.call(name, arguments: #"{"host":"dandy-07","request_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}"#), exchange: &exchange)
+        #expect(!result.1, "AUTONOMOUS_UPDATE_RESULT: \(result.0)")
+        #expect(f.executor.calls == ["POST /api/panes"] && f.harness.pendingCard == nil)
+        // Its receipts classify as finished, refused, failed or still running.
+        for (status, outcome) in [("installed", "ran"), ("refused", "refused"), ("failed", "failed"), ("in_progress", "unknown")] {
+            #expect(RelayAssistantActions.classify(status: 200, body: Data(#"{"status":"\#(status)"}"#.utf8)) == outcome, "\(status)")
+        }
     }
 
     @Test func autonomousWritesRetainGrantsAndAudit() async throws {
@@ -591,7 +617,7 @@ import Testing
                 transitions += 1
             }
         }
-        #expect(states == 251_424) // 97 published tools × 2_592 policy tuples
+        #expect(states == 254_016) // 98 published tools × 2_592 policy tuples
         #expect(transitions == 16_384)
         print("MP bounded: tuples=\(states), two-actor sequences=4096 depth=4 transitions=\(transitions)")
     }
@@ -666,7 +692,7 @@ import Testing
         var seed: UInt64 = 0x4d_49_4b_4f
         func next() -> UInt64 { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return seed }
         let first = try RelayMikoToolCatalog.discover(.object([:]))
-        #expect(first["tools"]?.array?.count == 12 && first["total"] == .integer(97))
+        #expect(first["tools"]?.array?.count == 12 && first["total"] == .integer(98))
         for name in ["relay_miko_set_capabilities", "relay_register_caller", "relay_call_tool", "relay_ask_miko"] {
             #expect(throws: (any Error).self) { try RelayMikoToolCatalog.discover(.object(["tool_name": .string(name)])) }
         }

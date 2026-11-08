@@ -213,7 +213,7 @@ private struct MP4Form {
 
     @Test func boundedActualCompiledAndNativeOperationMatrix() async throws {
         let rows = MP4OperationFixtures.cases
-        try #require(rows.count == 143 && Set(rows.map(\.tool)) == RelayMikoToolCatalog.names, "MP4_EXACT_TOOL_COVERAGE")
+        try #require(rows.count == 144 && Set(rows.map(\.tool)) == RelayMikoToolCatalog.names, "MP4_EXACT_TOOL_COVERAGE")
         try #require(rows.contains { $0.id == "settings-account-rules" && $0.fixedActive && $0.fixedInactive && $0.arguments.contains("agent_account_rules") }, "INTEGRATION_ACCOUNT_RULE_WITNESS")
         try #require(rows.contains { $0.id == "workspace-status" && $0.tool == "relay_workspace_request" && $0.arguments.contains("status") && $0.capabilities == [.input] }, "INTEGRATION_WORKSPACE_STATUS_WITNESS")
         let f = try MP4Fixture(); defer { f.close() }

@@ -577,6 +577,7 @@ final class RelaySidePanelServer: ObservableObject {
         policyPermits: { [unowned self] caller in self.callerControl.permitted(caller) })
     private let localPaneApprovals = LocalPaneApproval()
     private let remoteInstall = RelayRemoteInstallControl()
+    private lazy var relaydUpdates = RelaydHostUpdateService(dependencies: .live(resolve: { [weak self] in self?.recoveryProfile(host: $0) }))
     private let workspaceControl = WorkspaceControl()
     private let mcpWorkspaceGrant = MCPWorkspaceGrant.shared
     private let workspaceApply = WorkspaceApplyAdmission()
@@ -2114,6 +2115,27 @@ final class RelaySidePanelServer: ObservableObject {
                 guard let object = try JSONSerialization.jsonObject(with: response) as? [String: Any] else { throw RelayHostRPCError.invalidRequest }
                 return try .jsonObject(object)
             } catch { return .text(error.localizedDescription, status: 409, reason: "Conflict") }
+        }
+        if request.method == "POST", request.path == "/api/host/relayd-update" {
+            // Same grant as remote installs; it runs Manage relayd's Update.
+            guard mcpWorkspaceGrant.permits(.input) else {
+                return .text("Remote installs need Relay's terminal control grant", status: 403, reason: "Forbidden")
+            }
+            guard let object = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+                  Set(object.keys) == ["host", "request_id"],
+                  let host = object["host"] as? String,
+                  let id = (object["request_id"] as? String).flatMap(UUID.init(uuidString:)) else {
+                return .text("Exact host and a request_id UUID required", status: 400, reason: "Bad Request")
+            }
+            do {
+                let caller = try callerControl.identity(token: request.headers["x-relay-caller-token"])
+                if let profile = recoveryProfile(host: host), profile.kind == .ssh {
+                    RelayHostRegistry.shared.register(profile, origin: "relayd update client: \(caller)")
+                }
+            } catch { return .text(error.localizedDescription, status: 409, reason: "Conflict") }
+            // relay-mcp's HTTP client gives up after 60 seconds; a longer
+            // update answers in_progress and the same request_id reads it.
+            return .json(await relaydUpdates.run(host: host, requestID: id, wait: .seconds(45)))
         }
         if request.method == "POST", request.path == "/api/host/remote-install" {
             guard mcpWorkspaceGrant.permits(.input) else {

@@ -22,7 +22,7 @@ enum RelayMikoToolCatalog {
     }
     static func catalogDataMatchesBuild(_ data: Data) -> Bool {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() ==
-            "4f596863712766abca5d216b634ea4e89f675b0d6d30b82306e1dc6db8903e3e"
+            "9e3cb6b97ede5d149c1722a179cf65b68fe7e8cbe4332b28c72e5e889906d94c"
     }
     static let definitions: [RelayPaneHealthJSON] = {
         guard let url = Bundle.module.url(forResource: "miko_tool_catalog", withExtension: "json", subdirectory: "Rotation"),
@@ -105,7 +105,7 @@ struct RelayMikoToolRequest: Equatable, Sendable {
              "relay_bind_question_thread", "relay_unbind_question_thread", "relay_workspace_migration_stage_plan",
              "relay_workspace_migration_apply", "relay_workspace_migration_undo", "relay_bind_workspace_context": return [.layout]
         case "relay_apply_installed_update", "relay_send_command", "relay_message_pane", "relay_exec", "relay_exec_cancel", "relay_upload_file",
-             "relay_install_relayd", "relay_rollback_relayd", "relay_move_pane_account", "relay_configure_context_rotation", "relay_terminal_edit", "relay_codex_resume_pane": return [.input]
+             "relay_install_relayd", "relay_update_host_relayd", "relay_rollback_relayd", "relay_move_pane_account", "relay_configure_context_rotation", "relay_terminal_edit", "relay_codex_resume_pane": return [.input]
         // Editor/R/network operations keep their existing domain-specific
         // approvals. Do not invent an additional terminal-input permission.
         default: return []
@@ -224,7 +224,7 @@ enum RelayMikoActionPolicy {
         "relay_update_settings", "relay_new_local_tab", "relay_new_stacked_pane", "relay_terminate_managed_pane",
         "relay_request_r_setup", "relay_request_r_evaluation", "relay_run_editor_selection",
         "relay_run_editor_file", "relay_run_project_file", "relay_run_r_code", "relay_pause_r_session",
-        "relay_request_editor_edit", "relay_request_editor_save", "relay_install_relayd",
+        "relay_request_editor_edit", "relay_request_editor_save", "relay_install_relayd", "relay_update_host_relayd",
         "relay_rollback_relayd", "relay_exec_cancel", "relay_request_network_action",
         "relay_request_desktop_route", "relay_create_desktop_route", "relay_send_desktop_message"
     ]
