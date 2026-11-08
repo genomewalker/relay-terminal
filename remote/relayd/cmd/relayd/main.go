@@ -1977,16 +1977,17 @@ func connectOrStart(socket string) (net.Conn, error) {
 	child.Stdout = logFile
 	child.Stderr = logFile
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := child.Start(); err != nil {
+	process, err := startSupervisorProcess(child, logFile)
+	if err != nil {
 		return nil, err
 	}
-	childPID := child.Process.Pid
+	childPID := process.Pid
 	// The supervisor is session-detached and survives this client, but while
 	// the client remains alive it is still the supervisor's Unix parent. Reap a
 	// supervisor that exits during an upgrade instead of leaving a zombie next
 	// to every long-lived node/attach process. If this client exits first, the
 	// detached supervisor is simply adopted by the host's normal reaper.
-	go func() { _ = child.Wait() }()
+	go func() { _, _ = process.Wait() }()
 	for attempt := 0; attempt < 80; attempt++ {
 		time.Sleep(25 * time.Millisecond)
 		if connection, dialErr := dialDaemon(socket, 250*time.Millisecond); dialErr == nil {

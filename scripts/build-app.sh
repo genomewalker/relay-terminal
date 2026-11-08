@@ -177,11 +177,17 @@ done
 # The Linux payloads cannot run on the build Mac. Build the same source for the
 # host once and verify the embedded helper version before signing the bundle.
 relayd_version_check="$stage_root/relayd-version-check"
+# cgo is required on macOS: the supervisor is spawned with a responsibility
+# disclaim so pane programs get relayd's privacy grants, not the launching app's.
 (
     cd "$project_root/remote/relayd"
-    go build -trimpath -ldflags="-X main.relaydVersion=$relayd_version" \
+    CGO_ENABLED=1 go build -trimpath -ldflags="-X main.relaydVersion=$relayd_version" \
         -o "$relayd_version_check" ./cmd/relayd
 )
+if ! go version -m "$relayd_version_check" | grep -q 'CGO_ENABLED=1'; then
+    echo "relayd was built without cgo; supervisor privacy attribution would regress" >&2
+    exit 1
+fi
 if [[ "$($relayd_version_check --version)" != "relayd $relayd_version" ]]; then
     echo "relayd version stamping failed" >&2
     exit 1
