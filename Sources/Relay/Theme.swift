@@ -14,6 +14,8 @@ enum RelayPalette {
     static let accent = dynamic(dark: 0x8DB7EB, light: .controlAccentColor)
     static let coral = dynamic(dark: 0xDDA398, light: .systemOrange)
     static let red = dynamic(dark: 0xDE827B, light: .systemRed)
+    /// Success/connected state; the side panel's Relay green.
+    static let success = dynamic(dark: 0x73C7A5, light: .systemGreen)
 
     static func dynamic(dark: UInt32, light: NSColor) -> NSColor {
         let dark = hex(dark)
@@ -55,6 +57,61 @@ enum RelayTheme {
     static let mint = accent
     static let coral = Color(nsColor: RelayPalette.coral)
     static let red = Color(nsColor: RelayPalette.red)
+    static let success = Color(nsColor: RelayPalette.success)
+
+    /// Spacing tokens: the 2/4/6/8/12/16/24 set the app already uses, scaled by `spacingScale`.
+    enum Space {
+        static let scale: [CGFloat] = [2, 4, 6, 8, 12, 16, 24]
+        static var xxs: CGFloat { spacing(2) }
+        static var xs: CGFloat { spacing(4) }
+        static var sm: CGFloat { spacing(6) }
+        static var md: CGFloat { spacing(8) }
+        static var lg: CGFloat { spacing(12) }
+        static var xl: CGFloat { spacing(16) }
+        static var xxl: CGFloat { spacing(24) }
+    }
+
+    /// Control geometry: standard controls are 28 pt; compact icon buttons in dense rows are 22 pt.
+    enum Control {
+        static let height: CGFloat = 28
+        static let compactIcon: CGFloat = 22
+    }
+
+    /// Smallest text Relay draws; badges and micro labels use exactly this size.
+    static let minimumTextSize: CGFloat = 10
+
+    /// Text roles mapped from today's dominant sizes. None is below `minimumTextSize`.
+    enum TextRole: CaseIterable {
+        case title, heading, body, label, callout, caption, micro, code, codeSmall
+
+        var size: CGFloat {
+            switch self {
+            case .title: 17
+            case .heading: 14
+            case .body: 13
+            case .label, .code: 12
+            case .callout: 11.5
+            case .caption, .codeSmall: 11
+            case .micro: RelayTheme.minimumTextSize
+            }
+        }
+
+        var weight: Font.Weight {
+            switch self {
+            case .title, .heading, .label: .medium
+            default: .regular
+            }
+        }
+
+        var design: Font.Design {
+            switch self {
+            case .code, .codeSmall: .monospaced
+            default: .default
+            }
+        }
+
+        var font: Font { RelayTheme.font(size: size, weight: weight, design: design) }
+    }
 
     static let typeScale: CGFloat = 1
     static let spacingScale: CGFloat = 1

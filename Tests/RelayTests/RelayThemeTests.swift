@@ -45,6 +45,43 @@ struct RelayThemeTests {
         #expect(try close(components(color, in: .darkAqua), [channel(16), channel(8), channel(0), 1]), "\(name)")
     }
 
+    @Test func successIsRelayGreenInDarkAndSystemGreenInLight() throws {
+        let dark = try components(RelayPalette.success, in: .darkAqua)
+        let green: [CGFloat] = [0x73, 0xC7, 0xA5].map { CGFloat($0) / 255 } + [1]
+        #expect(close(dark, green))
+        #expect(try close(components(RelayPalette.success, in: .aqua),
+                          components(NSColor.systemGreen, in: .aqua)))
+        // Success must be distinguishable from the accent it used to share.
+        #expect(try !close(dark, components(RelayPalette.accent, in: .darkAqua)))
+        #expect(try close(components(NSColor(RelayTheme.success), in: .darkAqua), dark))
+    }
+
+    @Test func spacingScaleIsTheCodifiedSet() {
+        typealias S = RelayTheme.Space
+        let expected: [CGFloat] = [2, 4, 6, 8, 12, 16, 24]
+        let named: [CGFloat] = [S.xxs, S.xs, S.sm, S.md, S.lg, S.xl, S.xxl]
+        let scaled: [CGFloat] = expected.map { RelayTheme.spacing($0) }
+        #expect(S.scale == expected)
+        #expect(named == scaled)
+    }
+
+    @Test func controlsAre28PointWithCompact22PointIcons() {
+        #expect(RelayTheme.Control.height == 28)
+        #expect(RelayTheme.Control.compactIcon == 22)
+    }
+
+    @Test func noTextRoleIsBelowTheTenPointFloor() {
+        #expect(RelayTheme.minimumTextSize == 10)
+        #expect(RelayTheme.TextRole.micro.size == RelayTheme.minimumTextSize)
+        for role in RelayTheme.TextRole.allCases {
+            #expect(role.size >= RelayTheme.minimumTextSize, "\(role)")
+        }
+        // Roles keep today's dominant sizes so later migrations stay 1:1.
+        #expect(RelayTheme.TextRole.body.size == 13)
+        #expect(RelayTheme.TextRole.label.size == 12)
+        #expect(RelayTheme.TextRole.caption.size == 11)
+    }
+
     @Test func relayWindowsStayDark() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 120, height: 80), styleMask: [.titled],
                               backing: .buffered, defer: true)
