@@ -53,6 +53,52 @@ import Testing
         #expect(await store.loads == 1)
         #expect(seen.calls == 1 && seen.onMain == 0)
     }
+
+    // 0.5.30: while the post-update Keychain prompt stayed unanswered, every
+    // Miko supervisor call hung in attachDaemon with no HTTP reply. A bounded
+    // request now refuses promptly; the single load keeps waiting for the user.
+    @Test func boundedKeyRequestsRefuseWhileTheKeychainPromptIsOpen() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let seen = OSAllocatedUnfairLockBox()
+        let fixed = Curve25519.Signing.PrivateKey()
+        let store = RelayCallerAdminProof.AdminKeyStore(load: {
+            seen.record(main: Thread.isMainThread)
+            gate.wait()
+            return fixed
+        })
+        let clock = ContinuousClock(), begun = clock.now
+        await #expect(throws: RelayCallerAdminProof.KeychainApprovalPending.self) {
+            _ = try await store.key(within: .milliseconds(50))
+        }
+        #expect(clock.now - begun < .seconds(2))
+        // Concurrent bounded requests share the one load (one prompt).
+        let waiting = (0..<6).map { _ in Task.detached { try? await store.key(within: .milliseconds(30)) } }
+        for task in waiting { #expect(await task.value == nil) }
+        #expect(await store.loads == 1 && seen.calls == 1)
+        // An unbounded request waits for the same load; approval releases it.
+        let patient = Task.detached { try await store.key().rawRepresentation }
+        try await Task.sleep(for: .milliseconds(20))
+        gate.signal()
+        #expect(try await patient.value == fixed.rawRepresentation)
+        // Cached: later requests succeed at once without loading again.
+        #expect(try await store.key(within: .milliseconds(1)).rawRepresentation == fixed.rawRepresentation)
+        #expect(await store.loads == 1 && seen.calls == 1)
+    }
+
+    // A denied prompt is reported, not cached: the next request loads (and
+    // prompts) again, as before.
+    @Test func aDeniedKeychainLoadIsReportedAndRetriedOnTheNextRequest() async throws {
+        let seen = OSAllocatedUnfairLockBox()
+        let fixed = Curve25519.Signing.PrivateKey()
+        let store = RelayCallerAdminProof.AdminKeyStore(load: {
+            seen.record(main: false)
+            if seen.calls == 1 { throw RelayHostRPCError.invalidRequest }
+            return fixed
+        })
+        await #expect(throws: RelayHostRPCError.self) { _ = try await store.key(within: .seconds(2)) }
+        #expect(try await store.key(within: .seconds(2)).rawRepresentation == fixed.rawRepresentation)
+        #expect(await store.loads == 2 && seen.calls == 2)
+    }
 }
 
 private final class OSAllocatedUnfairLockBox: @unchecked Sendable {

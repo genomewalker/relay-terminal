@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import Relay
@@ -115,6 +116,52 @@ struct RelayMikoSupervisorTests {
         #expect(f.supervisorRecords().first?.outcome == "admitted")
         f.provenPane = UUID().uuidString.lowercased()
         #expect(try await f.call("relay_miko_state").0 == 403)
+    }
+
+    // 0.5.30: after an update the first caller-policy import waits on a
+    // Keychain prompt. Until it was answered every supervisor call hung with
+    // only an "admitted" record and no reply. The call now refuses promptly
+    // with "Keychain approval pending", is audited as refused, and its
+    // attestation is never sent to relayd; after approval the next call runs.
+    @Test func anOpenKeychainPromptRefusesPromptlyWithoutSpendingTheProof() async throws {
+        let f = try Fixture()
+        defer { f.workspace.shutdown() }
+        let gate = DispatchSemaphore(value: 0)
+        let key = Curve25519.Signing.PrivateKey()
+        let store = RelayCallerAdminProof.AdminKeyStore(load: { gate.wait(); return key })
+        f.audit.transportIncarnation = { _ in nil }
+        f.audit.policyTransport = { _, packet in
+            if RelayCallerAdminProof.mutating.contains(packet["operation"] as? String ?? "") {
+                _ = try await store.key(within: .milliseconds(50))
+            }
+            return ["authority": "relayd", "callers": []]
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("relay-miko-keychain-" + UUID().uuidString)
+        let messaging = RelayPaneMessaging(linksDirectory: directory)
+        messaging.callerControl = f.audit
+        var sent: [String] = []
+        messaging.communicationTransport = { _, packet in
+            sent.append(packet["operation"] as? String ?? "")
+            return (["authority": "relayd", "source": ["authentication": "source_host_attested",
+                "attestationID": packet["attestation_id"] as? String ?? "",
+                "paneID": packet["source_pane_id"] as? String ?? "", "provider": f.pane.kind.rawValue]], Data())
+        }
+        f.channel = RelayMikoSupervisorChannel(supervision: f.supervision, audit: f.audit, redeem: { profile, packet in
+            try await messaging.daemonRequest(profile: profile, packet: packet)
+        })
+        let clock = ContinuousClock(), begun = clock.now
+        let (status, value) = try await f.call("relay_miko_state")
+        #expect(clock.now - begun < .seconds(3))
+        #expect(status == 503)
+        #expect((value["error"] as? String)?.contains("Keychain approval pending") == true, "\(value)")
+        #expect(f.supervisorRecords().map(\.outcome) == ["refused"])
+        #expect(sent.isEmpty, "the attestation must not be spent: \(sent)")
+        gate.signal()
+        _ = try await store.key()
+        let (after, _) = try await f.call("relay_miko_state")
+        #expect(after == 200)
+        #expect(sent == ["attest_consume"])
+        #expect(f.supervisorRecords().map(\.outcome).prefix(2) == ["refused", "admitted"])
     }
 
     @Test func pausedAndRevokedSupervisorsAreRefusedAtOnce() async throws {

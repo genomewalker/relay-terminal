@@ -554,6 +554,11 @@ extension JSONDecoder {
             reply = try await redeem(pane.profile, ["operation": "attest_consume", "attestation_id": request.attestationID,
                 "source_pane_id": request.supervisorPaneID, "pane_id": RelayAssistantMessaging.inboxID,
                 "message_id": request.requestID, "text": Self.canonicalText(tool: request.tool, arguments: request.arguments)])
+        } catch let pending as RelayCallerAdminProof.KeychainApprovalPending {
+            // The caller-policy attach is waiting on the user's Keychain
+            // prompt; the proof was not sent, so a fresh one can retry. 503:
+            // a transient local condition, not a refused authority.
+            throw Refusal(status: 503, message: pending.localizedDescription)
         } catch {
             throw Refusal(status: 403, message: "The supervisor proof could not be verified: " + String(error.localizedDescription.prefix(160)))
         }

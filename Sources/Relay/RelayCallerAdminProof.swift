@@ -41,17 +41,84 @@ enum RelayCallerAdminProof {
     /// attaches from raising more than one prompt.
     static let adminKey = AdminKeyStore(load: loadOrCreateKey)
 
+    /// How long a request waits for the key. An unanswered Keychain prompt
+    /// must not hold request handlers (0.5.30: Miko supervisor calls hung with
+    /// no reply); the load itself keeps waiting for the user.
+    static let keyWait: Duration = .seconds(3)
+
+    /// The key load is still waiting on the user's Keychain approval.
+    struct KeychainApprovalPending: LocalizedError, Equatable {
+        static let message = "Keychain approval pending: approve Relay's caller-admin key in the macOS Keychain prompt, then retry with a fresh request."
+        var errorDescription: String? { Self.message }
+    }
+
     actor AdminKeyStore {
-        private let load: @Sendable () throws -> Curve25519.Signing.PrivateKey
-        private var cached: Curve25519.Signing.PrivateKey?
+        typealias Key = Curve25519.Signing.PrivateKey
+        private let load: @Sendable () throws -> Key
+        private var cached: Key?
+        /// The one load in flight; it raises at most one Keychain prompt.
+        private var loading: Task<Data, Error>?
         private(set) var loads = 0
-        init(load: @escaping @Sendable () throws -> Curve25519.Signing.PrivateKey) { self.load = load }
-        func key() throws -> Curve25519.Signing.PrivateKey {
+        init(load: @escaping @Sendable () throws -> Key) { self.load = load }
+
+        /// Returns the key, waiting at most `bound` (nil: until the load ends)
+        /// for the load in progress. A timeout leaves that load running and
+        /// throws KeychainApprovalPending; a later request picks up its result.
+        /// A failed load is reported and not cached, so the next request loads
+        /// (and prompts) again, as before.
+        func key(within bound: Duration? = nil) async throws -> Key {
             if let cached { return cached }
-            loads += 1
-            let key = try load()
-            cached = key
-            return key
+            let task: Task<Data, Error>
+            if let loading { task = loading } else {
+                loads += 1
+                let load = self.load
+                task = Task.detached {
+                    try await withCheckedThrowingContinuation { continuation in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            continuation.resume(with: Result { try load().rawRepresentation })
+                        }
+                    }
+                }
+                loading = task
+            }
+            do {
+                let key = try Key(rawRepresentation: try await Self.value(of: task, within: bound))
+                cached = key
+                if loading == task { loading = nil }
+                return key
+            } catch let pending as KeychainApprovalPending {
+                throw pending
+            } catch {
+                if loading == task { loading = nil }
+                throw error
+            }
+        }
+
+        /// Awaiting a Task's value ignores cancellation, so a task group could
+        /// not stop waiting; the first of the load or the bound resumes once.
+        private static func value(of task: Task<Data, Error>, within bound: Duration?) async throws -> Data {
+            guard let bound else { return try await task.value }
+            let once = ResumeOnce()
+            return try await withCheckedThrowingContinuation { continuation in
+                once.set(continuation)
+                Task.detached { once.resume(with: await task.result) }
+                Task.detached {
+                    try? await Task.sleep(for: bound)
+                    once.resume(with: .failure(KeychainApprovalPending()))
+                }
+            }
+        }
+
+        private final class ResumeOnce: @unchecked Sendable {
+            private let lock = NSLock()
+            private var continuation: CheckedContinuation<Data, Error>?
+            func set(_ continuation: CheckedContinuation<Data, Error>) {
+                lock.lock(); self.continuation = continuation; lock.unlock()
+            }
+            func resume(with result: Result<Data, Error>) {
+                lock.lock(); let continuation = self.continuation; self.continuation = nil; lock.unlock()
+                continuation?.resume(with: result)
+            }
         }
     }
 
@@ -99,7 +166,7 @@ enum RelayCallerAdminProof {
         if let operation = packet["operation"] as? String, mutating.contains(operation) {
             let info = try await RelayHostExecution.communicationRequest(profile: profile, packet: ["operation": "caller_admin_info"])
             guard let node = info.value?["node_id"] as? String, !node.isEmpty else { throw RelayHostRPCError.invalidRequest }
-            let key = try await adminKey.key()
+            let key = try await adminKey.key(within: keyWait)
             // A host pinned to a different key is not ours to administer.
             if let pinned = info.value?["admin_key_sha256"] as? String, !pinned.isEmpty,
                pinned != SHA256.hash(data: key.publicKey.rawRepresentation).map({ String(format: "%02x", $0) }).joined() {
