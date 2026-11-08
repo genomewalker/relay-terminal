@@ -203,4 +203,27 @@ struct PaneVisitHistoryTests {
         workspace.selectPane(first, origin: .programmatic)
         #expect(workspace.paneVisits.visits.map(\.paneID) == [second, first])
     }
+
+    @MainActor
+    @Test("Rapid user visits coalesce into one workspace write that holds the last visit")
+    func rapidVisitsCoalesce() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("relay-visits-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false, workspaceDirectory: directory)
+        defer { workspace.shutdown() }
+        workspace.newFloatingPane()
+        let first = workspace.activePane!.id
+        workspace.newFloatingPane()
+        let second = workspace.activePane!.id
+        try await Task.sleep(for: .milliseconds(600))
+        let before = workspace.workspaceSaveCount
+        let ids = [first, second]
+        for step in 0..<20 { workspace.selectPane(ids[step % 2], origin: .user) }
+        #expect(workspace.workspaceSaveCount == before)
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(workspace.workspaceSaveCount == before + 1)
+        let saved = try #require(try workspace.sharedWorkspaceStore.restore(legacy: nil))
+        #expect(saved.paneVisits?.first?.paneID == second)
+        #expect(saved.paneVisits?.map(\.paneID) == workspace.paneVisits.visits.map(\.paneID))
+    }
 }

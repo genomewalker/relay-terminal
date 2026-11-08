@@ -1283,7 +1283,7 @@ struct RelayAssistantReviewRegressionTests {
     let before = workspace.activePaneID
     workspace.newTab(profile: .local)
     let pane = workspace.activePaneID ?? UUID()
-    if let before { workspace.revealPane(before, origin: .user) }
+    if let before { workspace.revealPane(before, origin: .programmatic) }
     return ScriptedExecutor.json(["status": "applied", "tabID": (workspace.tabID(containingPane: pane) ?? UUID()).uuidString.lowercased(),
                                   "paneID": pane.uuidString.lowercased()])
 }

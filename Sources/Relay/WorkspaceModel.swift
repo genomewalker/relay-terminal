@@ -343,6 +343,9 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var workspacePendingChanges = 0
     private var sidebarBeforeFullScreen = true
     private var persistenceTask: Task<Void, Never>?
+    /// Committed workspace saves. `persistWorkspace` is a trailing debounce,
+    /// so rapid selections (and their visits) share one save.
+    private(set) var workspaceSaveCount = 0
     private var supervisorTask: Task<Void, Never>?
     private var supervisorAdvisoryTask: Task<Void, Never>?
     private var supervisorAdvisoryRequestKey: SupervisorAdvisoryRequestKey?
@@ -3780,6 +3783,7 @@ final class WorkspaceModel: ObservableObject {
             let result = try sharedWorkspaceStore.commit(snapshot, baseline: workspaceBaseline,
                 ownership: submittedOwnership, ownershipBaseline: ownershipBaseline)
             let merged = result.workspace
+            workspaceSaveCount += 1
             // Another writer's placements reach this renderer on every save,
             // not only on a conflict, so captured admissions are never stale.
             if let owned = result.ownership { adoptOwnership(owned) }
