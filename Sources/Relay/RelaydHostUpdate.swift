@@ -247,9 +247,12 @@ final class RelaydHostUpdateProgress: ObservableObject {
     /// A check of the host completed with a fresh report. It supersedes the
     /// finished row only if it started after the update finished: the
     /// update's own recheck, or one still running when it ended, does not.
-    /// Starting a check (opening Manage relayd) never clears the row.
+    /// Starting a check (opening Manage relayd) never clears the row. A
+    /// failed row keeps its reason and Details until it expires or an
+    /// install starts: a later check does not explain the failure.
     func checkCompleted(key: String, startedAt: Date) {
-        guard let finished = entries[key]?.finishedAt, startedAt >= finished else { return }
+        guard let entry = entries[key], let finished = entry.finishedAt, startedAt >= finished else { return }
+        if case .failed = entry.phase { return }
         entries[key] = nil
     }
 

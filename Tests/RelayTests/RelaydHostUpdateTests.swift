@@ -305,14 +305,19 @@ import Testing
         // A check that started before the update finished (its own recheck) keeps it.
         progress.checkCompleted(key: "a", startedAt: beforeFinish)
         #expect(progress.entry(forKey: "a") != nil)
-        // A newer check supersedes only that host's finished row.
+        // A newer check supersedes only that host's successful row; a failed
+        // row keeps its reason and Details, and a running row stays.
         now += 5
-        for key in ["a", "r"] { progress.checkCompleted(key: key, startedAt: now) }
-        #expect(progress.entry(forKey: "a") == nil && progress.entry(forKey: "b") != nil)
+        let succeeded = UUID()
+        progress.began(key: "s", host: "s", requestID: succeeded)
+        progress.ended(requestID: succeeded, phase: .alreadyCurrent(version: "v"))
+        for key in ["a", "r", "s"] { progress.checkCompleted(key: key, startedAt: now) }
+        #expect(progress.entry(forKey: "s") == nil && progress.entry(forKey: "b") != nil)
+        #expect(progress.entry(forKey: "a")?.phase == .failed(message: "x"))
         #expect(progress.entry(forKey: "r")?.phase == .updating)
-        // An explicit install supersedes a finished row, not a running one.
-        progress.installStarted(key: "b"); progress.installStarted(key: "r")
-        #expect(progress.entry(forKey: "b") == nil && progress.entry(forKey: "r") != nil)
+        // An explicit install supersedes a finished row, failed or not, but not a running one.
+        progress.installStarted(key: "a"); progress.installStarted(key: "b"); progress.installStarted(key: "r")
+        #expect(progress.entry(forKey: "a") == nil && progress.entry(forKey: "b") == nil && progress.entry(forKey: "r") != nil)
     }
 
     // Through RelaydManager: starting the check (as onAppear does) keeps the
