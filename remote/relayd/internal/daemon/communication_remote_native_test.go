@@ -306,3 +306,25 @@ func TestHostChannelForgedExpiredEnvelopeIsRefused(t *testing.T) {
 		t.Fatal("a forged envelope was answered", got)
 	}
 }
+
+// The classifier and both too-late messages share one pinned prefix, so a
+// reworded message cannot silently stop classifying as too_late.
+func TestRemoteNativeTooLateMessagesSharePinnedPrefix(t *testing.T) {
+	if remoteNativeTooLatePrefix != "carried too late" {
+		t.Fatalf("prefix changed: %q", remoteNativeTooLatePrefix)
+	}
+	for _, text := range []string{remoteNativeTooLate, remoteNativeTooLateDelivery} {
+		if !strings.HasPrefix(text, remoteNativeTooLatePrefix+": ") {
+			t.Fatalf("message lacks the pinned prefix: %q", text)
+		}
+		receipt := communicationRemoteOutbound{Result: map[string]any{"error": text}}
+		if got := remoteNativeFinalState(receipt); got != "too_late" {
+			t.Fatalf("%q classified as %q", text, got)
+		}
+	}
+	other := communicationRemoteOutbound{PeerConfirmed: true, Result: map[string]any{
+		"error": "the recipient pane is closed", "peer_authentication": workNativeAuth, "status": "not_delivered"}}
+	if got := remoteNativeFinalState(other); got != "refused" {
+		t.Fatalf("other error classified as %q", got)
+	}
+}

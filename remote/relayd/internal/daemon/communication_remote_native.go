@@ -26,12 +26,15 @@ const (
 	remoteNativeKind      = "remote"
 	remoteNativeReplyKind = "remote_reply"
 	remoteNativeNote      = "carried by the Relay app over the host channel; query this receipt later, never resend"
+	// remoteNativeTooLatePrefix starts both too-late messages; remoteNativeFinalState
+	// classifies by it.
+	remoteNativeTooLatePrefix = "carried too late"
 	// remoteNativeTooLate names a signed message the carrier could not deliver
 	// while the sender's signed statement was still valid.
-	remoteNativeTooLate = "carried too late: the sender's signed statement would expire before delivery; nothing was sent. Resend under a new message ID"
+	remoteNativeTooLate = remoteNativeTooLatePrefix + ": the sender's signed statement would expire before delivery; nothing was sent. Resend under a new message ID"
 	// remoteNativeTooLateDelivery is the receiver's refusal of a signed message
 	// whose statement expired in transit. An earlier copy may have arrived.
-	remoteNativeTooLateDelivery = "carried too late: the sender's signed statement expired before delivery; it was not delivered now. Ask the recipient whether an earlier copy arrived, then resend under a new message ID"
+	remoteNativeTooLateDelivery = remoteNativeTooLatePrefix + ": the sender's signed statement expired before delivery; it was not delivered now. Ask the recipient whether an earlier copy arrived, then resend under a new message ID"
 	// remoteNativeSignedWindow leaves the carrier time to deliver before the
 	// statement expires.
 	remoteNativeSignedWindow = communicationStatementTTL - time.Minute
@@ -422,7 +425,7 @@ func remoteNativeQueuedResult(root string, receipt communicationRemoteOutbound) 
 // unsettled or for a message that never used the host channel.
 func remoteNativeFinalState(receipt communicationRemoteOutbound) string {
 	errText, _ := receipt.Result["error"].(string)
-	if strings.HasPrefix(errText, "carried too late") {
+	if strings.HasPrefix(errText, remoteNativeTooLatePrefix) {
 		return "too_late"
 	}
 	if !receipt.PeerConfirmed || receipt.Result["peer_authentication"] != workNativeAuth {
