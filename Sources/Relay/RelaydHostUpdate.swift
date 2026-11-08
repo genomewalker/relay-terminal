@@ -14,6 +14,8 @@ final class RelaydHostUpdateService {
         var check: @MainActor (ConnectionProfile) async -> RelaydHostReport?
         var install: @MainActor (ConnectionProfile, _ retrying: Bool) -> Void
         var report: @MainActor (ConnectionProfile) -> RelaydHostReport
+        /// The relayd version this app installs.
+        var bundledVersion: String = RelaydRemoteClient.expectedVersion
 
         static func live(resolve: @escaping @MainActor (String) -> ConnectionProfile?) -> Self {
             .init(
@@ -92,7 +94,7 @@ final class RelaydHostUpdateService {
         Task { [weak self, pollInterval, completionLimit] in
             let clock = ContinuousClock(), deadline = clock.now.advanced(by: completionLimit)
             while clock.now < deadline {
-                if self?.settle(profile: profile, requestID: requestID) != false { return }
+                if await self?.settle(profile: profile, requestID: requestID, before: report) != false { return }
                 try? await Task.sleep(for: pollInterval)
             }
             self?.update(requestID, "The relayd update on \(profile.host) is still running after \(completionLimit); check Manage relayd.")
@@ -101,7 +103,7 @@ final class RelaydHostUpdateService {
 
     /// The install ends in .failed, or in the manager's recheck (.checking,
     /// then .ready or another state). Returns whether the receipt is final.
-    private func settle(profile: ConnectionProfile, requestID: UUID) -> Bool {
+    private func settle(profile: ConnectionProfile, requestID: UUID, before: RelaydHostReport) async -> Bool {
         let report = dependencies.report(profile)
         switch report.state {
         case .installing, .checking:
@@ -110,9 +112,34 @@ final class RelaydHostUpdateService {
             finish(requestID, "installed", "relayd on \(profile.host) is updated and its supervisor restarted\(report.version.map { " at \($0)" } ?? "").", version: report.version)
         default:
             let detail = report.message.map { ": \($0)" } ?? ""
-            finish(requestID, "failed", "The relayd update on \(profile.host) ended \(report.state.rawValue)\(detail).", version: report.version)
+            await settleByRecheck(profile: profile, requestID: requestID, before: before,
+                                  ended: "The relayd update on \(profile.host) ended \(report.state.rawValue)\(detail)")
         }
         return true
+    }
+
+    /// A non-ready end can hide a completed swap: the install job's outcome is
+    /// lost when the supervisor it ran under is replaced. A fresh check decides
+    /// by evidence bound to this request: "installed" only if the supervisor
+    /// differs from the one the pre-install check saw (so it was replaced after
+    /// this request's check and dispatch) and runs the bundled relayd. The
+    /// manager's .ready already requires the installed payload hash to match
+    /// the bundled one for an equal version.
+    private func settleByRecheck(profile: ConnectionProfile, requestID: UUID, before: RelaydHostReport, ended: String) async {
+        let bundled = dependencies.bundledVersion
+        guard let after = await dependencies.check(profile) else {
+            return finish(requestID, "failed", ended + ". A recheck could not run (another relayd check or install is running); check Manage relayd.")
+        }
+        let wasPID = before.supervisorPID.map(String.init) ?? "none"
+        if after.state == .ready, after.version == bundled, after.liveVersion == bundled, let pid = after.supervisorPID {
+            if pid != before.supervisorPID {
+                return finish(requestID, "installed", "relayd on \(profile.host) is updated and its supervisor restarted at \(bundled): a recheck found a new supervisor (pid \(pid), was \(wasPID)) running the bundled relayd. The install itself reported: \(ended).", version: after.version)
+            }
+            return finish(requestID, "already_current", "relayd on \(profile.host) runs the bundled relayd \(bundled) under the same supervisor (pid \(pid)) as before this request, so this request did not update it. The install reported: \(ended).", version: after.version)
+        }
+        let seen = "state \(after.state.rawValue), installed \(after.version ?? "unknown"), running \(after.liveVersion ?? "none"), supervisor pid \(after.supervisorPID.map(String.init) ?? "none") (was \(wasPID))"
+        let detail = after.message.map { ": \($0)" } ?? ""
+        finish(requestID, "failed", ended + ". A recheck found \(seen)\(detail); Relay includes \(bundled).", version: after.version)
     }
 
     private func awaitReceipt(_ id: UUID, wait: Duration) async -> [String: String] {

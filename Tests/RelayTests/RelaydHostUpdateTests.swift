@@ -12,6 +12,9 @@ import Testing
     var checks = 0
     var installs: [Bool] = []
     var finish: ((inout RelaydHostReport) -> Void)?
+    /// What a fresh check sees once an install has run (nil: the current report).
+    var recheck: RelaydHostReport?
+    var recheckBusy = false
 
     init() {
         profiles["dandy-07"] = ConnectionProfile(host: "dandy-07")
@@ -26,6 +29,10 @@ import Testing
             check: { [weak self] _ in
                 guard let self else { return nil }
                 self.checks += 1
+                if !self.installs.isEmpty {
+                    if self.recheckBusy { return nil }
+                    if let recheck = self.recheck { self.report = recheck }
+                }
                 return self.busy ? nil : self.report
             },
             install: { [weak self] _, retrying in
@@ -40,7 +47,8 @@ import Testing
                     }
                 }
             },
-            report: { [weak self] _ in self?.report ?? RelaydHostReport(state: .unknown) }
+            report: { [weak self] _ in self?.report ?? RelaydHostReport(state: .unknown) },
+            bundledVersion: "new"
         )
     }
 }
@@ -144,5 +152,54 @@ import Testing
         failing.finish = { $0.state = .failed; $0.message = "checksum mismatch" }
         let failed = await second.run(host: "dandy-07", requestID: UUID(), wait: .seconds(5))
         #expect(failed["status"] == "failed" && failed["message"]?.contains("checksum mismatch") == true)
+    }
+
+    // 0.5.30 on dandy-07: the update swapped the supervisor, but the Mac lost
+    // the install job's outcome with the supervisor it ran under, and the
+    // receipt said "failed". A non-ready end now settles by a fresh check
+    // bound to this request: the supervisor must differ from the one seen
+    // before dispatch and run the bundled relayd.
+    private let lostOutcome = "Host exec outcome unavailable; job job-1; Do not replay execution."
+
+    private func swapRace(recheck: RelaydHostReport?, busy: Bool = false) async -> (FakeRelaydHost, [String: String]) {
+        let host = FakeRelaydHost(), updates = service(host)
+        host.report = RelaydHostReport(state: .outdated, architecture: "amd64", version: "old", liveVersion: "old", supervisorPID: 100)
+        host.finish = { [lostOutcome] in $0.state = .failed; $0.message = lostOutcome }
+        host.recheck = recheck
+        host.recheckBusy = busy
+        let result = await updates.run(host: "dandy-07", requestID: UUID(), wait: .seconds(5))
+        return (host, result)
+    }
+
+    @Test func aLostInstallOutcomeIsInstalledWhenANewSupervisorRunsTheBundledRelayd() async {
+        let (host, result) = await swapRace(recheck: RelaydHostReport(state: .ready, architecture: "amd64",
+            version: "new", liveVersion: "new", supervisorPID: 200))
+        #expect(result["status"] == "installed" && result["version"] == "new", "\(result)")
+        #expect(result["message"]?.contains("Host exec outcome unavailable") == true)
+        #expect(host.installs.count == 1 && host.checks == 2)
+    }
+
+    @Test func aLostInstallOutcomeUnderTheSameSupervisorIsAlreadyCurrent() async {
+        let (host, result) = await swapRace(recheck: RelaydHostReport(state: .ready, architecture: "amd64",
+            version: "new", liveVersion: "new", supervisorPID: 100))
+        #expect(result["status"] == "already_current", "\(result)")
+        #expect(host.installs.count == 1 && host.checks == 2)
+    }
+
+    @Test func aLostInstallOutcomeWithoutEvidenceStaysFailed() async {
+        let cases: [(String, RelaydHostReport?, Bool)] = [
+            ("outdated", RelaydHostReport(state: .outdated, architecture: "amd64", version: "old", liveVersion: "old", supervisorPID: 300), false),
+            ("unreachable", RelaydHostReport(state: .unreachable, message: "no route"), false),
+            ("no supervisor", RelaydHostReport(state: .ready, architecture: "amd64", version: "new", supervisorPID: nil), false),
+            ("other running version", RelaydHostReport(state: .ready, architecture: "amd64", version: "new", liveVersion: "newer", supervisorPID: 300), false),
+            ("recheck busy", nil, true),
+        ]
+        for (name, recheck, busy) in cases {
+            let (host, result) = await swapRace(recheck: recheck, busy: busy)
+            #expect(result["status"] == "failed", "\(name): \(result)")
+            #expect(result["message"]?.contains("Host exec outcome unavailable") == true, "\(name)")
+            #expect(result["message"]?.contains("recheck") == true, "\(name): \(result)")
+            #expect(host.installs.count == 1, "\(name)")
+        }
     }
 }
