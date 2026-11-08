@@ -39,12 +39,15 @@ final class RelaydHostUpdateService {
     private let dependencies: Dependencies
     private let pollInterval: Duration
     private let completionLimit: Duration
+    private let progress: RelaydHostUpdateProgress
     private var receipts: [UUID: Receipt] = [:]
 
-    init(dependencies: Dependencies, pollInterval: Duration = .seconds(1), completionLimit: Duration = .seconds(1800)) {
+    init(dependencies: Dependencies, pollInterval: Duration = .seconds(1), completionLimit: Duration = .seconds(1800),
+         progress: RelaydHostUpdateProgress = .shared) {
         self.dependencies = dependencies
         self.pollInterval = pollInterval
         self.completionLimit = completionLimit
+        self.progress = progress
     }
 
     func receipt(_ id: UUID) -> [String: String]? { receipts[id]?.result }
@@ -89,6 +92,7 @@ final class RelaydHostUpdateService {
             return finish(requestID, "refused", "Relay did not start the update for \(host); nothing was run.")
         }
         update(requestID, "Updating relayd on \(host): installing the bundled relayd, replacing the supervisor with workers preserved.")
+        progress.began(key: profile.connectionKey, host: host, requestID: requestID)
         // The manager's operation continues on its own; this only records how
         // it ends, and stops if the service goes away.
         Task { [weak self, pollInterval, completionLimit] in
@@ -98,6 +102,7 @@ final class RelaydHostUpdateService {
                 try? await Task.sleep(for: pollInterval)
             }
             self?.update(requestID, "The relayd update on \(profile.host) is still running after \(completionLimit); check Manage relayd.")
+            self?.progress.ended(requestID: requestID, phase: .stillRunning(after: completionLimit))
         }
     }
 
@@ -168,9 +173,87 @@ final class RelaydHostUpdateService {
     private func finish(_ id: UUID, _ status: String, _ message: String, version: String? = nil) {
         guard let host = receipts[id]?.host else { return }
         receipts[id]?.result = result(host, id, status, message, version: version)
+        // Only an update that started has a row; refusals ran nothing.
+        switch status {
+        case "installed": progress.ended(requestID: id, phase: .installed(version: version ?? dependencies.bundledVersion))
+        case "already_current": progress.ended(requestID: id, phase: .alreadyCurrent(version: version ?? dependencies.bundledVersion))
+        default: progress.ended(requestID: id, phase: .failed(message: message))
+        }
     }
 
     private func update(_ id: UUID, _ message: String) {
         receipts[id]?.result["message"] = message
+    }
+}
+
+/// The in-flight and last relayd update per host, observed by the Manage
+/// relayd host rail. Written only by RelaydHostUpdateService.
+@MainActor
+final class RelaydHostUpdateProgress: ObservableObject {
+    static let shared = RelaydHostUpdateProgress()
+
+    struct Entry: Equatable {
+        enum Phase: Equatable {
+            case updating
+            case stillRunning(after: Duration)
+            case installed(version: String)
+            case alreadyCurrent(version: String)
+            case failed(message: String)
+        }
+        let host: String
+        let requestID: UUID
+        let startedAt: Date
+        var phase: Phase
+    }
+
+    /// Keyed by ConnectionProfile.connectionKey.
+    @Published private(set) var entries: [String: Entry] = [:]
+
+    func entry(forKey key: String) -> Entry? { entries[key] }
+
+    func began(key: String, host: String, requestID: UUID, at date: Date = Date()) {
+        entries[key] = Entry(host: host, requestID: requestID, startedAt: date, phase: .updating)
+    }
+
+    /// Updates the row of this request; a newer update on the host owns it.
+    func ended(requestID: UUID, phase: Entry.Phase) {
+        guard let key = entries.first(where: { $0.value.requestID == requestID })?.key else { return }
+        entries[key]?.phase = phase
+    }
+}
+
+/// What the host rail shows for an update: text, tone and whether Details
+/// (the host's Manage relayd detail) is offered.
+struct RelaydHostUpdateRow: Equatable {
+    enum Tone: Equatable { case muted, success, failure }
+    let text: String
+    let tone: Tone
+    let showsDetails: Bool
+
+    init(entry: RelaydHostUpdateProgress.Entry, now: Date) {
+        switch entry.phase {
+        case .updating:
+            text = "Updating relayd… " + Self.elapsed(now.timeIntervalSince(entry.startedAt))
+            tone = .muted; showsDetails = false
+        case .stillRunning(let limit):
+            text = "Updating relayd… still running after " + Self.elapsed(Double(limit.components.seconds))
+            tone = .muted; showsDetails = true
+        case .installed(let version):
+            text = "Updated to " + version
+            tone = .success; showsDetails = false
+        case .alreadyCurrent(let version):
+            text = "Already current at " + version
+            tone = .success; showsDetails = false
+        case .failed(let message):
+            text = message
+            tone = .failure; showsDetails = true
+        }
+    }
+
+    /// m:ss, or h:mm:ss from an hour.
+    static func elapsed(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.isFinite ? seconds : 0))
+        let h = total / 3600, m = total / 60 % 60, s = total % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
     }
 }

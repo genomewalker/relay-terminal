@@ -908,6 +908,7 @@ struct RelaydManagerView: View {
     let preferredProfile: ConnectionProfile?
     @ObservedObject private var manager = RelaydManager.shared
     @ObservedObject private var preferences = RelayPreferences.shared
+    @ObservedObject private var updates = RelaydHostUpdateProgress.shared
     @Environment(\.dismiss) private var dismiss
 
     private var profiles: [ConnectionProfile] {
@@ -995,6 +996,9 @@ struct RelaydManagerView: View {
                                 )
                             }
                             .buttonStyle(.plain)
+                            if let update = updates.entry(forKey: profile.connectionKey) {
+                                updateRow(update, profile: profile)
+                            }
                         }
                     }
                     .padding(RelayTheme.spacing(8))
@@ -1003,6 +1007,35 @@ struct RelaydManagerView: View {
             Spacer(minLength: 0)
         }
         .background(RelayTheme.sidebar)
+    }
+
+    /// The host's relayd update: elapsed time while it runs, then its
+    /// outcome. Details opens this host's detail. A sibling of the host
+    /// button, not inside it, so its own button stays clickable.
+    private func updateRow(_ entry: RelaydHostUpdateProgress.Entry, profile: ConnectionProfile) -> some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let row = RelaydHostUpdateRow(entry: entry, now: context.date)
+            HStack(alignment: .firstTextBaseline, spacing: RelayTheme.spacing(6)) {
+                if entry.phase == .updating { ProgressView().controlSize(.mini) }
+                Text(row.text)
+                    .font(RelayTheme.font(size: 9.5))
+                    .foregroundStyle(row.tone == .success ? RelayTheme.success
+                        : row.tone == .failure ? RelayTheme.red : RelayTheme.textMuted)
+                    .lineLimit(3)
+                    .monospacedDigit()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if row.showsDetails {
+                    // Select only: a check could collide with a still-running install.
+                    Button("Details") { manager.select(profile) }
+                    .buttonStyle(.link)
+                    .font(RelayTheme.font(size: 9.5))
+                }
+            }
+            .padding(.horizontal, RelayTheme.spacing(10))
+            .padding(.bottom, RelayTheme.spacing(4))
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("relayd.update." + profile.connectionKey)
+        }
     }
 
     @ViewBuilder
