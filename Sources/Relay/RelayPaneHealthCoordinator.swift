@@ -62,7 +62,7 @@ import SwiftUI
         let signal: String
         let at: Date
     }
-    private struct Journal: Codable {
+    private struct Journal: Codable, Equatable {
         var hosts: [String: Host] = [:]
         var tools: [String: ToolReceipt] = [:]
         var controllerActionResults: [String: RelayPaneHealthControllerActionReceipt]?
@@ -149,6 +149,10 @@ import SwiftUI
     private var controllerRegisteredPanes: [String: [String]] = [:]
     private var controllerLastSynced: [String: Date] = [:]
     private var journal = Journal()
+    /// The journal as the file holds it (loaded or last written). `save()`
+    /// skips only when the in-memory journal equals it and the file exists,
+    /// so every changed journal, including each pre-dispatch fence, is written.
+    private var persistedJournal: Journal?
     private var loadFailed = false
     private let startedAt = Date()
     private let url: URL
@@ -167,6 +171,7 @@ import SwiftUI
                 let data = try Data(contentsOf: url)
                 guard data.count <= 4 << 20 else { throw RelayHostRotationRPC.Failure.invalidResponse }
                 journal = try JSONDecoder().decode(Journal.self, from: data)
+                persistedJournal = journal
             }
         } catch { loadFailed = true }
     }
@@ -719,10 +724,13 @@ import SwiftUI
             let completed = journal.tools.values.filter { $0.result != nil }.sorted { $0.createdAt < $1.createdAt }
             for entry in completed.prefix(journal.tools.count - 384) { journal.tools.removeValue(forKey: entry.id) }
         }
+        // A routine sync rewrote an unchanged journal every 15 s per host.
+        if journal == persistedJournal, FileManager.default.fileExists(atPath: url.path) { return }
         let data = try RelayPaneHealthJSON.data(journal)
         guard data.count <= 4 << 20 else { loadFailed = true; throw RelayHostRotationRPC.Failure.invalidResponse }
         try data.write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        persistedJournal = journal
         revision &+= 1
     }
 
