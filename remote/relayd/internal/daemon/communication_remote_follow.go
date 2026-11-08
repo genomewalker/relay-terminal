@@ -50,6 +50,9 @@ func validFollowedFrom(list []communicationPinnedConversation, current communica
 func remoteLinkFollowLocal(root string, link CommunicationRemoteLink, live communicationMember) (CommunicationRemoteLink, bool, error) {
 	saved := communicationMember{PaneID: link.LocalPaneID, Provider: link.LocalConversation.Provider, SessionID: link.LocalConversation.SessionID,
 		PID: link.LocalPID, Start: link.LocalStart}
+	if link.LocalRootPID > 0 {
+		saved.Endpoint = map[string]any{"rootPID": link.LocalRootPID, "rootStart": link.LocalRootStart}
+	}
 	if saved.PID == 0 && link.LocalConversation.SessionID != live.SessionID {
 		// A link saved before process pins were kept: take the process from
 		// this host's own saved pane pairs, which pinned the same pane and
@@ -81,6 +84,7 @@ func remoteLinkFollowLocal(root string, link CommunicationRemoteLink, live commu
 		link.LocalFollowedFrom = history
 	}
 	link.LocalConversation, link.LocalPID, link.LocalStart = next, updated.PID, updated.Start
+	link.LocalRootPID, link.LocalRootStart = communicationEndpointRoot(live.Endpoint)
 	return link, true, nil
 }
 
@@ -121,10 +125,8 @@ func remoteLinkLearnFromMessage(link CommunicationRemoteLink, message communicat
 }
 
 func remoteFollowAudit(link CommunicationRemoteLink, before CommunicationRemoteLink) map[string]any {
-	kind := "process_refreshed"
-	if before.LocalConversation != link.LocalConversation {
-		kind = "conversation_followed"
-	}
+	kind := communicationFollowKind(before.LocalConversation != link.LocalConversation,
+		before.LocalPID != 0 && (before.LocalPID != link.LocalPID || before.LocalStart != link.LocalStart))
 	return map[string]any{"time": time.Now().UTC(), "link_id": link.ID, "kind": kind, "pane_id": link.LocalPaneID,
 		"provider": link.LocalConversation.Provider, "old_session": before.LocalConversation.SessionID, "new_session": link.LocalConversation.SessionID,
 		"old_pid": before.LocalPID, "new_pid": link.LocalPID, "old_start": before.LocalStart, "new_start": link.LocalStart}

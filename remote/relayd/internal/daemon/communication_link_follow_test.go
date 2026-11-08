@@ -163,3 +163,49 @@ func TestAssistantSendFollowsARecipientClearedInTheSameProcess(t *testing.T) {
 		t.Fatalf("stored %+v err=%v", stored.Members, err)
 	}
 }
+
+// An agent restarted in the same pane (a new process, a new conversation) is
+// the same partner when the kernel shows the same pane root and provider. A
+// changed root (pane recovery, another terminal) or provider is not.
+func TestLinkFollowsAnAgentRestartedUnderTheSamePaneRoot(t *testing.T) {
+	withRoot := func(m communicationMember, root int, start string) communicationMember {
+		endpoint := map[string]any{}
+		for k, v := range m.Endpoint {
+			endpoint[k] = v
+		}
+		endpoint["rootPID"], endpoint["rootStart"] = float64(root), start
+		m.Endpoint = endpoint
+		return m
+	}
+	saved := withRoot(followMember("old-session", 4575, "darwin:5"), 39777, "darwin:1")
+	restarted := withRoot(followMember("new-session", 65179, "darwin:8"), 39777, "darwin:1")
+	got, moved, err := communicationLinkFollow(saved, restarted)
+	if err != nil || !moved || got.SessionID != "new-session" || got.PID != 65179 {
+		t.Fatalf("restart under the same root: %+v moved=%v err=%v", got, moved, err)
+	}
+	if root, start := communicationEndpointRoot(got.Endpoint); root != 39777 || start != "darwin:1" {
+		t.Fatal("the followed member lost its pane root", root, start)
+	}
+	for name, live := range map[string]communicationMember{
+		"other_root_pid":   withRoot(followMember("new-session", 65179, "darwin:8"), 40000, "darwin:1"),
+		"other_root_start": withRoot(followMember("new-session", 65179, "darwin:8"), 39777, "darwin:2"),
+		"no_root":          followMember("new-session", 65179, "darwin:8"),
+	} {
+		if _, _, err := communicationLinkFollow(saved, live); err == nil || !strings.Contains(err.Error(), "relink needed") {
+			t.Fatal(name, "was followed", err)
+		}
+	}
+	codex := restarted
+	codex.Provider = "codex"
+	if _, _, err := communicationLinkFollow(saved, codex); err == nil {
+		t.Fatal("a restart under another provider was followed")
+	}
+	// A pin without a recorded root gains one on the next unchanged use.
+	plain := followMember("same", 1, "s")
+	rooted := withRoot(followMember("same", 1, "s"), 9, "r")
+	if got, moved, err := communicationLinkFollow(plain, rooted); err != nil || !moved {
+		t.Fatal("the pane root was not recorded", got, moved, err)
+	} else if root, _ := communicationEndpointRoot(got.Endpoint); root != 9 {
+		t.Fatal("root not stored", got.Endpoint)
+	}
+}

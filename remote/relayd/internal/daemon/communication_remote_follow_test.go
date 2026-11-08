@@ -295,3 +295,26 @@ func TestLegacyLinkFollowsOnlyWithARecordOfTheLiveProcess(t *testing.T) {
 		t.Fatalf("legacy link with a record of the live process: %+v moved=%v err=%v", followed, moved, err)
 	}
 }
+
+// A remote link records the pane root on use and follows an agent restarted
+// under it; a different root is refused.
+func TestRemoteLinkFollowsARestartUnderItsPaneRoot(t *testing.T) {
+	root := t.TempDir()
+	pin := communicationPinnedConversation{Provider: "claude", SessionID: "old-session"}
+	link := CommunicationRemoteLink{ID: "x", LocalPaneID: "p", LocalConversation: pin}
+	live := func(session string, pid int, rootPID int) communicationMember {
+		return communicationMember{PaneID: "p", Provider: "claude", SessionID: session, PID: pid, Start: "linux:" + session,
+			Endpoint: map[string]any{"transport": "fixture", "rootPID": float64(rootPID), "rootStart": "linux:1"}}
+	}
+	link, moved, err := remoteLinkFollowLocal(root, link, live("old-session", 10, 7))
+	if err != nil || !moved || link.LocalRootPID != 7 || link.LocalRootStart != "linux:1" {
+		t.Fatalf("first use did not record the pane root: %+v err=%v", link, err)
+	}
+	if _, _, err := remoteLinkFollowLocal(root, link, live("new-session", 11, 8)); err == nil {
+		t.Fatal("a restart under another pane root was followed")
+	}
+	link, moved, err = remoteLinkFollowLocal(root, link, live("new-session", 11, 7))
+	if err != nil || !moved || link.LocalConversation.SessionID != "new-session" || link.LocalPID != 11 || len(link.LocalFollowedFrom) != 1 {
+		t.Fatalf("restart under the same root: %+v err=%v", link, err)
+	}
+}

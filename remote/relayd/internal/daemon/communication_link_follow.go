@@ -24,7 +24,7 @@ import (
 // revision (shepherd reports check it), and following changes no review.
 
 // communicationLinkRelinkNeeded names a conversation change the link cannot follow.
-const communicationLinkRelinkNeeded = "linked conversation changed in another process; relink needed: save the pair again"
+const communicationLinkRelinkNeeded = "linked conversation changed in another process or pane root; relink needed: save the pair again"
 
 // communicationLinkFollow decides whether a saved member still names the live
 // one. It returns the member to store and whether it differs from saved.
@@ -36,12 +36,19 @@ func communicationLinkFollow(saved, live communicationMember) (communicationMemb
 		return saved, false, errors.New("linked conversation changed; review the pair before sending")
 	}
 	sameProcess := saved.PID != 0 && saved.Start != "" && saved.PID == live.PID && saved.Start == live.Start
-	if saved.SessionID != live.SessionID && !sameProcess {
+	// The pane is the partner: an agent restarted in the same pane keeps its
+	// links when the kernel shows the same pane root (the pane's worker and
+	// shell incarnation) and the same provider. A changed root is a pane
+	// recovery or another terminal and is not followed.
+	savedRoot, savedRootStart := communicationEndpointRoot(saved.Endpoint)
+	liveRoot, liveRootStart := communicationEndpointRoot(live.Endpoint)
+	sameRoot := savedRoot > 0 && savedRootStart != "" && savedRoot == liveRoot && savedRootStart == liveRootStart
+	if saved.SessionID != live.SessionID && !sameProcess && !sameRoot {
 		return saved, false, errors.New(communicationLinkRelinkNeeded)
 	}
 	// Same conversation (perhaps resumed in a new process) or the same process
 	// in a new conversation: keep the pin current so a later /clear follows.
-	if saved.SessionID == live.SessionID && saved.PID == live.PID && saved.Start == live.Start {
+	if saved.SessionID == live.SessionID && saved.PID == live.PID && saved.Start == live.Start && (sameRoot || liveRoot == 0) {
 		return saved, false, nil
 	}
 	updated := saved
@@ -69,10 +76,7 @@ func communicationLinkFollowAll(root string, link communicationLink, live map[st
 			continue
 		}
 		members[i], changed = updated, true
-		kind := "process_refreshed"
-		if saved.SessionID != updated.SessionID {
-			kind = "conversation_followed"
-		}
+		kind := communicationFollowKind(saved.SessionID != updated.SessionID, saved.PID != updated.PID || saved.Start != updated.Start)
 		repins = append(repins, map[string]any{"time": time.Now().UTC(), "link_id": link.ID, "pane_id": saved.PaneID, "kind": kind,
 			"provider": updated.Provider, "old_session": saved.SessionID, "new_session": updated.SessionID,
 			"old_pid": saved.PID, "new_pid": updated.PID, "old_start": saved.Start, "new_start": updated.Start})
@@ -106,4 +110,38 @@ func communicationAppendRepinFile(root, name string, record map[string]any) erro
 		return fmt.Errorf("record link repin: %w", err)
 	}
 	return nil
+}
+
+// communicationEndpointRoot is the pane root a native observation recorded:
+// the root process and its kernel start. Zero when absent.
+func communicationEndpointRoot(endpoint map[string]any) (int, string) {
+	if endpoint == nil {
+		return 0, ""
+	}
+	pid := 0
+	switch value := endpoint["rootPID"].(type) {
+	case float64:
+		if value == float64(int(value)) {
+			pid = int(value)
+		}
+	case int:
+		pid = value
+	case int64:
+		pid = int(value)
+	}
+	start, _ := endpoint["rootStart"].(string)
+	return pid, start
+}
+
+// communicationFollowKind names a recorded change: a new conversation in the
+// same process (/clear), a restarted agent under the same pane root, or only
+// a refreshed process pin for the same conversation.
+func communicationFollowKind(conversationChanged, processChanged bool) string {
+	switch {
+	case conversationChanged && processChanged:
+		return "restart_followed"
+	case conversationChanged:
+		return "conversation_followed"
+	}
+	return "process_refreshed"
 }
