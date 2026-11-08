@@ -611,7 +611,10 @@ private struct RelaySpinningArc: NSViewRepresentable {
 final class RelaySpinnerView: NSView {
     private let track = CAShapeLayer()
     private let arc = CAShapeLayer()
+    private var occlusionObserver: NSObjectProtocol?
     var animating = false { didSet { if animating != oldValue { updateSpin() } } }
+    /// The window server's occlusion; replaceable where no window is shown.
+    var occlusionVisible: (NSWindow) -> Bool = { $0.occlusionState.contains(.visible) }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -631,14 +634,20 @@ final class RelaySpinnerView: NSView {
     override var intrinsicContentSize: NSSize { NSSize(width: RelayStatusMark.size, height: RelayStatusMark.size) }
     override var isFlipped: Bool { true }
 
+    /// The layers drawn by hand, for tests.
+    var shapeLayers: [CAShapeLayer] { [track, arc] }
+    var isSpinning: Bool { arc.animation(forKey: "spin") != nil }
+
     override func layout() {
         super.layout()
         // Same geometry as the still arc: 1.5 pt inset, stroke centred on the circle.
         let inset = 1.5 + 1.75 / 2
         let box = bounds.insetBy(dx: inset, dy: inset)
-        for layer in [track, arc] {
-            layer.frame = bounds
-            layer.path = CGPath(ellipseIn: box, transform: nil)
+        withoutImplicitAnimation {
+            for layer in [track, arc] {
+                layer.frame = bounds
+                layer.path = CGPath(ellipseIn: box, transform: nil)
+            }
         }
     }
 
@@ -647,24 +656,54 @@ final class RelaySpinnerView: NSView {
         updateColors()
     }
 
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateScale()
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if let occlusionObserver { NotificationCenter.default.removeObserver(occlusionObserver) }
+        occlusionObserver = nil
+        if let window {
+            // Marks outside a visibility scope still stop in a covered window.
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.updateSpin() } }
+        }
+        updateScale()
         updateSpin()
     }
 
+    private func withoutImplicitAnimation(_ body: () -> Void) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        body()
+        CATransaction.commit()
+    }
+
+    private func updateScale() {
+        let scale = window?.backingScaleFactor ?? 2
+        withoutImplicitAnimation {
+            for layer in [track, arc] { layer.contentsScale = scale }
+        }
+    }
+
     private func updateColors() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            track.strokeColor = RelayPalette.success.withAlphaComponent(0.25).cgColor
-            arc.strokeColor = RelayPalette.success.cgColor
+        withoutImplicitAnimation {
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                track.strokeColor = RelayPalette.success.withAlphaComponent(0.25).cgColor
+                arc.strokeColor = RelayPalette.success.cgColor
+            }
         }
     }
 
     private func updateSpin() {
-        guard animating, window != nil else {
+        guard animating, let window, occlusionVisible(window) else {
             arc.removeAnimation(forKey: "spin")
             return
         }
-        guard arc.animation(forKey: "spin") == nil else { return }
+        guard !isSpinning else { return }
         let spin = CABasicAnimation(keyPath: "transform.rotation.z")
         spin.fromValue = 0
         spin.toValue = 2 * Double.pi
