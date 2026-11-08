@@ -213,7 +213,7 @@ func communicationSendRemote(root, node string, r CommunicationRequest, hooks co
 			}
 			// A sending pane that ran /clear in the same process keeps the pair;
 			// the message tells the peer which conversation it followed from.
-			followed, moved, err := remoteLinkFollowLocal(current, source)
+			followed, moved, err := remoteLinkFollowLocal(root, current, source)
 			if err != nil {
 				return err
 			}

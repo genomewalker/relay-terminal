@@ -263,3 +263,35 @@ func TestFollowedFromIsBoundAndOnlyFromThePinnedConversation(t *testing.T) {
 func globRemoteLinks(root string) ([]string, error) {
 	return filepath.Glob(filepath.Join(root, "remote-link-*.json"))
 }
+
+// A link saved before process pins were kept (the live dandy-07 link) follows
+// a /clear only when one of the host's saved pane pairs recorded the old
+// conversation in exactly the live process. A record of an earlier process
+// that once resumed the same conversation is not evidence.
+func TestLegacyLinkFollowsOnlyWithARecordOfTheLiveProcess(t *testing.T) {
+	root := t.TempDir()
+	pane := "767dc718-6476-4d81-8f96-5875f4bd8ed7"
+	old := communicationPinnedConversation{Provider: "claude", SessionID: "e2dc1ae4-321b-4f39-b111-9264ef0af3c5"}
+	link := CommunicationRemoteLink{ID: "x", LocalPaneID: pane, LocalConversation: old}
+	live := communicationMember{PaneID: pane, Provider: "claude", SessionID: "ea871a3f-879c-4e1f-9539-2f99a25b2c0a", PID: 3968237, Start: "linux:40852365",
+		Endpoint: map[string]any{"transport": "fixture"}}
+	record := func(name string, pid int, start string) {
+		pair := communicationLink{Version: 1, ID: name, Members: []communicationMember{{PaneID: pane, Provider: "claude", SessionID: old.SessionID, PID: pid, Start: start}}}
+		if err := communicationAtomic(filepath.Join(root, "link-"+name+".json"), pair); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := remoteLinkFollowLocal(root, link, live); err == nil || !strings.Contains(err.Error(), "relink needed") {
+		t.Fatal("a legacy link followed without evidence", err)
+	}
+	record("earlier", 2648214, "linux:6368696")
+	if _, _, err := remoteLinkFollowLocal(root, link, live); err == nil {
+		t.Fatal("a record of an earlier process was taken as evidence")
+	}
+	record("live", 3968237, "linux:40852365")
+	followed, moved, err := remoteLinkFollowLocal(root, link, live)
+	if err != nil || !moved || followed.LocalConversation.SessionID != live.SessionID || followed.LocalPID != 3968237 ||
+		len(followed.LocalFollowedFrom) != 1 || followed.LocalFollowedFrom[0] != old {
+		t.Fatalf("legacy link with a record of the live process: %+v moved=%v err=%v", followed, moved, err)
+	}
+}

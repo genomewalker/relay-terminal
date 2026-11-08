@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"errors"
+	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -45,9 +47,17 @@ func validFollowedFrom(list []communicationPinnedConversation, current communica
 
 // remoteLinkFollowLocal follows the link's local member to the live
 // observation. It returns the link to store and whether it changed.
-func remoteLinkFollowLocal(link CommunicationRemoteLink, live communicationMember) (CommunicationRemoteLink, bool, error) {
+func remoteLinkFollowLocal(root string, link CommunicationRemoteLink, live communicationMember) (CommunicationRemoteLink, bool, error) {
 	saved := communicationMember{PaneID: link.LocalPaneID, Provider: link.LocalConversation.Provider, SessionID: link.LocalConversation.SessionID,
 		PID: link.LocalPID, Start: link.LocalStart}
+	if saved.PID == 0 && link.LocalConversation.SessionID != live.SessionID {
+		// A link saved before process pins were kept: take the process from
+		// this host's own saved pane pairs, which pinned the same pane and
+		// conversation to one exact process.
+		if communicationRecordedProcess(root, link.LocalPaneID, link.LocalConversation, live.PID, live.Start) {
+			saved.PID, saved.Start = live.PID, live.Start
+		}
+	}
 	updated, moved, err := communicationLinkFollow(saved, live)
 	if err != nil {
 		if err.Error() == communicationLinkRelinkNeeded {
@@ -125,4 +135,31 @@ func remoteAppendRepins(root, linkID string, records ...map[string]any) {
 		// Evidence only: a failed append never undoes a follow the checks accepted.
 		_ = communicationAppendRepinFile(root, "remote-link-"+linkID+".repins.jsonl", record)
 	}
+}
+
+// communicationRecordedProcess reports whether one of this host's saved pane
+// pairs pinned pane, in conversation, to exactly the process pid/start. A
+// conversation resumed in several processes over time leaves several records;
+// only a record of this very process is evidence that it ran the conversation.
+func communicationRecordedProcess(root, pane string, conversation communicationPinnedConversation, pid int, start string) bool {
+	if pid <= 0 || start == "" {
+		return false
+	}
+	paths, err := filepath.Glob(filepath.Join(root, "link-*.json"))
+	if err != nil {
+		return false
+	}
+	for _, path := range paths {
+		var pair communicationLink
+		if communicationRead(path, &pair) != nil {
+			continue
+		}
+		for _, member := range pair.Members {
+			if strings.EqualFold(member.PaneID, pane) && member.SessionID == conversation.SessionID && member.Provider == conversation.Provider &&
+				member.PID == pid && member.Start == start {
+				return true
+			}
+		}
+	}
+	return false
 }

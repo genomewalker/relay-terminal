@@ -443,7 +443,7 @@ func communicationReceiveRemote(ctx context.Context, root, node, certificateHash
 		// A recipient pane that ran /clear in the same process keeps the pair;
 		// the message also tells this host which conversation the sender is in.
 		before := link
-		followed, moved, err := remoteLinkFollowLocal(link, target)
+		followed, moved, err := remoteLinkFollowLocal(root, link, target)
 		if err != nil {
 			if err.Error() == communicationLinkRelinkNeeded {
 				return err
