@@ -182,8 +182,11 @@ type routeEvent struct {
 	PID     int    `json:"pid"`
 	Start   string `json:"start"`
 	Account string `json:"account,omitempty"`
-	Name    string `json:"name"`
-	Drain   int    `json:"drain"`
+	// AccountShared, on a ready frame, says the remote verified that Account
+	// shares the recorded account's conversation history.
+	AccountShared bool   `json:"account_shared,omitempty"`
+	Name          string `json:"name"`
+	Drain         int    `json:"drain"`
 }
 
 func parseEvent(raw []byte) (routeEvent, error) {
@@ -221,8 +224,39 @@ func readyAccount(c Config, path string, event routeEvent) (Config, bool, error)
 	if e != nil {
 		return updated, true, e
 	}
+	if updated, e = correctOwnerAccount(updated, path, event); e != nil {
+		return updated, true, e
+	}
 	updated, e = recordAccountAcceptance(updated, path, true)
 	return updated, true, e
+}
+
+// correctOwnerAccount replaces a recorded account that the owner incarnation
+// the route names does not run in, when the remote verified that both share
+// one conversation history. The pid and start are unchanged; the correction is
+// logged beside the route like a re-pin, and written only over the exact
+// configuration this listener holds.
+func correctOwnerAccount(c Config, path string, event routeEvent) (Config, error) {
+	if !event.AccountShared || event.Account == "" || c.RemoteAccount == "" || event.Account == c.RemoteAccount {
+		return c, nil
+	}
+	current, e := readConfig(path)
+	if e != nil {
+		return c, e
+	}
+	if current != c {
+		return c, nil
+	}
+	updated := c
+	updated.RemoteAccount = event.Account
+	if e = updated.Validate(); e != nil {
+		return c, e
+	}
+	if e = atomicJSON(path, updated); e != nil {
+		return c, e
+	}
+	recordRepin(path, c, updated)
+	return updated, nil
 }
 
 // recordAccountAcceptance durably sets whether the remote takes the recorded

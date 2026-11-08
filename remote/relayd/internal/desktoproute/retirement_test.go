@@ -889,7 +889,7 @@ func TestReplyMailboxStableSingleOwnerBusyIsClean(t *testing.T) {
 		return processInfo{}, nil
 	}}
 	var out bytes.Buffer
-	if e := r.listen(context.Background(), registry, peerRecord{}, name, &out); e != nil || out.String() != "{\"type\":\"mailbox_busy\"}\n" {
+	if e := r.listen(context.Background(), registry, "", peerRecord{}, name, &out); e != nil || out.String() != "{\"type\":\"mailbox_busy\"}\n" {
 		t.Fatal("busy listener did not exit cleanly", out.String(), e)
 	}
 	after, e := os.Stat(path)

@@ -224,7 +224,7 @@ func parsePeerMessage(auth, frame []byte, secret string, target peerRecord) (Env
 	}
 	return Envelope{ID: p.ID, Sender: target.Name, Content: p.Message.Content}, nil
 }
-func (r *remoteRuntime) listen(ctx context.Context, registry string, target peerRecord, name string, out io.Writer) error {
+func (r *remoteRuntime) listen(ctx context.Context, registry, recorded string, target peerRecord, name string, out io.Writer) error {
 	root := mailboxRoot(os.Getuid())
 	if e := privateDirectory(root, true); e != nil {
 		return e
@@ -287,7 +287,14 @@ func (r *remoteRuntime) listen(ctx context.Context, registry string, target peer
 		return e
 	}
 	defer os.Remove(recordPath)
-	if e = emit(out, map[string]any{"type": "ready", "pid": ownPID, "start": own.Start, "name": name, "peer": target.Name, "drain": 1, "account": filepath.Dir(registry)}); e != nil {
+	ready := map[string]any{"type": "ready", "pid": ownPID, "start": own.Start, "name": name, "peer": target.Name, "drain": 1, "account": filepath.Dir(registry)}
+	// The live owner's account differs from the one the route recorded but holds
+	// the same conversation history: an account move that an older listener
+	// re-pinned without its account. Only then may the route correct it.
+	if live := filepath.Dir(registry); recorded != "" && filepath.Clean(recorded) != live && sharedHistory(recorded, live) {
+		ready["account_shared"] = true
+	}
+	if e = emit(out, ready); e != nil {
 		return e
 	}
 	last := time.Time{}
@@ -465,7 +472,7 @@ func (r *remoteRuntime) run(ctx context.Context, args []string, in io.Reader, ou
 		}
 		return r.send(ctx, registry, target, args[4], Mailbox{PID: boxPID, Start: args[6]}, in, out)
 	}
-	e = r.listen(ctx, registry, target, args[4], out)
+	e = r.listen(ctx, registry, account, target, args[4], out)
 	if errors.Is(e, errIdentity) {
 		return r.identityEvent(registry, args[2], account, out)
 	}
