@@ -669,6 +669,7 @@ final class RelaydManager: ObservableObject {
         let key = profile.connectionKey
         RelayHostRegistry.shared.register(profile, origin: "Relay installation manager")
         guard operations[key] == nil else { return }
+        RelaydHostUpdateProgress.shared.hostChecked(key: key)
         var checking = report(for: profile)
         checking.state = .checking
         checking.message = nil

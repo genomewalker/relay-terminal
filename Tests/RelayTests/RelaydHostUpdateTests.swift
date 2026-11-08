@@ -263,6 +263,37 @@ import Testing
         #expect(row.text == "Updating relayd… still running after 30:00" && row.tone == .muted && row.showsDetails)
     }
 
+    // bc08 N1: finished rows expire 10 minutes after they finish, or when
+    // the host is checked again; updating and still-running rows stay.
+    @Test func finishedRowsExpireAfterTenMinutesOrARecheck() {
+        var now = Date(timeIntervalSince1970: 1_000_000)
+        let progress = RelaydHostUpdateProgress(now: { now })
+        let ids = (0..<5).map { _ in UUID() }
+        let phases: [RelaydHostUpdateProgress.Entry.Phase] = [.installed(version: "0.5.32"),
+            .alreadyCurrent(version: "0.5.32"), .failed(message: "boom"), .stillRunning(after: .seconds(1800))]
+        for (index, phase) in phases.enumerated() {
+            progress.began(key: "k\(index)", host: "h\(index)", requestID: ids[index])
+            progress.ended(requestID: ids[index], phase: phase)
+        }
+        progress.began(key: "k4", host: "h4", requestID: ids[4])
+        now += 9 * 60
+        #expect((0..<5).allSatisfy { progress.entry(forKey: "k\($0)") != nil })
+        now += 60
+        #expect((0..<3).allSatisfy { progress.entry(forKey: "k\($0)") == nil })
+        now += 3600
+        #expect(progress.entry(forKey: "k3")?.phase == .stillRunning(after: .seconds(1800)))
+        #expect(progress.entry(forKey: "k4")?.phase == .updating)
+
+        // A recheck of the host clears its finished row at once, only that one.
+        progress.began(key: "a", host: "a", requestID: ids[0]); progress.ended(requestID: ids[0], phase: .failed(message: "x"))
+        // Expired rows are removed from the published state on the next write.
+        #expect(progress.entries["k0"] == nil && progress.entries["k1"] == nil && progress.entries["k2"] == nil)
+        progress.began(key: "b", host: "b", requestID: ids[1]); progress.ended(requestID: ids[1], phase: .installed(version: "v"))
+        for key in ["a", "k3", "k4"] { progress.hostChecked(key: key) }
+        #expect(progress.entry(forKey: "a") == nil && progress.entry(forKey: "b") != nil)
+        #expect(progress.entry(forKey: "k3") != nil && progress.entry(forKey: "k4") != nil)
+    }
+
     // Refusals run nothing, so they add no row.
     @Test func aRefusedRequestAddsNoProgress() async {
         let host = FakeRelaydHost(), progress = RelaydHostUpdateProgress(), updates = service(host, progress)

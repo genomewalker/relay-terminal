@@ -187,10 +187,13 @@ final class RelaydHostUpdateService {
 }
 
 /// The in-flight and last relayd update per host, observed by the Manage
-/// relayd host rail. Written only by RelaydHostUpdateService.
+/// relayd host rail. Written only by RelaydHostUpdateService. A finished row
+/// stays for `finishedLifetime`, or until the host is checked again; an
+/// update still running (or past the service's limit) stays.
 @MainActor
 final class RelaydHostUpdateProgress: ObservableObject {
     static let shared = RelaydHostUpdateProgress()
+    static let finishedLifetime: TimeInterval = 600
 
     struct Entry: Equatable {
         enum Phase: Equatable {
@@ -199,26 +202,74 @@ final class RelaydHostUpdateProgress: ObservableObject {
             case installed(version: String)
             case alreadyCurrent(version: String)
             case failed(message: String)
+
+            var finished: Bool {
+                switch self {
+                case .installed, .alreadyCurrent, .failed: true
+                case .updating, .stillRunning: false
+                }
+            }
         }
         let host: String
         let requestID: UUID
         let startedAt: Date
         var phase: Phase
+        var finishedAt: Date? = nil
     }
 
     /// Keyed by ConnectionProfile.connectionKey.
     @Published private(set) var entries: [String: Entry] = [:]
+    private let now: () -> Date
+    private var expiry: Task<Void, Never>?
 
-    func entry(forKey key: String) -> Entry? { entries[key] }
+    init(now: @escaping () -> Date = Date.init) { self.now = now }
 
-    func began(key: String, host: String, requestID: UUID, at date: Date = Date()) {
-        entries[key] = Entry(host: host, requestID: requestID, startedAt: date, phase: .updating)
+    func entry(forKey key: String) -> Entry? {
+        guard let entry = entries[key], !expired(entry) else { return nil }
+        return entry
+    }
+
+    func began(key: String, host: String, requestID: UUID) {
+        prune()
+        entries[key] = Entry(host: host, requestID: requestID, startedAt: now(), phase: .updating)
     }
 
     /// Updates the row of this request; a newer update on the host owns it.
     func ended(requestID: UUID, phase: Entry.Phase) {
         guard let key = entries.first(where: { $0.value.requestID == requestID })?.key else { return }
         entries[key]?.phase = phase
+        entries[key]?.finishedAt = phase.finished ? now() : nil
+        prune()
+        scheduleExpiry()
+    }
+
+    /// The host's status is being checked again: its finished row is stale.
+    func hostChecked(key: String) {
+        guard entries[key]?.phase.finished == true else { return }
+        entries[key] = nil
+    }
+
+    private func expired(_ entry: Entry) -> Bool {
+        entry.finishedAt.map { now().timeIntervalSince($0) >= Self.finishedLifetime } ?? false
+    }
+
+    private func prune() {
+        let stale = entries.filter { expired($0.value) }.map(\.key)
+        for key in stale { entries[key] = nil }
+    }
+
+    /// Removes rows as they expire, so the rail redraws without them.
+    private func scheduleExpiry() {
+        expiry?.cancel()
+        let ends = entries.values.compactMap(\.finishedAt).map { $0.addingTimeInterval(Self.finishedLifetime) }
+        guard let next = ends.min() else { expiry = nil; return }
+        let delay = max(0, next.timeIntervalSince(now()))
+        expiry = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.prune()
+            self.scheduleExpiry()
+        }
     }
 }
 
