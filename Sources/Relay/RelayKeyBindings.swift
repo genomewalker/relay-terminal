@@ -7,6 +7,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
     case newLocalSession
     case findHost
     case quickNavigate
+    case fleetBoard
     case connectHost
     case openEditor
     case zoomPane
@@ -43,6 +44,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .newTab: "New tab in session"
         case .newLocalSession: "New local session"
         case .quickNavigate: "Go to pane"
+        case .fleetBoard: "Agent fleet"
         case .findHost: "Find SSH host"
         case .connectHost: "Connect to host"
         case .openEditor: "Open remote editor"
@@ -77,7 +79,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
 
     var section: String {
         switch self {
-        case .newTab, .newLocalSession, .findHost, .quickNavigate, .connectHost: "Sessions"
+        case .newTab, .newLocalSession, .findHost, .quickNavigate, .fleetBoard, .connectHost: "Sessions"
         case .previousTab, .nextTab: "Tabs"
         case .openEditor, .zoomPane, .floatPane, .balancePanes, .splitRight,
              .splitDown, .newFloatingPane, .previousPane, .nextPane,
@@ -94,6 +96,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .newTab: .init("t", command: true)
         case .newLocalSession: .init("n", command: true, option: true)
         case .quickNavigate: .init("p", command: true, shift: true)
+        case .fleetBoard: .init("a", command: true, shift: true)
         case .findHost: .init("k", command: true)
         case .connectHost: .init("n", command: true, shift: true)
         case .openEditor: .init("e", command: true, shift: true)

@@ -304,6 +304,11 @@ struct WorkspaceView: View {
         }) {
             RelayQuickNavigate(workspace: workspace)
         }
+        .sheet(isPresented: $workspace.isFleetBoardPresented, onDismiss: {
+            workspace.fleetBoardDidDismiss()
+        }) {
+            RelayFleetBoard(workspace: workspace)
+        }
         .sheet(isPresented: $workspace.isHostLauncherPresented) {
             HostLauncher(workspace: workspace)
         }

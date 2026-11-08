@@ -20,7 +20,11 @@ struct RelayQuickNavigate: View {
 
     private var results: [Index.Entry] {
         _ = activityIndex.revision
-        let now = Date()
+        return Self.entries(for: workspace, query: query)
+    }
+
+    /// Every row Go to pane lists for `query`, in display order.
+    static func entries(for workspace: WorkspaceModel, query: String, now: Date = Date()) -> [RelayWorkOverviewIndex.Entry] {
         let visits = workspace.paneVisits
         var entries = Index.navigationEntries(query: query)
         for item in workspace.ownership.orderedWorkspaces {
@@ -42,20 +46,18 @@ struct RelayQuickNavigate: View {
                 guard let pane = workspace.panes[id] else { continue }
                 let hidden = tab.hiddenStackPaneIDs.contains(id)
                 let activity = pane.agentActivities.last
-                let changedAt = [activity?.occurredAt, pane.lastCompletedAgentTurn].compactMap { $0 }.max()
                 let timestamp = activity.map { $0.occurredAt.formatted(date: .abbreviated, time: .standard) } ?? "Unavailable"
                 let stale = activity.map { Date().timeIntervalSince($0.occurredAt) > 300 } ?? false
-                let report = pane.programStatus.records.min {
-                    let priority = ["blocked": 0, "error": 1, "working": 2, "done": 3, "idle": 4]
-                    return (priority[$0.state] ?? 5) < (priority[$1.state] ?? 5)
-                }
+                // The same metadata and predicate as the fleet board and its counts.
+                let fact = Index.paneFact(pane, tabID: tab.id, workspaceName: owner, tabName: title, hidden: hidden)
+                let report = Index.mostUrgentProgramState(pane.programStatus.records.map(\.state))
                 let reportCurrent = pane.connectionState == .connected && pane.programStatus.revision != nil
                 // Idle is only the absence of recent output; it cannot
                 // establish that the worker is ready or its task succeeded.
                 let signalDetail = pane.pendingAgentApprovals == 0 && report == nil && pane.phase == .quiet
                     ? "No recent output; readiness has not been confirmed.\n" : ""
                 let status = Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
-                                              programState: report?.state, programReportCurrent: reportCurrent)
+                                              programState: report, programReportCurrent: reportCurrent)
                 let stateSource = pane.pendingAgentApprovals > 0 ? "pending agent approval count"
                     : (report != nil ? "program self-report" : "terminal output and agent signals")
                 let programDetails = pane.programStatus.records.map { record in
@@ -70,8 +72,8 @@ struct RelayQuickNavigate: View {
                     symbol: pane.contentKind == .editor ? "doc.text" : "terminal", destination: .pane(id, tab.id),
                     searchFields: [pane.title, pane.profile.name, pane.profile.host, pane.directory ?? "", id.uuidString,
                                    hidden ? "hidden stack" : "", pane.connectionStatusLabel],
-                    needsAttention: pane.pendingAgentApprovals > 0 || pane.phase == .needsInput || report?.state == "blocked" || report?.state == "error",
-                    isCurrent: current, changedAt: changedAt,
+                    needsAttention: fact.status == .waiting,
+                    isCurrent: current, changedAt: fact.changedAt,
                     lastVisitedAt: id == workspace.activePaneID ? nil : visits.visit(id)?.lastVisitedAt,
                     frecency: visits.frecency(of: id, at: now), isActivePane: id == workspace.activePaneID))
             }
@@ -85,8 +87,7 @@ struct RelayQuickNavigate: View {
         case .workspace(let id): workspace.selectWorkspace(id, origin: .user)
         case .tab(let id): workspace.selectTab(id, origin: .user)
         case .pane(let id, let tab):
-            workspace.selectTab(tab)
-            workspace.selectPane(id, origin: .user)
+            workspace.goToPane(id, inTab: tab)
         case .settings(let section):
             workspace.quickNavigateDidChooseAction {
                 RelaySettingsNavigation.shared.section = section
@@ -97,6 +98,12 @@ struct RelayQuickNavigate: View {
             workspace.quickNavigateDidChooseAction { [weak workspace] in
                 workspace?.performancePanelSection = "Control"
                 workspace?.performancePanelVisible = true
+            }
+            return
+        case .fleetBoard:
+            workspace.quickNavigateDidChooseAction { [weak workspace] in
+                guard let workspace else { return }
+                workspace.presentFleetBoard(filter: .initial(for: .init(Index.paneFacts(workspace))))
             }
             return
         case .askMiko:
