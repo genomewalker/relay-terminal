@@ -93,7 +93,14 @@ struct RelayFleetBoardTests {
         #expect(RelayFleetFilter.initial(for: counts) == .waiting)
         #expect(RelayFleetFilter.initial(for: .init()) == .all)
         #expect(RelayFleetCountsButton.spokenSummary(.init()) == "All quiet")
-        #expect(RelayFleetCountsButton.spokenSummary(counts) == "3 running, 2 waiting on you")
+        // The board's order, with empty segments hidden.
+        #expect(RelayFleetCountsButton.spokenSummary(counts) == "2 waiting on you, 1 disconnected, 3 running")
+        #expect(RelayFleetCountsButton.segments(counts) == [.waiting, .disconnected, .running])
+        #expect(RelayFleetCountsButton.segments(.init(waiting: 0, disconnected: 2, running: 0, idle: 4)) == [.disconnected])
+        #expect(RelayFleetCountsButton.spokenSummary(.init(waiting: 0, disconnected: 2, running: 1, idle: 0))
+                == "2 disconnected, 1 running")
+        #expect(RelayFleetCountsButton.segments(.init(waiting: 0, disconnected: 0, running: 0, idle: 5)).isEmpty)
+        #expect(RelayFleetCountsButton.spokenSummary(.init(waiting: 0, disconnected: 0, running: 0, idle: 5)) == "All quiet")
         #expect(Index.changeLabel(nil, now: now) == "No activity")
         #expect(Index.changeLabel(now.addingTimeInterval(-30), now: now) == "Just now")
         #expect(Index.changeLabel(now.addingTimeInterval(-12 * 60), now: now) == "12 min ago")
@@ -265,6 +272,7 @@ struct RelayFleetBoardTests {
             RelayFleetCountsButton(counts: counts, action: {})
             RelayFleetCountsButton(counts: .init(facts.filter { $0.status == .running }), action: {})
             RelayFleetCountsButton(counts: .init(facts.filter { $0.status == .waiting }), action: {})
+            RelayFleetCountsButton(counts: .init(facts.filter { $0.status != .waiting }), action: {})
             RelayFleetCountsButton(counts: .init(facts.filter { $0.status == .idle }), action: {})
         }
         .padding(RelayTheme.Space.md)

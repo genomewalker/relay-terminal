@@ -78,6 +78,22 @@ struct RelayTabStatusTests {
         #expect(Mark.size >= 10)
     }
 
+    @Test("A row's needs-you alert replaces its waiting mark; other marks stay")
+    func oneIconPerMeaning() {
+        typealias Mark = RelayStatusMark
+        #expect(Mark.status(.waiting, besideAlert: .needsInput) == nil)
+        #expect(Mark.status(.waiting, besideAlert: .error) == nil)
+        // Once the alert is read, the waiting mark shows again.
+        #expect(Mark.status(.waiting, besideAlert: nil) == .waiting)
+        // Routine alerts do not say the row waits.
+        #expect(Mark.status(.waiting, besideAlert: .done) == .waiting)
+        #expect(Mark.status(.waiting, besideAlert: .toolFailed) == .waiting)
+        // Running and disconnected say something the alert does not.
+        #expect(Mark.status(.running, besideAlert: .needsInput) == .running)
+        #expect(Mark.status(.disconnected, besideAlert: .error) == .disconnected)
+        #expect(Mark.status(nil, besideAlert: .needsInput) == nil)
+    }
+
     // MARK: Live workspace
 
     private func send(_ pane: PaneModel, _ json: String) { pane.receivedAgentEvent(Data(json.utf8)) }
@@ -167,6 +183,12 @@ struct RelayTabStatusTests {
         #expect(row(workspace.workspaceID(forTab: tabs["review"]!)!) == .waiting)
         #expect(row(workspace.workspaceID(forTab: tabs["align"]!)!) == .disconnected)
         #expect(row(workspace.workspaceID(forTab: tabs["views"]!)!) == .running)
+        // The review pane's approval is an unread needs-input alert, so its
+        // session row shows that marker alone.
+        let reviewPane = workspace.paneIDs(inTab: tabs["review"]!).first!
+        let alert = AgentIntelligenceStore.shared.marker(for: reviewPane)
+        #expect(alert == .needsInput)
+        #expect(RelayStatusMark.status(marks[tabs["review"]!], besideAlert: alert) == nil)
     }
 
     // MARK: Snapshots
@@ -183,9 +205,19 @@ struct RelayTabStatusTests {
         let navigator = WorkspaceNavigator(workspace: workspace)
             .frame(height: 600)
             .background(RelayTheme.sidebar)
+        // The session list, every session and tab expanded.
+        for tab in workspace.tabs {
+            if !workspace.navigationState.isExpanded(.session, id: tab.sessionID) {
+                workspace.toggleNavigationGroup(.session, id: tab.sessionID)
+            }
+        }
+        let sessionList = SessionManager(workspace: workspace).frame(height: 760).background(RelayTheme.sidebar)
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             let shot = try RelaySnapshot.render(strip, name: "tab-status-strip", width: 1240, appearance: appearance)
             #expect(shot.size.height >= 36)
+            let sessions = try RelaySnapshot.render(sessionList, name: "navigator-status-sessions", width: 260,
+                                                    appearance: appearance)
+            #expect(sessions.size.height >= 400)
             let list = try RelaySnapshot.render(navigator, name: "navigator-status", width: 280, appearance: appearance)
             #expect(list.size.height >= 600)
         }

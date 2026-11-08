@@ -420,14 +420,15 @@ struct RelayFleetCountsButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: RelayTheme.Space.sm) {
-                if counts.running == 0 && counts.waiting == 0 {
+                let segments = Self.segments(counts)
+                if segments.isEmpty {
                     part("All quiet", status: .idle)
                 } else {
-                    if counts.running > 0 { part("\(counts.running) running", status: .running) }
-                    if counts.waiting > 0 && counts.running > 0 {
-                        Text("·").foregroundStyle(RelayTheme.textMuted)
+                    // Full words when they fit, else counts beside their symbols.
+                    ViewThatFits(in: .horizontal) {
+                        segmentRow(segments, words: true)
+                        segmentRow(segments, words: false)
                     }
-                    if counts.waiting > 0 { part("\(counts.waiting) waiting", status: .waiting) }
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right").imageScale(.small).foregroundStyle(RelayTheme.textMuted)
@@ -438,7 +439,7 @@ struct RelayFleetCountsButton: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Open \(RelayCommand.fleetBoard.label)")
+        .help("\(Self.spokenSummary(counts)). Open \(RelayCommand.fleetBoard.label)")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Self.spokenSummary(counts))
         .accessibilityHint("Opens \(RelayCommand.fleetBoard.label)")
@@ -446,9 +447,35 @@ struct RelayFleetCountsButton: View {
         .accessibilityIdentifier("relay.navigator.fleet-counts")
     }
 
+    /// The board's order: waiting, disconnected, running; empty ones hidden.
+    static func segments(_ counts: RelayWorkOverviewIndex.PaneCounts) -> [RelayWorkOverviewIndex.PaneStatus] {
+        [.waiting, .disconnected, .running].filter { counts[$0] > 0 }
+    }
+
+    static func shortLabel(_ status: RelayWorkOverviewIndex.PaneStatus, _ count: Int) -> String {
+        switch status {
+        case .waiting: "\(count) waiting"
+        case .disconnected: "\(count) disconnected"
+        case .running: "\(count) running"
+        case .idle: "\(count) idle"
+        }
+    }
+
     static func spokenSummary(_ counts: RelayWorkOverviewIndex.PaneCounts) -> String {
-        if counts.running == 0 && counts.waiting == 0 { return "All quiet" }
-        return "\(counts.running) running, \(counts.waiting) waiting on you"
+        let segments = segments(counts)
+        if segments.isEmpty { return "All quiet" }
+        return segments.map { $0 == .waiting ? "\(counts.waiting) waiting on you" : shortLabel($0, counts[$0]) }
+            .joined(separator: ", ")
+    }
+
+    private func segmentRow(_ segments: [RelayWorkOverviewIndex.PaneStatus], words: Bool) -> some View {
+        HStack(spacing: RelayTheme.Space.sm) {
+            ForEach(Array(segments.enumerated()), id: \.element) { index, status in
+                if index > 0 { Text("·").foregroundStyle(RelayTheme.textMuted) }
+                part(words ? Self.shortLabel(status, counts[status]) : "\(counts[status])", status: status)
+            }
+        }
+        .fixedSize()
     }
 
     private func part(_ text: String, status: RelayWorkOverviewIndex.PaneStatus) -> some View {
@@ -528,6 +555,12 @@ struct RelayStatusMark: View {
     }
 
     static func spoken(_ status: Status) -> String { status.role.spoken(status.label) }
+
+    /// Beside a row's alert marker: an unread "needs you" alert (waiting or
+    /// error) already says the row waits, so the waiting mark is dropped.
+    static func status(_ status: Status?, besideAlert alert: RelayAttentionAlert?) -> Status? {
+        status == .waiting && alert?.needsUser == true ? nil : status
+    }
 
     var body: some View {
         if let status, status != .idle {

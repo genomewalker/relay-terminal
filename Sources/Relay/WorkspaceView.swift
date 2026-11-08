@@ -1489,7 +1489,7 @@ private struct SessionTabGroup: Identifiable {
     var tabs: [TabModel]
 }
 
-private struct SessionManager: View {
+struct SessionManager: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var activityIndex: WorkspaceActivityIndex
     @ObservedObject private var intelligence = AgentIntelligenceStore.shared
@@ -1834,8 +1834,8 @@ private struct AttachedSessionRow: View {
                         .foregroundStyle(selected ? RelayTheme.text : RelayTheme.textMuted)
                         .lineLimit(1)
                     Spacer(minLength: 3)
-                    RelayAttentionSummary(paneIDs: panes.map(\.id))
-                    RelayStatusMark(status: RelayWorkOverviewIndex.mostUrgent(session.tabs.map(\.id), in: marks))
+                    RelayAttentionSummary(paneIDs: panes.map(\.id),
+                                          status: RelayWorkOverviewIndex.mostUrgent(session.tabs.map(\.id), in: marks))
                     Text("\(session.tabs.count) tab\(session.tabs.count == 1 ? "" : "s")")
                         .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(RelayTheme.textFaint)
@@ -1928,8 +1928,7 @@ private struct SessionTabSection: View {
                             .font(RelayTheme.font(size: 11, weight: .medium))
                             .lineLimit(1)
                         Spacer(minLength: 4)
-                        RelayAttentionSummary(paneIDs: panes.map(\.id))
-                        RelayStatusMark(status: status)
+                        RelayAttentionSummary(paneIDs: panes.map(\.id), status: status)
                         Text("\(panes.count)")
                             .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                     }
@@ -2133,13 +2132,22 @@ private struct AttentionInboxRow: View {
 
 /// The most urgent unread alert among some panes (done, needs input, error),
 /// with how many panes have one. Selecting a pane clears its alert.
+/// A row's unread alert marker, then its status mark. One icon per meaning:
+/// the waiting mark gives way to a "needs you" alert already shown.
 private struct RelayAttentionSummary: View {
     let paneIDs: [UUID]
+    var status: RelayWorkOverviewIndex.PaneStatus?
     @ObservedObject private var inbox = AgentIntelligenceStore.shared
 
     var body: some View {
         let alerts = paneIDs.compactMap { inbox.marker(for: $0) }
-        if let alert = alerts.min(by: { $0.rank < $1.rank }) {
+        let shown = alerts.min(by: { $0.rank < $1.rank })
+        alertMarker(alerts, shown)
+        RelayStatusMark(status: RelayStatusMark.status(status, besideAlert: shown))
+    }
+
+    @ViewBuilder private func alertMarker(_ alerts: [RelayAttentionAlert], _ shown: RelayAttentionAlert?) -> some View {
+        if let alert = shown {
             let count = alerts.filter { $0 == alert }.count
             HStack(spacing: RelayTheme.spacing(2)) {
                 Image(systemName: alert.symbol)
