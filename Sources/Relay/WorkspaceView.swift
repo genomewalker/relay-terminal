@@ -3821,6 +3821,10 @@ private struct PaneView: View {
                         .padding(RelayTheme.spacing(12))
                 } else if pane.isRestoringTerminal && !pane.hasTerminalSnapshot {
                     RestoringTerminalOverlay(host: pane.profile.host)
+                } else if pane.remoteExitCode != nil, pane.exitNotice != nil {
+                    // Explained by the banner row below the terminal, which
+                    // never covers the output.
+                    EmptyView()
                 } else if let exitCode = pane.remoteExitCode, !sessionEndedNoticeDismissed {
                     SessionEndedOverlay(
                         exitCode: exitCode,
@@ -3862,6 +3866,23 @@ private struct PaneView: View {
                     }
                     .zIndex(100)
                 }
+            }
+            if pane.contentKind == .terminal, pane.remoteExitCode != nil, let notice = pane.exitNotice,
+               !sessionEndedNoticeDismissed {
+                // A row, not an overlay: the terminal gives up the banner's
+                // height, so its last output lines stay visible and scrollable.
+                FailedPaneExitBanner(
+                    notice: notice,
+                    runAgain: {
+                        NotificationCenter.default.post(name: .relayRestartExitedPane, object: pane.id)
+                    },
+                    close: {
+                        select()
+                        if let close { close() }
+                        else { NotificationCenter.default.post(name: .relayClosePane, object: pane.id) }
+                    },
+                    dismiss: { sessionEndedNoticeDismissed = true }
+                )
             }
             if preferences.artifactPresentation == .inline,
                let artifact = pane.artifacts.last, !artifact.userRequested {
