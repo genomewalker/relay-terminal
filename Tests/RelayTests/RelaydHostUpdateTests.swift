@@ -106,6 +106,24 @@ import Testing
         #expect(otherHost["status"] == "refused" && host.installs.count == 1)
     }
 
+    // bc08 review of 0.5.28: Stop cancels Miko's turn task, and a cancelled
+    // Task.sleep throws at once, so the wait spun on the main actor until its
+    // deadline. A cancelled wait now returns the current receipt.
+    @Test func cancelledWaitReturnsTheCurrentReceiptPromptly() async {
+        let host = FakeRelaydHost(), updates = service(host)
+        let id = UUID()
+        let started = await updates.run(host: "dandy-07", requestID: id, wait: .milliseconds(10))
+        #expect(started["status"] == "in_progress")
+        let waiting = Task { @MainActor in
+            await updates.run(host: "dandy-07", requestID: id, wait: .seconds(30))
+        }
+        waiting.cancel()
+        let clock = ContinuousClock(), begun = clock.now
+        let result = await waiting.value
+        #expect(result["status"] == "in_progress" && clock.now - begun < .seconds(2))
+        #expect(host.installs.count == 1)
+    }
+
     @Test func concurrentReplayDoesNotStartASecondInstall() async {
         let host = FakeRelaydHost(), updates = service(host)
         let id = UUID()

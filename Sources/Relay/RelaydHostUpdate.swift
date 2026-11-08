@@ -118,7 +118,9 @@ final class RelaydHostUpdateService {
     private func awaitReceipt(_ id: UUID, wait: Duration) async -> [String: String] {
         let clock = ContinuousClock(), deadline = clock.now.advanced(by: wait)
         while let receipt = receipts[id], !receipt.finished, clock.now < deadline {
-            try? await Task.sleep(for: pollInterval)
+            // A cancelled sleep throws at once; looping on it would spin on the
+            // main actor until the deadline (Stop cancels Miko's turn task).
+            do { try await Task.sleep(for: pollInterval) } catch { break }
         }
         return receipts[id]?.result ?? [:]
     }
