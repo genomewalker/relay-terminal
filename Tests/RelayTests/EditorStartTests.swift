@@ -57,9 +57,9 @@ struct EditorStartTests {
 
         let editor = try workspace.addFloatingRPanel(consoleID: console.id, contentKind: .editor)
         #expect(started == [editor.id])
-        workspace.selectPane(editor.id)
+        workspace.selectPane(editor.id, origin: .user)
         #expect(started == [editor.id, editor.id])
-        workspace.selectPane(console.id)
+        workspace.selectPane(console.id, origin: .user)
         #expect(started == [editor.id, editor.id])
     }
 
@@ -73,9 +73,9 @@ struct EditorStartTests {
         let console = try #require(workspace.activePane)
         let editor = try workspace.addFloatingRPanel(consoleID: console.id, contentKind: .editor)
 
-        workspace.selectPane(console.id)
+        workspace.selectPane(console.id, origin: .user)
         #expect(revealed.isEmpty)
-        workspace.selectPane(editor.id)
+        workspace.selectPane(editor.id, origin: .user)
         #expect(revealed == [editor.id])
     }
 

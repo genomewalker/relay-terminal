@@ -634,7 +634,10 @@ struct RelayApp: App {
                 .relaySurface()
                 .tint(RelayTheme.accent)
                 .onReceive(NotificationCenter.default.publisher(for: .relaySelectPane)) { note in
-                    if let id = note.object as? UUID { workspace.selectPane(id) }
+                    if let id = note.object as? UUID {
+                        let user = note.userInfo?[RelaySelectPaneKey.userInitiated] as? Bool == true
+                        workspace.selectPane(id, origin: user ? .user : .programmatic)
+                    }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .relaySplitRight)) { _ in
                     workspace.splitActive(axis: .horizontal)

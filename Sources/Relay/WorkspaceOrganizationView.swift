@@ -798,7 +798,7 @@ private enum WorkspaceNamingRequest: Identifiable {
                                     Button("Move left") { workspace.moveStackMember(id, toIndex: index - 1) }.disabled(index == 0)
                                     Button("Move right") { workspace.moveStackMember(id, toIndex: index + 1) }.disabled(index == stack.members.count - 1)
                                     Divider()
-                                    Button("Close pane") { workspace.selectPane(id); workspace.closeActivePane() }
+                                    Button("Close pane") { workspace.selectPane(id, origin: .programmatic); workspace.closeActivePane() }
                                 }
                             }
                         }

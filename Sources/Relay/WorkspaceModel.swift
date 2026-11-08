@@ -170,6 +170,8 @@ final class WorkspaceModel: ObservableObject {
     @Published var isHostLauncherPresented = false
     @Published var isPaneLinkPresented = false
     @Published var sidebarVisible = false
+    /// Panes the user opened, for Go to pane. Programmatic selection is not recorded.
+    @Published private(set) var paneVisits = PaneVisitHistory()
     @Published var networkVisible = false {
         didSet {
             guard networkVisible != oldValue else { return }
@@ -834,7 +836,7 @@ final class WorkspaceModel: ObservableObject {
     func openInboxItem(_ item: AgentInboxItem) {
         AgentIntelligenceStore.shared.markRead(item.id)
         guard panes[item.paneID] != nil else { return }
-        revealPane(item.paneID)
+        revealPane(item.paneID, origin: .user)
         if let agentID = item.agentID,
            panes[item.paneID]?.subagents.contains(where: { $0.id == agentID || $0.threadID == agentID }) == true {
             let resolvedID = panes[item.paneID]?.subagents.first(where: {
@@ -864,7 +866,7 @@ final class WorkspaceModel: ObservableObject {
             do {
                 try await RemotePaneControlService.terminate(profile: pane.profile, paneID: paneID)
                 guard panes[paneID] != nil else { return }
-                revealPane(paneID)
+                revealPane(paneID, origin: .programmatic)
                 closeActivePane()
             } catch {
                 operationError = error.localizedDescription
@@ -872,13 +874,13 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func revealPane(_ paneID: UUID) {
+    func revealPane(_ paneID: UUID, origin: PaneSelectionOrigin) {
         // Floating R panels belong to a tab without being in its layout.
         guard let tabID = tabID(containingPane: paneID) else { return }
         revealingPaneID = paneID
         defer { revealingPaneID = nil }
         if networkVisible || selectedTabID != tabID { selectTab(tabID) }
-        selectPane(paneID)
+        selectPane(paneID, origin: origin)
         networkVisible = false
         panes[paneID]?.focus()
     }
@@ -981,7 +983,7 @@ final class WorkspaceModel: ObservableObject {
     @discardableResult
     func sidePanelReveal(_ paneID: UUID) -> Bool {
         guard let pane = panes[paneID] else { return false }
-        revealPane(paneID)
+        revealPane(paneID, origin: .programmatic)
         activateSelectedWorkspacePane(pane)
         return true
     }
@@ -1193,7 +1195,7 @@ final class WorkspaceModel: ObservableObject {
         if let sessionID = remote.workspaceID.flatMap(UUID.init(uuidString:)), attached,
            RecoveryWindowRegistry.shared.focus(sessionID: sessionID) {
             isHostLauncherPresented = false
-            if let pane = remote.panes.compactMap({ UUID(uuidString: $0.paneID) }).first(where: { panes[$0] != nil }) { revealPane(pane) }
+            if let pane = remote.panes.compactMap({ UUID(uuidString: $0.paneID) }).first(where: { panes[$0] != nil }) { revealPane(pane, origin: .programmatic) }
             return
         }
         let destination = inNewWindow ? RecoveryWindowRegistry.shared.openWindow(workspace: self) : NSApp?.keyWindow
@@ -1207,7 +1209,7 @@ final class WorkspaceModel: ObservableObject {
                 panes[paneID]?.directory = remotePane.directory
             }
             isHostLauncherPresented = false
-            revealPane(existingPane)
+            revealPane(existingPane, origin: .programmatic)
             return
         }
 
@@ -1278,7 +1280,7 @@ final class WorkspaceModel: ObservableObject {
         if let pane = panes[paneID] {
             guard pane.profile.id == profile.id, pane.profile.backend == .relay else { return false }
             isHostLauncherPresented = false
-            revealPane(paneID)
+            revealPane(paneID, origin: .programmatic)
             // Catalog recovery is an explicit viewer reconnect. Renderer
             // status may still say connected after a failed native surface
             // attachment; it must not suppress the requested recovery.
@@ -1919,7 +1921,7 @@ final class WorkspaceModel: ObservableObject {
               let index = tab.floatingPanes.firstIndex(where: { $0.paneID == id }) else { return }
         tab.floatingPanes[index].minimized = true
         if zoomedPaneID == id { zoomedPaneID = nil }
-        if activePaneID == id, let next = tab.layout.paneIDs.first { selectPane(next) }
+        if activePaneID == id, let next = tab.layout.paneIDs.first { selectPane(next, origin: .programmatic) }
         persistWorkspace()
     }
 
@@ -2007,7 +2009,7 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func togglePaneZoom(_ paneID: UUID) {
-        selectPane(paneID)
+        selectPane(paneID, origin: .programmatic)
         toggleActivePaneZoom()
     }
 
@@ -2079,7 +2081,7 @@ final class WorkspaceModel: ObservableObject {
 
     func reconnectPane(_ paneID: UUID) {
         guard let pane = panes[paneID], pane.contentKind == .terminal else { return }
-        selectPane(paneID)
+        selectPane(paneID, origin: .programmatic)
         pane.runtime.restart()
     }
 
@@ -2386,13 +2388,14 @@ final class WorkspaceModel: ObservableObject {
         persistWorkspace()
     }
 
-    func selectTab(_ id: UUID) {
+    func selectTab(_ id: UUID, origin: PaneSelectionOrigin = .programmatic) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         // An explicit tab click always shows that tab's workspace, even when
         // the ID is already selected.
         if let owner = ownership.owner(of: id) { showWorkspace(owner) }
         organization.noteSelection(.tab(id))
         selectedTabID = id
+        if origin == .user, let paneID = activePaneID { recordPaneVisit(paneID) }
         persistWorkspace()
         // The previous tab's Ghostty surface can remain the AppKit first
         // responder briefly after SwiftUI hides it. Wait for the selected
@@ -2406,12 +2409,16 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func selectPane(_ id: UUID) {
+    /// Records a Go to pane visit. Callers pass `.user` only for a click,
+    /// key command or navigator choice; restore, focus repair, agents, Miko
+    /// and MCP tools pass `.programmatic`.
+    func selectPane(_ id: UUID, origin: PaneSelectionOrigin) {
         // Late callbacks from durable views in another tab must not corrupt
         // selection. Explicit cross-tab navigation reveals its owner first.
         guard panes[id] != nil, let selectedTabID, let tab = selectedTab,
               tab.allPaneIDs.contains(id) || floatingRPaneTabs[id] == selectedTabID else { return }
         organization.noteSelection(.pane(id))
+        if origin == .user { recordPaneVisit(id) }
         // A floating R pane is drawn only inside its R workspace.
         if floatingRPaneTabs[id] != nil { revealFloatingRPane?(id) }
         // Re-selecting the pane already in front reads alerts that arrived since.
@@ -2457,12 +2464,14 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    /// The Previous/Next pane menu commands: always user-initiated.
     func selectAdjacentPane(offset: Int) {
         guard let tab = selectedTab else { return }
         let ids = tab.allPaneIDs
         guard !ids.isEmpty else { return }
         let current = ids.firstIndex(of: activePaneID ?? ids[0]) ?? 0
         activePaneID = ids[(current + offset + ids.count) % ids.count]
+        recordPaneVisit(activePaneID!)
         panes[activePaneID!]?.focus()
         persistWorkspace()
     }
@@ -2471,7 +2480,13 @@ final class WorkspaceModel: ObservableObject {
         guard let workspaceID = selectedWorkspaceID,
               let next = WorkspaceNavigationState.adjacentTab(current: selectedTabID,
                 ordered: railTabs(inWorkspace: workspaceID).map(\.id), offset: offset) else { return }
-        selectTab(next)
+        selectTab(next, origin: .user)
+    }
+
+    private func recordPaneVisit(_ id: UUID, now: Date = Date()) {
+        guard panes[id] != nil else { return }
+        paneVisits.record(id, at: now)
+        persistWorkspace()
     }
 
     var navigationSessionIDs: [UUID] {
@@ -2654,6 +2669,7 @@ final class WorkspaceModel: ObservableObject {
         tabs = restoredTabs
         restoreRPresentationOwnership(snapshot.rPresentations ?? [])
         sidebarVisible = snapshot.sidebarVisible ?? false
+        paneVisits = PaneVisitHistory(snapshot.paneVisits ?? [])
         let savedPanes = Dictionary(uniqueKeysWithValues: snapshot.panes.map { ($0.id, $0) })
         for tab in restoredTabs {
             for paneID in tab.allPaneIDs {
@@ -2817,11 +2833,11 @@ final class WorkspaceModel: ObservableObject {
                 }
             }
         }
-        pane.runtime.onPaneSelection = { [weak self, weak pane] in
+        pane.runtime.onPaneSelection = { [weak self, weak pane] origin in
             guard let self, let pane, self.panes[pane.id] === pane else { return }
             self.updateTerminalFocusOwnership()
             if self.paneLinkSelection.active { self.paneLinkSelection.toggle(pane.id) }
-            else { self.selectPane(pane.id) }
+            else { self.selectPane(pane.id, origin: origin) }
         }
         pane.runtime.setKeyboardFocusEligible(pane.id == activePaneID && !paneLinkSelection.active && !networkVisible && !isQuickNavigatePresented)
         activityIndex.observe(pane)
@@ -3600,7 +3616,7 @@ final class WorkspaceModel: ObservableObject {
               let current = stack.members.firstIndex(of: stack.selected) else { return }
         let next = stack.members[((current + offset) % stack.members.count + stack.members.count) % stack.members.count]
         selectStackMember(next)
-        selectPane(next)
+        selectPane(next, origin: .user)
     }
 
     /// Takes a pane out of its stack and tiles it beside the stack's slot.
@@ -3682,7 +3698,8 @@ final class WorkspaceModel: ObservableObject {
             selectedTabID: selectedTabID,
             activePaneID: activePaneID,
             rPresentations: rPresentations,
-            sidebarVisible: sidebarVisible
+            sidebarVisible: sidebarVisible,
+            paneVisits: paneVisits.visits.filter { usedPaneIDs.contains($0.paneID) }
         )
     }
 
@@ -3752,6 +3769,7 @@ final class WorkspaceModel: ObservableObject {
         let snapshot = currentWorkspaceSnapshot()
         let usedPaneIDs = Set(tabs.flatMap(\.allPaneIDs) + (snapshot.rPresentations ?? []).flatMap(\.paneIDs))
         reportSilentPaneRemovals(placed: usedPaneIDs)
+        paneVisits.prune(keeping: usedPaneIDs)
         let livePins = pinnedPaneIDs.intersection(usedPaneIDs)
         if livePins != pinnedPaneIDs {
             pinnedPaneIDs = livePins
@@ -3918,6 +3936,8 @@ struct WorkspaceSnapshot: Codable, Sendable {
     var recoveryWindow: RecoveryWindowOrigin? = nil
     var rPresentations: [RWorkspacePresentation]? = nil
     var sidebarVisible: Bool? = nil
+    /// Go to pane's user-visit history; local to this Mac, never sent to hosts.
+    var paneVisits: [PaneVisit]? = nil
 }
 
 struct TabSnapshot: Codable, Sendable {

@@ -650,7 +650,7 @@ func reopenClosedRemotePane() {
 
     workspace.splitActive(axis: .horizontal)
     let siblingID = workspace.activePaneID!
-    workspace.selectPane(paneID)
+    workspace.selectPane(paneID, origin: .user)
     workspace.closeActivePane()
 
     #expect(workspace.panes[paneID] == nil)

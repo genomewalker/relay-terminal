@@ -746,8 +746,12 @@ final class RemoteEditorRuntime: NSObject, ObservableObject, WKNavigationDelegat
         webView.evaluateJavaScript("window.relayFocus && window.relayFocus()")
     }
 
-    func selectForInteraction() {
-        if let pane { NotificationCenter.default.post(name: .relaySelectPane, object: pane.id) }
+    /// `userInitiated` only for a pointer click; a web focus event can follow programmatic focus.
+    func selectForInteraction(userInitiated: Bool = false) {
+        if let pane {
+            NotificationCenter.default.post(name: .relaySelectPane, object: pane.id,
+                                            userInfo: userInitiated ? [RelaySelectPaneKey.userInitiated: true] : nil)
+        }
     }
 
     /// WebKit's first responder is usually a private content subview, not WKWebView itself.
@@ -1313,7 +1317,7 @@ final class RelayEditorWebView: WKWebView {
     weak var owner: RemoteEditorRuntime?
 
     override func mouseDown(with event: NSEvent) {
-        owner?.selectForInteraction()
+        owner?.selectForInteraction(userInitiated: true)
         super.mouseDown(with: event)
     }
 }

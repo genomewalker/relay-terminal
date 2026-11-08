@@ -119,7 +119,7 @@ struct RelayAgentAccountMenus: View {
             if pane.contentKind == .terminal {
                 Button("Start agent…") {
                     let id = pane.id
-                    directory.workspace?.revealPane(id)
+                    directory.workspace?.revealPane(id, origin: .programmatic)
                     // Opened after the context menu has closed.
                     Task { @MainActor in RelayAgentPickerPresenter.shared.paneID = id }
                 }

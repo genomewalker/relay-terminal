@@ -16,7 +16,7 @@ final class RelayClaudeQuotaScreenTests: XCTestCase {
         var presents = 0
         mover.screenRefusal = { _ in readable ? nil : "not yet shown" }
         mover.presentPane = { pane, workspace in
-            presents += 1; workspace.revealPane(pane.id); readable = true
+            presents += 1; workspace.revealPane(pane.id, origin: .programmatic); readable = true
         }
         let result = await RelayClaudeQuotaScheduler.ensureReadable(pane, in: workspace, mover: mover)
         XCTAssertTrue(result)
@@ -24,7 +24,7 @@ final class RelayClaudeQuotaScreenTests: XCTestCase {
         XCTAssertEqual(presents, 1)
         readable = false
         mover.presentPane = { pane, workspace in
-            workspace.revealPane(pane.id); workspace.revealPane(previous.id); readable = true
+            workspace.revealPane(pane.id, origin: .programmatic); workspace.revealPane(previous.id, origin: .programmatic); readable = true
         }
         let userSelection = await RelayClaudeQuotaScheduler.ensureReadable(pane, in: workspace, mover: mover)
         XCTAssertTrue(userSelection)
@@ -33,7 +33,7 @@ final class RelayClaudeQuotaScreenTests: XCTestCase {
         mover.resume = { _, _, _, _, _ in XCTFail("preflight is read-only"); return false }
         readable = false
         mover.screenTimeout = 0.01; mover.screenInterval = 0.001
-        mover.presentPane = { pane, workspace in workspace.revealPane(pane.id) }
+        mover.presentPane = { pane, workspace in workspace.revealPane(pane.id, origin: .programmatic) }
         let timedOut = await RelayClaudeQuotaScheduler.ensureReadable(pane, in: workspace, mover: mover)
         XCTAssertFalse(timedOut)
         XCTAssertEqual(workspace.activePaneID, previous.id)

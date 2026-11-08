@@ -18,6 +18,8 @@ struct RelayQuickNavigate: View {
 
     private var results: [Index.Entry] {
         _ = activityIndex.revision
+        let now = Date()
+        let visits = workspace.paneVisits
         var entries = Index.navigationEntries(query: query)
         for item in workspace.ownership.orderedWorkspaces {
             entries.append(.init(id: "workspace:\(item.id)", title: item.name,
@@ -68,7 +70,9 @@ struct RelayQuickNavigate: View {
                     searchFields: [pane.title, pane.profile.name, pane.profile.host, pane.directory ?? "", id.uuidString,
                                    hidden ? "hidden stack" : "", pane.connectionStatusLabel],
                     needsAttention: pane.pendingAgentApprovals > 0 || pane.phase == .needsInput || report?.state == "blocked" || report?.state == "error",
-                    isCurrent: current, changedAt: changedAt))
+                    isCurrent: current, changedAt: changedAt,
+                    lastVisitedAt: id == workspace.activePaneID ? nil : visits.visit(id)?.lastVisitedAt,
+                    frecency: visits.frecency(of: id, at: now), isActivePane: id == workspace.activePaneID))
             }
         }
         return Index.results(entries, query: query)
@@ -78,10 +82,10 @@ struct RelayQuickNavigate: View {
         workspace.networkVisible = false
         switch result.destination {
         case .workspace(let id): workspace.selectWorkspace(id)
-        case .tab(let id): workspace.selectTab(id)
+        case .tab(let id): workspace.selectTab(id, origin: .user)
         case .pane(let id, let tab):
             workspace.selectTab(tab)
-            workspace.selectPane(id)
+            workspace.selectPane(id, origin: .user)
         case .settings(let section):
             workspace.quickNavigateDidChooseAction {
                 RelaySettingsNavigation.shared.section = section
@@ -106,7 +110,7 @@ struct RelayQuickNavigate: View {
     }
 
     private func move(_ offset: Int) {
-        selectionID = Index.movedSelection(selectionID, by: offset, in: results)
+        selectionID = Index.movedSelection(selectionID, by: offset, in: results, query: query)
     }
 
     private func announceSelection(_ row: Index.Entry?) {
@@ -119,7 +123,7 @@ struct RelayQuickNavigate: View {
 
     var body: some View {
         let rows = results
-        let selected = Index.selectedID(selectionID, in: rows)
+        let selected = Index.selectedID(selectionID, in: rows, query: query)
         VStack(alignment: .leading, spacing: 0) {
             Text("Work overview").font(.headline).padding(.horizontal, 16).padding(.top, 14)
             HStack(spacing: 10) {
@@ -144,10 +148,10 @@ struct RelayQuickNavigate: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(Index.Group.allCases, id: \.rawValue) { group in
-                                let members = rows.filter { $0.group == group }
+                            ForEach(Index.sections(rows, query: query)) { section in
+                                let members = section.entries
                                 if !members.isEmpty {
-                                    Text(group.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                    Text(section.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                                         .padding(.horizontal, 12).padding(.top, 10).accessibilityAddTraits(.isHeader)
                                     ForEach(members) { result in
                                         VStack(alignment: .leading, spacing: 4) {
@@ -199,7 +203,7 @@ struct RelayQuickNavigate: View {
         .background(.regularMaterial)
         .onAppear { searchFocused = true }
         .onChange(of: query) { _, _ in selectionID = nil }
-        .onChange(of: rows.map(\.id)) { _, _ in selectionID = Index.selectedID(selectionID, in: rows) }
+        .onChange(of: rows.map(\.id)) { _, _ in selectionID = Index.selectedID(selectionID, in: rows, query: query) }
         .onChange(of: selected) { _, id in announceSelection(rows.first { $0.id == id }) }
         .onMoveCommand { direction in
             switch direction { case .down: move(1); case .up: move(-1); default: break }

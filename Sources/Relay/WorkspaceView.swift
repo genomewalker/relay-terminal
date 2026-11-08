@@ -124,7 +124,7 @@ struct WorkspaceView: View {
                 AgentInspectorPanel(
                     pane: pane,
                     subagentID: selection.subagentID,
-                    showTerminal: { workspace.revealPane(selection.paneID) },
+                    showTerminal: { workspace.revealPane(selection.paneID, origin: .user) },
                     close: workspace.closeAgentInspector
                 )
                 // Recreate the panel when the inspected agent changes: its
@@ -1056,7 +1056,7 @@ private struct WorkspaceTabRail: View {
                             label: workspace.tabDisplayName(tab, fallback: fallbackLabel),
                             isSelected: tab.id == workspace.selectedTabID,
                             pinned: workspace.isTabPinned(tab.id),
-                            select: { workspace.selectTab(tab.id) },
+                            select: { workspace.selectTab(tab.id, origin: .user) },
                             togglePin: { workspace.toggleTabPin(tab.id) },
                             rename: { workspace.beginRenameTab(tab.id) },
                             close: { workspace.closeTab(tab.id) },
@@ -1660,9 +1660,9 @@ private struct SessionManager: View {
                     LazyVStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
                         ForEach(tabSearchHits) { hit in
                             Button {
-                                if let pane = hit.pane { workspace.revealPane(pane.id) }
-                                else if let paneID = hit.tab.allPaneIDs.first { workspace.revealPane(paneID) }
-                                else { workspace.selectTab(hit.tab.id) }
+                                if let pane = hit.pane { workspace.revealPane(pane.id, origin: .user) }
+                                else if let paneID = hit.tab.allPaneIDs.first { workspace.revealPane(paneID, origin: .user) }
+                                else { workspace.selectTab(hit.tab.id, origin: .user) }
                             } label: {
                                 VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
                                     Text(hit.tab.name.isEmpty ? "Untitled tab" : hit.tab.name)
@@ -1889,7 +1889,7 @@ private struct SessionTabSection: View {
                 .accessibilityLabel(expanded ? "Collapse tab" : "Expand tab")
 
                 Button {
-                    workspace.selectTab(tab.id)
+                    workspace.selectTab(tab.id, origin: .user)
                 } label: {
                     HStack(spacing: RelayTheme.spacing(6)) {
                         Image(systemName: "rectangle")
@@ -2075,7 +2075,7 @@ private struct AttentionInboxRow: View {
         Button {
             // Selecting the pane reads its alerts, also when it is already
             // in front; a pane that cannot be shown keeps its row.
-            workspace.revealPane(entry.paneID)
+            workspace.revealPane(entry.paneID, origin: .user)
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: RelayTheme.spacing(7)) {
                 Image(systemName: alert.symbol)
@@ -2159,9 +2159,9 @@ private struct SessionPaneRow: View {
             .sorted { agentActivityDate($0) > agentActivityDate($1) }
     }
 
-    private func revealPane() {
+    private func revealPane(origin: PaneSelectionOrigin = .programmatic) {
         if workspace.networkVisible || workspace.selectedTabID != tabID { workspace.selectTab(tabID) }
-        workspace.selectPane(pane.id)
+        workspace.selectPane(pane.id, origin: origin)
         workspace.networkVisible = false
         pane.focus()
     }
@@ -2172,7 +2172,7 @@ private struct SessionPaneRow: View {
 
     var body: some View {
         VStack(spacing: RelayTheme.spacing(0)) {
-            Button(action: revealPane) {
+            Button(action: { revealPane(origin: .user) }) {
                 HStack(spacing: RelayTheme.spacing(7)) {
                 Capsule()
                     .fill(active ? RelayTheme.accent : Color.clear)
@@ -2244,7 +2244,7 @@ private struct SessionPaneRow: View {
                     revealPane()
                     workspace.splitActive(axis: .vertical)
                 }
-                Button("Show pane") { revealPane() }
+                Button("Show pane") { revealPane(origin: .user) }
                 Button("Zoom pane") {
                     revealPane()
                     workspace.togglePaneZoom(pane.id)
@@ -3204,13 +3204,13 @@ private struct WorkspaceCanvas: View {
                     pane: pane,
                     isActive: true,
                     compactChrome: true,
-                    select: { workspace.selectPane(zoomedID) },
+                    select: { workspace.selectPane(zoomedID, origin: .user) },
                     toggleZoom: { workspace.togglePaneZoom(zoomedID) },
                     toggleFloating: { workspace.toggleActivePaneFloating() },
                     rename: { workspace.beginRenamePane(zoomedID) },
                     terminate: { workspace.requestTerminatePane(zoomedID) },
                     close: {
-                        workspace.selectPane(zoomedID)
+                        workspace.selectPane(zoomedID, origin: .programmatic)
                         workspace.closeActivePane()
                     },
                     isFloating: tab.floatingPanes.contains(where: { $0.paneID == zoomedID }),
@@ -3230,7 +3230,7 @@ private struct WorkspaceCanvas: View {
                             bounds: proxy.size,
                             isActive: workspace.activePaneID == pane.id,
                             select: {
-                                workspace.selectPane(pane.id)
+                                workspace.selectPane(pane.id, origin: .user)
                                 pane.focus()
                             },
                             move: { x, y in
@@ -3245,7 +3245,7 @@ private struct WorkspaceCanvas: View {
                             rename: { workspace.beginRenamePane(pane.id) },
                             terminate: { workspace.requestTerminatePane(pane.id) },
                             close: {
-                                workspace.selectPane(pane.id)
+                                workspace.selectPane(pane.id, origin: .programmatic)
                                 workspace.closeActivePane()
                             }
                         )
@@ -3262,7 +3262,7 @@ private struct WorkspaceCanvas: View {
                let pane = workspace.panes[id] {
                 GeometryReader { geometry in
                     FloatingAgentConversation(pane: pane, bounds: geometry.size,
-                        terminal: { workspace.selectPane(id); pane.focus() },
+                        terminal: { workspace.selectPane(id, origin: .user); pane.focus() },
                         close: { toolWindows.embeddedAgentPaneID = nil })
                 }
             }
@@ -3273,7 +3273,7 @@ private struct WorkspaceCanvas: View {
                     HStack(spacing: RelayTheme.spacing(6)) {
                         ForEach(tab.floatingPanes.filter(\.isMinimized)) { placement in
                             if let pane = workspace.panes[placement.paneID] {
-                                Button { workspace.selectPane(pane.id) } label: {
+                                Button { workspace.selectPane(pane.id, origin: .user) } label: {
                                     Label(pane.customName ?? (pane.kind == .shell ? pane.displayName : pane.harnessLabel), systemImage: "arrow.up.forward.square")
                                         .font(RelayTheme.font(size: 11, weight: .medium))
                                         .lineLimit(1)
@@ -3623,7 +3623,7 @@ private struct SplitPaneTree: View {
                     pane: pane,
                     isActive: workspace.activePaneID == id,
                     compactChrome: workspace.isFullScreen,
-                    select: { workspace.selectPane(id) },
+                    select: { workspace.selectPane(id, origin: .user) },
                     rearrange: { draggedID, placement in
                         do {
                             try workspace.applyWorkspacePaneDrop(draggedID, toTab: tab.id, onto: id, placement: placement)
@@ -3634,7 +3634,7 @@ private struct SplitPaneTree: View {
                     rename: { workspace.beginRenamePane(id) },
                     terminate: { workspace.requestTerminatePane(id) },
                     close: {
-                        workspace.selectPane(id)
+                        workspace.selectPane(id, origin: .programmatic)
                         workspace.closeActivePane()
                     },
                     isFloating: false
@@ -5470,7 +5470,7 @@ final class RelayToolWindowCoordinator: NSObject, ObservableObject, NSWindowDele
                     let restoredContent = AnyView(Group {
                         if let pane = extra.pane {
                             PaneView(pane: pane, isActive: true, compactChrome: true,
-                                select: { if pane.contentKind == .terminal { workspace.selectPane(pane.id) } }, inToolWindow: true)
+                                select: { if pane.contentKind == .terminal { workspace.selectPane(pane.id, origin: .user) } }, inToolWindow: true)
                                 .environmentObject(workspace.paneLinkSelection)
                         } else {
                             RLayoutResultsDock(runtime: editor.editorRuntime)
@@ -5907,7 +5907,7 @@ private struct RStandaloneWorkspace: View {
                 }.frame(height: max(0, geometry.size.height * 0.65 - 1))
                 RDetachablePanel(title: "Console", key: parentKey + ":console", parent: parentKey, allowsFloating: false) {
                 PaneView(pane: console, isActive: workspace.activePaneID == console.id,
-                         compactChrome: true, select: { workspace.selectPane(console.id) }, inToolWindow: true)
+                         compactChrome: true, select: { workspace.selectPane(console.id, origin: .user) }, inToolWindow: true)
                     .environmentObject(workspace.paneLinkSelection)
                 }
             }.frame(width: max(0, geometry.size.width * 0.65 - 1))
@@ -5922,7 +5922,7 @@ private struct RStandaloneWorkspace: View {
                                  initiallyFloating: true) {
                     if let pane = panel.pane {
                         PaneView(pane: pane, isActive: true, compactChrome: true,
-                                 select: { if pane.contentKind == .terminal { workspace.selectPane(pane.id) } },
+                                 select: { if pane.contentKind == .terminal { workspace.selectPane(pane.id, origin: .user) } },
                                  inToolWindow: true)
                             .environmentObject(workspace.paneLinkSelection)
                     } else {

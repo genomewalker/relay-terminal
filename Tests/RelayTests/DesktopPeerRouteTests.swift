@@ -31,13 +31,13 @@ func desktopRoutePersistentDisconnect() {
     }
     if let pane {
         workspace.showNetwork()
-        workspace.selectPane(pane)
+        workspace.selectPane(pane, origin: .user)
         #expect(workspace.networkVisible)
         workspace.hideNetwork()
         #expect(!workspace.networkVisible)
         #expect(workspace.activePaneID == pane)
         workspace.showNetwork()
-        workspace.revealPane(pane)
+        workspace.revealPane(pane, origin: .user)
         #expect(!workspace.networkVisible)
         #expect(workspace.activePaneID == pane)
     }

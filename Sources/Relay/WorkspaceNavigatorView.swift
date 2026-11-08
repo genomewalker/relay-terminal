@@ -408,7 +408,7 @@ private struct WorkspaceFocusBar: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("\(expanded ? "Collapse" : "Expand") \(tab.name) panes")
-                Button { workspace.selectTab(tab.id) } label: {
+                Button { workspace.selectTab(tab.id, origin: .user) } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "rectangle.split.2x1").font(.system(size: 9)).foregroundStyle(RelayTheme.textMuted)
                         Text(workspace.tabDisplayName(tab, fallback: tab.name)).font(RelayTheme.font(size: 11)).lineLimit(1)
@@ -471,7 +471,7 @@ private struct WorkspaceFocusBar: View {
                         .padding(.trailing, 8)
                         .frame(height: 22)
                         .contentShape(Rectangle())
-                        .onTapGesture { workspace.revealPane(id) }
+                        .onTapGesture { workspace.revealPane(id, origin: .user) }
                         .onDrag { WorkspaceDragPayload.paneProvider(id) }
                         .help("Drag onto a tab or workspace to move this pane. It keeps its process, conversation and draft.")
                         .accessibilityIdentifier("relay.navigator.pane.\(id.uuidString.lowercased())")

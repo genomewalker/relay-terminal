@@ -56,7 +56,7 @@ struct RelayAgentAccountMoveDraftTests {
         mover.prepareRelayCodexProfile = { _, _ in nil }
         mover.presentPane = { pane, workspace in
             agent.presented += 1; agent.events.append("present")
-            workspace.revealPane(pane.id)
+            workspace.revealPane(pane.id, origin: .programmatic)
         }
         mover.screenRefusal = { _ in
             agent.events.append("screen")
@@ -154,9 +154,9 @@ struct RelayAgentAccountMoveDraftTests {
         // The pane the user was on closes while the move shows its own.
         mover.presentPane = { pane, workspace in
             agent.presented += 1
-            workspace.revealPane(other.id)
+            workspace.revealPane(other.id, origin: .programmatic)
             workspace.closeActivePane()
-            workspace.revealPane(pane.id)
+            workspace.revealPane(pane.id, origin: .programmatic)
         }
         let outcome = await mover.move(pane, in: workspace, to: personal, origin: .user, inputGranted: true)
         #expect(outcome.state == "refused")
