@@ -85,6 +85,13 @@ func controllerReplyErrorsKeepPrecedence() throws {
     // A missing result is invalid, as before.
     #expect(throws: (any Error).self) { try RelayPaneHealthHostControllerRPC.decodeReply(Data(#"{"request_id":"x"}"#.utf8)) }
     #expect(throws: (any Error).self) { try legacyDecode(Data(#"{"request_id":"x"}"#.utf8)) }
+    // A non-object reply is invalidResponse, as before.
+    for reply in ["[]", "7", "\"text\""] {
+        #expect(refusal(reply) == "other")
+        do { _ = try RelayPaneHealthHostControllerRPC.decodeReply(Data(reply.utf8)); Issue.record("decoded \(reply)") }
+        catch RelayHostRotationRPC.Failure.invalidResponse {}
+        catch { Issue.record("\(reply): \(error)") }
+    }
     // A non-string error is ignored by both paths.
     let ignored = #"{"error":{"code":1},"result":{"v":1,"status":"controller_status"}}"#
     #expect(try RelayPaneHealthHostControllerRPC.decodeReply(Data(ignored.utf8)).status == "controller_status")

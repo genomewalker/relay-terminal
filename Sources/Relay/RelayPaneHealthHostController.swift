@@ -243,7 +243,10 @@ enum RelayPaneHealthHostControllerRPC {
         let result: RelayPaneHealthHostControllerStatus?
         private enum CodingKeys: String, CodingKey { case error, result }
         init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
+            // A non-object reply had no `result` before: invalid, not a DecodingError.
+            guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+                error = nil; result = nil; return
+            }
             // A non-string `error` was ignored before; keep ignoring it.
             error = (try? container.decodeIfPresent(String.self, forKey: .error)) ?? nil
             result = error == nil ? try container.decodeIfPresent(RelayPaneHealthHostControllerStatus.self, forKey: .result) : nil
