@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func waitCall(s *server, arguments map[string]any) (map[string]any, int) {
@@ -126,5 +127,93 @@ func TestWaitForCommandRejectsInvalidArguments(t *testing.T) {
 		if _, code := waitCall(s, arguments); code != -32602 {
 			t.Fatalf("accepted %v", arguments)
 		}
+	}
+}
+
+// A stdio wait in flight must not block the client's other tools; cancelling
+// it (or closing stdin) stops its polling and it sends no response.
+func TestStdioWaitRunsBesideOtherCallsAndCancels(t *testing.T) {
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	started := make(chan struct{}, 4)
+	stopped := make(chan struct{}, 4)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/panes/"+id+"/command-wait" {
+			// Consume the body so the server watches for the client hanging up.
+			_, _ = io.ReadAll(r.Body)
+			started <- struct{}{}
+			<-r.Context().Done() // Relay is still waiting until the client gives up.
+			stopped <- struct{}{}
+			return
+		}
+		w.Write([]byte(`{"text":"prompt","scope":"visible_viewport_only"}`))
+	}))
+	defer ts.Close()
+	s := &server{token: "test", endpoint: ts.URL, client: ts.Client()}
+	inReader, inWriter := io.Pipe()
+	outReader, outWriter := io.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- s.run(inReader, outWriter); outWriter.Close() }()
+	responses := make(chan map[string]any, 8)
+	go func() {
+		decoder := json.NewDecoder(outReader)
+		for {
+			var response map[string]any
+			if decoder.Decode(&response) != nil {
+				close(responses)
+				return
+			}
+			responses <- response
+		}
+	}()
+	send := func(line string) {
+		if _, err := inWriter.Write([]byte(line + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	timeout := time.After(10 * time.Second)
+	send(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"relay_wait_for_command","arguments":{"pane_id":"` + id + `","timeout_ms":600000}}}`)
+	select {
+	case <-started:
+	case <-timeout:
+		t.Fatal("wait never reached Relay")
+	}
+	send(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"relay_read_viewport","arguments":{"pane_id":"` + id + `"}}}`)
+	select {
+	case response := <-responses:
+		if response["id"] != float64(2) {
+			t.Fatalf("expected the viewport answer while the wait runs, got %v", response)
+		}
+	case <-timeout:
+		t.Fatal("an in-flight wait blocked another tool call")
+	}
+	send(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"user"}}`)
+	select {
+	case <-stopped:
+	case <-timeout:
+		t.Fatal("cancel did not stop the wait")
+	}
+	// A second wait is stopped by stdin EOF.
+	send(`{"jsonrpc":"2.0","id":"w2","method":"tools/call","params":{"name":"relay_wait_for_command","arguments":{"pane_id":"` + id + `"}}}`)
+	select {
+	case <-started:
+	case <-timeout:
+		t.Fatal("second wait never reached Relay")
+	}
+	inWriter.Close()
+	select {
+	case <-stopped:
+	case <-timeout:
+		t.Fatal("stdin EOF did not stop the wait")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-timeout:
+		t.Fatal("run did not return after EOF")
+	}
+	for response := range responses {
+		t.Fatalf("a cancelled wait must not answer: %v", response)
 	}
 }

@@ -2937,7 +2937,7 @@ final class RelaySidePanelServer: ObservableObject {
                 do { return try .jsonObject(TerminalCommandWait.json(outcome, paneID: paneID, after: after)) }
                 catch { return .text("Command wait result unavailable", status: 500, reason: "Internal Server Error") }
             }
-            try? await Task.sleep(for: .milliseconds(50))
+            try? await Task.sleep(for: .milliseconds(250))
         }
     }
 }

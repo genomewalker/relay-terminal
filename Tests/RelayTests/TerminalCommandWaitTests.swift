@@ -132,6 +132,26 @@ import Testing
         #expect(TerminalCommandWait.json(outcome!, paneID: pane, after: 4)["exit_status"] == nil)
     }
 
+    @Test func nextAfterChainsWaitsWhereRunningGenerationWouldNot() {
+        // Command 5 is running at the first deadline.
+        let running = TerminalCommandWait.decide(observation(executions: 5, completed: 4), after: 4,
+                                                 pane: .live, producerChanged: false, deadline: true)!
+        let first = TerminalCommandWait.json(running, paneID: pane, after: 4)
+        #expect(first["generation"] as? UInt64 == 5)
+        let next = first["next_after"] as! UInt64
+        #expect(next == 4)
+        // It then returns: next_after finds it, its own generation would not.
+        let done = observation(executions: 5, completed: 5, status: 0)
+        #expect(TerminalCommandWait.decide(done, after: next, pane: .live, producerChanged: false, deadline: false)
+            == .returned(exitStatus: 0, generation: 5))
+        #expect(TerminalCommandWait.decide(done, after: 5, pane: .live, producerChanged: false, deadline: false) == nil)
+        let returned = TerminalCommandWait.json(.returned(exitStatus: 0, generation: 5), paneID: pane, after: next)
+        #expect(returned["next_after"] as? UInt64 == 5)
+        for outcome in [TerminalCommandWait.Outcome.paneExited(code: 1), .unknown(reason: "x", generation: 9)] {
+            #expect(TerminalCommandWait.json(outcome, paneID: pane, after: 4)["next_after"] as? UInt64 == 4)
+        }
+    }
+
     @Test func paneExitIsDistinctFromACommandReturn() {
         let running = observation(executions: 5, completed: 4)
         let outcome = TerminalCommandWait.decide(running, after: 4, pane: .exited(code: 137),

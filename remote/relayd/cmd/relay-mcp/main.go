@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -35,6 +36,8 @@ type request struct {
 }
 
 type server struct {
+	// waitContext bounds a relay_wait_for_command call on the stdio transport.
+	waitContext   context.Context
 	catalogRunner func(string, []byte) ([]byte, error)
 	daemonHelper  string
 	surfacePane   string
@@ -107,7 +110,11 @@ func (s *server) exchange(method, path string, body []byte) (string, error) {
 	if s.token == "" && s.callerToken == "" {
 		return "", fmt.Errorf("Relay connection is not configured: set RELAY_MCP_CALLER_TOKEN (preferred) or RELAY_MCP_TOKEN")
 	}
-	req, err := http.NewRequest(method, s.endpoint+path, bytes.NewReader(body))
+	ctx := s.waitContext
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, s.endpoint+path, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("invalid Relay endpoint")
 	}
@@ -1357,6 +1364,30 @@ func (s *server) run(in io.Reader, out io.Writer) error {
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 4096), (1<<20)+(64<<10))
 	enc := json.NewEncoder(out)
+	var encodeMu sync.Mutex
+	var writeErr error
+	encode := func(response map[string]any) error {
+		encodeMu.Lock()
+		defer encodeMu.Unlock()
+		if writeErr == nil {
+			writeErr = enc.Encode(response)
+		}
+		return writeErr
+	}
+	respond := func(r request, result any, code int, message string) error {
+		response := map[string]any{"jsonrpc": "2.0", "id": r.ID}
+		if code != 0 {
+			response["error"] = map[string]any{"code": code, "message": message}
+		} else {
+			response["result"] = result
+		}
+		return encode(response)
+	}
+	// relay_wait_for_command can block for minutes. It runs beside the serial
+	// loop so the client's other tools stay responsive; its response is matched
+	// by id. notifications/cancelled or stdin EOF stops its polling.
+	waits := newInflightWaits()
+	defer waits.stopAll()
 	for scanner.Scan() {
 		var r request
 		err := json.Unmarshal(scanner.Bytes(), &r)
@@ -1368,17 +1399,28 @@ func (s *server) run(in io.Reader, out io.Writer) error {
 		} else if r.JSONRPC != "2.0" || r.Method == "" {
 			code, message = -32600, "Invalid request"
 		} else if len(r.ID) == 0 {
+			if r.Method == "notifications/cancelled" {
+				waits.cancel(r.Params)
+			}
 			continue
+		} else if isWaitForCommandCall(r) {
+			if ctx, ok := waits.start(r.ID); ok {
+				go func(r request) {
+					defer waits.finish(r.ID)
+					waiting := *s
+					waiting.waitContext = ctx
+					result, code, message := waiting.handle(r)
+					if ctx.Err() == nil {
+						_ = respond(r, result, code, message)
+					}
+				}(r)
+				continue
+			}
+			code, message = -32600, "Duplicate in-flight request id"
 		} else {
 			result, code, message = s.handle(r)
 		}
-		response := map[string]any{"jsonrpc": "2.0", "id": r.ID}
-		if code != 0 {
-			response["error"] = map[string]any{"code": code, "message": message}
-		} else {
-			response["result"] = result
-		}
-		if err := enc.Encode(response); err != nil {
+		if err := respond(r, result, code, message); err != nil {
 			return err
 		}
 	}
