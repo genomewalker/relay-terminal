@@ -10,13 +10,23 @@ import SwiftUI
 extension RelayWorkOverviewIndex {
     /// Board order: what needs the user first, then what is broken, then work.
     enum PaneStatus: Int, CaseIterable, Comparable, Sendable {
-        case waiting, disconnected, reconnecting, running, idle
+        /// `failed`: a program that exited with a non-zero status. It waits on
+        /// the user like `waiting`, but it is a failure, so it is red.
+        case waiting, failed, disconnected, reconnecting, running, idle
 
         static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+
+        /// The role's symbol, except running: a waveform, so working never
+        /// reads as finished (checkmark) or reconnecting (circular arrows).
+        var symbol: String { self == .running ? RelayStatusMark.runningSymbol : role.symbol }
+
+        /// Waiting on the user: a wait or approval, or a failed exit.
+        var needsUser: Bool { self == .waiting || self == .failed }
 
         var label: String {
             switch self {
             case .waiting: "Waiting on you"
+            case .failed: "Failed"
             case .disconnected: "Disconnected"
             case .reconnecting: "Reconnecting"
             case .running: "Running"
@@ -27,8 +37,9 @@ extension RelayWorkOverviewIndex {
         var role: RelayTheme.StatusRole {
             switch self {
             case .waiting: .warning
-            // A lost or returning connection is not a failure: red is for
-            // errors and non-zero exits, which are waiting on the user.
+            // Red is for failures only: a non-zero exit. A lost or returning
+            // connection is not a failure.
+            case .failed: .danger
             case .disconnected: .offline
             case .reconnecting: .pending
             case .running: .success
@@ -45,11 +56,13 @@ extension RelayWorkOverviewIndex {
         approvals > 0 || phase == .needsInput || programState == "blocked" || programState == "error" || failedExit
     }
 
-    /// Waiting wins over a lost connection: a reconnecting pane whose replayed
-    /// state is waiting still waits on the user. A pane still connecting for
-    /// the first time is idle, not disconnected.
+    /// A failed exit is the newest fact, so it wins over a stale wait or
+    /// report. Waiting wins over a lost connection: a reconnecting pane whose
+    /// replayed state is waiting still waits on the user. A pane still
+    /// connecting for the first time is idle, not disconnected.
     static func paneStatus(phase: AgentPhase, approvals: Int, programState: String?,
                            connection: PaneConnectionState, failedExit: Bool = false) -> PaneStatus {
+        if failedExit { return .failed }
         if needsAttention(phase: phase, approvals: approvals, programState: programState, failedExit: failedExit) { return .waiting }
         switch connection {
         case .disconnected: return .disconnected
@@ -57,7 +70,7 @@ extension RelayWorkOverviewIndex {
         case .connecting, .connected: break
         }
         // A clean exit is finished work, not a lost connection; a failed one
-        // already returned .waiting.
+        // already returned .failed.
         if phase == .exited { return .idle }
         if phase == .active || programState == "working" { return .running }
         return .idle
@@ -90,17 +103,19 @@ extension RelayWorkOverviewIndex {
     }
 
     struct PaneCounts: Equatable, Sendable {
-        var waiting = 0, disconnected = 0, reconnecting = 0, running = 0, idle = 0
+        var waiting = 0, failed = 0, disconnected = 0, reconnecting = 0, running = 0, idle = 0
         init(_ facts: [PaneFact] = []) {
             for fact in facts { self[fact.status] += 1 }
         }
-        init(waiting: Int, disconnected: Int, reconnecting: Int = 0, running: Int, idle: Int) {
-            (self.waiting, self.disconnected, self.reconnecting, self.running, self.idle) = (waiting, disconnected, reconnecting, running, idle)
+        init(waiting: Int, failed: Int = 0, disconnected: Int, reconnecting: Int = 0, running: Int, idle: Int) {
+            (self.waiting, self.failed, self.disconnected, self.reconnecting, self.running, self.idle) =
+                (waiting, failed, disconnected, reconnecting, running, idle)
         }
         subscript(status: PaneStatus) -> Int {
             get {
                 switch status {
                 case .waiting: waiting
+                case .failed: failed
                 case .disconnected: disconnected
                 case .reconnecting: reconnecting
                 case .running: running
@@ -110,6 +125,7 @@ extension RelayWorkOverviewIndex {
             set {
                 switch status {
                 case .waiting: waiting = newValue
+                case .failed: failed = newValue
                 case .disconnected: disconnected = newValue
                 case .reconnecting: reconnecting = newValue
                 case .running: running = newValue
@@ -117,7 +133,7 @@ extension RelayWorkOverviewIndex {
                 }
             }
         }
-        var total: Int { waiting + disconnected + reconnecting + running + idle }
+        var total: Int { waiting + failed + disconnected + reconnecting + running + idle }
     }
 
     /// Every terminal pane in every tab and workspace, Mac and remote, from published
@@ -146,7 +162,7 @@ extension RelayWorkOverviewIndex {
                                 programState: report, connection: pane.connectionState, failedExit: failedExit != nil)
         // A lost connection names itself (disconnecting also marks the phase
         // exited); a pane whose session ended while connected says Exited.
-        let detail = status == .waiting && pane.phase == .exited && pane.pendingAgentApprovals == 0 && failedExit != nil
+        let detail = status == .failed
             ? "Exited with status \(failedExit ?? 0)"
             : status == .disconnected || status == .reconnecting
             ? pane.connectionStatusLabel
@@ -193,7 +209,7 @@ extension RelayWorkOverviewIndex {
         var hostCount: Int { Set(rows.map(\.host)).count }
 
         init(_ facts: [PaneFact]) {
-            rows = facts.filter { $0.isAgent || $0.status == .waiting }
+            rows = facts.filter { $0.isAgent || $0.status.needsUser }
             shellsNotShown = facts.count - rows.count
         }
     }
@@ -250,6 +266,8 @@ enum RelayFleetFilter: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .all: []
         case .disconnected: [.disconnected, .reconnecting]
+        // A failed exit also waits on the user.
+        case .waiting: [.waiting, .failed]
         default: status.map { [$0] } ?? []
         }
     }
@@ -260,7 +278,7 @@ enum RelayFleetFilter: String, CaseIterable, Identifiable, Sendable {
 
     /// Opening from the counts shows what is waiting when anything is.
     static func initial(for counts: RelayWorkOverviewIndex.PaneCounts) -> Self {
-        counts.waiting > 0 ? .waiting : .all
+        counts.waiting + counts.failed > 0 ? .waiting : .all
     }
 }
 
@@ -310,7 +328,7 @@ struct RelayFleetBoardHeader: View {
         return Button { filter = option } label: {
             HStack(spacing: RelayTheme.Space.xs) {
                 if let status = option.status {
-                    Image(systemName: status.role.symbol).imageScale(.small)
+                    Image(systemName: status.symbol).imageScale(.small)
                         .foregroundStyle(selected ? RelayTheme.text : role.color)
                 }
                 Text(option.title)
@@ -380,7 +398,7 @@ struct RelayFleetBoardRow: View {
     var body: some View {
         Button(action: open) {
             HStack(spacing: RelayTheme.Space.md) {
-                Image(systemName: fact.status.role.symbol)
+                Image(systemName: fact.status.symbol)
                     .font(RelayTheme.TextRole.body.font)
                     .foregroundStyle(fact.status.role.color)
                     .frame(width: 18)
@@ -474,14 +492,15 @@ struct RelayFleetCountsButton: View {
         .accessibilityIdentifier("relay.navigator.fleet-counts")
     }
 
-    /// The board's order: waiting, disconnected, running; empty ones hidden.
+    /// The board's order: waiting, failed, disconnected, running; empty ones hidden.
     static func segments(_ counts: RelayWorkOverviewIndex.PaneCounts) -> [RelayWorkOverviewIndex.PaneStatus] {
-        [.waiting, .disconnected, .reconnecting, .running].filter { counts[$0] > 0 }
+        [.waiting, .failed, .disconnected, .reconnecting, .running].filter { counts[$0] > 0 }
     }
 
     static func shortLabel(_ status: RelayWorkOverviewIndex.PaneStatus, _ count: Int) -> String {
         switch status {
         case .waiting: "\(count) waiting"
+        case .failed: "\(count) failed"
         case .disconnected: "\(count) disconnected"
         case .reconnecting: "\(count) reconnecting"
         case .running: "\(count) running"
@@ -511,7 +530,7 @@ struct RelayFleetCountsButton: View {
 
     private func part(_ text: String, status: RelayWorkOverviewIndex.PaneStatus) -> some View {
         HStack(spacing: RelayTheme.Space.xs) {
-            Image(systemName: status.role.symbol).imageScale(.small).foregroundStyle(status.role.color)
+            Image(systemName: status.symbol).imageScale(.small).foregroundStyle(status.role.color)
             Text(text).monospacedDigit().lineLimit(1).foregroundStyle(status == .idle ? RelayTheme.textMuted : RelayTheme.text)
         }
     }
@@ -613,43 +632,43 @@ extension EnvironmentValues {
 // MARK: - Status mark
 
 /// A tab, workspace or session row's status at a glance, from
-/// `RelayWorkOverviewIndex.groupStatus`: a turning arc while an agent runs
-/// (still under reduce motion), the warning symbol when something waits on
-/// the user, the danger symbol when disconnected, nothing when idle. Each
-/// shape differs, so colour is never the only signal.
+/// `RelayWorkOverviewIndex.groupStatus`: a green waveform while an agent
+/// runs, the warning symbol when something waits on the user, the danger
+/// symbol for a failed exit, the grey reconnect or offline symbol for a
+/// returning or lost connection, nothing when idle. Each shape differs, so
+/// colour is never the only signal.
 struct RelayStatusMark: View {
     typealias Status = RelayWorkOverviewIndex.PaneStatus
-    enum Kind: Equatable { case none, spinner, staticRunning, symbol(String) }
+    enum Kind: Equatable { case none, symbol(String) }
 
     let status: Status?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.relayStatusMarkWindowVisible) private var windowVisible
 
     static let size: CGFloat = 12
 
-    static func kind(_ status: Status?, reduceMotion: Bool) -> Kind {
+    /// Working, not finished (the success checkmark) and not a circle, so it
+    /// is never read as the reconnect arrows or the finished-unseen dot.
+    static let runningSymbol = "waveform"
+
+    static func kind(_ status: Status?) -> Kind {
         switch status {
         case nil, .idle?: .none
-        case .running?: reduceMotion ? .staticRunning : .spinner
-        case let status?: .symbol(status.role.symbol)
+        case let status?: .symbol(status.symbol)
         }
     }
 
     static func spoken(_ status: Status) -> String { status.role.spoken(status.label) }
 
     /// Beside a row's alert marker: an unread "needs you" alert (waiting or
-    /// error) already says the row waits, so the waiting mark is dropped.
+    /// error) already says the row waits, so the waiting or failed mark is dropped.
     static func status(_ status: Status?, besideAlert alert: RelayAttentionAlert?) -> Status? {
-        status == .waiting && alert?.needsUser == true ? nil : status
+        status?.needsUser == true && alert?.needsUser == true ? nil : status
     }
 
     var body: some View {
         if let status, status != .idle {
             Group {
-                switch Self.kind(status, reduceMotion: reduceMotion) {
+                switch Self.kind(status) {
                 case .none: EmptyView()
-                case .staticRunning: RelayRunningArc()
-                case .spinner: RelaySpinningArc(animating: windowVisible)
                 case let .symbol(name):
                     Image(systemName: name)
                         .font(RelayTheme.font(size: 10, weight: .semibold))
@@ -661,136 +680,6 @@ struct RelayStatusMark: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(Self.spoken(status))
         }
-    }
-}
-
-private struct RelayRunningArc: View {
-    var angle: Angle = .zero
-    var body: some View {
-        ZStack {
-            Circle().stroke(RelayTheme.success.opacity(0.25), lineWidth: 1.75)
-            Circle().trim(from: 0, to: 0.7)
-                .stroke(RelayTheme.success, style: StrokeStyle(lineWidth: 1.75, lineCap: .round))
-                .rotationEffect(angle)
-        }
-        .padding(1.5)
-    }
-}
-
-/// The running arc, turned by a Core Animation layer animation: the render
-/// server draws the frames, so Relay does no per-frame work (a SwiftUI
-/// TimelineView or repeating SwiftUI animation re-renders in-process every
-/// frame). The animation is removed while the window does not show.
-private struct RelaySpinningArc: NSViewRepresentable {
-    let animating: Bool
-
-    func makeNSView(context _: Context) -> RelaySpinnerView { RelaySpinnerView() }
-
-    func updateNSView(_ view: RelaySpinnerView, context _: Context) { view.animating = animating }
-}
-
-final class RelaySpinnerView: NSView {
-    private let track = CAShapeLayer()
-    private let arc = CAShapeLayer()
-    private var occlusionObserver: NSObjectProtocol?
-    var animating = false { didSet { if animating != oldValue { updateSpin() } } }
-    /// The window server's occlusion; replaceable where no window is shown.
-    var occlusionVisible: (NSWindow) -> Bool = { $0.occlusionState.contains(.visible) }
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        for (layer, end) in [(track, 1.0), (arc, 0.7)] {
-            layer.fillColor = nil
-            layer.lineWidth = 1.75
-            layer.lineCap = .round
-            layer.strokeEnd = end
-            self.layer?.addSublayer(layer)
-        }
-        updateColors()
-    }
-
-    @available(*, unavailable) required init?(coder _: NSCoder) { nil }
-
-    override var intrinsicContentSize: NSSize { NSSize(width: RelayStatusMark.size, height: RelayStatusMark.size) }
-    override var isFlipped: Bool { true }
-
-    /// The layers drawn by hand, for tests.
-    var shapeLayers: [CAShapeLayer] { [track, arc] }
-    var isSpinning: Bool { arc.animation(forKey: "spin") != nil }
-
-    override func layout() {
-        super.layout()
-        // Same geometry as the still arc: 1.5 pt inset, stroke centred on the circle.
-        let inset = 1.5 + 1.75 / 2
-        let box = bounds.insetBy(dx: inset, dy: inset)
-        withoutImplicitAnimation {
-            for layer in [track, arc] {
-                layer.frame = bounds
-                layer.path = CGPath(ellipseIn: box, transform: nil)
-            }
-        }
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        updateColors()
-    }
-
-    override func viewDidChangeBackingProperties() {
-        super.viewDidChangeBackingProperties()
-        updateScale()
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if let occlusionObserver { NotificationCenter.default.removeObserver(occlusionObserver) }
-        occlusionObserver = nil
-        if let window {
-            // Marks outside a visibility scope still stop in a covered window.
-            occlusionObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.updateSpin() } }
-        }
-        updateScale()
-        updateSpin()
-    }
-
-    private func withoutImplicitAnimation(_ body: () -> Void) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        body()
-        CATransaction.commit()
-    }
-
-    private func updateScale() {
-        let scale = window?.backingScaleFactor ?? 2
-        withoutImplicitAnimation {
-            for layer in [track, arc] { layer.contentsScale = scale }
-        }
-    }
-
-    private func updateColors() {
-        withoutImplicitAnimation {
-            effectiveAppearance.performAsCurrentDrawingAppearance {
-                track.strokeColor = RelayPalette.success.withAlphaComponent(0.25).cgColor
-                arc.strokeColor = RelayPalette.success.cgColor
-            }
-        }
-    }
-
-    private func updateSpin() {
-        guard animating, let window, occlusionVisible(window) else {
-            arc.removeAnimation(forKey: "spin")
-            return
-        }
-        guard !isSpinning else { return }
-        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-        spin.fromValue = 0
-        spin.toValue = 2 * Double.pi
-        spin.duration = 1
-        spin.repeatCount = .infinity
-        arc.add(spin, forKey: "spin")
     }
 }
 

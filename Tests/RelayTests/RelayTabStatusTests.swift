@@ -65,13 +65,14 @@ struct RelayTabStatusTests {
     @Test("Each mark has its own shape and a spoken label")
     func markKinds() {
         typealias Mark = RelayStatusMark
-        #expect(Mark.kind(nil, reduceMotion: false) == .none)
-        #expect(Mark.kind(.idle, reduceMotion: false) == .none)
-        #expect(Mark.kind(.running, reduceMotion: false) == .spinner)
-        #expect(Mark.kind(.running, reduceMotion: true) == .staticRunning)
-        #expect(Mark.kind(.waiting, reduceMotion: false) == .symbol(RelayTheme.StatusRole.warning.symbol))
-        #expect(Mark.kind(.waiting, reduceMotion: true) == .symbol(RelayTheme.StatusRole.warning.symbol))
-        #expect(Mark.kind(.disconnected, reduceMotion: false) == .symbol(RelayTheme.StatusRole.offline.symbol))
+        #expect(Mark.kind(nil) == .none)
+        #expect(Mark.kind(.idle) == .none)
+        // Running is a still waveform: not the reconnect arrows, not a checkmark.
+        #expect(Mark.kind(.running) == .symbol(Mark.runningSymbol))
+        #expect(Mark.kind(.waiting) == .symbol(RelayTheme.StatusRole.warning.symbol))
+        #expect(Mark.kind(.failed) == .symbol(RelayTheme.StatusRole.danger.symbol))
+        #expect(Mark.kind(.reconnecting) == .symbol(RelayTheme.StatusRole.pending.symbol))
+        #expect(Mark.kind(.disconnected) == .symbol(RelayTheme.StatusRole.offline.symbol))
         #expect(Mark.spoken(.waiting) == "Warning: Waiting on you")
         #expect(Mark.spoken(.disconnected) == "Offline: Disconnected")
         #expect(Mark.spoken(.running) == "Success: Running")
@@ -92,54 +93,6 @@ struct RelayTabStatusTests {
         #expect(Mark.status(.running, besideAlert: .needsInput) == .running)
         #expect(Mark.status(.disconnected, besideAlert: .error) == .disconnected)
         #expect(Mark.status(nil, besideAlert: .needsInput) == nil)
-    }
-
-    @Test("The spinner's layer animation runs only while shown in a visible window")
-    func spinnerGating() {
-        _ = NSApplication.shared
-        let view = RelaySpinnerView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
-        var unoccluded = true
-        view.occlusionVisible = { _ in unoccluded }
-        view.animating = true
-        #expect(!view.isSpinning, "no window, no animation")
-        // Never ordered in: nothing appears on screen; occlusion is stubbed.
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 40, height: 40),
-                              styleMask: [.borderless], backing: .buffered, defer: true)
-        window.isReleasedWhenClosed = false
-        window.contentView?.addSubview(view)
-        #expect(view.isSpinning)
-        view.animating = false
-        #expect(!view.isSpinning, "a hidden window stops the animation")
-        view.animating = true
-        #expect(view.isSpinning)
-        // Fallback outside a visibility scope: the window's own occlusion.
-        unoccluded = false
-        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: window)
-        #expect(!view.isSpinning, "a covered window stops the animation")
-        unoccluded = true
-        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: window)
-        #expect(view.isSpinning)
-        view.removeFromSuperview()
-        #expect(!view.isSpinning)
-        // The real occlusion check: a window never ordered in is not visible.
-        let real = RelaySpinnerView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
-        real.animating = true
-        window.contentView?.addSubview(real)
-        #expect(!real.isSpinning)
-    }
-
-    @Test("The spinner's layers draw at the window's backing scale")
-    func spinnerScale() {
-        _ = NSApplication.shared
-        let view = RelaySpinnerView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 40, height: 40),
-                              styleMask: [.borderless], backing: .buffered, defer: true)
-        window.isReleasedWhenClosed = false
-        window.contentView?.addSubview(view)
-        #expect(view.shapeLayers.count == 2)
-        for layer in view.shapeLayers {
-            #expect(layer.contentsScale == window.backingScaleFactor)
-        }
     }
 
     // MARK: Live workspace
