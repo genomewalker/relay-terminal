@@ -364,6 +364,9 @@ const bashSemanticPromptIntegration = `
 # Relay semantic prompt integration (OSC 133).
 if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
   __relay_command_active=""
+  # Bash runs every element of an array PROMPT_COMMAND only from 5.1; before
+  # that it runs element [0] alone. Arithmetic expansion: no subshell.
+  : "${__relay_prompt_command_array:=$(( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) ))}"
   # Always empty: PS0 expands one of its elements to mark a command started.
   __relay_ps0=()
 
@@ -378,15 +381,22 @@ if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_
   # Keep the capture the first PROMPT_COMMAND entry. User files and tools
   # that run after Relay's setup may prepend their own commands; the hook
   # re-asserts this at every prompt, without a subshell.
+  # A tool that also forces itself first with a prefix check at every prompt
+  # would alternate with this one; each prompt would still run both.
   __relay_capture_first() {
     builtin local -a __relay_entries
     builtin local __relay_entry
-    if [[ ${PROMPT_COMMAND@a} == *a* ]]; then
+    if [[ ${PROMPT_COMMAND@a} == *a* ]] && (( __relay_prompt_command_array )); then
       [[ "${PROMPT_COMMAND[0]}" == __relay_capture_status ]] && return
       for __relay_entry in "${PROMPT_COMMAND[@]}"; do
         [[ "$__relay_entry" == __relay_capture_status ]] || __relay_entries+=("$__relay_entry")
       done
       PROMPT_COMMAND=(__relay_capture_status "${__relay_entries[@]}")
+    elif [[ ${PROMPT_COMMAND@a} == *a* ]]; then
+      # Before bash 5.1 only element [0] runs: extend it as a string, never
+      # move the user's command to an element that would not run.
+      [[ "${PROMPT_COMMAND[0]:-}" == "__relay_capture_status;"* ]] ||
+        PROMPT_COMMAND[0]="__relay_capture_status;${PROMPT_COMMAND[0]//__relay_capture_status;/}"
     elif [[ "${PROMPT_COMMAND:-}" != "__relay_capture_status;"* ]]; then
       PROMPT_COMMAND="__relay_capture_status;${PROMPT_COMMAND//__relay_capture_status;/}"
     fi
@@ -455,6 +465,12 @@ if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_
      [[ "${PROMPT_COMMAND[*]:-}" == *__bp_install* || "${PROMPT_COMMAND[*]:-}" == *__bp_precmd_invoke_cmd* ]]; then
     if [[ " ${precmd_functions[*]:-} " != *" __relay_prompt_hook "* ]]; then
       precmd_functions+=(__relay_prompt_hook)
+    fi
+  elif [[ ${PROMPT_COMMAND@a} == *a* ]] && ! (( __relay_prompt_command_array )); then
+    # Before bash 5.1 only element [0] runs; a new element would never run.
+    if [[ ";${PROMPT_COMMAND[0]:-};" != *";__relay_prompt_hook 2>/dev/null;"* ]]; then
+      [[ -z "${PROMPT_COMMAND[0]:-}" || "${PROMPT_COMMAND[0]}" =~ (\;[[:space:]]*|$'\n')$ ]] || PROMPT_COMMAND[0]+=';'
+      PROMPT_COMMAND[0]+="__relay_prompt_hook 2>/dev/null"
     fi
   elif [[ ";${PROMPT_COMMAND[*]:-};" != *";__relay_prompt_hook 2>/dev/null;"* ]]; then
     if [[ -z "${PROMPT_COMMAND[*]:-}" ]]; then

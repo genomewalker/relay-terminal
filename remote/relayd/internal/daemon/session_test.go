@@ -1369,3 +1369,29 @@ func TestZshReportsCommandStatusDespiteUserPrecmd(t *testing.T) {
 		})
 	}
 }
+
+// Before bash 5.1 an array PROMPT_COMMAND runs only element [0]. Relay must
+// extend [0] as a string, never shift the user's command to [1]. Bash 5.1+
+// runs every element, so this test forces the pre-5.1 decision and then runs
+// [0] alone, as old bash would.
+func TestBashPre51ArrayPromptCommandKeepsUserEntryRunnable(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	requireBash44(t, bash)
+	bashrc := "__relay_prompt_command_array=0\n" +
+		`PROMPT_COMMAND=('builtin printf "user-ran:%s;" "$?"' 'builtin printf element-one;')` + "\n"
+	input := "true\ntrue\nbuiltin declare -p PROMPT_COMMAND\n" +
+		"false; eval \"${PROMPT_COMMAND[0]}\"\nexit 0\n"
+	output := bashSessionOutputWith(t, bash, map[string]string{".bashrc": bashrc}, input)
+	want := `declare -a PROMPT_COMMAND=([0]="__relay_capture_status;builtin printf \"user-ran:%s;\" \"\$?\";__relay_prompt_hook 2>/dev/null" [1]="builtin printf element-one;")`
+	if !strings.Contains(output, want) {
+		t.Fatalf("pre-5.1 PROMPT_COMMAND layout changed; want %s in %q", want, output)
+	}
+	// Running [0] alone after `false` reports 1 and still runs the user's entry
+	// with the command's status.
+	if !strings.Contains(output, "user-ran:1;") || !strings.Contains(output, "\x1b]133;D;1\a") {
+		t.Fatalf("element [0] alone lost the user's entry or the status: %q", output)
+	}
+}
