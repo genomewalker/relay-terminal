@@ -195,7 +195,7 @@ enum RelayCapacityManagement {
             "weight": ["provider", "account", "model", "value", "as_of_ms", "expires_ms", "provenance", "note"],
             "score": ["provider", "account", "model", "known", "eligible", "value", "weight", "unit", "limiting_window", "reason", "absolute_capacity", "observed_plan"],
             "effects": ["notice", "retire", "launch", "pickup"],
-            "trigger_resets": ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps", "seven_day_cowork", "seven_day_omelette"]
+            "trigger_resets": ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps", "seven_day_cowork", "seven_day_omelette", "seven_day_scoped"]
         ]
         if kind == "gates" {
             guard object.count <= 6 else { throw RelayHostRotationRPC.Failure.invalidResponse }

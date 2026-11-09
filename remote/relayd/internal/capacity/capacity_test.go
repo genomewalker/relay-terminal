@@ -785,3 +785,32 @@ func TestCapacityNativeTakeoverWinsConcurrentSettings(t *testing.T) {
 		t.Fatal("NATIVE_INPUT_LOST_TO_SETTINGS_CAS", nativeErr, err)
 	}
 }
+
+// A model-scoped weekly window is a weekly window: it counts for the weekly
+// requirement, triggers at the weekly threshold, and fits beside all seven
+// legacy windows.
+func TestCapacityModelScopedWeeklyWindow(t *testing.T) {
+	a := quota("team", "/team", 10, 10)
+	a.Windows = append(a.Windows, Window{Name: "seven_day_scoped", Used: 99, ResetMS: clock + 30000})
+	if !a.ObservationCurrent(clock) {
+		t.Fatal("scoped weekly window refused")
+	}
+	if got := triggers(a, Defaults()); got["seven_day_scoped"] != clock+30000 {
+		t.Fatalf("scoped weekly window did not trigger: %v", got)
+	}
+	for _, name := range []string{"seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps", "seven_day_cowork", "seven_day_omelette"} {
+		a.Windows = append(a.Windows, Window{Name: name, Used: 1, ResetMS: clock + 30000})
+	}
+	if len(a.Windows) != 8 || !a.ObservationCurrent(clock) {
+		t.Fatalf("all eight Claude windows refused (%d)", len(a.Windows))
+	}
+	a.Windows = append(a.Windows, Window{Name: "seven_day_scoped", Used: 1, ResetMS: clock + 30000})
+	if a.ObservationCurrent(clock) {
+		t.Fatal("duplicate window accepted")
+	}
+	e := entry()
+	e.Away = &Away{OriginalAccount: "team", OriginalConfig: "/team", Owner: "owned", Resets: map[string]int64{"seven_day_scoped": clock}}
+	if !e.Valid() {
+		t.Fatal("away record with a scoped weekly reset refused")
+	}
+}

@@ -137,7 +137,7 @@ import Combine
             let reason = usage.reason.map { ": " + String($0.prefix(120)) } ?? ""
             return .failure(.init(code: "status", text: "Claude usage " + String(usage.status.prefix(24)) + reason))
         }
-        guard let observed = usage.readDate, let windows = usage.windows, windows.count <= 7,
+        guard let observed = usage.readDate, let windows = usage.windows, windows.count <= 8,
               Set(windows.map(\.name)).count == windows.count else {
             return .failure(.init(code: "invalid", text: "the usage reading is malformed"))
         }

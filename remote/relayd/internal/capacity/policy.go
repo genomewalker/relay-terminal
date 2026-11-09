@@ -218,7 +218,9 @@ type Account struct {
 	Windows             []Window `json:"windows"`
 }
 
-var weekly = map[string]bool{"seven_day": true, "seven_day_opus": true, "seven_day_sonnet": true, "seven_day_oauth_apps": true, "seven_day_cowork": true, "seven_day_omelette": true}
+// seven_day_scoped is the most-used model-scoped weekly limit (Claude Code
+// 2.1.319+ reports these in model_scoped, not under a per-model name).
+var weekly = map[string]bool{"seven_day": true, "seven_day_opus": true, "seven_day_sonnet": true, "seven_day_oauth_apps": true, "seven_day_cowork": true, "seven_day_omelette": true, "seven_day_scoped": true}
 
 func windowName(n string) bool { return n == "five_hour" || weekly[n] || codexWindowName(n) }
 func fresh(at, now int64) bool { return at > 0 && now >= at && now-at <= MaxAgeMS }
@@ -229,7 +231,7 @@ func (a Account) ObservationCurrent(now int64) bool {
 	if a.Provider != "claude" && a.Provider != "codex" {
 		return false
 	}
-	if a.Provider == "claude" && len(a.Windows) > 7 {
+	if a.Provider == "claude" && len(a.Windows) > 8 {
 		return false
 	}
 	five, week := false, false

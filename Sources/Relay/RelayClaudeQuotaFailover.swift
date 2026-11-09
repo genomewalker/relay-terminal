@@ -63,7 +63,8 @@ struct RelayClaudeQuotaPollSchedule {
 /// All effects go through a write-ahead journal. A pending intent is never
 /// replayed after restart; the user gets an explicit uncertain-move notice.
 struct RelayClaudeQuotaEngine {
-    static let weeklyNames: Set<String> = ["seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps", "seven_day_cowork", "seven_day_omelette"]
+    /// `seven_day_scoped` is relayd's most-used model-scoped weekly limit.
+    static let weeklyNames: Set<String> = ["seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps", "seven_day_cowork", "seven_day_omelette", "seven_day_scoped"]
     struct Window: Equatable {
         var used: Double
         var reset: Date
@@ -176,7 +177,7 @@ struct RelayClaudeQuotaEngine {
                       RelayAgentAccount.validLabel(r.source) && RelayAgentAccount.validLabel(r.target) && r.source != r.target &&
                       RelayAgentAccount.validDirectory(r.sourceDir) && RelayAgentAccount.validDirectory(r.targetDir) &&
                       r.reset.timeIntervalSince1970 > 0 && r.reset.timeIntervalSince1970 < 253_402_300_800 &&
-                      (r.state == .user || !r.triggerResets.isEmpty) && r.triggerResets.count <= 7 &&
+                      (r.state == .user || !r.triggerResets.isEmpty) && r.triggerResets.count <= 8 &&
                       Set(r.triggerResets.keys).isSubset(of: RelayClaudeQuotaEngine.weeklyNames.union(["five_hour"])) &&
                       r.triggerResets.values.allSatisfy { $0.timeIntervalSince1970 > 0 && $0.timeIntervalSince1970 < 253_402_300_800 } &&
                       (r.triggerResets.isEmpty || r.triggerResets.values.max() == r.reset)
