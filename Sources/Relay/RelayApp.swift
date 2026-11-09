@@ -159,7 +159,6 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
     private let responsivenessMonitor = RelayResponsivenessMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.appearance = NSAppearance(named: RelayTheme.appearanceName)
         windowPresentationObservers.append(NotificationCenter.default.addObserver(
             forName: .relayApplicationActivityChanged, object: nil, queue: .main
         ) { [weak self] _ in

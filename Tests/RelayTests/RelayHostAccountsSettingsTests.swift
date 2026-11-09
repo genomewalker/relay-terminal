@@ -140,7 +140,7 @@ extension RelayHostAccountsSettingsTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         let application = NSApplication.shared
         application.setActivationPolicy(.prohibited)
-        application.appearance = NSAppearance(named: RelayTheme.appearanceName)
+        application.appearance = NSAppearance(named: .darkAqua)
         let preferences = RelayPreferences.shared
         preferences.intelligenceEnabled = true
         preferences.automaticAgentSummaries = false
@@ -170,7 +170,7 @@ extension RelayHostAccountsSettingsTests {
         let window = NSWindow(contentRect: NSRect(x: -20_000, y: -20_000, width: size.width, height: size.height),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        window.appearance = NSAppearance(named: RelayTheme.appearanceName)
+        window.appearance = NSAppearance(named: .darkAqua)
         window.contentView = hosting
         defer { window.close() }
         hosting.layoutSubtreeIfNeeded()

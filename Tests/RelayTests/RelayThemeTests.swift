@@ -83,13 +83,17 @@ struct RelayThemeTests {
         #expect(RelayTheme.TextRole.caption.size == 11)
     }
 
-    @Test func relayWindowsStayDark() {
+    /// Relay follows the system appearance: configuring a window keeps its
+    /// appearance (previously this forced darkAqua; see RelayLightModeTests).
+    @Test func relayWindowsFollowTheSystemAppearance() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 120, height: 80), styleMask: [.titled],
                               backing: .buffered, defer: true)
         window.isReleasedWhenClosed = false
         window.appearance = NSAppearance(named: .aqua)
         RelayTheme.configureAppearance(window)
-        #expect(window.appearance?.name == .darkAqua)
-        #expect(RelayTheme.colorScheme == .dark)
+        #expect(window.appearance?.name == .aqua)
+        window.appearance = nil
+        RelayTheme.configureAppearance(window)
+        #expect(window.appearance == nil)
     }
 }
