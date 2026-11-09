@@ -27,7 +27,8 @@ struct RelayComponentTests {
         let cases: [(NSColor, UInt32, NSColor)] = [
             (RelayPalette.warning, 0xDDA398, .systemOrange),
             (RelayPalette.danger, 0xDE827B, .systemRed),
-            (RelayPalette.info, 0x8DB7EB, .controlAccentColor),
+            // Info is the accent in both appearances; light mode now uses Relay's tuned accent.
+            (RelayPalette.info, 0x8DB7EB, RelayPalette.accent),
         ]
         for (color, dark, light) in cases {
             #expect(try same(rgba(color, in: .darkAqua), hex(dark)))
