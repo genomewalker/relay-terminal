@@ -347,7 +347,7 @@ struct RelayAgentToolRow: View {
     init(axID: String, name: String, status: String, summary: String, live: Bool = false) {
         self.axID = axID; self.status = status; self.summary = summary
         let state = RelayToolState(status: status, live: live)
-        let presentation = RelayToolPresentation(tool: name, text: summary)
+        let presentation = RelayToolPresentation(tool: name, status: status, text: summary)
         self.state = state; self.presentation = presentation
         // Failures and edits are what the reader needs to see; other output waits for a click.
         _open = State(initialValue: state == .failed || presentation.isDiff)

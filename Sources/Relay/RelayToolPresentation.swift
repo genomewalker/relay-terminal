@@ -66,13 +66,15 @@ struct RelayToolPresentation: Equatable {
     let lines: [Line]
     let isDiff: Bool
 
-    init(tool: String, text: String) {
+    /// `status` decides whether `text` is the call's arguments (requested/running)
+    /// or its output; output is never reinterpreted, even when it is JSON.
+    init(tool: String, status: String = "requested", text: String) {
         let display = Self.displayName(tool)
         name = display
         var body = text
         var summary: String?
         var diff: [Line]?
-        if let object = Self.jsonObject(text) {
+        if RelayToolState.mayBeRunning(status), let object = Self.jsonObject(text) {
             summary = Self.argumentSummary(tool: tool, input: object)
             if let edit = Self.editDiff(object) { diff = edit; body = "" }
             else if let patch = object["input"] as? String ?? object["patch"] as? String, patch.contains("*** Begin Patch") {

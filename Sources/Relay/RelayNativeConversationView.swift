@@ -188,7 +188,7 @@ struct RelayNativeConversationView: View {
         let shown = items
         let live = liveIDs(shown)
         guard let item = shown.last(where: { live.contains($0.id) }) else { return nil }
-        return (item.id, RelayToolPresentation(tool: item.tool ?? "", text: item.text).name)
+        return (item.id, RelayToolPresentation.displayName(item.tool ?? ""))
     }
     private var items: [RelayNativeItem] {
         let current = conversation.snapshot?.items ?? []
@@ -297,7 +297,7 @@ private struct RelayNativeToolCard: View {
     init(item: RelayNativeItem, live: Bool) {
         self.item = item
         state = RelayToolState(status: item.status ?? "", live: live)
-        presentation = RelayToolPresentation(tool: item.tool ?? "", text: item.text)
+        presentation = RelayToolPresentation(tool: item.tool ?? "", status: item.status ?? "", text: item.text)
     }
 
     var body: some View {

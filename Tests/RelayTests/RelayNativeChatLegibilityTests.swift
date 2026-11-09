@@ -89,6 +89,14 @@ import Testing
         #expect(long.title.count <= "Bash · ".count + 60)
     }
 
+    @Test func jsonOutputOfAFinishedCallIsShownVerbatim() {
+        let output = #"{"path":"/x","type":"file"}"#
+        let result = RelayToolPresentation(tool: "Bash", status: "completed", text: output)
+        #expect(result.title == "Bash" && result.lines.map(\.text) == [output])
+        let command = RelayToolPresentation(tool: "Bash", status: "failed", text: #"{"command":"ls x"}"#)
+        #expect(command.title == "Bash" && command.lines.map(\.text) == [#"{"command":"ls x"}"#])
+    }
+
     @Test func rawInfrastructureErrorIsNotUserFacing() {
         let raw = "Host exec outcome unavailable; job job-5f0c. Do not replay execution. The network connection was lost."
         let shown = RelayConversationErrorText.userFacing(raw)
