@@ -89,8 +89,10 @@ struct RelayPaneHealthFacts: Codable, Equatable, Sendable {
                 if proof.bound == false { actions.append("repair_link") }
                 if proof.installedUpdate == true { actions.append("apply_update") }
             }
-            if !ended, connection == "disconnected", pane.profile.backend == .relay,
-               pane.remoteExitCode == nil { actions.append("reconnect") }
+            // A lost transport also marks the phase exited, so `ended` is true
+            // here; only a program that really ended rules out a reattach.
+            if !pane.programExited, case .disconnected = pane.connectionState,
+               pane.profile.backend == .relay { actions.append("reconnect") }
         }
         var fields: [String: RelayPaneHealthJSON] = [
             "pane_id": .string(pane.id.uuidString.lowercased()), "kind": .string(kind),

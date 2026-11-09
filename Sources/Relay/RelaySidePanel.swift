@@ -2922,8 +2922,9 @@ final class RelaySidePanelServer: ObservableObject {
             guard pane.profile.backend == .relay else {
                 return .unsupported("pane output does not pass through a Relay worker; command status is unavailable")
             }
-            if pane.remoteExitCode != nil || pane.phase == .exited { return .exited(code: pane.remoteExitCode) }
-            return pane.connectionState == .connected ? .live : .disconnected
+            if pane.programExited { return .exited(code: pane.remoteExitCode) }
+            // A lost transport is not a pane exit: the command may still run.
+            return pane.connectionState == .connected && pane.phase != .exited ? .live : .disconnected
         }
         let start = pane.runtime.commandWaitContext
         let after = request.after ?? TerminalCommandWait.defaultAfter(start.observation)

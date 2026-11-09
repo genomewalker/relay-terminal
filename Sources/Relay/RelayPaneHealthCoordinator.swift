@@ -245,7 +245,7 @@ import SwiftUI
         let observation = observations[pane.id]
         let fresh = pane.connectionState == .connected && pane.phase != .exited && pane.remoteExitCode == nil &&
             (observation.map { now.timeIntervalSince($0.at) < 300 } ?? false)
-        let state = pane.phase == .exited || pane.remoteExitCode != nil ? "exited" : pane.connectionState != .connected ? "connection_unavailable" :
+        let state = pane.programExited ? "exited" : pane.connectionState != .connected || pane.phase == .exited ? "connection_unavailable" :
             observation == nil ? "not_checked" : !fresh ? "stale" :
             observation?.proof.unavailable != nil ? "unavailable" : "observed"
         return (state, fresh)

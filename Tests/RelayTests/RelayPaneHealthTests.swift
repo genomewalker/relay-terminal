@@ -36,6 +36,40 @@ private let healthPaneID = "0e426bf7-58ab-4e0b-a521-b2400a8989aa"
     #expect(!facts.allowedActions.contains("reconnect"))
 }
 
+/// A lost connection marks the agent phase exited, but the program may still
+/// run in its retained worker: health must not report it ended, and must
+/// offer the retained-worker reconnect that the coordinator performs.
+@MainActor @Test func paneHealthLostTransportIsNotAProgramExit() throws {
+    _ = NSApplication.shared
+    let oldMaintenance = RelayPreferences.shared.automaticAgentMaintenance
+    RelayPreferences.shared.automaticAgentMaintenance = true
+    defer { RelayPreferences.shared.automaticAgentMaintenance = oldMaintenance }
+    let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+    let pane = try #require(workspace.activePaneID.flatMap { workspace.panes[$0] })
+    pane.connected()
+    pane.disconnected("Owned transport loss")
+    #expect(pane.phase == .exited)
+    #expect(pane.remoteExitCode == nil)
+    #expect(!pane.programExited)
+    let coordinator = RelayPaneHealthCoordinator(url: FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString).appendingPathComponent("journal.json"))
+    coordinator.heartbeat(workspace)
+    let host = try #require(coordinator.snapshot().hosts.first)
+    #expect(host.endedPanes == 0)
+    #expect(host.livePanes.first?.observationState == "connection_unavailable")
+    let facts = try #require(host.livePanes.first?.facts)
+    #expect(facts.value["connection"]?.string == "disconnected")
+    #expect(facts.allowedActions.contains("reconnect"))
+
+    // The program's own exit, reported while disconnected, still ends it.
+    pane.exited(exitCode: 1)
+    #expect(pane.programExited)
+    coordinator.heartbeat(workspace)
+    let ended = try #require(coordinator.snapshot().hosts.first)
+    #expect(ended.livePanes.first?.observationState == "exited")
+    #expect(!(ended.livePanes.first?.facts.allowedActions.contains("reconnect") ?? true))
+}
+
 @MainActor @Test func paneHealthNativeCoverageIncludesShellsWithoutClaimingHeartbeatAsObservation() throws {
     _ = NSApplication.shared
     let workspace = WorkspaceModel(restoreSavedWorkspace: false)
