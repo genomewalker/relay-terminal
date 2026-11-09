@@ -80,7 +80,7 @@ struct RelayAttentionClassificationTests {
         #expect(f.store.marker(for: f.toolFailed.id) == .toolFailed)
         // The board's waiting is the inbox, less the unread agent error alert
         // (an event, not pane state, which the board does not read).
-        let board = Set(Index.paneFacts(f.workspace).filter { $0.status == .waiting }.map(\.paneID))
+        let board = Set(Index.paneFacts(f.workspace).filter(\.status.needsUser).map(\.paneID))
         #expect(board == [f.waiting.id, f.failedExit.id])
         #expect(Set(rows.map(\.paneID)).subtracting(board) == [f.errored.id])
         // Dismissing a failed exit hides it until the exit changes.

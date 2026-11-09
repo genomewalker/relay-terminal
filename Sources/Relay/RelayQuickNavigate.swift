@@ -72,7 +72,7 @@ struct RelayQuickNavigate: View {
                     symbol: pane.contentKind == .editor ? "doc.text" : "terminal", destination: .pane(id, tab.id),
                     searchFields: [pane.title, pane.profile.name, pane.profile.host, pane.directory ?? "", id.uuidString,
                                    hidden ? "hidden stack" : "", pane.connectionStatusLabel],
-                    needsAttention: fact.status == .waiting,
+                    needsAttention: fact.status.needsUser,
                     isCurrent: current, changedAt: fact.changedAt,
                     lastVisitedAt: id == workspace.activePaneID ? nil : visits.visit(id)?.lastVisitedAt,
                     frecency: visits.frecency(of: id, at: now), isActivePane: id == workspace.activePaneID))

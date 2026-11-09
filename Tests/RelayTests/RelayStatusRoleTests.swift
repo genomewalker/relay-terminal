@@ -23,15 +23,15 @@ struct RelayStatusRoleTests {
         #expect(status(.exited).role == .neutral)
         #expect(status(.quiet).role == .neutral)
         // A real failure keeps the attention role and says why.
-        #expect(status(.exited, failedExit: true) == .waiting)
+        #expect(status(.exited, failedExit: true) == .failed)
         #expect(status(.quiet, program: "error") == .waiting)
         // Nothing but a failure maps to red; the calm roles are grey.
-        for state in Index.PaneStatus.allCases { #expect(state.role != .danger) }
+        for state in Index.PaneStatus.allCases { #expect((state.role == .danger) == (state == .failed)) }
         for role in [RelayTheme.StatusRole.pending, .offline] {
             #expect(role.color == RelayTheme.StatusRole.neutral.color)
             #expect(role != .danger && role.symbol != RelayTheme.StatusRole.danger.symbol)
         }
-        #expect(Set(Index.PaneStatus.allCases.map(\.role.symbol)).count == Index.PaneStatus.allCases.count)
+        #expect(Set(Index.PaneStatus.allCases.map(\.symbol)).count == Index.PaneStatus.allCases.count)
     }
 
     @Test("The summary strip is always labelled and stays on one line")
@@ -57,7 +57,7 @@ struct RelayStatusRoleTests {
     func snapshots() throws {
         let facts = [
             fact("smdb-import", .waiting, detail: "Needs input", minutesAgo: 3),
-            fact("old-run", .waiting, detail: "Exited with status 2", minutesAgo: 9),
+            fact("old-run", .failed, detail: "Exited with status 2", minutesAgo: 9),
             fact("metadmg-sweep", .disconnected, detail: "Connection lost", minutesAgo: 41),
             fact("pan-barley-align", .reconnecting, detail: "Reconnecting", minutesAgo: 6),
             fact("relay-build", .running, detail: "Working", host: "This Mac", workspace: "Relay", tab: "build", minutesAgo: 1),

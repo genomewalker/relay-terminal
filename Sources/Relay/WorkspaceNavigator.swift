@@ -332,7 +332,14 @@ extension WorkspaceModel {
             guard let pane = panes[id] else { continue }
             let item = unread[id]
             let program = RelayWorkOverviewIndex.mostUrgentProgramState(pane.programStatus.records.map(\.state))
-            if pane.phase != .needsInput,
+            if let status = Self.failedExitStatus(pane) {
+                // The exit is the newest fact: a report, approval, wait or
+                // activity ("Started") from before it is stale. Dismissed:
+                // hidden until the exit changes.
+                guard !Self.isDismissedWait(dismissedAttention[id], current: Self.exitIdentity(status)) else { continue }
+                entries.append((AttentionInboxEntry(paneID: id, alert: .error, title: "Exited with status \(status)",
+                                                    occurredAt: pane.lastActivity), index))
+            } else if pane.phase != .needsInput,
                RelayWorkOverviewIndex.needsAttention(phase: pane.phase, approvals: pane.pendingAgentApprovals, programState: program) {
                 // An approval or a blocked or failed program report: the same
                 // predicate the fleet board and Go to pane use.
@@ -349,10 +356,6 @@ extension WorkspaceModel {
                     entries.append((AttentionInboxEntry(paneID: id, alert: .needsInput, title: waiting?.label ?? pane.activitySummary,
                                                         occurredAt: waiting?.occurredAt ?? pane.lastActivity), index))
                 }
-            } else if let status = Self.failedExitStatus(pane),
-                      !Self.isDismissedWait(dismissedAttention[id], current: Self.exitIdentity(status)) {
-                entries.append((AttentionInboxEntry(paneID: id, alert: .error, title: "Exited with status \(status)",
-                                                    occurredAt: pane.lastActivity), index))
             } else if let item, let alert = item.alert, alert.needsUser {
                 // Finished turns and failed tools stay unread markers; they
                 // are not things the user must act on.

@@ -2255,7 +2255,7 @@ private struct SessionPaneRow: View {
                     .frame(width: 2, height: 16)
                 Image(systemName: pane.contentKind == .editor ? "curlybraces" : pane.kind.symbol)
                     .font(RelayTheme.font(size: 9.5, weight: .medium))
-                    .foregroundStyle(pane.contentKind == .editor ? RelayTheme.blue : pane.phase.color)
+                    .foregroundStyle(pane.contentKind == .editor ? RelayTheme.blue : pane.phaseColor)
                     .frame(width: 14)
                 VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
                     Text(pane.contentKind == .editor ? pane.displayName : pane.kind == .shell ? pane.displayName : pane.harnessLabel)
@@ -5125,7 +5125,7 @@ struct ConnectionPath: View {
                 Label(pane.activeSubagents > 0 ? String(pane.activeSubagents) + " agents" : pane.harnessLabel,
                       systemImage: pane.kind.symbol)
                     .font(RelayTheme.font(size: 9.5, weight: .medium))
-                    .foregroundStyle(pane.phase.color)
+                    .foregroundStyle(pane.phaseColor)
                     .lineLimit(1)
                     .fixedSize()
                     .layoutPriority(2)
