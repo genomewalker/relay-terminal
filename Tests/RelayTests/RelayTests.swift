@@ -868,6 +868,14 @@ func sshFailureDiagnosis() {
     let timeout = SSHConnectionFailure.diagnose("ssh: connect to host hpc port 22: Operation timed out", terminationStatus: 255)
     #expect(timeout.kind == .networkRoute)
     #expect(timeout.userMessage == "VPN or network route unavailable.")
+    #expect(!timeout.isNameLookup)
+
+    // A stale DNS answer can outlast the VPN outage; say it is a name lookup.
+    let dns = SSHConnectionFailure.diagnose("ssh: Could not resolve hostname dandycomp07fl.unicph.domain: nodename nor servname provided, or not known", terminationStatus: 255)
+    #expect(dns.kind == .networkRoute)
+    #expect(dns.shouldRetry)
+    #expect(dns.isNameLookup)
+    #expect(dns.userMessage.contains("DNS") && !dns.userMessage.hasPrefix("VPN or network route unavailable"))
 
     let permission = SSHConnectionFailure.diagnose("user@hpc: Permission denied (publickey).", terminationStatus: 255)
     #expect(permission.kind == .authentication)

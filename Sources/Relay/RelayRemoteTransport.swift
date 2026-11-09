@@ -57,10 +57,20 @@ struct SSHConnectionFailure: Equatable, Sendable {
         kind == .networkRoute || kind == .interrupted
     }
 
+    /// The host name did not resolve: a DNS problem, which can persist after
+    /// the VPN is back while the system resolver still holds an old answer.
+    var isNameLookup: Bool {
+        let detail = detail.lowercased()
+        return ["could not resolve hostname", "nodename nor servname provided", "temporary failure in name resolution"]
+            .contains(where: detail.contains)
+    }
+
     var userMessage: String {
         switch kind {
         case .networkRoute:
-            "VPN or network route unavailable."
+            isNameLookup
+                ? "Can't look up this host's name (DNS). If the VPN is connected, macOS may still be using an old lookup; Relay keeps retrying."
+                : "VPN or network route unavailable."
         case .interrupted:
             "Connection interrupted."
         case .authentication:

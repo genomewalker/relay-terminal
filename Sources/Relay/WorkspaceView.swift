@@ -5443,7 +5443,7 @@ private struct ConnectionRecoveryBanner: View {
             Image(systemName: waitingForNetwork ? "network.slash" : "arrow.trianglehead.2.clockwise.rotate.90")
                 .foregroundStyle(waitingForNetwork ? RelayTheme.coral : RelayTheme.blue)
             VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
-                Text(waitingForNetwork ? "VPN or network unavailable" : "Reconnecting to \(host)")
+                Text(waitingForNetwork ? "Can't reach \(host)" : "Reconnecting to \(host)")
                     .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .foregroundStyle(RelayTheme.text)
                 Text(message)
