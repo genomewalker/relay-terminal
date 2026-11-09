@@ -764,10 +764,12 @@ private enum WorkspaceNamingRequest: Identifiable {
     @ObservedObject var workspace: WorkspaceModel
     let paneID: UUID
     let content: Content
+    var inbox: AgentIntelligenceStore = .shared
     @State private var failure: String?
 
-    init(tab: TabModel, workspace: WorkspaceModel, paneID: UUID, @ViewBuilder content: () -> Content) {
-        self.tab = tab; self.workspace = workspace; self.paneID = paneID; self.content = content()
+    init(tab: TabModel, workspace: WorkspaceModel, paneID: UUID, inbox: AgentIntelligenceStore = .shared,
+         @ViewBuilder content: () -> Content) {
+        self.tab = tab; self.workspace = workspace; self.paneID = paneID; self.inbox = inbox; self.content = content()
     }
 
     var body: some View {
@@ -778,8 +780,12 @@ private enum WorkspaceNamingRequest: Identifiable {
                         ForEach(Array(stack.members.enumerated()), id: \.element) { index, id in
                             if let pane = workspace.panes[id] {
                                 Button { workspace.organization.navigate(to: .pane(id)) } label: {
-                                    Text(pane.customName ?? pane.title).font(RelayTheme.font(size: 10, weight: id == stack.selected ? .semibold : .regular))
-                                        .lineLimit(1).frame(maxWidth: 175).padding(.horizontal, 9).frame(height: 26)
+                                    HStack(spacing: 4) {
+                                        Text(pane.customName ?? pane.title).font(RelayTheme.font(size: 10, weight: id == stack.selected ? .semibold : .regular))
+                                            .lineLimit(1)
+                                        RelayFinishedDot(paneIDs: [id], inbox: inbox)
+                                    }
+                                    .frame(maxWidth: 175).padding(.horizontal, 9).frame(height: 26)
                                         .background(id == stack.selected ? RelayTheme.accent.opacity(0.15) : .clear, in: RoundedRectangle(cornerRadius: 4))
                                 }
                                 .buttonStyle(.plain)

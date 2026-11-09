@@ -112,7 +112,8 @@ struct WorkspaceFocusTests {
         workspace.endFocus()
         #expect(workspace.attentionOutsideFocus(inbox: store) == 0)
         #expect(workspace.panesInFocus() == nil)
-        #expect(Set(workspace.attentionInbox(inbox: store).map(\.paneID)) == [a.pane, b.pane, c.pane])
+        // Finished work (c) stays an unread marker, not an inbox row.
+        #expect(Set(workspace.attentionInbox(inbox: store).map(\.paneID)) == [a.pane, b.pane])
         #expect(store.panesNeedingUser { workspace.isInFocus(paneID: $0) } == 2)
     }
 

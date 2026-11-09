@@ -2608,6 +2608,7 @@ final class WorkspaceModel: ObservableObject {
     func dismissAttention(_ paneID: UUID, inbox: AgentIntelligenceStore = .shared) {
         inbox.markPaneRead(paneID)
         if let pane = panes[paneID], pane.phase == .needsInput, let wait = pane.waitIdentity { dismissedAttention[paneID] = wait }
+        else if let pane = panes[paneID], let status = Self.failedExitStatus(pane) { dismissedAttention[paneID] = Self.exitIdentity(status) }
         inboxHold?.removeAll { $0.paneID == paneID }
     }
 

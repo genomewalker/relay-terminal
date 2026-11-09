@@ -73,8 +73,9 @@ struct WorkspaceNavigatorAttentionTests {
         store.record(event(gone, .failure, .error, "closed pane", at: base.addingTimeInterval(10)))
 
         let rows = workspace.attentionInbox(inbox: store)
-        #expect(rows.map(\.paneID) == [newError.id, oldError.id, failed.id, finished.id])
-        #expect(rows.map(\.alert) == [.error, .error, .toolFailed, .done])
+        // Finished turns and failed tools stay unread markers but are not listed.
+        #expect(rows.map(\.paneID) == [newError.id, oldError.id])
+        #expect(rows.map(\.alert) == [.error, .error])
         #expect(Set(rows.map(\.paneID)).count == rows.count)
         store.markPaneRead(newError.id)
         #expect(workspace.attentionInbox(inbox: store).first?.paneID == oldError.id)

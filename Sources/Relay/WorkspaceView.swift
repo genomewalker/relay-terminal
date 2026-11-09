@@ -1301,6 +1301,7 @@ private struct WorkspaceTab: View {
                     Text(label)
                         .font(RelayTheme.font(size: 11.5, weight: .medium))
                         .lineLimit(1)
+                    RelayFinishedDot(paneIDs: tab.allPaneIDs)
                 }
                 .padding(.leading, RelayTheme.spacing(10))
                 .padding(.trailing, RelayTheme.spacing(6))
@@ -2006,8 +2007,8 @@ private struct PanePresence: View {
 /// dismissed. The first rows show; the rest behind "Show more".
 struct AttentionInboxSection: View {
     @ObservedObject var workspace: WorkspaceModel
+    @ObservedObject var inbox: AgentIntelligenceStore = .shared
     var identifier = "relay.sidebar.attention-inbox"
-    @ObservedObject private var inbox = AgentIntelligenceStore.shared
 
     var body: some View {
         // Waiting is a pane phase; the activity index redraws on it.
@@ -2152,7 +2153,14 @@ private struct RelayAttentionSummary: View {
     }
 
     @ViewBuilder private func alertMarker(_ alerts: [RelayAttentionAlert], _ shown: RelayAttentionAlert?) -> some View {
-        if let alert = shown {
+        if shown == .done {
+            // Finished, not yet seen: a calm dot, not the checkmark.
+            let count = alerts.filter { $0 == .done }.count
+            Circle().fill(RelayTheme.StatusRole.info.color).frame(width: 6, height: 6)
+                .help(RelayFinishedDot.label(count))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(RelayFinishedDot.label(count))
+        } else if let alert = shown {
             let count = alerts.filter { $0 == alert }.count
             HStack(spacing: RelayTheme.spacing(2)) {
                 Image(systemName: alert.symbol)

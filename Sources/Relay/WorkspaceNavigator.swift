@@ -301,16 +301,23 @@ extension WorkspaceModel {
         }.map { rows[$0] }
     }
 
-    /// One row per pane needing attention: every pane waiting on the user now,
-    /// even with its alerts read or raised before a restart (unless dismissed
-    /// in that wait), and every pane
-    /// with an unread alert. Waiting panes first, then errors, failed tools
-    /// and finished work; newest first within each, then pane order.
+    /// A program that exited with a non-zero status: a failure to act on.
+    /// A clean exit is not attention.
+    static func failedExitStatus(_ pane: PaneModel) -> Int? {
+        pane.remoteExitCode.flatMap { $0 != 0 ? $0 : nil }
+    }
+
+    static func exitIdentity(_ status: Int) -> String { "exit:\(status)" }
+
     /// A wait is hidden only when one was dismissed and it is still that wait.
     nonisolated static func isDismissedWait(_ dismissed: String?, current: String?) -> Bool {
         dismissed != nil && dismissed == current
     }
 
+    /// One row per pane that needs the user: waiting on input or approval,
+    /// an unread error, or a program that exited with a failure. Finished
+    /// turns, "Done" and failed agent tools stay unread markers but are not
+    /// listed. Waiting first, then errors; newest first, then pane order.
     /// While focusing, panes outside focus are left out unless `outsideFocus`;
     /// their alerts stay unread, so they are listed again when focus ends.
     func attentionInbox(inbox: AgentIntelligenceStore = .shared, outsideFocus: Bool = false) -> [AttentionInboxEntry] {
@@ -324,7 +331,15 @@ extension WorkspaceModel {
         for (index, id) in order.enumerated() where seen.insert(id).inserted && inside?.contains(id) != false {
             guard let pane = panes[id] else { continue }
             let item = unread[id]
-            if pane.phase == .needsInput {
+            let program = RelayWorkOverviewIndex.mostUrgentProgramState(pane.programStatus.records.map(\.state))
+            if pane.phase != .needsInput,
+               RelayWorkOverviewIndex.needsAttention(phase: pane.phase, approvals: pane.pendingAgentApprovals, programState: program) {
+                // An approval or a blocked or failed program report: the same
+                // predicate the fleet board and Go to pane use.
+                entries.append((AttentionInboxEntry(paneID: id, alert: program == "error" ? .error : .needsInput,
+                                                    title: item?.title ?? pane.activitySummary,
+                                                    occurredAt: item?.occurredAt ?? pane.lastActivity), index))
+            } else if pane.phase == .needsInput {
                 // Dismissed in this wait: hidden until a new wait starts.
                 guard !Self.isDismissedWait(dismissedAttention[id], current: pane.waitIdentity) else { continue }
                 if let item, item.alert == .needsInput {
@@ -334,7 +349,13 @@ extension WorkspaceModel {
                     entries.append((AttentionInboxEntry(paneID: id, alert: .needsInput, title: waiting?.label ?? pane.activitySummary,
                                                         occurredAt: waiting?.occurredAt ?? pane.lastActivity), index))
                 }
-            } else if let item, let alert = item.alert {
+            } else if let status = Self.failedExitStatus(pane),
+                      !Self.isDismissedWait(dismissedAttention[id], current: Self.exitIdentity(status)) {
+                entries.append((AttentionInboxEntry(paneID: id, alert: .error, title: "Exited with status \(status)",
+                                                    occurredAt: pane.lastActivity), index))
+            } else if let item, let alert = item.alert, alert.needsUser {
+                // Finished turns and failed tools stay unread markers; they
+                // are not things the user must act on.
                 entries.append((AttentionInboxEntry(paneID: id, alert: alert, title: item.title, occurredAt: item.occurredAt), index))
             }
         }

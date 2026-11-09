@@ -10,7 +10,7 @@ import SwiftUI
 extension RelayWorkOverviewIndex {
     /// Board order: what needs the user first, then what is broken, then work.
     enum PaneStatus: Int, CaseIterable, Comparable, Sendable {
-        case waiting, disconnected, running, idle
+        case waiting, disconnected, reconnecting, running, idle
 
         static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 
@@ -18,6 +18,7 @@ extension RelayWorkOverviewIndex {
             switch self {
             case .waiting: "Waiting on you"
             case .disconnected: "Disconnected"
+            case .reconnecting: "Reconnecting"
             case .running: "Running"
             case .idle: "Idle"
             }
@@ -26,7 +27,10 @@ extension RelayWorkOverviewIndex {
         var role: RelayTheme.StatusRole {
             switch self {
             case .waiting: .warning
-            case .disconnected: .danger
+            // A lost or returning connection is not a failure: red is for
+            // errors and non-zero exits, which are waiting on the user.
+            case .disconnected: .offline
+            case .reconnecting: .pending
             case .running: .success
             case .idle: .neutral
             }
@@ -35,21 +39,26 @@ extension RelayWorkOverviewIndex {
 
     /// The one "waiting on you" predicate. Go to pane's Needs attention group,
     /// the fleet board and the navigator counts all call this.
-    static func needsAttention(phase: AgentPhase, approvals: Int, programState: String?) -> Bool {
-        approvals > 0 || phase == .needsInput || programState == "blocked" || programState == "error"
+    /// A finished turn, "Done", a clean exit and idle are not attention; a
+    /// non-zero exit is.
+    static func needsAttention(phase: AgentPhase, approvals: Int, programState: String?, failedExit: Bool = false) -> Bool {
+        approvals > 0 || phase == .needsInput || programState == "blocked" || programState == "error" || failedExit
     }
 
     /// Waiting wins over a lost connection: a reconnecting pane whose replayed
     /// state is waiting still waits on the user. A pane still connecting for
     /// the first time is idle, not disconnected.
     static func paneStatus(phase: AgentPhase, approvals: Int, programState: String?,
-                           connection: PaneConnectionState) -> PaneStatus {
-        if needsAttention(phase: phase, approvals: approvals, programState: programState) { return .waiting }
+                           connection: PaneConnectionState, failedExit: Bool = false) -> PaneStatus {
+        if needsAttention(phase: phase, approvals: approvals, programState: programState, failedExit: failedExit) { return .waiting }
         switch connection {
-        case .disconnected, .reconnecting, .waitingForNetwork: return .disconnected
+        case .disconnected: return .disconnected
+        case .reconnecting, .waitingForNetwork: return .reconnecting
         case .connecting, .connected: break
         }
-        if phase == .exited { return .disconnected }
+        // A clean exit is finished work, not a lost connection; a failed one
+        // already returned .waiting.
+        if phase == .exited { return .idle }
         if phase == .active || programState == "working" { return .running }
         return .idle
     }
@@ -81,18 +90,19 @@ extension RelayWorkOverviewIndex {
     }
 
     struct PaneCounts: Equatable, Sendable {
-        var waiting = 0, disconnected = 0, running = 0, idle = 0
+        var waiting = 0, disconnected = 0, reconnecting = 0, running = 0, idle = 0
         init(_ facts: [PaneFact] = []) {
             for fact in facts { self[fact.status] += 1 }
         }
-        init(waiting: Int, disconnected: Int, running: Int, idle: Int) {
-            (self.waiting, self.disconnected, self.running, self.idle) = (waiting, disconnected, running, idle)
+        init(waiting: Int, disconnected: Int, reconnecting: Int = 0, running: Int, idle: Int) {
+            (self.waiting, self.disconnected, self.reconnecting, self.running, self.idle) = (waiting, disconnected, reconnecting, running, idle)
         }
         subscript(status: PaneStatus) -> Int {
             get {
                 switch status {
                 case .waiting: waiting
                 case .disconnected: disconnected
+                case .reconnecting: reconnecting
                 case .running: running
                 case .idle: idle
                 }
@@ -101,12 +111,13 @@ extension RelayWorkOverviewIndex {
                 switch status {
                 case .waiting: waiting = newValue
                 case .disconnected: disconnected = newValue
+                case .reconnecting: reconnecting = newValue
                 case .running: running = newValue
                 case .idle: idle = newValue
                 }
             }
         }
-        var total: Int { waiting + disconnected + running + idle }
+        var total: Int { waiting + disconnected + reconnecting + running + idle }
     }
 
     /// Every terminal pane in every tab and workspace, Mac and remote, from published
@@ -130,16 +141,17 @@ extension RelayWorkOverviewIndex {
                                     tabName: String, hidden: Bool) -> PaneFact {
         let report = mostUrgentProgramState(pane.programStatus.records.map(\.state))
         let reportCurrent = pane.connectionState == .connected && pane.programStatus.revision != nil
+        let failedExit = WorkspaceModel.failedExitStatus(pane)
         let status = paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
-                                programState: report, connection: pane.connectionState)
+                                programState: report, connection: pane.connectionState, failedExit: failedExit != nil)
         // A lost connection names itself (disconnecting also marks the phase
         // exited); a pane whose session ended while connected says Exited.
-        let connectionLost = switch pane.connectionState {
-        case .disconnected, .reconnecting, .waitingForNetwork: true
-        case .connecting, .connected: false
-        }
-        let detail = status == .disconnected
-            ? (!connectionLost && pane.phase == .exited ? PaneDisplayState.exited.label : pane.connectionStatusLabel)
+        let detail = status == .waiting && pane.phase == .exited && pane.pendingAgentApprovals == 0 && failedExit != nil
+            ? "Exited with status \(failedExit ?? 0)"
+            : status == .disconnected || status == .reconnecting
+            ? pane.connectionStatusLabel
+            : status == .idle && pane.phase == .exited
+            ? PaneDisplayState.exited.label
             : paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
                          programState: report, programReportCurrent: reportCurrent)
         let changedAt = [pane.agentActivities.last?.occurredAt, pane.lastCompletedAgentTurn].compactMap { $0 }.max()
@@ -233,8 +245,17 @@ enum RelayFleetFilter: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// "Disconnected" also lists panes whose connection is coming back.
+    var statuses: [RelayWorkOverviewIndex.PaneStatus] {
+        switch self {
+        case .all: []
+        case .disconnected: [.disconnected, .reconnecting]
+        default: status.map { [$0] } ?? []
+        }
+    }
+
     func includes(_ fact: RelayWorkOverviewIndex.PaneFact) -> Bool {
-        status.map { fact.status == $0 } ?? true
+        self == .all || statuses.contains(fact.status)
     }
 
     /// Opening from the counts shows what is waiting when anything is.
@@ -280,7 +301,7 @@ struct RelayFleetBoardHeader: View {
     }
 
     private func count(_ option: RelayFleetFilter) -> Int {
-        option.status.map { counts[$0] } ?? counts.total
+        option == .all ? counts.total : option.statuses.reduce(0) { $0 + counts[$1] }
     }
 
     private func chip(_ option: RelayFleetFilter) -> some View {
@@ -424,10 +445,16 @@ struct RelayFleetCountsButton: View {
                 if segments.isEmpty {
                     part("All quiet", status: .idle)
                 } else {
-                    // Full words when they fit, else counts beside their symbols.
+                    // Always labelled ("2 waiting · 2 disconnected · 3 running"),
+                    // on one line: smaller type first, then the least urgent
+                    // segments fold into "+N" (the tooltip names them all).
                     ViewThatFits(in: .horizontal) {
-                        segmentRow(segments, words: true)
-                        segmentRow(segments, words: false)
+                        segmentRow(segments, small: false)
+                        segmentRow(segments, small: true)
+                        ForEach(Array((1 ..< segments.count).reversed()), id: \.self) { shown in
+                            segmentRow(Array(segments.prefix(shown)), small: true,
+                                       more: segments.dropFirst(shown).reduce(0) { $0 + counts[$1] })
+                        }
                     }
                 }
                 Spacer(minLength: 0)
@@ -449,13 +476,14 @@ struct RelayFleetCountsButton: View {
 
     /// The board's order: waiting, disconnected, running; empty ones hidden.
     static func segments(_ counts: RelayWorkOverviewIndex.PaneCounts) -> [RelayWorkOverviewIndex.PaneStatus] {
-        [.waiting, .disconnected, .running].filter { counts[$0] > 0 }
+        [.waiting, .disconnected, .reconnecting, .running].filter { counts[$0] > 0 }
     }
 
     static func shortLabel(_ status: RelayWorkOverviewIndex.PaneStatus, _ count: Int) -> String {
         switch status {
         case .waiting: "\(count) waiting"
         case .disconnected: "\(count) disconnected"
+        case .reconnecting: "\(count) reconnecting"
         case .running: "\(count) running"
         case .idle: "\(count) idle"
         }
@@ -468,20 +496,23 @@ struct RelayFleetCountsButton: View {
             .joined(separator: ", ")
     }
 
-    private func segmentRow(_ segments: [RelayWorkOverviewIndex.PaneStatus], words: Bool) -> some View {
+    private func segmentRow(_ segments: [RelayWorkOverviewIndex.PaneStatus], small: Bool, more: Int = 0) -> some View {
         HStack(spacing: RelayTheme.Space.sm) {
             ForEach(Array(segments.enumerated()), id: \.element) { index, status in
                 if index > 0 { Text("·").foregroundStyle(RelayTheme.textMuted) }
-                part(words ? Self.shortLabel(status, counts[status]) : "\(counts[status])", status: status)
+                part(Self.shortLabel(status, counts[status]), status: status)
             }
+            if more > 0 { Text("· +\(more)").foregroundStyle(RelayTheme.textMuted) }
         }
+        .font(small ? RelayTheme.TextRole.micro.font : RelayTheme.TextRole.caption.font)
+        .lineLimit(1)
         .fixedSize()
     }
 
     private func part(_ text: String, status: RelayWorkOverviewIndex.PaneStatus) -> some View {
         HStack(spacing: RelayTheme.Space.xs) {
             Image(systemName: status.role.symbol).imageScale(.small).foregroundStyle(status.role.color)
-            Text(text).monospacedDigit().foregroundStyle(status == .idle ? RelayTheme.textMuted : RelayTheme.text)
+            Text(text).monospacedDigit().lineLimit(1).foregroundStyle(status == .idle ? RelayTheme.textMuted : RelayTheme.text)
         }
     }
 }
@@ -526,6 +557,56 @@ struct RelayFleetBoard: View {
         .relaySurface()
         .onExitCommand { workspace.isFleetBoardPresented = false }
         .accessibilityIdentifier("relay.fleet.board")
+    }
+}
+
+// MARK: - Finished, not yet seen
+
+/// A calm accent dot (info role, not a wait): an agent finished a turn or a
+/// program reported done while the pane was out of sight. It is the store's
+/// unread "done" marker, set only when nobody was looking and cleared when the
+/// user views the pane. It never counts toward waiting.
+struct RelayFinishedDot: View {
+    let paneIDs: [UUID]
+    var inbox: AgentIntelligenceStore?
+    @Environment(\.relayInboxStore) private var environmentInbox
+
+    var body: some View { Marker(paneIDs: paneIDs, inbox: inbox ?? environmentInbox) }
+
+    static func unseen(_ paneIDs: [UUID], inbox: AgentIntelligenceStore) -> Int {
+        paneIDs.filter { inbox.marker(for: $0) == .done }.count
+    }
+
+    static func label(_ count: Int) -> String {
+        count > 1 ? "\(count) panes finished, not yet seen" : "Finished, not yet seen"
+    }
+
+    private struct Marker: View {
+        let paneIDs: [UUID]
+        @ObservedObject var inbox: AgentIntelligenceStore
+
+        var body: some View {
+            let count = RelayFinishedDot.unseen(paneIDs, inbox: inbox)
+            if count > 0 {
+                Circle().fill(RelayTheme.StatusRole.info.color)
+                    .frame(width: 6, height: 6)
+                    .help(RelayFinishedDot.label(count))
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(RelayFinishedDot.label(count))
+            }
+        }
+    }
+}
+
+private struct RelayInboxStoreKey: EnvironmentKey {
+    static var defaultValue: AgentIntelligenceStore { MainActor.assumeIsolated { .shared } }
+}
+
+extension EnvironmentValues {
+    /// The inbox the finished-dot reads; tests inject a private store.
+    var relayInboxStore: AgentIntelligenceStore {
+        get { self[RelayInboxStoreKey.self] }
+        set { self[RelayInboxStoreKey.self] = newValue }
     }
 }
 
