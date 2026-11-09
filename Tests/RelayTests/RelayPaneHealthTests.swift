@@ -22,8 +22,9 @@ private let healthPaneID = "0e426bf7-58ab-4e0b-a521-b2400a8989aa"
     let workspace = WorkspaceModel(restoreSavedWorkspace: false)
     let pane = try #require(workspace.activePaneID.flatMap { workspace.panes[$0] })
     pane.connected()
-    pane.exited()
-    #expect(pane.remoteExitCode == nil)
+    // relayd's exit status always carries a code (TerminalRuntime passes ?? 0).
+    pane.exited(exitCode: 0)
+    #expect(pane.remoteExitCode == 0)
     #expect(pane.phase == .exited)
     let coordinator = RelayPaneHealthCoordinator(url: FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString).appendingPathComponent("journal.json"))

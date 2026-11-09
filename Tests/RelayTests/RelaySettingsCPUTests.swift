@@ -387,7 +387,7 @@ func hostSummariesMatchSnapshot() throws {
     coordinator.observe(pane, proof: RelayAgentMaintenanceProbe(version: 1, unavailable: "Owned unavailable proof"), now: now)
     #expect(try matches(now).freshObservations == 1)
     #expect(try matches(now.addingTimeInterval(301)).freshObservations == 0)
-    pane.exited()
+    pane.exited(exitCode: 0)
     #expect(try matches(now).endedPanes == 1)
 }
 
@@ -669,7 +669,7 @@ func hostOverviewsMatchSnapshot() throws {
     let stale = try matches(now.addingTimeInterval(301))
     #expect(stale.livePanes.first?.observationState == "stale")
     #expect(stale.livePanes.first?.worker == nil && stale.livePanes.first?.context == nil)
-    pane.exited()
+    pane.exited(exitCode: 0)
     #expect(try matches(now).livePanes.first?.observationState == "exited")
 }
 

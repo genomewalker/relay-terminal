@@ -686,13 +686,11 @@ final class PaneModel: ObservableObject, Identifiable {
     /// The pane's program ended, as opposed to Relay losing its connection.
     /// `disconnected()` also marks the agent phase exited, so
     /// `phase == .exited` alone cannot tell the two apart: a lost transport
-    /// may leave the program running in its retained worker.
-    var programExited: Bool {
-        if remoteExitCode != nil { return true }
-        guard phase == .exited else { return false }
-        if case .disconnected = connectionState { return false }
-        return true
-    }
+    /// may leave the program running in its retained worker. The exit code
+    /// is relayd's report of the exit (always set by the exit status) and is
+    /// cleared only by an attach, so neither late output, which can reset the
+    /// phase, nor a reattach, which does not, misreports it.
+    var programExited: Bool { remoteExitCode != nil }
     /// Set when the program ended quickly or with a failure status; the pane
     /// shows a danger banner instead of the session-ended notice.
     @Published private(set) var exitNotice: PaneExitNotice?
