@@ -12,6 +12,8 @@ struct RelayAgentMessageView: View {
     @ObservedObject var pane: PaneModel
     let item: RelayAgentConversationItem
     var artifactBaseDirectory: String? = nil
+    /// True when this item is an unanswered call that is the conversation's current step.
+    var live = false
 
     var body: some View {
         switch item.role {
@@ -49,7 +51,7 @@ struct RelayAgentMessageView: View {
                     }
                 }
             case .tool(let name, let status, let summary):
-                RelayAgentToolRow(axID: axID, name: name, status: status, summary: summary)
+                RelayAgentToolRow(axID: axID, name: name, status: status, summary: summary, live: live)
             case .code(let language, let source):
                 RelayAgentCodeBlock(axID: axID, language: language, source: source)
             case .equation(let source):
@@ -332,51 +334,56 @@ struct RelayAgentCodeBlock: View {
 
 // MARK: - Tools
 
-/// A tool call as one quiet row; its output opens below in a bounded scroller.
+/// A tool call as one quiet row: name and argument summary, a state that never
+/// relies on colour alone, and bounded output below.
 struct RelayAgentToolRow: View {
     let axID: String
-    let name: String
     let status: String
     let summary: String
-    @State private var open = false
-    private var failed: Bool { ["error", "failed", "failure", "rejected", "denied"].contains(status.lowercased()) }
-    private var running: Bool { ["started", "running", "in_progress", "inprogress", "pending"].contains(status.lowercased()) }
+    private let state: RelayToolState
+    private let presentation: RelayToolPresentation
+    @State private var open: Bool
+
+    init(axID: String, name: String, status: String, summary: String, live: Bool = false) {
+        self.axID = axID; self.status = status; self.summary = summary
+        let state = RelayToolState(status: status, live: live)
+        let presentation = RelayToolPresentation(tool: name, status: status, text: summary)
+        self.state = state; self.presentation = presentation
+        // Failures and edits are what the reader needs to see; other output waits for a click.
+        _open = State(initialValue: state == .failed || presentation.isDiff)
+    }
+    /// The first output line, for calls whose title carries no argument summary.
     private var headline: String {
+        guard presentation.title == presentation.name else { return "" }
         let first = summary.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
-        return String(first.trimmingCharacters(in: .whitespaces).prefix(120))
+        return String(RelayToolPresentation.expandTabs(first).trimmingCharacters(in: .whitespaces).prefix(120))
     }
     var body: some View {
         RelayAgentDisclosureRow(axID: axID, open: $open) {
             HStack(spacing: RelayTheme.spacing(6)) {
-                if running { ProgressView().controlSize(.mini).frame(width: 12, height: 12) }
-                else {
-                    Image(systemName: failed ? "xmark.circle" : "wrench.and.screwdriver")
-                        .font(RelayTheme.font(size: 10)).frame(width: 12)
-                        .foregroundStyle(failed ? RelayAgentDesign.failureInk : RelayAgentDesign.tertiaryInk)
-                }
-                Text(name).font(RelayAgentDesign.label).foregroundStyle(Color.primary.opacity(0.8)).lineLimit(1)
-                Text(status == "inProgress" ? "Running" : status.capitalized)
-                    .font(RelayAgentDesign.meta).foregroundStyle(failed ? RelayAgentDesign.failureInk : RelayAgentDesign.tertiaryInk)
-                    .lineLimit(1)
+                Image(systemName: "wrench.and.screwdriver")
+                    .font(RelayTheme.font(size: 10)).frame(width: 12)
+                    .foregroundStyle(RelayAgentDesign.tertiaryInk)
+                    .accessibilityHidden(true)
+                Text(presentation.title).font(RelayAgentDesign.label).foregroundStyle(Color.primary.opacity(0.8))
+                    .lineLimit(1).truncationMode(.middle)
+                RelayToolStateBadge(state: state)
                 if !headline.isEmpty {
                     Text(headline).font(RelayAgentDesign.mono).foregroundStyle(RelayAgentDesign.tertiaryInk).lineLimit(1)
                         .truncationMode(.tail)
                 }
             }
         } detail: {
-            ScrollView {
-                Text(summary.isEmpty ? "No output recorded." : summary)
-                    .font(RelayAgentDesign.mono).lineSpacing(RelayAgentDesign.monoLineSpacing)
-                    .foregroundStyle(failed ? RelayAgentDesign.failureInk : RelayAgentDesign.secondaryInk)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(RelayTheme.spacing(10))
+            if presentation.lines.isEmpty {
+                Text("No output recorded.").font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.tertiaryInk)
+            } else {
+                RelayToolOutputView(axID: axID, presentation: presentation, failed: state == .failed)
+                    .overlay(alignment: .leading) {
+                        if state == .failed { Rectangle().fill(state.role.color).frame(width: 2) }
+                    }
             }
-            .frame(maxHeight: 288)
-            .fixedSize(horizontal: false, vertical: true)
-            .background(RelayAgentDesign.codeFill, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)))
         }
-        .accessibilityLabel(headline.isEmpty ? "Tool \(name), \(status)" : "Tool \(name), \(status): \(headline)")
+        .accessibilityLabel(presentation.title + ", " + state.spoken + (headline.isEmpty ? "" : ": " + headline))
     }
 }
 

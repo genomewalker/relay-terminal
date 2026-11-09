@@ -49,7 +49,15 @@ private struct RelayConversationSnapshot: Decodable {
     private var refreshPending = false
     private(set) var rootPID = 0
     var visible = true
-    init(pane: PaneModel) { self.pane = pane }
+    /// False for offline presentation (previews, snapshot tests): never reads the host.
+    let live: Bool
+    init(pane: PaneModel) { self.pane = pane; live = true }
+    /// Presents an already-read conversation without connecting to the host.
+    init(pane: PaneModel, presenting conversation: RelayAgentConversation, failure: String? = nil) {
+        self.pane = pane; live = false
+        self.conversation = conversation; self.failure = failure
+        updatedAt = conversation.binding == nil ? nil : Date()
+    }
     func stop() { visible = false; generation = UUID() }
 
     func showOlder() async {
@@ -68,7 +76,7 @@ private struct RelayConversationSnapshot: Decodable {
     }
     @discardableResult
     func refresh() async -> Bool {
-        guard visible, let pane else { return false }
+        guard live, visible, let pane else { return false }
         if busy { refreshPending = true; return false }
         let token = generation
         let profile = pane.profile
@@ -173,8 +181,8 @@ struct RelayAgentTimelineView: View {
     @State private var currentMatch: String?
     @State private var searchJump = 0
     @FocusState private var searchFocused: Bool
-    init(pane: PaneModel) {
-        self.pane = pane; _store = StateObject(wrappedValue: RelayAgentTimelineStore(pane: pane))
+    init(pane: PaneModel, store: RelayAgentTimelineStore? = nil) {
+        self.pane = pane; _store = StateObject(wrappedValue: store ?? RelayAgentTimelineStore(pane: pane))
         _composerState = ObservedObject(wrappedValue: pane.composerState)
         _attachmentQueue = ObservedObject(wrappedValue: pane.composerState.attachmentQueue)
     }
@@ -300,6 +308,10 @@ struct RelayAgentTimelineView: View {
                 .font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.tertiaryInk).lineLimit(1)
             }
             Spacer(minLength: 8)
+            if pane.phase == .active, let status = pane.headerStatus {
+                RelayTimelineActivity(status: status.text, detail: pane.headerActivityDetail,
+                                      since: pane.agentActivities.last?.occurredAt)
+            }
             if let date = store.updatedAt {
                 Text(date, style: .time).font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.tertiaryInk)
                     .help("Last read from the provider transcript")
@@ -334,9 +346,15 @@ struct RelayAgentTimelineView: View {
 
     @ViewBuilder private var content: some View {
         if let error = store.failure {
-            stateView(symbol: "link.badge.plus", title: "Not bound to a conversation", detail: error,
-                      note: "Relay binds only to the exact provider session of this pane's process. The terminal is unaffected.",
-                      retry: true)
+            let shown = RelayConversationErrorText.userFacing(error)
+            if let raw = shown.detail {
+                stateView(symbol: "exclamationmark.triangle", title: "Conversation not loaded", detail: shown.message,
+                          note: nil, retry: true, rawDetail: raw)
+            } else {
+                stateView(symbol: "link.badge.plus", title: "Not bound to a conversation", detail: error,
+                          note: "Relay binds only to the exact provider session of this pane's process. The terminal is unaffected.",
+                          retry: true)
+            }
         } else if store.conversation.binding == nil {
             if store.busy {
                 VStack(spacing: RelayTheme.spacing(10)) {
@@ -354,7 +372,8 @@ struct RelayAgentTimelineView: View {
         }
     }
 
-    private func stateView(symbol: String, title: String, detail: String?, note: String?, retry: Bool) -> some View {
+    private func stateView(symbol: String, title: String, detail: String?, note: String?, retry: Bool,
+                           rawDetail: String? = nil) -> some View {
         VStack(spacing: RelayTheme.spacing(8)) {
             Image(systemName: symbol).font(RelayTheme.font(size: 22, weight: .light)).foregroundStyle(RelayAgentDesign.tertiaryInk)
             Text(title).font(RelayTheme.font(size: 13, weight: .semibold))
@@ -365,6 +384,7 @@ struct RelayAgentTimelineView: View {
             if let note {
                 Text(note).font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.tertiaryInk).multilineTextAlignment(.center)
             }
+            if let rawDetail { RelayErrorDetails(raw: rawDetail) }
             if retry {
                 Button("Try again") { Task { await store.refresh() } }
                     .buttonStyle(RelayAgentPrimaryButtonStyle()).disabled(store.busy).padding(.top, RelayTheme.spacing(4))
@@ -381,6 +401,15 @@ struct RelayAgentTimelineView: View {
         store.conversation.items.suffix(4).map(\.revision) + [UInt64(store.conversation.items.count)]
     }
 
+    /// Unanswered trailing calls while the pane's agent is working.
+    private var liveToolIndices: Set<Int> {
+        let statuses = store.conversation.items.map { item -> String? in
+            guard item.role == .tool, case .tool(_, let status, _)? = item.blocks.first else { return nil }
+            return status
+        }
+        return RelayToolPresentation.liveIndices(statuses: statuses, active: pane.phase == .active && !store.historical)
+    }
+
     private var transcript: some View {
         GeometryReader { viewport in
             ScrollViewReader { proxy in
@@ -391,8 +420,9 @@ struct RelayAgentTimelineView: View {
                     // variable-height transcript rows on first presentation.
                     VStack(alignment: .leading, spacing: RelayTheme.spacing(12)) {
                         notices
+                        let live = liveToolIndices
                         ForEach(Array(store.conversation.items.enumerated()), id: \.element.id) { index, item in
-                            RelayAgentMessageView(pane: pane, item: item)
+                            RelayAgentMessageView(pane: pane, item: item, live: live.contains(index))
                                 .background(searchMark(for: item.id))
                                 .padding(.top, item.role == .user && index > 0
                                     ? max(0, RelayAgentDesign.turnSpacing - RelayTheme.spacing(12)) : 0)
@@ -866,6 +896,45 @@ struct RelayAgentTimelineView: View {
             for item in attachmentQueue.attachments { attachmentQueue.remove(item.id) }
             submissionStatus = "Submitted once. Waiting for a completed turn; reconnect never resends it."
         }
+    }
+}
+
+/// "Working · Using Bash · 12 s" beside the header; elapsed counts from the
+/// pane's latest activity event.
+private struct RelayTimelineActivity: View {
+    let status: String
+    let detail: String?
+    let since: Date?
+    var body: some View {
+        HStack(spacing: RelayTheme.spacing(5)) {
+            ProgressView().controlSize(.mini).frame(width: 12, height: 12)
+            TimelineView(.periodic(from: since ?? Date(), by: 1)) { context in
+                Text(([status] + [detail, since.map { RelayToolPresentation.elapsed(context.date.timeIntervalSince($0)) }]
+                    .compactMap { $0 }).joined(separator: " · "))
+                    .monospacedDigit()
+            }
+        }
+        .font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.secondaryInk).lineLimit(1)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("relay.agent.activity")
+    }
+}
+
+/// The raw diagnostic behind a plain error sentence, kept selectable for support.
+struct RelayErrorDetails: View {
+    let raw: String
+    @State private var open = false
+    var body: some View {
+        VStack(spacing: RelayTheme.spacing(4)) {
+            Button(open ? "Hide details" : "Details") { open.toggle() }
+                .buttonStyle(RelayAgentQuietButtonStyle())
+                .accessibilityIdentifier("relay.agent.error-details")
+            if open {
+                Text(raw).font(RelayAgentDesign.mono).foregroundStyle(RelayAgentDesign.secondaryInk)
+                    .textSelection(.enabled).multilineTextAlignment(.leading)
+            }
+        }
+        .help(raw)
     }
 }
 
