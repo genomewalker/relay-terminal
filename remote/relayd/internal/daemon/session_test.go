@@ -662,6 +662,31 @@ func TestEnvironmentOverridesReplaceHotPathVariables(t *testing.T) {
 	}
 }
 
+// A pane opened from inside another pane inherits that pane's identity
+// variables; the new pane must export only its own id under both names.
+func TestSessionEnvironmentExportsOwnPaneID(t *testing.T) {
+	const pane = "57c1dd5b-f283-4933-834b-d01625280261"
+	const parent = "0e3d2a1c-0000-4000-8000-000000000001"
+	environment := sessionEnvironment([]string{
+		"HOME=/home/user", "RELAY_PANE_ID=" + parent, "RELAY_SESSION=" + parent, "PATH=/usr/bin",
+	}, pane, "/shims")
+	counts := make(map[string]int)
+	values := make(map[string]string)
+	for _, entry := range environment {
+		name, value, _ := strings.Cut(entry, "=")
+		counts[name]++
+		values[name] = value
+	}
+	for _, name := range []string{"RELAY_PANE_ID", "RELAY_SESSION"} {
+		if counts[name] != 1 || values[name] != pane {
+			t.Fatalf("%s: count %d value %q, want exactly one %q in %q", name, counts[name], values[name], pane, environment)
+		}
+	}
+	if values["HOME"] != "/home/user" {
+		t.Fatalf("unrelated variable lost: %q", environment)
+	}
+}
+
 func TestBashIntegrationKeepsRelayShimsAheadOfUserPathChanges(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {

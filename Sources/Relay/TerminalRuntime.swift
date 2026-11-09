@@ -2119,6 +2119,17 @@ final class TerminalRuntime: NSObject {
         ])
     }
 
+    /// Environment for a pane Ghostty executes directly. RELAY_PANE_ID uses the
+    /// same lowercase form relayd exports for relay-backed panes, and always
+    /// replaces a value inherited from the pane that launched Relay.
+    nonisolated static func directExecEnvironment(paneID: UUID?, base: [String: String]) -> [String: String] {
+        var environment = base
+        environment["RELAY_PANE_ID"] = paneID?.uuidString.lowercased() ?? ""
+        environment["COLORTERM"] = "truecolor"
+        environment["TERM_PROGRAM"] = "relay"
+        return environment
+    }
+
     private func makeView() -> RelayGhosttyView {
         let terminal = RelayGhosttyView(frame: .zero)
         terminal.owner = self
@@ -2130,13 +2141,9 @@ final class TerminalRuntime: NSObject {
                 resizeThrottleMilliseconds: 16
             )
         } else {
-            var environment = RelayTerminfo.sessionEnvironment
-            environment["RELAY_PANE_ID"] = pane?.id.uuidString ?? ""
-            environment["COLORTERM"] = "truecolor"
-            environment["TERM_PROGRAM"] = "relay"
             terminal.configuration = TerminalSurfaceOptions(
                 backend: .exec,
-                envVars: environment,
+                envVars: Self.directExecEnvironment(paneID: pane?.id, base: RelayTerminfo.sessionEnvironment),
                 command: directCommand(),
                 waitAfterCommand: true,
                 context: .window
