@@ -778,14 +778,21 @@ private enum WorkspaceNamingRequest: Identifiable {
                         ForEach(Array(stack.members.enumerated()), id: \.element) { index, id in
                             if let pane = workspace.panes[id] {
                                 Button { workspace.organization.navigate(to: .pane(id)) } label: {
-                                    Text(pane.customName ?? pane.title).font(RelayTheme.font(size: 10, weight: id == stack.selected ? .semibold : .regular))
+                                    HStack(spacing: 4) {
+                                        if let status = pane.headerStatus {
+                                            Image(systemName: status.role.symbol).imageScale(.small)
+                                                .foregroundStyle(status.role == .neutral ? RelayTheme.textFaint : status.role.color)
+                                        }
+                                        Text(pane.customName ?? pane.title).font(RelayTheme.font(size: 10, weight: id == stack.selected ? .semibold : .regular))
+                                    }
                                         .lineLimit(1).frame(maxWidth: 175).padding(.horizontal, 9).frame(height: 26)
                                         .background(id == stack.selected ? RelayTheme.accent.opacity(0.15) : .clear, in: RoundedRectangle(cornerRadius: 4))
                                 }
                                 .buttonStyle(.plain)
                                 .foregroundStyle(id == stack.selected ? RelayTheme.text : RelayTheme.textMuted)
                                 .onDrag { WorkspaceDragPayload.paneProvider(id) }
-                                .accessibilityLabel("\(pane.customName ?? pane.title), stack tab \(index + 1) of \(stack.members.count)")
+                                .help(pane.statusTooltip)
+                                .accessibilityLabel("\(pane.statusTooltip), stack tab \(index + 1) of \(stack.members.count)")
                                 .accessibilityAddTraits(id == stack.selected ? .isSelected : [])
                                 .accessibilityIdentifier("relay.stack.member.\(id.uuidString.lowercased())")
                                 .contextMenu {

@@ -5030,13 +5030,26 @@ struct ConnectionPath: View {
                     .foregroundStyle(.orange).lineLimit(1)
                     .help(inputMessage).accessibilityLabel("Typing paused. " + inputMessage)
             }
-            Text(PaneHeaderName.visible(pane.displayName))
-                .font(RelayTheme.font(size: 11.5, weight: .medium))
-                .lineLimit(1)
-                .layoutPriority(3)
-                .help(pane.displayName + " · " + pane.id.uuidString.lowercased())
-                .accessibilityLabel("Pane " + pane.displayName)
-                .onTapGesture(count: 2) { rename?() }
+            let nameParts = PaneHeaderName.parts(pane.displayName)
+            HStack(spacing: RelayTheme.spacing(5)) {
+                Text(nameParts.name)
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                if let id = nameParts.id {
+                    Text(id)
+                        .font(RelayTheme.font(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .layoutPriority(2)
+                }
+            }
+            .layoutPriority(3)
+            .help(pane.displayName + " · " + pane.id.uuidString.lowercased())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Pane " + pane.displayName)
+            .onTapGesture(count: 2) { rename?() }
             if pane.profile.kind == .ssh, pane.displayName != pane.profile.host {
                 droppable {
                     Text(pane.profile.host)
@@ -5093,6 +5106,16 @@ struct ConnectionPath: View {
                 }
             }
             Spacer(minLength: 8)
+            if let detail = pane.headerActivityDetail {
+                droppable {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .lineLimit(1)
+                        .help(detail)
+                }
+                .layoutPriority(-1)
+            }
             if let status = headerStatus {
                 RelayBadge(status.text, role: status.role)
                     .fixedSize()
@@ -5223,34 +5246,9 @@ struct ConnectionPath: View {
         linkSelection.paneIDs.contains(pane.id) || !linkSelection.memberships(for: pane.id).isEmpty
     }
 
-    private var connectionNormal: Bool {
-        pane.connectionState == .connected && pane.connectionStatusLabel == "Connected"
-    }
+    private var connectionNormal: Bool { pane.connectionIsNormal }
 
-    /// The one status shown for the pane, with its role colour and symbol. A
-    /// connection problem takes precedence; otherwise program-reported status
-    /// (its own badge) or the agent's phase.
-    private var headerStatus: (text: String, role: RelayTheme.StatusRole)? {
-        if !connectionNormal {
-            let role: RelayTheme.StatusRole
-            switch pane.connectionState {
-            case .reconnecting, .waitingForNetwork: role = .warning
-            case .disconnected: role = .danger
-            case .connecting: role = .info
-            case .connected: role = pane.phase == .exited ? .danger : .info
-            }
-            return (pane.connectionStatusLabel, role)
-        }
-        guard pane.contentKind == .terminal, pane.kind != .shell, pane.programStatus.records.isEmpty else { return nil }
-        let role: RelayTheme.StatusRole
-        switch pane.phase {
-        case .connecting, .active: role = .info
-        case .quiet: role = .neutral
-        case .needsInput: role = .warning
-        case .exited: role = .danger
-        }
-        return (AgentLabelFormatter.activity(pane.activitySummary), role)
-    }
+    private var headerStatus: (text: String, role: RelayTheme.StatusRole)? { pane.headerStatus }
 
     /// Secondary pane actions in one keyboard-reachable menu so the name keeps its width.
     private var overflowMenu: some View {

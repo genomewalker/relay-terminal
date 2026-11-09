@@ -5,8 +5,10 @@ import Testing
 
 @Suite("Pane header name") struct PaneHeaderNameTests {
     @Test func hidesOnlyTheAgentAndSixHexSuffix() {
-        #expect(PaneHeaderName.visible("Sapropel - annotation jobs - claude 767dc7") == "Sapropel - annotation jobs")
-        #expect(PaneHeaderName.visible("annotation jobs Codex 0a1b2c") == "annotation jobs")
+        let a = PaneHeaderName.parts("Sapropel - annotation jobs - claude 767dc7")
+        #expect(a.name == "Sapropel - annotation jobs" && a.id == "767dc7")
+        let b = PaneHeaderName.parts("annotation jobs Codex 0a1b2c")
+        #expect(b.name == "annotation jobs" && b.id == "0a1b2c")
     }
 
     @Test func leavesUserChosenNamesAlone() {
@@ -18,7 +20,8 @@ import Testing
                      "Sapropel - build 767dc7",
                      "Sapropel claude 767dc7 notes",        // not trailing
                      "annotation jobs", "dandy-07", ""] {
-            #expect(PaneHeaderName.visible(name) == name, "\(name)")
+            let parts = PaneHeaderName.parts(name)
+            #expect(parts.name == name && parts.id == nil, "\(name)")
         }
     }
 }
@@ -30,7 +33,7 @@ import Testing
     private func pane(name: String, kind: AgentKind, phase: AgentPhase, summary: String,
                       state: PaneConnectionState = .connected, account: String? = nil) -> PaneModel {
         let saved = PersistedAgentPaneState(cursor: 0, kind: kind, phase: phase, summary: summary, subagents: [],
-                                            activities: [], resourceUsage: nil, progressPercent: nil, pendingApprovals: 0)
+                                            activities: [AgentActivityItem(id: UUID(), label: summary, phase: phase, occurredAt: Date())], resourceUsage: nil, progressPercent: nil, pendingApprovals: 0)
         let pane = PaneModel(profile: Self.host, customName: name, directory: "/projects/sapropel", savedAgentState: saved)
         pane.connectionState = state
         if let account { pane.recordAgentAccount(RelayAgentAccount(provider: kind.rawValue, label: account, dir: "~/.\(kind.rawValue)-\(account)")) }
@@ -42,6 +45,8 @@ import Testing
                               summary: "Subagent finished", account: "business")),
          ("codex-waiting", pane(name: "Sapropel - read mapping - codex 1f3a9c", kind: .codex, phase: .needsInput,
                                 summary: "Waiting for approval")),
+         ("claude-working", pane(name: "Sapropel - annotation jobs - claude 767dc7", kind: .claude, phase: .active,
+                                 summary: "Using Bash", account: "business")),
          ("reconnecting", pane(name: "Sapropel - annotation jobs - claude 767dc7", kind: .claude, phase: .active,
                                summary: "Working", state: .reconnecting("link"), account: "business")),
          ("exited", pane(name: "Sapropel - annotation jobs - claude 767dc7", kind: .claude, phase: .exited,
@@ -65,6 +70,6 @@ import Testing
                 }
             }
         }
-        #expect(rendered == 16)
+        #expect(rendered == 20)
     }
 }
