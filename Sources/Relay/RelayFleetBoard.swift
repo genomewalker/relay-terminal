@@ -35,16 +35,18 @@ extension RelayWorkOverviewIndex {
 
     /// The one "waiting on you" predicate. Go to pane's Needs attention group,
     /// the fleet board and the navigator counts all call this.
-    static func needsAttention(phase: AgentPhase, approvals: Int, programState: String?) -> Bool {
-        approvals > 0 || phase == .needsInput || programState == "blocked" || programState == "error"
+    /// A finished turn, "Done", a clean exit and idle are not attention; a
+    /// non-zero exit is.
+    static func needsAttention(phase: AgentPhase, approvals: Int, programState: String?, failedExit: Bool = false) -> Bool {
+        approvals > 0 || phase == .needsInput || programState == "blocked" || programState == "error" || failedExit
     }
 
     /// Waiting wins over a lost connection: a reconnecting pane whose replayed
     /// state is waiting still waits on the user. A pane still connecting for
     /// the first time is idle, not disconnected.
     static func paneStatus(phase: AgentPhase, approvals: Int, programState: String?,
-                           connection: PaneConnectionState) -> PaneStatus {
-        if needsAttention(phase: phase, approvals: approvals, programState: programState) { return .waiting }
+                           connection: PaneConnectionState, failedExit: Bool = false) -> PaneStatus {
+        if needsAttention(phase: phase, approvals: approvals, programState: programState, failedExit: failedExit) { return .waiting }
         switch connection {
         case .disconnected, .reconnecting, .waitingForNetwork: return .disconnected
         case .connecting, .connected: break
@@ -130,15 +132,18 @@ extension RelayWorkOverviewIndex {
                                     tabName: String, hidden: Bool) -> PaneFact {
         let report = mostUrgentProgramState(pane.programStatus.records.map(\.state))
         let reportCurrent = pane.connectionState == .connected && pane.programStatus.revision != nil
+        let failedExit = WorkspaceModel.failedExitStatus(pane)
         let status = paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
-                                programState: report, connection: pane.connectionState)
+                                programState: report, connection: pane.connectionState, failedExit: failedExit != nil)
         // A lost connection names itself (disconnecting also marks the phase
         // exited); a pane whose session ended while connected says Exited.
         let connectionLost = switch pane.connectionState {
         case .disconnected, .reconnecting, .waitingForNetwork: true
         case .connecting, .connected: false
         }
-        let detail = status == .disconnected
+        let detail = status == .waiting && pane.phase == .exited && pane.pendingAgentApprovals == 0 && failedExit != nil
+            ? "Exited with status \(failedExit ?? 0)"
+            : status == .disconnected
             ? (!connectionLost && pane.phase == .exited ? PaneDisplayState.exited.label : pane.connectionStatusLabel)
             : paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
                          programState: report, programReportCurrent: reportCurrent)

@@ -19,7 +19,7 @@ import UniformTypeIdentifiers
     @ObservedObject var workspace: WorkspaceModel
     // Attention order follows pane phases (throttled), alerts and drags.
     @ObservedObject private var activityIndex: WorkspaceActivityIndex
-    @ObservedObject private var inbox = AgentIntelligenceStore.shared
+    @ObservedObject private var inbox: AgentIntelligenceStore
     @ObservedObject private var drag = WorkspaceNavigatorDragState.shared
     @ObservedObject private var hold: WorkspaceNavigatorHold
     @State private var query = ""
@@ -28,8 +28,9 @@ import UniformTypeIdentifiers
     @State private var renaming: WorkspaceRecord?
     @State private var pointerInside = false
 
-    init(workspace: WorkspaceModel) {
+    init(workspace: WorkspaceModel, inbox: AgentIntelligenceStore = .shared) {
         self.workspace = workspace
+        _inbox = ObservedObject(wrappedValue: inbox)
         activityIndex = workspace.activityIndex
         hold = workspace.navigatorHoldState
     }
@@ -105,7 +106,7 @@ import UniformTypeIdentifiers
             }
             .padding(.horizontal, 6)
             if workspace.isFocusing {
-                WorkspaceFocusBar(workspace: workspace, inbox: .shared)
+                WorkspaceFocusBar(workspace: workspace, inbox: inbox)
             }
             if let failure {
                 Button { self.failure = nil } label: {
@@ -121,7 +122,7 @@ import UniformTypeIdentifiers
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     if query.isEmpty {
-                        AttentionInboxSection(workspace: workspace, identifier: "relay.navigator.attention-inbox")
+                        AttentionInboxSection(workspace: workspace, inbox: inbox, identifier: "relay.navigator.attention-inbox")
                             .padding(.horizontal, 8)
                     }
                     let pinned = lists.shown.filter { $0.favourite && !$0.isInbox }

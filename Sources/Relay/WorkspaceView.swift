@@ -2006,8 +2006,8 @@ private struct PanePresence: View {
 /// dismissed. The first rows show; the rest behind "Show more".
 struct AttentionInboxSection: View {
     @ObservedObject var workspace: WorkspaceModel
+    @ObservedObject var inbox: AgentIntelligenceStore = .shared
     var identifier = "relay.sidebar.attention-inbox"
-    @ObservedObject private var inbox = AgentIntelligenceStore.shared
 
     var body: some View {
         // Waiting is a pane phase; the activity index redraws on it.
