@@ -87,6 +87,18 @@ struct RelayStatusFollowupTests {
         #expect(f.running.phaseColor == f.running.phase.color)
     }
 
+    @Test("Only a running mark moves, and only when motion is allowed and the window shows")
+    func runningMarkMoves() {
+        typealias Mark = RelayStatusMark
+        #expect(Mark.animates(.running, reduceMotion: false, windowVisible: true))
+        #expect(!Mark.animates(.running, reduceMotion: true, windowVisible: true), "Reduce Motion keeps it still")
+        #expect(!Mark.animates(.running, reduceMotion: false, windowVisible: false), "no drawing for a hidden window")
+        for other: Index.PaneStatus in [.waiting, .failed, .reconnecting, .disconnected, .idle] {
+            #expect(!Mark.animates(other, reduceMotion: false, windowVisible: true), "\(other) stays still")
+        }
+        #expect(!Mark.animates(nil, reduceMotion: false, windowVisible: true))
+    }
+
     @Test("Running uses a waveform, never the reconnecting arrows")
     func runningMark() throws {
         typealias Mark = RelayStatusMark

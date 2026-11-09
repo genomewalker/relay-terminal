@@ -664,6 +664,16 @@ struct RelayStatusMark: View {
         status?.needsUser == true && alert?.needsUser == true ? nil : status
     }
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.relayStatusMarkWindowVisible) private var windowVisible
+
+    /// A running mark moves gently (the waveform's bars light in turn) so a
+    /// working agent stands out from the still marks; it stays still when the
+    /// user asks for reduced motion or the window is not visible.
+    static func animates(_ status: Status?, reduceMotion: Bool, windowVisible: Bool) -> Bool {
+        status == .running && !reduceMotion && windowVisible
+    }
+
     var body: some View {
         if let status, status != .idle {
             Group {
@@ -673,6 +683,8 @@ struct RelayStatusMark: View {
                     Image(systemName: name)
                         .font(RelayTheme.font(size: 10, weight: .semibold))
                         .foregroundStyle(status.role.color)
+                        .symbolEffect(.variableColor.iterative.dimInactiveLayers.nonReversing, options: .repeating,
+                                      isActive: Self.animates(status, reduceMotion: reduceMotion, windowVisible: windowVisible))
                 }
             }
             .frame(width: Self.size, height: Self.size)
@@ -711,8 +723,7 @@ extension View {
 }
 
 /// The shared window visibility view (ordered in, not minimised, not fully
-/// covered). Nothing animates in a status mark any more; kept for the
-/// containers that still set the scope.
+/// covered). The running waveform animates only while this reports visible.
 private struct RelayStatusMarkVisibility: NSViewRepresentable {
     @Binding var visible: Bool
 
