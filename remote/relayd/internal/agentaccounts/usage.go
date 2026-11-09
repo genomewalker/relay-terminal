@@ -166,8 +166,11 @@ func parseClaudeUsage(line []byte) ([]UsageWindow, string) {
 	if len(line) > 64<<10 {
 		return nil, "Claude usage exceeds the input limit"
 	}
+	// Claude Code adds fields to this answer between releases (2.1.319 added
+	// behaviors, session and ~30 rate_limits keys). Unknown fields are
+	// ignored at every level; the windows read below still need their own
+	// percentage and reset time, and anything else stays unread.
 	decoder := json.NewDecoder(bytes.NewReader(line))
-	decoder.DisallowUnknownFields()
 	var trailing any
 	if decoder.Decode(&message) != nil || decoder.Decode(&trailing) != io.EOF || message.Response.Subtype != "success" || message.Response.Response == nil {
 		return nil, "Claude did not report usage"
@@ -198,21 +201,21 @@ func parseClaudeUsage(line []byte) ([]UsageWindow, string) {
 	return windows, ""
 }
 
-// Strict at the authoritative window boundary. An unknown field must not be
-// mistaken for a recognized quota. used_dollars is known, non-quota metadata.
+// A window needs exactly one consistent percentage (utilization or
+// used_percentage) in 0...100 and a valid reset time. Other fields, such as
+// used_dollars, limit_dollars or locked_reason, are metadata and ignored; a
+// renamed percentage leaves the window without one, so it is refused.
 func parseClaudeQuotaWindow(data []byte) (UsageWindow, error) {
 	var window struct {
 		Utilization    *float64        `json:"utilization"`
 		UsedPercentage *float64        `json:"used_percentage"`
 		ResetsAt       json.RawMessage `json:"resets_at"`
-		UsedDollars    json.RawMessage `json:"used_dollars"`
 	}
 	bad := errors.New("invalid Claude quota window")
 	if len(data) > 4096 {
 		return UsageWindow{}, bad
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	if decoder.Decode(&window) != nil {
 		return UsageWindow{}, bad
 	}

@@ -8,12 +8,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestQuotaFailoverWindowStrict(t *testing.T) {
+	// Metadata fields, known or new, do not change the window.
+	for _, data := range []string{
+		`{"used_percentage":90,"resets_at":"2026-10-23T17:00:00Z","unknown":1}`,
+		`{"utilization":90,"resets_at":"2026-10-23T17:00:00Z","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null}`,
+	} {
+		window, err := parseClaudeQuotaWindow([]byte(data))
+		if err != nil || window.UsedPercent != 90 || window.ResetsAt != "2026-10-23T17:00:00Z" {
+			t.Fatalf("%s: %+v %v", data, window, err)
+		}
+	}
 	for _, reset := range []string{`"2026-10-23T17:00:00Z"`, `"2026-10-23T19:00:00.123456+02:00"`, `1792774800`, `"1792774800.5"`} {
 		for _, field := range []string{"utilization", "used_percentage"} {
 			data := `{"` + field + `":90,"resets_at":` + reset + `}`
@@ -31,7 +42,8 @@ func TestQuotaFailoverWindowStrict(t *testing.T) {
 		`{"used_percentage":90,"resets_at":true}`,
 		`{"used_percentage":90,"resets_at":-1}`,
 		`{"used_percentage":90,"resets_at":253402300800}`,
-		`{"used_percentage":90,"resets_at":"2026-10-23T17:00:00Z","unknown":1}`,
+		// A renamed percentage is no percentage.
+		`{"utilisation_percent":90,"resets_at":"2026-10-23T17:00:00Z"}`,
 		`{"utilization":90,"used_percentage":80,"resets_at":"2026-10-23T17:00:00Z"}`,
 	} {
 		if _, err := parseClaudeQuotaWindow([]byte(data)); err == nil {
@@ -77,8 +89,8 @@ func FuzzClaudeQuotaWindow(f *testing.F) {
 		}
 		fields["unknown"] = json.RawMessage(`1`)
 		unknown, _ := json.Marshal(fields)
-		if _, err := parseClaudeQuotaWindow(unknown); err == nil {
-			t.Fatal("unknown field accepted")
+		if extended, err := parseClaudeQuotaWindow(unknown); err != nil || extended != window {
+			t.Fatal("an unknown metadata field changed the window")
 		}
 	})
 }
@@ -114,8 +126,8 @@ func FuzzClaudeQuotaEnvelope(f *testing.F) {
 			}
 			fields["unknown"] = json.RawMessage(`true`)
 			unknown, _ := json.Marshal(fields)
-			if next, _ := parseClaudeUsage(unknown); len(next) > 0 {
-				t.Fatal("unknown envelope field accepted")
+			if next, _ := parseClaudeUsage(unknown); !reflect.DeepEqual(next, windows) {
+				t.Fatal("an unknown envelope field changed the windows")
 			}
 		}
 	})
@@ -162,9 +174,13 @@ func TestQuotaWeeklyNamesAndFormats(t *testing.T) {
 				if reason != "" || len(windows) != 2 || windows[1].Name != name || windows[1].UsedPercent != 98 || windows[1].WindowMinutes != 10080 {
 					t.Fatalf("weekly refused %s: %+v %s", body, windows, reason)
 				}
-				invalid := strings.Replace(body, weekly, strings.TrimSuffix(weekly, "}")+`,"unknown":1}`, 1)
-				if windows, _ := parseClaudeUsage([]byte(invalid)); len(windows) != 0 {
-					t.Fatal("unknown weekly authoritative field accepted")
+				extended := strings.Replace(body, weekly, strings.TrimSuffix(weekly, "}")+`,"unknown":1}`, 1)
+				if again, _ := parseClaudeUsage([]byte(extended)); !reflect.DeepEqual(again, windows) {
+					t.Fatal("an unknown weekly metadata field changed the windows")
+				}
+				renamed := strings.Replace(body, weekly, strings.Replace(weekly, field, "renamed_"+field, 1), 1)
+				if again, reason := parseClaudeUsage([]byte(renamed)); len(again) != 0 || reason == "" {
+					t.Fatal("a weekly window without a recognized percentage was accepted")
 				}
 			}
 		}
