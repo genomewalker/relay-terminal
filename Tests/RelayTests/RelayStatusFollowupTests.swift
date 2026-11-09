@@ -50,12 +50,14 @@ struct RelayStatusFollowupTests {
             }
             #expect(rgb(RelayPalette.danger) == rgb(RelayPalette.red), "\(name.rawValue)")
         }
-        // Still waiting on the user: counted, listed under the Waiting filter.
+        // Needs the user, with its own filter chip named like its group.
         #expect(failed.status.needsUser)
-        #expect(RelayFleetFilter.waiting.includes(failed))
+        #expect(RelayFleetFilter.failed.includes(failed) && !RelayFleetFilter.waiting.includes(failed))
+        #expect(RelayFleetFilter.failed.title == "Failed")
         let fleet = Index.Fleet(Array(facts.values))
         #expect(fleet.counts.failed == 1 && fleet.counts.waiting == 1)
         #expect(RelayFleetFilter.initial(for: fleet.counts) == .waiting)
+        #expect(RelayFleetFilter.initial(for: Index.PaneCounts(waiting: 0, failed: 1, disconnected: 0, running: 0, idle: 0)) == .failed)
         // Waits and approvals stay amber; a clean exit is idle and grey.
         #expect(facts[f.waiting.id]?.status == .waiting)
         #expect(Index.PaneStatus.waiting.role == .warning)

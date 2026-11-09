@@ -240,13 +240,14 @@ extension RelayWorkOverviewIndex {
 // MARK: - Board filter
 
 enum RelayFleetFilter: String, CaseIterable, Identifiable, Sendable {
-    case all, waiting, running, disconnected
+    case all, waiting, failed, running, disconnected
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .all: "All"
         case .waiting: "Waiting"
+        case .failed: "Failed"
         case .running: "Running"
         case .disconnected: "Disconnected"
         }
@@ -256,6 +257,7 @@ enum RelayFleetFilter: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .all: nil
         case .waiting: .waiting
+        case .failed: .failed
         case .running: .running
         case .disconnected: .disconnected
         }
@@ -266,8 +268,6 @@ enum RelayFleetFilter: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .all: []
         case .disconnected: [.disconnected, .reconnecting]
-        // A failed exit also waits on the user.
-        case .waiting: [.waiting, .failed]
         default: status.map { [$0] } ?? []
         }
     }
@@ -278,7 +278,7 @@ enum RelayFleetFilter: String, CaseIterable, Identifiable, Sendable {
 
     /// Opening from the counts shows what is waiting when anything is.
     static func initial(for counts: RelayWorkOverviewIndex.PaneCounts) -> Self {
-        counts.waiting + counts.failed > 0 ? .waiting : .all
+        counts.waiting > 0 ? .waiting : counts.failed > 0 ? .failed : .all
     }
 }
 
@@ -711,7 +711,8 @@ extension View {
 }
 
 /// The shared window visibility view (ordered in, not minimised, not fully
-/// covered), so a spinner in a hidden window stops drawing frames.
+/// covered). Nothing animates in a status mark any more; kept for the
+/// containers that still set the scope.
 private struct RelayStatusMarkVisibility: NSViewRepresentable {
     @Binding var visible: Bool
 
