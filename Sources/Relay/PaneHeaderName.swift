@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// The pane name as shown in the pane header. Relay has no generator for the
 /// trailing "<agent> <6-hex>" in names such as "Sapropel - annotation jobs -
@@ -37,8 +38,7 @@ extension PaneModel {
             case .disconnected: role = .offline
             case .connecting: role = .info
             case .connected:
-                role = phase != .exited ? .info
-                    : WorkspaceModel.failedExitStatus(self) != nil ? .danger : .neutral
+                role = exitRole ?? .info
             }
             return (connectionStatusLabel, role)
         }
@@ -48,10 +48,21 @@ extension PaneModel {
         case .connecting, .active: role = .info
         case .quiet: role = .neutral
         case .needsInput: role = .warning
-        case .exited: role = WorkspaceModel.failedExitStatus(self) != nil ? .danger : .neutral
+        case .exited: role = exitRole ?? .neutral
         }
         return (phase.label, role)
     }
+
+    /// An ended pane's role, as `headerStatus` gives it: red only for a
+    /// non-zero exit, a clean exit is muted. Nil while the pane runs.
+    var exitRole: RelayTheme.StatusRole? {
+        guard phase == .exited else { return nil }
+        return WorkspaceModel.failedExitStatus(self) != nil ? .danger : .neutral
+    }
+
+    /// The agent chip's and pane row icon's colour: the phase colour, except
+    /// that an ended pane follows `exitRole` (`AgentPhase.exited` alone is red).
+    var phaseColor: Color { exitRole?.color ?? phase.color }
 
     /// What a working agent is doing, e.g. "Using Bash"; nil when idle or unknown.
     var headerActivityDetail: String? {
