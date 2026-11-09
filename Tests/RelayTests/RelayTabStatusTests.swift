@@ -71,9 +71,9 @@ struct RelayTabStatusTests {
         #expect(Mark.kind(.running, reduceMotion: true) == .staticRunning)
         #expect(Mark.kind(.waiting, reduceMotion: false) == .symbol(RelayTheme.StatusRole.warning.symbol))
         #expect(Mark.kind(.waiting, reduceMotion: true) == .symbol(RelayTheme.StatusRole.warning.symbol))
-        #expect(Mark.kind(.disconnected, reduceMotion: false) == .symbol(RelayTheme.StatusRole.danger.symbol))
+        #expect(Mark.kind(.disconnected, reduceMotion: false) == .symbol(RelayTheme.StatusRole.offline.symbol))
         #expect(Mark.spoken(.waiting) == "Warning: Waiting on you")
-        #expect(Mark.spoken(.disconnected) == "Error: Disconnected")
+        #expect(Mark.spoken(.disconnected) == "Offline: Disconnected")
         #expect(Mark.spoken(.running) == "Success: Running")
         #expect(Mark.size >= 10)
     }

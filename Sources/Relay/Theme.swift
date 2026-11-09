@@ -69,10 +69,14 @@ enum RelayTheme {
     /// its own symbol so colour is never the only signal.
     enum StatusRole: CaseIterable, Hashable {
         case neutral, success, warning, danger, info
+        /// Calm, not a failure: a connection coming back (grey, reconnect symbol).
+        case pending
+        /// Calm, not a failure: a connection that is gone (grey, offline symbol).
+        case offline
 
         var color: Color {
             switch self {
-            case .neutral: RelayTheme.textMuted
+            case .neutral, .pending, .offline: RelayTheme.textMuted
             case .success: RelayTheme.success
             case .warning: RelayTheme.warning
             case .danger: RelayTheme.danger
@@ -88,6 +92,8 @@ enum RelayTheme {
             case .warning: "Warning"
             case .danger: "Error"
             case .info: "Info"
+            case .pending: "In progress"
+            case .offline: "Offline"
             }
         }
 
@@ -103,6 +109,8 @@ enum RelayTheme {
             case .warning: "exclamationmark.triangle.fill"
             case .danger: "xmark.octagon.fill"
             case .info: "info.circle.fill"
+            case .pending: "arrow.triangle.2.circlepath"
+            case .offline: "wifi.slash"
             }
         }
     }

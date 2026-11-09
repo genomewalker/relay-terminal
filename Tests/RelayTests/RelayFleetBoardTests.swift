@@ -50,9 +50,10 @@ struct RelayFleetBoardTests {
         // A wait outranks a lost connection: it still needs the user.
         #expect(status(.needsInput, .disconnected("lost")) == .waiting)
         #expect(status(.active, .disconnected("lost")) == .disconnected)
-        #expect(status(.quiet, .reconnecting("retrying")) == .disconnected)
-        #expect(status(.quiet, .waitingForNetwork("VPN")) == .disconnected)
-        #expect(status(.exited) == .disconnected)
+        #expect(status(.quiet, .reconnecting("retrying")) == .reconnecting)
+        #expect(status(.quiet, .waitingForNetwork("VPN")) == .reconnecting)
+        // A clean exit is finished, not a lost connection.
+        #expect(status(.exited) == .idle)
         #expect(status(.active) == .running)
         #expect(status(.quiet, program: "working") == .running)
         #expect(status(.quiet) == .idle)
@@ -70,7 +71,7 @@ struct RelayFleetBoardTests {
         }
         #expect(Index.PaneStatus.waiting.role == .warning)
         #expect(Index.PaneStatus.running.role == .success)
-        #expect(Index.PaneStatus.disconnected.role == .danger)
+        #expect(Index.PaneStatus.disconnected.role == .offline)
         #expect(Index.PaneStatus.idle.role == .neutral)
     }
 
@@ -161,7 +162,7 @@ struct RelayFleetBoardTests {
         #expect(goToPane.contains { $0.destination == .fleetBoard && $0.group == .actions })
     }
 
-    @Test("A local pane whose session ended reads Exited; a lost connection says so")
+    @Test("A local pane whose session ended cleanly reads Exited; a lost connection says so")
     func exitedDetail() {
         // A direct (non-relay) local pane: its connection label stays "Connected".
         let local = PaneModel(profile: ConnectionProfile(name: "Local shell", kind: .local, host: "", user: "",
@@ -169,7 +170,7 @@ struct RelayFleetBoardTests {
         local.connectionState = .connected
         local.exited(exitCode: 0)
         let fact = Index.paneFact(local, tabID: UUID(), workspaceName: "Relay", tabName: "sh", hidden: false)
-        #expect(fact.status == .disconnected)
+        #expect(fact.status == .idle)
         #expect(fact.detail == "Exited")
         let lost = PaneModel(profile: .sshConfigHost("fleet-exit.invalid"))
         lost.disconnected("Host unreachable")
