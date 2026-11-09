@@ -274,6 +274,32 @@ private struct WorkspaceFocusBar: View {
     }
 }
 
+/// Host labels in the navigator. A row names its host only when it differs
+/// from its workspace's main host, which the workspace row names once.
+enum WorkspaceNavigatorHosts {
+    static func label(_ profile: ConnectionProfile) -> String { profile.kind == .local ? "This Mac" : profile.host }
+
+    /// The host most of the workspace's panes run on; ties go to the first
+    /// name alphabetically. Nil for a workspace without panes.
+    static func main(_ paneHosts: [String]) -> String? {
+        let counts = Dictionary(paneHosts.map { ($0, 1) }, uniquingKeysWith: +)
+        return counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }.first?.key
+    }
+
+    /// A tab row's chip: its hosts, unless they are just the workspace's main host.
+    static func chip(tabHosts: [String], main: String?) -> String? {
+        let hosts = Set(tabHosts).sorted()
+        if hosts.isEmpty || hosts == [main].compactMap({ $0 }) { return nil }
+        return hosts.joined(separator: ", ")
+    }
+
+    /// The workspace row's caption, unless its name already says the host.
+    static func workspaceCaption(name: String, main: String?) -> String? {
+        guard let main, name.range(of: main, options: .caseInsensitive) == nil else { return nil }
+        return main
+    }
+}
+
 @MainActor private struct WorkspaceNavigatorRow: View {
     let record: WorkspaceRecord
     @ObservedObject var workspace: WorkspaceModel
@@ -296,6 +322,10 @@ private struct WorkspaceFocusBar: View {
 
     var body: some View {
         let tabs = workspace.navigatorTabs(self.tabs, of: record, matching: query)
+        let allTabs = workspace.tabs(inWorkspace: record.id)
+        let mainHost = WorkspaceNavigatorHosts.main(allTabs.flatMap(\.allPaneIDs).compactMap { workspace.panes[$0] }
+            .map { WorkspaceNavigatorHosts.label($0.profile) })
+        let caption = WorkspaceNavigatorHosts.workspaceCaption(name: record.name, main: mainHost)
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 4) {
                 Button { workspace.setNavigatorWorkspaceExpanded(record.id, !expanded) } label: {
@@ -308,6 +338,10 @@ private struct WorkspaceFocusBar: View {
                         Image(systemName: record.isInbox ? "tray" : "square.stack")
                             .font(.system(size: 10)).foregroundStyle(RelayTheme.textMuted)
                         Text(record.name).font(RelayTheme.font(size: 11.5, weight: .semibold)).lineLimit(1)
+                        if let caption {
+                            Text(caption).font(RelayTheme.font(size: 8)).foregroundStyle(RelayTheme.textFaint).lineLimit(1)
+                                .layoutPriority(-1)
+                        }
                         Spacer(minLength: 3)
                         // Every tab of the workspace, also those a search hides.
                         RelayStatusMark(status: RelayWorkOverviewIndex.mostUrgent(
@@ -391,7 +425,7 @@ private struct WorkspaceFocusBar: View {
             if expanded {
                 ForEach(tabs) { tab in
                     WorkspaceNavigatorTab(tab: tab, workspace: workspace, hold: hold, status: marks[tab.id],
-                                          failure: $failure)
+                                          mainHost: mainHost, failure: $failure)
                 }
             }
         }
@@ -414,6 +448,8 @@ private struct WorkspaceFocusBar: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject var hold: WorkspaceNavigatorHold
     let status: RelayWorkOverviewIndex.PaneStatus?
+    /// The workspace's main host, which this row and its panes leave unsaid.
+    let mainHost: String?
     @Binding var failure: String?
     @State private var targeted = false
     @State private var refusal: String?
@@ -433,7 +469,10 @@ private struct WorkspaceFocusBar: View {
                     HStack(spacing: 6) {
                         Image(systemName: "rectangle.split.2x1").font(.system(size: 9)).foregroundStyle(RelayTheme.textMuted)
                         Text(workspace.tabDisplayName(tab, fallback: tab.name)).font(RelayTheme.font(size: 11)).lineLimit(1)
-                        Text(hosts).font(RelayTheme.font(size: 8)).foregroundStyle(RelayTheme.textFaint).lineLimit(1)
+                        if let chip = WorkspaceNavigatorHosts.chip(tabHosts: hosts, main: mainHost) {
+                            Text(chip).font(RelayTheme.font(size: 8)).foregroundStyle(RelayTheme.textFaint).lineLimit(1)
+                                .layoutPriority(-1)
+                        }
                         Spacer(minLength: 3)
                         RelayStatusMark(status: status)
                         RelayFinishedDot(paneIDs: tab.allPaneIDs)
@@ -487,8 +526,9 @@ private struct WorkspaceFocusBar: View {
                             Image(systemName: pane.contentKind == .editor ? "doc.text" : "terminal").font(.system(size: 9))
                             Text(pane.displayName).font(RelayTheme.font(size: 10.5)).lineLimit(1)
                             Spacer(minLength: 3)
-                            Text(pane.profile.kind == .local ? "This Mac" : pane.profile.host)
-                                .font(RelayTheme.font(size: 8)).foregroundStyle(RelayTheme.textFaint).lineLimit(1)
+                            if let chip = WorkspaceNavigatorHosts.chip(tabHosts: [WorkspaceNavigatorHosts.label(pane.profile)], main: mainHost) {
+                                Text(chip).font(RelayTheme.font(size: 8)).foregroundStyle(RelayTheme.textFaint).lineLimit(1)
+                            }
                         }
                         .padding(.leading, 50)
                         .padding(.trailing, 8)
@@ -504,9 +544,8 @@ private struct WorkspaceFocusBar: View {
         }
     }
 
-    private var hosts: String {
-        Set(tab.allPaneIDs.compactMap { workspace.panes[$0] }.map { $0.profile.kind == .local ? "This Mac" : $0.profile.host })
-            .sorted().joined(separator: ", ")
+    private var hosts: [String] {
+        tab.allPaneIDs.compactMap { workspace.panes[$0] }.map { WorkspaceNavigatorHosts.label($0.profile) }
     }
 
     private var rowFill: NavigatorRowFill {

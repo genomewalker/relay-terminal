@@ -1046,25 +1046,32 @@ struct WorkspaceTabRail: View {
                     }
                 }
             } label: {
-                HStack(spacing: 6) {
+                // A menu button, not a tab: workspace icon, up-down chevron
+                // and a filled control shape instead of the tab underline.
+                HStack(spacing: 5) {
+                    Image(systemName: "square.stack").font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.textMuted)
                     Text(workspaceName).lineLimit(1).truncationMode(.tail)
-                    Image(systemName: "chevron.down").font(RelayTheme.font(size: 8, weight: .medium))
+                    Image(systemName: "chevron.up.chevron.down").font(RelayTheme.font(size: 8, weight: .medium))
+                        .foregroundStyle(RelayTheme.textMuted)
                 }
+                .padding(.horizontal, RelayTheme.Space.sm)
+                .frame(height: 24)
+                .background(RelayTheme.wash, in: RoundedRectangle(cornerRadius: RelayTheme.Radius.control))
+                .overlay(RoundedRectangle(cornerRadius: RelayTheme.Radius.control).strokeBorder(RelayTheme.line))
             }
-                .menuStyle(.borderlessButton)
+                .menuStyle(.button)
+                .buttonStyle(.plain)
                 .menuIndicator(.hidden)
                 .help(dropFailure ?? "Switch workspace")
                 .accessibilityLabel("Switch workspace, " + workspaceName)
                 .accessibilityIdentifier("relay.navigation.workspace-switcher")
-                .font(RelayTheme.font(size: 12, weight: .semibold))
+                .font(RelayTheme.font(size: 11.5, weight: .medium))
                 .foregroundStyle(RelayTheme.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: 180, alignment: .leading)
+                .fixedSize(horizontal: true, vertical: false)
                 .padding(.leading, workspace.sidebarVisible ? 0 : 28)
-                .frame(width: 156, alignment: .leading)
-
-            Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(width: 1, height: 24)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: RelayTheme.spacing(3)) {
@@ -2085,16 +2092,40 @@ private struct AttentionInboxRows: View {
     }
 }
 
+/// An inbox row's two lines: the pane (or its tab) once, then the status and
+/// its workspace once, so neither line repeats the other.
+struct AttentionInboxRowText: Equatable {
+    let title: String
+    let subtitle: String
+
+    init(pane: String?, tab: String?, workspace: String?, status: String, closed: Bool) {
+        func clean(_ value: String?) -> String? {
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        title = clean(pane) ?? clean(tab) ?? "Pane"
+        let status = closed ? "Closed" : status
+        if let workspace = clean(workspace), workspace != title, !status.contains(workspace) {
+            subtitle = status + " · " + workspace
+        } else {
+            subtitle = status
+        }
+    }
+}
+
 private struct AttentionInboxRow: View {
     let entry: AttentionInboxEntry
     @ObservedObject var workspace: WorkspaceModel
     let identifier: String
 
-    private var place: String {
-        let pane = workspace.panes[entry.paneID]?.displayName ?? "Pane"
-        guard let tabID = workspace.tabID(containingPane: entry.paneID),
-              let tab = workspace.tabs.first(where: { $0.id == tabID }), !tab.name.isEmpty else { return pane }
-        return tab.name + " · " + pane
+    private var text: AttentionInboxRowText {
+        let tabID = workspace.tabID(containingPane: entry.paneID)
+        let tab = tabID.flatMap { id in workspace.tabs.first { $0.id == id } }
+        return AttentionInboxRowText(pane: workspace.panes[entry.paneID]?.displayName, tab: tab?.name,
+                                     workspace: tabID.flatMap(workspace.workspaceID(forTab:))
+                                        .flatMap { workspace.ownership.workspace($0)?.name },
+                                     status: entry.title.isEmpty ? entry.alert.label : entry.title,
+                                     closed: workspace.panes[entry.paneID] == nil)
     }
 
     var body: some View {
@@ -2111,11 +2142,11 @@ private struct AttentionInboxRow: View {
                     .font(RelayTheme.font(size: 9.5, weight: .semibold))
                     .foregroundStyle(alert.color)
                 VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
-                    Text(place)
+                    Text(text.title)
                         .font(RelayTheme.font(size: 11.5, weight: .medium))
                         .foregroundStyle(RelayTheme.text)
                         .lineLimit(1)
-                    Text(closed ? "Closed" : entry.title.isEmpty ? alert.label : entry.title)
+                    Text(text.subtitle)
                         .font(RelayTheme.font(size: 10.5))
                         .foregroundStyle(RelayTheme.textMuted)
                         .lineLimit(1)
@@ -2129,8 +2160,8 @@ private struct AttentionInboxRow: View {
         }
         .buttonStyle(.plain)
         .disabled(closed)
-        .help("\(alert.label) · \(place)")
-        .accessibilityLabel("\(alert.label), \(place)")
+        .help("\(alert.label) · \(text.title) · \(text.subtitle)")
+        .accessibilityLabel("\(alert.label), \(text.title), \(text.subtitle)")
         .accessibilityIdentifier("\(identifier).\(entry.paneID.uuidString.lowercased())")
         .contextMenu { Button("Dismiss") { workspace.dismissAttention(entry.paneID) } }
     }

@@ -131,20 +131,8 @@ private enum WorkspaceNamingRequest: Identifiable {
             navigationButton("Forward", symbol: "chevron.right", id: "forward", enabled: organization.canGoForward) {
                 organization.goForward()
             }
-            Rectangle().fill(RelayTheme.line).frame(width: 1, height: 14).padding(.horizontal, 4)
-            // Workspace › tab, from ownership records (no groups, no sessions).
-            HStack(spacing: 5) {
-                if let workspaceID = workspace.selectedWorkspaceID, let record = workspace.ownership.workspace(workspaceID) {
-                    Text(record.name).lineLimit(1).font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
-                        .accessibilityIdentifier("relay.workspace.breadcrumb.0")
-                    Image(systemName: "chevron.right").font(.system(size: 8)).foregroundStyle(RelayTheme.textFaint)
-                }
-                if let tab = workspace.visibleTab {
-                    Text(workspace.tabDisplayName(tab, fallback: tab.name)).lineLimit(1)
-                        .font(RelayTheme.font(size: 11, weight: .semibold)).foregroundStyle(RelayTheme.text)
-                        .accessibilityIdentifier("relay.workspace.breadcrumb.1")
-                }
-            }
+            // No workspace › tab breadcrumb: the switcher and the selected
+            // tab directly below already name both.
             Spacer(minLength: 6)
             WorkspacePinnedMenu(workspace: workspace)
             Menu {
