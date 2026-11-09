@@ -54,6 +54,36 @@ private struct SupervisorAdvisoryRequestKey: Equatable {
     let stage: RelaySupervisorStage
 }
 
+/// Names a newly created tab. A tab opened in a project directory is named
+/// after it ("sapropel"); without one, or in a home directory or "/", it keeps
+/// the host name with an ordinal ("dandy-07 3"). Existing tabs are never
+/// renamed; duplicate names are told apart by `tabDisplayName`.
+enum WorkspaceTabNaming {
+    static func newTabName(directory: String?, profileName: String, ordinal: Int,
+                           home: String = NSHomeDirectory()) -> String {
+        if let name = directoryName(directory, home: home) { return name }
+        return ordinal == 1 ? profileName : "\(profileName) \(ordinal)"
+    }
+
+    /// The directory's last component, or nil for no directory, "/", "~" and
+    /// home directories: the local home, or /home/<user>, /Users/<user> and
+    /// /root on a remote host whose home is not known here.
+    static func directoryName(_ directory: String?, home: String = NSHomeDirectory()) -> String? {
+        var path = directory?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+        guard !path.isEmpty, path != "/", path != "~" else { return nil }
+        var homePath = home
+        while homePath.count > 1, homePath.hasSuffix("/") { homePath.removeLast() }
+        if !homePath.isEmpty, homePath != "/", path == homePath { return nil }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true)
+        if path.hasPrefix("/"), components.count == 2, ["home", "Users"].contains(components[0]) { return nil }
+        if path == "/root" { return nil }
+        let name = TerminalPathSyntax.lastComponent(path)
+        guard !name.isEmpty, name != ".", name != ".." else { return nil }
+        return String(name.prefix(80))
+    }
+}
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var tabs: [TabModel] = [] {
@@ -1660,10 +1690,10 @@ final class WorkspaceModel: ObservableObject {
             : nil
         let pane = PaneModel(profile: targetProfile, remoteParentSessionID: parentSessionID, startDirectory: directory)
         storePane(pane)
-        let ordinal = sessionTabs.count + 1
         let tab = TabModel(
             sessionID: sessionID,
-            name: ordinal == 1 ? targetProfile.name : "\(targetProfile.name) \(ordinal)",
+            name: WorkspaceTabNaming.newTabName(directory: directory, profileName: targetProfile.name,
+                                                ordinal: sessionTabs.count + 1),
             firstPane: pane.id
         )
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
