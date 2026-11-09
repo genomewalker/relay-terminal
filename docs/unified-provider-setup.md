@@ -76,6 +76,12 @@ The prompt is gated by interactive mode and `TERM_PROGRAM=relay`. Normal shell
 PATH must resolve the official provider executables, excluding Relay shims.
 Relay-specific commands such as `rcode` and Relay MCP tools still require Relay.
 
+Every Relay pane exports its own pane ID as `RELAY_PANE_ID` (lowercase UUID),
+so a script or agent in the pane can learn which pane it runs in. A value
+inherited from a parent pane is always replaced. Panes started through relayd
+also export the same value as `RELAY_SESSION`, which remains for compatibility
+with existing hooks and helpers; new integrations should read `RELAY_PANE_ID`.
+
 Recorded checks, 4 October 2026: local and dandy-07 Claude/Codex version checks
 passed with Relay environment removed; both Claude status commands rendered
 nonempty output with exit0 and no stderr. All eleven installed local Relay hooks

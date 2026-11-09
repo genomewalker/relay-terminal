@@ -175,15 +175,7 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	if workingDirectory != "" {
 		child.Dir = workingDirectory
 	}
-	environmentOverrides := relayterminfo.PreferredEnvironment()
-	environmentOverrides["COLORTERM"] = "truecolor"
-	environmentOverrides["TERM_PROGRAM"] = "relay"
-	environmentOverrides["RELAY_SESSION"] = id
-	// Configure only newly launched shells. The official Claude shim can
-	// prepare its editor bridge before exec without rebinding live providers.
-	environmentOverrides["RELAY_PROMPT_EDITOR_ENABLE"] = promptEditorLaunchSetting(os.Environ())
-	environmentOverrides["PATH"] = shimPath + string(os.PathListSeparator) + os.Getenv("PATH")
-	child.Env = TerminalEnvironment(environmentWithOverrides(os.Environ(), environmentOverrides))
+	child.Env = sessionEnvironment(os.Environ(), id, shimPath)
 	if cols == 0 {
 		cols = 120
 	}
@@ -201,6 +193,23 @@ func startSession(id, command, workingDirectory string, cols, rows uint16) (*Ses
 	session.agentProcesses = descendantAgentProcesses(child.Process.Pid)
 	session.start()
 	return session, nil
+}
+
+// sessionEnvironment is the environment of a new pane process. The pane id is
+// exported as RELAY_PANE_ID (the documented name) and RELAY_SESSION (kept for
+// existing hooks and helpers); both override any value inherited from a
+// parent pane.
+func sessionEnvironment(base []string, id, shimPath string) []string {
+	environmentOverrides := relayterminfo.PreferredEnvironment()
+	environmentOverrides["COLORTERM"] = "truecolor"
+	environmentOverrides["TERM_PROGRAM"] = "relay"
+	environmentOverrides["RELAY_SESSION"] = id
+	environmentOverrides["RELAY_PANE_ID"] = id
+	// Configure only newly launched shells. The official Claude shim can
+	// prepare its editor bridge before exec without rebinding live providers.
+	environmentOverrides["RELAY_PROMPT_EDITOR_ENABLE"] = promptEditorLaunchSetting(base)
+	environmentOverrides["PATH"] = shimPath + string(os.PathListSeparator) + os.Getenv("PATH")
+	return TerminalEnvironment(environmentWithOverrides(base, environmentOverrides))
 }
 
 func newSession(id, command string, terminal *os.File, child *exec.Cmd) *Session {
