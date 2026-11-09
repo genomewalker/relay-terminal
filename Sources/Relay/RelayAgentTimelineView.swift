@@ -49,7 +49,15 @@ private struct RelayConversationSnapshot: Decodable {
     private var refreshPending = false
     private(set) var rootPID = 0
     var visible = true
-    init(pane: PaneModel) { self.pane = pane }
+    /// False for offline presentation (previews, snapshot tests): never reads the host.
+    let live: Bool
+    init(pane: PaneModel) { self.pane = pane; live = true }
+    /// Presents an already-read conversation without connecting to the host.
+    init(pane: PaneModel, presenting conversation: RelayAgentConversation, failure: String? = nil) {
+        self.pane = pane; live = false
+        self.conversation = conversation; self.failure = failure
+        updatedAt = conversation.binding == nil ? nil : Date()
+    }
     func stop() { visible = false; generation = UUID() }
 
     func showOlder() async {
@@ -68,7 +76,7 @@ private struct RelayConversationSnapshot: Decodable {
     }
     @discardableResult
     func refresh() async -> Bool {
-        guard visible, let pane else { return false }
+        guard live, visible, let pane else { return false }
         if busy { refreshPending = true; return false }
         let token = generation
         let profile = pane.profile
@@ -173,8 +181,8 @@ struct RelayAgentTimelineView: View {
     @State private var currentMatch: String?
     @State private var searchJump = 0
     @FocusState private var searchFocused: Bool
-    init(pane: PaneModel) {
-        self.pane = pane; _store = StateObject(wrappedValue: RelayAgentTimelineStore(pane: pane))
+    init(pane: PaneModel, store: RelayAgentTimelineStore? = nil) {
+        self.pane = pane; _store = StateObject(wrappedValue: store ?? RelayAgentTimelineStore(pane: pane))
         _composerState = ObservedObject(wrappedValue: pane.composerState)
         _attachmentQueue = ObservedObject(wrappedValue: pane.composerState.attachmentQueue)
     }
