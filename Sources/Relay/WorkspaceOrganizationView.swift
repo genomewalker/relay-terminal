@@ -90,10 +90,14 @@ private enum WorkspaceNamingRequest: Identifiable {
         self.tabs = tabs()
     }
 
+    // One row: back/forward, the tab rail, then Pinned and Saved views. The
+    // breadcrumb that once filled a bar of its own is gone (the switcher and
+    // selected tab name both), so a separate bar would only hold four buttons.
     var body: some View {
-        VStack(spacing: 0) {
-            WorkspaceNavigationBar(workspace: workspace, organization: organization)
-            tabs
+        HStack(spacing: 0) {
+            WorkspaceNavigationBar(workspace: workspace, organization: organization, edge: .leading)
+            tabs.frame(maxWidth: .infinity)
+            WorkspaceNavigationBar(workspace: workspace, organization: organization, edge: .trailing)
         }
     }
 }
@@ -116,24 +120,51 @@ private enum WorkspaceNamingRequest: Identifiable {
     }
 }
 
+/// The rail's height, canvas and bottom rule, so the controls beside it
+/// read as one continuous row.
+private struct WorkspaceNavigationRowSegment: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .frame(height: 36)
+            .background(RelayTheme.canvas)
+            .overlay(alignment: .bottom) { Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1) }
+    }
+}
+
+/// The navigation controls at either end of the tab rail's row: back and
+/// forward before it, Pinned and Saved views (with their sheets) after it.
 @MainActor private struct WorkspaceNavigationBar: View {
+    enum Edge { case leading, trailing }
+
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject var organization: WorkspaceOrganizationController
+    let edge: Edge
     @State private var naming: WorkspaceNamingRequest?
     @State private var choosingView = false
     @State private var choosingStack = false
 
     var body: some View {
-        HStack(spacing: 6) {
+        switch edge {
+        case .leading: history
+        case .trailing: quickAccess
+        }
+    }
+
+    private var history: some View {
+        HStack(spacing: 0) {
             navigationButton("Back", symbol: "chevron.left", id: "back", enabled: organization.canGoBack) {
                 organization.goBack()
             }
             navigationButton("Forward", symbol: "chevron.right", id: "forward", enabled: organization.canGoForward) {
                 organization.goForward()
             }
-            // No workspace › tab breadcrumb: the switcher and the selected
-            // tab directly below already name both.
-            Spacer(minLength: 6)
+        }
+        .padding(.leading, workspace.sidebarVisible ? 6 : 34)
+        .modifier(WorkspaceNavigationRowSegment())
+    }
+
+    private var quickAccess: some View {
+        HStack(spacing: 6) {
             WorkspacePinnedMenu(workspace: workspace)
             Menu {
                 Button("Save current view…") { naming = .saveView }
@@ -146,17 +177,19 @@ private enum WorkspaceNamingRequest: Identifiable {
                     Button("Manage saved views…") { choosingView = true }
                 }
             } label: {
+                // Icons only: beside the tab rail the words would cost a tab.
                 Label("Saved views", systemImage: "bookmark")
+                    .labelStyle(.iconOnly)
                     .font(RelayTheme.font(size: 11))
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .help("Saved views")
             .accessibilityIdentifier("relay.workspace.saved-views")
         }
-        .padding(.horizontal, 10)
-        .frame(height: 34)
-        .background(RelayTheme.sidebar)
-        .overlay(alignment: .bottom) { Rectangle().fill(RelayTheme.line.opacity(0.4)).frame(height: 1) }
+        .padding(.leading, 4)
+        .padding(.trailing, 10)
+        .modifier(WorkspaceNavigationRowSegment())
         .sheet(item: $naming) { request in WorkspaceNamingSheet(request: request, organization: organization) }
         .sheet(isPresented: $choosingView) { WorkspaceSavedViewPicker(organization: organization) }
         .sheet(isPresented: $choosingStack) { WorkspaceStackTargetPicker(workspace: workspace) }

@@ -1071,7 +1071,6 @@ struct WorkspaceTabRail: View {
                 .truncationMode(.tail)
                 .frame(maxWidth: 180, alignment: .leading)
                 .fixedSize(horizontal: true, vertical: false)
-                .padding(.leading, workspace.sidebarVisible ? 0 : 28)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: RelayTheme.spacing(3)) {
