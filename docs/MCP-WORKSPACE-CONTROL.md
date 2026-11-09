@@ -33,6 +33,19 @@ authorization rules.
    finished. Inspect the terminal afterward. `relay_read_viewport` reads the
    visible screen of persistent Relay and local Ghostty terminals without
    changing focus or scroll position.
+5. To wait for that command instead of sleeping and polling, call
+   `relay_wait_for_command` with the same `pane_id` and `after` set to the
+   `commandGeneration` in `relay_send_command`'s result (`timeout_ms` defaults
+   to 30000, at most 600000). It is read-only, needs no grant beyond reading a
+   viewport, and never writes to or probes the pane. It returns `returned` with
+   `exit_status` and `generation`, `running` at the timeout, `pane_exited` with
+   the pane program's `exit_code` when known, or `unknown` with a `reason`
+   (no shell integration seen, not a Relay worker pane, disconnected,
+   reconnected, or no command start observed). The status comes from the
+   OSC 133;C/D marks that Relay's bash and zsh integration prints in the pane
+   (`source: shell_reported_osc133`), for This Mac and remote hosts alike. Any
+   program in the pane can print them, so treat the status as shell-reported,
+   not verified, and never as authorization.
 
 ### Reading a sibling pane
 

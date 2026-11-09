@@ -20,7 +20,7 @@ func TestMikoCatalogComplete(t *testing.T) {
 			continue
 		}
 		switch name {
-		case "relay_read_desktop_inbox", "relay_ask_miko", "relay_register_caller", "relay_control_caller", "relay_begin_terminal_control", "relay_authorize_r_session", "relay_call_tool", "relay_available_tools", "relay_research_capability", "relay_prompt_provenance",
+		case "relay_read_desktop_inbox", "relay_ask_miko", "relay_register_caller", "relay_control_caller", "relay_begin_terminal_control", "relay_authorize_r_session", "relay_call_tool", "relay_available_tools", "relay_research_capability", "relay_prompt_provenance", "relay_wait_for_command",
 			"relay_broadcast_message": // not offered to Miko yet
 			continue
 		}

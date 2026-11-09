@@ -3428,6 +3428,11 @@ final class TerminalRuntime: NSObject {
 
     /// Background read of the exact ordered worker buffer. It never attaches,
     /// selects, focuses or resizes the live terminal to make a screen readable.
+    /// Shell-reported command markers for `relay_wait_for_command`. Read-only.
+    var commandWaitContext: (producer: UUID, observation: TerminalSemanticPromptStateTracker.CommandObservation) {
+        io.commandContext
+    }
+
     func backgroundViewportText() async -> String? {
         if let text = sidePanelViewportText() { return text }
         guard let pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
@@ -4818,6 +4823,14 @@ final class TerminalIOBridge: @unchecked Sendable {
 
     /// The transport incarnation producing output, and the shell's command
     /// count and prompt state, for binding a sign-in code hand-off.
+    /// Shell-reported command state and the output producer it came from.
+    var commandContext: (producer: UUID, observation: TerminalSemanticPromptStateTracker.CommandObservation) {
+        resizeLock.lock()
+        let producer = outputProducerID
+        resizeLock.unlock()
+        return (producer, semanticPromptTracker.commandObservation)
+    }
+
     var signInContext: (producer: UUID, execution: UInt64, promptShown: Bool) {
         resizeLock.lock()
         let producer = outputProducerID
@@ -4854,7 +4867,12 @@ final class TerminalIOBridge: @unchecked Sendable {
         bracketedPasteTracker.observe(data)
         shellInputTracker.observe(data)
         let priorExecution = semanticPromptTracker.executionGeneration
-        let semanticState = semanticPromptTracker.observe(data)
+        replayLock.lock()
+        // Same liveness rule as the history boundary below: replayed history
+        // must not report an old command result as a new one.
+        let liveOutput = !replaying || (remoteSequence > 0 && remoteSequence > replayKnownSequence)
+        replayLock.unlock()
+        let semanticState = semanticPromptTracker.observe(data, recordsCompletion: liveOutput)
         let executionChanged = semanticPromptTracker.executionGeneration != priorExecution
         replayLock.lock()
         let newExecution = TerminalPromptReconnectBoundaryPolicy.invalidatesHistory(
@@ -5965,16 +5983,42 @@ final class TerminalSemanticPromptStateTracker: @unchecked Sendable {
     private var payload: [UInt8] = []
     private var promptActive = false
     private var executions: UInt64 = 0
+    // Not persisted: the last command completion (OSC 133;D) and whether any
+    // OSC 133 marker was seen. Shell-reported, never authorization evidence.
+    private var completedExecutions: UInt64 = 0
+    private var lastExitStatus: Int?
+    private var markersSeen = false
 
     var executionGeneration: UInt64 {
         lock.lock(); defer { lock.unlock() }
         return executions
     }
 
+    /// The shell-reported command state read by `relay_wait_for_command`.
+    struct CommandObservation: Equatable, Sendable {
+        /// Command starts (OSC 133;C) observed.
+        var executions: UInt64
+        /// `executions` when the newest live OSC 133;D arrived; 0 if none.
+        var completedExecutions: UInt64
+        /// The status that D reported; nil when it carried none.
+        var exitStatus: Int?
+        /// Any OSC 133 marker was observed (or restored state implies one).
+        var integrationSeen: Bool
+    }
+
+    var commandObservation: CommandObservation {
+        lock.lock(); defer { lock.unlock() }
+        return CommandObservation(executions: executions, completedExecutions: completedExecutions,
+                                  exitStatus: lastExitStatus,
+                                  integrationSeen: markersSeen || executions > 0 || promptActive)
+    }
+
     /// Returns the newest prompt state only when a complete semantic marker
     /// changes it. Other OSC payloads are ignored and bounded to avoid retaining
-    /// terminal titles or clipboard data.
-    func observe(_ data: Data) -> Bool? {
+    /// terminal titles or clipboard data. `recordsCompletion` false observes
+    /// replayed history: prompt state and generations advance as before, but
+    /// an old 133;D is not recorded as a new command result.
+    func observe(_ data: Data, recordsCompletion: Bool = true) -> Bool? {
         guard !data.isEmpty else { return nil }
         lock.lock()
         defer { lock.unlock() }
@@ -6002,7 +6046,7 @@ final class TerminalSemanticPromptStateTracker: @unchecked Sendable {
                 }
             case .osc:
                 if byte == 0x07 { // BEL terminator
-                    changed = finishPayload() ?? changed
+                    changed = finishPayload(recordsCompletion) ?? changed
                     parserState = .ground
                 } else if byte == 0x1B {
                     parserState = .oscEscape
@@ -6011,7 +6055,7 @@ final class TerminalSemanticPromptStateTracker: @unchecked Sendable {
                 }
             case .oscEscape:
                 if byte == 0x5C { // ST: ESC \
-                    changed = finishPayload() ?? changed
+                    changed = finishPayload(recordsCompletion) ?? changed
                     parserState = .ground
                 } else {
                     if payload.count < 63 {
@@ -6026,20 +6070,41 @@ final class TerminalSemanticPromptStateTracker: @unchecked Sendable {
         return changed
     }
 
-    private func finishPayload() -> Bool? {
+    private func finishPayload(_ recordsCompletion: Bool) -> Bool? {
         defer { payload.removeAll(keepingCapacity: true) }
         guard payload.count >= 5,
               payload[0] == 0x31, payload[1] == 0x33, payload[2] == 0x33,
               payload[3] == 0x3B else { return nil }
+        markersSeen = true
         let active: Bool
         switch payload[4] {
         case 0x42: active = true  // OSC 133;B — command input begins
         case 0x43: executions &+= 1; active = false // OSC 133;C — command execution begins
+        case 0x44: // OSC 133;D[;status] — command finished
+            if recordsCompletion, executions > completedExecutions {
+                completedExecutions = executions
+                lastExitStatus = Self.exitStatus(payload)
+            }
+            return nil
         default: return nil
         }
         guard active != promptActive else { return nil }
         promptActive = active
         return active
+    }
+
+    /// Decimal status after `133;D;`, up to the next `;` or the end.
+    private static func exitStatus(_ payload: [UInt8]) -> Int? {
+        guard payload.count > 6, payload[5] == 0x3B else { return nil }
+        var value = 0
+        var digits = 0
+        for byte in payload[6...] {
+            if byte == 0x3B { break }
+            guard byte >= 0x30, byte <= 0x39, digits < 9 else { return nil }
+            value = value * 10 + Int(byte - 0x30)
+            digits += 1
+        }
+        return digits > 0 ? value : nil
     }
 }
 
@@ -10590,6 +10655,10 @@ extension TerminalSemanticPromptStateTracker {
         payload = saved.payload
         promptActive = saved.promptActive
         executions = saved.executions
+        // A restored stream has no live completion; the next 133;D records one.
+        completedExecutions = 0
+        lastExitStatus = nil
+        markersSeen = false
         return true
     }
 }
