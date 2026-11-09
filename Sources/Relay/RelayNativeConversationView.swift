@@ -68,9 +68,16 @@ struct RelayNativeConversationView: View {
                 }
                 Spacer(minLength: 8)
                 if let snapshot = conversation.snapshot {
-                    Text(snapshot.phase.capitalized).font(.caption.weight(.medium)).foregroundStyle(.secondary)
-                        .padding(.horizontal, 9).padding(.vertical, 5)
-                        .background(RelayAgentDesign.wash, in: Capsule())
+                    HStack(spacing: 5) {
+                        if snapshot.phase == "running" { ProgressView().controlSize(.mini).frame(width: 12, height: 12) }
+                        Text(snapshot.phase == "running" ? "Working" : snapshot.phase.capitalized)
+                        if snapshot.phase == "running", let step = currentStep {
+                            RelayNativeStepLabel(step: step.title).id(step.id)
+                        }
+                    }
+                    .font(.caption.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(RelayAgentDesign.wash, in: Capsule())
                 } else { ProgressView().controlSize(.small) }
                 Button("Reconnect", systemImage: "arrow.clockwise") { observation = UUID() }
                     .labelStyle(.iconOnly).help("Read the same worker without replaying actions")
@@ -84,11 +91,14 @@ struct RelayNativeConversationView: View {
             }
             Divider()
             if let failure = conversation.failure {
+                let shown = RelayConversationErrorText.userFacing(failure)
                 HStack(alignment: .top) {
-                    Image(systemName: "exclamationmark.triangle")
-                    Text(failure).textSelection(.enabled)
+                    Image(systemName: RelayTheme.StatusRole.warning.symbol).foregroundStyle(RelayTheme.StatusRole.warning.color)
+                    Text(shown.message).textSelection(.enabled)
                     Spacer()
-                }.font(.callout).padding(12).background(Color.orange.opacity(0.1))
+                    if let raw = shown.detail { RelayErrorDetails(raw: raw) }
+                }.font(.callout).padding(12).background(RelayTheme.StatusRole.warning.color.opacity(0.1))
+                    .help(shown.detail ?? "")
             }
             if conversation.uncertainAction != nil {
                 HStack {
@@ -111,8 +121,10 @@ struct RelayNativeConversationView: View {
                         if (conversation.snapshot?.olderBefore ?? 0) > 0 {
                             Button("Load earlier messages") { Task { await conversation.loadOlder() } }
                         }
-                        ForEach(items) { item in
-                            RelayNativeMessageRow(item: item).id(item.id)
+                        let shown = items
+                        let live = liveIDs(shown)
+                        ForEach(shown) { item in
+                            RelayNativeMessageRow(item: item, live: live.contains(item.id)).id(item.id)
                         }
                         ForEach(conversation.snapshot?.requests ?? []) { request in
                             RelayNativeRequestView(request: request, disabled: unavailable ||
@@ -164,6 +176,19 @@ struct RelayNativeConversationView: View {
                 .padding(.horizontal, 20).padding(.vertical, 12)
         }
         .task(id: observation) { if observeLive { await conversation.observe() } }
+    }
+    /// Unanswered trailing calls while the turn is running.
+    private func liveIDs(_ items: [RelayNativeItem]) -> Set<String> {
+        let indices = RelayToolPresentation.liveIndices(statuses: items.map { $0.role == "tool" ? $0.status ?? "" : nil },
+                                                        active: conversation.snapshot?.phase == "running")
+        return Set(indices.map { items[$0].id })
+    }
+    /// The latest live call, for the header ("Using Bash · 12 s").
+    private var currentStep: (id: String, title: String)? {
+        let shown = items
+        let live = liveIDs(shown)
+        guard let item = shown.last(where: { live.contains($0.id) }) else { return nil }
+        return (item.id, RelayToolPresentation(tool: item.tool ?? "", text: item.text).name)
     }
     private var items: [RelayNativeItem] {
         let current = conversation.snapshot?.items ?? []
@@ -218,16 +243,22 @@ struct RelayNativeConversationView: View {
 
 private struct RelayNativeMessageRow: View {
     let item: RelayNativeItem
+    var live = false
     private var presentation: RelayNativeItemPresentation { .init(item: item) }
 
     var body: some View {
+        if item.role == "tool" {
+            RelayNativeToolCard(item: item, live: live)
+        } else {
+            message
+        }
+    }
+
+    private var message: some View {
         HStack(alignment: .top, spacing: 10) {
             if item.role == "user" { Spacer(minLength: 32) }
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 7) {
-                    if item.role == "tool" {
-                        Image(systemName: "wrench.and.screwdriver").font(.caption)
-                    }
                     Text(item.role.capitalized).font(.caption.weight(.semibold))
                     if let tool = item.tool { Text(tool).font(.caption.monospaced()) }
                     Spacer(minLength: 8)
@@ -243,7 +274,7 @@ private struct RelayNativeMessageRow: View {
                         }
                     }
                 } else {
-                    Text(item.text).font(item.role == "tool" ? .system(.callout, design: .monospaced) : .body)
+                    Text(item.text).font(.body)
                         .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if item.truncated == true { Text("Display truncated").font(.caption).foregroundStyle(.secondary) }
@@ -254,6 +285,59 @@ private struct RelayNativeMessageRow: View {
                 in: RoundedRectangle(cornerRadius: 12))
             if item.role != "user" { Spacer(minLength: 0).frame(width: 0) }
         }.frame(maxWidth: .infinity, alignment: item.role == "user" ? .trailing : .leading)
+    }
+}
+
+/// One tool call: "Bash · git status", its state, and bounded output.
+private struct RelayNativeToolCard: View {
+    let item: RelayNativeItem
+    private let state: RelayToolState
+    private let presentation: RelayToolPresentation
+
+    init(item: RelayNativeItem, live: Bool) {
+        self.item = item
+        state = RelayToolState(status: item.status ?? "", live: live)
+        presentation = RelayToolPresentation(tool: item.tool ?? "", text: item.text)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "wrench.and.screwdriver")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text(presentation.title).font(.caption.weight(.semibold)).foregroundStyle(.primary.opacity(0.85))
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 8)
+                RelayToolStateBadge(state: state)
+            }
+            if !presentation.lines.isEmpty {
+                RelayToolOutputView(axID: "native.tool." + item.id, presentation: presentation, failed: state == .failed)
+            }
+            if item.truncated == true { Text("Display truncated").font(.caption).foregroundStyle(.secondary) }
+        }
+        .padding(10)
+        .background(RelayAgentDesign.wash, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            if state == .failed {
+                RoundedRectangle(cornerRadius: 12).strokeBorder(state.role.color.opacity(0.55))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(presentation.title + ", " + state.spoken)
+    }
+}
+
+/// "Using Bash · 12 s", counted from when this view first showed the step.
+private struct RelayNativeStepLabel: View {
+    let step: String
+    @State private var shownAt = Date()
+    var body: some View {
+        TimelineView(.periodic(from: shownAt, by: 1)) { context in
+            Text("· Using " + step + " · " + RelayToolPresentation.elapsed(context.date.timeIntervalSince(shownAt)))
+                .monospacedDigit()
+        }
     }
 }
 
