@@ -25,6 +25,18 @@ var hostUpgradeListenerDrain = 10 * time.Second
 // replaced, so it resumes the listeners it drained.
 var hostUpgradeHandoff = 30 * time.Second
 
+// Upgrade inspection bounds. Finished (exited/failed) records cost one small
+// read each and never block, so finished history alone cannot defer an
+// upgrade; the scan as a whole is held to a time budget inside the 30-second
+// probe (listener drain is a further 10 s). Unfinished records need a
+// process check each, so at most hostUpgradeUnfinishedLimit of them are
+// inspected. The entry ceiling only stops a pathological directory.
+var (
+	hostUpgradeScanBudget       = 15 * time.Second
+	hostUpgradeUnfinishedLimit  = 4096
+	hostUpgradeLedgerEntryLimit = 200000
+)
+
 // Reservations and the upgrade barrier share one lock. A snapshot alone would
 // permit a new job to start between the check and supervisor SIGTERM.
 func (s *Server) prepareHostUpgrade() error {
@@ -51,12 +63,17 @@ func (s *Server) prepareHostUpgrade() error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("cannot inspect host jobs: %w", err)
 	}
-	if len(entries) > 4096 {
+	if len(entries) > hostUpgradeLedgerEntryLimit {
 		return errors.New("host job ledger exceeds upgrade inspection limit")
 	}
+	scanDeadline := time.Now().Add(hostUpgradeScanBudget)
+	unfinished := 0
 	for _, entry := range entries {
 		if !entry.IsDir() || known[entry.Name()] {
 			continue
+		}
+		if time.Now().After(scanDeadline) {
+			return errors.New("host job ledger inspection exceeded its time budget; upgrade deferred")
 		}
 		if !validSessionID.MatchString(entry.Name()) {
 			return errors.New("invalid host job ledger entry")
@@ -73,6 +90,9 @@ func (s *Server) prepareHostUpgrade() error {
 		}
 		if record.State == "exited" || record.State == "failed" {
 			continue
+		}
+		if unfinished++; unfinished > hostUpgradeUnfinishedLimit {
+			return errors.New("host job ledger exceeds upgrade inspection limit")
 		}
 		// Quiescence concerns the recorded process incarnation, not a reused
 		// PID. A proven replacement cannot be the old job. Unknown identity
