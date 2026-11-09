@@ -5038,11 +5038,14 @@ struct ConnectionPath: View {
                 .accessibilityLabel("Pane " + pane.displayName)
                 .onTapGesture(count: 2) { rename?() }
             if pane.profile.kind == .ssh, pane.displayName != pane.profile.host {
-                Text(pane.profile.host)
-                    .font(RelayTheme.font(size: 11, weight: .medium))
-                    .foregroundStyle(RelayTheme.textFaint)
-                    .lineLimit(1)
-                    .layoutPriority(-2)
+                droppable {
+                    Text(pane.profile.host)
+                        .font(RelayTheme.font(size: 11, weight: .medium))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .lineLimit(1)
+                        .help(pane.profile.host)
+                }
+                .layoutPriority(-2)
             }
             if pane.profile.kind == .ssh {
                 Text(pane.profile.backend == .relay ? "" : "SSH")
@@ -5051,13 +5054,15 @@ struct ConnectionPath: View {
             }
             if let directory = pane.directory, !directory.isEmpty {
                 let component = TerminalPathSyntax.lastComponent(directory)
-                Text(component.isEmpty ? "/" : component)
-                    .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(RelayTheme.textFaint)
-                    .lineLimit(1)
-                    .layoutPriority(-1)
-                    .help(directory)
-                    .accessibilityLabel("Working directory \(directory)")
+                droppable {
+                    Text(component.isEmpty ? "/" : component)
+                        .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .lineLimit(1)
+                        .help(directory)
+                        .accessibilityLabel("Working directory \(directory)")
+                }
+                .layoutPriority(-1)
             }
             if pane.contentKind == .editor {
                 Label("Editor", systemImage: "curlybraces")
@@ -5092,7 +5097,7 @@ struct ConnectionPath: View {
                 RelayBadge(status.text, role: status.role)
                     .fixedSize()
                     .layoutPriority(2)
-                    .help(status.text)
+                    .help(status.text + (pane.lastCommandExitCode.map { $0 == 0 ? "" : " · last command exited with status \($0)" } ?? ""))
             }
             if connectionNormal { RelayProgramStatusBadge(pane: pane).layoutPriority(2) }
             if let progress = pane.terminalProgressPercent {
@@ -5109,7 +5114,8 @@ struct ConnectionPath: View {
                     .help("Command in progress")
                     .accessibilityLabel("Command in progress")
             }
-            if let exitCode = pane.lastCommandExitCode {
+            // An exited or disconnected pane already shows that as its status.
+            if connectionNormal, let exitCode = pane.lastCommandExitCode {
                 Image(systemName: exitCode == 0 ? "checkmark.circle" : "xmark.circle")
                     .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(exitCode == 0 ? RelayTheme.textFaint : RelayTheme.coral)
@@ -5201,6 +5207,15 @@ struct ConnectionPath: View {
             if pane.profile.kind == .ssh, pane.profile.backend == .relay, let terminate {
                 Button("Terminate remote pane…", role: .destructive, action: terminate)
             }
+        }
+    }
+
+    /// A secondary field that cannot show a readable stub is hidden, not shown as one letter.
+    private func droppable<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        let shown = content()
+        return ViewThatFits(in: .horizontal) {
+            shown.frame(minWidth: 56, alignment: .leading)
+            Color.clear.frame(width: 0, height: 0)
         }
     }
 
