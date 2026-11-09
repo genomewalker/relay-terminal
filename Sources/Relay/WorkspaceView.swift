@@ -26,6 +26,8 @@ extension Notification.Name {
     static let relayShowHPC = Notification.Name("relay.showHPC")
     static let relayShowPlugin = Notification.Name("relay.showPlugin")
     static let relayConnectPaneSessions = Notification.Name("relay.connect-pane-sessions")
+    /// Opens the agent inspector on a pane's main agent; the object is the pane id.
+    static let relayInspectPaneAgent = Notification.Name("relay.inspect-pane-agent")
 }
 
 private struct PaneConnectionRequest: Identifiable {
@@ -125,6 +127,7 @@ struct WorkspaceView: View {
                     pane: pane,
                     subagentID: selection.subagentID,
                     showTerminal: { workspace.revealPane(selection.paneID, origin: .user) },
+                    inspect: { workspace.inspectAgent(paneID: selection.paneID, subagentID: $0) },
                     close: workspace.closeAgentInspector
                 )
                 // Recreate the panel when the inspected agent changes: its
@@ -228,6 +231,7 @@ struct WorkspaceView: View {
             guard let id = notification.object as? UUID, workspace.panes[id] != nil else { return }
             paneConnectionRequest = PaneConnectionRequest(id: id)
         }
+        .modifier(RInspectPaneAgentRequests(workspace: workspace))
         .sheet(item: $paneConnectionRequest) { request in
             PeerNetworkTopologyView(workspace: workspace, connectionOnly: true, startingPaneID: request.id, manage: {})
         }
@@ -708,16 +712,57 @@ private struct AgentInboxRow: View {
     }
 }
 
-private struct AgentInspectorSnapshot: Equatable {
+/// Opens the agent inspector when a pane header asks for its agent's details.
+private struct RInspectPaneAgentRequests: ViewModifier {
+    let workspace: WorkspaceModel
+
+    func body(content: Content) -> some View {
+        content.onReceive(NotificationCenter.default.publisher(for: .relayInspectPaneAgent)) { notification in
+            guard let id = notification.object as? UUID, workspace.panes[id] != nil else { return }
+            workspace.inspectAgent(paneID: id)
+        }
+    }
+}
+
+/// Header text that opens something: plain until hovered, then underlined.
+struct RelayHeaderLinkStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Label(label: configuration.label, pressed: configuration.isPressed)
+    }
+
+    private struct Label<Content: View>: View {
+        let label: Content
+        let pressed: Bool
+        @State private var hovering = false
+
+        var body: some View {
+            label
+                .underline(hovering)
+                .opacity(pressed ? 0.6 : 1)
+                .onHover { inside in
+                    hovering = inside
+                    if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                }
+        }
+    }
+}
+
+struct AgentInspectorSnapshot: Equatable {
     let kind: AgentKind
     let agent: SubagentActivity?
     let plans: [AgentTaskPlan]
+    /// The pane's sub-agents, listed only for the main agent's view.
+    var subagents: [SubagentActivity] = []
+    /// The main agent's status as the pane header words it.
+    var statusText: String? = nil
 }
 
-private struct AgentInspectorPanel: View {
+struct AgentInspectorPanel: View {
     let pane: PaneModel
-    let subagentID: String
+    /// Nil shows the pane's main agent.
+    let subagentID: String?
     let showTerminal: () -> Void
+    var inspect: (String) -> Void = { _ in }
     let close: () -> Void
     @State private var settledOffset: CGSize = .zero
     @State private var panelSize = CGSize(width: 470, height: 410)
@@ -730,13 +775,15 @@ private struct AgentInspectorPanel: View {
 
     init(
         pane: PaneModel,
-        subagentID: String,
+        subagentID: String?,
         showTerminal: @escaping () -> Void,
+        inspect: @escaping (String) -> Void = { _ in },
         close: @escaping () -> Void
     ) {
         self.pane = pane
         self.subagentID = subagentID
         self.showTerminal = showTerminal
+        self.inspect = inspect
         self.close = close
         self._snapshot = State(initialValue: Self.capture(pane: pane, subagentID: subagentID))
     }
@@ -814,7 +861,7 @@ private struct AgentInspectorPanel: View {
             Image(systemName: snapshot.kind.symbol)
                 .font(RelayTheme.font(size: 11, weight: .medium))
                 .foregroundStyle(RelayTheme.textMuted)
-            Text("Agent thread")
+            Text(subagentID == nil ? "Agent details" : "Agent thread")
                 .font(RelayTheme.font(size: 11.5, weight: .medium))
                 .foregroundStyle(RelayTheme.text)
             Text(snapshot.kind.label)
@@ -872,8 +919,9 @@ private struct AgentInspectorPanel: View {
         .onKeyPress(.downArrow) { settledOffset.height += 20; return .handled }
     }
 
-    private static func capture(pane: PaneModel, subagentID: String) -> AgentInspectorSnapshot {
-        AgentInspectorSnapshot(
+    static func capture(pane: PaneModel, subagentID: String?) -> AgentInspectorSnapshot {
+        guard let subagentID else { return captureMainAgent(pane: pane) }
+        return AgentInspectorSnapshot(
             kind: pane.kind,
             agent: pane.subagents.first { $0.id == subagentID },
             plans: pane.taskPlans.filter { plan in
@@ -881,6 +929,29 @@ private struct AgentInspectorPanel: View {
                 return plan.id == pane.kind.rawValue + ":" + subagentID ||
                     agent?.threadID.map { plan.id == pane.kind.rawValue + ":" + $0 } == true
             }
+        )
+    }
+
+    /// The pane's own agent as one thread: its recent steps, newest first,
+    /// every task plan in the pane, and its sub-agents to open from here.
+    static func captureMainAgent(pane: PaneModel) -> AgentInspectorSnapshot {
+        let steps = pane.agentActivities
+        let ended = pane.phase == .exited || pane.phase == .quiet
+        return AgentInspectorSnapshot(
+            kind: pane.kind,
+            agent: SubagentActivity(
+                id: "",
+                label: pane.customName ?? pane.harnessLabel,
+                startedAt: steps.first?.occurredAt ?? pane.lastActivity,
+                provider: pane.kind,
+                phase: pane.phase,
+                completedAt: ended ? steps.last?.occurredAt : nil,
+                // Newest first: the step the header shows heads the list.
+                updates: steps.reversed().map { SubagentUpdate(id: $0.id, message: $0.label, occurredAt: $0.occurredAt) }
+            ),
+            plans: pane.taskPlans,
+            subagents: pane.subagents,
+            statusText: pane.headerStatus?.text
         )
     }
 
@@ -894,6 +965,48 @@ private struct AgentInspectorPanel: View {
         if !active, refreshPending {
             refreshSnapshot()
         }
+    }
+
+    /// The main agent's sub-agents, newest first; each opens its own thread.
+    private var subagentList: some View {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
+            Text("Sub-agents")
+                .font(RelayTheme.font(size: 10, weight: .medium))
+                .foregroundStyle(RelayTheme.textFaint)
+                .padding(.horizontal, RelayTheme.spacing(16))
+            ScrollView {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
+                    ForEach(snapshot.subagents.reversed()) { subagent in
+                        Button { inspect(subagent.id) } label: {
+                            HStack(spacing: RelayTheme.spacing(8)) {
+                                Circle().fill(subagent.phase.color).frame(width: 6, height: 6)
+                                Text(subagent.label)
+                                    .font(RelayTheme.font(size: 11.5, weight: .medium))
+                                    .foregroundStyle(RelayTheme.text)
+                                    .lineLimit(1)
+                                Text(subagent.updates.last?.message ?? "")
+                                    .font(RelayTheme.font(size: 11))
+                                    .foregroundStyle(RelayTheme.textMuted)
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                Image(systemName: "chevron.right")
+                                    .font(RelayTheme.font(size: 9, weight: .medium))
+                                    .foregroundStyle(RelayTheme.textFaint)
+                            }
+                            .padding(.horizontal, RelayTheme.spacing(16))
+                            .frame(height: 26)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open \(subagent.label)")
+                        .accessibilityLabel("Open sub-agent \(subagent.label)")
+                    }
+                }
+            }
+            .frame(maxHeight: 110)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.bottom, RelayTheme.spacing(10))
     }
 
     private func inspectorContent(_ agent: SubagentActivity) -> some View {
@@ -919,7 +1032,7 @@ private struct AgentInspectorPanel: View {
                     Spacer()
                     HStack(spacing: RelayTheme.spacing(5)) {
                         Circle().fill(agent.phase.color).frame(width: 6, height: 6)
-                        Text(agent.phase == .active ? PaneDisplayState.working.label : "Finished")
+                        Text(snapshot.statusText ?? (agent.phase == .active ? PaneDisplayState.working.label : "Finished"))
                             .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                             .foregroundStyle(agent.phase.color)
                     }
@@ -939,6 +1052,8 @@ private struct AgentInspectorPanel: View {
                 .foregroundStyle(RelayTheme.textFaint)
             }
             .padding(RelayTheme.spacing(16))
+
+            if !snapshot.subagents.isEmpty { subagentList }
 
             Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
 
@@ -5152,11 +5267,17 @@ struct ConnectionPath: View {
             Spacer(minLength: 8)
             if let detail = pane.headerActivityDetail {
                 droppable {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(RelayTheme.textMuted)
-                        .lineLimit(1)
-                        .help(detail)
+                    Button(action: inspectAgent) {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(RelayTheme.textMuted)
+                            .lineLimit(1)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(RelayHeaderLinkStyle())
+                    .help(detail + " · Show agent details")
+                    .accessibilityLabel(detail)
+                    .accessibilityHint("Shows agent details")
                 }
                 .layoutPriority(-1)
             }
@@ -5253,6 +5374,7 @@ struct ConnectionPath: View {
                     }
                 }
                 Button(pane.nativeConversationVisible ? "Return to terminal" : "View CLI conversation", action: toggleConversation)
+                if pane.kind != .shell { Button("Agent details…", action: inspectAgent) }
                 Button("Connect with other sessions…") {
                     NotificationCenter.default.post(name: .relayConnectPaneSessions, object: pane.id)
                 }
@@ -5303,6 +5425,7 @@ struct ConnectionPath: View {
                     .disabled(linkSelection.connecting)
             }
             Button(pane.nativeConversationVisible ? "Return to terminal" : "View CLI conversation", action: toggleConversation)
+            if pane.kind != .shell { Button("Agent details…", action: inspectAgent) }
             if let toggleFloating {
                 Button(isFloating ? "Dock pane" : "Float pane", action: toggleFloating)
             }
@@ -5324,6 +5447,12 @@ struct ConnectionPath: View {
                  arrowEdge: .bottom) {
             RelayAgentPicker(pane: pane) { agentPicker.paneID = nil }
         }
+    }
+
+    /// Opens the floating inspector on this pane's agent: its steps, plans and sub-agents.
+    private func inspectAgent() {
+        select()
+        NotificationCenter.default.post(name: .relayInspectPaneAgent, object: pane.id)
     }
 
     private func toggleConversation() {

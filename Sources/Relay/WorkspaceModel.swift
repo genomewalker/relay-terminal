@@ -1,9 +1,12 @@
 import AppKit
 import Foundation
 
+/// The agent the floating inspector shows: one sub-agent thread, or, when
+/// `subagentID` is nil, the pane's main agent with its recent steps, plans
+/// and sub-agents.
 struct AgentInspectorSelection: Hashable, Sendable {
     let paneID: UUID
-    let subagentID: String
+    let subagentID: String?
 }
 
 enum TabMovePlacement: String, Codable, Equatable, Sendable {
@@ -872,7 +875,7 @@ final class WorkspaceModel: ObservableObject {
         NSApp?.keyWindow?.makeFirstResponder(nil)
     }
 
-    func inspectAgent(paneID: UUID, subagentID: String) {
+    func inspectAgent(paneID: UUID, subagentID: String? = nil) {
         intelligencePanelVisible = false
         agentInspector = AgentInspectorSelection(paneID: paneID, subagentID: subagentID)
     }
