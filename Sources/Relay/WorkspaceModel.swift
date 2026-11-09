@@ -54,6 +54,36 @@ private struct SupervisorAdvisoryRequestKey: Equatable {
     let stage: RelaySupervisorStage
 }
 
+/// Names a newly created tab. A tab opened in a project directory is named
+/// after it ("sapropel"); without one, or in a home directory or "/", it keeps
+/// the host name with an ordinal ("dandy-07 3"). Existing tabs are never
+/// renamed; duplicate names are told apart by `tabDisplayName`.
+enum WorkspaceTabNaming {
+    static func newTabName(directory: String?, profileName: String, ordinal: Int,
+                           home: String = NSHomeDirectory()) -> String {
+        if let name = directoryName(directory, home: home) { return name }
+        return ordinal == 1 ? profileName : "\(profileName) \(ordinal)"
+    }
+
+    /// The directory's last component, or nil for no directory, "/", "~" and
+    /// home directories: the local home, or /home/<user>, /Users/<user> and
+    /// /root on a remote host whose home is not known here.
+    static func directoryName(_ directory: String?, home: String = NSHomeDirectory()) -> String? {
+        var path = directory?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+        guard !path.isEmpty, path != "/", path != "~" else { return nil }
+        var homePath = home
+        while homePath.count > 1, homePath.hasSuffix("/") { homePath.removeLast() }
+        if !homePath.isEmpty, homePath != "/", path == homePath { return nil }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true)
+        if path.hasPrefix("/"), components.count == 2, ["home", "Users"].contains(components[0]) { return nil }
+        if path == "/root" { return nil }
+        let name = TerminalPathSyntax.lastComponent(path)
+        guard !name.isEmpty, name != ".", name != ".." else { return nil }
+        return String(name.prefix(80))
+    }
+}
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var tabs: [TabModel] = [] {
@@ -1136,6 +1166,26 @@ final class WorkspaceModel: ObservableObject {
             throw PluginError.invalid("Tab name must contain 1–80 characters and target an existing tab")
         }
         tabs[index].name = trimmed
+        // A rename, even to the same text, ends automatic naming for good.
+        tabs[index].automaticName = nil
+        persistWorkspace()
+    }
+
+    /// Names a tab that still has its generated name after the folder its
+    /// first pane reports, once: the first real folder is adopted and later
+    /// cd's are not followed. "/", "~" and home directories are skipped and
+    /// the tab keeps waiting. Runs only when a pane's directory changes.
+    func adoptAutomaticTabName(for pane: PaneModel) {
+        guard let tab = tabs.first(where: { $0.automaticName != nil && $0.allPaneIDs.first == pane.id }),
+              let generated = tab.automaticName else { return }
+        guard tab.name == generated else {
+            // Named some other way since (the user, an agent): never again.
+            tab.automaticName = nil
+            return
+        }
+        guard let name = WorkspaceTabNaming.directoryName(pane.directory) else { return }
+        tab.automaticName = nil
+        tab.name = name
         persistWorkspace()
     }
 
@@ -1233,6 +1283,7 @@ final class WorkspaceModel: ObservableObject {
         RelayCapacityManagementCoordinator.shared.didCreate(pane)
         storePane(pane)
         let tab = TabModel(sessionID: UUID(), name: profile.name, firstPane: pane.id)
+        tab.automaticName = tab.name
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         withTabAdmission(tabAdmission(for: origin)) { tabs.append(tab) }
         selectedTabID = tab.id
@@ -1594,6 +1645,7 @@ final class WorkspaceModel: ObservableObject {
             tab.restoreLayout(legacy: saved.layout, visible: saved.visibleLayout, stacks: saved.stacks)
             tab.splitRatios = saved.splitRatios ?? [:]
             restoreRLayout(saved, in: tab)
+            tab.automaticName = saved.automaticName
             if tab.splitRatios.isEmpty { tab.balanceSplits() }
             for paneID in tab.allPaneIDs {
                 if let pane = panes[paneID] {
@@ -1660,12 +1712,13 @@ final class WorkspaceModel: ObservableObject {
             : nil
         let pane = PaneModel(profile: targetProfile, remoteParentSessionID: parentSessionID, startDirectory: directory)
         storePane(pane)
-        let ordinal = sessionTabs.count + 1
         let tab = TabModel(
             sessionID: sessionID,
-            name: ordinal == 1 ? targetProfile.name : "\(targetProfile.name) \(ordinal)",
+            name: WorkspaceTabNaming.newTabName(directory: directory, profileName: targetProfile.name,
+                                                ordinal: sessionTabs.count + 1),
             firstPane: pane.id
         )
+        if WorkspaceTabNaming.directoryName(directory) == nil { tab.automaticName = tab.name }
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         // A human session switcher or "new tab in session" files the tab with
         // its source tab, even when that legacy session has no workspace.
@@ -2310,6 +2363,7 @@ final class WorkspaceModel: ObservableObject {
                     name: recovery.tab.name,
                     firstPane: saved.id
                 )
+                tab.automaticName = recovery.tab.automaticName
                 let index = min(recovery.tabIndex, tabs.count)
                 tabs.insert(tab, at: index)
                 restoredTab = tab
@@ -2719,6 +2773,7 @@ final class WorkspaceModel: ObservableObject {
             tab.restoreLayout(legacy: saved.layout, visible: saved.visibleLayout, stacks: saved.stacks)
             tab.splitRatios = saved.splitRatios ?? [:]
             restoreRLayout(saved, in: tab)
+            tab.automaticName = saved.automaticName
             if tab.splitRatios.isEmpty { tab.balanceSplits() }
             return tab
         }
@@ -2811,6 +2866,7 @@ final class WorkspaceModel: ObservableObject {
 
     func storePane(_ pane: PaneModel) {
         panes[pane.id] = pane
+        pane.onDirectoryChange = { [weak self] pane in self?.adoptAutomaticTabName(for: pane) }
         if monitorsStoredPanes { pane.startAgentMonitoring(monitor: agentMonitorService) }
         RelaySurfacePublication.shared.restore(pane)
         if pane.contentKind == .editor {
@@ -3742,6 +3798,7 @@ final class WorkspaceModel: ObservableObject {
             rLayoutEditorID: tab.rLayoutEditorID,
             rResultsVisible: tab.rLayoutEditorID.flatMap { panes[$0]?.editorRuntime.showsRResults }
         )
+        snapshot.automaticName = tab.automaticName
         if !tab.stacks.isEmpty {
             snapshot.visibleLayout = tab.layout
             snapshot.stacks = tab.stacks
@@ -4018,6 +4075,10 @@ struct TabSnapshot: Codable, Sendable {
     /// projection with every stacked pane tiled, for older readers.
     var visibleLayout: PaneLayout? = nil
     var stacks: [PaneStack]? = nil
+    /// Set only by builds that name tabs after their folder, while the tab
+    /// still has its generated name. Absent in older saves: those tabs keep
+    /// their names, since a "<host> N" name alone cannot tell auto from typed.
+    var automaticName: String? = nil
 }
 
 struct PaneSnapshot: Codable, Sendable {

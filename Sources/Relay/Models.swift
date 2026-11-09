@@ -616,7 +616,12 @@ final class PaneModel: ObservableObject, Identifiable {
     let requiresExistingWorker: Bool
     @Published var title: String
     @Published var customName: String?
-    @Published var directory: String?
+    @Published var directory: String? {
+        didSet { if directory != oldValue { onDirectoryChange?(self) } }
+    }
+    /// Told when `directory` changes (an OSC 7 cwd report, mostly). Set by
+    /// the workspace to name a tab after its first pane's folder.
+    var onDirectoryChange: ((PaneModel) -> Void)?
     /// A starting directory requested for a new worker. Not a claim about the
     /// shell's real cwd: `directory` changes only from observed cwd reports.
     let requestedStartDirectory: String?
@@ -1817,6 +1822,10 @@ final class TabModel: ObservableObject, Identifiable {
     let id: UUID
     let sessionID: UUID
     @Published var name: String
+    /// The name Relay generated for this tab ("dandy-07 3") while it still
+    /// waits to be named after its first pane's folder; nil once named, by
+    /// that folder, the user or an agent. Older saved tabs have none.
+    var automaticName: String?
     @Published var layout: PaneLayout {
         didSet { notePanesLeft(oldValue.paneIDs + floatingPanes.map(\.paneID) + hiddenStackPaneIDs, via: "layout") }
     }

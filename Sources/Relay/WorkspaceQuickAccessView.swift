@@ -47,7 +47,7 @@ struct WorkspacePinnedMenu: View {
                     workspace.togglePanePin(pane.id)
                 }
             }
-        } label: { Label("Pinned", systemImage: "pin").font(RelayTheme.font(size: 11)) }
+        } label: { Label("Pinned", systemImage: "pin").labelStyle(.iconOnly).font(RelayTheme.font(size: 11)) }
         .menuStyle(.borderlessButton).fixedSize()
         .accessibilityIdentifier("relay.workspace.pinned")
         .help("Pinned tabs and panes from every workspace. Drop a tab or pane here to pin it.")
