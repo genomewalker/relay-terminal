@@ -90,10 +90,16 @@ enum TerminalCommandWait {
     }
 
     static func json(_ outcome: Outcome, paneID: UUID, after: UInt64) -> [String: Any] {
-        var result: [String: Any] = ["pane_id": paneID.uuidString.lowercased(), "after": after, "source": source]
+        // next_after is the handle for waiting again: the returned command's
+        // generation, or the same handle while that command has not returned.
+        // A running result's generation is the command's own number and would
+        // never match it.
+        var result: [String: Any] = ["pane_id": paneID.uuidString.lowercased(), "after": after,
+                                     "next_after": after, "source": source]
         switch outcome {
         case .returned(let status, let generation):
             result["state"] = "returned"
+            result["next_after"] = generation
             result["exit_status"] = status.map { $0 as Any } ?? NSNull()
             result["generation"] = generation
         case .running(let generation):

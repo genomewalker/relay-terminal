@@ -35,10 +35,13 @@ authorization rules.
    changing focus or scroll position.
 5. To wait for that command instead of sleeping and polling, call
    `relay_wait_for_command` with the same `pane_id` and `after` set to the
-   `commandGeneration` in `relay_send_command`'s result (`timeout_ms` defaults
-   to 30000, at most 600000). It is read-only, needs no grant beyond reading a
+   `commandGeneration` in `relay_send_command`'s result, only after that result
+   reported the input as submitted; otherwise a later unrelated command may
+   answer (`timeout_ms` defaults to 30000, at most 600000). To wait again, pass
+   the result's `next_after`, not its `generation`. It is read-only, needs no grant beyond reading a
    viewport, and never writes to or probes the pane. It returns `returned` with
-   `exit_status` and `generation`, `running` at the timeout, `pane_exited` with
+   `exit_status` and `generation`, `running` at the timeout (possibly stale
+   after a replay or reconnect within the same transport), `pane_exited` with
    the pane program's `exit_code` when known, or `unknown` with a `reason`
    (no shell integration seen, not a Relay worker pane, disconnected,
    reconnected, or no command start observed). The status comes from the
