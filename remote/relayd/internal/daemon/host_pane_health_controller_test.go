@@ -986,3 +986,40 @@ func TestPaneHealthLockWaitStillSucceedsWhenTheHolderReleasesInTime(t *testing.T
 		t.Fatalf("live check did not apply after waiting: %s", pyCompact(result))
 	}
 }
+
+// A long launch command (an initial prompt) lives only in resume_command,
+// which health never keeps, so it must not count against the proof cap; a
+// kept proof over the cap, and a failed probe, each say why they were refused.
+func TestPaneHealthProbeCapCountsOnlyTheKeptProof(t *testing.T) {
+	backend := newPHFakeBackend()
+	c := &paneHealthController{root: t.TempDir(), backend: backend, now: func() any { return int64(1) }, parentAlive: func() bool { return true }}
+
+	long := phProof(phPane, "claude", 1234)
+	long.Set("resume_command", strings.Repeat("p", 40000))
+	long.Set("resume_error", nil)
+	backend.native[phPane] = long
+	proof := c.probe(phPane)
+	if proof.Has("unavailable") || proof.Has("resume_command") || !pyEqual(proof.Get("session_id"), "owned-session") {
+		t.Fatalf("bound proof with a long resume command was refused or leaked it: %s", pyCompact(proof))
+	}
+	if facts := c.observe(phPane); pyIndex(facts.Get("facts"), "identity_verified") != true {
+		t.Fatalf("identity not verified: %s", pyCompact(facts))
+	}
+
+	oversized := phProof(phPane, "claude", 1234)
+	oversized.Set("subagent_work", strings.Repeat("s", 40000))
+	backend.native[phPane] = oversized
+	if got := c.probe(phPane).Get("unavailable"); got != "Native identity could not be verified on this host: the native proof exceeded its size limit." {
+		t.Fatalf("oversized kept proof: %v", got)
+	}
+
+	delete(backend.native, phPane)
+	if got := c.probe(phPane).Get("unavailable"); got != "Native identity could not be verified on this host: the native probe failed." {
+		t.Fatalf("failed probe: %v", got)
+	}
+
+	backend.native[phPane] = pyListOf()
+	if got := c.probe(phPane).Get("unavailable"); got != "Native identity could not be verified on this host: the native probe returned no proof." {
+		t.Fatalf("non-object probe: %v", got)
+	}
+}

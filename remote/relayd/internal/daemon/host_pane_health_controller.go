@@ -583,8 +583,11 @@ func (c *paneHealthController) current(config *pyObject) bool {
 func paneHealthIsInt(v any) bool { return pyIsInt(v) }
 
 func (c *paneHealthController) probe(pane string) *pyObject {
-	unavailable := func() *pyObject {
-		return pyObj("version", int64(1), "unavailable", "Native identity could not be verified on this host.")
+	// Each refusal names its cause, so a pane that relay_agent_binding
+	// reports bound but health cannot verify is diagnosable. The reasons are
+	// fixed text: no backend error string or proof content is copied.
+	unavailable := func(reason string) *pyObject {
+		return pyObj("version", int64(1), "unavailable", "Native identity could not be verified on this host: "+reason)
 	}
 	value, err := c.backend.Probe(pane)
 	if errors.Is(err, errPaneHealthBackendLost) {
@@ -592,15 +595,24 @@ func (c *paneHealthController) probe(pane string) *pyObject {
 		// unverified observations because the backend itself went away.
 		panic(paneHealthOSError{err})
 	}
+	if err != nil {
+		return unavailable("the native probe failed.")
+	}
 	proof, ok := value.(*pyObject)
-	if err != nil || !ok || len(pyCompact(proof)) > 32768 {
-		return unavailable()
+	if !ok {
+		return unavailable("the native probe returned no proof.")
 	}
 	filtered := newPyObject()
 	for _, key := range proof.Keys() {
 		if key != "resume_command" && key != "resume_error" {
 			filtered.Set(key, proof.Get(key))
 		}
+	}
+	// The cap bounds what health keeps. The resume command is never kept and
+	// carries the agent's launch arguments, including any initial prompt, so
+	// counting it refused a correctly bound agent launched with a long one.
+	if len(pyCompact(filtered)) > 32768 {
+		return unavailable("the native proof exceeded its size limit.")
 	}
 	return filtered
 }
