@@ -560,6 +560,56 @@ struct RelayFleetBoard: View {
     }
 }
 
+// MARK: - Finished, not yet seen
+
+/// A calm accent dot (info role, not a wait): an agent finished a turn or a
+/// program reported done while the pane was out of sight. It is the store's
+/// unread "done" marker, set only when nobody was looking and cleared when the
+/// user views the pane. It never counts toward waiting.
+struct RelayFinishedDot: View {
+    let paneIDs: [UUID]
+    var inbox: AgentIntelligenceStore?
+    @Environment(\.relayInboxStore) private var environmentInbox
+
+    var body: some View { Marker(paneIDs: paneIDs, inbox: inbox ?? environmentInbox) }
+
+    static func unseen(_ paneIDs: [UUID], inbox: AgentIntelligenceStore) -> Int {
+        paneIDs.filter { inbox.marker(for: $0) == .done }.count
+    }
+
+    static func label(_ count: Int) -> String {
+        count > 1 ? "\(count) panes finished, not yet seen" : "Finished, not yet seen"
+    }
+
+    private struct Marker: View {
+        let paneIDs: [UUID]
+        @ObservedObject var inbox: AgentIntelligenceStore
+
+        var body: some View {
+            let count = RelayFinishedDot.unseen(paneIDs, inbox: inbox)
+            if count > 0 {
+                Circle().fill(RelayTheme.StatusRole.info.color)
+                    .frame(width: 6, height: 6)
+                    .help(RelayFinishedDot.label(count))
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(RelayFinishedDot.label(count))
+            }
+        }
+    }
+}
+
+private struct RelayInboxStoreKey: EnvironmentKey {
+    static var defaultValue: AgentIntelligenceStore { MainActor.assumeIsolated { .shared } }
+}
+
+extension EnvironmentValues {
+    /// The inbox the finished-dot reads; tests inject a private store.
+    var relayInboxStore: AgentIntelligenceStore {
+        get { self[RelayInboxStoreKey.self] }
+        set { self[RelayInboxStoreKey.self] = newValue }
+    }
+}
+
 // MARK: - Status mark
 
 /// A tab, workspace or session row's status at a glance, from

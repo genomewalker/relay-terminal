@@ -178,6 +178,7 @@ import UniformTypeIdentifiers
         // search field and Sort included) or a drag runs. The hold keeps the
         // rows as this body drew them; SwiftUI takes this closure afresh
         // with each body, so `lists` and `rails` are the latest drawn.
+        .environment(\.relayInboxStore, inbox)
         .contentShape(Rectangle())
         .onHover { inside in
             pointerInside = inside
@@ -311,6 +312,7 @@ private struct WorkspaceFocusBar: View {
                         // Every tab of the workspace, also those a search hides.
                         RelayStatusMark(status: RelayWorkOverviewIndex.mostUrgent(
                             workspace.tabs(inWorkspace: record.id).map(\.id), in: marks))
+                        RelayFinishedDot(paneIDs: workspace.tabs(inWorkspace: record.id).flatMap(\.allPaneIDs))
                         Text("\(workspace.tabs(inWorkspace: record.id).count)")
                             .font(RelayTheme.font(size: 9)).foregroundStyle(RelayTheme.textFaint)
                     }
@@ -434,6 +436,7 @@ private struct WorkspaceFocusBar: View {
                         Text(hosts).font(RelayTheme.font(size: 8)).foregroundStyle(RelayTheme.textFaint).lineLimit(1)
                         Spacer(minLength: 3)
                         RelayStatusMark(status: status)
+                        RelayFinishedDot(paneIDs: tab.allPaneIDs)
                         if workspace.isTabPinned(tab.id) {
                             Image(systemName: "pin.fill").font(.system(size: 8)).foregroundStyle(RelayTheme.textMuted)
                                 .accessibilityLabel("Pinned")
