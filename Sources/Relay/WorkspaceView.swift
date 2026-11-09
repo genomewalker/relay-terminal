@@ -5011,8 +5011,9 @@ private struct SessionEndedOverlay: View {
     }
 }
 
-private struct ConnectionPath: View {
+struct ConnectionPath: View {
     @EnvironmentObject private var linkSelection: PaneLinkSelection
+    @ObservedObject private var agentPicker = RelayAgentPickerPresenter.shared
     @ObservedObject var pane: PaneModel
     let active: Bool
     let compact: Bool
@@ -5037,15 +5038,35 @@ private struct ConnectionPath: View {
                     .foregroundStyle(.orange).lineLimit(1)
                     .help(inputMessage).accessibilityLabel("Typing paused. " + inputMessage)
             }
-            Text(pane.displayName)
-                .font(RelayTheme.font(size: 11.5, weight: .medium))
-                .lineLimit(1)
-                .onTapGesture(count: 2) { rename?() }
-            if pane.profile.kind == .ssh, pane.displayName != pane.profile.host {
-                Text(pane.profile.host)
-                    .font(RelayTheme.font(size: 11, weight: .medium))
-                    .foregroundStyle(RelayTheme.textFaint)
+            let nameParts = PaneHeaderName.parts(pane.displayName)
+            HStack(spacing: RelayTheme.spacing(5)) {
+                Text(nameParts.name)
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .lineLimit(1)
+                    .layoutPriority(1)
+                if let id = nameParts.id {
+                    Text(id)
+                        .font(RelayTheme.font(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .layoutPriority(2)
+                }
+            }
+            .layoutPriority(3)
+            .help(pane.displayName + " · " + pane.id.uuidString.lowercased())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Pane " + pane.displayName)
+            .onTapGesture(count: 2) { rename?() }
+            if pane.profile.kind == .ssh, pane.displayName != pane.profile.host {
+                droppable {
+                    Text(pane.profile.host)
+                        .font(RelayTheme.font(size: 11, weight: .medium))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .lineLimit(1)
+                        .help(pane.profile.host)
+                }
+                .layoutPriority(-2)
             }
             if pane.profile.kind == .ssh {
                 Text(pane.profile.backend == .relay ? "" : "SSH")
@@ -5054,12 +5075,15 @@ private struct ConnectionPath: View {
             }
             if let directory = pane.directory, !directory.isEmpty {
                 let component = TerminalPathSyntax.lastComponent(directory)
-                Text(component.isEmpty ? "/" : component)
-                    .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(RelayTheme.textFaint)
-                    .lineLimit(1)
-                    .help(directory)
-                    .accessibilityLabel("Working directory \(directory)")
+                droppable {
+                    Text(component.isEmpty ? "/" : component)
+                        .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .lineLimit(1)
+                        .help(directory)
+                        .accessibilityLabel("Working directory \(directory)")
+                }
+                .layoutPriority(-1)
             }
             if pane.contentKind == .editor {
                 Label("Editor", systemImage: "curlybraces")
@@ -5072,12 +5096,10 @@ private struct ConnectionPath: View {
                     .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(pane.phase.color)
                     .lineLimit(1)
+                    .fixedSize()
+                    .layoutPriority(2)
                 RelayAgentAccountBadge(pane: pane)
-                Text(AgentLabelFormatter.activity(pane.activitySummary))
-                    .font(RelayTheme.font(size: 11, weight: .medium))
-                    .foregroundStyle(RelayTheme.textFaint)
-                    .lineLimit(1)
-                    .layoutPriority(-1)
+                    .layoutPriority(2)
                 if pane.pendingAgentApprovals > 0 {
                     Image(systemName: "hand.raised.fill")
                         .font(RelayTheme.font(size: 9, weight: .medium))
@@ -5092,7 +5114,23 @@ private struct ConnectionPath: View {
                 }
             }
             Spacer(minLength: 8)
-            RelayProgramStatusBadge(pane: pane)
+            if let detail = pane.headerActivityDetail {
+                droppable {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .lineLimit(1)
+                        .help(detail)
+                }
+                .layoutPriority(-1)
+            }
+            if let status = headerStatus {
+                RelayBadge(status.text, role: status.role)
+                    .fixedSize()
+                    .layoutPriority(2)
+                    .help(status.text + (pane.lastCommandExitCode.map { $0 == 0 ? "" : " · last command exited with status \($0)" } ?? ""))
+            }
+            if connectionNormal { RelayProgramStatusBadge(pane: pane).layoutPriority(2) }
             if let progress = pane.terminalProgressPercent {
                 ProgressView(value: Double(progress), total: 100)
                     .progressViewStyle(.linear)
@@ -5107,50 +5145,23 @@ private struct ConnectionPath: View {
                     .help("Command in progress")
                     .accessibilityLabel("Command in progress")
             }
-            if let exitCode = pane.lastCommandExitCode {
+            // An exited or disconnected pane already shows that as its status.
+            if connectionNormal, let exitCode = pane.lastCommandExitCode {
                 Image(systemName: exitCode == 0 ? "checkmark.circle" : "xmark.circle")
                     .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(exitCode == 0 ? RelayTheme.textFaint : RelayTheme.coral)
                     .help(commandStatusHelp(exitCode: exitCode, durationNanos: pane.lastCommandDurationNanos))
                     .accessibilityLabel(exitCode == 0 ? "Last command succeeded" : "Last command exited with status \(exitCode)")
             }
-            if pane.connectionState != .connected || pane.connectionStatusLabel != "Connected" {
-                Text(pane.connectionStatusLabel)
-                    .font(RelayTheme.font(size: 11, weight: .medium))
-                    .foregroundStyle(pane.phase == .exited ? RelayTheme.red : pane.connectionState.color)
-            }
             if pane.contentKind == .terminal || toggleFloating != nil || toggleZoom != nil || close != nil {
                 HStack(spacing: RelayTheme.spacing(0)) {
                     if pane.contentKind == .terminal {
-                        PaneHeaderLinkButton(paneID: pane.id)
-                        RelayAgentPickerButton(pane: pane)
-                    }
-                    if pane.contentKind == .terminal {
-                        Button(action: toggleConversation) {
-                            Image(systemName: pane.nativeConversationVisible ? "terminal" : "text.bubble")
-                                .font(RelayTheme.font(size: 9.5, weight: .medium))
-                                .frame(width: 24, height: 24)
-                                .contentShape(Rectangle())
+                        // A pane with saved or pending links keeps its link control,
+                        // which carries that state and the saved-links popover.
+                        if linkControlVisible {
+                            PaneHeaderLinkButton(paneID: pane.id)
                         }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(RelayTheme.textMuted)
-                        .focusEffectDisabled()
-                        .help(pane.nativeConversationVisible ? "Return to terminal" : "View this pane's CLI conversation")
-                        .accessibilityLabel(pane.nativeConversationVisible ? "Return to terminal" : "View CLI conversation")
-                        .accessibilityIdentifier("relay.agent.open-conversation." + pane.id.uuidString.lowercased())
-                    }
-                    if let toggleFloating {
-                        Button(action: toggleFloating) {
-                            Image(systemName: isFloating ? "rectangle.portrait.and.arrow.right" : "macwindow.on.rectangle")
-                                .font(RelayTheme.font(size: 9.5, weight: .medium))
-                                .frame(width: 24, height: 24)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(RelayTheme.textMuted)
-                        .focusEffectDisabled()
-                        .help(isFloating ? "Dock pane" : "Float pane")
-                        .accessibilityLabel(isFloating ? "Dock pane" : "Float pane")
+                        overflowMenu
                     }
                     if let toggleZoom {
                         Button(action: toggleZoom) {
@@ -5180,6 +5191,8 @@ private struct ConnectionPath: View {
                     }
                 }
                 .frame(height: 24)
+                .fixedSize()
+                .layoutPriority(4)
             }
         }
         .padding(.horizontal, compact ? 9 : 12)
@@ -5225,6 +5238,55 @@ private struct ConnectionPath: View {
             if pane.profile.kind == .ssh, pane.profile.backend == .relay, let terminate {
                 Button("Terminate remote pane…", role: .destructive, action: terminate)
             }
+        }
+    }
+
+    /// A secondary field that cannot show a readable stub is hidden, not shown as one letter.
+    private func droppable<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        let shown = content()
+        return ViewThatFits(in: .horizontal) {
+            shown.frame(minWidth: 56, alignment: .leading)
+            Color.clear.frame(width: 0, height: 0)
+        }
+    }
+
+    private var linkControlVisible: Bool {
+        linkSelection.paneIDs.contains(pane.id) || !linkSelection.memberships(for: pane.id).isEmpty
+    }
+
+    private var connectionNormal: Bool { pane.connectionIsNormal }
+
+    private var headerStatus: (text: String, role: RelayTheme.StatusRole)? { pane.headerStatus }
+
+    /// Secondary pane actions in one keyboard-reachable menu so the name keeps its width.
+    private var overflowMenu: some View {
+        Menu {
+            Button("Start agent…") { agentPicker.paneID = pane.id }
+            if !linkControlVisible {
+                Button("Link with another pane") { linkSelection.selectPairPane(pane.id) }
+                    .disabled(linkSelection.connecting)
+            }
+            Button(pane.nativeConversationVisible ? "Return to terminal" : "View CLI conversation", action: toggleConversation)
+            if let toggleFloating {
+                Button(isFloating ? "Dock pane" : "Float pane", action: toggleFloating)
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(RelayTheme.font(size: 9.5, weight: .medium))
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .foregroundStyle(RelayTheme.textMuted)
+        .help("More pane actions")
+        .accessibilityLabel("More pane actions")
+        .accessibilityIdentifier("relay.pane.more-actions." + pane.id.uuidString.lowercased())
+        .popover(isPresented: Binding(get: { agentPicker.paneID == pane.id },
+                                      set: { if !$0, agentPicker.paneID == pane.id { agentPicker.paneID = nil } }),
+                 arrowEdge: .bottom) {
+            RelayAgentPicker(pane: pane) { agentPicker.paneID = nil }
         }
     }
 

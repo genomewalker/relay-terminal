@@ -1,0 +1,88 @@
+import AppKit
+import SwiftUI
+import Testing
+@testable import Relay
+
+@Suite("Pane header name") struct PaneHeaderNameTests {
+    @Test func hidesOnlyTheAgentAndSixHexSuffix() {
+        let a = PaneHeaderName.parts("Sapropel - annotation jobs - claude 767dc7")
+        #expect(a.name == "Sapropel - annotation jobs" && a.id == "767dc7")
+        let b = PaneHeaderName.parts("annotation jobs Codex 0a1b2c")
+        #expect(b.name == "annotation jobs" && b.id == "0a1b2c")
+    }
+
+    @Test func leavesUserChosenNamesAlone() {
+        for name in ["claude 767dc7",                       // nothing left to show
+                     "Sapropel - claude 767dc7x",           // not a 6-hex id
+                     "Sapropel - claude 767DC7",            // ids are lowercase
+                     "Sapropel - claude facade",            // a word, not an id
+                     "Sapropel - shell 767dc7",             // not a generated agent label
+                     "Sapropel - build 767dc7",
+                     "Sapropel claude 767dc7 notes",        // not trailing
+                     "annotation jobs", "dandy-07", ""] {
+            let parts = PaneHeaderName.parts(name)
+            #expect(parts.name == name && parts.id == nil, "\(name)")
+        }
+    }
+}
+
+/// Offscreen renders of the pane header. PNGs go to RELAY_SNAPSHOT_DIR when set.
+@MainActor @Suite("Pane header snapshots", .serialized) struct PaneHeaderSnapshotTests {
+    private static let host = ConnectionProfile(name: "dandy-07", kind: .ssh, host: "dandy-07.ux-header.invalid")
+
+    private func pane(name: String, kind: AgentKind, phase: AgentPhase, summary: String,
+                      state: PaneConnectionState = .connected, account: String? = nil) -> PaneModel {
+        let saved = PersistedAgentPaneState(cursor: 0, kind: kind, phase: phase, summary: summary, subagents: [],
+                                            activities: [AgentActivityItem(id: UUID(), label: summary, phase: phase, occurredAt: Date())], resourceUsage: nil, progressPercent: nil, pendingApprovals: 0)
+        let pane = PaneModel(profile: Self.host, customName: name, directory: "/projects/sapropel", savedAgentState: saved)
+        pane.connectionState = state
+        if let account { pane.recordAgentAccount(RelayAgentAccount(provider: kind.rawValue, label: account, dir: "~/.\(kind.rawValue)-\(account)")) }
+        return pane
+    }
+
+    private func cases() -> [(String, PaneModel)] {
+        [("claude-idle", pane(name: "Sapropel - annotation jobs - claude 767dc7", kind: .claude, phase: .quiet,
+                              summary: "Subagent finished", account: "business")),
+         ("codex-waiting", pane(name: "Sapropel - read mapping - codex 1f3a9c", kind: .codex, phase: .needsInput,
+                                summary: "Waiting for approval")),
+         ("claude-working", pane(name: "Sapropel - annotation jobs - claude 767dc7", kind: .claude, phase: .active,
+                                 summary: "Using Bash", account: "business")),
+         ("reconnecting", pane(name: "Sapropel - annotation jobs - claude 767dc7", kind: .claude, phase: .active,
+                               summary: "Working", state: .reconnecting("link"), account: "business")),
+         ("exited", pane(name: "Sapropel - annotation jobs - claude 767dc7", kind: .claude, phase: .exited,
+                         summary: "Exited"))]
+    }
+
+    @Test func connectionRolesMatchTheSidebar() {
+        let returning = pane(name: "a - claude 767dc7", kind: .claude, phase: .active, summary: "Working", state: .reconnecting("link"))
+        #expect(returning.headerStatus?.role == .pending)
+        #expect(returning.headerStatus?.role == RelayWorkOverviewIndex.PaneStatus.reconnecting.role)
+        let lost = pane(name: "a - claude 767dc7", kind: .claude, phase: .exited, summary: "Exited", state: .disconnected("lost"))
+        #expect(lost.headerStatus?.role == .offline)
+        #expect(lost.headerStatus?.role == RelayWorkOverviewIndex.PaneStatus.disconnected.role)
+        let clean = pane(name: "a - claude 767dc7", kind: .claude, phase: .exited, summary: "Exited")
+        #expect(clean.headerStatus?.role != .danger)
+        clean.remoteExitCode = 2
+        #expect(clean.headerStatus?.role == .danger)
+    }
+
+    @Test func rendersAtWideAndNarrowWidthsInBothAppearances() throws {
+        var rendered = 0
+        for (label, pane) in cases() {
+            if label == "exited" { pane.lastCommandExitCode = 2 }
+            for width in [CGFloat(1200), 520] {
+                for (appearance, scheme) in [(NSAppearance.Name.darkAqua, ColorScheme.dark), (.aqua, .light)] {
+                    let view = ConnectionPath(pane: pane, active: true, compact: false, zoomed: false, isFloating: false,
+                                              select: {}, toggleZoom: {}, toggleFloating: {}, rename: {}, terminate: nil, close: {})
+                        .environmentObject(PaneLinkSelection())
+                        .environment(\.colorScheme, scheme)
+                    let result = try RelaySnapshot.render(view, name: "header-\(label)-\(Int(width))", width: width,
+                                                          appearance: appearance)
+                    #expect(result.size.width == width && result.size.height > 10)
+                    rendered += 1
+                }
+            }
+        }
+        #expect(rendered == 20)
+    }
+}

@@ -781,6 +781,10 @@ private enum WorkspaceNamingRequest: Identifiable {
                             if let pane = workspace.panes[id] {
                                 Button { workspace.organization.navigate(to: .pane(id)) } label: {
                                     HStack(spacing: 4) {
+                                        if let status = pane.headerStatus {
+                                            Image(systemName: status.role.symbol).imageScale(.small)
+                                                .foregroundStyle(status.role == .neutral ? RelayTheme.textFaint : status.role.color)
+                                        }
                                         Text(pane.customName ?? pane.title).font(RelayTheme.font(size: 10, weight: id == stack.selected ? .semibold : .regular))
                                             .lineLimit(1)
                                         RelayFinishedDot(paneIDs: [id], inbox: inbox)
@@ -791,7 +795,8 @@ private enum WorkspaceNamingRequest: Identifiable {
                                 .buttonStyle(.plain)
                                 .foregroundStyle(id == stack.selected ? RelayTheme.text : RelayTheme.textMuted)
                                 .onDrag { WorkspaceDragPayload.paneProvider(id) }
-                                .accessibilityLabel("\(pane.customName ?? pane.title), stack tab \(index + 1) of \(stack.members.count)")
+                                .help(pane.statusTooltip)
+                                .accessibilityLabel("\(pane.statusTooltip), stack tab \(index + 1) of \(stack.members.count)")
                                 .accessibilityAddTraits(id == stack.selected ? .isSelected : [])
                                 .accessibilityIdentifier("relay.stack.member.\(id.uuidString.lowercased())")
                                 .contextMenu {
