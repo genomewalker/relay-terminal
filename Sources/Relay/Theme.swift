@@ -1,28 +1,34 @@
 import AppKit
 import SwiftUI
 
-/// Chrome colours as AppKit colours. Under a dark appearance every colour is
-/// Relay's own value; a light appearance uses the matching system colour.
+/// Chrome colours as AppKit colours. Every colour follows the system
+/// appearance: a dark appearance uses Relay's dark values, a light appearance
+/// Relay's tuned light values (near-white content, a light grey sidebar, text
+/// at WCAG AA contrast on every surface) or the matching system colour.
 enum RelayPalette {
-    static let canvas = dynamic(dark: 0x171717, light: .windowBackgroundColor)
-    static let sidebar = dynamic(dark: 0x1B1B1B, light: .underPageBackgroundColor)
-    static let surface = dynamic(dark: 0x222222, light: .controlBackgroundColor)
-    static let elevated = dynamic(dark: 0x2A2A2A, light: .textBackgroundColor)
-    static let text = dynamic(dark: 0xEBEBEB, light: .labelColor)
-    static let textMuted = dynamic(dark: 0xAAAAAA, light: .secondaryLabelColor)
-    static let textFaint = dynamic(dark: 0x969696, light: .tertiaryLabelColor)
-    static let accent = dynamic(dark: 0x8DB7EB, light: .controlAccentColor)
+    static let canvas = dynamic(dark: 0x171717, light: 0xFBFBFB)
+    static let sidebar = dynamic(dark: 0x1B1B1B, light: 0xEBEBED)
+    static let surface = dynamic(dark: 0x222222, light: 0xF3F3F4)
+    static let elevated = dynamic(dark: 0x2A2A2A, light: 0xFFFFFF)
+    static let text = dynamic(dark: 0xEBEBEB, light: 0x1D1D1F)
+    static let textMuted = dynamic(dark: 0xAAAAAA, light: 0x55555A)
+    static let textFaint = dynamic(dark: 0x969696, light: 0x737378)
+    static let accent = dynamic(dark: 0x8DB7EB, light: 0x1F63D1)
     static let coral = dynamic(dark: 0xDDA398, light: .systemOrange)
     static let red = dynamic(dark: 0xDE827B, light: .systemRed)
     /// Success/connected state; the side panel's Relay green.
     static let success = dynamic(dark: 0x73C7A5, light: .systemGreen)
     static let warning = dynamic(dark: 0xDDA398, light: .systemOrange)
     static let danger = dynamic(dark: 0xDE827B, light: .systemRed)
-    static let info = dynamic(dark: 0x8DB7EB, light: .controlAccentColor)
+    static let info = dynamic(dark: 0x8DB7EB, light: 0x1F63D1)
 
     static func dynamic(dark: UInt32, light: NSColor) -> NSColor {
         let dark = hex(dark)
         return NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light }
+    }
+
+    static func dynamic(dark: UInt32, light: UInt32) -> NSColor {
+        dynamic(dark: dark, light: hex(light))
     }
 
     private static func hex(_ value: UInt32) -> NSColor {
@@ -35,8 +41,7 @@ enum RelayTheme {
     // The application chrome is deliberately independent from the terminal
     // palette. A terminal theme should not recolor navigation and controls.
     // App-wide template. Edit these values to restyle every Relay surface.
-    static let colorScheme: ColorScheme = .dark
-    static let appearanceName: NSAppearance.Name = .darkAqua
+    // Relay follows the system appearance; nothing here pins light or dark.
     static let canvas = Color(nsColor: RelayPalette.canvas)
     /// Behind terminals, which keep their dark background in any appearance.
     static let terminalCanvas = Color(hex: 0x171717)
@@ -255,7 +260,6 @@ enum RelayTheme {
     @MainActor static func configureAppearance(_ window: NSWindow) {
         let background = RelayPalette.canvas
         if window.backgroundColor != background { window.backgroundColor = background }
-        if window.appearance?.name != appearanceName { window.appearance = NSAppearance(named: appearanceName) }
         if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
     }
 
@@ -281,7 +285,6 @@ struct RelaySurfaceStyle: ViewModifier {
             .foregroundStyle(RelayTheme.text)
             .tint(RelayTheme.accent)
             .controlSize(RelayTheme.controlSize)
-            .preferredColorScheme(RelayTheme.colorScheme)
             .background(RelayTheme.canvas)
             .background(RelaySurfaceAppearanceMarker().frame(width: 0, height: 0))
     }
