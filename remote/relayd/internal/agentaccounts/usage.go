@@ -159,6 +159,7 @@ func parseClaudeUsage(line []byte) ([]UsageWindow, string) {
 					Sonnet   json.RawMessage `json:"seven_day_sonnet"`
 					Cowork   json.RawMessage `json:"seven_day_cowork"`
 					Omelette json.RawMessage `json:"seven_day_omelette"`
+					Scoped   json.RawMessage `json:"model_scoped"`
 				} `json:"rate_limits"`
 			} `json:"response"`
 		} `json:"response"`
@@ -198,7 +199,53 @@ func parseClaudeUsage(line []byte) ([]UsageWindow, string) {
 		windows = append(windows, UsageWindow{Name: window.name, UsedPercent: parsed.UsedPercent,
 			ResetsAt: parsed.ResetsAt, WindowMinutes: window.minutes})
 	}
+	scoped, ok := claudeModelScopedWindow(report.RateLimits.Scoped)
+	if !ok {
+		return nil, "Claude reported an invalid model-scoped window"
+	}
+	if scoped != nil {
+		windows = append(windows, *scoped)
+	}
 	return windows, ""
+}
+
+// claudeModelScopedWindow reads model_scoped (Claude Code 2.1.319+), where
+// per-model weekly limits such as a Fable cap now live, as one weekly window
+// named seven_day_scoped: the most-used entry, the later reset on a tie, as
+// failover only needs the limit closest to exhaustion. An entry without a
+// percentage is not an active limit and is skipped; any other invalid entry
+// refuses the answer, as an invalid legacy window does.
+func claudeModelScopedWindow(data json.RawMessage) (*UsageWindow, bool) {
+	if len(data) == 0 || string(data) == "null" {
+		return nil, true
+	}
+	var entries []json.RawMessage
+	if json.Unmarshal(data, &entries) != nil || len(entries) > 32 {
+		return nil, false
+	}
+	var best *UsageWindow
+	for _, entry := range entries {
+		var percent struct {
+			Utilization    *float64 `json:"utilization"`
+			UsedPercentage *float64 `json:"used_percentage"`
+		}
+		if json.Unmarshal(entry, &percent) != nil {
+			return nil, false
+		}
+		if percent.Utilization == nil && percent.UsedPercentage == nil {
+			continue
+		}
+		parsed, err := parseClaudeQuotaWindow(entry)
+		if err != nil {
+			return nil, false
+		}
+		if best == nil || parsed.UsedPercent > best.UsedPercent ||
+			parsed.UsedPercent == best.UsedPercent && parsed.ResetsAt > best.ResetsAt {
+			best = &UsageWindow{Name: "seven_day_scoped", UsedPercent: parsed.UsedPercent,
+				ResetsAt: parsed.ResetsAt, WindowMinutes: 10080}
+		}
+	}
+	return best, true
 }
 
 // A window needs exactly one consistent percentage (utilization or
