@@ -2092,24 +2092,28 @@ private struct AttentionInboxRows: View {
     }
 }
 
-/// An inbox row's two lines: the pane (or its tab) once, then the status and
-/// its workspace once, so neither line repeats the other.
+/// An inbox row's two lines: the tab (or, without one, the pane) once, then
+/// the status and its workspace once, so neither line repeats the other. The
+/// pane is named before the status only when its tab has several panes.
 struct AttentionInboxRowText: Equatable {
     let title: String
     let subtitle: String
 
-    init(pane: String?, tab: String?, workspace: String?, status: String, closed: Bool) {
+    init(pane: String?, tab: String?, workspace: String?, status: String, closed: Bool, multiPane: Bool = false) {
         func clean(_ value: String?) -> String? {
             let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return trimmed.isEmpty ? nil : trimmed
         }
-        title = clean(pane) ?? clean(tab) ?? "Pane"
+        let tab = clean(tab)
+        title = tab ?? clean(pane) ?? "Pane"
         let status = closed ? "Closed" : status
+        var parts: [String] = []
+        if multiPane, tab != nil, let pane = clean(pane), pane != title { parts.append(pane) }
+        parts.append(status)
         if let workspace = clean(workspace), workspace != title, !status.contains(workspace) {
-            subtitle = status + " · " + workspace
-        } else {
-            subtitle = status
+            parts.append(workspace)
         }
+        subtitle = parts.joined(separator: " · ")
     }
 }
 
@@ -2121,11 +2125,13 @@ private struct AttentionInboxRow: View {
     private var text: AttentionInboxRowText {
         let tabID = workspace.tabID(containingPane: entry.paneID)
         let tab = tabID.flatMap { id in workspace.tabs.first { $0.id == id } }
-        return AttentionInboxRowText(pane: workspace.panes[entry.paneID]?.displayName, tab: tab?.name,
+        return AttentionInboxRowText(pane: workspace.panes[entry.paneID]?.displayName,
+                                     tab: tab.map { workspace.tabDisplayName($0, fallback: "") },
                                      workspace: tabID.flatMap(workspace.workspaceID(forTab:))
                                         .flatMap { workspace.ownership.workspace($0)?.name },
                                      status: entry.title.isEmpty ? entry.alert.label : entry.title,
-                                     closed: workspace.panes[entry.paneID] == nil)
+                                     closed: workspace.panes[entry.paneID] == nil,
+                                     multiPane: (tab?.allPaneIDs.count ?? 0) > 1)
     }
 
     var body: some View {

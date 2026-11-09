@@ -81,14 +81,17 @@ struct RelaySidebarRedundancyTests {
         #expect(Hosts.chip(tabHosts: [Hosts.label(f.cluster.profile)], main: main(f.mixedID)) == "dandy-07")
     }
 
-    @Test("An inbox row names the pane once, then the status and workspace once")
+    @Test("An inbox row names its tab once, then the status and workspace once")
     func attentionRowText() {
+        // Since the sidebar leftovers pass the tab, not the pane, titles the row.
         let text = AttentionInboxRowText(pane: "math-guarantees", tab: "Math & Guarantees", workspace: "Pan-barley",
                                          status: "Needs input", closed: false)
-        #expect(text.title == "math-guarantees")
+        #expect(text.title == "Math & Guarantees")
         #expect(text.subtitle == "Needs input · Pan-barley")
-        #expect(!text.title.contains("Pan-barley") && !text.title.contains("Math & Guarantees"))
-        // No pane name: the tab names the row.
+        #expect(!text.title.contains("Pan-barley") && !text.subtitle.contains("math-guarantees"))
+        // No tab name: the pane names the row.
+        #expect(AttentionInboxRowText(pane: "cluster-sync", tab: "  ", workspace: "Relay", status: "Exited with status 2",
+                                      closed: false).title == "cluster-sync")
         #expect(AttentionInboxRowText(pane: "  ", tab: "Cluster sync", workspace: "Relay", status: "Exited with status 2",
                                       closed: false).title == "Cluster sync")
         // A closed pane says so; a workspace the status already names is not repeated.

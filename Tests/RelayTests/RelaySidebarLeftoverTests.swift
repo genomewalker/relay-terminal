@@ -80,6 +80,33 @@ struct RelaySidebarLeftoverTests {
         #expect(shown == ["sapropel 1", "sapropel 2"])
     }
 
+    @Test("An inbox row is titled by its tab and names the pane only in a multi-pane tab")
+    func attentionTitles() throws {
+        let single = AttentionInboxRowText(pane: "math-guarantees", tab: "Math & Guarantees", workspace: "Pan-barley",
+                                           status: "Needs input", closed: false, multiPane: false)
+        #expect(single.title == "Math & Guarantees" && single.subtitle == "Needs input · Pan-barley")
+        let multi = AttentionInboxRowText(pane: "math-guarantees", tab: "Math & Guarantees", workspace: "Pan-barley",
+                                          status: "Needs input", closed: false, multiPane: true)
+        #expect(multi.title == "Math & Guarantees" && multi.subtitle == "math-guarantees · Needs input · Pan-barley")
+        // A failed exit keeps its status text; a pane named like its tab is not repeated.
+        #expect(AttentionInboxRowText(pane: "cluster-sync", tab: "Cluster sync", workspace: "Relay",
+                                      status: "Exited with status 2", closed: false, multiPane: false).subtitle
+            == "Exited with status 2 · Relay")
+        #expect(AttentionInboxRowText(pane: "notes", tab: "notes", workspace: nil, status: "Needs input",
+                                      closed: false, multiPane: true).subtitle == "Needs input")
+        // Without a tab the pane is already the title.
+        #expect(AttentionInboxRowText(pane: "notes", tab: nil, workspace: "Relay", status: "Needs input",
+                                      closed: false, multiPane: true) ==
+                AttentionInboxRowText(pane: "notes", tab: nil, workspace: "Relay", status: "Needs input", closed: false))
+
+        // The fixture's Math tab has two panes, Cluster sync one.
+        let f = try Self.makeFixture()
+        defer { f.workspace.shutdown() }
+        let math = try #require(f.workspace.tabs.first { $0.allPaneIDs.contains(f.math.id) })
+        let cluster = try #require(f.workspace.tabs.first { $0.allPaneIDs.contains(f.cluster.id) })
+        #expect(math.allPaneIDs.count == 2 && cluster.allPaneIDs.count == 1)
+    }
+
     @Test("Navigator inbox and header row at 700 and 1200 pt, light and dark")
     func snapshots() throws {
         let f = try Self.makeFixture()
