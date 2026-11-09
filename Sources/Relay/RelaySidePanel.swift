@@ -2709,11 +2709,17 @@ final class RelaySidePanelServer: ObservableObject {
                 return .text("Terminal input receipt limit reached", status: 409, reason: "Conflict")
             }
             directInputRequests[proposal.requestID] = (paneID, proposal)
-            directInputResults[proposal.requestID] = ["status": "submitted_outcome_unknown", "paneID": paneID.uuidString.lowercased()]
+            // Handle for relay_wait_for_command: command starts the shell had
+            // reported before this input, so only a command started after it
+            // (not one already running) can answer the wait. Read-only.
+            let commandGeneration = String(pane.runtime.commandWaitContext.observation.executions)
+            directInputResults[proposal.requestID] = ["status": "submitted_outcome_unknown", "paneID": paneID.uuidString.lowercased(),
+                                                      "commandGeneration": commandGeneration]
             if let expected = proposal.expectedInputRevision {
                 // Assistant-originated: fenced against a user draft or new input.
                 let outcome = await pane.runtime.sendAssistantApprovedText(proposal.text, expectedInputRevision: expected)
-                directInputResults[proposal.requestID] = ["status": outcome.rawValue, "paneID": paneID.uuidString.lowercased()]
+                directInputResults[proposal.requestID] = ["status": outcome.rawValue, "paneID": paneID.uuidString.lowercased(),
+                                                          "commandGeneration": commandGeneration]
                 return .json(directInputResults[proposal.requestID]!)
             }
             if pane.runtime.sendSidePanelPrompt(proposal.text) {
@@ -2865,6 +2871,16 @@ final class RelaySidePanelServer: ObservableObject {
                 return .text("Viewport unavailable", status: 409, reason: "Conflict")
             }
             return .json(["pane_id": paneID.uuidString.lowercased(), "text": text, "scope": "visible_viewport_only"])
+        case ("GET", "command-wait"):
+            // Read-only, like the viewport: observes the shell's OSC 133
+            // markers and never writes to the pane.
+            guard let wait = TerminalCommandWait.Request.decode(request.body) else {
+                return .text("Invalid command wait arguments", status: 400, reason: "Bad Request")
+            }
+            guard let pane = workspace.panes[paneID] else {
+                return .text("Pane not found", status: 404, reason: "Not Found")
+            }
+            return await waitForCommand(pane, paneID: paneID, request: wait)
         case ("POST", "reveal"):
             guard workspace.sidePanelReveal(paneID) else {
                 return .text("Pane not found", status: 404, reason: "Not Found")
@@ -2893,6 +2909,35 @@ final class RelaySidePanelServer: ObservableObject {
             }
         default:
             return .text("Not found", status: 404, reason: "Not Found")
+        }
+    }
+
+    /// Polls the pane's shell-reported command state until a final outcome or
+    /// the request deadline. Never writes to the pane.
+    private func waitForCommand(_ pane: PaneModel, paneID: UUID,
+                                request: TerminalCommandWait.Request) async -> RelaySidePanelHTTPResponse {
+        func paneState() -> TerminalCommandWait.PaneState {
+            guard workspace?.panes[paneID] === pane else { return .unsupported("pane was closed or replaced") }
+            guard pane.contentKind == .terminal else { return .unsupported("not a terminal pane") }
+            guard pane.profile.backend == .relay else {
+                return .unsupported("pane output does not pass through a Relay worker; command status is unavailable")
+            }
+            if pane.remoteExitCode != nil || pane.phase == .exited { return .exited(code: pane.remoteExitCode) }
+            return pane.connectionState == .connected ? .live : .disconnected
+        }
+        let start = pane.runtime.commandWaitContext
+        let after = request.after ?? TerminalCommandWait.defaultAfter(start.observation)
+        let deadline = ContinuousClock.now + .milliseconds(request.timeoutMilliseconds)
+        while true {
+            let current = pane.runtime.commandWaitContext
+            let expired = ContinuousClock.now >= deadline || Task.isCancelled
+            if let outcome = TerminalCommandWait.decide(current.observation, after: after, pane: paneState(),
+                                                        producerChanged: current.producer != start.producer,
+                                                        deadline: expired) {
+                do { return try .jsonObject(TerminalCommandWait.json(outcome, paneID: paneID, after: after)) }
+                catch { return .text("Command wait result unavailable", status: 500, reason: "Internal Server Error") }
+            }
+            try? await Task.sleep(for: .milliseconds(50))
         }
     }
 }
