@@ -956,9 +956,10 @@ struct RelaydManagerView: View {
             VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
                 Text("Remote helpers")
                     .font(RelayTheme.font(size: 15, weight: .semibold))
-                Text("One shared binary · one supervisor per node")
+                Text(RelaySettingsCopy.helperManagerSubtitle)
                     .font(RelayTheme.font(size: 10.5))
                     .foregroundStyle(RelayTheme.textMuted)
+                    .help(RelaySettingsCopy.helperManagerSubtitleDetail)
             }
             .padding(RelayTheme.spacing(18))
 
