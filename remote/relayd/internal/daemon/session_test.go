@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"github.com/creack/pty"
 	"io"
 	"os"
 	"os/exec"
@@ -956,13 +957,26 @@ func bashSessionOutput(t *testing.T, bashrc, input string) string {
 	if err != nil {
 		t.Skip("bash is not installed")
 	}
-	// The integration needs Bash 4.4 or later.
+	requireBash44(t, bash)
+	return bashSessionOutputWith(t, bash, map[string]string{".bashrc": bashrc}, input)
+}
+
+// The integration needs Bash 4.4 or later.
+func requireBash44(t *testing.T, bash string) {
+	t.Helper()
 	if exec.Command(bash, "-c", "(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) ))").Run() != nil {
 		t.Skip("bash is older than 4.4")
 	}
+}
+
+// bashSessionOutputWith runs bash with the given home files.
+func bashSessionOutputWith(t *testing.T, bash string, files map[string]string, input string) string {
+	t.Helper()
 	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, ".bashrc"), []byte(bashrc), 0o600); err != nil {
-		t.Fatal(err)
+	for name, contents := range files {
+		if err := os.WriteFile(filepath.Join(home, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	command, err := sessionCommand(bash, "", home, filepath.Join(home, "shims"))
 	if err != nil {
@@ -1151,5 +1165,207 @@ func TestSessionShellDoesNotInheritClaudeSessionMarkers(t *testing.T) {
 			name, _, _ := strings.Cut(setting, "=")
 			t.Fatalf("pane environment lost its own %s", name)
 		}
+	}
+}
+
+// A user profile shaped like a real one: it prepends commands that reset $?
+// (history -a/-c/-r and a logging function) to PROMPT_COMMAND, and its
+// bashrc appends a hook that preserves $? and installs a DEBUG trap.
+var promptStatusUserFiles = map[string]string{
+	".bash_profile": `
+run_on_prompt_command() { builtin printf '%s\n' "$PWD" >> "$HOME/.persistent_history"; }
+export PROMPT_COMMAND="history -a; history -c; history -r; run_on_prompt_command${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+[ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+`,
+	".bashrc": `
+__sqz_preexec() { :; }
+__sqz_postexec() { local status=$?; return $status; }
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__sqz_postexec"
+trap '__sqz_preexec' DEBUG
+`,
+}
+
+func commandStatuses(output string) []string {
+	var statuses []string
+	for _, part := range strings.Split(output, "\x1b]133;D;")[1:] {
+		status, _, _ := strings.Cut(part, "\a")
+		statuses = append(statuses, status)
+	}
+	return statuses
+}
+
+// The finished mark reports the command's own status even when the user's
+// PROMPT_COMMAND runs commands that reset $? before Relay's hook.
+func TestBashReportsCommandStatusDespiteUserPromptCommands(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	requireBash44(t, bash)
+	for name, files := range map[string]map[string]string{
+		"history-prepend": promptStatusUserFiles,
+		// A first user entry that reads $? must still see the command's status.
+		"status-reading-user-entry": {".bashrc": `PROMPT_COMMAND='builtin printf "first-entry-saw:%s;" "$?"'` + "\n"},
+		"array-prompt-command":      {".bashrc": `PROMPT_COMMAND=('history -a' 'true')` + "\n"},
+		"bash-preexec":              {".bashrc": bashPreexecReplacingPromptCommand + "PROMPT_COMMAND=\"history -a; $PROMPT_COMMAND\"\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			output := bashSessionOutputWith(t, bash, files, "false\nsh -c 'exit 7'\ntrue\n(exit 3)\nexit 0\n")
+			if got := commandStatuses(output); strings.Join(got, ",") != "1,7,0,3" {
+				t.Fatalf("finished statuses %v, want [1 7 0 3]: %q", got, output)
+			}
+			if name == "status-reading-user-entry" {
+				var seen []string
+				for _, part := range strings.Split(output, "first-entry-saw:")[1:] {
+					status, _, _ := strings.Cut(part, ";")
+					seen = append(seen, status)
+				}
+				// Relay's capture must not change $? for the user's own entry.
+				// The startup prompt sees 0 first, then each command's status.
+				if strings.Join(seen, ",") != "0,1,7,0,3" {
+					t.Fatalf("user entry saw %v, want [0 1 7 0 3]: %q", seen, output)
+				}
+			}
+		})
+	}
+}
+
+// A command prepended to PROMPT_COMMAND after Relay's setup (by a tool loaded
+// later, or typed) can reset $? once; the hook moves the capture back in front
+// for every later prompt, without duplicating it.
+func TestBashStatusCaptureReassertsAfterALatePrepend(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	requireBash44(t, bash)
+	input := "PROMPT_COMMAND=\"history -a; $PROMPT_COMMAND\"\nfalse\nsh -c 'exit 7'\ntrue\n" +
+		"builtin printf 'captures:%s;' \"$(builtin printf '%s' \"$PROMPT_COMMAND\" | grep -o __relay_capture_status | wc -l | tr -d ' ')\"\nexit 0\n"
+	output := bashSessionOutputWith(t, bash, map[string]string{".bashrc": "PROMPT_COMMAND='history -a'\n"}, input)
+	if got := commandStatuses(output); strings.Join(got, ",") != "0,1,7,0,0" {
+		t.Fatalf("finished statuses %v, want [0 1 7 0 0]: %q", got, output)
+	}
+	if !strings.Contains(output, "captures:1;") {
+		t.Fatalf("status capture duplicated or lost: %q", output)
+	}
+}
+
+// The vendored bash-preexec passes the real status to precmd functions; the
+// finished marks stay correct with a status-resetting entry beside it.
+func TestBashReportsCommandStatusWithVendoredBashPreexec(t *testing.T) {
+	preexec, err := filepath.Abs("../../../../Vendor/libghostty-spm/Sources/GhosttyTerminal/Resources/Ghostty/shell-integration/bash/bash-preexec.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(preexec); err != nil {
+		t.Skip("vendored bash-preexec is not in this tree")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	requireBash44(t, bash)
+	bashrc := ". " + shellQuote(preexec) + "\nPROMPT_COMMAND=\"history -a; ${PROMPT_COMMAND}\"\n"
+	output := bashSessionOutputWith(t, bash, map[string]string{".bashrc": bashrc}, "false\nsh -c 'exit 7'\ntrue\n(exit 3)\nexit 0\n")
+	if got := commandStatuses(output); strings.Join(got, ",") != "1,7,0,3" {
+		t.Fatalf("finished statuses %v, want [1 7 0 3]: %q", got, output)
+	}
+}
+
+// macOS /bin/bash 3.2 predates the integration (4.4+); it must still start
+// cleanly with the generated rc and the user profile.
+func TestBashIntegrationIsQuietOnBash32(t *testing.T) {
+	const bash32 = "/bin/bash"
+	if exec.Command(bash32, "-c", "(( BASH_VERSINFO[0] == 3 ))").Run() != nil {
+		t.Skip("no bash 3 at /bin/bash")
+	}
+	output := bashSessionOutputWith(t, bash32, promptStatusUserFiles, "false\necho done-$?\nexit 0\n")
+	if !strings.Contains(output, "done-1") || strings.Contains(output, "syntax error") ||
+		strings.Contains(output, "bad substitution") || strings.Contains(output, "__relay") {
+		t.Fatalf("bash 3.2 session: %q", output)
+	}
+}
+
+// zshSessionOutput types input into a Relay zsh session on a pseudo-terminal
+// (the zsh integration writes its marks to /dev/tty) and returns its output.
+func zshSessionOutput(t *testing.T, zshrc, input string) string {
+	t.Helper()
+	zsh, err := exec.LookPath("zsh")
+	if err != nil {
+		t.Skip("zsh is not installed")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".zshrc"), []byte(zshrc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command, err := sessionCommand(zsh, "", home, filepath.Join(home, "shims"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range os.Environ() {
+		if name, _, _ := strings.Cut(entry, "="); name != "ZDOTDIR" && name != "PS1" && name != "PROMPT" && name != "RPROMPT" {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, "HOME="+home, "TERM=xterm-256color")
+	terminal, err := pty.StartWithSize(command, &pty.Winsize{Cols: 200, Rows: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer terminal.Close()
+	output := make(chan string, 1)
+	go func() {
+		var all []byte
+		buffer := make([]byte, 4096)
+		for {
+			n, err := terminal.Read(buffer)
+			all = append(all, buffer[:n]...)
+			if err != nil {
+				output <- string(all)
+				return
+			}
+		}
+	}()
+	// Type one line per prompt: wait for each input-start mark first.
+	for _, line := range strings.SplitAfter(input, "\n") {
+		if line == "" {
+			continue
+		}
+		time.Sleep(300 * time.Millisecond)
+		if _, err := terminal.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		_ = command.Process.Signal(os.Interrupt)
+		t.Fatal("zsh session did not exit")
+	}
+	select {
+	case text := <-output:
+		return text
+	case <-time.After(5 * time.Second):
+		t.Fatal("zsh output did not close")
+	}
+	return ""
+}
+
+// zsh runs other precmd functions before Relay's; one that runs a command
+// must not replace the finished command's status.
+func TestZshReportsCommandStatusDespiteUserPrecmd(t *testing.T) {
+	for name, zshrc := range map[string]string{
+		"plain":           "",
+		"history-precmd":  "setopt INC_APPEND_HISTORY\nHISTFILE=$HOME/.zsh_history\nuser_precmd() { fc -AI; true; }\nprecmd_functions+=(user_precmd)\n",
+		"precmd-function": "precmd() { true; }\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			output := zshSessionOutput(t, zshrc, "false\nsh -c 'exit 7'\ntrue\n(exit 3)\nexit 0\n")
+			if got := commandStatuses(output); strings.Join(got, ",") != "1,7,0,3" {
+				t.Fatalf("finished statuses %v, want [1 7 0 3]: %q", got, output)
+			}
+		})
 	}
 }

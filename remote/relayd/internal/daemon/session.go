@@ -367,9 +367,41 @@ if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_
   # Always empty: PS0 expands one of its elements to mark a command started.
   __relay_ps0=()
 
+  # Other PROMPT_COMMAND entries (history -a, logging functions) can reset $?
+  # before the hook runs. This entry runs first, saves the finished command's
+  # status and returns it, so $? is unchanged for every later entry.
+  __relay_capture_status() {
+    __relay_status=$?
+    return "$__relay_status"
+  }
+
+  # Keep the capture the first PROMPT_COMMAND entry. User files and tools
+  # that run after Relay's setup may prepend their own commands; the hook
+  # re-asserts this at every prompt, without a subshell.
+  __relay_capture_first() {
+    builtin local -a __relay_entries
+    builtin local __relay_entry
+    if [[ ${PROMPT_COMMAND@a} == *a* ]]; then
+      [[ "${PROMPT_COMMAND[0]}" == __relay_capture_status ]] && return
+      for __relay_entry in "${PROMPT_COMMAND[@]}"; do
+        [[ "$__relay_entry" == __relay_capture_status ]] || __relay_entries+=("$__relay_entry")
+      done
+      PROMPT_COMMAND=(__relay_capture_status "${__relay_entries[@]}")
+    elif [[ "${PROMPT_COMMAND:-}" != "__relay_capture_status;"* ]]; then
+      PROMPT_COMMAND="__relay_capture_status;${PROMPT_COMMAND//__relay_capture_status;/}"
+    fi
+  }
+
   __relay_prompt_hook() {
     builtin local command_status=$? __relay_function
     builtin local -a __relay_others
+    # Prefer the status saved before any other entry ran. bash-preexec also
+    # hands precmd functions the real status as $?, so either is correct
+    # there; the saved one is cleared so a later cycle never reuses it.
+    if [[ -n "${__relay_status+x}" ]]; then
+      command_status=$__relay_status
+      builtin unset __relay_status
+    fi
 
     # Stay the last bash-preexec precmd function, so the markers wrap the
     # PS1 that other functions (such as its own precmd) leave behind.
@@ -413,6 +445,7 @@ if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_
       # and the empty element adds nothing to the output.
       PS0+='${__relay_ps0[__relay_command_active=1]}\e]133;C\a'
     fi
+    __relay_capture_first
   }
 
   # bash-preexec installs itself at the first prompt, and older releases then
@@ -433,6 +466,7 @@ if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_
       PROMPT_COMMAND+="__relay_prompt_hook 2>/dev/null"
     fi
   fi
+  __relay_capture_first
 fi
 `
 
@@ -443,6 +477,8 @@ if [[ -o interactive ]]; then
   typeset -g __relay_command_active=0
 
   __relay_precmd() {
+    # zsh gives every precmd function the finished command's status as $?,
+    # even after an earlier one ran commands (tested), so no capture is needed.
     local command_status=$?
     if (( __relay_command_active )); then
       print -rn -- $'\e]133;D;'${command_status}$'\a' > /dev/tty
