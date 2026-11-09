@@ -10655,8 +10655,10 @@ extension TerminalSemanticPromptStateTracker {
         payload = saved.payload
         promptActive = saved.promptActive
         executions = saved.executions
-        // A restored stream has no live completion; the next 133;D records one.
-        completedExecutions = 0
+        // A restored stream has no live completion status. A prompt shown
+        // after the last command start means that command already ended; the
+        // next live 133;D records a status.
+        completedExecutions = saved.promptActive ? saved.executions : (saved.executions > 0 ? saved.executions - 1 : 0)
         lastExitStatus = nil
         markersSeen = false
         return true

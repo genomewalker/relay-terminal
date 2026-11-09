@@ -76,6 +76,39 @@ import Testing
         #expect(json["exit_status"] as? Int == 2)
         #expect(json["generation"] as? UInt64 == 4)
         #expect(json["source"] as? String == "shell_reported_osc133")
+        #expect((try? JSONSerialization.data(withJSONObject: json)) != nil)
+        let pending = TerminalCommandWait.json(.paneExited(code: nil), paneID: pane, after: 3)
+        #expect((try? JSONSerialization.data(withJSONObject: pending)) != nil)
+    }
+
+    @Test func restoredIdlePromptIsNotARunningCommand() {
+        let live = TerminalSemanticPromptStateTracker()
+        _ = live.observe(osc("C") + osc("D;0") + osc("C") + osc("D;0") + osc("A") + osc("B"))
+        let restored = TerminalSemanticPromptStateTracker()
+        #expect(restored.restore(live.persistentState))
+        let idle = restored.commandObservation
+        #expect(idle.executions == 2 && idle.completedExecutions == 2 && idle.exitStatus == nil)
+        guard case .unknown = TerminalCommandWait.decide(idle, after: TerminalCommandWait.defaultAfter(idle),
+                                                          pane: .live, producerChanged: false, deadline: true) else {
+            Issue.record("a restored idle prompt must not read as running"); return
+        }
+        // Restored mid-command: that command's live completion is still reported.
+        let busy = TerminalSemanticPromptStateTracker()
+        _ = busy.observe(osc("B") + osc("C"))
+        let resumed = TerminalSemanticPromptStateTracker()
+        #expect(resumed.restore(busy.persistentState))
+        _ = resumed.observe(osc("D;6"))
+        #expect(resumed.commandObservation.completedExecutions == 1 && resumed.commandObservation.exitStatus == 6)
+    }
+
+    @Test func httpParserKeepsAGetBody() {
+        let body = #"{"after":7,"timeout_ms":50000}"#
+        let raw = "GET /api/panes/\(pane.uuidString.lowercased())/command-wait HTTP/1.1\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+        guard case .request(let request) = RelaySidePanelHTTPRequest.parse(Data(raw.utf8)) else {
+            Issue.record("GET with a body not parsed"); return
+        }
+        #expect(request.method == "GET")
+        #expect(TerminalCommandWait.Request.decode(request.body) == .init(after: 7, timeoutMilliseconds: 50_000))
     }
 
     @Test func staleCompletionBeforeTheHandleIsNotReported() {
