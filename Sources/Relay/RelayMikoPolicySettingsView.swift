@@ -16,9 +16,10 @@ import SwiftUI
             Text("Miko acts autonomously and asks when it needs your decision. Choose cards to review actions before they run. Pausing stops new actions in every workspace.")
                 .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
                 .fixedSize(horizontal: false, vertical: true)
-            Toggle("Let agent panes ask Miko to update relayd on hosts", isOn: $preferences.agentHostRelaydUpdates)
+            Toggle(RelaySettingsCopy.agentHelperUpdates, isOn: $preferences.agentHostRelaydUpdates)
+                .help(RelaySettingsCopy.agentHelperUpdatesDetail)
                 .accessibilityIdentifier("relay.settings.miko.agent-relayd-updates")
-            Text("When on, a coding agent's request to Miko to update relayd on a configured host carries your authority and runs without a card. Every other agent request still waits for your Run. Only you can change this here.")
+            Text(RelaySettingsCopy.agentHelperUpdatesExplanation)
                 .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
                 .fixedSize(horizontal: false, vertical: true)
             Toggle("Pause Miko", isOn: Binding(get: { supervision.current.disabledTools.contains("*") }, set: { paused in

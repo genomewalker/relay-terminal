@@ -19,19 +19,7 @@ struct RelaySettingsView: View {
     private var selectedTitle: String {
         sections.first(where: { $0.id == navigation.section })?.title ?? "Appearance"
     }
-    private var selectedDescription: String {
-        switch navigation.section {
-        case "keyboard": "Customize shortcuts for sessions, tabs and panes."
-        case "accounts": "API keys Relay itself uses on each host (handoff text), shared by every tab. Agent sign-ins are under Agent Accounts."
-        case "agent-accounts": "Work and personal Claude and Codex accounts on each host."
-        case "intelligence": "Optional features that use models on this Mac."
-        case "connections": "Manage Relay helpers and remote sessions."
-        case "clients": "Control which clients can work with Relay."
-        case "plugins": "Manage extensions for your workspace."
-        case "advanced": "Terminal compatibility and diagnostics."
-        default: "Choose how your terminal and workspace look."
-        }
-    }
+    private var selectedDescription: String { RelaySettingsCopy.description(section: navigation.section) }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -66,6 +54,19 @@ struct RelaySettingsView: View {
                         .foregroundStyle(RelayTheme.textMuted)
                 }
                 Spacer()
+                if let workspace {
+                    Button {
+                        if !workspace.haikuAssistantVisible { workspace.toggleHaikuAssistant() }
+                    } label: {
+                        Label(RelaySettingsCopy.askMiko, systemImage: "sparkles")
+                            .font(RelayTheme.font(size: 12, weight: .medium))
+                    }
+                    .buttonStyle(.link)
+                    .help(RelaySettingsCopy.askMikoDetail)
+                    .accessibilityHint(RelaySettingsCopy.askMikoDetail)
+                    .accessibilityIdentifier("relay.settings.askMiko")
+                    .padding(.horizontal, 12)
+                }
                 Text("Relay")
                     .font(RelayTheme.font(size: 11))
                     .foregroundStyle(RelayTheme.textMuted)
@@ -78,15 +79,6 @@ struct RelaySettingsView: View {
                     Text(selectedTitle).font(RelayTheme.font(size: 22, weight: .semibold))
                     Text(selectedDescription).font(RelayTheme.font(size: 13))
                         .foregroundStyle(RelayTheme.textMuted)
-                    if let workspace {
-                        Button("Ask Miko about settings…") {
-                            if !workspace.haikuAssistantVisible { workspace.toggleHaikuAssistant() }
-                        }
-                        .buttonStyle(.link)
-                        .accessibilityIdentifier("relay.settings.askMiko")
-                    }
-                    Text("Miko can explain common settings and propose an exact change on This Mac. Review the target and value; completion includes a verified settings receipt. You can also use the controls below.")
-                        .font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
                 }
                 .padding(26)
                 Divider().overlay(RelayTheme.line.opacity(0.4))
@@ -157,12 +149,16 @@ HStack(alignment: .top, spacing: 22) {
                 preview.frame(width: 260)
             }
 settingSection("Workspace") {
-                    Picker("Palette", selection: $preferences.palette) {
+                    Picker(RelaySettingsCopy.palette, selection: $preferences.palette) {
                         ForEach(RelayTerminalPalette.allCases) { palette in
                             Text(palette.label).tag(palette)
                         }
                     }
                     .pickerStyle(.segmented)
+                    Text(RelaySettingsCopy.paletteExplanation)
+                        .font(RelayTheme.font(size: 11))
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
                     Toggle("Compact interface", isOn: $preferences.compactInterface)
                     Toggle("Hide navigator in full screen", isOn: $preferences.hideSidebarInFullScreen)
                 }
@@ -206,15 +202,16 @@ settingSection("Images") {
                         .font(RelayTheme.font(size: 11))
                         .foregroundStyle(RelayTheme.textMuted)
                 } }
-    private var connectionsSettings: some View { settingSection("Remote sessions") {
-                    Toggle("Update relayd on approved hosts", isOn: $preferences.automaticallyUpdateRelayd)
+    private var connectionsSettings: some View { settingSection(RelaySettingsCopy.connectionsSection) {
+                    Toggle(RelaySettingsCopy.autoUpdateHelper, isOn: $preferences.automaticallyUpdateRelayd)
+                        .help(RelaySettingsCopy.autoUpdateHelperDetail)
                     Button {
                         NotificationCenter.default.post(name: .relayManageRelayd, object: nil)
                     } label: {
                         HStack(spacing: RelayTheme.spacing(9)) {
                             Image(systemName: "server.rack")
                                 .foregroundStyle(RelayTheme.mint)
-                            Text("Check relayd and remote sessions")
+                            Text(RelaySettingsCopy.checkHelpers)
                                 .font(RelayTheme.font(size: 11.5, weight: .medium))
                             Spacer()
                             Image(systemName: "chevron.right")
@@ -224,10 +221,11 @@ settingSection("Images") {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    Text("Relay asks before the first installation in a shared home. Nodes reuse that binary while keeping separate supervisors and sockets. Approved SSH hosts can apply verified updates automatically.")
+                    Text(RelaySettingsCopy.connectionsExplanation)
                         .font(RelayTheme.font(size: 11))
                         .foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
+                        .help(RelaySettingsCopy.connectionsExplanationDetail)
                 } }
     private var clientSettings: some View { settingSection("Clients") {
                     Button("Manage clients…") { showingCallers = true }
@@ -369,7 +367,7 @@ settingSection("Images") {
 
             DisclosureGroup("Advanced · custom decision model") {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("This optional model uses numeric session evidence to advise the supervisor. Apple’s model does not require an additional file.")
+                    Text(RelaySettingsCopy.decisionModelExplanation)
                         .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
                     TextField("Local model file path", text: $preferences.decisionModelPath)
                     HStack {
