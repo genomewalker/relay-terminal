@@ -69,7 +69,7 @@
                 updateMetalLayerMetrics()
                 updateColorScheme()
                 core.startDisplayLink()
-                core.requestImmediateTick()
+                core.requestFullRepaint(.attach)
 
                 NotificationCenter.default.addObserver(
                     self,
@@ -132,7 +132,7 @@
                 guard let self else { return }
                 updateMetalLayerMetrics()
                 core.synchronizeMetrics()
-                core.requestImmediateTick()
+                core.requestFullRepaint(.scale)
             }
         }
 
@@ -158,9 +158,14 @@
         }
 
         override open func setFrameSize(_ newSize: NSSize) {
+            let changed = frame.size != newSize
             super.setFrameSize(newSize)
             core.fitToSize()
-            core.requestImmediateTick()
+            if changed {
+                core.requestFullRepaint(.size)
+            } else {
+                core.requestImmediateTick()
+            }
         }
 
         override open func layout() {
@@ -173,7 +178,7 @@
             super.viewDidChangeBackingProperties()
             updateMetalLayerMetrics()
             core.fitToSize()
-            core.requestImmediateTick()
+            core.requestFullRepaint(.scale)
         }
 
         public func fitToSize() {

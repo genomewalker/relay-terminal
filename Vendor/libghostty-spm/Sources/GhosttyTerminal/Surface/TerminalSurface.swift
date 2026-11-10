@@ -318,6 +318,22 @@ public final class TerminalSurface {
         ghostty_surface_refresh(s)
     }
 
+    /// Makes the renderer rebuild every viewport row on its next update, the
+    /// same full rebuild a resize causes, without changing the size.
+    ///
+    /// `refresh()` only wakes the renderer, which then rebuilds dirty rows
+    /// alone. Ghostty's preedit callback always sets the terminal's preedit
+    /// dirty flag, any terminal dirty flag makes the render state redraw the
+    /// whole viewport, and the callback then queues a render. With no IME
+    /// composition in progress an empty preedit changes nothing else: it
+    /// clears the selection only when a preedit existed. Callers must not
+    /// use this while the view has marked text.
+    func markFullyDirty() {
+        guard let s = surface else { return }
+        TerminalDebugLog.log(.render, "surface mark fully dirty")
+        "".withCString { ghostty_surface_preedit(s, $0, 0) }
+    }
+
     func setSize(width: UInt32, height: UInt32) {
         guard let s = surface else {
             TerminalDebugLog.log(.metrics, "surface setSize ignored: missing surface")

@@ -259,6 +259,8 @@
                 y: event.scrollingDeltaY,
                 mods: scrollMods.rawValue
             )
+            // Requests within one frame share a rebuild (coalesceInterval).
+            core.requestFullRepaint(.scroll)
         }
 
         private func updatePointerSelectionRect(to point: CGPoint) {

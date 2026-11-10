@@ -103,13 +103,22 @@
         /// toward newer prompts. Prompt navigation requires shell integration.
         @discardableResult
         public func jumpToPrompt(by offset: Int16) -> Bool {
-            surface?.jumpToPrompt(by: offset) ?? false
+            let moved = surface?.jumpToPrompt(by: offset) ?? false
+            if moved { core.requestFullRepaint(.scroll) }
+            return moved
         }
 
         /// Reveal an absolute scrollback row, where zero is the first row.
         @discardableResult
         public func scrollToRow(_ row: UInt) -> Bool {
-            surface?.scrollToRow(row) ?? false
+            let moved = surface?.scrollToRow(row) ?? false
+            if moved { core.requestFullRepaint(.scroll) }
+            return moved
+        }
+
+        /// Counters of the repaint contract, for attributing a garble.
+        public var repaintStatistics: TerminalRepaintStatistics {
+            core.repaintStatistics
         }
     }
 #endif

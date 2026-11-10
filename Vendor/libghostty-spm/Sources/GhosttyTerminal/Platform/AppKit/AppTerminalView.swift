@@ -159,6 +159,9 @@
             core.onPostRender = { [weak self] in
                 self?.enforceMetalLayerScale()
             }
+            core.isComposing = { [weak self] in
+                self?.hasMarkedText() ?? false
+            }
         }
 
         open func selectionMenuPoint(at point: CGPoint) -> CGPoint? {

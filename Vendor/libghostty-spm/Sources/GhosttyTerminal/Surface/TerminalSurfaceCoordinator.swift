@@ -76,6 +76,18 @@ final class TerminalSurfaceCoordinator {
     /// correcting any drift introduced by ghostty within a single frame.
     var onPostRender: (() -> Void)?
     var onContentUpdate: (() -> Void)?
+    /// True while the view has IME marked text. A full rebuild waits for it:
+    /// the rebuild lever is an empty preedit, which would cancel composition.
+    var isComposing: () -> Bool = { false }
+    /// Tests observe applied full rebuilds here instead of on a surface.
+    var fullRebuildOverride: ((TerminalRepaintReason) -> Void)?
+    private(set) var repaintStatistics = TerminalRepaintStatistics()
+    /// A full rebuild that could not run yet, redeemed by the next frame.
+    private var fullRepaintOwed: TerminalRepaintReason?
+    private var trailingRepaint: Task<Void, Never>?
+    private var settleRepaint: Task<Void, Never>?
+    private var lastDamageUptime: TimeInterval?
+    private var damageSinceUptime: TimeInterval?
     private var inspectionWidthPixels: UInt32?
     private var inspectionSuppressesRendering = false
 
@@ -138,17 +150,138 @@ final class TerminalSurfaceCoordinator {
                 ensureDisplayLink()
                 return
             }
+            repaintStatistics.deferredAsAnimation += 1
             scheduleDeferredAnimationTick()
             return
         }
+        armFrameBurst()
+        noteDamage()
+    }
+
+    /// Fresh PTY damage, input, focus, resize and full repaints receive a
+    /// short full-rate burst for smooth interactive animation. A
+    /// self-sustaining cursor request cannot keep extending the burst by
+    /// itself.
+    private func armFrameBurst() {
         deferredAnimationTick?.cancel()
         deferredAnimationTick = nil
-        // Fresh PTY damage, input, focus, and resize receive a short full-rate
-        // burst for smooth interactive animation. A self-sustaining cursor
-        // request cannot keep extending the burst by itself.
         animationBurstFramesRemaining = 8
         pendingImmediateTick = true
         ensureDisplayLink()
+    }
+
+    // MARK: - Full Repaint
+
+    /// Repaints the whole viewport: every row is rebuilt from the terminal,
+    /// exactly as a resize would, and a frame is armed. Output keeps
+    /// repainting only the rows it damaged; this is for the transitions
+    /// (size, scale, scroll, replay, visibility) after which a stale row
+    /// would otherwise survive until the next resize.
+    ///
+    /// Never downgraded to the 250 ms animation tick, and applied after any
+    /// occlusion change the caller made, so the renderer is visible when it
+    /// rebuilds.
+    func requestFullRepaint(_ reason: TerminalRepaintReason) {
+        repaintStatistics.requested[reason, default: 0] += 1
+        TerminalDebugLog.log(.render, "full repaint requested reason=\(reason.rawValue)")
+        applyOrOweFullRepaint(reason, counting: true)
+        if TerminalRepaintPolicy.needsTrailingRepaint(reason) {
+            scheduleTrailingRepaint(reason)
+        }
+        if canRenderFrame { armFrameBurst() }
+    }
+
+    private var canApplyFullRepaint: Bool {
+        canRenderFrame && (surface != nil || fullRebuildOverride != nil)
+    }
+
+    private func applyOrOweFullRepaint(_ reason: TerminalRepaintReason, counting: Bool) {
+        let composing = isComposing()
+        let action = TerminalRepaintPolicy.action(
+            canRender: canApplyFullRepaint,
+            composing: composing,
+            now: Self.monotonicTimestamp(),
+            lastApplied: repaintStatistics.lastAppliedUptime
+        )
+        switch action {
+        case .apply:
+            applyFullRepaint(reason)
+        case .owe, .coalesce:
+            if counting {
+                if composing { repaintStatistics.skippedWhileComposing += 1 } else { repaintStatistics.owed += 1 }
+            }
+            fullRepaintOwed = fullRepaintOwed ?? reason
+        }
+    }
+
+    private func applyFullRepaint(_ reason: TerminalRepaintReason) {
+        fullRepaintOwed = nil
+        repaintStatistics.applied += 1
+        repaintStatistics.lastReason = reason
+        repaintStatistics.lastAppliedUptime = Self.monotonicTimestamp()
+        TerminalDebugLog.log(.render, "full repaint applied reason=\(reason.rawValue)")
+        if let fullRebuildOverride {
+            fullRebuildOverride(reason)
+        } else {
+            surface?.markFullyDirty()
+        }
+    }
+
+    /// The resize throttle can deliver the final size after the first
+    /// rebuild; repaint once more after it has landed.
+    private func scheduleTrailingRepaint(_ reason: TerminalRepaintReason) {
+        trailingRepaint?.cancel()
+        trailingRepaint = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(TerminalRepaintPolicy.trailingDelay))
+            guard !Task.isCancelled, let self else { return }
+            self.trailingRepaint = nil
+            self.applyOrOweFullRepaint(reason, counting: false)
+            if self.canRenderFrame { self.armFrameBurst() }
+        }
+    }
+
+    /// Self-heal: once output has been quiet for `settleDelay`, or every
+    /// `maximumIntervalUnderDamage` under continuous output, rebuild the
+    /// whole viewport once. A row whose damage was never reported is then
+    /// stale for at most that long instead of until the next resize.
+    private func noteDamage() {
+        guard canRenderFrame else { return }
+        let now = Self.monotonicTimestamp()
+        if TerminalRepaintPolicy.isEcho(now: now, lastApplied: repaintStatistics.lastAppliedUptime) { return }
+        lastDamageUptime = now
+        let since = damageSinceUptime ?? now
+        damageSinceUptime = since
+        if TerminalRepaintPolicy.settleIsOverdue(
+            now: now, lastApplied: repaintStatistics.lastAppliedUptime, damageSince: since
+        ) {
+            damageSinceUptime = nil
+            requestFullRepaint(.settle)
+            return
+        }
+        guard settleRepaint == nil else { return }
+        settleRepaint = Task { @MainActor [weak self] in
+            while true {
+                guard let self, !Task.isCancelled else { return }
+                let quiet = Self.monotonicTimestamp() - (self.lastDamageUptime ?? 0)
+                let remaining = TerminalRepaintPolicy.settleDelay - quiet
+                if remaining <= 0 { break }
+                try? await Task.sleep(for: .seconds(remaining))
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.settleRepaint = nil
+            self.damageSinceUptime = nil
+            self.requestFullRepaint(.settle)
+        }
+    }
+
+    private func cancelRepaintTasks() {
+        trailingRepaint?.cancel()
+        trailingRepaint = nil
+        settleRepaint?.cancel()
+        settleRepaint = nil
+        fullRepaintOwed = nil
+        lastDamageUptime = nil
+        damageSinceUptime = nil
     }
 
     func startDisplayLink() {
@@ -376,7 +509,7 @@ final class TerminalSurfaceCoordinator {
         performMetricsSync()
         inspectionSuppressesRendering = false
         surface?.setOcclusion(effectiveSurfaceVisible)
-        requestImmediateTick()
+        requestFullRepaint(.inspection)
     }
 
     func setResizeSynchronizationSuspended(_ suspended: Bool) {
@@ -521,6 +654,8 @@ final class TerminalSurfaceCoordinator {
         // resize or restoration. Request it once here, rather than on every
         // display tick (which feeds the renderer's callback back into itself).
         surface?.refresh()
+        // Replay and presentation rebuild every row, not only the dirty ones.
+        requestFullRepaint(.replay)
         renderImmediately()
     }
 
@@ -534,7 +669,9 @@ final class TerminalSurfaceCoordinator {
         surface?.setOcclusion(effectiveSurfaceVisible)
 
         if canRenderFrame {
-            requestImmediateTick()
+            // Ghostty keeps updating frame data while occluded but skips
+            // drawing; a revealed pane gets every row rebuilt and drawn.
+            requestFullRepaint(.visibility)
         } else {
             stopDisplayLink()
         }
@@ -560,6 +697,7 @@ final class TerminalSurfaceCoordinator {
 
         if active {
             synchronizeMetrics()
+            requestFullRepaint(.visibility)
             renderImmediately()
         } else {
             stopDisplayLink()
@@ -584,6 +722,11 @@ final class TerminalSurfaceCoordinator {
         pendingImmediateTick = false
         lastTickTimestamp = context.timestamp
         TerminalDebugLog.log(.render, "tick")
+        // Redeem a full repaint that was coalesced, or owed while the pane
+        // could not draw or an IME composition was open.
+        if let owed = fullRepaintOwed {
+            applyOrOweFullRepaint(owed, counting: false)
+        }
         isRenderingFrame = true
         controller?.tick()
         // Output, input and native animation already schedule frame updates.
@@ -628,6 +771,12 @@ final class TerminalSurfaceCoordinator {
         tearDownSurface(removingBridgeFrom: controller)
     }
 
+    #if DEBUG
+        var testHooks_fullRepaintOwed: TerminalRepaintReason? { fullRepaintOwed }
+        var testHooks_settleScheduled: Bool { settleRepaint != nil }
+        func testHooks_noteDamage() { noteDamage() }
+    #endif
+
     /// Tests only: the bridge a surface generation was created with.
     var bridgeForTesting: TerminalCallbackBridge { bridge }
 
@@ -646,6 +795,7 @@ final class TerminalSurfaceCoordinator {
                                  replacingBridge: Bool = true) {
         TerminalDebugLog.log(.lifecycle, "tear down surface")
         releaseDisplayLink()
+        cancelRepaintTasks()
         let retiredSurface = surface
         let retiredBridge = bridge
         // In-memory output may still be inside a Ghostty call on this surface,
