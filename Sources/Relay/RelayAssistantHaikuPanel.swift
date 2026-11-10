@@ -27,14 +27,12 @@ struct RelayAssistantHaikuPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "sparkles").foregroundStyle(RelayTheme.accent)
-                Text("Miko").font(RelayTheme.font(size: 15, weight: .semibold))
-                Spacer()
-                if harness.isBusy { ProgressView().controlSize(.small).help("Miko is working") }
+            // The shared viewer bar: the pane header's height, inset, type
+            // and icon controls, like View CLI conversation and Agent details.
+            RelayViewerBar(symbol: "sparkles", title: "Miko", detail: harness.isBusy ? "Working" : nil) {
+                if harness.isBusy { ProgressView().controlSize(.mini).help("Miko is working") }
                 Button("New chat") { harness.newChat() }
-                    .buttonStyle(.plain).font(RelayTheme.font(size: 11))
-                    .foregroundStyle(RelayTheme.textMuted)
+                    .buttonStyle(RelayAgentQuietButtonStyle())
                     .disabled(harness.isBusy || harness.exchanges.isEmpty)
                     .accessibilityIdentifier("relay.assistant.new-chat")
                 Menu {
@@ -50,18 +48,19 @@ struct RelayAssistantHaikuPanel: View {
                     .accessibilityIdentifier("relay.assistant.sessions-health")
                 } label: {
                     Image(systemName: "ellipsis")
+                        .font(RelayViewerMetrics.icon)
+                        .frame(width: RelayViewerMetrics.iconSize, height: RelayViewerMetrics.iconSize)
+                        .contentShape(Rectangle())
                 }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .foregroundStyle(RelayTheme.textMuted)
                 .help("More").accessibilityLabel("More Miko actions")
                 .accessibilityIdentifier("relay.assistant.more")
-                Button { close() } label: { Image(systemName: "xmark") }
-                    .buttonStyle(.plain).help("Close · Esc")
-                    .accessibilityLabel("Close Relay assistant")
+                RelayViewerIconButton(title: "Close Relay assistant", symbol: "xmark") { close() }
+                    .help("Close · Esc")
                     .accessibilityIdentifier("relay.assistant.panel-close")
             }
-            .padding(.horizontal, 14).frame(height: 44)
-            Divider().overlay(RelayTheme.line)
+            Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
             if let notice = entryPoints.hotkeyStatus.notice {
                 Text(notice).font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.coral)
                     .padding(.horizontal, 12).padding(.bottom, 8)
@@ -176,8 +175,9 @@ struct RelayAssistantHaikuPanel: View {
         .font(RelayTheme.font(size: 12))
         .foregroundStyle(RelayTheme.text)
         .frame(width: panelSize.width, height: panelSize.height)
-        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(RelayTheme.line))
+        .background(RelayTheme.canvas, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous).stroke(RelayTheme.line.opacity(0.85)))
         .shadow(color: .black.opacity(0.25), radius: 18, y: 5)
         // Esc cancels a waiting action card first; otherwise it closes the panel.
         .onExitCommand { if harness.pendingCard != nil { harness.cancelCard() } else { close() } }
