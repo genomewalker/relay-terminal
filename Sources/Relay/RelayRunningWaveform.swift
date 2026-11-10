@@ -126,10 +126,13 @@ final class RelayRunningWaveformView: NSView {
     }
 
     /// Bars fill one after another, hold full for a beat, then start again.
+    /// Discrete keyframes need one more key time than values (each value
+    /// holds until the next time; the last time, 1, ends the cycle), or Core
+    /// Animation rejects the animation and the fill stays at zero width.
     static func sweep() -> CAKeyframeAnimation {
         let animation = CAKeyframeAnimation(keyPath: "transform.scale.x")
         let fractions = (0...steps).map { Double($0) / Double(steps) }
-        animation.values = fractions + [1]
+        animation.values = fractions
         animation.keyTimes = (fractions.map { $0 * 0.8 } + [1]).map { NSNumber(value: $0) }
         animation.calculationMode = .discrete
         animation.duration = period

@@ -51,7 +51,11 @@ import Testing
         let values = try #require(sweep.values as? [Double])
         #expect(values.first == 0 && values.last == 1)
         #expect(values == values.sorted())
-        #expect(values.count == RelayRunningWaveformView.steps + 2)
+        #expect(values.count == RelayRunningWaveformView.steps + 1)
+        // Discrete mode: one more key time than values, from 0 to 1, rising.
+        let times = try #require(sweep.keyTimes).map(\.doubleValue)
+        #expect(times.count == values.count + 1)
+        #expect(times.first == 0 && times.last == 1 && times == times.sorted())
     }
 
     @Test func runningMarkRendersInBothAppearances() throws {
