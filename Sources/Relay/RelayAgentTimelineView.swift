@@ -214,27 +214,28 @@ struct RelayAgentTimelineView: View {
         nonmutating set { composerState.submissionStatus = newValue }
     }
     var body: some View {
-        VStack(spacing: RelayTheme.spacing(0)) {
+        RelayViewerLayout {
             header
+        } content: {
             if searching { searchBar }
             if store.olderCursor != nil || store.historical {
-                HStack(spacing: 12) {
+                RelayViewerStrip {
                     Text(store.historical ? "Earlier messages · live updates paused" : "Latest messages")
-                        .font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.secondaryInk)
                     Spacer()
                     if store.olderCursor != nil {
-                        Button("Earlier") { Task { await store.showOlder() } }.disabled(store.busy)
+                        Button("Earlier") { Task { await store.showOlder() } }
+                            .buttonStyle(RelayAgentQuietButtonStyle()).disabled(store.busy)
                     }
                     if store.historical {
-                        Button("Return to latest") { Task { await store.showLatest() } }.disabled(store.busy)
+                        Button("Return to latest") { Task { await store.showLatest() } }
+                            .buttonStyle(RelayAgentQuietButtonStyle()).disabled(store.busy)
                     }
-                }.padding(.horizontal, 14).padding(.vertical, 8)
+                }
+                Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
             }
-            Rectangle().fill(RelayAgentDesign.stroke).frame(height: 1)
             content.frame(maxWidth: .infinity, maxHeight: .infinity)
             composer
         }
-        .background(RelayTheme.canvas)
         .task {
             composerState.restoreIfNeeded(hostID: draftHostID, paneID: pane.id)
             store.visible = true; await store.refresh()
@@ -291,35 +292,41 @@ struct RelayAgentTimelineView: View {
 
     // MARK: Header
 
+    /// Inside a pane the pane header above already names the pane and shows
+    /// its status, so the bar says what this view is; in its own window it
+    /// carries the pane's name and status itself.
+    static func headerTitle(paneName: String, inPane: Bool) -> String { inPane ? "Conversation" : paneName }
+
+    static func bindingDetail(_ binding: RelayAgentConversationBinding?, busy: Bool) -> String {
+        if let binding {
+            return binding.provider.capitalized + " · PID " + String(binding.processID) + " · " + String(binding.sessionID.prefix(12))
+        }
+        return busy ? "Reading the conversation source…" : "Not bound to a conversation"
+    }
+
     private var header: some View {
-        HStack(spacing: RelayTheme.spacing(10)) {
-            Image(systemName: "text.bubble")
-                .font(RelayTheme.font(size: 12, weight: .medium)).foregroundStyle(RelayAgentDesign.secondaryInk)
-                .frame(width: 24, height: 24)
-                .background(RelayAgentDesign.wash, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)))
-            VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
-                Text(pane.displayName).font(RelayTheme.font(size: 13, weight: .semibold)).lineLimit(1)
-                Group {
-                    if let binding = store.conversation.binding {
-                        Text(binding.provider.capitalized + " · PID " + String(binding.processID) + " · " + String(binding.sessionID.prefix(12)))
-                            .textSelection(.enabled)
-                    } else if store.busy {
-                        Text("Reading the conversation source…")
-                    } else { Text("Not bound to a conversation") }
-                }
-                .font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.tertiaryInk).lineLimit(1)
-            }
-            Spacer(minLength: 8)
-            if pane.phase == .active, let status = pane.headerStatus {
+        let inPane = pane.nativeConversationVisible
+        return RelayViewerBar(symbol: "text.bubble",
+                              title: Self.headerTitle(paneName: pane.displayName, inPane: inPane),
+                              detail: Self.bindingDetail(store.conversation.binding, busy: store.busy)) {
+            if !inPane, pane.phase == .active, let status = pane.headerStatus {
                 RelayTimelineActivity(status: status.text, detail: pane.headerActivityDetail,
                                       since: pane.agentActivities.last?.occurredAt)
             }
+            if store.busy { ProgressView().controlSize(.mini) }
             if let date = store.updatedAt {
-                Text(date, style: .time).font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.tertiaryInk)
+                Text(date, style: .time).font(RelayViewerMetrics.identifier).foregroundStyle(RelayTheme.textFaint)
                     .help("Last read from the provider transcript")
             }
-            if store.busy { ProgressView().controlSize(.small) }
-            if pane.nativeConversationVisible {
+            RelayViewerIconButton(title: "Find in conversation", symbol: "magnifyingglass") { openSearch() }
+                .disabled(store.conversation.items.isEmpty).help("Find in conversation (⌘F)")
+                .accessibilityIdentifier("relay.agent.search.open")
+                .keyboardShortcut("f", modifiers: .command)
+            RelayViewerIconButton(title: "Refresh", symbol: "arrow.clockwise") { Task { await store.refresh() } }
+                .disabled(store.busy).help("Read the conversation again")
+                .accessibilityIdentifier("relay.agent.refresh")
+                .keyboardShortcut("r", modifiers: .command)
+            if inPane {
                 Button("Terminal", systemImage: "terminal") {
                     var transaction = Transaction()
                     transaction.disablesAnimations = true
@@ -328,20 +335,8 @@ struct RelayAgentTimelineView: View {
                 .buttonStyle(RelayAgentQuietButtonStyle())
                 .help("Return to this session’s terminal")
                 .accessibilityIdentifier("relay.agent.return-terminal")
-                Divider().frame(height: 18).padding(.horizontal, 2)
             }
-            Button("Find in conversation", systemImage: "magnifyingglass") { openSearch() }
-                .buttonStyle(RelayAgentQuietButtonStyle()).labelStyle(.iconOnly)
-                .disabled(store.conversation.items.isEmpty).help("Find in conversation (⌘F)")
-                .accessibilityIdentifier("relay.agent.search.open")
-                .keyboardShortcut("f", modifiers: .command)
-            Button("Refresh", systemImage: "arrow.clockwise") { Task { await store.refresh() } }
-                .buttonStyle(RelayAgentQuietButtonStyle()).labelStyle(.iconOnly)
-                .disabled(store.busy).help("Read the conversation again")
-                .accessibilityIdentifier("relay.agent.refresh")
-                .keyboardShortcut("r", modifiers: .command)
         }
-        .padding(.horizontal, RelayTheme.spacing(14)).padding(.vertical, RelayTheme.spacing(10))
     }
 
     // MARK: Content states
@@ -526,7 +521,7 @@ struct RelayAgentTimelineView: View {
         .onDrop(of: [UTType.fileURL.identifier, UTType.image.identifier], isTargeted: nil) { acceptAttachmentDrop($0) }
         .background(RelayAgentDesign.composerFill, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)))
         .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6)).strokeBorder(searchFocused ? Color.primary.opacity(0.20) : Color.primary.opacity(0.10)))
-        .padding(.horizontal, RelayTheme.spacing(14)).padding(.bottom, RelayTheme.spacing(8))
+        .padding(.horizontal, RelayTheme.spacing(RelayViewerMetrics.barPadding)).padding(.vertical, RelayTheme.spacing(8))
     }
 
     private var searchCountText: String {
