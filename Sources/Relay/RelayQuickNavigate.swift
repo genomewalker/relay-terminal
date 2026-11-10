@@ -7,7 +7,8 @@ struct RelayQuickNavigate: View {
     @ObservedObject private var activityIndex: WorkspaceActivityIndex
     @State private var query = ""
     @State private var selectionID: String?
-    @State private var expandedIDs: Set<String> = []
+    /// ⌘I shows the selected row's sources and context.
+    @State private var showsDetails = false
     @FocusState private var searchFocused: Bool
     private typealias Index = RelayWorkOverviewIndex
     nonisolated static let title = RelayCommand.quickNavigate.label
@@ -56,8 +57,12 @@ struct RelayQuickNavigate: View {
                 // establish that the worker is ready or its task succeeded.
                 let signalDetail = pane.pendingAgentApprovals == 0 && report == nil && pane.phase == .quiet
                     ? "No recent output; readiness has not been confirmed.\n" : ""
-                let status = Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
-                                              programState: report, programReportCurrent: reportCurrent)
+                // A lost, returning or failed terminal says so in the fleet
+                // board's words; the phase alone would still read "Working".
+                let status = pane.contentKind == .terminal && [.reconnecting, .disconnected, .failed].contains(fact.status)
+                    ? fact.detail
+                    : Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
+                                       programState: report, programReportCurrent: reportCurrent)
                 let stateSource = pane.pendingAgentApprovals > 0 ? "pending agent approval count"
                     : (report != nil ? "program self-report" : "terminal output and agent signals")
                 let programDetails = pane.programStatus.records.map { record in
@@ -69,16 +74,29 @@ struct RelayQuickNavigate: View {
                 let details = "State source: \(stateSource). State observation time: unavailable.\n\(signalDetail)Connection: \(pane.connectionStatusLabel). Host: \(pane.profile.host).\nLatest pane activity record: \(timestamp)\(stale ? " (older than 5 minutes)" : "").\n\(activity?.label ?? "No timestamped activity available.")\n\(programDetails)"
                 entries.append(.init(id: "pane:\(id)", title: pane.displayName, location: location,
                     status: status, details: details,
-                    symbol: pane.contentKind == .editor ? "doc.text" : "terminal", destination: .pane(id, tab.id),
+                    symbol: Self.paneSymbol(contentKind: pane.contentKind, kind: pane.kind), destination: .pane(id, tab.id),
                     searchFields: [pane.title, pane.profile.name, pane.profile.host, pane.directory ?? "", id.uuidString,
                                    hidden ? "hidden stack" : "", pane.connectionStatusLabel],
                     needsAttention: fact.status.needsUser,
                     isCurrent: current, changedAt: fact.changedAt,
                     lastVisitedAt: id == workspace.activePaneID ? nil : visits.visit(id)?.lastVisitedAt,
-                    frecency: visits.frecency(of: id, at: now), isActivePane: id == workspace.activePaneID))
+                    frecency: visits.frecency(of: id, at: now), isActivePane: id == workspace.activePaneID,
+                    statusRole: Self.paneRole(contentKind: pane.contentKind, status: fact.status)))
             }
         }
         return Index.results(entries, query: query)
+    }
+
+    /// A pane row's kind icon: the agent's symbol, a shell, or the editor's,
+    /// as the sidebar shows them.
+    static func paneSymbol(contentKind: PaneContentKind, kind: AgentKind) -> String {
+        contentKind == .editor ? PaneContentKind.editor.symbol : kind.symbol
+    }
+
+    /// The icon's colour role: the fleet board's status role. An editor has
+    /// no agent, so its status says nothing and it stays neutral.
+    static func paneRole(contentKind: PaneContentKind, status: RelayWorkOverviewIndex.PaneStatus) -> RelayTheme.StatusRole {
+        contentKind == .editor ? .neutral : status.role
     }
 
     private func open(_ result: Index.Entry) {
@@ -129,88 +147,102 @@ struct RelayQuickNavigate: View {
                                         .priority: NSAccessibilityPriorityLevel.medium.rawValue])
     }
 
+    /// One dense line: the kind icon in its status colour, the title, then
+    /// status and location muted. The selected row shows its details while
+    /// ⌘I is on; the pointer shows them as a tooltip.
+    private func row(_ result: Index.Entry, selected: Bool) -> some View {
+        let expanded = selected && showsDetails
+        let secondary = [result.status, result.location].filter { !$0.isEmpty }.joined(separator: " · ")
+        return VStack(alignment: .leading, spacing: RelayTheme.Space.xxs) {
+            Button { open(result) } label: {
+                HStack(alignment: .firstTextBaseline, spacing: RelayTheme.Space.md) {
+                    Image(systemName: result.symbol)
+                        .font(RelayTheme.TextRole.label.font)
+                        .foregroundStyle(result.statusRole?.color ?? RelayTheme.textFaint)
+                        .frame(width: 18)
+                        .accessibilityHidden(true)
+                    Text(result.title).relayText(.label).foregroundStyle(RelayTheme.text).lineLimit(1)
+                        .layoutPriority(1)
+                    Text(secondary).relayText(.caption).foregroundStyle(RelayTheme.textMuted)
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 0)
+                }.contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(result.details)
+            .accessibilityLabel("\(result.title), \(result.status), \(result.location)")
+            .accessibilityAddTraits(selected ? [.isSelected] : [])
+            .accessibilityAction(named: expanded ? "Hide details" : "Show details") {
+                selectionID = result.id
+                showsDetails = !expanded
+            }
+            if expanded {
+                Text(result.details).relayText(.caption).foregroundStyle(RelayTheme.textMuted)
+                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 18 + RelayTheme.Space.md)
+            }
+        }
+        .padding(.horizontal, RelayTheme.Space.md).padding(.vertical, RelayTheme.Space.xs)
+        .background(selected ? RelayTheme.accent.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+    }
+
     var body: some View {
         let rows = results
         let selected = Index.selectedID(selectionID, in: rows, query: query)
         VStack(alignment: .leading, spacing: 0) {
-            Text(Self.title).font(.headline).padding(.horizontal, 16).padding(.top, 14)
+            Text(Self.title).font(.headline).foregroundStyle(RelayTheme.text).padding(.horizontal, 16).padding(.top, 14)
             HStack(spacing: 10) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                Image(systemName: "magnifyingglass").foregroundStyle(RelayTheme.textMuted)
                 TextField(Self.searchPlaceholder, text: $query)
                     .textFieldStyle(.plain).focused($searchFocused)
                     .onSubmit { if let row = rows.first(where: { $0.id == selected }) { open(row) } }
                     .accessibilityLabel(Self.title)
-                    .accessibilityHint("Use up and down arrows to select a result, Return to open, Escape to return to the original pane")
+                    .accessibilityHint("Use up and down arrows to select a result, Return to open, Command-I to show details, Escape to return to the original pane")
                     .accessibilityIdentifier("relay.overview.search")
                     .onKeyPress(.downArrow) { move(1); return .handled }
                     .onKeyPress(.upArrow) { move(-1); return .handled }
                     .onKeyPress(.escape) { workspace.isQuickNavigatePresented = false; return .handled }
+                    .onKeyPress(keys: ["i"]) { press in
+                        guard press.modifiers == .command, selected != nil else { return .ignored }
+                        showsDetails.toggle()
+                        return .handled
+                    }
             }.padding(16)
             Divider()
-            Text("Work and navigation · Details show sources and context")
-                .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 8)
             if rows.isEmpty {
-                Text("No matching work").foregroundStyle(.secondary).padding(20)
+                Text("No matching work").foregroundStyle(RelayTheme.textMuted).padding(20)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 2) {
+                        LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(Index.sections(rows, query: query)) { section in
                                 let members = section.entries
                                 if !members.isEmpty {
-                                    Text(section.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                                        .padding(.horizontal, 12).padding(.top, 10).accessibilityAddTraits(.isHeader)
+                                    Text(section.title).relayText(.eyebrow).foregroundStyle(RelayTheme.textMuted)
+                                        .padding(.horizontal, RelayTheme.Space.md).padding(.top, RelayTheme.Space.md)
+                                        .padding(.bottom, RelayTheme.Space.xxs).accessibilityAddTraits(.isHeader)
                                     ForEach(members) { result in
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            HStack(spacing: 6) {
-                                                Button { open(result) } label: {
-                                                    HStack(spacing: 10) {
-                                                        Image(systemName: result.symbol).frame(width: 20).foregroundStyle(.secondary)
-                                                        VStack(alignment: .leading, spacing: 3) {
-                                                            Text(result.title).lineLimit(1)
-                                                            Text([result.status, result.location].filter { !$0.isEmpty }.joined(separator: " · "))
-                                                                .font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                                                        }
-                                                        Spacer()
-                                                    }.contentShape(Rectangle())
-                                                }.buttonStyle(.plain)
-                                                .accessibilityLabel("\(result.title), \(result.status), \(result.location)")
-                                                .accessibilityAddTraits(result.id == selected ? [.isSelected] : [])
-                                                Button {
-                                                    if !expandedIDs.insert(result.id).inserted { expandedIDs.remove(result.id) }
-                                                } label: { Image(systemName: expandedIDs.contains(result.id) ? "chevron.up" : "info.circle") }
-                                                .buttonStyle(.plain).help("Show source and activity details")
-                                                .accessibilityLabel("\(expandedIDs.contains(result.id) ? "Hide" : "Show") details for \(result.title)")
-                                            }
-                                            if expandedIDs.contains(result.id) {
-                                                Text(result.details).font(.caption).foregroundStyle(.secondary)
-                                                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                                                    .padding(.leading, 30)
-                                            }
-                                        }
-                                        .padding(.horizontal, 12).padding(.vertical, 8)
-                                        .background(result.id == selected ? Color.primary.opacity(0.08) : Color.clear,
-                                                    in: RoundedRectangle(cornerRadius: 6)).id(result.id)
+                                        row(result, selected: result.id == selected).id(result.id)
                                     }
                                 }
                             }
                         }.padding(6)
                     }
                     .onChange(of: selected) { _, id in if let id { proxy.scrollTo(id, anchor: .center) } }
-                }.frame(height: 370)
+                }.frame(height: 400)
             }
             Divider()
             HStack {
-                Text("↑↓ Select   ↵ Open   esc Close")
+                Text("↑↓ Select   ↵ Open   ⌘I Details   esc Close")
                 Spacer()
                 Text("\(rows.count) results")
-            }.font(.caption).foregroundStyle(.secondary).padding(12)
+            }.font(.caption).foregroundStyle(RelayTheme.textMuted).padding(12)
         }
         .frame(width: 620)
         .background(.regularMaterial)
         .onAppear { searchFocused = true }
-        .onChange(of: query) { _, _ in selectionID = nil }
+        .onChange(of: query) { _, _ in selectionID = nil; showsDetails = false }
         .onChange(of: rows.map(\.id)) { _, _ in selectionID = Index.selectedID(selectionID, in: rows, query: query) }
         .onChange(of: selected) { _, id in announceSelection(rows.first { $0.id == id }) }
         .onMoveCommand { direction in
