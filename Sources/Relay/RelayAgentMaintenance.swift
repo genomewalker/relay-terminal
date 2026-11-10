@@ -333,7 +333,7 @@ enum RelayAgentMaintenancePolicy {
         }
         guard !entries.values.contains(where: {
             $0.paneID == pane && $0.host == host &&
-            (!["verified", "draft_restored_without_restart", "draft_restore_held"].contains($0.state) ||
+            (!Self.settledStates.contains($0.state) ||
              Date().timeIntervalSince($0.createdAt) < 1800)
         }) else { return nil }
         let source = [host, pane.uuidString, String(proof.processID ?? 0), String(proof.processStart ?? 0),
@@ -367,6 +367,42 @@ enum RelayAgentMaintenancePolicy {
         guard entries[id]?.draftDigest != nil else { throw RemoteCatalogError.invalidResponse }
         entries[id]?.draftRestored = true
         try save()
+    }
+
+    /// A saved draft whose text is already in the prompt of the same agent
+    /// process (same start time and conversation) was never lost: the restart
+    /// did not happen. The record is settled as restored without a restart.
+    func settleDraftAlreadyInPrompt(_ id: String, proof: RelayAgentMaintenanceProbe, prompt: Data) throws -> Bool {
+        guard !loadFailed, let entry = entries[id], let digest = entry.draftDigest, entry.draftRestored != true,
+              entry.state == "draft_saved", entry.sessionID == proof.sessionID,
+              let process = proof.processID, let start = proof.processStart,
+              entry.originalProcessID == process, entry.originalProcessStart == start,
+              RelayPromptEditorRPC.digest(prompt) == digest else { return false }
+        entries[id]?.draftRestored = true
+        entries[id]?.state = "draft_restored_without_restart"
+        try save()
+        return true
+    }
+
+    /// States that no longer hold a new action once their cooldown has passed.
+    static let settledStates: Set<String> = ["verified", "draft_restored_without_restart", "draft_restore_held",
+                                             "restart_not_admitted"]
+
+    /// A restart whose admission outcome was unknown did not happen when the
+    /// same process, with the same start time and conversation, is still the
+    /// pane's agent. Nothing is resent; the record only stops holding the pane.
+    func resolveUnadmittedRestarts(pane: UUID, host: String, proof: RelayAgentMaintenanceProbe) throws -> Bool {
+        guard !loadFailed, proof.valid(for: pane), proof.bound == true, let session = proof.sessionID,
+              let process = proof.processID, let start = proof.processStart else { return false }
+        let ids = entries.values.filter {
+            $0.paneID == pane && $0.host == host && $0.sessionID == session &&
+            $0.state == "restart_admission_unknown" &&
+            $0.originalProcessID == process && $0.originalProcessStart == start
+        }.map(\.id)
+        guard !ids.isEmpty else { return false }
+        for id in ids { entries[id]?.state = "restart_not_admitted" }
+        try save()
+        return true
     }
 
     /// Reconcile a repair from its exact binding and, for updates, the running
@@ -831,6 +867,9 @@ enum RelayAgentMaintenanceRestartAdmission {
             statuses[pane.id] = "Saved draft restored and verified"
             return
         }
+        if try journal.resolveUnadmittedRestarts(pane: pane.id, host: profile.connectionKey, proof: proof) {
+            statuses[pane.id] = "The earlier restart did not happen; the same agent process is still running"
+        }
         if try journal.reconcileBinding(pane: pane.id, host: profile.connectionKey, proof: proof) {
             statuses[pane.id] = "The recorded maintenance result is verified; conversation preserved"
             completeHaikuTool(pane, state: "verified", message: "The original conversation binding is recovered.", proof: proof)
@@ -1050,6 +1089,8 @@ enum RelayAgentMaintenanceRestartAdmission {
         let revision = pane.agentInputRevision
         let current = try await pane.runtime.editAgentMaintenanceDraft(proof: proof, inputRevision: revision,
             expected: nil, replacement: nil)
+        // The backup is kept: settling a record never discards the user's text.
+        if try journal.settleDraftAlreadyInPrompt(entry.id, proof: proof, prompt: current) { return true }
         if current != saved.text {
             guard current.isEmpty else {
                 try journal.mark(entry.id, "draft_restore_held")
