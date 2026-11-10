@@ -121,6 +121,7 @@ func (server *Server) Serve(socketPath string) error {
 	defer stopHealth()
 	server.hostHealth = newHostPaneHealthSupervisor(server.stateDir, server.executable)
 	server.hostHealth.lifetime = healthContext
+	server.hostHealth.manifest = server.manifestPath
 	go server.hostHealth.run(healthContext)
 	// Startup-only retention avoids a polling goroutine and bounds cleanup
 	// work. Running panes are never eligible.

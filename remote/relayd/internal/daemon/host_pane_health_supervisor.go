@@ -196,6 +196,54 @@ type hostPaneHealthSupervisor struct {
 	wake             chan struct{}
 	command          func(context.Context, string, any) (json.RawMessage, error)
 	lifetime         context.Context
+	// manifest names a pane's worker manifest. When set, the periodic tick
+	// runs only on the node whose workers own the configured panes.
+	manifest func(pane string) string
+}
+
+// paneHealthForeignRecheck is how long a daemon on another node waits before
+// looking again; a configure from the desktop wakes it sooner.
+var paneHealthForeignRecheck = 5 * time.Minute
+
+// configuredElsewhere reports whether the configured panes belong to another
+// node. The state directory can be shared by several nodes (an NFS home). A
+// daemon on another node cannot see those workers, so its tick would replace
+// every observation with an unverified one. It is true only when some
+// configured pane has a manifest from a different boot and none has one from
+// this boot; anything unreadable keeps the former behaviour.
+func (s *hostPaneHealthSupervisor) configuredElsewhere() bool {
+	if s.manifest == nil {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(s.root, "pane-health-controller", "configuration.json"))
+	if err != nil {
+		return false
+	}
+	var config struct {
+		Panes []string `json:"panes"`
+	}
+	if json.Unmarshal(data, &config) != nil || len(config.Panes) == 0 {
+		return false
+	}
+	boot, err := nodeBootID()
+	if err != nil || boot == "" {
+		return false
+	}
+	foreign := false
+	for _, pane := range config.Panes {
+		if !validSessionID.MatchString(pane) {
+			continue
+		}
+		manifest, err := loadManifest(s.manifest(pane))
+		if err != nil || manifest.NodeBootID == "" {
+			continue
+		}
+		if manifest.NodeBootID == boot {
+			return false
+		}
+		foreign = true
+	}
+	return foreign
 }
 
 func newHostPaneHealthSupervisor(root, executable string) *hostPaneHealthSupervisor {
@@ -221,6 +269,17 @@ func (s *hostPaneHealthSupervisor) run(ctx context.Context) {
 			return
 		case <-s.wake:
 		case <-deadline:
+		}
+		if s.configuredElsewhere() {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(paneHealthForeignRecheck)
+			deadline = timer.C
+			continue
 		}
 		call, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		result, err := s.command(call, "tick", map[string]any{})
