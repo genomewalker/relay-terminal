@@ -40,6 +40,8 @@ enum RelayWorkOverviewIndex {
         var isActivePane = false
         /// Set by `results` for the most recently visited panes.
         var listedAsRecent = false
+        /// A pane row's status role, for its icon colour; nil for other rows.
+        var statusRole: RelayTheme.StatusRole? = nil
         var group: Group {
             if needsAttention { return .attention }
             if listedAsRecent { return .visited }
