@@ -814,6 +814,18 @@ extension RelaydHostState {
         }
     }
 
+    /// Status role for badges; reuses the theme's status colours.
+    var role: RelayTheme.StatusRole {
+        switch self {
+        case .ready: .success
+        case .missing, .outdated, .installing: .info
+        case .checking: .pending
+        case .unreachable: .offline
+        case .failed: .danger
+        case .unknown: .neutral
+        }
+    }
+
     var color: Color {
         switch self {
         case .ready: RelayTheme.mint
@@ -914,44 +926,100 @@ struct RelaydFirstRunView: View {
     }
 }
 
-struct RelaydManagerView: View {
-    @ObservedObject var profileStore: ProfileStore
-    let preferredProfile: ConnectionProfile?
-    @ObservedObject private var manager = RelaydManager.shared
-    @ObservedObject private var preferences = RelayPreferences.shared
-    @ObservedObject private var updates = RelaydHostUpdateProgress.shared
-    @Environment(\.dismiss) private var dismiss
-
-    private var profiles: [ConnectionProfile] {
-        profileStore.connectableHosts.filter { $0.kind == .ssh }
-    }
-
-    private var selectedProfile: ConnectionProfile? {
-        let key = manager.selectedHostKey
-        return profiles.first { $0.connectionKey == key } ?? profiles.first
-    }
+/// Version, helper and pane counts for one host. Only versions and process ids
+/// use monospace; counts and words use the normal interface font.
+struct RelaydHostMetrics: View {
+    let report: RelaydHostReport
 
     var body: some View {
-        HStack(spacing: RelayTheme.spacing(0)) {
-            hostRail
-                .frame(width: 220)
-            Divider().overlay(RelayTheme.line.opacity(0.5))
-            detail
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .frame(width: 860, height: 610)
-        .foregroundStyle(RelayTheme.text)
-        .background(RelayTheme.canvas)
-        .relaySurface()
-        .onAppear {
-            profileStore.refreshSSHConfig()
-            if let preferredProfile { manager.select(preferredProfile) }
-            else if manager.selectedHostKey == nil, let first = profiles.first { manager.select(first) }
-            if let selectedProfile { manager.check(selectedProfile) }
+        HStack(spacing: RelayTheme.spacing(8)) {
+            metric("Version", report.version ?? "—", monospaced: report.version != nil)
+            metric(
+                "Helper",
+                report.supervisorPID == nil ? "Stopped" : "Running",
+                detail: report.supervisorPID.map { pid in
+                    // The running version is worth showing only when it differs from the installed one.
+                    if let live = report.liveVersion, live != report.version { return "\(live) · pid \(pid)" }
+                    return "pid \(pid)"
+                }
+            )
+            metric("Sessions", String(report.sessionCount))
+            metric("Panes", "\(report.runningPaneCount) of \(report.paneCount) running")
         }
     }
 
-    private var hostRail: some View {
+    private func metric(_ label: String, _ value: String, monospaced: Bool = false,
+                        detail: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+            Text(label.uppercased())
+                .font(RelayTheme.font(size: 8.5, weight: .semibold))
+                .tracking(0.5)
+                .foregroundStyle(RelayTheme.textFaint)
+            HStack(alignment: .firstTextBaseline, spacing: RelayTheme.spacing(6)) {
+                Text(value)
+                    .font(RelayTheme.font(size: 12, weight: .medium, design: monospaced ? .monospaced : .default))
+                    .monospacedDigit()
+                    .foregroundStyle(RelayTheme.text)
+                if let detail {
+                    Text(detail)
+                        .font(RelayTheme.font(size: 9.5, design: .monospaced))
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .textSelection(.enabled)
+                }
+            }
+            .lineLimit(1)
+        }
+        .padding(RelayTheme.spacing(11))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
+    }
+}
+
+/// Splits the host list into hosts Relay uses and the rest of ~/.ssh/config.
+/// A host is in use when it had panes, holds a check result from this session
+/// or an earlier one, or was saved from Connect. Input order is kept.
+enum RelaydHostGrouping {
+    static func split(_ profiles: [ConnectionProfile], usedKeys: Set<String>)
+        -> (inUse: [ConnectionProfile], other: [ConnectionProfile]) {
+        var inUse: [ConnectionProfile] = []
+        var other: [ConnectionProfile] = []
+        for profile in profiles {
+            if usedKeys.contains(profile.connectionKey) { inUse.append(profile) } else { other.append(profile) }
+        }
+        return (inUse, other)
+    }
+
+    static func usedKeys(
+        reports: [String: RelaydHostReport],
+        lastKnown: [String: RelaydHostState],
+        recentHostKeys: [String],
+        savedProfiles: [ConnectionProfile]
+    ) -> Set<String> {
+        var keys = Set(recentHostKeys)
+        keys.formUnion(savedProfiles.filter { $0.kind == .ssh }.map(\.connectionKey))
+        for (key, report) in reports where report.state != .unknown || report.paneCount > 0 { keys.insert(key) }
+        for (key, state) in lastKnown where state != .unknown { keys.insert(key) }
+        return keys
+    }
+}
+
+/// Host list of the Remote helpers window. Takes plain values so tests can
+/// render it with fixture hosts and no remote checks.
+struct RelaydHostRail<UpdateRow: View>: View {
+    let profiles: [ConnectionProfile]
+    let reports: [String: RelaydHostReport]
+    /// State from a check in an earlier session, shown until this session checks.
+    var lastKnown: [String: RelaydHostState] = [:]
+    let usedKeys: Set<String>
+    let selectedKey: String?
+    let select: (ConnectionProfile) -> Void
+    @ViewBuilder let updateRow: (ConnectionProfile) -> UpdateRow
+    @State private var showsOtherHosts = false
+
+    var body: some View {
+        let groups = RelaydHostGrouping.split(profiles, usedKeys: usedKeys)
+        let otherExpanded = showsOtherHosts || groups.inUse.isEmpty
+            || groups.other.contains { $0.connectionKey == selectedKey }
         VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
             VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
                 Text("Remote helpers")
@@ -959,6 +1027,7 @@ struct RelaydManagerView: View {
                 Text(RelaySettingsCopy.helperManagerSubtitle)
                     .font(RelayTheme.font(size: 10.5))
                     .foregroundStyle(RelayTheme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
                     .help(RelaySettingsCopy.helperManagerSubtitleDetail)
             }
             .padding(RelayTheme.spacing(18))
@@ -979,37 +1048,27 @@ struct RelaydManagerView: View {
                 .padding(RelayTheme.spacing(18))
             } else {
                 ScrollView {
-                    LazyVStack(spacing: RelayTheme.spacing(4)) {
-                        ForEach(profiles) { profile in
-                            let report = manager.report(for: profile)
-                            Button {
-                                manager.select(profile)
-                                manager.check(profile)
-                            } label: {
-                                HStack(spacing: RelayTheme.spacing(9)) {
-                                    Circle().fill(report.state.color).frame(width: 6, height: 6)
-                                    VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
-                                        Text(profile.name)
-                                            .font(RelayTheme.font(size: 11.5, weight: .medium))
-                                            .lineLimit(1)
-                                        Text(report.state.label)
-                                            .font(RelayTheme.font(size: 9.5))
-                                            .foregroundStyle(RelayTheme.textMuted)
-                                    }
-                                    Spacer()
-                                }
+                    LazyVStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+                        if groups.inUse.isEmpty {
+                            Text("No hosts in use yet. Pick a host to check it.")
+                                .font(RelayTheme.font(size: 10.5))
+                                .foregroundStyle(RelayTheme.textMuted)
+                                .fixedSize(horizontal: false, vertical: true)
                                 .padding(.horizontal, RelayTheme.spacing(10))
-                                .frame(height: 44)
-                                .contentShape(Rectangle())
-                                .background(
-                                    manager.selectedHostKey == profile.connectionKey
-                                        ? RelayTheme.elevated : Color.clear,
-                                    in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9))
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            if let update = updates.entry(forKey: profile.connectionKey) {
-                                updateRow(update, profile: profile)
+                                .padding(.vertical, RelayTheme.spacing(6))
+                        }
+                        ForEach(groups.inUse) { profile in
+                            usedRow(profile)
+                            updateRow(profile)
+                        }
+                        if !groups.other.isEmpty {
+                            otherHeader(count: groups.other.count, expanded: otherExpanded,
+                                        canCollapse: !groups.inUse.isEmpty)
+                            if otherExpanded {
+                                ForEach(groups.other) { profile in
+                                    otherRow(profile)
+                                    updateRow(profile)
+                                }
                             }
                         }
                     }
@@ -1019,6 +1078,170 @@ struct RelaydManagerView: View {
             Spacer(minLength: 0)
         }
         .background(RelayTheme.sidebar)
+    }
+
+    private func usedRow(_ profile: ConnectionProfile) -> some View {
+        let report = reports[profile.connectionKey] ?? RelaydHostReport()
+        let earlier = report.state == .unknown ? lastKnown[profile.connectionKey] : nil
+        return Button {
+            select(profile)
+        } label: {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+                Text(profile.name)
+                    .font(RelayTheme.font(size: 11.5, weight: .medium))
+                    .lineLimit(1)
+                if let earlier, earlier != .unknown {
+                    // Not re-checked yet in this session: say so instead of
+                    // presenting an old result as current.
+                    RelayBadge("Last check: \(earlier.label)", role: .neutral, showsSymbol: false)
+                } else {
+                    RelayBadge(report.state.label, role: report.state.role)
+                }
+            }
+            .padding(.horizontal, RelayTheme.spacing(10))
+            .padding(.vertical, RelayTheme.spacing(7))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(rowBackground(profile), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9)))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func otherRow(_ profile: ConnectionProfile) -> some View {
+        Button {
+            select(profile)
+        } label: {
+            Text(profile.name)
+                .font(RelayTheme.font(size: 11))
+                .foregroundStyle(RelayTheme.textMuted)
+                .lineLimit(1)
+                .padding(.horizontal, RelayTheme.spacing(10))
+                .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
+                .contentShape(Rectangle())
+                .background(rowBackground(profile), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7)))
+        }
+        .buttonStyle(.plain)
+        .help("Check \(profile.name)")
+    }
+
+    /// "Other SSH hosts (N)". A disclosure while hosts are in use; a plain
+    /// heading when it is the only list.
+    @ViewBuilder
+    private func otherHeader(count: Int, expanded: Bool, canCollapse: Bool) -> some View {
+        let title = Text("Other SSH hosts (\(count))")
+            .font(RelayTheme.font(size: 10.5, weight: .semibold))
+        if canCollapse {
+            Button {
+                showsOtherHosts = !expanded
+            } label: {
+                HStack(spacing: RelayTheme.spacing(6)) {
+                    Image(systemName: "chevron.right")
+                        .font(RelayTheme.font(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .frame(width: 10)
+                    title
+                    Spacer()
+                }
+                .foregroundStyle(RelayTheme.textMuted)
+                .padding(.horizontal, RelayTheme.spacing(10))
+                .padding(.top, RelayTheme.spacing(10))
+                .padding(.bottom, RelayTheme.spacing(4))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Hosts from ~/.ssh/config that Relay has not used. Pick one to check it.")
+            .accessibilityLabel("Other SSH hosts, \(count)")
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+        } else {
+            title
+                .foregroundStyle(RelayTheme.textMuted)
+                .padding(.horizontal, RelayTheme.spacing(10))
+                .padding(.top, RelayTheme.spacing(10))
+                .padding(.bottom, RelayTheme.spacing(4))
+                .accessibilityAddTraits(.isHeader)
+        }
+    }
+
+    private func rowBackground(_ profile: ConnectionProfile) -> Color {
+        selectedKey == profile.connectionKey ? RelayTheme.elevated : Color.clear
+    }
+}
+
+struct RelaydManagerView: View {
+    @ObservedObject var profileStore: ProfileStore
+    let preferredProfile: ConnectionProfile?
+    @ObservedObject private var manager = RelaydManager.shared
+    @ObservedObject private var preferences = RelayPreferences.shared
+    @ObservedObject private var updates = RelaydHostUpdateProgress.shared
+    @ObservedObject private var registry = RelayHostRegistry.shared
+    @Environment(\.dismiss) private var dismiss
+
+    private var profiles: [ConnectionProfile] {
+        profileStore.connectableHosts.filter { $0.kind == .ssh }
+    }
+
+    /// Installation state recorded by checks in earlier sessions.
+    private var lastKnown: [String: RelaydHostState] {
+        registry.records.compactMapValues { record in
+            record.checkedAt == nil ? nil : RelaydHostState(rawValue: record.installation)
+        }
+    }
+
+    private var usedKeys: Set<String> {
+        RelaydHostGrouping.usedKeys(
+            reports: manager.reports, lastKnown: lastKnown,
+            recentHostKeys: profileStore.recentHostKeys, savedProfiles: profileStore.profiles
+        )
+    }
+
+    /// Without an explicit choice, open on a host Relay uses rather than the
+    /// first entry of ~/.ssh/config.
+    private var defaultProfile: ConnectionProfile? {
+        RelaydHostGrouping.split(profiles, usedKeys: usedKeys).inUse.first ?? profiles.first
+    }
+
+    private var selectedProfile: ConnectionProfile? {
+        let key = manager.selectedHostKey
+        return profiles.first { $0.connectionKey == key } ?? defaultProfile
+    }
+
+    var body: some View {
+        HStack(spacing: RelayTheme.spacing(0)) {
+            hostRail
+                .frame(width: 220)
+            Divider().overlay(RelayTheme.line.opacity(0.5))
+            detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(width: 860, height: 610)
+        .foregroundStyle(RelayTheme.text)
+        .background(RelayTheme.canvas)
+        .relaySurface()
+        .onAppear {
+            profileStore.refreshSSHConfig()
+            if let preferredProfile { manager.select(preferredProfile) }
+            else if manager.selectedHostKey == nil, let first = defaultProfile { manager.select(first) }
+            if let selectedProfile { manager.check(selectedProfile) }
+        }
+    }
+
+    private var hostRail: some View {
+        RelaydHostRail(
+            profiles: profiles,
+            reports: manager.reports,
+            lastKnown: lastKnown,
+            usedKeys: usedKeys,
+            selectedKey: manager.selectedHostKey,
+            select: { profile in
+                manager.select(profile)
+                manager.check(profile)
+            },
+            updateRow: { profile in
+                if let update = updates.entry(forKey: profile.connectionKey) {
+                    updateRow(update, profile: profile)
+                }
+            }
+        )
     }
 
     /// The host's relayd update: elapsed time while it runs, then its
@@ -1074,9 +1297,7 @@ struct RelaydManagerView: View {
                     HStack(spacing: RelayTheme.spacing(7)) {
                         Text(profile.name)
                             .font(RelayTheme.font(size: 17, weight: .semibold))
-                        Label(report.state.label, systemImage: report.state.symbol)
-                            .font(RelayTheme.font(size: 9.5, weight: .semibold))
-                            .foregroundStyle(report.state.color)
+                        RelayBadge(report.state.label, role: report.state.role)
                     }
                     Text(profile.subtitle)
                         .font(RelayTheme.font(size: 10.5))
@@ -1104,7 +1325,7 @@ struct RelaydManagerView: View {
                             .background(report.state.color.opacity(0.08), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9)))
                     }
 
-                    metrics(report)
+                    RelaydHostMetrics(report: report)
 
                     HStack(spacing: RelayTheme.spacing(9)) {
                         Image(systemName: manager.isTrusted(profile) ? "checkmark.shield" : "shield")
@@ -1184,34 +1405,6 @@ struct RelaydManagerView: View {
                 .padding(RelayTheme.spacing(20))
             }
         }
-    }
-
-    private func metrics(_ report: RelaydHostReport) -> some View {
-        HStack(spacing: RelayTheme.spacing(8)) {
-            metric("Version", report.version ?? "—")
-            metric(
-                "Supervisor",
-                report.supervisorPID.map { "\(report.liveVersion ?? "unknown") · \($0)" } ?? "Stopped"
-            )
-            metric("Sessions", String(report.sessionCount))
-            metric("Panes", "\(report.runningPaneCount)/\(report.paneCount)")
-        }
-    }
-
-    private func metric(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
-            Text(label.uppercased())
-                .font(RelayTheme.font(size: 8.5, weight: .semibold))
-                .tracking(0.5)
-                .foregroundStyle(RelayTheme.textFaint)
-            Text(value)
-                .font(RelayTheme.font(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(RelayTheme.text)
-                .lineLimit(1)
-        }
-        .padding(RelayTheme.spacing(11))
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
     }
 
     private func installationCard(profile: ConnectionProfile, report: RelaydHostReport) -> some View {
