@@ -39,12 +39,38 @@ enum RelayAgentMaintenancePrompt {
     }
 
     private static func busy(_ value: String, explainedAgents: Int) -> Bool {
-        value.range(of: footerWork, options: [.regularExpression, .caseInsensitive]) != nil ||
-            agentCount(value) > explainedAgents
+        if value.range(of: footerWork, options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        if explainedAgents == waitingSessionsExplained { return agentCount(withoutWaitingSessions(value)) > 0 }
+        return agentCount(value) > explainedAgents
+    }
+
+    /// `explainedAgents` value for a pane whose own agent work relayd has
+    /// verified absent. Claude Code's "← N agent(s)" footer is the agents-view
+    /// nudge: it skips the pane's own session and counts only other sessions
+    /// that are blocked waiting for the user, so restarting this pane cannot
+    /// stop them. Any other footer agent count still holds the prompt.
+    static let waitingSessionsExplained = Int.max - 1
+
+    /// The footer's agent count other than the "← N agent(s)" waiting-sessions
+    /// nudge, 0 when none is shown.
+    static func footerOtherAgentCount(_ vt: String?, provider: String) -> Int {
+        guard provider == "claude", let vt, vt.utf8.count <= maximumScreenBytes, let rows = parse(vt) else { return 0 }
+        return rows.suffix(14).map {
+            agentCount(withoutWaitingSessions(String(String.UnicodeScalarView($0.map(\.character))).trimmingCharacters(in: .whitespaces)))
+        }.max() ?? 0
+    }
+
+    private static func withoutWaitingSessions(_ value: String) -> String {
+        var text = value
+        while let range = text.range(of: footerWaitingSessions, options: [.regularExpression, .caseInsensitive]) {
+            text.removeSubrange(range)
+        }
+        return text
     }
 
     private static let footerWork = #"\b[1-9][0-9]* (?:shells?|background tasks?)\b"#
-    private static let footerAgents = #"\b[1-9][0-9]* agents?\b"#
+    private static let footerAgents = #"\b[1-9][0-9]*\+? agents?\b"#
+    private static let footerWaitingSessions = #"\u{2190}\s*(?:[1-9][0-9]*|99\+)\s+agents?\b"#
 
     /// A footer agent count above `explainedAgents` keeps the prompt busy; the
     /// default 0 treats any agent count as running work.

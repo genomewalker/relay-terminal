@@ -2,12 +2,11 @@ import Foundation
 import Testing
 @testable import Relay
 
-/// "← N agent" in Claude's footer counts the user's Claude background agent
-/// jobs on the host as well as the pane's own subagents. A move goes ahead
-/// only when relayd's evidence accounts for every footer agent: the pane's
-/// subagents all finished (main-transcript lifecycle and relayd's live event
-/// state), Claude reports the bound process idle, and the host has at least
-/// that many background agent jobs outside the pane.
+/// "← N agent" in Claude's footer counts the user's other Claude sessions
+/// waiting for input. A move goes ahead only when relayd's evidence shows the
+/// pane has no work of its own: the pane's subagents all finished
+/// (main-transcript lifecycle and relayd's live event state), Claude reports
+/// the bound process idle, and no native child agent or shell is running.
 @Suite("Account move footer agent count")
 struct RelayAgentMoveFooterTests {
     private let paneID = UUID(uuidString: "7d85fd72-64ec-46a4-8591-567bf64f7c93")!
@@ -55,7 +54,9 @@ struct RelayAgentMoveFooterTests {
         #expect(refusal(try proof(), screen: idleWithAgentFooter) == nil)
         let two = idleWithAgentFooter.replacingOccurrences(of: "← 1 agent", with: "← 2 agents")
         #expect(refusal(try proof(hostJobs: 2), screen: two) == nil)
-        #expect(refusal(try proof(hostJobs: 1), screen: two)?.contains("← 2 agents") == true)
+        // A bare agent count is not the waiting-sessions nudge: host jobs no longer explain it.
+        let bare = idleWithAgentFooter.replacingOccurrences(of: "← 1 agent", with: "2 agents")
+        #expect(refusal(try proof(hostJobs: 2), screen: bare)?.contains("2 agents") == true)
         // No agent count: nothing to account for, whatever the evidence.
         let plain = idleWithAgentFooter.replacingOccurrences(of: " · ← 1 agent", with: "")
         #expect(refusal(try proof(subagentWork: nil, harness: nil, hostJobs: nil), screen: plain) == nil)
@@ -87,10 +88,12 @@ struct RelayAgentMoveFooterTests {
         #expect(refusal(try proof(harness: nil), screen: idleWithAgentFooter) != nil)
     }
 
-    @Test("Without host background jobs to account for it, the footer agent count holds")
-    func noHostJobsHold() throws {
-        #expect(refusal(try proof(hostJobs: 0), screen: idleWithAgentFooter) != nil)
-        #expect(refusal(try proof(hostJobs: nil), screen: idleWithAgentFooter) != nil)
+    @Test("'← N agent' counts other sessions waiting: with no native child agent it needs no host job")
+    func waitingSessionsNeedNoHostJob() throws {
+        #expect(refusal(try proof(hostJobs: 0), screen: idleWithAgentFooter) == nil)
+        #expect(refusal(try proof(hostJobs: nil), screen: idleWithAgentFooter) == nil)
+        #expect(refusal(try proof(backgroundWork: true, hostJobs: 0), screen: idleWithAgentFooter) != nil)
+        #expect(refusal(try proof(backgroundWork: nil, hostJobs: 0), screen: idleWithAgentFooter) != nil)
     }
 
     @Test("A native child agent process refuses even when every agent is accounted for")

@@ -3037,7 +3037,7 @@ final class TerminalRuntime: NSObject {
             if let work = RelayAgentMaintenancePrompt.backgroundWork(screen, provider: provider, explainedAgents: explainedAgents) {
                 if RelayAgentMaintenancePrompt.backgroundWork(screen, provider: provider, explainedAgents: .max) == nil {
                     return "the footer shows \(RelayAgentMaintenancePrompt.footerAgentCount(screen, provider: provider)) agent(s) but " +
-                        "relayd accounts for \(explainedAgents): the pane's subagents, harness status or the host's background " +
+                        "relayd accounts for \(explainedAgents == RelayAgentMaintenancePrompt.waitingSessionsExplained ? "only other sessions waiting for input" : String(explainedAgents)): the pane's subagents, harness status or the host's background " +
                         "agent jobs are not verified (\(String(work.suffix(60))))"
                 }
                 return "the footer shows background work still running (\(String(work.suffix(60))))"
@@ -3083,9 +3083,15 @@ final class TerminalRuntime: NSObject {
         /// Empty apart from the footer agent count, and that count.
         let agentEmptyIgnoringAgents: Bool
         let footerAgents: Int
+        /// The footer agent count other than the "← N agent(s)" waiting-sessions nudge.
+        let footerOtherAgents: Int
 
         func empty(explainedAgents: Int) -> Bool {
-            explainedAgents == 0 ? agentEmpty : agentEmptyIgnoringAgents && footerAgents <= explainedAgents
+            if explainedAgents == 0 { return agentEmpty }
+            if explainedAgents == RelayAgentMaintenancePrompt.waitingSessionsExplained {
+                return agentEmptyIgnoringAgents && footerOtherAgents == 0
+            }
+            return agentEmptyIgnoringAgents && footerAgents <= explainedAgents
         }
         let agentTyped: Bool
         let shellEmpty: Bool
@@ -3229,6 +3235,7 @@ final class TerminalRuntime: NSObject {
             agentEmptyIgnoringAgents: RelayAgentMaintenancePrompt.isEmpty(screen,
                 provider: pane.kind == .codex ? "codex" : "claude", explainedAgents: .max),
             footerAgents: RelayAgentMaintenancePrompt.footerAgentCount(screen, provider: pane.kind == .codex ? "codex" : "claude"),
+            footerOtherAgents: RelayAgentMaintenancePrompt.footerOtherAgentCount(screen, provider: pane.kind == .codex ? "codex" : "claude"),
             agentTyped: RelayAgentMaintenancePrompt.hasTypedText(screen, provider: pane.kind == .codex ? "codex" : "claude"),
             shellEmpty: RelayAgentMaintenancePrompt.retainedShellIsEmpty(screen))
         preparedMaintenancePrompt?.claudeOverlay = pane.kind != .codex && RelayAgentMaintenancePrompt.isClaudeSettingsOverlay(screen)

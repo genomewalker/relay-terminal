@@ -147,9 +147,16 @@ enum RelayAgentMaintenancePolicy {
     /// and Claude's own sessions/<pid>.json reports the bound process idle.
     /// Then the footer may show up to the host's live background agent jobs,
     /// which Claude counts for every pane but which this pane does not own.
+    ///
+    /// When relayd also finds no child agent or shell under the bound process
+    /// (`backgroundWork == false`), the pane has no agent work of its own, and
+    /// the "← N agent(s)" agents-view nudge, which counts only other sessions
+    /// waiting for input, is explained whatever its number.
     static func explainedFooterAgents(_ proof: RelayAgentMaintenanceProbe, activeSubagents: Int) -> Int {
         guard proof.provider == "claude", proof.subagentWork == false, activeSubagents == 0,
-              proof.harnessStatus == "idle", let jobs = proof.backgroundAgentJobs, jobs > 0 else { return 0 }
+              proof.harnessStatus == "idle" else { return 0 }
+        if proof.backgroundWork == false { return RelayAgentMaintenancePrompt.waitingSessionsExplained }
+        guard let jobs = proof.backgroundAgentJobs, jobs > 0 else { return 0 }
         return jobs
     }
 
