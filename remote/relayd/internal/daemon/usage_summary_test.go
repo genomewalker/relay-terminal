@@ -103,7 +103,7 @@ func TestUsageSummaryStatesFromHookEvents(t *testing.T) {
 		t.Fatalf("summary %+v", summary)
 	}
 	pane := summary.Panes[0]
-	want := "idle 0-5, working 5-8, needs_you/approval 8-12, working 12-15, needs_you/question 15-20, working 20-30, your_turn 30-120"
+	want := "idle_after_start 0-5, working 5-8, needs_you/approval 8-12, working 12-15, needs_you/question 15-20, working 20-30, your_turn 30-120"
 	if got := usageSegments(pane); got != want {
 		t.Fatalf("segments\n got %s\nwant %s", got, want)
 	}
@@ -260,5 +260,93 @@ func TestUsageSummaryCarriesNoPrivateContent(t *testing.T) {
 		if !allowed[key] {
 			t.Fatalf("unexpected pane field %q", key)
 		}
+	}
+}
+
+// A restart (process end, then start) is idle_after_start, not your turn,
+// and Claude's idle_prompt does not turn it into one.
+func TestUsageSummaryRestartIsIdleAfterStart(t *testing.T) {
+	f := newUsageFixture(t)
+	f.manifest("pane-r", "boot-here", 100)
+	f.journal("pane-r",
+		usageLine(1, 0, "claude", "UserPromptSubmit", ""),
+		usageLine(2, 10, "claude", "Stop", `,"session_id":"s"`),
+		usageLine(3, 20, "claude", "SessionEnd", `,"source":"process-tree","root_id":"r1"`),
+		usageLine(4, 21, "claude", "SessionStart", `,"source":"process-tree","root_id":"r2"`),
+		usageLine(5, 25, "claude", "Notification", `,"notification_type":"idle_prompt"`),
+		usageLine(6, 40, "claude", "UserPromptSubmit", ""),
+		// An interrupted turn has no Stop; idle_prompt after work is your turn.
+		usageLine(7, 50, "claude", "Notification", `,"notification_type":"idle_prompt"`),
+	)
+	pane := f.build(usageAt(0), usageAt(60), usageAt(60)).Panes[0]
+	want := "working 0-10, your_turn 10-20, no_agent 20-21, idle_after_start 21-40, working 40-50, your_turn 50-60"
+	if got := usageSegments(pane); got != want || pane.CurrentState != "your_turn" {
+		t.Fatalf("segments\n got %s\nwant %s (%s)", got, want, pane.CurrentState)
+	}
+}
+
+// A live pane whose agent exited has no agent running: its current state and
+// remaining time are no_agent, and an ask it left is unanswered.
+func TestUsageSummaryNoAgentRunning(t *testing.T) {
+	f := newUsageFixture(t)
+	f.manifest("pane-n", "boot-here", 100)
+	f.journal("pane-n",
+		usageLine(1, 0, "codex", "SessionStart", `,"source":"process-tree","root_id":"r1"`),
+		usageLine(2, 5, "codex", "UserPromptSubmit", ""),
+		usageLine(3, 8, "claude", "PermissionRequest", `,"tool_name":"Bash"`),
+		usageLine(4, 15, "codex", "SessionEnd", `,"source":"process-tree","root_id":"r1"`),
+	)
+	pane := f.build(usageAt(0), usageAt(60), usageAt(60)).Panes[0]
+	want := "idle_after_start 0-5, working 5-8, needs_you/approval 8-15, no_agent 15-60"
+	if got := usageSegments(pane); got != want || pane.CurrentState != "no_agent" ||
+		pane.Asks.Unanswered != 1 || pane.Asks.Answered != 0 || pane.Asks.Open != 0 {
+		t.Fatalf("segments\n got %s\nwant %s (%+v)", got, want, pane)
+	}
+}
+
+// Hook SessionStart/SessionEnd (on /clear or compaction) do not change the
+// state, and one of several agent processes ending leaves an agent running.
+func TestUsageSummaryIgnoresHookSessionEventsAndNestedRoots(t *testing.T) {
+	f := newUsageFixture(t)
+	f.manifest("pane-h", "boot-here", 100)
+	f.journal("pane-h",
+		usageLine(1, 0, "claude", "SessionStart", `,"source":"process-tree","root_id":"main"`),
+		usageLine(2, 2, "claude", "UserPromptSubmit", ""),
+		usageLine(3, 4, "claude", "SessionStart", `,"source":"hook"`),
+		usageLine(4, 5, "claude", "SessionEnd", `,"source":"hook"`),
+		usageLine(5, 6, "claude", "SessionStart", `,"source":"process-tree","root_id":"nested"`),
+		usageLine(6, 7, "claude", "SessionEnd", `,"source":"process-tree","root_id":"nested"`),
+		usageLine(7, 9, "claude", "Stop", `,"session_id":"s"`),
+	)
+	pane := f.build(usageAt(0), usageAt(20), usageAt(20)).Panes[0]
+	if got := usageSegments(pane); got != "idle_after_start 0-2, working 2-9, your_turn 9-20" {
+		t.Fatalf("got %s", got)
+	}
+}
+
+// Each rule on its own: /clear's hook SessionEnd/SessionStart after a turn
+// (agent start not in view), and a nested agent starting during your turn.
+func TestUsageSummaryHookClearAndNestedStartDuringYourTurn(t *testing.T) {
+	f := newUsageFixture(t)
+	f.manifest("pane-clear", "boot-here", 100)
+	f.journal("pane-clear",
+		usageLine(1, 0, "claude", "UserPromptSubmit", ""),
+		usageLine(2, 5, "claude", "Stop", `,"session_id":"s"`),
+		usageLine(3, 7, "claude", "SessionEnd", `,"source":"hook"`),
+		usageLine(4, 8, "claude", "SessionStart", `,"source":"hook"`),
+	)
+	f.manifest("pane-nest", "boot-here", 100)
+	f.journal("pane-nest",
+		usageLine(1, 0, "claude", "SessionStart", `,"source":"process-tree","root_id":"main"`),
+		usageLine(2, 1, "claude", "UserPromptSubmit", ""),
+		usageLine(3, 3, "claude", "Stop", `,"session_id":"s"`),
+		usageLine(4, 5, "claude", "SessionStart", `,"source":"process-tree","root_id":"nested"`),
+	)
+	panes := f.build(usageAt(0), usageAt(20), usageAt(20)).Panes
+	if got := usageSegments(panes[0]); got != "working 0-5, your_turn 5-20" {
+		t.Fatalf("clear: got %s", got)
+	}
+	if got := usageSegments(panes[1]); got != "idle_after_start 0-1, working 1-3, your_turn 3-20" {
+		t.Fatalf("nested: got %s", got)
 	}
 }

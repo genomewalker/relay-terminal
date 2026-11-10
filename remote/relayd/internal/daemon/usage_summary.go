@@ -33,8 +33,11 @@ const (
 	usageWorking  = "working"
 	usageNeedsYou = "needs_you"
 	usageYourTurn = "your_turn"
-	usageIdle     = "idle"
-	usageEnded    = "ended"
+	// The agent process started (or restarted) and no prompt has been
+	// submitted since: not the same as a finished turn waiting for the user.
+	usageIdleAfterStart = "idle_after_start"
+	// The pane is open but no agent process runs in it (only the shell).
+	usageNoAgent = "no_agent"
 
 	usageReasonApproval = "approval"
 	usageReasonQuestion = "question"
@@ -87,6 +90,8 @@ type usageEvent struct {
 	agent  string
 	state  string
 	reason string
+	root   string // agent process root, for process start/end
+	soft   bool   // idle_prompt: your turn only after real work
 }
 
 // usageClassify maps one journal payload to a pane state. Subagent events do
@@ -104,6 +109,8 @@ func usageClassify(payload []byte) (usageEvent, bool) {
 			AgentID          string `json:"agent_id"`
 			ParentSessionID  string `json:"parent_session_id"`
 			OccurredAt       string `json:"occurred_at"`
+			Source           string `json:"source"`
+			RootID           string `json:"root_id"`
 		} `json:"event"`
 	}
 	if json.Unmarshal(payload, &v) != nil || (v.Agent != "claude" && v.Agent != "codex") {
@@ -144,16 +151,23 @@ func usageClassify(payload []byte) (usageEvent, bool) {
 		case "elicitation_dialog":
 			event.state, event.reason = usageNeedsYou, usageReasonQuestion
 		case "idle_prompt":
-			event.state = usageYourTurn
+			event.state, event.soft = usageYourTurn, true
 		default:
 			return usageEvent{}, false
 		}
 	case "Stop", "turn/completed":
 		event.state = usageYourTurn
-	case "SessionStart":
-		event.state = usageIdle
-	case "SessionEnd":
-		event.state = usageEnded
+	// Agent process start and exit come from relayd's process tree. Hook
+	// SessionStart/SessionEnd also fire on /clear and compaction while the
+	// agent keeps running, so they do not change the state.
+	case "SessionStart", "SessionEnd":
+		if v.Event.Source == "hook" {
+			return usageEvent{}, false
+		}
+		event.state, event.root = usageIdleAfterStart, v.Event.RootID
+		if name == "SessionEnd" {
+			event.state = usageNoAgent
+		}
 	default:
 		return usageEvent{}, false
 	}
@@ -324,8 +338,32 @@ func usageBuildPane(pane *UsagePane, events []usageEvent, since, until, newest t
 		start, end    time.Time
 	}
 	runs := make([]run, 0)
+	// Agent processes started in the events read. A process ending leaves
+	// the pane without an agent only when no other one it started still runs.
+	roots := map[string]bool{}
 	for _, event := range events {
 		pane.Agent = event.agent
+		switch event.state {
+		case usageIdleAfterStart:
+			// Another agent process starting while one runs or works (a
+			// nested agent) is not a restart.
+			running := len(roots) > 0
+			roots[event.root] = true
+			if n := len(runs); running || (n > 0 && (runs[n-1].state == usageWorking || runs[n-1].state == usageNeedsYou)) {
+				continue
+			}
+		case usageNoAgent:
+			delete(roots, event.root)
+			if len(roots) > 0 {
+				continue
+			}
+		}
+		// idle_prompt only means "your turn" after work; after a start or
+		// with no agent it is the same idle prompt.
+		if n := len(runs); event.soft && n > 0 &&
+			(runs[n-1].state == usageIdleAfterStart || runs[n-1].state == usageNoAgent) {
+			continue
+		}
 		// One ask raises several events (PreToolUse, PermissionRequest,
 		// Notification); they stay one ask with the reason first seen.
 		if n := len(runs); n > 0 && runs[n-1].state == event.state &&
@@ -340,9 +378,7 @@ func usageBuildPane(pane *UsagePane, events []usageEvent, since, until, newest t
 	last := &runs[len(runs)-1]
 	if pane.Live {
 		last.end = until
-		if last.state != usageEnded {
-			pane.CurrentState, pane.CurrentReason = last.state, last.reason
-		}
+		pane.CurrentState, pane.CurrentReason = last.state, last.reason
 	} else {
 		last.end = newest
 		if last.end.Before(last.start) {
@@ -353,7 +389,7 @@ func usageBuildPane(pane *UsagePane, events []usageEvent, since, until, newest t
 		if r.state == usageNeedsYou && !r.start.Before(since) && r.start.Before(until) {
 			pane.Asks.Opened++
 			switch {
-			case i+1 < len(runs) && runs[i+1].state != usageEnded:
+			case i+1 < len(runs) && runs[i+1].state != usageNoAgent:
 				pane.Asks.Answered++
 				if len(pane.Asks.WaitSeconds) < usageSummaryMaxWaits {
 					pane.Asks.WaitSeconds = append(pane.Asks.WaitSeconds, runs[i+1].start.Sub(r.start).Seconds())
@@ -363,9 +399,6 @@ func usageBuildPane(pane *UsagePane, events []usageEvent, since, until, newest t
 			default:
 				pane.Asks.Unanswered++
 			}
-		}
-		if r.state == usageEnded {
-			continue
 		}
 		start, end := r.start, r.end
 		if start.Before(since) {
