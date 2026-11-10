@@ -37,6 +37,7 @@ private struct PaneConnectionRequest: Identifiable {
 struct WorkspaceView: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var preferences = RelayPreferences.shared
+    @StateObject private var recentPlaces = RelayRecentPlacesSwitcher()
     @State private var showingQuitConfirmation = false
     @State private var mikoPanelOffset: CGSize = .zero
     @State private var hpcPaneID: UUID?
@@ -307,6 +308,14 @@ struct WorkspaceView: View {
                 .accessibilityElement(children: .contain)
             }
         }
+        .overlay(alignment: .top) {
+            if recentPlaces.isVisible {
+                RelayRecentPlacesPanel(switcher: recentPlaces)
+                    .padding(.top, RelayTheme.spacing(72))
+            }
+        }
+        .onAppear { recentPlaces.install(workspace: workspace) }
+        .onDisappear { recentPlaces.uninstall() }
         .sheet(isPresented: $workspace.isQuickNavigatePresented, onDismiss: {
             workspace.quickNavigateDidDismiss()
         }) {

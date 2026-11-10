@@ -36,6 +36,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
     case nextStackPane
     case saveWorkspaceView
     case openWorkspaceView
+    case recentPlaces
 
     var id: String { rawValue }
 
@@ -74,6 +75,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .nextStackPane: "Next pane in stack"
         case .saveWorkspaceView: "Save current view"
         case .openWorkspaceView: "Open saved view"
+        case .recentPlaces: "Recent places"
         }
     }
 
@@ -87,7 +89,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .toggleSidebar, .agentActivity: "Workspace"
         case .workspaceOverview, .workspaceBack, .workspaceForward, .workspaceUp,
              .saveWorkspaceView, .openWorkspaceView: "Workspace"
-        case .stackPane, .unstackPane, .previousStackPane, .nextStackPane: "Panes"
+        case .stackPane, .unstackPane, .previousStackPane, .nextStackPane, .recentPlaces: "Panes"
         }
     }
 
@@ -126,6 +128,8 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .nextStackPane: .init("]", command: true, control: true)
         case .saveWorkspaceView: .init("s", command: true, control: true, shift: true)
         case .openWorkspaceView: .init("o", command: true, control: true, shift: true)
+        // Held like ⌘Tab: tap to move, release the modifier to go.
+        case .recentPlaces: .init("tab", control: true)
         }
     }
 }
@@ -162,6 +166,7 @@ struct RelayKeyBinding: Codable, Equatable, Hashable, Sendable {
         let key: String
         switch event.keyCode {
         case 36, 76: key = "return"
+        case 48: key = "tab"
         case 123: key = "left"
         case 124: key = "right"
         case 125: key = "down"
@@ -185,6 +190,7 @@ struct RelayKeyBinding: Codable, Equatable, Hashable, Sendable {
     var keyEquivalent: KeyEquivalent {
         switch key {
         case "return": .return
+        case "tab": .tab
         case "left": .leftArrow
         case "right": .rightArrow
         case "up": .upArrow
@@ -210,6 +216,7 @@ struct RelayKeyBinding: Codable, Equatable, Hashable, Sendable {
         if command { result += "⌘" }
         let keyLabel = switch key {
         case "return": "↩"
+        case "tab": "⇥"
         case "left": "←"
         case "right": "→"
         case "up": "↑"

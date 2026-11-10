@@ -52,17 +52,13 @@ struct RelayQuickNavigate: View {
                 // The same metadata and predicate as the fleet board and its counts.
                 let fact = Index.paneFact(pane, tabID: tab.id, workspaceName: owner, tabName: title, hidden: hidden)
                 let report = Index.mostUrgentProgramState(pane.programStatus.records.map(\.state))
-                let reportCurrent = pane.connectionState == .connected && pane.programStatus.revision != nil
                 // Idle is only the absence of recent output; it cannot
                 // establish that the worker is ready or its task succeeded.
                 let signalDetail = pane.pendingAgentApprovals == 0 && report == nil && pane.phase == .quiet
                     ? "No recent output; readiness has not been confirmed.\n" : ""
                 // A lost, returning or failed terminal says so in the fleet
                 // board's words; the phase alone would still read "Working".
-                let status = pane.contentKind == .terminal && [.reconnecting, .disconnected, .failed].contains(fact.status)
-                    ? fact.detail
-                    : Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
-                                       programState: report, programReportCurrent: reportCurrent)
+                let status = Self.paneStatusText(pane, fact: fact)
                 let stateSource = pane.pendingAgentApprovals > 0 ? "pending agent approval count"
                     : (report != nil ? "program self-report" : "terminal output and agent signals")
                 let programDetails = pane.programStatus.records.map { record in
@@ -85,6 +81,17 @@ struct RelayQuickNavigate: View {
             }
         }
         return Index.results(entries, query: query)
+    }
+
+    /// A pane's status in the fleet board's words: a lost, returning or
+    /// failed terminal says so; otherwise its agent phase, approvals or
+    /// program report.
+    @MainActor static func paneStatusText(_ pane: PaneModel, fact: RelayWorkOverviewIndex.PaneFact) -> String {
+        if pane.contentKind == .terminal && [.reconnecting, .disconnected, .failed].contains(fact.status) { return fact.detail }
+        let report = Index.mostUrgentProgramState(pane.programStatus.records.map(\.state))
+        let reportCurrent = pane.connectionState == .connected && pane.programStatus.revision != nil
+        return Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
+                                programState: report, programReportCurrent: reportCurrent)
     }
 
     /// A pane row's kind icon: the agent's symbol, a shell, or the editor's,
