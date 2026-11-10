@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import SwiftUI
 
 /// The running status mark's waveform, animated by Core Animation.
@@ -38,6 +39,7 @@ final class RelayRunningWaveformView: NSView {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
+        RelayWaveformDiagnostics.shared.created(self)
         wantsLayer = true
         layerContentsRedrawPolicy = .never
         fill.anchorPoint = CGPoint(x: 0, y: 0.5)
@@ -54,7 +56,10 @@ final class RelayRunningWaveformView: NSView {
     override var intrinsicContentSize: NSSize { NSSize(width: RelayStatusMark.size, height: RelayStatusMark.size) }
     override var isFlipped: Bool { true }
 
+    deinit { Task { @MainActor in RelayWaveformDiagnostics.shared.count(\.destroyed) } }
+
     func update(color: NSColor, animating: Bool) {
+        RelayWaveformDiagnostics.shared.count(\.updates)
         self.color = color
         self.animating = animating
         applyColors()
@@ -85,6 +90,7 @@ final class RelayRunningWaveformView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        RelayWaveformDiagnostics.shared.count(window == nil ? \.leftWindow : \.joinedWindow)
         // A layer leaving and rejoining a window drops its animations.
         applyMask(); applyColors(); applyAnimation()
     }
@@ -119,10 +125,27 @@ final class RelayRunningWaveformView: NSView {
     private func applyAnimation() {
         let running = fill.animation(forKey: Self.animationKey) != nil
         if animating, window != nil, !running {
-            fill.add(Self.sweep(), forKey: Self.animationKey)
+            let sweep = Self.sweep()
+            // Phase-locked to one shared clock: a mark that is recreated or
+            // re-added joins the cycle where every other mark is, instead of
+            // restarting at an empty fill.
+            sweep.beginTime = fill.convertTime(Self.cycleStart(now: CACurrentMediaTime()), from: nil)
+            fill.add(sweep, forKey: Self.animationKey)
+            RelayWaveformDiagnostics.shared.count(\.animationsAdded)
         } else if !animating || window == nil, running {
             fill.removeAnimation(forKey: Self.animationKey)
+            RelayWaveformDiagnostics.shared.count(\.animationsRemoved)
         }
+    }
+
+    /// The start of the current sweep cycle on the shared media clock.
+    static func cycleStart(now: CFTimeInterval) -> CFTimeInterval {
+        (now / period).rounded(.down) * period
+    }
+
+    /// Live state for the diagnostics summary.
+    var diagnosticState: (inWindow: Bool, animating: Bool, sweeping: Bool, fillWidth: CGFloat) {
+        (window != nil, animating, fill.animation(forKey: Self.animationKey) != nil, fill.bounds.width)
     }
 
     /// Bars fill one after another, hold full for a beat, then start again.
@@ -156,5 +179,42 @@ final class RelayRunningWaveformView: NSView {
         let size = image.size
         image.draw(in: NSRect(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2,
                               width: size.width, height: size.height))
+    }
+}
+
+/// Temporary diagnostics (0.5.47 instrumented build): how often running
+/// waveform views are created, destroyed, moved between windows, updated and
+/// (re)animated, plus the live views' state, logged every 10 s under
+/// subsystem dev.relay.terminal, category waveform.
+@MainActor final class RelayWaveformDiagnostics {
+    static let shared = RelayWaveformDiagnostics()
+    struct Counts { var created = 0, destroyed = 0, joinedWindow = 0, leftWindow = 0, updates = 0, animationsAdded = 0, animationsRemoved = 0 }
+    private var counts = Counts()
+    private let live = NSHashTable<RelayRunningWaveformView>.weakObjects()
+    private let log = Logger(subsystem: "dev.relay.terminal", category: "waveform")
+    private var timer: Timer?
+
+    func created(_ view: RelayRunningWaveformView) {
+        counts.created += 1
+        live.add(view)
+        if timer == nil {
+            timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
+                MainActor.assumeIsolated { RelayWaveformDiagnostics.shared.report() }
+            }
+        }
+    }
+
+    func count(_ key: WritableKeyPath<Counts, Int>) { counts[keyPath: key] += 1 }
+
+    private func report() {
+        let views = live.allObjects.map(\.diagnosticState)
+        let c = counts
+        log.notice("""
+        waveform 10s: created \(c.created) destroyed \(c.destroyed) joined \(c.joinedWindow) left \(c.leftWindow) \
+        updates \(c.updates) added \(c.animationsAdded) removed \(c.animationsRemoved) | live \(views.count) \
+        inWindow \(views.filter(\.inWindow).count) animating \(views.filter(\.animating).count) \
+        sweeping \(views.filter(\.sweeping).count) zeroWidth \(views.filter { $0.fillWidth == 0 }.count)
+        """)
+        counts = Counts()
     }
 }

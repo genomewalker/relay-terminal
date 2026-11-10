@@ -44,6 +44,14 @@ import Testing
         #expect(!RelayRunningWaveformView.drawsStillCopy(inWindow: true))
     }
 
+    /// Every mark shares one cycle: the start is the last whole period on the clock.
+    @Test func sweepIsPhaseLockedToASharedClock() {
+        let period = RelayRunningWaveformView.period
+        #expect(RelayRunningWaveformView.cycleStart(now: period * 10.4) == period * 10)
+        #expect(RelayRunningWaveformView.cycleStart(now: period * 3) == period * 3)
+        #expect(RelayRunningWaveformView.cycleStart(now: 0.5) == 0)
+    }
+
     @Test func sweepFillsTheBarsInTurnThenHolds() throws {
         let sweep = RelayRunningWaveformView.sweep()
         #expect(sweep.calculationMode == .discrete)
