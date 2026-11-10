@@ -9,9 +9,20 @@ struct RelayAssistantHaikuPanel: View {
     var panelSize = CGSize(width: 560, height: 680)
     @State private var focusRequest = UUID()
     @State private var followsLatest = true
+    @State private var composerHeight = RelayMikoComposerHeight.minimum
+    /// Saved tasks, Shepherd delivery and the profile, collapsed below the chat by default.
+    @State private var detailsExpanded: Bool
     private var draft: String {
         get { workspace.haikuAssistantDraft }
         nonmutating set { workspace.haikuAssistantDraft = newValue }
+    }
+
+    init(workspace: WorkspaceModel, harness: RelayAssistantHarness,
+         panelSize: CGSize = CGSize(width: 560, height: 680), detailsInitiallyExpanded: Bool = false) {
+        self.workspace = workspace
+        self.harness = harness
+        self.panelSize = panelSize
+        _detailsExpanded = State(initialValue: detailsInitiallyExpanded)
     }
 
     var body: some View {
@@ -21,25 +32,29 @@ struct RelayAssistantHaikuPanel: View {
                 Text("Miko").font(RelayTheme.font(size: 15, weight: .semibold))
                 Spacer()
                 if harness.isBusy { ProgressView().controlSize(.small).help("Miko is working") }
-                Button { openControlCenter("Control") } label: {
-                    Label("Control Center", systemImage: "slider.horizontal.3")
-                }
-                .font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
-                .buttonStyle(.plain).help("Open Control Center")
-                .accessibilityLabel("Open Control Center")
-                .accessibilityIdentifier("relay.assistant.control-center")
-                Button { openControlCenter("Agents") } label: {
-                    Label("Sessions", systemImage: "heart.text.square")
-                }
-                .font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
-                .buttonStyle(.plain).help("All sessions and health")
-                .accessibilityLabel("Open Sessions and Health")
-                .accessibilityIdentifier("relay.assistant.sessions-health")
                 Button("New chat") { harness.newChat() }
                     .buttonStyle(.plain).font(RelayTheme.font(size: 11))
                     .foregroundStyle(RelayTheme.textMuted)
                     .disabled(harness.isBusy || harness.exchanges.isEmpty)
                     .accessibilityIdentifier("relay.assistant.new-chat")
+                Menu {
+                    Button { openControlCenter("Control") } label: {
+                        Label("Control Center", systemImage: "slider.horizontal.3")
+                    }
+                    .accessibilityLabel("Open Control Center")
+                    .accessibilityIdentifier("relay.assistant.control-center")
+                    Button { openControlCenter("Agents") } label: {
+                        Label("Sessions and health", systemImage: "heart.text.square")
+                    }
+                    .accessibilityLabel("Open Sessions and Health")
+                    .accessibilityIdentifier("relay.assistant.sessions-health")
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .foregroundStyle(RelayTheme.textMuted)
+                .help("More").accessibilityLabel("More Miko actions")
+                .accessibilityIdentifier("relay.assistant.more")
                 Button { close() } label: { Image(systemName: "xmark") }
                     .buttonStyle(.plain).help("Close · Esc")
                     .accessibilityLabel("Close Relay assistant")
@@ -64,52 +79,6 @@ struct RelayAssistantHaikuPanel: View {
                 Text(notice).font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.coral)
                     .padding(.horizontal, 12).accessibilityIdentifier("relay.miko.task-store-notice")
             }
-            if !harness.taskRows.isEmpty {
-                DisclosureGroup("Saved tasks (\(harness.taskRows.count))") {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 8) {
-                            ForEach(harness.taskRows) { task in
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(task.objective).font(RelayTheme.font(size: 11, weight: .medium)).lineLimit(2)
-                                    Text(task.status == "reportedComplete" ? "Result reported · verification separate" : task.status)
-                                        .font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.textMuted)
-                                    if !task.unresolved.isEmpty {
-                                        Text("Unresolved operations: " + task.unresolved.joined(separator: ", "))
-                                            .font(RelayTheme.font(size: 9, design: .monospaced))
-                                            .foregroundStyle(RelayTheme.coral).textSelection(.enabled)
-                                    }
-                                    HStack {
-                                        Button("Continue") { harness.continueTask(task.id) }
-                                            .disabled(harness.isBusy || !task.canContinue)
-                                        if task.status != "reportedComplete" && task.status != "cancelled" {
-                                            Button("Cancel task") { harness.cancelSavedTask(task.id) }
-                                                .disabled(harness.isBusy)
-                                        }
-                                    }.buttonStyle(.bordered).controlSize(.mini)
-                                }
-                            }
-                        }
-                    }.frame(maxHeight: 170)
-                }.font(RelayTheme.font(size: 11)).padding(.horizontal, 12).padding(.bottom, 8)
-                    .accessibilityIdentifier("relay.miko.saved-tasks")
-            }
-            RelayShepherdPushStatusView()
-            DisclosureGroup("What Miko knows") {
-                ScrollView {
-                    Text(harness.profile.map { $0.text.isEmpty ? "Nothing yet." : $0.text } ??
-                         "Built when you send your first request.")
-                        .font(RelayTheme.font(size: 10.5, design: .monospaced)).textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 140)
-                if let profile = harness.profile {
-                    Text("Sent with every request to the Anthropic API under your account · sha256 " + String(profile.sha256.prefix(12)))
-                        .font(RelayTheme.font(size: 9)).foregroundStyle(RelayTheme.textMuted)
-                }
-            }
-            .font(RelayTheme.font(size: 11))
-            .padding(.horizontal, 12).padding(.bottom, 8)
-            .accessibilityIdentifier("relay.assistant.profile")
             if !harness.inbox.isEmpty {
                 DisclosureGroup("Replies to Miko (\(harness.inbox.count))") {
                     ScrollView {
@@ -159,22 +128,33 @@ struct RelayAssistantHaikuPanel: View {
                 .onChange(of: harness.pendingCard?.id) { _, _ in if followsLatest { proxy.scrollTo("latest", anchor: .bottom) } }
             }
             Divider()
-            VStack(alignment: .leading, spacing: 10) {
-                RelayMikoComposer(text: $workspace.haikuAssistantDraft, canSend: !harness.isBusy,
-                                  focusRequest: focusRequest, send: submit)
-                    .frame(height: 86)
-                    .overlay(alignment: .topLeading) {
-                        if draft.isEmpty {
-                            Text("Ask Miko to work on your workspace…")
-                                .font(RelayTheme.font(size: 13)).foregroundStyle(RelayTheme.textMuted)
-                                .padding(.top, 6).padding(.leading, 5).allowsHitTesting(false)
+            DisclosureGroup(isExpanded: $detailsExpanded) {
+                VStack(alignment: .leading, spacing: 0) {
+                    savedTasks
+                    RelayShepherdPushStatusView()
+                    profile
+                }
+                .frame(maxHeight: 300, alignment: .top)
+            } label: {
+                Text(harness.taskRows.isEmpty ? "Tasks and context" : "Tasks and context · \(harness.taskRows.count) saved")
+                    .font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .accessibilityIdentifier("relay.miko.details")
+            Divider()
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .bottom, spacing: 8) {
+                    RelayMikoComposer(text: $workspace.haikuAssistantDraft, canSend: !harness.isBusy,
+                                      focusRequest: focusRequest, send: submit,
+                                      onHeightChange: { composerHeight = $0 })
+                        .frame(height: composerHeight)
+                        .overlay(alignment: .topLeading) {
+                            if draft.isEmpty {
+                                Text("Ask Miko to work on your workspace…")
+                                    .font(RelayTheme.font(size: 13)).foregroundStyle(RelayTheme.textMuted)
+                                    .padding(.top, 6).padding(.leading, 5).allowsHitTesting(false)
+                            }
                         }
-                    }
-                HStack {
-                    Text(harness.isBusy ? "Working · you can draft your next message" : "Enter to send · Shift Enter for a new line")
-                        .font(RelayTheme.font(size: 10))
-                        .foregroundStyle(RelayTheme.textMuted)
-                    Spacer()
                     if harness.isBusy {
                         Button("Stop", systemImage: "stop.fill") { harness.cancel() }
                             .accessibilityIdentifier("relay.assistant.stop")
@@ -185,8 +165,11 @@ struct RelayAssistantHaikuPanel: View {
                             .accessibilityIdentifier("relay.assistant.send-request")
                     }
                 }
+                Text(harness.isBusy ? "Working · you can draft your next message" : "Enter to send · Shift Enter for a new line")
+                    .font(RelayTheme.font(size: 10))
+                    .foregroundStyle(RelayTheme.textMuted)
             }
-            .padding(14)
+            .padding(.horizontal, 12).padding(.vertical, 8)
             .background(RelayTheme.elevated)
 
         }
@@ -204,6 +187,16 @@ struct RelayAssistantHaikuPanel: View {
             focusRequest = UUID()
         }
         .accessibilityIdentifier("relay.assistant.panel")
+        // Pane names and ids in Miko's answers reveal that pane.
+        .environment(\.openURL, OpenURLAction { url in
+            guard let paneID = RelayMikoPaneLinks.paneID(from: url) else { return .systemAction }
+            workspace.revealPane(paneID, origin: .user)
+            return .handled
+        })
+    }
+
+    private var paneNames: [(id: UUID, name: String)] {
+        workspace.panes.values.map { (id: $0.id, name: $0.displayName) }
     }
 
     @ViewBuilder private func exchangeView(_ exchange: RelayAssistantExchange) -> some View {
@@ -234,7 +227,8 @@ struct RelayAssistantHaikuPanel: View {
             if exchange.reply.isEmpty && harness.isBusy {
                 Text("Working…").foregroundStyle(RelayTheme.textMuted)
             } else {
-                Text(exchange.reply).textSelection(.enabled).lineSpacing(3)
+                Text(RelayMikoPaneLinks.attributed(exchange.reply, panes: paneNames))
+                    .textSelection(.enabled).lineSpacing(3)
                     .foregroundStyle(exchange.failed ? RelayTheme.coral : RelayTheme.text)
             }
             ForEach(exchange.messages) { message in
@@ -262,6 +256,57 @@ struct RelayAssistantHaikuPanel: View {
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder private var savedTasks: some View {
+        if !harness.taskRows.isEmpty {
+            DisclosureGroup("Saved tasks (\(harness.taskRows.count))") {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(harness.taskRows) { task in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(task.objective).font(RelayTheme.font(size: 11, weight: .medium)).lineLimit(2)
+                                Text(task.status == "reportedComplete" ? "Result reported · verification separate" : task.status)
+                                    .font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.textMuted)
+                                if !task.unresolved.isEmpty {
+                                    Text("Unresolved operations: " + task.unresolved.joined(separator: ", "))
+                                        .font(RelayTheme.font(size: 9, design: .monospaced))
+                                        .foregroundStyle(RelayTheme.coral).textSelection(.enabled)
+                                }
+                                HStack {
+                                    Button("Continue") { harness.continueTask(task.id) }
+                                        .disabled(harness.isBusy || !task.canContinue)
+                                    if task.status != "reportedComplete" && task.status != "cancelled" {
+                                        Button("Cancel task") { harness.cancelSavedTask(task.id) }
+                                            .disabled(harness.isBusy)
+                                    }
+                                }.buttonStyle(.bordered).controlSize(.mini)
+                            }
+                        }
+                    }
+                }.frame(maxHeight: 170)
+            }.font(RelayTheme.font(size: 11)).padding(.horizontal, 12).padding(.bottom, 8)
+                .accessibilityIdentifier("relay.miko.saved-tasks")
+        }
+    }
+
+    private var profile: some View {
+        DisclosureGroup("What Miko knows") {
+            ScrollView {
+                Text(harness.profile.map { $0.text.isEmpty ? "Nothing yet." : $0.text } ??
+                     "Built when you send your first request.")
+                    .font(RelayTheme.font(size: 10.5, design: .monospaced)).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 140)
+            if let profile = harness.profile {
+                Text("Sent with every request to the Anthropic API under your account · sha256 " + String(profile.sha256.prefix(12)))
+                    .font(RelayTheme.font(size: 9)).foregroundStyle(RelayTheme.textMuted)
+            }
+        }
+        .font(RelayTheme.font(size: 11))
+        .padding(.horizontal, 12).padding(.bottom, 8)
+        .accessibilityIdentifier("relay.assistant.profile")
     }
 
     private func submit() {

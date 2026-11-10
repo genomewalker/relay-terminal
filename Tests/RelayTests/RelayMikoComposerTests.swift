@@ -48,6 +48,21 @@ struct RelayMikoComposerTests {
         let entries = RelayWorkOverviewIndex.navigationEntries(query: "Control Center") + [pane]
         #expect(RelayWorkOverviewIndex.results(entries, query: "Control Center").first?.destination == .controlCenter)
     }
+    @MainActor @Test func composerGrowsWithItsContent() {
+        let editor = RelayMikoComposer.Editor()
+        editor.font = .systemFont(ofSize: 13)
+        editor.textContainerInset = NSSize(width: 0, height: 6)
+        editor.textContainer?.widthTracksTextView = true
+        editor.setFrameSize(NSSize(width: 400, height: 30))
+        editor.string = "a"
+        let one = editor.contentHeight
+        editor.string = "a\nb\nc\nd"
+        let four = editor.contentHeight
+        #expect(one > 12 && RelayMikoComposerHeight.clamped(one) < 40)
+        #expect(four > one + 30)
+        #expect(RelayMikoComposerHeight.clamped(four) > RelayMikoComposerHeight.minimum)
+        #expect(RelayMikoComposerHeight.clamped(four) <= RelayMikoComposerHeight.maximum)
+    }
     @MainActor @Test func renderPanelOffscreenForInspection() async throws {
         guard let path = ProcessInfo.processInfo.environment["RELAY_MIKO_PREVIEW_PATH"] else { return }
         _ = NSApplication.shared
