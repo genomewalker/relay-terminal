@@ -482,6 +482,8 @@ func main() {
 		runTerminfo(os.Args[2:])
 	case "live-status":
 		runLiveStatus(os.Args[2:])
+	case "usage-summary":
+		runUsageSummary(os.Args[2:])
 	case "upgrade-supervisor":
 		runUpgradeSupervisor(os.Args[2:])
 	case "--version", "version":
