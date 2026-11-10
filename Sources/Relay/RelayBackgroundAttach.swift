@@ -154,8 +154,7 @@ struct RelayBackgroundAttachPolicy {
     @discardableResult
     func step() -> Bool {
         let now = uptime()
-        let current = (panes?() ?? workspaces.compactMap(\.value).flatMap(Self.hiddenPanes))
-            .sorted { ($0.kind == .shell ? 1 : 0, $0.id.uuidString) < ($1.kind == .shell ? 1 : 0, $1.id.uuidString) }
+        let current = Self.attachOrder(panes?() ?? workspaces.compactMap(\.value).flatMap(Self.hiddenPanes))
         var byID: [UUID: PaneModel] = [:]
         var candidates: [RelayBackgroundAttachCandidate] = []
         for pane in current {
@@ -187,6 +186,38 @@ struct RelayBackgroundAttachPolicy {
         }
         recordHeldHosts(candidates, nodes: nodeStates, started: Set(chosen.map(\.hostKey)), now: now)
         return !policy.isIdle || candidates.contains { RelayBackgroundAttachPolicy.eligible($0) && !policy.attempted.contains($0.paneID) }
+    }
+
+    /// Agents before shells, then by pane ID. This runs every tick over every
+    /// hidden pane, so each pane's key is computed once and the ID order
+    /// compares raw bytes: `uuidString` is their uppercase hex with hyphens
+    /// at fixed places, which orders the same without building strings.
+    static func attachOrder(_ panes: [PaneModel]) -> [PaneModel] {
+        // Plain integers, so the sort moves no references.
+        var keys: [(shell: Bool, high: UInt64, low: UInt64, index: Int)] = []
+        keys.reserveCapacity(panes.count)
+        for (index, pane) in panes.enumerated() {
+            let id = orderKey(pane.id)
+            keys.append((pane.kind == .shell, id.0, id.1, index))
+        }
+        keys.sort { lhs, rhs in
+            if lhs.shell != rhs.shell { return !lhs.shell }
+            if lhs.high != rhs.high { return lhs.high < rhs.high }
+            return lhs.low < rhs.low
+        }
+        return keys.map { panes[$0.index] }
+    }
+
+    /// The UUID's 16 bytes as two big-endian halves: tuple order is byte order.
+    nonisolated static func orderKey(_ id: UUID) -> (UInt64, UInt64) {
+        withUnsafeBytes(of: id.uuid) { bytes in
+            (UInt64(bigEndian: bytes.loadUnaligned(as: UInt64.self)),
+             UInt64(bigEndian: bytes.loadUnaligned(fromByteOffset: 8, as: UInt64.self)))
+        }
+    }
+
+    nonisolated static func uuidPrecedes(_ lhs: UUID, _ rhs: UUID) -> Bool {
+        orderKey(lhs) < orderKey(rhs)
     }
 
     /// The 2026-10-30 08:14Z stall left no trace of why its host was held.

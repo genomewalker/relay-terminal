@@ -320,11 +320,33 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         loadSnapshot(paneID: paneID, viewport: viewport)?.payload
     }
 
+    /// The files a restore reads, read and decoded once away from the main
+    /// thread. The loaders take it in place of the disk; every decision
+    /// about the bytes is still made by them, at restore time.
+    struct Prefetched: Sendable {
+        let paneID: UUID
+        let log: TerminalSnapshotLogCodec.Log?
+        let legacyRecord: Data?
+    }
+
+    func prefetch(paneID: UUID) -> Prefetched {
+        let log = loadLog(paneID: paneID)
+        // Every loader reads the legacy record only when there is no log.
+        return Prefetched(paneID: paneID, log: log, legacyRecord: log == nil ? loadLegacyRecord(paneID: paneID) : nil)
+    }
+
+    /// Reads on the write queue, so the result reflects every save queued
+    /// before it. `completion` runs on that queue.
+    func prefetch(paneID: UUID, completion: @escaping @Sendable (Prefetched) -> Void) {
+        queue.async { [self] in completion(prefetch(paneID: paneID)) }
+    }
+
     func loadSnapshot(
         paneID: UUID,
-        viewport: RelayViewport
+        viewport: RelayViewport,
+        prefetched: Prefetched? = nil
     ) -> TerminalSnapshotRecordCodec.Snapshot? {
-        if let log = loadLog(paneID: paneID) {
+        if let log = log(paneID, prefetched) {
             // Bounded overflow suffixes have no self-contained screen; the
             // window check still catches buffers bounded outside this store.
             guard log.viewport == viewport, !log.truncated,
@@ -336,7 +358,7 @@ final class TerminalSnapshotStore: @unchecked Sendable {
                 trackerState: log.trackerState
             )
         }
-        guard let record = loadLegacyRecord(paneID: paneID) else { return nil }
+        guard let record = legacyRecord(paneID, prefetched) else { return nil }
         guard let snapshot = TerminalSnapshotRecordCodec.decodeSnapshot(
             record, expectedViewport: viewport
         ) else { return nil }
@@ -355,8 +377,10 @@ final class TerminalSnapshotStore: @unchecked Sendable {
     /// restore (other viewport, truncated suffix) still resumes after the
     /// bytes that enabled it, so its last observed state must survive. Also
     /// adopts the log so a later suffix checkpoint can carry that state.
-    func loadBracketedPasteState(paneID: UUID) -> TerminalBracketedPasteStateTracker.PersistentState? {
-        guard let log = loadLog(paneID: paneID) else { return nil }
+    func loadBracketedPasteState(
+        paneID: UUID, prefetched: Prefetched? = nil
+    ) -> TerminalBracketedPasteStateTracker.PersistentState? {
+        guard let log = log(paneID, prefetched) else { return nil }
         let state: TerminalBracketedPasteStateTracker.PersistentState
         if let saved = log.trackerState {
             state = saved.bracketedPaste
@@ -376,9 +400,9 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         return state
     }
 
-    func loadResumeCursor(paneID: UUID) -> UInt64? {
-        if let log = loadLog(paneID: paneID) { return log.remoteSequence }
-        guard let record = loadLegacyRecord(paneID: paneID) else { return nil }
+    func loadResumeCursor(paneID: UUID, prefetched: Prefetched? = nil) -> UInt64? {
+        if let log = log(paneID, prefetched) { return log.remoteSequence }
+        guard let record = legacyRecord(paneID, prefetched) else { return nil }
         return TerminalSnapshotRecordCodec.resumeCursor(record)
     }
 
@@ -460,6 +484,16 @@ final class TerminalSnapshotStore: @unchecked Sendable {
         let created = NSLock()
         paneLocks[paneID] = created
         return created
+    }
+
+    private func log(_ paneID: UUID, _ prefetched: Prefetched?) -> TerminalSnapshotLogCodec.Log? {
+        if let prefetched, prefetched.paneID == paneID { return prefetched.log }
+        return loadLog(paneID: paneID)
+    }
+
+    private func legacyRecord(_ paneID: UUID, _ prefetched: Prefetched?) -> Data? {
+        if let prefetched, prefetched.paneID == paneID { return prefetched.legacyRecord }
+        return loadLegacyRecord(paneID: paneID)
     }
 
     private func loadLog(paneID: UUID) -> TerminalSnapshotLogCodec.Log? {
