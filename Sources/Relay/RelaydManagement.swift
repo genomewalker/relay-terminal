@@ -914,6 +914,116 @@ struct RelaydFirstRunView: View {
     }
 }
 
+/// Version, helper and pane counts for one host.
+struct RelaydHostMetrics: View {
+    let report: RelaydHostReport
+
+    var body: some View {
+        HStack(spacing: RelayTheme.spacing(8)) {
+            metric("Version", report.version ?? "—")
+            metric(
+                "Supervisor",
+                report.supervisorPID.map { "\(report.liveVersion ?? "unknown") · \($0)" } ?? "Stopped"
+            )
+            metric("Sessions", String(report.sessionCount))
+            metric("Panes", "\(report.runningPaneCount)/\(report.paneCount)")
+        }
+    }
+
+    private func metric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+            Text(label.uppercased())
+                .font(RelayTheme.font(size: 8.5, weight: .semibold))
+                .tracking(0.5)
+                .foregroundStyle(RelayTheme.textFaint)
+            Text(value)
+                .font(RelayTheme.font(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(RelayTheme.text)
+                .lineLimit(1)
+        }
+        .padding(RelayTheme.spacing(11))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
+    }
+}
+
+/// Host list of the Remote helpers window. Takes plain values so tests can
+/// render it with fixture hosts and no remote checks.
+struct RelaydHostRail<UpdateRow: View>: View {
+    let profiles: [ConnectionProfile]
+    let reports: [String: RelaydHostReport]
+    let selectedKey: String?
+    let select: (ConnectionProfile) -> Void
+    @ViewBuilder let updateRow: (ConnectionProfile) -> UpdateRow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
+                Text("Remote helpers")
+                    .font(RelayTheme.font(size: 15, weight: .semibold))
+                Text(RelaySettingsCopy.helperManagerSubtitle)
+                    .font(RelayTheme.font(size: 10.5))
+                    .foregroundStyle(RelayTheme.textMuted)
+                    .help(RelaySettingsCopy.helperManagerSubtitleDetail)
+            }
+            .padding(RelayTheme.spacing(18))
+
+            Divider().overlay(RelayTheme.line.opacity(0.4))
+
+            if profiles.isEmpty {
+                VStack(alignment: .leading, spacing: RelayTheme.spacing(8)) {
+                    Image(systemName: "server.rack")
+                        .font(RelayTheme.font(size: 18))
+                        .foregroundStyle(RelayTheme.textFaint)
+                    Text("No SSH hosts found")
+                        .font(RelayTheme.font(size: 11.5, weight: .semibold))
+                    Text("Add a host to ~/.ssh/config or save one from Connect.")
+                        .font(RelayTheme.font(size: 10.5))
+                        .foregroundStyle(RelayTheme.textMuted)
+                }
+                .padding(RelayTheme.spacing(18))
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: RelayTheme.spacing(4)) {
+                        ForEach(profiles) { profile in
+                            let report = reports[profile.connectionKey] ?? RelaydHostReport()
+                            Button {
+                                select(profile)
+                            } label: {
+                                HStack(spacing: RelayTheme.spacing(9)) {
+                                    Circle().fill(report.state.color).frame(width: 6, height: 6)
+                                    VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
+                                        Text(profile.name)
+                                            .font(RelayTheme.font(size: 11.5, weight: .medium))
+                                            .lineLimit(1)
+                                        Text(report.state.label)
+                                            .font(RelayTheme.font(size: 9.5))
+                                            .foregroundStyle(RelayTheme.textMuted)
+                                    }
+                                    Spacer()
+                                }
+                                .padding(.horizontal, RelayTheme.spacing(10))
+                                .frame(height: 44)
+                                .contentShape(Rectangle())
+                                .background(
+                                    selectedKey == profile.connectionKey
+                                        ? RelayTheme.elevated : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9))
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            updateRow(profile)
+                        }
+                    }
+                    .padding(RelayTheme.spacing(8))
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .background(RelayTheme.sidebar)
+    }
+}
+
 struct RelaydManagerView: View {
     @ObservedObject var profileStore: ProfileStore
     let preferredProfile: ConnectionProfile?
@@ -952,73 +1062,20 @@ struct RelaydManagerView: View {
     }
 
     private var hostRail: some View {
-        VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
-            VStack(alignment: .leading, spacing: RelayTheme.spacing(3)) {
-                Text("Remote helpers")
-                    .font(RelayTheme.font(size: 15, weight: .semibold))
-                Text(RelaySettingsCopy.helperManagerSubtitle)
-                    .font(RelayTheme.font(size: 10.5))
-                    .foregroundStyle(RelayTheme.textMuted)
-                    .help(RelaySettingsCopy.helperManagerSubtitleDetail)
-            }
-            .padding(RelayTheme.spacing(18))
-
-            Divider().overlay(RelayTheme.line.opacity(0.4))
-
-            if profiles.isEmpty {
-                VStack(alignment: .leading, spacing: RelayTheme.spacing(8)) {
-                    Image(systemName: "server.rack")
-                        .font(RelayTheme.font(size: 18))
-                        .foregroundStyle(RelayTheme.textFaint)
-                    Text("No SSH hosts found")
-                        .font(RelayTheme.font(size: 11.5, weight: .semibold))
-                    Text("Add a host to ~/.ssh/config or save one from Connect.")
-                        .font(RelayTheme.font(size: 10.5))
-                        .foregroundStyle(RelayTheme.textMuted)
-                }
-                .padding(RelayTheme.spacing(18))
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: RelayTheme.spacing(4)) {
-                        ForEach(profiles) { profile in
-                            let report = manager.report(for: profile)
-                            Button {
-                                manager.select(profile)
-                                manager.check(profile)
-                            } label: {
-                                HStack(spacing: RelayTheme.spacing(9)) {
-                                    Circle().fill(report.state.color).frame(width: 6, height: 6)
-                                    VStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
-                                        Text(profile.name)
-                                            .font(RelayTheme.font(size: 11.5, weight: .medium))
-                                            .lineLimit(1)
-                                        Text(report.state.label)
-                                            .font(RelayTheme.font(size: 9.5))
-                                            .foregroundStyle(RelayTheme.textMuted)
-                                    }
-                                    Spacer()
-                                }
-                                .padding(.horizontal, RelayTheme.spacing(10))
-                                .frame(height: 44)
-                                .contentShape(Rectangle())
-                                .background(
-                                    manager.selectedHostKey == profile.connectionKey
-                                        ? RelayTheme.elevated : Color.clear,
-                                    in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9))
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            if let update = updates.entry(forKey: profile.connectionKey) {
-                                updateRow(update, profile: profile)
-                            }
-                        }
-                    }
-                    .padding(RelayTheme.spacing(8))
+        RelaydHostRail(
+            profiles: profiles,
+            reports: manager.reports,
+            selectedKey: manager.selectedHostKey,
+            select: { profile in
+                manager.select(profile)
+                manager.check(profile)
+            },
+            updateRow: { profile in
+                if let update = updates.entry(forKey: profile.connectionKey) {
+                    updateRow(update, profile: profile)
                 }
             }
-            Spacer(minLength: 0)
-        }
-        .background(RelayTheme.sidebar)
+        )
     }
 
     /// The host's relayd update: elapsed time while it runs, then its
@@ -1104,7 +1161,7 @@ struct RelaydManagerView: View {
                             .background(report.state.color.opacity(0.08), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9)))
                     }
 
-                    metrics(report)
+                    RelaydHostMetrics(report: report)
 
                     HStack(spacing: RelayTheme.spacing(9)) {
                         Image(systemName: manager.isTrusted(profile) ? "checkmark.shield" : "shield")
@@ -1184,34 +1241,6 @@ struct RelaydManagerView: View {
                 .padding(RelayTheme.spacing(20))
             }
         }
-    }
-
-    private func metrics(_ report: RelaydHostReport) -> some View {
-        HStack(spacing: RelayTheme.spacing(8)) {
-            metric("Version", report.version ?? "—")
-            metric(
-                "Supervisor",
-                report.supervisorPID.map { "\(report.liveVersion ?? "unknown") · \($0)" } ?? "Stopped"
-            )
-            metric("Sessions", String(report.sessionCount))
-            metric("Panes", "\(report.runningPaneCount)/\(report.paneCount)")
-        }
-    }
-
-    private func metric(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
-            Text(label.uppercased())
-                .font(RelayTheme.font(size: 8.5, weight: .semibold))
-                .tracking(0.5)
-                .foregroundStyle(RelayTheme.textFaint)
-            Text(value)
-                .font(RelayTheme.font(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(RelayTheme.text)
-                .lineLimit(1)
-        }
-        .padding(RelayTheme.spacing(11))
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(10)))
     }
 
     private func installationCard(profile: ConnectionProfile, report: RelaydHostReport) -> some View {
