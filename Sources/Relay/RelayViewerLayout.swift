@@ -19,26 +19,40 @@ enum RelayViewerMetrics {
     static let identifier = RelayTheme.font(size: 10, weight: .medium, design: .monospaced)
     /// The pane header's icon controls.
     static let icon = RelayTheme.font(size: 9.5, weight: .medium)
+    /// The pane header's close glyph, drawn last on the right of every bar.
+    static let closeSymbol = "xmark"
 }
 
-/// A viewer's header row: a symbol and title, faint metadata, then trailing
-/// controls, at the pane header's height and inset.
+/// A viewer's header row: a symbol and title, faint metadata, trailing
+/// controls, then close, always last on the right, at the pane header's
+/// height, inset and icon size. Every in-window viewer uses this bar, so its
+/// close button is in the same place everywhere.
 struct RelayViewerBar<Trailing: View>: View {
     let symbol: String
     let title: String
     var detail: String?
+    /// Identifiers read best monospaced; a sentence ("You're caught up") does not.
+    var detailMonospaced: Bool
+    var detailColor: Color
+    var close: (() -> Void)?
+    var closeLabel: String
     @ViewBuilder var trailing: () -> Trailing
-    @ObservedObject private var preferences = RelayPreferences.shared
 
-    init(symbol: String, title: String, detail: String? = nil, @ViewBuilder trailing: @escaping () -> Trailing) {
+    init(symbol: String, title: String, detail: String? = nil, detailMonospaced: Bool = true,
+         detailColor: Color = RelayTheme.textFaint, close: (() -> Void)? = nil, closeLabel: String = "Close",
+         @ViewBuilder trailing: @escaping () -> Trailing) {
         self.symbol = symbol
         self.title = title
         self.detail = detail
+        self.detailMonospaced = detailMonospaced
+        self.detailColor = detailColor
+        self.close = close
+        self.closeLabel = closeLabel
         self.trailing = trailing
     }
 
     var body: some View {
-        HStack(spacing: RelayTheme.spacing(RelayViewerMetrics.barSpacing)) {
+        frame {
             Image(systemName: symbol)
                 .font(RelayViewerMetrics.icon)
                 .foregroundStyle(RelayTheme.textFaint)
@@ -50,18 +64,56 @@ struct RelayViewerBar<Trailing: View>: View {
                 .layoutPriority(2)
             if let detail {
                 Text(detail)
-                    .font(RelayViewerMetrics.identifier)
-                    .foregroundStyle(RelayTheme.textFaint)
+                    .font(detailMonospaced ? RelayViewerMetrics.identifier : RelayViewerMetrics.meta)
+                    .foregroundStyle(detailColor)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
             }
             Spacer(minLength: RelayViewerMetrics.barSpacing)
+        } trailing: {
             trailing()
+        }
+    }
+
+    private func frame<Leading: View, Controls: View>(@ViewBuilder leading: @escaping () -> Leading,
+                                                      @ViewBuilder trailing: @escaping () -> Controls) -> some View {
+        RelayViewerBarFrame(close: close, closeLabel: closeLabel, leading: leading, trailing: trailing)
+    }
+}
+
+/// The bar's frame for a viewer with its own leading content (a floating
+/// pane's drag handle): the pane header's height, inset and background,
+/// trailing controls, then close last on the right.
+struct RelayViewerBarFrame<Leading: View, Trailing: View>: View {
+    var close: (() -> Void)?
+    var closeLabel: String = "Close"
+    @ViewBuilder var leading: () -> Leading
+    @ViewBuilder var trailing: () -> Trailing
+    @ObservedObject private var preferences = RelayPreferences.shared
+
+    var body: some View {
+        HStack(spacing: RelayTheme.spacing(RelayViewerMetrics.barSpacing)) {
+            leading()
+            trailing()
+            if let close {
+                RelayViewerIconButton(title: closeLabel, symbol: RelayViewerMetrics.closeSymbol, action: close)
+                    .focusEffectDisabled()
+                    .help(closeLabel)
+                    .accessibilityIdentifier("relay.viewer.close")
+            }
         }
         .padding(.horizontal, RelayTheme.spacing(RelayViewerMetrics.barPadding))
         .frame(height: RelayViewerMetrics.barHeight(compact: preferences.compactInterface))
         .background(RelayTheme.canvas)
+    }
+}
+
+extension RelayViewerBar where Trailing == EmptyView {
+    init(symbol: String, title: String, detail: String? = nil, detailMonospaced: Bool = true,
+         detailColor: Color = RelayTheme.textFaint, close: (() -> Void)? = nil, closeLabel: String = "Close") {
+        self.init(symbol: symbol, title: title, detail: detail, detailMonospaced: detailMonospaced,
+                  detailColor: detailColor, close: close, closeLabel: closeLabel) { EmptyView() }
     }
 }
 
@@ -93,6 +145,19 @@ struct RelayViewerIconButton: View {
         }
         .buttonStyle(RelayViewerIconButtonStyle())
         .accessibilityLabel(title)
+    }
+}
+
+/// A menu's icon label sized like the bar's icon buttons.
+struct RelayViewerMenuLabel: View {
+    let symbol: String
+
+    var body: some View {
+        Image(systemName: symbol)
+            .font(RelayViewerMetrics.icon)
+            .foregroundStyle(RelayTheme.textMuted)
+            .frame(width: RelayViewerMetrics.iconSize, height: RelayViewerMetrics.iconSize)
+            .contentShape(Rectangle())
     }
 }
 

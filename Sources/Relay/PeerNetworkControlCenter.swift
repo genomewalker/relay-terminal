@@ -560,28 +560,33 @@ struct PeerNetworkTopologyView: View {
     private var liveHUDContent: some View {
         GeometryReader { geometry in
             VStack(spacing: RelayTheme.spacing(0)) {
-                HStack(spacing: RelayTheme.spacing(10)) {
-                    Image(systemName: "point.3.connected.trianglepath.dotted").foregroundStyle(Color.accentColor)
-                    Menu("Network") {
+                RelayViewerBarFrame(close: { workspace.hideNetwork() }, closeLabel: "Close Network") {
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                        .font(RelayViewerMetrics.icon).foregroundStyle(RelayTheme.textFaint)
+                    Menu {
                         ForEach(NetworkDestination.allCases) { item in
                             Button(item.rawValue) { networkView = item.rawValue }
                         }
-                    }.font(RelayTheme.font(size: 13, weight: .medium))
-                    Text("\(scopedLinks.count) links").font(RelayTheme.font(size: 11)).foregroundStyle(RelayTheme.textMuted)
-                    Spacer()
+                    } label: {
+                        Text("Network").font(RelayViewerMetrics.title).foregroundStyle(RelayTheme.text)
+                    }
+                    .menuStyle(.borderlessButton).fixedSize()
+                    .controlSize(.small)
+                    Text("\(scopedLinks.count) links").font(RelayViewerMetrics.meta).foregroundStyle(RelayTheme.textFaint)
+                    Spacer(minLength: RelayViewerMetrics.barSpacing)
+                } trailing: {
                     TextField("Find a session…", text: $search)
-                        .textFieldStyle(.plain).font(RelayTheme.font(size: 11)).frame(maxWidth: 190)
+                        .textFieldStyle(.plain).font(RelayViewerMetrics.meta).frame(maxWidth: 190)
                         .accessibilityIdentifier("relay.network.search")
                     Menu {
                         Button("Link sessions…") { chosenConnections.removeAll(); panePicker = true }
                         Button("Connection settings…", action: manage)
-                    } label: { Image(systemName: "plus") }
-                    Button { inspectorOpen.toggle() } label: { Image(systemName: "sidebar.right") }
-                        .accessibilityLabel("Show or hide details")
-                    Button { workspace.hideNetwork() } label: { Image(systemName: "xmark") }
-                        .accessibilityLabel("Close Network")
-                }.buttonStyle(.plain).padding(.horizontal, RelayTheme.spacing(16)).frame(height: 48)
-                Divider().opacity(0.5)
+                    } label: { RelayViewerMenuLabel(symbol: "plus") }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .accessibilityLabel("New link")
+                    RelayViewerIconButton(title: "Show or hide details", symbol: "sidebar.right") { inspectorOpen.toggle() }
+                }
+                Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
                 ViewThatFits(in: .horizontal) {
                     HStack(alignment: .top, spacing: RelayTheme.spacing(0)) {
                         browserContent.frame(minWidth: 440)
@@ -594,8 +599,9 @@ struct PeerNetworkTopologyView: View {
                 }
             }
             .frame(maxWidth: 1120, maxHeight: 500)
-            .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)))
-            .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line))
+            .background(RelayTheme.canvas, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)))
+            .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)))
+            .overlay(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line.opacity(0.85)))
             .shadow(color: .black.opacity(0.25), radius: 20, y: 8)
             .padding(geometry.size.width < 760 ? 12 : 28)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -629,18 +635,19 @@ struct PeerNetworkTopologyView: View {
     private var standardNetworkContent: some View {
         GeometryReader { geometry in
             VStack(spacing: RelayTheme.spacing(0)) {
-                HStack(spacing: RelayTheme.spacing(12)) {
-                    Text("Network").font(RelayTheme.font(size: 17, weight: .semibold))
-                    Spacer()
+                RelayViewerBar(symbol: "point.3.connected.trianglepath.dotted", title: "Network",
+                               close: { workspace.hideNetwork() }, closeLabel: "Close Network") {
                     TextField("Search hosts, sessions or routes", text: $search)
-                        .textFieldStyle(.roundedBorder).frame(maxWidth: 300)
+                        .textFieldStyle(.plain).font(RelayViewerMetrics.meta).frame(maxWidth: 300)
                         .accessibilityIdentifier("relay.network.search")
                     Menu {
                         Button("Link a group of sessions…") { chosenConnections.removeAll(); panePicker = true }
                         Button("Other connection types…", action: manage)
                     } label: { Label("New link", systemImage: "plus") }
-                    Button { inspectorOpen.toggle() } label: { Image(systemName: "sidebar.right") }
-                        .help("Show or hide details").accessibilityLabel("Show or hide details")
+                    .menuStyle(.borderlessButton).fixedSize()
+                    .font(RelayViewerMetrics.meta).foregroundStyle(RelayTheme.textMuted)
+                    RelayViewerIconButton(title: "Show or hide details", symbol: "sidebar.right") { inspectorOpen.toggle() }
+                        .help("Show or hide details")
                     Menu {
                         Toggle("Include inactive sessions", isOn: $showOffline)
                         Button("Refresh This Mac") { discover(host: nil) }
@@ -648,11 +655,11 @@ struct PeerNetworkTopologyView: View {
                             Button("Refresh \(target)") { discover(host: target) }
                         }
                         Button("Advanced connection settings…", action: manage)
-                    } label: { Image(systemName: "ellipsis") }
-                    Button { workspace.hideNetwork() } label: { Image(systemName: "xmark") }
-                        .help("Back to workspace").accessibilityLabel("Close Network")
-                }.padding(RelayTheme.spacing(16))
-                Divider()
+                    } label: { RelayViewerMenuLabel(symbol: "ellipsis") }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .accessibilityLabel("More network actions")
+                }
+                Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
                 if geometry.size.width < 700 {
                     Picker("Destination", selection: $networkView) {
                         ForEach(NetworkDestination.allCases) { item in Text(item.rawValue).tag(item.rawValue) }

@@ -306,9 +306,13 @@ struct RelayAgentTimelineView: View {
 
     private var header: some View {
         let inPane = pane.nativeConversationVisible
+        // In a pane, closing returns to its terminal and leaves the agent
+        // running; a separate window closes with its own window controls.
         return RelayViewerBar(symbol: "text.bubble",
                               title: Self.headerTitle(paneName: pane.displayName, inPane: inPane),
-                              detail: Self.bindingDetail(store.conversation.binding, busy: store.busy)) {
+                              detail: Self.bindingDetail(store.conversation.binding, busy: store.busy),
+                              close: inPane ? { returnToTerminal() } : nil,
+                              closeLabel: "Close conversation and return to the terminal; the agent keeps running") {
             if !inPane, pane.phase == .active, let status = pane.headerStatus {
                 RelayTimelineActivity(status: status.text, detail: pane.headerActivityDetail,
                                       since: pane.agentActivities.last?.occurredAt)
@@ -326,17 +330,13 @@ struct RelayAgentTimelineView: View {
                 .disabled(store.busy).help("Read the conversation again")
                 .accessibilityIdentifier("relay.agent.refresh")
                 .keyboardShortcut("r", modifiers: .command)
-            if inPane {
-                Button("Terminal", systemImage: "terminal") {
-                    var transaction = Transaction()
-                    transaction.disablesAnimations = true
-                    withTransaction(transaction) { pane.nativeConversationVisible = false }
-                }
-                .buttonStyle(RelayAgentQuietButtonStyle())
-                .help("Return to this session’s terminal")
-                .accessibilityIdentifier("relay.agent.return-terminal")
-            }
         }
+    }
+
+    private func returnToTerminal() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { pane.nativeConversationVisible = false }
     }
 
     // MARK: Content states

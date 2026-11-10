@@ -453,7 +453,7 @@ struct WorkspaceView: View {
     }
 }
 
-private struct AgentIntelligencePanel: View {
+struct AgentIntelligencePanel: View {
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject private var store = AgentIntelligenceStore.shared
     @StateObject private var search = AgentInboxSearchController()
@@ -471,12 +471,12 @@ private struct AgentIntelligencePanel: View {
     var body: some View {
         SmoothFloatingPanelDrag(
             settledOffset: $settledOffset,
-            headerHeight: 54,
+            headerHeight: RelayViewerMetrics.barHeight(compact: RelayPreferences.shared.compactInterface),
             onDragActivityChanged: { isDragging = $0 }
         ) {
             VStack(spacing: RelayTheme.spacing(0)) {
                 panelHeader
-                Divider().overlay(RelayTheme.line.opacity(0.5))
+                Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
                 searchBar
                 scopePicker
                 Divider().overlay(RelayTheme.line.opacity(0.35))
@@ -485,7 +485,8 @@ private struct AgentIntelligencePanel: View {
                 statusBar
             }
             .frame(width: 570, height: 620)
-            .background(RelayTheme.elevated, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+            .background(RelayTheme.canvas, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous)
                     .stroke(RelayTheme.line.opacity(0.9))
@@ -501,44 +502,16 @@ private struct AgentIntelligencePanel: View {
     }
 
     private var panelHeader: some View {
-        HStack(spacing: RelayTheme.spacing(10)) {
-            ZStack {
-                RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(7), style: .continuous)
-                    .fill(RelayTheme.blue.opacity(0.14))
-                Image(systemName: "sparkles")
-                    .font(RelayTheme.font(size: 11, weight: .medium))
-                    .foregroundStyle(RelayTheme.blue)
-            }
-            .frame(width: 28, height: 28)
-            VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
-                Text("Agent activity")
-                    .font(RelayTheme.font(size: 13, weight: .medium))
-                    .foregroundStyle(RelayTheme.text)
-                Text(store.unreadCount == 0 ? "You're caught up" : "\(store.unreadCount) since you last checked")
-                    .font(RelayTheme.font(size: 11, weight: .medium))
-                    .foregroundStyle(store.attentionCount > 0 ? RelayTheme.coral : RelayTheme.textFaint)
-            }
-            Spacer()
+        RelayViewerBar(symbol: "sparkles", title: "Agent activity",
+                       detail: store.unreadCount == 0 ? "You're caught up" : "\(store.unreadCount) since you last checked",
+                       detailMonospaced: false,
+                       detailColor: store.attentionCount > 0 ? RelayTheme.coral : RelayTheme.textFaint,
+                       close: close, closeLabel: "Close agent activity") {
             if store.unreadCount > 0 {
                 Button("Mark all read") { store.markAllRead() }
-                    .buttonStyle(.plain)
-                    .font(RelayTheme.font(size: 10, weight: .medium))
-                    .foregroundStyle(RelayTheme.textMuted)
+                    .buttonStyle(RelayAgentQuietButtonStyle())
             }
-            Button(action: close) {
-                Image(systemName: "xmark")
-                    .font(RelayTheme.font(size: 10, weight: .medium))
-                    .frame(width: 26, height: 26)
-                    .background(RelayTheme.surface, in: Circle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .help("Close agent activity")
-            .accessibilityLabel("Close agent activity")
         }
-        .padding(.horizontal, RelayTheme.spacing(14))
-        .frame(height: 54)
         .contentShape(Rectangle())
     }
 
@@ -881,7 +854,7 @@ struct AgentInspectorPanel: View {
 
     private var inspectorTitleBar: some View {
         RelayViewerBar(symbol: snapshot.kind.symbol, title: subagentID == nil ? "Agent details" : "Agent thread",
-                       detail: snapshot.kind.label) {
+                       detail: snapshot.kind.label, close: close, closeLabel: "Close agent inspector") {
             RelayViewerIconButton(title: collapsed ? "Expand agent inspector" : "Collapse agent inspector",
                                   symbol: collapsed ? "chevron.down" : "chevron.up") { collapsed.toggle() }
                 .focusEffectDisabled()
@@ -894,8 +867,6 @@ struct AgentInspectorPanel: View {
             RelayViewerIconButton(title: "Show parent terminal", symbol: "terminal", action: showTerminal)
                 .focusEffectDisabled()
                 .help("Show parent terminal")
-            RelayViewerIconButton(title: "Close agent inspector", symbol: "xmark", action: close)
-                .focusEffectDisabled()
         }
         .contentShape(Rectangle())
         .focusable()
@@ -3534,7 +3505,7 @@ private struct WorkspaceCanvas: View {
     }
 }
 
-private struct FloatingAgentConversation: View {
+struct FloatingAgentConversation: View {
     @ObservedObject var pane: PaneModel
     let bounds: CGSize
     let terminal: () -> Void
@@ -3549,23 +3520,21 @@ private struct FloatingAgentConversation: View {
     private var y: CGFloat { min(max(8, origin.y + movement.height), max(8, bounds.height - height - 8)) }
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Label("Conversation · " + pane.displayName, systemImage: "text.bubble")
-                    .font(RelayTheme.font(size: 12, weight: .medium)).lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityIdentifier("relay.agent.embedded." + pane.id.uuidString)
-                    .contentShape(Rectangle())
-                    .gesture(DragGesture().updating($movement) { value, offset, _ in offset = value.translation }
-                        .onEnded { value in
-                            origin = CGPoint(x: min(max(8, origin.x + value.translation.width), max(8, bounds.width - width - 8)),
-                                             y: min(max(8, origin.y + value.translation.height), max(8, bounds.height - height - 8)))
-                        })
-                Button(action: terminal) { Image(systemName: "terminal") }.help("Return to the original terminal")
+            RelayViewerBar(symbol: "text.bubble", title: "Conversation", detail: pane.displayName,
+                           detailMonospaced: false, close: close,
+                           closeLabel: "Close conversation; keep the agent running") {
+                RelayViewerIconButton(title: "Return to the original terminal", symbol: "terminal", action: terminal)
+                    .help("Return to the original terminal")
                     .accessibilityIdentifier("relay.agent.embedded.terminal")
-                Button(action: close) { Image(systemName: "xmark") }.help("Close conversation; keep the agent running")
-                    .accessibilityIdentifier("relay.agent.embedded.close")
             }
-            .buttonStyle(.plain).padding(10).background(RelayTheme.elevated)
+            .contentShape(Rectangle())
+            .gesture(DragGesture().updating($movement) { value, offset, _ in offset = value.translation }
+                .onEnded { value in
+                    origin = CGPoint(x: min(max(8, origin.x + value.translation.width), max(8, bounds.width - width - 8)),
+                                     y: min(max(8, origin.y + value.translation.height), max(8, bounds.height - height - 8)))
+                })
+            .accessibilityIdentifier("relay.agent.embedded." + pane.id.uuidString)
+            Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
             RelayAgentConversationHostView(pane: pane).id(pane.id)
         }
         .frame(width: width, height: height)
@@ -3600,7 +3569,7 @@ private struct RLayoutResultsDock: View {
     }
 }
 
-private struct FloatingPaneWindow: View {
+struct FloatingPaneWindow: View {
     @ObservedObject var pane: PaneModel
     let placement: FloatingPanePlacement
     let bounds: CGSize
@@ -3694,7 +3663,8 @@ private struct FloatingPaneWindow: View {
     }
 
     private var floatingTitleBar: some View {
-        HStack(spacing: RelayTheme.spacing(9)) {
+        RelayViewerBarFrame(close: close,
+                            closeLabel: pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane") {
             HStack(spacing: RelayTheme.spacing(9)) {
                 Capsule()
                     .fill(isActive ? RelayTheme.accent : RelayTheme.textFaint)
@@ -3764,47 +3734,14 @@ private struct FloatingPaneWindow: View {
                 move(Double(baseOriginX), Double(min(bounds.height - baseHeight - edgeInset, baseOriginY + 20))); return .handled
             }
 
-            HStack(spacing: RelayTheme.spacing(0)) {
-                Button(action: minimize) {
-                    Image(systemName: "minus")
-                        .font(RelayTheme.font(size: 9, weight: .medium))
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
+        } trailing: {
+            RelayViewerIconButton(title: "Minimize floating pane", symbol: "minus", action: minimize)
                 .focusEffectDisabled()
                 .help("Minimize pane — keep session running")
-                .accessibilityLabel("Minimize floating pane")
-                Button(action: dock) {
-                    Image(systemName: "rectangle.portrait.and.arrow.right")
-                        .font(RelayTheme.font(size: 9, weight: .medium))
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
+            RelayViewerIconButton(title: "Dock floating pane", symbol: "rectangle.portrait.and.arrow.right", action: dock)
                 .focusEffectDisabled()
                 .help("Dock pane")
-                .accessibilityLabel("Dock floating pane")
-
-                Button(action: close) {
-                    Image(systemName: "xmark")
-                        .font(RelayTheme.font(size: 9, weight: .medium))
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .focusEffectDisabled()
-                .help(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
-                .accessibilityLabel(pane.profile.kind == .ssh ? "Detach floating pane" : "Close floating pane")
-            }
-            .frame(height: 24)
         }
-        .padding(.horizontal, RelayTheme.spacing(10))
-        .frame(height: 36)
-        .background(RelayTheme.elevated)
     }
 
     private var resizeHandle: some View {
@@ -5107,31 +5044,15 @@ private struct RelayLogTextView: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {}
 }
 
-private struct InlineArtifactView: View {
+struct InlineArtifactView: View {
     let artifact: PaneArtifact
     let dismiss: () -> Void
 
     var body: some View {
         VStack(spacing: RelayTheme.spacing(0)) {
-            HStack(spacing: RelayTheme.spacing(7)) {
-                Image(systemName: artifact.kind.symbol)
-                    .foregroundStyle(RelayTheme.blue)
-                Text(artifact.filename)
-                    .font(RelayTheme.font(size: 11, weight: .medium))
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                Button(action: dismiss) {
-                    Image(systemName: "xmark")
-                        .font(RelayTheme.font(size: 9, weight: .medium))
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RelayTheme.textMuted)
-                .focusEffectDisabled()
-                .accessibilityLabel(artifact.kind == .log ? "Close inline text" : "Close inline image")
-            }
-            .padding(.horizontal, RelayTheme.spacing(10))
-            .frame(height: 32)
+            RelayViewerBar(symbol: artifact.kind.symbol, title: artifact.filename, close: dismiss,
+                           closeLabel: artifact.kind == .log ? "Close inline text" : "Close inline image")
+            Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
 
             if artifact.kind == .log {
                 VStack(spacing: 0) {

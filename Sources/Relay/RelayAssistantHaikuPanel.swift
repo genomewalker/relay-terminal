@@ -29,7 +29,8 @@ struct RelayAssistantHaikuPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             // The shared viewer bar: the pane header's height, inset, type
             // and icon controls, like View CLI conversation and Agent details.
-            RelayViewerBar(symbol: "sparkles", title: "Miko", detail: harness.isBusy ? "Working" : nil) {
+            RelayViewerBar(symbol: "sparkles", title: "Miko", detail: harness.isBusy ? "Working" : nil,
+                           close: { close() }, closeLabel: "Close Relay assistant · Esc") {
                 if harness.isBusy { ProgressView().controlSize(.mini).help("Miko is working") }
                 Button("New chat") { harness.newChat() }
                     .buttonStyle(RelayAgentQuietButtonStyle())
@@ -46,19 +47,11 @@ struct RelayAssistantHaikuPanel: View {
                     }
                     .accessibilityLabel("Open Sessions and Health")
                     .accessibilityIdentifier("relay.assistant.sessions-health")
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(RelayViewerMetrics.icon)
-                        .frame(width: RelayViewerMetrics.iconSize, height: RelayViewerMetrics.iconSize)
-                        .contentShape(Rectangle())
-                }
+                } label: { RelayViewerMenuLabel(symbol: "ellipsis") }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .foregroundStyle(RelayTheme.textMuted)
                 .help("More").accessibilityLabel("More Miko actions")
                 .accessibilityIdentifier("relay.assistant.more")
-                RelayViewerIconButton(title: "Close Relay assistant", symbol: "xmark") { close() }
-                    .help("Close · Esc")
-                    .accessibilityIdentifier("relay.assistant.panel-close")
             }
             Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
             if let notice = entryPoints.hotkeyStatus.notice {

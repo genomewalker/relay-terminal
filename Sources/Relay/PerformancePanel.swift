@@ -245,7 +245,7 @@ struct RelayPerformancePanel: View {
     }
 
     var body: some View {
-        SmoothFloatingPanelDrag(settledOffset: $settledOffset, headerHeight: 42) {
+        SmoothFloatingPanelDrag(settledOffset: $settledOffset, headerHeight: barHeight) {
             VStack(spacing: RelayTheme.spacing(0)) {
                 titleBar
                     .fixedSize(horizontal: false, vertical: true)
@@ -277,8 +277,8 @@ struct RelayPerformancePanel: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            .frame(width: section == "Performance" || section == "Energy" ? 560 : 760, height: collapsed ? 42 : 560)
-            .background(RelayTheme.surface)
+            .frame(width: section == "Performance" || section == "Energy" ? 560 : 760, height: collapsed ? barHeight : 560)
+            .background(RelayTheme.canvas)
             .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous)
@@ -327,46 +327,18 @@ struct RelayPerformancePanel: View {
         }
     }
 
+    private var barHeight: CGFloat { RelayViewerMetrics.barHeight(compact: RelayPreferences.shared.compactInterface) }
+
+    /// The shared viewer bar; also the panel's drag handle and collapsed height.
     private var titleBar: some View {
-        HStack(spacing: RelayTheme.spacing(9)) {
-            Image(systemName: "waveform.path.ecg.rectangle")
-                .font(RelayTheme.font(size: 11, weight: .medium))
-                .foregroundStyle(RelayTheme.accent)
-            Text("Monitoring")
-                .font(RelayTheme.font(size: 11.5, weight: .medium))
-                .foregroundStyle(RelayTheme.text)
-            Text("Live")
-                .font(RelayTheme.font(size: 11, weight: .medium))
-                .foregroundStyle(RelayTheme.textFaint)
-            Spacer()
-            Button { collapsed.toggle() } label: {
-                Image(systemName: collapsed ? "chevron.down" : "chevron.up")
-                    .font(RelayTheme.font(size: 9, weight: .medium))
-                    .frame(width: 28, height: 28)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .help(collapsed ? "Expand monitoring" : "Collapse monitoring")
-            .accessibilityLabel(collapsed ? "Expand monitoring" : "Collapse monitoring")
-            .accessibilityIdentifier("relay.monitoring.collapse")
-            Button(action: close) {
-                Image(systemName: "xmark")
-                    .font(RelayTheme.font(size: 9, weight: .medium))
-                    .frame(width: 28, height: 28)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .help("Close monitoring")
-            .accessibilityLabel("Close monitoring")
-            .accessibilityIdentifier("relay.monitoring.close")
+        RelayViewerBar(symbol: "waveform.path.ecg.rectangle", title: "Monitoring", detail: "Live",
+                       detailMonospaced: false, close: close, closeLabel: "Close monitoring") {
+            RelayViewerIconButton(title: collapsed ? "Expand monitoring" : "Collapse monitoring",
+                                  symbol: collapsed ? "chevron.down" : "chevron.up") { collapsed.toggle() }
+                .focusEffectDisabled()
+                .help(collapsed ? "Expand monitoring" : "Collapse monitoring")
+                .accessibilityIdentifier("relay.monitoring.collapse")
         }
-        .padding(.horizontal, RelayTheme.spacing(12))
-        .frame(height: 42)
-        .background(RelayTheme.surface.opacity(0.7))
         .contentShape(Rectangle())
     }
 

@@ -214,7 +214,8 @@ struct RelayRecentPlacesPanel: View {
     var body: some View {
         RelayViewerLayout {
             RelayViewerBar(symbol: "clock.arrow.circlepath", title: "Recent places",
-                           detail: "Tab next · Shift-Tab back · release to go · Esc stays") { EmptyView() }
+                           detail: "Tab next · Shift-Tab back · release to go · Esc stays",
+                           close: { switcher.cancel() }, closeLabel: "Close recent places · Esc")
         } content: {
             VStack(spacing: RelayTheme.spacing(2)) {
                 ForEach(Array(switcher.places.enumerated()), id: \.element.id) { index, place in
