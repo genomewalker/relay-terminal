@@ -48,4 +48,33 @@ import Testing
         }
         #expect(rendered == 4)
     }
+
+    /// Agent details uses the same bar, on the pane's canvas.
+    @Test func rendersAgentDetailsOnTheViewerBarInBothAppearances() throws {
+        _ = NSApplication.shared
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        workspace.relayIsFrontmost = { true }
+        defer { workspace.shutdown() }
+        workspace.newTab(profile: .sshConfigHost("viewer-agent-details.invalid"))
+        let pane = try #require(workspace.activePane)
+        pane.connectionState = .connected
+        for json in [#"{"agent":"claude","event":{"hook_event_name":"SessionStart","event_id":"viewer-start"}}"#,
+                     #"{"agent":"claude","event":{"hook_event_name":"SubagentStart","agent_id":"viewer-explore","agent_type":"Explore"}}"#,
+                     #"{"agent":"claude","event":{"hook_event_name":"PreToolUse","tool_name":"Bash","event_id":"viewer-bash"}}"#] {
+            pane.receivedAgentEvent(Data(json.utf8))
+        }
+        defer { AgentIntelligenceStore.shared.markPaneRead(pane.id) }
+        var rendered = 0
+        for subagent in [nil, "viewer-explore"] as [String?] {
+            for (appearance, scheme) in [(NSAppearance.Name.darkAqua, ColorScheme.dark), (.aqua, .light)] {
+                let panel = AgentInspectorPanel(pane: pane, subagentID: subagent, showTerminal: {}, close: {})
+                    .environment(\.colorScheme, scheme)
+                let shot = try RelaySnapshot.render(panel, name: "viewer-agent-details-\(subagent == nil ? "main" : "thread")",
+                                                    width: 520, appearance: appearance)
+                #expect(shot.size.height > RelayViewerMetrics.barHeight(compact: RelayPreferences.shared.compactInterface) + 100)
+                rendered += 1
+            }
+        }
+        #expect(rendered == 4)
+    }
 }

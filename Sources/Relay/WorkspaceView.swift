@@ -778,6 +778,7 @@ struct AgentInspectorPanel: View {
     @State private var refreshPending = false
     @State private var snapshot: AgentInspectorSnapshot
     @FocusState private var titleFocused: Bool
+    @ObservedObject private var preferences = RelayPreferences.shared
 
     init(
         pane: PaneModel,
@@ -799,13 +800,13 @@ struct AgentInspectorPanel: View {
     var body: some View {
         SmoothFloatingPanelDrag(
             settledOffset: $settledOffset,
-            headerHeight: 42,
+            headerHeight: barHeight,
             onDragActivityChanged: dragActivityChanged
         ) {
             VStack(spacing: RelayTheme.spacing(0)) {
                 inspectorTitleBar
                 if !collapsed {
-                    Rectangle().fill(RelayTheme.line.opacity(0.7)).frame(height: 1)
+                    Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
                     if let agent = snapshot.agent {
                         inspectorContent(agent)
                     } else {
@@ -823,9 +824,9 @@ struct AgentInspectorPanel: View {
             }
             .frame(
                 width: collapsed ? 330 : min(max(panelSize.width + resizeOffset.width, 380), 820),
-                height: collapsed ? 42 : min(max(panelSize.height + resizeOffset.height, 260), 760)
+                height: collapsed ? barHeight : min(max(panelSize.height + resizeOffset.height, 260), 760)
             )
-            .background(RelayTheme.sidebar)
+            .background(RelayTheme.canvas)
             .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous)
@@ -864,63 +865,29 @@ struct AgentInspectorPanel: View {
         }
     }
 
+    /// The shared viewer bar, so Agent details reads like the pane header and
+    /// View CLI conversation. It is also the panel's drag handle and its
+    /// collapsed height.
+    private var barHeight: CGFloat { RelayViewerMetrics.barHeight(compact: preferences.compactInterface) }
+
     private var inspectorTitleBar: some View {
-        HStack(spacing: RelayTheme.spacing(9)) {
-            Image(systemName: snapshot.kind.symbol)
-                .font(RelayTheme.font(size: 11, weight: .medium))
-                .foregroundStyle(RelayTheme.textMuted)
-            Text(subagentID == nil ? "Agent details" : "Agent thread")
-                .font(RelayTheme.font(size: 11.5, weight: .medium))
-                .foregroundStyle(RelayTheme.text)
-            Text(snapshot.kind.label)
-                .font(RelayTheme.font(size: 11, weight: .medium))
-                .foregroundStyle(RelayTheme.textFaint)
-            Spacer()
-            Button { collapsed.toggle() } label: {
-                Image(systemName: collapsed ? "chevron.down" : "chevron.up")
-                    .font(RelayTheme.font(size: 9, weight: .medium))
-                    .frame(width: 24, height: 24)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .help(collapsed ? "Expand inspector" : "Collapse inspector")
-            .accessibilityLabel(collapsed ? "Expand agent inspector" : "Collapse agent inspector")
-            Button { openConversation(nil) } label: {
-                Label("Full conversation", systemImage: "text.bubble")
-                    .font(RelayTheme.font(size: 10.5, weight: .medium))
-                    .padding(.horizontal, RelayTheme.spacing(7))
-                    .frame(height: 22)
-                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(5)))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .help("Show the full conversation: every tool call with its command and output")
-            .accessibilityIdentifier("relay.agent-inspector.full-conversation")
-            Button(action: showTerminal) {
-                Image(systemName: "terminal")
-                    .font(RelayTheme.font(size: 10, weight: .medium))
-                    .frame(width: 24, height: 24)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .help("Show parent terminal")
-            .accessibilityLabel("Show parent terminal")
-            Button(action: close) {
-                Image(systemName: "xmark")
-                    .font(RelayTheme.font(size: 9, weight: .medium))
-                    .frame(width: 24, height: 24)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(RelayTheme.textMuted)
-            .focusEffectDisabled()
-            .accessibilityLabel("Close agent inspector")
+        RelayViewerBar(symbol: snapshot.kind.symbol, title: subagentID == nil ? "Agent details" : "Agent thread",
+                       detail: snapshot.kind.label) {
+            RelayViewerIconButton(title: collapsed ? "Expand agent inspector" : "Collapse agent inspector",
+                                  symbol: collapsed ? "chevron.down" : "chevron.up") { collapsed.toggle() }
+                .focusEffectDisabled()
+                .help(collapsed ? "Expand inspector" : "Collapse inspector")
+            Button("Full conversation", systemImage: "text.bubble") { openConversation(nil) }
+                .buttonStyle(RelayAgentQuietButtonStyle())
+                .focusEffectDisabled()
+                .help("Show the full conversation: every tool call with its command and output")
+                .accessibilityIdentifier("relay.agent-inspector.full-conversation")
+            RelayViewerIconButton(title: "Show parent terminal", symbol: "terminal", action: showTerminal)
+                .focusEffectDisabled()
+                .help("Show parent terminal")
+            RelayViewerIconButton(title: "Close agent inspector", symbol: "xmark", action: close)
+                .focusEffectDisabled()
         }
-        .padding(.horizontal, RelayTheme.spacing(12))
-        .frame(height: 42)
-        .background(RelayTheme.surface.opacity(0.7))
         .contentShape(Rectangle())
         .focusable()
         .focused($titleFocused)
@@ -929,7 +896,7 @@ struct AgentInspectorPanel: View {
             Capsule()
                 .fill(titleFocused ? RelayTheme.accent : Color.clear)
                 .frame(height: 2)
-                .padding(.horizontal, RelayTheme.spacing(14))
+                .padding(.horizontal, RelayTheme.spacing(RelayViewerMetrics.barPadding))
                 .accessibilityHidden(true)
         }
         .accessibilityLabel("Movable agent inspector")
