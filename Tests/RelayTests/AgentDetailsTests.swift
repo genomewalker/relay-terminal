@@ -123,3 +123,18 @@ import Testing
         #expect(rendered == 2)
     }
 }
+
+/// A sub-agent whose event carries an empty type still gets a readable name.
+@MainActor @Suite(.serialized) struct AgentDetailsSubagentLabelTests {
+    @Test func emptyAgentTypeFallsBackToSubagent() throws {
+        _ = NSApplication.shared
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        workspace.newTab(profile: .sshConfigHost("agent-label.invalid"))
+        let pane = try #require(workspace.activePane)
+        pane.receivedAgentEvent(Data(#"{"agent":"claude","event":{"hook_event_name":"SubagentStart","agent_id":"blank-1","agent_type":""}}"#.utf8))
+        pane.receivedAgentEvent(Data(#"{"agent":"claude","event":{"hook_event_name":"SubagentStart","agent_id":"named-1","agent_type":"Explore"}}"#.utf8))
+        #expect(pane.subagents.map(\.label) == ["Subagent", "Explore"])
+        AgentIntelligenceStore.shared.markPaneRead(pane.id)
+    }
+}

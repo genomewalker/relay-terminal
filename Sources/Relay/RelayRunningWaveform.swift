@@ -138,9 +138,14 @@ final class RelayRunningWaveformView: NSView {
         return animation
     }
 
-    /// Offscreen captures (`cacheDisplay`) draw views, not sublayers: draw
-    /// the still mark so snapshots show what the layers show at rest.
+    /// Only offscreen captures (`cacheDisplay` of a view outside any window)
+    /// draw the still mark here: they draw views, not sublayers. In a window
+    /// this drawing would become the view's own layer contents, a fully lit
+    /// copy underneath the sweep that hides its motion.
+    static func drawsStillCopy(inWindow: Bool) -> Bool { !inWindow }
+
     override func draw(_ dirtyRect: NSRect) {
+        guard Self.drawsStillCopy(inWindow: window != nil) else { return }
         let config = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
             .applying(.init(paletteColors: [color]))
         guard let image = NSImage(systemSymbolName: Self.symbolName, accessibilityDescription: nil)?

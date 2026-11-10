@@ -1016,7 +1016,8 @@ struct AgentInspectorPanel: View {
                         Button { inspect(subagent.id) } label: {
                             HStack(spacing: RelayTheme.spacing(8)) {
                                 Circle().fill(subagent.phase.color).frame(width: 6, height: 6)
-                                Text(subagent.label)
+                                // Saved threads may carry an empty label from older events.
+                                Text(subagent.label.isEmpty ? "Sub-agent" : subagent.label)
                                     .font(RelayTheme.font(size: 11.5, weight: .medium))
                                     .foregroundStyle(RelayTheme.text)
                                     .lineLimit(1)

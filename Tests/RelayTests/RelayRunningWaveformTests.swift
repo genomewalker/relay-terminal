@@ -37,6 +37,13 @@ import Testing
         withExtendedLifetime(window) {}
     }
 
+    /// In a window the still copy must not be drawn: it would sit under the
+    /// sweep as the view's own layer contents and hide the motion.
+    @Test func stillCopyIsOnlyForOffscreenCaptures() {
+        #expect(RelayRunningWaveformView.drawsStillCopy(inWindow: false))
+        #expect(!RelayRunningWaveformView.drawsStillCopy(inWindow: true))
+    }
+
     @Test func sweepFillsTheBarsInTurnThenHolds() throws {
         let sweep = RelayRunningWaveformView.sweep()
         #expect(sweep.calculationMode == .discrete)

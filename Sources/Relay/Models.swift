@@ -1319,7 +1319,10 @@ final class PaneModel: ObservableObject, Identifiable {
             ?? (event["type"] as? String)
             ?? "Agent event"
         let tool = event["tool_name"] as? String
-        let agentType = event["agent_type"] as? String
+        // An empty type is no type: the label falls back to "Subagent".
+        let agentType = (event["agent_type"] as? String).flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        }
         let threadID = event["thread_id"] as? String
         let message = (event["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let occurredAt = Self.agentEventDate(event: event, envelope: envelope)
