@@ -57,8 +57,12 @@ struct RelayQuickNavigate: View {
                 // establish that the worker is ready or its task succeeded.
                 let signalDetail = pane.pendingAgentApprovals == 0 && report == nil && pane.phase == .quiet
                     ? "No recent output; readiness has not been confirmed.\n" : ""
-                let status = Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
-                                              programState: report, programReportCurrent: reportCurrent)
+                // A lost, returning or failed terminal says so in the fleet
+                // board's words; the phase alone would still read "Working".
+                let status = pane.contentKind == .terminal && [.reconnecting, .disconnected, .failed].contains(fact.status)
+                    ? fact.detail
+                    : Index.paneStatus(phase: pane.phase, approvals: pane.pendingAgentApprovals,
+                                       programState: report, programReportCurrent: reportCurrent)
                 let stateSource = pane.pendingAgentApprovals > 0 ? "pending agent approval count"
                     : (report != nil ? "program self-report" : "terminal output and agent signals")
                 let programDetails = pane.programStatus.records.map { record in

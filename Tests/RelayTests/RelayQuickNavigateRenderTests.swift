@@ -35,6 +35,12 @@ struct RelayQuickNavigateRenderTests {
             #expect(row.statusRole == role)
             #expect(row.symbol == pane.kind.symbol)
         }
+        // A reconnecting agent's words match its grey icon and the fleet board.
+        let reconnectingFact = try #require(RelayWorkOverviewIndex.paneFacts(f.workspace).first { $0.paneID == f.reconnecting.id })
+        #expect(reconnectingFact.status == .reconnecting)
+        #expect(try entry(f.reconnecting).status == reconnectingFact.detail)
+        #expect(try entry(f.reconnecting).status.localizedCaseInsensitiveContains("reconnecting"))
+        #expect(try entry(f.failed).status == "Exited with status 2")
         let tabs = entries.filter { $0.id.hasPrefix("tab:") }
         #expect(!tabs.isEmpty)
         #expect(tabs.allSatisfy { $0.statusRole == nil && $0.symbol == "rectangle.on.rectangle" })
