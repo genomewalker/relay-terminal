@@ -68,6 +68,17 @@ enum RelayAgentMaintenancePrompt {
         return text
     }
 
+    /// A status-line tools row: " | "-separated "+ Name ×N" (finished) and
+    /// "~ Name[: target]" (shown as running) segments, at least one "~".
+    static func statusToolRow(_ value: String) -> Bool {
+        let segments = value.components(separatedBy: " | ")
+        guard segments.contains(where: { $0.hasPrefix("~ ") }) else { return false }
+        return segments.allSatisfy { segment in
+            segment.range(of: #"^~ [A-Za-z_][A-Za-z0-9_.-]*(?:: .*)?$"#, options: .regularExpression) != nil ||
+                segment.range(of: #"^\+ [A-Za-z_][A-Za-z0-9_.-]*(?: ×[0-9]+)?…?$"#, options: .regularExpression) != nil
+        }
+    }
+
     private static let footerWork = #"\b[1-9][0-9]* (?:shells?|background tasks?)\b"#
     private static let footerAgents = #"\b[1-9][0-9]*\+? agents?\b"#
     private static let footerWaitingSessions = #"\u{2190}\s*(?:[1-9][0-9]*|99\+)\s+agents?\b"#
@@ -132,8 +143,14 @@ enum RelayAgentMaintenancePrompt {
                 // "[Haiku 5.5>]"), so a new model family needs no code change.
                 let modelStatus = value.range(of: #"\| \[[A-Z][A-Za-z]* [0-9]+(?:\.[0-9]+)*[^\]|]*\]"#,
                     options: .regularExpression) != nil
+                // A status-line tool row may mark a tool "~" (running) from a
+                // transcript that never recorded its result (interrupted or
+                // restored turn). Only relayd's proof that Claude's harness is
+                // idle with no subagent or background work lets it through.
+                let staleToolRow = explainedAgents == waitingSessionsExplained && statusToolRow(value)
                 let known = value.hasPrefix("⏵") || value.hasPrefix("⏸") || value.hasPrefix("◈") ||
                     value.hasPrefix("+ ") || value.hasPrefix("$") || centsCost || commandNotice || waitingStatus ||
+                    staleToolRow ||
                     modelStatus ||
                     (value.contains(" | [") && ["Opus", "Sonnet", "Haiku"].contains(where: value.contains))
                 guard known else { return false }
