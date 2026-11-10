@@ -30,13 +30,55 @@ import Testing
         ]
     }
 
+    /// Hosts in use: the recently used one (panes), the saved one, the ones with a
+    /// check result this session, and one checked in an earlier session.
+    static var usedKeys: Set<String> {
+        let hosts = profiles
+        return RelaydHostGrouping.usedKeys(
+            reports: reports, lastKnown: [:], recentHostKeys: [hosts[0].connectionKey], savedProfiles: []
+        )
+    }
+
+    @Test func groupsHostsInUseBeforeOtherSSHHosts() {
+        let hosts = Self.profiles
+        let saved = ConnectionProfile(name: "saved", kind: .ssh, host: "saved.fixture.invalid")
+        let local = ConnectionProfile(name: "local", kind: .local)
+        var unknownWithPanes = RelaydHostReport()
+        unknownWithPanes.paneCount = 1
+        let used = RelaydHostGrouping.usedKeys(
+            reports: [
+                hosts[1].connectionKey: RelaydHostReport(state: .outdated),
+                hosts[3].connectionKey: RelaydHostReport(state: .unknown),
+                hosts[4].connectionKey: unknownWithPanes,
+            ],
+            lastKnown: [hosts[5].connectionKey: .ready, hosts[6].connectionKey: .unknown],
+            recentHostKeys: [hosts[7].connectionKey],
+            savedProfiles: [saved, local]
+        )
+        #expect(used == [hosts[1].connectionKey, hosts[4].connectionKey, hosts[5].connectionKey,
+                         hosts[7].connectionKey, saved.connectionKey])
+        #expect(!used.contains(local.connectionKey))
+
+        let groups = RelaydHostGrouping.split(hosts, usedKeys: used)
+        // Input order (recency, then name) is kept within each group.
+        #expect(groups.inUse.map(\.connectionKey) == [1, 4, 5, 7].map { hosts[$0].connectionKey })
+        #expect(groups.other.count == hosts.count - 4)
+        #expect(groups.other.map(\.connectionKey) == hosts.enumerated()
+            .filter { ![1, 4, 5, 7].contains($0.offset) }.map(\.element.connectionKey))
+        #expect(Set(groups.inUse.map(\.id)).isDisjoint(with: groups.other.map(\.id)))
+
+        let none = RelaydHostGrouping.split(hosts, usedKeys: [])
+        #expect(none.inUse.isEmpty && none.other.count == hosts.count)
+    }
+
     @Test func rendersHostRailAndMetricsInBothAppearances() throws {
         _ = NSApplication.shared
         let hosts = Self.profiles
         let reports = Self.reports
         for (appearance, scheme) in [(NSAppearance.Name.darkAqua, ColorScheme.dark), (.aqua, .light)] {
             let rail = RelaydHostRail(
-                profiles: hosts, reports: reports, selectedKey: hosts[0].connectionKey,
+                profiles: hosts, reports: reports, usedKeys: Self.usedKeys,
+                selectedKey: hosts[0].connectionKey,
                 select: { _ in }, updateRow: { _ in EmptyView() }
             )
             .frame(height: 610)
@@ -44,6 +86,27 @@ import Testing
             .environment(\.colorScheme, scheme)
             let railShot = try RelaySnapshot.render(rail, name: "remote-helpers-rail", width: 220, appearance: appearance)
             #expect(railShot.size.height == 610)
+
+            // A host with panes from an earlier session but no check yet in this one.
+            let earlier = RelaydHostRail(
+                profiles: hosts, reports: [:], lastKnown: [hosts[1].connectionKey: .ready],
+                usedKeys: [hosts[0].connectionKey, hosts[1].connectionKey], selectedKey: nil,
+                select: { _ in }, updateRow: { _ in EmptyView() }
+            )
+            .frame(height: 300)
+            .foregroundStyle(RelayTheme.text)
+            .environment(\.colorScheme, scheme)
+            _ = try RelaySnapshot.render(earlier, name: "remote-helpers-rail-earlier", width: 220, appearance: appearance)
+
+            // Nothing used yet: the other hosts are listed open, not hidden.
+            let fresh = RelaydHostRail(
+                profiles: Array(hosts.suffix(5)), reports: [:], usedKeys: [], selectedKey: nil,
+                select: { _ in }, updateRow: { _ in EmptyView() }
+            )
+            .frame(height: 360)
+            .foregroundStyle(RelayTheme.text)
+            .environment(\.colorScheme, scheme)
+            _ = try RelaySnapshot.render(fresh, name: "remote-helpers-rail-unused", width: 220, appearance: appearance)
 
             let metrics = RelaydHostMetrics(report: reports[hosts[0].connectionKey] ?? RelaydHostReport())
                 .padding(20)

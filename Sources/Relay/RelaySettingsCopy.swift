@@ -30,8 +30,8 @@ enum RelaySettingsCopy {
     static let connectionsExplanation = "Relay installs a small helper on each host you connect to and asks before the first install. Hosts that share a home folder share one copy. Approved hosts can update it automatically."
     static let connectionsExplanationDetail = "The helper is relayd. Nodes in a shared home reuse one verified binary; each node runs its own supervisor and socket."
 
-    static let helperManagerSubtitle = "One copy per shared home folder, running on each host"
-    static let helperManagerSubtitleDetail = "One shared relayd binary · one supervisor per node"
+    static let helperManagerSubtitle = "Relay runs a small helper on each remote host to keep sessions alive."
+    static let helperManagerSubtitleDetail = "The helper is relayd. Hosts that share a home folder share one installed copy, and each host runs its own relayd supervisor."
 
     static let agentHelperUpdates = "Let agent panes ask Miko to update the remote helper on hosts"
     static let agentHelperUpdatesExplanation = "When on, a coding agent's request to Miko to update the remote helper on a configured host carries your authority and runs without a card. Every other agent request still waits for your Run. Only you can change this here."
