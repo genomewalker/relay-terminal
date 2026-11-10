@@ -1046,7 +1046,9 @@ final class TerminalRuntime: NSObject {
     }
     var ioForTesting: TerminalIOBridge { io }
 
-    func startIfNeeded() {
+    func startIfNeeded() { startIfNeeded(prefetchedSnapshot: nil) }
+
+    private func startIfNeeded(prefetchedSnapshot: TerminalSnapshotStore.Prefetched?) {
         guard !started, let pane else { return }
         guard pane.profile.backend == .relay else {
             started = true
@@ -1091,7 +1093,7 @@ final class TerminalRuntime: NSObject {
         // the old channel is identity checked and cannot detach the new one.
         defer { connectionPreparation.close() }
         TerminalReplayTrace.log("connection-prepared pane=\(pane.id.uuidString)")
-        let restoration = io.restoreSnapshot(paneID: pane.id)
+        let restoration = io.restoreSnapshot(paneID: pane.id, prefetched: prefetchedSnapshot)
         // A cursor without a renderable checkpoint cannot reconstruct an idle
         // shell. Ask the durable worker for its bounded screen history when the
         // saved viewport differs or the checkpoint contains only mode changes.
@@ -1483,22 +1485,52 @@ final class TerminalRuntime: NSObject {
         io.endReplay()
         io.removeTransport()?.detach()
         started = false
+        backgroundStartGeneration &+= 1
     }
 
     /// Attaches a restored pane whose tab has not been shown, at the grid its
     /// snapshot log was saved at. An unattached view has no surface, so
     /// nothing resizes until a window lays it out. A pane in a window is left
     /// to its presentation path.
+    ///
+    /// The snapshot files are read off the main thread first. The start
+    /// itself, from installing the transport to the first Hello, is still one
+    /// main-actor turn, so no live output can precede the restored bytes. A
+    /// read that a stop, restart, presentation or newer background start has
+    /// overtaken is dropped.
     func startInBackground(viewport: RelayViewport) {
-        guard !started, let pane, pane.profile.backend == .relay, pane.contentKind == .terminal,
-              view.window == nil else { return }
-        io.seedInitialViewport(viewport)
-        startIfNeeded()
+        guard canStartInBackground else { return }
+        backgroundStartGeneration &+= 1
+        let generation = backgroundStartGeneration
+        guard let paneID = pane?.id else { return }
+        backgroundSnapshotLoader(paneID) { [weak self] prefetched in
+            guard let self, self.backgroundStartGeneration == generation, self.pane?.id == paneID,
+                  self.canStartInBackground else { return }
+            // Seeded here, not before the read: a tab shown meanwhile must
+            // see the grid it would have seen without this pane.
+            self.io.seedInitialViewport(viewport)
+            self.startIfNeeded(prefetchedSnapshot: prefetched)
+        }
+    }
+
+    private var canStartInBackground: Bool {
+        guard !started, let pane else { return false }
+        return pane.profile.backend == .relay && pane.contentKind == .terminal && view.window == nil
+    }
+
+    /// Bumped by every start path; a background read for an older value is stale.
+    private var backgroundStartGeneration: UInt64 = 0
+    /// Tests hold the read to overtake it. `completion` runs on the main actor.
+    var backgroundSnapshotLoader: (UUID, @escaping @MainActor (TerminalSnapshotStore.Prefetched) -> Void) -> Void = { paneID, completion in
+        TerminalSnapshotStore.shared.prefetch(paneID: paneID) { prefetched in
+            Task { @MainActor in completion(prefetched) }
+        }
     }
 
     func restart() {
         io.removeTransport()?.detach()
         started = false
+        backgroundStartGeneration &+= 1
         pane?.reconnecting()
         startIfNeeded()
     }
@@ -4970,7 +5002,9 @@ final class TerminalIOBridge: @unchecked Sendable {
         promptWidthMode.configure(readline: readline, promptActive: promptActive)
     }
 
-    func restoreSnapshot(paneID: UUID) -> SnapshotRestoration? {
+    /// `prefetched` replaces the disk reads with files already read off the
+    /// main thread; the restore is otherwise the same.
+    func restoreSnapshot(paneID: UUID, prefetched: TerminalSnapshotStore.Prefetched? = nil) -> SnapshotRestoration? {
         // The restored bytes replace the replay buffer and enter the display
         // queue; both are ordered with the send fence.
         outputOrderingLock.lock()
@@ -4981,16 +5015,16 @@ final class TerminalIOBridge: @unchecked Sendable {
         snapshotPaneID = paneID
         receiveLock.unlock()
         let store = TerminalSnapshotStore.shared
-        guard let cached = store.loadSnapshot(paneID: paneID, viewport: currentViewport),
+        guard let cached = store.loadSnapshot(paneID: paneID, viewport: currentViewport, prefetched: prefetched),
               !cached.payload.isEmpty else {
             replayLock.lock()
             preservesRestoredScreenOnReconnect = false
             replayLock.unlock()
-            if let resumeCursor = store.loadResumeCursor(paneID: paneID), resumeCursor > 0 {
+            if let resumeCursor = store.loadResumeCursor(paneID: paneID, prefetched: prefetched), resumeCursor > 0 {
                 // The worker resumes after this cursor, so the bytes that
                 // enabled bracketed paste are never replayed. Workers without
                 // terminal_mode_state_v1 send no mode prelude either.
-                if let saved = store.loadBracketedPasteState(paneID: paneID),
+                if let saved = store.loadBracketedPasteState(paneID: paneID, prefetched: prefetched),
                    bracketedPasteTracker.persistentState == TerminalSnapshotTrackerState.initial.bracketedPaste {
                     bracketedPasteTracker.restore(saved)
                 }
