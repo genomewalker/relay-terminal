@@ -3082,6 +3082,9 @@ final class TerminalRuntime: NSObject {
         let agentEmpty: Bool
         /// Empty apart from the footer agent count, and that count.
         let agentEmptyIgnoringAgents: Bool
+        /// Empty under relayd's idle proof (waiting-sessions nudge and stale
+        /// "~" status tool rows explained).
+        let agentEmptyIdleProven: Bool
         let footerAgents: Int
         /// The footer agent count other than the "← N agent(s)" waiting-sessions nudge.
         let footerOtherAgents: Int
@@ -3089,7 +3092,7 @@ final class TerminalRuntime: NSObject {
         func empty(explainedAgents: Int) -> Bool {
             if explainedAgents == 0 { return agentEmpty }
             if explainedAgents == RelayAgentMaintenancePrompt.waitingSessionsExplained {
-                return agentEmptyIgnoringAgents && footerOtherAgents == 0
+                return agentEmptyIdleProven && footerOtherAgents == 0
             }
             return agentEmptyIgnoringAgents && footerAgents <= explainedAgents
         }
@@ -3234,6 +3237,9 @@ final class TerminalRuntime: NSObject {
             agentEmpty: RelayAgentMaintenancePrompt.isEmpty(screen, provider: pane.kind == .codex ? "codex" : "claude"),
             agentEmptyIgnoringAgents: RelayAgentMaintenancePrompt.isEmpty(screen,
                 provider: pane.kind == .codex ? "codex" : "claude", explainedAgents: .max),
+            agentEmptyIdleProven: RelayAgentMaintenancePrompt.isEmpty(screen,
+                provider: pane.kind == .codex ? "codex" : "claude",
+                explainedAgents: RelayAgentMaintenancePrompt.waitingSessionsExplained),
             footerAgents: RelayAgentMaintenancePrompt.footerAgentCount(screen, provider: pane.kind == .codex ? "codex" : "claude"),
             footerOtherAgents: RelayAgentMaintenancePrompt.footerOtherAgentCount(screen, provider: pane.kind == .codex ? "codex" : "claude"),
             agentTyped: RelayAgentMaintenancePrompt.hasTypedText(screen, provider: pane.kind == .codex ? "codex" : "claude"),

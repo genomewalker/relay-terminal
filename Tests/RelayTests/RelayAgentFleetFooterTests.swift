@@ -122,4 +122,59 @@ struct RelayAgentFleetFooterTests {
             #expect(empty(screen, try proof()), "\(tail)")
         }
     }
+
+    // MARK: Stale "~" status tool rows (cc-status ≤0.13.10)
+
+    /// Pane d0d7ae13 on 2026-11-10: idle since Friday, empty prompt, but the
+    /// status line still shows the restored turn's unanswered Edit as running.
+    static func staleToolScreen(_ toolRow: String, prompt: String = "❯ \n") -> String {
+        "✔ Update installed · Restart to update\n"
+        + "───────────────────────────────────────────────────────────── faro ─\n" + prompt
+        + "────────────────────────────────────────────────────────────────────\n"
+        + "  ~ | [Opus 5.5] | 375h24m | [==-------------] 90% 96K↓107↑\n"
+        + "  $9.35 $0.02/h | 4/m | wait 0% | 2 CLAUDE.md 7 MCPs 8 hooks\n"
+        + "  ◈ v5.74.1 mem:280K pending:15K\n"
+        + "  " + toolRow + "\n"
+        + "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent"
+    }
+    static let d0d7ae13Tools = "~ Edit: .../current-handoff.md | + ToolSearch ×3 | + mcp__relayDesktopR__relay_read_viewport ×3 | + Bash ×1 | + mcp__relayDeskt…"
+    static let e4b42aeTools = "~ Bash: .../... | ~ Bash: .../... | + Bash ×13 | + mcp__chitta__remember ×2 | + Write ×2"
+
+    @Test("d0d7ae13/8e4b42ae: a stale '~' tool row is explained only by relayd's idle proof")
+    func staleToolRowExplainedByIdleProof() throws {
+        for row in [Self.d0d7ae13Tools, Self.e4b42aeTools] {
+            let screen = Self.staleToolScreen(row)
+            #expect(empty(screen, try proof()), "\(row)")
+            // Without relayd's proof the row is unrecognised: held.
+            #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "claude"), "\(row)")
+            #expect(!empty(screen, try proof(subagentWork: true)), "\(row)")
+            #expect(!empty(screen, try proof(subagentWork: nil)), "\(row)")
+            #expect(!empty(screen, try proof(backgroundWork: true)), "\(row)")
+            #expect(!empty(screen, try proof(backgroundWork: nil)), "\(row)")
+            #expect(!empty(screen, try proof(harness: "busy")), "\(row)")
+            #expect(!empty(screen, try proof(harness: nil)), "\(row)")
+            #expect(!empty(screen, try proof(), activeSubagents: 1), "\(row)")
+            // The host-job count path (background work present) never explains it.
+            #expect(!empty(screen, try proof(backgroundWork: true, hostJobs: 1)), "\(row)")
+            #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "claude", explainedAgents: 3), "\(row)")
+            #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "claude", explainedAgents: .max), "\(row)")
+        }
+    }
+
+    @Test("The idle proof never hides a draft, shells, tasks or a malformed tool row")
+    func staleToolRowGuardStaysNarrow() throws {
+        // A typed draft still holds.
+        #expect(!empty(Self.staleToolScreen(Self.d0d7ae13Tools, prompt: "❯ run the loader\n"), try proof()))
+        // Footer work in the same row or another row still holds.
+        for row in [Self.d0d7ae13Tools + " | 2 shells", "~ Bash: make · 1 background task",
+                    "~ Bash: x | something else", "~ | not a tool", "~ Edit: a.md | + Bash ×1 | 3 agents"] {
+            #expect(!empty(Self.staleToolScreen(row), try proof()), "\(row)")
+        }
+        #expect(RelayAgentMaintenancePrompt.statusToolRow(Self.d0d7ae13Tools))
+        #expect(RelayAgentMaintenancePrompt.statusToolRow(Self.e4b42aeTools))
+        #expect(RelayAgentMaintenancePrompt.statusToolRow("~ Read"))
+        #expect(!RelayAgentMaintenancePrompt.statusToolRow("+ Bash ×1 | + Read ×2"))
+        #expect(!RelayAgentMaintenancePrompt.statusToolRow("~ | [Opus 5.5] | 375h24m"))
+        #expect(!RelayAgentMaintenancePrompt.statusToolRow("~ Bash: x | 2 shells"))
+    }
 }
