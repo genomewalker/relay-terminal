@@ -34,6 +34,15 @@ Checked against upstream Ghostty at the vendored commit
   that is not dirty.
 - `ghostty_surface_draw` → `drawFrame(true)`. It draws the frame data as it is
   now; if nothing was rebuilt it presents the last target again.
+- Who draws output: the renderer thread draws on its own after each rebuild.
+  - A pane without focus is drawn on change: `hasVsync()` is false while the
+    renderer's display link is stopped.
+  - The focused pane is drawn by the renderer's own display link.
+  - Nothing calls back into Swift. On a real surface (probe on the vendored
+    binary), output, `refresh()` and an empty preedit produced no `render`
+    action and no app wakeup.
+  - Relay's display-link tick (`controller.tick()` + `draw()`) is an extra
+    main-thread draw, mainly for input, resize and presentation.
 
 So a row whose dirty bit is lost, or whose rebuild races a presentation change,
 stays stale until something forces a full redraw. A resize does that through the
@@ -71,11 +80,15 @@ Other options considered:
    - Requests closer together than 1/120 s share one rebuild, and the rest is
      redeemed by the next frame.
 3. **Settle (self-heal).** After output has been quiet for 300 ms, or every 2 s
-   under continuous output, a visible pane gets one full rebuild. Any row that
+   under continuous output, a visible pane gets one full rebuild. Because
+   Ghostty never reports output to Swift, the settle subscribes to the
+   session's `parsedHostOutputEvents()`: one coalesced event per parsed batch. Any row that
    escaped rule 1 is then stale for at most that long, not until the next
    resize.
-   - Damage within 0.5 s of a full rebuild is treated as that rebuild's own
-     render request coming back, so the settle cannot trigger itself.
+   - A full rebuild produces no host output, so it cannot trigger another
+     settle through that path. Ticks driven by layout, focus or title changes
+     also count as damage; any of those within 0.5 s of a full rebuild is
+     ignored, so the settle can never trigger itself.
    - Cursor-blink requests arrive inside a frame and never schedule a settle,
      so an idle pane does not repaint repeatedly.
 
@@ -120,8 +133,10 @@ category `.render`.
     hides it within that window but does not explain it.
   - If a garble still lasts longer than 2 s on 0.5.57, it is not a stale cell
     buffer. It would be a presentation problem: the layer showing an old
-    drawable, or a wrong contents scale. Capture the pane, the time and
-    `repaintStatistics.summary` before resizing.
+    drawable, or a wrong contents scale. Note the pane, the time and whether
+    the garble outlasted 2 s, before resizing. `repaintStatistics` is not yet
+    shown anywhere in Relay; adding it to the Performance panel is planned
+    for 0.5.58.
 
 ## Tests
 
@@ -131,6 +146,8 @@ category `.render`.
   - the lever sends no bytes to the session and keeps the screen and the selection;
   - a hidden pane owes the repaint and redeems it on show;
   - an open composition defers the repaint;
+  - real session output schedules exactly one settle, and a quiet pane is not
+    rebuilt again;
   - requests within one frame coalesce;
   - the settle fires once and does not trigger itself;
   - size and scroll transitions request a full repaint.

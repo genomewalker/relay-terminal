@@ -86,6 +86,10 @@ final class TerminalSurfaceCoordinator {
     private var fullRepaintOwed: TerminalRepaintReason?
     private var trailingRepaint: Task<Void, Never>?
     private var settleRepaint: Task<Void, Never>?
+    /// Parsed host output for this surface. Ghostty's renderer thread draws
+    /// output on its own and never calls back, so the settle learns about
+    /// output damage from the session's completion events instead.
+    private var outputDamageTask: Task<Void, Never>?
     private var lastDamageUptime: TimeInterval?
     private var damageSinceUptime: TimeInterval?
     private var inspectionWidthPixels: UInt32?
@@ -274,7 +278,24 @@ final class TerminalSurfaceCoordinator {
         }
     }
 
+    private func observeOutputDamage() {
+        outputDamageTask?.cancel()
+        guard let session = configuration.inMemorySession else { outputDamageTask = nil; return }
+        let events = session.parsedHostOutputEvents()
+        outputDamageTask = Task { @MainActor [weak self] in
+            var first = true
+            for await _ in events {
+                // The stream starts with the current revision, which is not new output.
+                if first { first = false; continue }
+                guard !Task.isCancelled, let self else { return }
+                self.noteDamage()
+            }
+        }
+    }
+
     private func cancelRepaintTasks() {
+        outputDamageTask?.cancel()
+        outputDamageTask = nil
         trailingRepaint?.cancel()
         trailingRepaint = nil
         settleRepaint?.cancel()
@@ -376,6 +397,7 @@ final class TerminalSurfaceCoordinator {
             self?.requestImmediateTick()
         }
         TerminalDebugLog.log(.lifecycle, "surface rebuild succeeded")
+        observeOutputDamage()
         (delegate as? any TerminalSurfaceLifecycleDelegate)?
             .terminalDidAttachSurface(newSurface)
         synchronizeMetrics()

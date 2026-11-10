@@ -128,6 +128,7 @@ struct TerminalRepaintContractTests {
         #expect(t.writes.count == written, "an empty preedit must never reach the program as input")
         #expect(t.view.readViewportText() == before)
         #expect(t.view.surface?.hasSelection() == true, "with no composition open the selection survives")
+
         t.tearDown()
     }
 
@@ -198,6 +199,25 @@ struct TerminalRepaintContractTests {
         #expect(!t.view.core.testHooks_settleScheduled)
         try await Task.sleep(for: .seconds(TerminalRepaintPolicy.settleDelay + 0.25))
         #expect(t.applied.filter { $0 == .settle }.count == 1, "no settle loop on an idle pane")
+        t.tearDown()
+    }
+
+    @Test("Parsed session output schedules exactly one settle after it goes quiet", .timeLimit(.minutes(1)))
+    func outputDrivesTheSettle() async throws {
+        let t = try await RepaintTerminal()
+        t.observe()
+        try await t.waitQuiet()
+        // Ghostty's renderer thread draws output itself and never calls back;
+        // the settle hears about output from the session's parsed-output events.
+        for i in 0..<5 { t.session.receive(Data("streamed output \(i)\r\n".utf8)) }
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !t.applied.contains(.settle), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let settles = t.applied.filter { $0 == .settle }.count
+        #expect(settles >= 1, "output is healed once it goes quiet")
+        try await Task.sleep(for: .seconds(TerminalRepaintPolicy.settleDelay + 0.5))
+        #expect(t.applied.filter { $0 == .settle }.count == settles, "a quiet pane is not rebuilt again")
         t.tearDown()
     }
 
