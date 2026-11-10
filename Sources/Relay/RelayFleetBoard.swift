@@ -679,12 +679,15 @@ struct RelayStatusMark: View {
             Group {
                 switch Self.kind(status) {
                 case .none: EmptyView()
+                case let .symbol(name) where name == Self.runningSymbol:
+                    // Core Animation plays the motion; no main-thread frames.
+                    RelayRunningWaveform(color: status.role.color,
+                                         animating: Self.animates(status, reduceMotion: reduceMotion,
+                                                                  windowVisible: windowVisible))
                 case let .symbol(name):
                     Image(systemName: name)
                         .font(RelayTheme.font(size: 10, weight: .semibold))
                         .foregroundStyle(status.role.color)
-                        .symbolEffect(.variableColor.cumulative.nonReversing, options: .repeating,
-                                      isActive: Self.animates(status, reduceMotion: reduceMotion, windowVisible: windowVisible))
                 }
             }
             .frame(width: Self.size, height: Self.size)
