@@ -614,8 +614,20 @@ final class PaneModel: ObservableObject, Identifiable {
     let profile: ConnectionProfile
     let contentKind: PaneContentKind
     let requiresExistingWorker: Bool
-    @Published var title: String
-    @Published var customName: String?
+    /// Changes whenever an input of the pane's overview fact changes
+    /// (`RelayWorkOverviewIndex.paneFact`), so the fact can be reused while it
+    /// is unchanged. Drawn from one counter for every pane, so a replacement
+    /// pane with the same id never matches a value cached for the old one.
+    /// Any new input read by `paneFact` must bump it in its `didSet`.
+    private(set) var overviewRevision = PaneModel.nextOverviewRevision()
+    private static var overviewRevisionCounter: UInt64 = 0
+    private static func nextOverviewRevision() -> UInt64 {
+        overviewRevisionCounter &+= 1
+        return overviewRevisionCounter
+    }
+    private func overviewInputChanged() { overviewRevision = Self.nextOverviewRevision() }
+    @Published var title: String { didSet { overviewInputChanged() } }
+    @Published var customName: String? { didSet { overviewInputChanged() } }
     @Published var directory: String? {
         didSet { if directory != oldValue { onDirectoryChange?(self) } }
     }
@@ -633,7 +645,7 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var conversationFocus: RelayConversationFocus?
     @Published var lastCommandExitCode: Int?
     @Published var lastCommandDurationNanos: UInt64?
-    @Published var programStatus = RelayProgramStatusSnapshot()
+    @Published var programStatus = RelayProgramStatusSnapshot() { didSet { overviewInputChanged() } }
     private var programStatusAttention = RelayProgramStatusAttention()
     private var programStatusFlush: Task<Void, Never>?
     @Published var terminalProgressPercent: Int?
@@ -642,6 +654,8 @@ final class PaneModel: ObservableObject, Identifiable {
     var promptProvenance = RelayPromptProvenanceLog()
     private(set) var detector = AgentSignalDetector() {
         didSet {
+            // The overview fact reads only the detector's phase and kind.
+            if detector.phase != oldValue.phase || detector.kind != oldValue.kind { overviewInputChanged() }
             // A wait seen in terminal output; agent events name theirs in raiseWait.
             guard agentEventInProgress == nil, detector.phase == .needsInput, oldValue.phase != .needsInput else { return }
             terminalWaits &+= 1
@@ -661,23 +675,24 @@ final class PaneModel: ObservableObject, Identifiable {
         detector.applyStructuredEvent(kind: kind, phase: .needsInput, excerpt: excerpt)
         if let event = agentEventInProgress { waitIdentity = "event:" + event }
     }
-    private(set) var harnessIdentity: AgentHarnessIdentity?
+    private(set) var harnessIdentity: AgentHarnessIdentity? { didSet { overviewInputChanged() } }
     private(set) var reportedHarnessName: String?
     private(set) var lastActivity = Date()
-    private(set) var lastCompletedAgentTurn: Date?
+    private(set) var lastCompletedAgentTurn: Date? { didSet { overviewInputChanged() } }
     private(set) var lastNetworkConversationTurn: NetworkConversationTurn?
     var activeSubagents: Int { subagents.count { $0.phase == .active } }
     private(set) var subagents: [SubagentActivity] = []
-    private(set) var agentActivities: [AgentActivityItem] = []
+    private(set) var agentActivities: [AgentActivityItem] = [] { didSet { overviewInputChanged() } }
     private(set) var taskPlans: [AgentTaskPlan] = []
     private(set) var agentResourceUsage: AgentResourceUsage?
     private(set) var agentProgressPercent: Int?
-    private(set) var pendingAgentApprovals = 0
+    private(set) var pendingAgentApprovals = 0 { didSet { overviewInputChanged() } }
     private(set) var agentLastInputAt = Date.distantPast
     private(set) var agentInputRevision: UInt64 = 0
     @Published var connectionState: PaneConnectionState {
         didSet {
             guard oldValue != connectionState else { return }
+            overviewInputChanged()
             agentInputRevision &+= 1
             switch connectionState {
             case .connecting, .reconnecting, .waitingForNetwork:
@@ -690,7 +705,7 @@ final class PaneModel: ObservableObject, Identifiable {
         }
     }
     @Published private(set) var remoteClientCount: Int?
-    @Published var remoteExitCode: Int?
+    @Published var remoteExitCode: Int? { didSet { overviewInputChanged() } }
     /// The pane's program ended, as opposed to Relay losing its connection.
     /// `disconnected()` also marks the agent phase exited, so
     /// `phase == .exited` alone cannot tell the two apart: a lost transport
@@ -731,7 +746,7 @@ final class PaneModel: ObservableObject, Identifiable {
     private(set) var previewRequest = UUID()
     private var previewTask: Task<Void, Never>?
     @Published var editorRequest: EditorOpenRequest?
-    @Published var isRestoringTerminal = false
+    @Published var isRestoringTerminal = false { didSet { overviewInputChanged() } }
     @Published var hasTerminalSnapshot = false
     private var structuredAgentRunning: Bool?
     private var activeAgentRoots: [String: AgentKind] = [:]

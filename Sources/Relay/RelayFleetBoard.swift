@@ -138,19 +138,71 @@ extension RelayWorkOverviewIndex {
 
     /// Every terminal pane in every tab and workspace, Mac and remote, from published
     /// pane state. Cheap enough to run on each throttled activity revision.
+    /// Each pane's fact is reused while the pane's `overviewRevision` and its
+    /// tab placement are unchanged, so a pass recomputes only changed panes.
     @MainActor static func paneFacts(_ workspace: WorkspaceModel) -> [PaneFact] {
+        paneFacts(workspace, cache: workspace.paneFactCache)
+    }
+
+    /// With `cache: nil` every fact is recomputed: the reference result.
+    @MainActor static func paneFacts(_ workspace: WorkspaceModel, cache: PaneFactCache?) -> [PaneFact] {
         var facts: [PaneFact] = []
+        // One lookup table per pass instead of a linear search per tab; the
+        // first match wins, as in `owner(of:)` and `workspace(_:)`.
+        let ownership = workspace.ownership
+        let ownerOf = Dictionary(ownership.owners.map { ($0.id, $0.workspaceID) }, uniquingKeysWith: { first, _ in first })
+        let nameOf = Dictionary(ownership.workspaces.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
         for tab in workspace.tabs {
-            let owner = workspace.ownership.owner(of: tab.id).flatMap { workspace.ownership.workspace($0)?.name } ?? "Workspace"
+            let owner = ownerOf[tab.id].flatMap { nameOf[$0] } ?? "Workspace"
             let tabName = tab.name.isEmpty ? "Untitled tab" : tab.name
-            for id in workspace.paneIDs(inTab: tab.id) {
+            let hiddenIDs = Set(tab.hiddenStackPaneIDs)
+            for id in workspace.paneIDs(in: tab) {
                 // Editors have no agent; a never-started one would read as lost.
                 guard let pane = workspace.panes[id], pane.contentKind == .terminal else { continue }
-                facts.append(paneFact(pane, tabID: tab.id, workspaceName: owner, tabName: tabName,
-                                      hidden: tab.hiddenStackPaneIDs.contains(id)))
+                let hidden = hiddenIDs.contains(id)
+                facts.append(cache?.fact(pane, tabID: tab.id, workspaceName: owner, tabName: tabName, hidden: hidden)
+                             ?? paneFact(pane, tabID: tab.id, workspaceName: owner, tabName: tabName, hidden: hidden))
             }
         }
+        cache?.endPass()
         return facts
+    }
+
+    /// Per-workspace memo of `paneFact`, keyed by the pane's overview
+    /// revision and placement. A plain class, not observable: SwiftUI bodies
+    /// fill it while they draw. `paneFact` reads no clock, so a reused fact
+    /// cannot go stale with time alone.
+    @MainActor final class PaneFactCache {
+        private struct Key: Equatable {
+            let revision: UInt64
+            let tabID: UUID
+            let workspaceName: String
+            let tabName: String
+            let hidden: Bool
+        }
+        private var entries: [UUID: (key: Key, fact: PaneFact)] = [:]
+        private var seen = Set<UUID>()
+        /// Facts computed rather than reused; for tests.
+        private(set) var computed = 0
+        var count: Int { entries.count }
+
+        func fact(_ pane: PaneModel, tabID: UUID, workspaceName: String, tabName: String, hidden: Bool) -> PaneFact {
+            let key = Key(revision: pane.overviewRevision, tabID: tabID, workspaceName: workspaceName,
+                          tabName: tabName, hidden: hidden)
+            seen.insert(pane.id)
+            if let entry = entries[pane.id], entry.key == key { return entry.fact }
+            computed += 1
+            let fact = RelayWorkOverviewIndex.paneFact(pane, tabID: tabID, workspaceName: workspaceName,
+                                                       tabName: tabName, hidden: hidden)
+            entries[pane.id] = (key, fact)
+            return fact
+        }
+
+        /// Drops panes the pass did not visit (closed, or now an editor).
+        func endPass() {
+            if entries.count != seen.count { entries = entries.filter { seen.contains($0.key) } }
+            seen.removeAll(keepingCapacity: true)
+        }
     }
 
     @MainActor static func paneFact(_ pane: PaneModel, tabID: UUID, workspaceName: String,

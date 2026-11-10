@@ -314,6 +314,8 @@ final class WorkspaceModel: ObservableObject {
 
     let profileStore = ProfileStore()
     let activityIndex = WorkspaceActivityIndex()
+    /// Reused overview facts for the sidebar, fleet board, tab rail and Go to pane.
+    let paneFactCache = RelayWorkOverviewIndex.PaneFactCache()
     private(set) var panes: [UUID: PaneModel] = [:]
     private var floatingRPaneTabs: [UUID: UUID] = [:]
     private var floatingRPrimaryEditors: [UUID: UUID] = [:]
@@ -1033,8 +1035,16 @@ final class WorkspaceModel: ObservableObject {
 
     func paneIDs(inTab tabID: UUID) -> [UUID] {
         guard let tab = tabs.first(where: { $0.id == tabID }) else { return [] }
-        return tab.allPaneIDs + floatingRPaneTabs
-            .filter { $0.value == tabID && !tab.allPaneIDs.contains($0.key) }
+        return paneIDs(in: tab)
+    }
+
+    /// `paneIDs(inTab:)` for a tab already in hand.
+    func paneIDs(in tab: TabModel) -> [UUID] {
+        let ids = tab.allPaneIDs
+        let floating = floatingRPaneTabs.filter { $0.value == tab.id }
+        guard !floating.isEmpty else { return ids }
+        let own = Set(ids)
+        return ids + floating.filter { !own.contains($0.key) }
             .map(\.key)
             .sorted { $0.uuidString < $1.uuidString }
     }
