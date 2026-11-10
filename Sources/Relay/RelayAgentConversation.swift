@@ -33,6 +33,42 @@ struct RelayAgentConversationBinding: Equatable, Codable, Sendable {
     }
 }
 
+/// A step from Agent details, as a tool call in the conversation: the
+/// `ordinalFromEnd`-th most recent call to `toolName` (0 = newest). Steps and
+/// transcript items share no id, so the match is by name and order and falls
+/// back to the end of the conversation when the call is not in the loaded page.
+struct RelayConversationFocus: Equatable, Sendable {
+    let toolName: String
+    let ordinalFromEnd: Int
+    /// Distinguishes two clicks on the same step.
+    var request = UUID()
+
+    /// The focus for a step label such as "Using Bash", given how many newer
+    /// steps used the same tool; nil for steps that are not tool calls.
+    static func step(_ label: String, newerSameTool: Int) -> RelayConversationFocus? {
+        guard let name = toolName(of: label) else { return nil }
+        return RelayConversationFocus(toolName: name, ordinalFromEnd: newerSameTool)
+    }
+
+    static func toolName(of label: String) -> String? {
+        guard label.hasPrefix("Using ") else { return nil }
+        let name = String(label.dropFirst("Using ".count))
+        return name.isEmpty || name == "tool" ? nil : name
+    }
+
+    /// The id of the matching tool item, or nil when the loaded page has none.
+    func target(in items: [RelayAgentConversationItem]) -> String? {
+        var remaining = ordinalFromEnd
+        for item in items.reversed() where item.role == .tool {
+            guard case .tool(let name, _, _)? = item.blocks.first,
+                  name.caseInsensitiveCompare(toolName) == .orderedSame else { continue }
+            if remaining == 0 { return item.id }
+            remaining -= 1
+        }
+        return nil
+    }
+}
+
 struct RelayAgentConversationItem: Equatable, Codable, Identifiable, Sendable {
     enum Role: String, Codable, Sendable { case user, assistant, tool, system }
     enum Block: Equatable, Codable, Sendable {

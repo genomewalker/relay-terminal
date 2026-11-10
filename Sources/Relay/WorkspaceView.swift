@@ -128,6 +128,10 @@ struct WorkspaceView: View {
                     subagentID: selection.subagentID,
                     showTerminal: { workspace.revealPane(selection.paneID, origin: .user) },
                     inspect: { workspace.inspectAgent(paneID: selection.paneID, subagentID: $0) },
+                    openConversation: { focus in
+                        workspace.revealPane(selection.paneID, origin: .user)
+                        AgentInspectorPanel.openConversation(pane: pane, focus: focus)
+                    },
                     close: workspace.closeAgentInspector
                 )
                 // Recreate the panel when the inspected agent changes: its
@@ -763,6 +767,8 @@ struct AgentInspectorPanel: View {
     let subagentID: String?
     let showTerminal: () -> Void
     var inspect: (String) -> Void = { _ in }
+    /// Opens View CLI conversation, at a step's tool call when one is given.
+    var openConversation: (RelayConversationFocus?) -> Void = { _ in }
     let close: () -> Void
     @State private var settledOffset: CGSize = .zero
     @State private var panelSize = CGSize(width: 470, height: 410)
@@ -778,12 +784,14 @@ struct AgentInspectorPanel: View {
         subagentID: String?,
         showTerminal: @escaping () -> Void,
         inspect: @escaping (String) -> Void = { _ in },
+        openConversation: @escaping (RelayConversationFocus?) -> Void = { _ in },
         close: @escaping () -> Void
     ) {
         self.pane = pane
         self.subagentID = subagentID
         self.showTerminal = showTerminal
         self.inspect = inspect
+        self.openConversation = openConversation
         self.close = close
         self._snapshot = State(initialValue: Self.capture(pane: pane, subagentID: subagentID))
     }
@@ -878,6 +886,18 @@ struct AgentInspectorPanel: View {
             .focusEffectDisabled()
             .help(collapsed ? "Expand inspector" : "Collapse inspector")
             .accessibilityLabel(collapsed ? "Expand agent inspector" : "Collapse agent inspector")
+            Button { openConversation(nil) } label: {
+                Label("Full conversation", systemImage: "text.bubble")
+                    .font(RelayTheme.font(size: 10.5, weight: .medium))
+                    .padding(.horizontal, RelayTheme.spacing(7))
+                    .frame(height: 22)
+                    .background(RelayTheme.surface, in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(5)))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(RelayTheme.textMuted)
+            .focusEffectDisabled()
+            .help("Show the full conversation: every tool call with its command and output")
+            .accessibilityIdentifier("relay.agent-inspector.full-conversation")
             Button(action: showTerminal) {
                 Image(systemName: "terminal")
                     .font(RelayTheme.font(size: 10, weight: .medium))
@@ -955,6 +975,22 @@ struct AgentInspectorPanel: View {
         )
     }
 
+    /// Shows the pane's conversation in place of its terminal, scrolled to
+    /// `focus` when given.
+    static func openConversation(pane: PaneModel, focus: RelayConversationFocus?) {
+        pane.conversationFocus = focus
+        RelayToolWindowCoordinator.shared.showAgent(pane: pane)
+    }
+
+    /// The conversation focus for the step at `index` of the main agent's
+    /// newest-first steps: the same tool's newer steps above it count back.
+    static func focus(forStepAt index: Int, in updates: [SubagentUpdate]) -> RelayConversationFocus? {
+        guard updates.indices.contains(index),
+              let name = RelayConversationFocus.toolName(of: updates[index].message) else { return nil }
+        let newer = updates[..<index].filter { RelayConversationFocus.toolName(of: $0.message) == name }.count
+        return RelayConversationFocus.step(updates[index].message, newerSameTool: newer)
+    }
+
     private func refreshSnapshot() {
         snapshot = Self.capture(pane: pane, subagentID: subagentID)
         refreshPending = false
@@ -1007,6 +1043,38 @@ struct AgentInspectorPanel: View {
             .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.bottom, RelayTheme.spacing(10))
+    }
+
+    private func stepCard(_ update: SubagentUpdate, opens: Bool) -> some View {
+        HStack(alignment: .center, spacing: RelayTheme.spacing(8)) {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(5)) {
+                Text(update.occurredAt.formatted(date: .omitted, time: .shortened))
+                    .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(RelayTheme.textFaint)
+                if opens {
+                    // Selection would take the click that opens the conversation.
+                    Text(update.message)
+                        .font(RelayTheme.font(size: 11.5))
+                        .foregroundStyle(RelayTheme.text)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Text(update.message)
+                        .font(RelayTheme.font(size: 11.5))
+                        .foregroundStyle(RelayTheme.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if opens {
+                Image(systemName: "arrow.up.right")
+                    .font(RelayTheme.font(size: 9, weight: .medium))
+                    .foregroundStyle(RelayTheme.textFaint)
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(RelayTheme.spacing(11))
+        .background(RelayTheme.surface.opacity(0.62), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9)))
+        .contentShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9)))
     }
 
     private func inspectorContent(_ agent: SubagentActivity) -> some View {
@@ -1070,19 +1138,19 @@ struct AgentInspectorPanel: View {
                         }
                         .padding(.vertical, RelayTheme.spacing(4))
                     } else {
-                        ForEach(agent.updates) { update in
-                            VStack(alignment: .leading, spacing: RelayTheme.spacing(5)) {
-                                Text(update.occurredAt.formatted(date: .omitted, time: .shortened))
-                                    .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(RelayTheme.textFaint)
-                                Text(update.message)
-                                    .font(RelayTheme.font(size: 11.5))
-                                    .foregroundStyle(RelayTheme.text)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                        ForEach(Array(agent.updates.enumerated()), id: \.element.id) { index, update in
+                            if subagentID == nil {
+                                // Main agent: a step opens the conversation, at its tool call when it has one.
+                                let focus = Self.focus(forStepAt: index, in: agent.updates)
+                                Button { openConversation(focus) } label: {
+                                    stepCard(update, opens: true)
+                                }
+                                .buttonStyle(.plain)
+                                .help(focus == nil ? "Show the conversation" : "Show this call in the conversation")
+                                .accessibilityHint(focus == nil ? "Shows the conversation" : "Shows this call in the conversation")
+                            } else {
+                                stepCard(update, opens: false)
                             }
-                            .padding(RelayTheme.spacing(11))
-                            .background(RelayTheme.surface.opacity(0.62), in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(9)))
                         }
                     }
                 }

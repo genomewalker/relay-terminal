@@ -628,6 +628,9 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var uploadProgress: RelayTransferProgress?
     var uploadProgressID: UUID?
     @Published var nativeConversationVisible = false
+    /// A tool call the conversation view scrolls to when it next shows it;
+    /// set by Agent details, cleared once resolved.
+    @Published var conversationFocus: RelayConversationFocus?
     @Published var lastCommandExitCode: Int?
     @Published var lastCommandDurationNanos: UInt64?
     @Published var programStatus = RelayProgramStatusSnapshot()

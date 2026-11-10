@@ -58,3 +58,68 @@ import Testing
         #expect(rendered == 2)
     }
 }
+
+/// Agent details steps open View CLI conversation at their tool call.
+@MainActor @Suite(.serialized) struct AgentDetailsConversationTests {
+    private static func tool(_ id: String, _ name: String) -> RelayAgentConversationItem {
+        RelayAgentConversationItem(id: id, turnID: nil, role: .tool,
+                                   blocks: [.tool(name: name, status: "completed", summary: id)],
+                                   revision: 1, complete: true)
+    }
+
+    @Test func stepsMapToTheirToolCallsCountingBackFromTheNewest() {
+        let items = [Self.tool("bash-1", "Bash"), Self.tool("read-1", "Read"), Self.tool("bash-2", "Bash"),
+                     RelayAgentConversationItem(id: "text", turnID: nil, role: .assistant,
+                                                blocks: [.markdown("done")], revision: 1, complete: true),
+                     Self.tool("bash-3", "Bash")]
+        // Newest-first steps, as Agent details lists them.
+        let now = Date()
+        let steps = ["Using Bash", "Finished Bash", "Using Bash", "Using Read", "Started", "Using Bash"].map {
+            SubagentUpdate(id: UUID(), message: $0, occurredAt: now)
+        }
+        let targets = steps.indices.map { AgentInspectorPanel.focus(forStepAt: $0, in: steps)?.target(in: items) }
+        #expect(targets == ["bash-3", nil, "bash-2", "read-1", nil, "bash-1"])
+        // Older than the loaded page: no target, so the view stays at the end.
+        let missing = RelayConversationFocus(toolName: "Bash", ordinalFromEnd: 3)
+        #expect(missing.target(in: items) == nil)
+        #expect(RelayConversationFocus.toolName(of: "Using tool") == nil)
+        #expect(RelayConversationFocus(toolName: "bash", ordinalFromEnd: 0).target(in: items) == "bash-3")
+    }
+
+    @Test func openingAStepShowsTheConversationWithItsFocus() throws {
+        _ = NSApplication.shared
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        workspace.newTab(profile: .sshConfigHost("agent-conversation.invalid"))
+        let pane = try #require(workspace.activePane)
+        let focus = RelayConversationFocus(toolName: "Bash", ordinalFromEnd: 1)
+        AgentInspectorPanel.openConversation(pane: pane, focus: focus)
+        #expect(pane.nativeConversationVisible)
+        #expect(pane.conversationFocus == focus)
+        pane.nativeConversationVisible = false
+        AgentInspectorPanel.openConversation(pane: pane, focus: nil)
+        #expect(pane.nativeConversationVisible && pane.conversationFocus == nil)
+    }
+
+    /// The conversation opened from a step outlines that step's call.
+    @Test func rendersTheFocusedCallInBothAppearances() throws {
+        _ = NSApplication.shared
+        var rendered = 0
+        for (appearance, scheme) in [(NSAppearance.Name.darkAqua, ColorScheme.dark), (.aqua, .light)] {
+            let pane = RelayNativeChatFixture.pane(active: true)
+            let conversation = RelayNativeChatFixture.timelineConversation(pane: pane)
+            let focus = RelayConversationFocus(toolName: "Edit", ordinalFromEnd: 0)
+            #expect(focus.target(in: conversation.items) != nil)
+            pane.conversationFocus = focus
+            let store = RelayAgentTimelineStore(pane: pane, presenting: conversation)
+            let view = RelayAgentTimelineView(pane: pane, store: store).frame(height: 900)
+                .environment(\.colorScheme, scheme)
+            let shot = try RelaySnapshot.render(view, name: "agent-step-conversation", width: 760, appearance: appearance)
+            #expect(shot.size.height >= 899)
+            // Resolved on appear and cleared, so a later open starts fresh.
+            #expect(pane.conversationFocus == nil)
+            rendered += 1
+        }
+        #expect(rendered == 2)
+    }
+}

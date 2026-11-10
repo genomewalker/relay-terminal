@@ -181,6 +181,8 @@ struct RelayAgentTimelineView: View {
     @State private var currentMatch: String?
     @State private var searchJump = 0
     @FocusState private var searchFocused: Bool
+    /// The tool call Agent details asked for, outlined until the next request.
+    @State private var focusedItem: String?
     init(pane: PaneModel, store: RelayAgentTimelineStore? = nil) {
         self.pane = pane; _store = StateObject(wrappedValue: store ?? RelayAgentTimelineStore(pane: pane))
         _composerState = ObservedObject(wrappedValue: pane.composerState)
@@ -424,6 +426,7 @@ struct RelayAgentTimelineView: View {
                         ForEach(Array(store.conversation.items.enumerated()), id: \.element.id) { index, item in
                             RelayAgentMessageView(pane: pane, item: item, live: live.contains(index))
                                 .background(searchMark(for: item.id))
+                                .background(focusMark(for: item.id))
                                 .padding(.top, item.role == .user && index > 0
                                     ? max(0, RelayAgentDesign.turnSpacing - RelayTheme.spacing(12)) : 0)
                                 .id(item.id)
@@ -446,7 +449,12 @@ struct RelayAgentTimelineView: View {
                     if near != atBottom { atBottom = near }
                     if near { unseen = false }
                 }
-                .onAppear { proxy.scrollTo(Self.endAnchor, anchor: .bottom) }
+                .onAppear {
+                    proxy.scrollTo(Self.endAnchor, anchor: .bottom)
+                    applyFocus(proxy)
+                }
+                .onChange(of: pane.conversationFocus) { _, _ in applyFocus(proxy) }
+                .onChange(of: store.conversation.items.count) { _, _ in applyFocus(proxy) }
                 .onChange(of: searchJump) { _, _ in
                     guard let target = currentMatch else { return }
                     withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(target, anchor: .center) }
@@ -530,6 +538,25 @@ struct RelayAgentTimelineView: View {
 
     private var searchCountAccessibility: String {
         searchCountText.isEmpty ? "No search" : searchCountText.replacingOccurrences(of: " found", with: " matching messages")
+    }
+
+    @ViewBuilder private func focusMark(for id: String) -> some View {
+        if id == focusedItem {
+            RoundedRectangle(cornerRadius: RelayAgentDesign.radius)
+                .strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 1.5)
+                .padding(-6)
+        }
+    }
+
+    /// Scrolls to the call a step in Agent details names. Waits while the
+    /// page is still empty; gives up quietly (staying at the end) when the
+    /// loaded page does not hold that call.
+    private func applyFocus(_ proxy: ScrollViewProxy) {
+        guard let focus = pane.conversationFocus, !store.conversation.items.isEmpty else { return }
+        pane.conversationFocus = nil
+        guard let target = focus.target(in: store.conversation.items) else { return }
+        focusedItem = target
+        withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(target, anchor: .center) }
     }
 
     @ViewBuilder private func searchMark(for id: String) -> some View {
