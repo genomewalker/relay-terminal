@@ -32,6 +32,25 @@ type promptEditorResponse struct {
 	Message     string              `json:"message,omitempty"`
 }
 
+// MarshalJSON always carries the text of a captured draft. An empty prompt is
+// a valid capture, and the desktop requires the field: with omitempty an empty
+// snapshot arrived without text, and every saved-draft restore failed with
+// "The prompt editor response could not be verified".
+func (response promptEditorResponse) MarshalJSON() ([]byte, error) {
+	type plain promptEditorResponse
+	if response.State != "captured" {
+		return json.Marshal(plain(response))
+	}
+	text := response.Text
+	if text == nil {
+		text = []byte{}
+	}
+	return json.Marshal(struct {
+		plain
+		Text []byte `json:"text"`
+	}{plain(response), text})
+}
+
 type promptEditorPending struct {
 	id          string
 	transaction *promptEditorTransaction
