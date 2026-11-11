@@ -731,6 +731,8 @@ import SwiftUI
         let stable = panes.map { pane -> RelayPaneHealthJSON in
             guard case .object(var fields) = pane.value else { return pane.value }
             fields.removeValue(forKey: "evidence_id")
+            // Explanatory text (it can quote the footer); prompt_empty carries the decision.
+            fields.removeValue(forKey: "prompt_blocker")
             if fields["binding"]?.string == "bound", fields["installed_update"]?.boolean == false {
                 for key in ["activity", "prompt_empty", "has_draft", "pending_approvals", "input_idle", "allowed_actions"] {
                     fields.removeValue(forKey: key)

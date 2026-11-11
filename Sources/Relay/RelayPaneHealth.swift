@@ -65,8 +65,8 @@ struct RelayPaneHealthFacts: Codable, Equatable, Sendable {
         let draft = pane.composerStateIfCreated.map {
             !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld
         } ?? false
-        let empty = pane.runtime.agentMaintenancePromptIsEmpty(
-            explainedAgents: proof.map { RelayAgentMaintenancePolicy.explainedFooterAgents($0, activeSubagents: pane.activeSubagents) } ?? 0)
+        let explained = proof.map { RelayAgentMaintenancePolicy.explainedFooterAgents($0, activeSubagents: pane.activeSubagents) } ?? 0
+        let empty = pane.runtime.agentMaintenancePromptIsEmpty(explainedAgents: explained)
         let inputIdle = Date().timeIntervalSince(pane.agentLastInputAt) >= 15
         let connection: String
         switch pane.connectionState {
@@ -105,6 +105,13 @@ struct RelayPaneHealthFacts: Codable, Equatable, Sendable {
             "installed_update": .bool(valid && proof?.installedUpdate == true),
             "allowed_actions": .array(actions.map { .string($0) }),
         ]
+        // prompt_empty=false also means "could not be read" (a hidden pane
+        // whose screen was never read, a changing screen, a guard). Say which,
+        // so a hold is not mistaken for typed text. Unknown still holds.
+        if !empty {
+            fields["prompt_blocker"] = .string(pane.runtime.agentMaintenancePromptBlocker(explainedAgents: explained)
+                ?? "the screen changed while it was read")
+        }
         if shellValid, let proof, let pid = proof.processID, let start = proof.processStart {
             fields["process_id"] = .integer(Int64(pid)); fields["process_start"] = .unsigned(start)
         }

@@ -567,7 +567,7 @@ struct RelayAssistantFacts {
             let coordinator = RelayPaneHealthCoordinator.shared
             let facts = coordinator.facts(pane).value
             var result: [String: RelayPaneHealthJSON] = [:]
-            for key in ["kind", "connection", "binding", "activity", "identity_verified", "prompt_empty", "has_draft",
+            for key in ["kind", "connection", "binding", "activity", "identity_verified", "prompt_empty", "prompt_blocker", "has_draft",
                         "pending_approvals", "input_idle", "installed_update", "allowed_actions"] {
                 if let value = facts[key] { result[key] = value }
             }

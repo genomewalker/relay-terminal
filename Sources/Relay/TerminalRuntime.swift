@@ -3026,24 +3026,44 @@ final class TerminalRuntime: NSObject {
         agentMaintenanceTerminalPromptBlocker(observeActiveScreen(), explainedAgents: explainedAgents)
     }
 
+    /// Why `agentMaintenancePromptIsEmpty(explainedAgents:)` is false, for
+    /// pane health and the installed-update receipt; nil when the prompt
+    /// reads empty. Mirrors that check, including a composer draft. It takes
+    /// its own observation, so a screen that changed between the two reads
+    /// can make it nil while the earlier check was false.
+    func agentMaintenancePromptBlocker(explainedAgents: Int) -> String? {
+        if let reason = agentMaintenanceTerminalPromptBlocker(observeActiveScreen(), explainedAgents: explainedAgents) {
+            return reason
+        }
+        if let composer = pane?.composerStateIfCreated,
+           !composer.draft.isEmpty || !composer.attachmentQueue.attachments.isEmpty {
+            return "Relay's composer holds a draft for this pane"
+        }
+        return nil
+    }
+
     private func agentMaintenanceTerminalPromptBlocker(_ observation: RelayActiveScreenCache.Observation,
                                                        explainedAgents: Int) -> String? {
         guard let pane else { return "the pane closed" }
         let provider = pane.kind == .codex ? "codex" : "claude"
-        for (passed, reason) in [
-            (pane.profile.backend == .relay, "the pane is not a Relay terminal"),
-            (pane.connectionState == .connected, "the pane is not connected"),
+        // Evaluated lazily and in order, like the guard in
+        // agentMaintenancePromptIsEmpty: reading a reason must never make the
+        // view of a pane that has not been shown.
+        let checks: [(@MainActor () -> Bool, String)] = [
+            ({ [self] in pane.profile.backend == .relay }, "the pane is not a Relay terminal"),
+            ({ [self] in pane.connectionState == .connected }, "the pane is not connected"),
             // Agent monitoring marks a pane connected before its terminal
             // starts; that waits for the tab's first layout.
-            (started, "the pane's terminal has not been opened since Relay started; select its tab once so its prompt can be read"),
-            (pane.pendingAgentApprovals == 0, "an approval prompt is pending"),
-            (conversationInputLease == nil, "another input operation holds the prompt"),
-            ((pane.remoteClientCount ?? 1) <= 1, "\(pane.remoteClientCount ?? 0) viewers are attached"),
-            (!view.promptInspectionBlocksExternalInput, "a prompt inspection is active"),
-            (view.window == nil || promptEditingViewportIsLive, "the visible viewport is not live"),
-            (io.isBracketedPasteActive, "the agent has not enabled bracketed paste"),
-            (view.markedRange().location == NSNotFound, "text composition (IME) is in progress"),
-        ] where !passed { return reason }
+            ({ [self] in started }, "the pane's terminal has not been opened since Relay started; select its tab once so its prompt can be read"),
+            ({ [self] in pane.pendingAgentApprovals == 0 }, "an approval prompt is pending"),
+            ({ [self] in conversationInputLease == nil }, "another input operation holds the prompt"),
+            ({ [self] in (pane.remoteClientCount ?? 1) <= 1 }, "\(pane.remoteClientCount ?? 0) viewers are attached"),
+            ({ [self] in !view.promptInspectionBlocksExternalInput }, "a prompt inspection is active"),
+            ({ [self] in view.window == nil || promptEditingViewportIsLive }, "the visible viewport is not live"),
+            ({ [self] in io.isBracketedPasteActive }, "the agent has not enabled bracketed paste"),
+            ({ [self] in view.markedRange().location == NSNotFound }, "text composition (IME) is in progress"),
+        ]
+        for (passed, reason) in checks where !passed() { return reason }
         if let composer = pane.composerStateIfCreated, composer.submitting || composer.nativeDeliveryHeld {
             return "the composer is delivering a prompt"
         }
