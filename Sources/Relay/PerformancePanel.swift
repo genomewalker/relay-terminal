@@ -30,6 +30,8 @@ struct RelayLivePerformanceSnapshot: Equatable, Sendable {
     var supervisorWarningCount = 0
     var supervisorHighestStage = RelaySupervisorStage.observe
     var supervisorActionPaneID: UUID?
+    /// `TerminalRepaintStatistics.summary` of the focused pane, when it has a terminal view.
+    var focusedRepaintSummary: String?
 }
 
 private struct RelayProcessUsageSample {
@@ -182,6 +184,7 @@ final class RelayPerformancePanelMonitor: ObservableObject {
                 ? String(pane.id.uuidString.lowercased().prefix(8))
                 : "Local"
             next.activeConnectionState = pane.connectionStatusLabel
+            next.focusedRepaintSummary = pane.runtime.repaintSummary
         }
         let recommendations = workspace.supervisorRecommendations.values
         next.supervisorWarningCount = recommendations.count { $0.stage > .observe }
@@ -486,6 +489,14 @@ struct RelayPerformancePanel: View {
                 )
                 divider
                 PerformanceStatusRow(
+                    symbol: "paintbrush.pointed",
+                    label: "Repaints · focused pane",
+                    value: Self.repaintRowValue(value.focusedRepaintSummary)
+                )
+                .textSelection(.enabled)
+                .accessibilityIdentifier("relay.monitoring.repaint")
+                divider
+                PerformanceStatusRow(
                     symbol: "shield.lefthalf.filled",
                     label: "Supervisor",
                     value: value.supervisorWarningCount == 0
@@ -524,6 +535,11 @@ struct RelayPerformancePanel: View {
 
     private var divider: some View {
         Rectangle().fill(RelayTheme.line.opacity(0.52)).frame(height: 1)
+    }
+
+    /// The focused pane's repaint counters, or why there are none.
+    static func repaintRowValue(_ summary: String?) -> String {
+        summary ?? "no terminal view focused"
     }
 
     private static func bytes(_ bytes: UInt64) -> String {
@@ -567,9 +583,12 @@ private struct PerformanceStatusRow: View {
             Text(value)
                 .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(RelayTheme.text)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, RelayTheme.spacing(11))
-        .frame(height: 34)
+        .padding(.vertical, RelayTheme.spacing(4))
+        .frame(minHeight: 34)
     }
 }
 

@@ -875,6 +875,21 @@ final class TerminalRuntime: NSObject {
 
     private var session: InMemoryTerminalSession { io.session }
     private(set) lazy var view: RelayGhosttyView = makeView()
+    /// Whether `view` has been made. Diagnostics read the view only when it
+    /// exists, so sampling never builds a renderer for an unshown pane.
+    private var viewIsMade = false
+
+    /// The focused-pane row of the Performance panel: this pane's repaint
+    /// contract counters, or nil when the pane is not a terminal or its view
+    /// has not been made yet. Reading it never makes the view.
+    var repaintSummary: String? {
+        guard viewIsMade, pane?.contentKind == .terminal else { return nil }
+        return view.repaintStatistics.summary
+    }
+
+    #if DEBUG
+    var viewIsMadeForTesting: Bool { viewIsMade }
+    #endif
 
     var networkForegroundPID: pid_t? {
         guard started else { return nil }
@@ -2164,6 +2179,7 @@ final class TerminalRuntime: NSObject {
 
     private func makeView() -> RelayGhosttyView {
         let terminal = RelayGhosttyView(frame: .zero)
+        viewIsMade = true
         terminal.owner = self
         terminal.delegate = self
         if let pane, pane.profile.backend == .relay {
