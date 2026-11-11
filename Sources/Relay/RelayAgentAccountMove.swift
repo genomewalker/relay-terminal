@@ -537,7 +537,7 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
     /// stay in place across the restart, so only its delivery holds a move.
     var readPrompt: @MainActor (PaneModel, RelayAgentMaintenanceProbe) async -> PromptState = { pane, proof in
         await pane.runtime.prepareAgentMaintenancePromptProof()
-        let explained = RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents)
+        let explained = RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents)
         let empty = pane.runtime.agentMaintenanceTerminalPromptIsEmpty(explainedAgents: explained)
         return PromptState(empty: empty, typed: !empty && pane.runtime.agentMaintenanceTerminalPromptHasTypedText,
             blocker: empty ? nil : pane.runtime.agentMaintenanceTerminalPromptBlocker(explainedAgents: explained),

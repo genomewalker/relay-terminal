@@ -152,6 +152,45 @@ enum RelayAgentMaintenancePolicy {
     /// (`backgroundWork == false`), the pane has no agent work of its own, and
     /// the "← N agent(s)" agents-view nudge, which counts only other sessions
     /// waiting for input, is explained whatever its number.
+    /// How long a hook-reported subagent may run before its host files
+    /// exist. Within this window an "active" entry always counts.
+    static let subagentHostEvidenceGrace: TimeInterval = 600
+
+    /// Hook-reported subagents that may still be working. Relay learns of
+    /// subagents from hook events; a lost stop event leaves an entry "active"
+    /// forever. relayd's proof reads the session's subagent files on the host,
+    /// so when it shows no subagent work and Claude reports itself idle, an
+    /// entry older than the grace window has no evidence and is not counted.
+    /// Unknown host facts (nil) never discount anything.
+    static func countedActiveSubagents(_ subagents: [SubagentActivity], proof: RelayAgentMaintenanceProbe,
+                                       now: Date = Date()) -> Int {
+        let hostShowsNone = proof.provider == "claude" && proof.subagentWork == false
+            && proof.harnessStatus == "idle"
+        return subagents.count { subagent in
+            guard subagent.phase == .active else { return false }
+            guard hostShowsNone, subagent.provider == .claude else { return true }
+            return now.timeIntervalSince(subagent.startedAt) <= subagentHostEvidenceGrace
+        }
+    }
+
+    /// The facts `explainedFooterAgents` decides on, for a held receipt.
+    /// Host facts and counts only: no labels, prompts or transcript text.
+    static func footerAgentFacts(_ proof: RelayAgentMaintenanceProbe, subagents: [SubagentActivity],
+                                 now: Date = Date()) -> String {
+        func text(_ value: Bool?) -> String { value.map { $0 ? "true" : "false" } ?? "unknown" }
+        let reported = subagents.count { $0.phase == .active }
+        let counted = countedActiveSubagents(subagents, proof: proof, now: now)
+        return "harness_status=\(proof.harnessStatus ?? "unknown") subagent_work=\(text(proof.subagentWork)) " +
+            "background_work=\(text(proof.backgroundWork)) " +
+            "background_agent_jobs=\(proof.backgroundAgentJobs.map(String.init) ?? "unknown") " +
+            "active_subagents=\(counted) of \(reported) reported"
+    }
+
+    static func explainedFooterAgents(_ proof: RelayAgentMaintenanceProbe, subagents: [SubagentActivity],
+                                      now: Date = Date()) -> Int {
+        explainedFooterAgents(proof, activeSubagents: countedActiveSubagents(subagents, proof: proof, now: now))
+    }
+
     static func explainedFooterAgents(_ proof: RelayAgentMaintenanceProbe, activeSubagents: Int) -> Int {
         guard proof.provider == "claude", proof.subagentWork == false, activeSubagents == 0,
               proof.harnessStatus == "idle" else { return 0 }
@@ -899,7 +938,7 @@ enum RelayAgentMaintenanceRestartAdmission {
         await pane.runtime.prepareAgentMaintenancePromptProof()
         if let held = RelayAgentMaintenancePolicy.deferral(proof, paneID: pane.id,
             emptyPrompt: pane.runtime.agentMaintenanceTerminalPromptIsEmpty(
-                explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents)), hasDraft: draft,
+                explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents)), hasDraft: draft,
             pendingApprovals: pane.pendingAgentApprovals, inputAge: Date().timeIntervalSince(pane.agentLastInputAt),
             preservingDraft: true, recordedAccount: pane.agentAccount?.recorded) {
             statuses[pane.id] = reason == .update ? "Update " + (proof.versionTransition ?? "installed") + ": " + held : held
@@ -931,7 +970,7 @@ enum RelayAgentMaintenanceRestartAdmission {
         // The separate agent-window composer stays in place. Persist its text
         // and attachments before allowing the terminal underneath it to restart.
         pane.composerStateIfCreated?.persist(hostID: profile.id.uuidString, paneID: pane.id, immediate: true)
-        let explained = RelayAgentMaintenancePolicy.explainedFooterAgents(fresh, activeSubagents: pane.activeSubagents)
+        let explained = RelayAgentMaintenancePolicy.explainedFooterAgents(fresh, subagents: pane.subagents)
         let command = RelayAgentMaintenancePolicy.exitCommand(provider: fresh.provider)
         let readmit = RelayAgentMaintenanceRestartAdmission.readmission(pane: pane, paneID: pane.id,
             original: fresh, inputRevision: revision, reason: reason, grantAtStart: grant,

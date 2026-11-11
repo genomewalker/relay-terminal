@@ -65,7 +65,7 @@ struct RelayPaneHealthFacts: Codable, Equatable, Sendable {
         let draft = pane.composerStateIfCreated.map {
             !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld
         } ?? false
-        let explained = proof.map { RelayAgentMaintenancePolicy.explainedFooterAgents($0, activeSubagents: pane.activeSubagents) } ?? 0
+        let explained = proof.map { RelayAgentMaintenancePolicy.explainedFooterAgents($0, subagents: pane.subagents) } ?? 0
         let empty = pane.runtime.agentMaintenancePromptIsEmpty(explainedAgents: explained)
         let inputIdle = Date().timeIntervalSince(pane.agentLastInputAt) >= 15
         let connection: String
@@ -111,6 +111,10 @@ struct RelayPaneHealthFacts: Codable, Equatable, Sendable {
         if !empty {
             fields["prompt_blocker"] = .string(pane.runtime.agentMaintenancePromptBlocker(explainedAgents: explained)
                 ?? "the screen changed while it was read")
+            if let proof {
+                fields["footer_agent_facts"] = .string(RelayAgentMaintenancePolicy.footerAgentFacts(proof,
+                    subagents: pane.subagents))
+            }
         }
         if shellValid, let proof, let pid = proof.processID, let start = proof.processStart {
             fields["process_id"] = .integer(Int64(pid)); fields["process_start"] = .unsigned(start)

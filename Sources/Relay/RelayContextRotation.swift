@@ -908,7 +908,7 @@ enum RelayAgentLaunchHostName {
               let provider = proof.provider, let pid = proof.processID, let start = proof.processStart,
               let session = proof.sessionID else { return nil }
         await pane.runtime.prepareAgentMaintenancePromptProof()
-        let explained = RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents)
+        let explained = RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents)
         let empty = pane.runtime.agentMaintenancePromptIsEmpty(explainedAgents: explained)
         let draft = pane.contextRotationDraftPending
         let blocker = RelayStockRotationPolicy.blocker(proof, paneID: pane.id, emptyPrompt: empty, hasDraft: draft,

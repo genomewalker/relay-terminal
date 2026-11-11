@@ -1396,14 +1396,20 @@ final class WorkspaceModel: ObservableObject {
         remotePane: RemoteCatalogPane,
         workspaceID: String?,
         sessionLabel: String,
-        intoSessionID: UUID? = nil
+        intoSessionID: UUID? = nil,
+        activate: Bool = true
     ) -> Bool {
         guard remotePane.recoverable,
               let paneID = UUID(uuidString: remotePane.paneID) else { return false }
         if let pane = panes[paneID] {
             guard pane.profile.id == profile.id, pane.profile.backend == .relay else { return false }
-            isHostLauncherPresented = false
-            revealPane(paneID, origin: .programmatic)
+            // A recovery requested by an agent or tool (activate == false)
+            // reconnects in place. It never changes the selected tab, the
+            // active pane or keyboard focus: only the user moves focus.
+            if activate {
+                isHostLauncherPresented = false
+                revealPane(paneID, origin: .programmatic)
+            }
             // Catalog recovery is an explicit viewer reconnect. Renderer
             // status may still say connected after a failed native surface
             // attachment; it must not suppress the requested recovery.
@@ -1447,9 +1453,17 @@ final class WorkspaceModel: ObservableObject {
         }
 
         sessionNames[sessionID] = sessionNames[sessionID] ?? sessionLabel
+        if profile.kind == .ssh { profileStore.markUsed(profile) }
+        guard activate else {
+            // Background recovery: the pane is added to its tab, but the
+            // user's selection and focus stay where they are. An empty
+            // workspace has no selection to keep, so it selects the tab.
+            if selectedTabID == nil { selectedTabID = tabID; activePaneID = paneID }
+            persistWorkspace()
+            return true
+        }
         selectedTabID = tabID
         activePaneID = paneID
-        if profile.kind == .ssh { profileStore.markUsed(profile) }
         isHostLauncherPresented = false
         persistWorkspace()
         Task { @MainActor in

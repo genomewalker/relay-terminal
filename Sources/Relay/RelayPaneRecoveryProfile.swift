@@ -25,9 +25,10 @@ enum RelayPaneRecoveryAttachment {
                        pane: RemoteCatalogPane, sessionLabel: String) -> Bool {
         // The pane's catalog workspace, not whichever tab is selected after
         // catalog I/O, determines the session when its tab is not open.
+        // Tool-requested recovery never moves the user's focus.
         workspace.attachRemotePane(profile: profile, remotePane: pane,
                                    workspaceID: pane.workspaceID, sessionLabel: sessionLabel,
-                                   intoSessionID: nil)
+                                   intoSessionID: nil, activate: false)
     }
 }
 

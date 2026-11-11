@@ -733,6 +733,7 @@ import SwiftUI
             fields.removeValue(forKey: "evidence_id")
             // Explanatory text (it can quote the footer); prompt_empty carries the decision.
             fields.removeValue(forKey: "prompt_blocker")
+            fields.removeValue(forKey: "footer_agent_facts")
             if fields["binding"]?.string == "bound", fields["installed_update"]?.boolean == false {
                 for key in ["activity", "prompt_empty", "has_draft", "pending_approvals", "input_idle", "allowed_actions"] {
                     fields.removeValue(forKey: key)

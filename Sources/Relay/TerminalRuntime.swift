@@ -3308,7 +3308,7 @@ final class TerminalRuntime: NSObject {
         let observation = observeActiveScreen()
         if observation == .unstable, io.outputPhaseOpenNow { return .outputPhaseOpen }
         let empty = agentMaintenancePromptIsEmpty(observation, preservingComposerDraft: preservingComposerDraft,
-            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents))
+            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents))
         guard proof.valid(for: pane.id), RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: empty, hasDraft: false), proof.backgroundWork != true,
               proof.subagentWork != true,
               command == RelayAgentMaintenancePolicy.exitCommand(provider: proof.provider),
@@ -3332,7 +3332,7 @@ final class TerminalRuntime: NSObject {
         inputRevision: UInt64, observation: RelayActiveScreenCache.Observation? = nil) -> String? {
         guard let pane else { return "The pane is gone" }
         let empty = agentMaintenancePromptIsEmpty(observation ?? observeActiveScreen(), preservingComposerDraft: false,
-            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents))
+            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents))
         return RelayStockRotationPolicy.sendBlocker(proof, paneID: pane.id, emptyPrompt: empty,
             hasDraft: pane.contextRotationDraftPending, pendingApprovals: pane.pendingAgentApprovals,
             inputRevision: pane.agentInputRevision, expectedRevision: inputRevision, text: text, kind: kind)
@@ -3348,7 +3348,7 @@ final class TerminalRuntime: NSObject {
         guard let pane else { return false }
         let observation = observeActiveScreen()
         let empty = agentMaintenancePromptIsEmpty(observation, preservingComposerDraft: false,
-            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: pane.activeSubagents))
+            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents))
         guard contextRotationSendBlocker(text, kind: kind, proof: proof, inputRevision: inputRevision,
                                          observation: observation) == nil,
               proof.valid(for: pane.id), proof.bound == true,
