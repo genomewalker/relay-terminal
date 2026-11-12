@@ -245,6 +245,67 @@ private func runCarrier(_ hosts: FakeWorkHosts, _ loop: RelayWorkCarrierLoop, fo
     #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 2)
 }
 
+@Test func workCarrierRecognisesOnlyACompletedWorkSend() {
+    #expect(RelayWorkCarrier.queuedWork(eventName: "PostToolUse", toolName: "mcp__relay-work__relay_work_message"))
+    #expect(RelayWorkCarrier.queuedWork(eventName: "PostToolUse", toolName: "mcp__relay-work__relay_work_send_file"))
+    #expect(RelayWorkCarrier.queuedWork(eventName: "PostToolUse", toolName: "relay_work_message"))
+    #expect(!RelayWorkCarrier.queuedWork(eventName: "PreToolUse", toolName: "mcp__relay-work__relay_work_message"))
+    #expect(!RelayWorkCarrier.queuedWork(eventName: "PostToolUseFailure", toolName: "mcp__relay-work__relay_work_message"))
+    #expect(!RelayWorkCarrier.queuedWork(eventName: "PostToolUse", toolName: "mcp__relay-work__relay_work_receipt"))
+    #expect(!RelayWorkCarrier.queuedWork(eventName: "PostToolUse", toolName: "mcp__relay__relay_message_pane"))
+    #expect(!RelayWorkCarrier.queuedWork(eventName: "PostToolUse", toolName: nil))
+}
+
+/// 46cea338: queued on dandy-07 at 09:55:08, carried at 09:55:17 because the
+/// host was only checked on its schedule. A send from a pane on that host now
+/// makes it due at once, without restarting what was learned about it.
+@MainActor
+@Test func workCarrierChecksTheSendingHostAsSoonAsAWorkMessageIsQueued() async {
+    let hosts = FakeWorkHosts()
+    hosts.failFirstChecks = 0
+    hosts.queued = false
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { [hosts] profile, packet in try await hosts.request(profile, packet) })
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    hosts.now = hosts.now.addingTimeInterval(5)
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 1, "an idle route-bearing host waits 30 s")
+    hosts.queued = true
+    RelayWorkCarrier.workQueued(hosts.dandy)
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 2)
+    #expect(hosts.carriedAt == hosts.now)
+    // The carried item's own recheck 5 s later finds nothing queued.
+    hosts.now = hosts.now.addingTimeInterval(5)
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 3)
+    // Another host's send does not make dandy due.
+    hosts.now = hosts.now.addingTimeInterval(5)
+    RelayWorkCarrier.workQueued(ConnectionProfile(name: "other", kind: .ssh, host: "other-host"))
+    await loop.tick(profiles: [hosts.mac, hosts.dandy], now: hosts.now)
+    #expect(hosts.pendingChecks[hosts.dandy.connectionKey]?.count == 3)
+}
+
+/// The loop's sleep between passes ends as soon as a send is reported, and a
+/// report that lands during a pass is not lost.
+@MainActor
+@Test func workCarrierPauseEndsWhenWoken() async {
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { _, _ in [:] })
+    let clock = ContinuousClock()
+    var started = clock.now
+    async let paused: Void = loop.pause(.seconds(60))
+    for _ in 0..<20 { await Task.yield() }
+    loop.wake()
+    await paused
+    #expect(clock.now - started < .seconds(5))
+    loop.wake()
+    started = clock.now
+    await loop.pause(.seconds(60))
+    #expect(clock.now - started < .seconds(5))
+    started = clock.now
+    await loop.pause(.milliseconds(50))
+    #expect(clock.now - started >= .milliseconds(50))
+}
+
 @Test func workCarrierRequestsGoOnlyToTheWorkOwningRelayd() {
     #expect(RelayWorkCarrier.carries(["operation": "work_native_pending"]))
     #expect(RelayWorkCarrier.carries(["operation": "deliver_signed_work"]))
@@ -283,4 +344,25 @@ private func runCarrier(_ hosts: FakeWorkHosts, _ loop: RelayWorkCarrierLoop, fo
     #expect(RelayHostExecution.captureLimit(RelayWorkCarrier.pendingPacket) == 256 << 10)
     #expect(RelayHostExecution.captureLimit(["operation": "deliver_signed"]) == 128 << 10)
     #expect(RelayHostExecution.captureLimit([:]) == 128 << 10)
+}
+
+/// The pane's own PostToolUse hook for a Work send nudges the carrier for that
+/// pane's host; a replayed or unrelated event does not.
+@MainActor
+@Test func paneWorkSendHookNudgesTheCarrierForItsHost() {
+    let profile = ConnectionProfile(name: "dandy", kind: .ssh, host: "dandy-07")
+    let pane = PaneModel(profile: profile)
+    var nudged: [String] = []
+    let observer = NotificationCenter.default.addObserver(forName: RelayWorkCarrier.workQueuedNotification, object: nil, queue: nil) { note in
+        if let key = note.userInfo?["key"] as? String { nudged.append(key) }
+    }
+    defer { NotificationCenter.default.removeObserver(observer) }
+    func send(_ json: String) { pane.receivedAgentEvent(Data(json.utf8)) }
+    send(#"{"agent":"claude","relay_event_seq":5,"event":{"hook_event_name":"PostToolUse","tool_name":"mcp__relay-work__relay_work_message","event_id":"w-1"}}"#)
+    #expect(nudged == [profile.connectionKey])
+    send(#"{"agent":"claude","relay_event_seq":6,"event":{"hook_event_name":"PostToolUse","tool_name":"Bash","event_id":"w-2"}}"#)
+    send(#"{"agent":"claude","relay_event_seq":7,"event":{"hook_event_name":"PreToolUse","tool_name":"mcp__relay-work__relay_work_send_file","event_id":"w-3"}}"#)
+    // An event at or before the cursor is a replay, not a new send.
+    send(#"{"agent":"claude","relay_event_seq":4,"event":{"hook_event_name":"PostToolUse","tool_name":"mcp__relay-work__relay_work_send_file","event_id":"w-4"}}"#)
+    #expect(nudged == [profile.connectionKey])
 }

@@ -1319,6 +1319,13 @@ final class PaneModel: ObservableObject, Identifiable {
             ?? (event["type"] as? String)
             ?? "Agent event"
         let tool = event["tool_name"] as? String
+        // A live Work send from this pane queued a message for the app's
+        // carrier on this pane's host; carry it now, not on the next check.
+        if agentSnapshotReplayDepth == 0,
+           ((envelope["relay_event_seq"] as? NSNumber)?.uint64Value ?? UInt64.max) > priorCursor,
+           RelayWorkCarrier.queuedWork(eventName: eventName, toolName: tool) {
+            RelayWorkCarrier.workQueued(profile)
+        }
         // An empty type is no type: the label falls back to "Subagent".
         let agentType = (event["agent_type"] as? String).flatMap {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0

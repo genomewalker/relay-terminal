@@ -127,6 +127,27 @@ enum RelayWorkCarrier {
         guard profile.backend == .relay else { return }
         NotificationCenter.default.post(name: hostReadyNotification, object: nil, userInfo: ["key": profile.connectionKey])
     }
+
+    /// Work tools whose completed call means the pane's relayd has just queued
+    /// a message for this carrier (a send, or a send whose receipt it reads).
+    static let workSendTools: Set<String> = ["relay_work_message", "relay_work_send_file"]
+
+    /// A provider's PostToolUse for a Work send, by bare or MCP-qualified name
+    /// (mcp__relay-work__relay_work_message).
+    static func queuedWork(eventName: String, toolName: String?) -> Bool {
+        guard eventName == "PostToolUse", let toolName, !toolName.isEmpty else { return false }
+        let bare = toolName.components(separatedBy: "__").last ?? toolName
+        return workSendTools.contains(bare)
+    }
+
+    /// Posted when a pane on a host has just sent a Work message, so the
+    /// carrier checks that host at once instead of on its next scheduled pass.
+    static let workQueuedNotification = Notification.Name("RelayWorkCarrier.workQueued")
+
+    @MainActor static func workQueued(_ profile: ConnectionProfile) {
+        guard profile.backend == .relay else { return }
+        NotificationCenter.default.post(name: workQueuedNotification, object: nil, userInfo: ["key": profile.connectionKey])
+    }
 }
 
 @MainActor final class RelayWorkCarrierLoop {
@@ -139,6 +160,10 @@ enum RelayWorkCarrier {
     private var due: [String: Date] = [:]
     private var schedules: [String: RelayWorkCarrier.HostSchedule] = [:]
     nonisolated(unsafe) private var readyObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var queuedObserver: NSObjectProtocol?
+    private var wakeup: CheckedContinuation<Void, Never>?
+    private var wakePending = false
+    private var pauseGeneration = 0
 
     init(workspace: WorkspaceModel?, request: Request? = nil) {
         self.workspace = workspace
@@ -149,10 +174,15 @@ enum RelayWorkCarrier {
             guard let key = note.userInfo?["key"] as? String else { return }
             MainActor.assumeIsolated { self?.hostReady(key) }
         }
+        queuedObserver = NotificationCenter.default.addObserver(forName: RelayWorkCarrier.workQueuedNotification, object: nil, queue: nil) { [weak self] note in
+            guard let key = note.userInfo?["key"] as? String else { return }
+            MainActor.assumeIsolated { self?.workQueued(key) }
+        }
     }
 
     deinit {
         if let readyObserver { NotificationCenter.default.removeObserver(readyObserver) }
+        if let queuedObserver { NotificationCenter.default.removeObserver(queuedObserver) }
     }
 
     func start() {
@@ -161,9 +191,46 @@ enum RelayWorkCarrier {
             while !Task.isCancelled {
                 guard let self, let workspace = self.workspace else { return }
                 await self.tick(workspace)
-                try? await Task.sleep(for: RelayWorkCarrier.tick)
+                await self.pause(RelayWorkCarrier.tick)
             }
         }
+    }
+
+    /// Sleeps between passes; wake() ends the sleep at once. A wake that
+    /// arrives during a pass makes the next pause return immediately.
+    func pause(_ duration: Duration) async {
+        if wakePending {
+            wakePending = false
+            return
+        }
+        pauseGeneration &+= 1
+        let generation = pauseGeneration
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            wakeup = continuation
+            Task { @MainActor [self] in
+                try? await Task.sleep(for: duration)
+                guard pauseGeneration == generation, let pending = wakeup else { return }
+                wakeup = nil
+                pending.resume()
+            }
+        }
+    }
+
+    func wake() {
+        if let pending = wakeup {
+            wakeup = nil
+            pending.resume()
+        } else {
+            wakePending = true
+        }
+    }
+
+    /// A pane on this host has just sent a Work message: its relayd queued it
+    /// for this carrier, so check the host now. Unlike a reattach, what was
+    /// learned about the host still holds, so its schedule is kept.
+    func workQueued(_ key: String) {
+        due[key] = nil
+        wake()
     }
 
     /// A pane on this host attached or caught up: its relayd (or supervisor)
