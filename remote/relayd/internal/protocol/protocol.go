@@ -39,6 +39,9 @@ const (
 	// worker does not count it as human input. Sent only to workers that
 	// advertise automation_input_v1.
 	AutomationInputV2 Type = 22
+	// FreshRedraw asks the worker for one screen built only from a reset and
+	// the foreground program's redraw, never from retained output.
+	FreshRedraw Type = 23
 )
 
 const MaxPayload = 16 << 20
@@ -123,12 +126,14 @@ type StatusPayload struct {
 	Message               string                  `json:"message,omitempty"`
 	WorkerPID             int                     `json:"worker_pid,omitempty"`
 	Capabilities          []string                `json:"capabilities,omitempty"`
-	OutputReset           bool                    `json:"output_reset,omitempty"`
-	EventReset            bool                    `json:"event_reset,omitempty"`
-	ControlGranted        *bool                   `json:"control_granted,omitempty"`
-	ClientCount           int                     `json:"client_count,omitempty"`
-	ReexecOperation       string                  `json:"reexec_operation,omitempty"`
-	ExecutableSHA256      string                  `json:"executable_sha256,omitempty"`
+	// Sequence: the output sequence a fresh_redraw_done status follows.
+	Sequence         uint64 `json:"sequence,omitempty"`
+	OutputReset      bool   `json:"output_reset,omitempty"`
+	EventReset       bool   `json:"event_reset,omitempty"`
+	ControlGranted   *bool  `json:"control_granted,omitempty"`
+	ClientCount      int    `json:"client_count,omitempty"`
+	ReexecOperation  string `json:"reexec_operation,omitempty"`
+	ExecutableSHA256 string `json:"executable_sha256,omitempty"`
 }
 
 const inputIdentityBytes = 16

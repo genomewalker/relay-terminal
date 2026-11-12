@@ -39,7 +39,7 @@ type WorkerResume struct {
 	Operation  string
 }
 
-var workerCapabilities = []string{"host_rotation_v1", "host_rotation_text_v1", "host_rotation_credentials_v1", "native_rotation_bridge_v1", "input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1", "automation_input_v1", workerReexecCapability}
+var workerCapabilities = []string{"host_rotation_v1", "host_rotation_text_v1", "host_rotation_credentials_v1", "native_rotation_bridge_v1", "input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1", "automation_input_v1", freshRedrawCapability, workerReexecCapability}
 
 // workerRuntime is one worker process's serving state. Everything here except
 // the session is either rebuilt by the next image or restarted after a failed
@@ -427,7 +427,7 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 	)
 	defer session.detach(viewer)
 	attached, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
-		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1", "automation_input_v1"},
+		State: "attached", WorkerPID: os.Getpid(), Capabilities: []string{"input_ack_v1", "event_cursor_v1", "state_snapshot_v1", "native_agent_stream_v1", "transcript_events_v1", "input_lease_v1", "viewport_attach_v1", "viewport_attach_v2", "viewport_commit_v1", "viewport_commit_v2", "attach_repaint_v1", "attach_repaint_v2", "client_count_v1", "terminal_mode_state_v1", "program_status_snapshot_v1", "program_status_reply_v1", "program_status_negotiation_v1", "automation_input_v1", freshRedrawCapability},
 		OutputReset: outputReset, EventReset: eventReset,
 		ControlGranted: &controlGranted, ClientCount: clientCount,
 	})
@@ -523,6 +523,10 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 				enqueueViewportOperation(viewportOperations, viewportOperation{
 					generation: generation, cols: cols, rows: rows, commit: true,
 				})
+			}
+		case protocol.FreshRedraw:
+			if controlGranted {
+				go session.freshRedraw(viewer)
 			}
 		case protocol.Ping:
 			_ = writer.Write(protocol.Frame{Type: protocol.Pong})

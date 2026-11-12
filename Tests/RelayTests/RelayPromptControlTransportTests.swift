@@ -338,14 +338,21 @@ struct RelayPromptControlTransportTests {
         // A cursor resume carries only the bytes after the cursor.
         await replay("\u{1b}[3;1Hdelta", sequence: 101)
         #expect(io.maintenanceScreenAvailability().reason == TerminalIOBridge.savedCopyCutShort)
-        #expect(io.prepareFreshBaseReplay())
-        await replay(screen, sequence: 102)
+        // fresh_redraw_begin, then a sequence-zero reset and the agent's
+        // redraw, then fresh_redraw_done.
+        io.beginFreshRedrawReplay()
+        #expect(io.maintenanceScreenAvailability().reason == "a replay is in progress")
+        _ = io.receive(Data("\u{1b}c".utf8), remoteSequence: 0)
+        _ = io.receive(Data(screen.utf8), remoteSequence: 102)
+        await withCheckedContinuation { continuation in
+            io.onReplayFinished = { _ in continuation.resume() }
+            io.endReplay()
+        }
+        io.onReplayFinished = nil
         #expect(io.maintenanceScreenAvailability().reason == nil)
         let snapshot = try #require(io.maintenanceScreenSnapshot())
         #expect(snapshot.token.sequence == 102)
-        // Never while a replay is open.
-        io.beginReplay()
-        #expect(!io.prepareFreshBaseReplay())
+        #expect(snapshot.data.range(of: Data("delta".utf8)) == nil || snapshot.data.range(of: Data("\u{1b}c".utf8)) != nil)
     }
 
     @MainActor @Test

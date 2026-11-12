@@ -1216,6 +1216,14 @@ final class TerminalRuntime: NSObject {
                         io.beginReplay()
                     }
                     if status.outputReset { io.resetRemoteSequence() }
+                    switch status.state {
+                    case "fresh_redraw_begin": io.beginFreshRedrawReplay()
+                    case "fresh_redraw_done":
+                        io.noteFreshRedrawOutcome("done: " + (status.message ?? ""))
+                        io.endReplay()
+                    case "fresh_redraw_refused": io.noteFreshRedrawOutcome("refused: " + (status.message ?? ""))
+                    default: break
+                    }
                     if status.state == "attached" || status.state == "read_only" {
                         // Current workers emit an authoritative caught_up marker
                         // after replay. Do not let the legacy timeout start feeding
@@ -3267,21 +3275,23 @@ final class TerminalRuntime: NSObject {
     /// Outcome of the last fresh-base request, named in held receipts.
     private(set) var hiddenScreenRefreshNote: String?
 
-    /// 0.5.61, for a user-requested installed update only: a hidden pane
-    /// whose saved copy was cut short at restore gets one fresh screen
-    /// without being shown. Refused unless the pane has no surface, is
-    /// connected with no other viewer and the copy is cut short; the caller
-    /// also requires relayd's idle proof, no draft and no approval.
+    /// 0.5.62, for a user-requested installed update only: a hidden pane
+    /// whose saved copy was cut short at restore asks its worker for one
+    /// screen made of a reset and the agent's own redraw, with no old output.
+    /// The worker sends the redraw signal that showing the pane causes, at the
+    /// unchanged grid; nothing is typed. Refused unless the pane has no
+    /// surface, is connected with no other viewer and the copy is cut short;
+    /// the caller also requires relayd's idle proof, no draft and no approval.
     func refreshHiddenScreenBaseForInstalledUpdate() async -> Bool {
         guard let pane, pane.profile.backend == .relay, pane.connectionState == .connected, started,
               observeActiveScreen() == .noSurface, (pane.remoteClientCount ?? 1) <= 1,
               io.maintenanceScreenAvailability().reason == TerminalIOBridge.savedCopyCutShort else { return false }
-        guard io.reconnectFromStartForFreshBase() else {
-            hiddenScreenRefreshNote = "Relay could not reopen the pane's route for a fresh screen"
-            recordInputDiagnostic("hidden-screen-base-refresh-refused")
+        guard io.requestFreshRedraw() else {
+            hiddenScreenRefreshNote = "the pane's worker cannot give a fresh screen (needs relayd 0.5.38 in this worker)"
+            recordInputDiagnostic("hidden-screen-fresh-redraw-unsupported")
             return false
         }
-        recordInputDiagnostic("hidden-screen-base-refresh")
+        recordInputDiagnostic("hidden-screen-fresh-redraw")
         for _ in 0..<60 {
             try? await Task.sleep(for: .milliseconds(250))
             guard self.pane === pane else { return false }
@@ -3289,8 +3299,13 @@ final class TerminalRuntime: NSObject {
                 hiddenScreenRefreshNote = nil
                 return true
             }
+            if let outcome = io.freshRedrawOutcome, outcome.hasPrefix("refused") {
+                hiddenScreenRefreshNote = "the worker " + outcome
+                return false
+            }
         }
-        hiddenScreenRefreshNote = "a fresh screen was requested but did not arrive within 15 s"
+        hiddenScreenRefreshNote = "a fresh screen was requested but did not arrive within 15 s" +
+            (io.freshRedrawOutcome.map { " (" + $0 + ")" } ?? "")
         return false
     }
 
@@ -4565,17 +4580,31 @@ final class TerminalIOBridge: @unchecked Sendable {
         return currentTransport?.reconnectExistingPaneRoute() == true
     }
 
-    /// The next replay rebuilds the saved copy from scratch. Refused while a
-    /// replay is open, so it never changes one already in progress.
-    func prepareFreshBaseReplay() -> Bool {
+    /// 0.5.62: opens the replay that a worker's fresh_redraw_begin starts.
+    /// Everything up to fresh_redraw_done (a reset, the input modes and the
+    /// agent's redraw) commits as a fresh base, never extending the retained
+    /// grid. Without that begin status nothing changes, so a refused or
+    /// unsupported request never makes a cut-short copy readable.
+    func beginFreshRedrawReplay() {
+        beginReplay()
         outputOrderingLock.lock()
         defer { outputOrderingLock.unlock() }
         replayLock.lock()
         defer { replayLock.unlock() }
-        guard !replaying, replayCommitGeneration == nil else { return false }
+        guard replaying, replayCommitGeneration == nil else { return }
         replayRequiresFreshBase = true
         replayUsesRetainedGrid = false
-        return true
+    }
+
+    /// The last fresh redraw's outcome from the worker, for held receipts.
+    private let freshRedrawOutcomeLock = NSLock()
+    private var freshRedrawOutcomeValue: String?
+    var freshRedrawOutcome: String? {
+        freshRedrawOutcomeLock.lock(); defer { freshRedrawOutcomeLock.unlock() }
+        return freshRedrawOutcomeValue
+    }
+    func noteFreshRedrawOutcome(_ outcome: String?) {
+        freshRedrawOutcomeLock.lock(); freshRedrawOutcomeValue = outcome; freshRedrawOutcomeLock.unlock()
     }
 
     /// Tests only: the state a viewport-mismatched restore leaves.
@@ -4585,25 +4614,13 @@ final class TerminalIOBridge: @unchecked Sendable {
         receiveLock.unlock()
     }
 
-    /// 0.5.61: rebuilds a hidden pane's saved copy that was cut short at
-    /// restore. The route reopens on the grid it already uses and asks the
-    /// worker for its whole retained output; the worker's attach repaint is
-    /// the same redraw that showing the pane causes. The copy stays marked
-    /// cut short until that replay commits as a fresh base, so a refused or
-    /// failed reopen never makes a partial copy readable.
-    @discardableResult
-    func reconnectFromStartForFreshBase() -> Bool {
-        guard prepareFreshBaseReplay() else { return false }
+    /// Asks the worker for one screen from a reset and the agent's redraw.
+    func requestFreshRedraw() -> Bool {
         resizeLock.lock()
         let currentTransport = transport
         resizeLock.unlock()
-        let accepted = currentTransport?.reconnectExistingPaneRoute(fromStart: true) == true
-        if !accepted {
-            replayLock.lock()
-            if !replaying { replayRequiresFreshBase = false }
-            replayLock.unlock()
-        }
-        return accepted
+        noteFreshRedrawOutcome(nil)
+        return currentTransport?.requestFreshRedraw() == true
     }
 
     func removeTransport() -> RelayRemoteTransport? {

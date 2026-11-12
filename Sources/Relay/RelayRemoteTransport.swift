@@ -255,6 +255,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// The worker accepts Relay's own keystrokes as automation input, which it
     /// does not count as a human takeover of context rotation.
     private var supportsAutomationInput = false
+    private var supportsFreshRedraw = false
     /// Consecutive dedicated reattachments made only to obtain the input lease.
     private var dedicatedLeaseRetryAttempt = 0
     /// Pending acknowledged sequences that were sent as automation input. A
@@ -418,6 +419,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         hasAttachedWorker = false
         supportsInputAcknowledgements = false
         supportsAutomationInput = false
+        supportsFreshRedraw = false
         supportsViewportCommits = false
         supportsSupervisorViewportCommits = false
         supportsExactViewportCommits = false
@@ -1216,6 +1218,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         attachRetryScheduled = false
         supportsInputAcknowledgements = capabilities.contains("input_ack_v1")
         supportsAutomationInput = supportsInputAcknowledgements && capabilities.contains("automation_input_v1")
+        supportsFreshRedraw = capabilities.contains("fresh_redraw_v1")
         supportsViewportCommits = RelayTransportCapabilityPolicy.supportsViewportCommit(capabilities)
         supportsExactViewportCommits = RelayTransportCapabilityPolicy.supportsExactViewportCommit(capabilities)
         let needsPostAttachResize = RelayTransportCapabilityPolicy.needsPostAttachResize(capabilities)
@@ -1577,21 +1580,34 @@ final class RelayRemoteTransport: @unchecked Sendable {
         writer?.writeAsync(type: .resize, payload: payload)
     }
 
+    /// Asks the attached worker for one screen built from a reset and the
+    /// agent's redraw, with no retained output (fresh_redraw_v1). Refused for
+    /// an older worker, an observer, or a route without input control. The
+    /// worker answers with fresh_redraw_begin/done/refused statuses in order.
+    func requestFreshRedraw() -> Bool {
+        lock.lock()
+        guard supportsFreshRedraw, attached, !detached, !sessionEnded, let writer,
+              let context = connectionContext, !context.observeAgentsOnly,
+              promptEditorControlGranted || !attachedWithInputLease else {
+            lock.unlock()
+            return false
+        }
+        lock.unlock()
+        writer.writeAsync(type: .freshRedraw, payload: Data())
+        return true
+    }
+
     /// Exercise the normal route recovery without closing the shared node or worker.
     /// Only an attached multiplexed pane can enter this path; its next Hello
     /// must attach an existing worker rather than creating a replacement.
-    /// `fromStart` asks the worker for its whole retained output instead of
-    /// the bytes after the last acknowledged sequence, so the viewer can
-    /// rebuild a complete screen. It is set only when the reopen is accepted.
     @discardableResult
-    func reconnectExistingPaneRoute(fromStart: Bool = false) -> Bool {
+    func reconnectExistingPaneRoute() -> Bool {
         lock.lock()
         // A dedicated fallback route reopens through the same retained-worker
         // reconnect as an interrupted connection: the next Hello requires the
         // existing worker and resumes from the last acknowledged sequences.
         if !detached, !sessionEnded, attached, hasAttachedWorker, nodeChannel == nil,
            !reconnectScheduled, let dedicated = process, let context = connectionContext {
-            if fromStart { lastSequence = 0 }
             let dedicatedWriter = writer
             lock.unlock()
             context.onStatus(RelayStatus(state: "reconnecting",
@@ -1608,7 +1624,6 @@ final class RelayRemoteTransport: @unchecked Sendable {
             return false
         }
         attached = false
-        if fromStart { lastSequence = 0 }
         lock.unlock()
         context.onStatus(RelayStatus(state: "reconnecting",
             message: "Reopening this pane's terminal route."), deliveryEpochSnapshot())
@@ -1799,6 +1814,8 @@ enum RelayWireType: UInt8 {
     case hello = 1, input, resize, output, status, detach, ping, pong, agentEvent, artifact, inputAck, inputV2, hostEvent, workspaceState, viewportCommit, viewportAck, hostRequest, hostResponse, fragment, capabilities
     /// Same payload as inputV2; the worker does not count it as human input.
     case automationInputV2 = 22
+    /// Empty payload: one screen from a reset and the agent's redraw (fresh_redraw_v1).
+    case freshRedraw = 23
 }
 
 struct RelayWireFrame {
