@@ -24,7 +24,7 @@ func installSource(data []byte) (string, error) {
 	if len(data) > 1<<20 {
 		return "", errors.New("source limit")
 	}
-	start := bytes.Index(data, []byte("    private static func installScript("))
+	start := bytes.Index(data, []byte("    static func installScript("))
 	if start < 0 {
 		return "", errors.New("function missing")
 	}

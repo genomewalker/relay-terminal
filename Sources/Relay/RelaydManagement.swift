@@ -311,6 +311,7 @@ enum RelaydRemoteClient {
         "relay-install-codex",
         "relay-repair-codehost",
         "relay-client",
+        "relay-work-mcp",
     ]
 
     private static func installationArchive(architecture: String) throws -> Data {
