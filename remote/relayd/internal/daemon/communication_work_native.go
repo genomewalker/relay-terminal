@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // A Work route whose peer binding names workNativeEndpoint is carried by the
@@ -79,6 +81,11 @@ type workNativePending struct {
 	Dispatched  bool      `json:"dispatched"`
 	Queries     int       `json:"queries"`
 	Created     time.Time `json:"created"`
+	// The last refusal the Relay app reported when it delivered this message
+	// to the peer. The app is an untrusted carrier, so this is only shown with
+	// the receipt as unverified; it never settles or changes the receipt.
+	LastRefusal string `json:"last_refusal,omitempty"`
+	RefusedAt   string `json:"refused_at,omitempty"`
 }
 
 func workNativePendingPath(root, id string) string {
@@ -154,7 +161,67 @@ func workNativeReceiptResult(root string, receipt workTransportReceipt) map[stri
 		result["carrier_state"] = "queued"
 		result["note"] = "queued on this host until the Relay app carries it; query this receipt later, never resend"
 	}
+	if p.LastRefusal != "" {
+		result["carrier_error"] = "peer refused: " + p.LastRefusal
+		result["carrier_error_at"] = p.RefusedAt
+		result["carrier_error_source"] = "relay_app_unverified"
+		result["note"] = "the peer's relayd refused this message when the Relay app delivered it; it stays queued and is retried. Check the link before anything else, and never resend it under a new ID"
+	}
 	return result
+}
+
+// workNativeRefused records the reason the Relay app reports for a dispatched
+// send that the peer's relayd refused. It never settles the receipt: the app
+// is an untrusted carrier, so the reason is kept on the queue record and shown
+// with the receipt as unverified, and the message stays queued.
+func workNativeRefused(root, id, reason string) (map[string]any, error) {
+	if !validSessionID.MatchString(id) {
+		return nil, errors.New("message UUID required")
+	}
+	if _, ok := workNativeRepinFor(root, id); ok || remoteNativePendingFor(root, id) {
+		return map[string]any{"status": "ignored", "authority": "relayd"}, nil
+	}
+	reason = workNativeCarrierReason(reason)
+	if reason == "" {
+		return nil, errors.New("refusal reason required")
+	}
+	err := communicationFanoutLocked(root, func() error {
+		var p workNativePending
+		if e := communicationRead(workNativePendingPath(root, id), &p); e != nil {
+			return e
+		}
+		if p.Version != 1 || p.MessageID != id {
+			return errors.New("pending Work message does not match its record")
+		}
+		if !p.Dispatched {
+			return errors.New("this Work message has not been dispatched")
+		}
+		p.LastRefusal = reason
+		p.RefusedAt = workNativeNow().Format(time.RFC3339Nano)
+		return communicationAtomic(workNativePendingPath(root, id), p)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"status": "recorded", "authority": "relayd"}, nil
+}
+
+// workNativeCarrierReason keeps one printable line of at most 300 bytes.
+func workNativeCarrierReason(text string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(text) {
+		if r == '\n' || r == '\r' || r == '\t' {
+			r = ' '
+		}
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		if b.Len()+utf8.RuneLen(r) > 300 {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func workNativeSign(root, node, kind string, payload []byte) (string, error) {
@@ -251,6 +318,8 @@ func communicationWorkNativeWith(ctx context.Context, root, node string, r Commu
 			return remoteNativeSettle(root, node, r.MessageID, r.WorkReply)
 		}
 		return workNativeSettle(ctx, root, node, r.MessageID, r.WorkReply)
+	case "work_native_refused":
+		return workNativeRefused(root, r.MessageID, r.CarrierError)
 	}
 	return nil, errors.New("unsupported Work carrier operation")
 }

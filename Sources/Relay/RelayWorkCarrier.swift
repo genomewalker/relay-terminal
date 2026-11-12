@@ -27,7 +27,7 @@ enum RelayWorkCarrier {
 
     static var pendingPacket: [String: Any] { ["operation": "work_native_pending"] }
 
-    static let carrierOperations: Set<String> = ["work_native_pending", "work_native_claim", "deliver_signed_work", "work_native_settle"]
+    static let carrierOperations: Set<String> = ["work_native_pending", "work_native_claim", "deliver_signed_work", "work_native_settle", "work_native_refused"]
 
     static func carries(_ packet: [String: Any]) -> Bool {
         (packet["operation"] as? String).map(carrierOperations.contains) ?? false
@@ -43,6 +43,20 @@ enum RelayWorkCarrier {
 
     static func settlePacket(messageID: String, reply: String) -> [String: Any] {
         ["operation": "work_native_settle", "message_id": messageID, "work_reply": reply]
+    }
+
+    static func refusedPacket(messageID: String, reason: String) -> [String: Any] {
+        ["operation": "work_native_refused", "message_id": messageID, "carrier_error": reason]
+    }
+
+    /// The reason the peer's relayd gave for refusing a signed delivery, or nil
+    /// when the peer could not be reached at all: only an answer from the
+    /// peer's relayd is reported to the sender as a refusal.
+    static func refusal(_ error: Error) -> String? {
+        guard case RemoteCatalogError.failed(let message) = error else { return nil }
+        let line = message.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }.joined(separator: " ")
+        return line.isEmpty ? nil : String(line.prefix(300))
     }
 
     static func outbox(hostKey: String, reply: [String: Any]?) -> Outbox? {
@@ -272,9 +286,31 @@ enum RelayWorkCarrier {
         for step in RelayWorkCarrier.plan(Array(outboxes.values)) {
             guard let from = byKey[step.fromHost], let to = byKey[step.toHost] else { continue }
             guard let claim = try? await request(from, RelayWorkCarrier.claimPacket(messageID: step.messageID)),
-                  let envelope = claim["work_envelope"] as? String,
-                  let delivered = try? await request(to, RelayWorkCarrier.deliverPacket(envelope: envelope)),
-                  let reply = delivered["work_reply"] as? String else { continue }
+                  let envelope = claim["work_envelope"] as? String else { continue }
+            let delivered: [String: Any]
+            do {
+                delivered = try await request(to, RelayWorkCarrier.deliverPacket(envelope: envelope))
+            } catch {
+                // The peer's relayd refused the signed message (a changed
+                // target, say): tell the sending relayd, whose receipt shows it
+                // as unverified. The message stays queued there; nothing is
+                // settled or resent under a new ID.
+                let reason = RelayWorkCarrier.refusal(error)
+                RelayDiagnostics.shared.record(category: "work_carrier", name: reason == nil ? "deliver_unreachable" : "deliver_refused",
+                    details: ["message_id": step.messageID, "from": step.fromHost, "to": step.toHost,
+                              "reason": reason ?? error.localizedDescription])
+                if let reason {
+                    _ = try? await request(from, RelayWorkCarrier.refusedPacket(messageID: step.messageID, reason: reason))
+                }
+                continue
+            }
+            guard let reply = delivered["work_reply"] as? String else {
+                let reason = "the peer's relayd answered without a signed reply"
+                RelayDiagnostics.shared.record(category: "work_carrier", name: "deliver_refused",
+                    details: ["message_id": step.messageID, "from": step.fromHost, "to": step.toHost, "reason": reason])
+                _ = try? await request(from, RelayWorkCarrier.refusedPacket(messageID: step.messageID, reason: reason))
+                continue
+            }
             _ = try? await request(from, RelayWorkCarrier.settlePacket(messageID: step.messageID, reply: reply))
         }
         // A carried item is gone from the cached outbox until its host is

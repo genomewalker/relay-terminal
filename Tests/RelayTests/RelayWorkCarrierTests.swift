@@ -366,3 +366,53 @@ private func runCarrier(_ hosts: FakeWorkHosts, _ loop: RelayWorkCarrierLoop, fo
     send(#"{"agent":"claude","relay_event_seq":4,"event":{"hook_event_name":"PostToolUse","tool_name":"mcp__relay-work__relay_work_send_file","event_id":"w-4"}}"#)
     #expect(nudged == [profile.connectionKey])
 }
+
+/// eede66c6: the Mac's relayd refused every delivery after the Codex app
+/// restarted, and the carrier dropped the refusal. It now tells the sending
+/// relayd why, never settles, and still drops an unreachable peer quietly.
+@MainActor
+@Test func workCarrierReportsAPeerRefusalToTheSenderWithoutSettling() async {
+    let mac = ConnectionProfile(name: "mac", kind: .ssh, host: "mac-host")
+    let dandy = ConnectionProfile(name: "dandy", kind: .ssh, host: "dandy-07")
+    var deliverError: Error? = RemoteCatalogError.failed("relayd: Work target changed\n(incarnation 71513)\n")
+    var sent: [(String, [String: Any])] = []
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { profile, packet in
+        let operation = packet["operation"] as? String ?? ""
+        sent.append((profile.connectionKey, packet))
+        switch operation {
+        case "work_native_pending":
+            if profile.connectionKey == mac.connectionKey { return ["node_id": "node-mac", "items": [], "native_routes": 1] }
+            return ["node_id": "node-dandy", "items": [["message_id": "e1", "peer_node_id": "node-mac"]], "native_routes": 1]
+        case "work_native_claim": return ["work_envelope": "signed"]
+        case "deliver_signed_work":
+            if let deliverError { throw deliverError }
+            return [:]
+        default: return [:]
+        }
+    })
+    var now = Date(timeIntervalSince1970: 2_000_000)
+    await loop.tick(profiles: [mac, dandy], now: now)
+    let refusals = sent.filter { $0.1["operation"] as? String == "work_native_refused" }
+    #expect(refusals.count == 1)
+    #expect(refusals.first?.0 == dandy.connectionKey)
+    #expect(refusals.first?.1["message_id"] as? String == "e1")
+    #expect(refusals.first?.1["carrier_error"] as? String == "relayd: Work target changed (incarnation 71513)")
+    #expect(!sent.contains { $0.1["operation"] as? String == "work_native_settle" })
+
+    // An unreachable peer is not a refusal: nothing is reported or settled.
+    sent.removeAll()
+    deliverError = RemoteCatalogError.networkUnavailable
+    now = now.addingTimeInterval(5)
+    await loop.tick(profiles: [mac, dandy], now: now)
+    #expect(sent.contains { $0.1["operation"] as? String == "deliver_signed_work" })
+    #expect(!sent.contains { ["work_native_refused", "work_native_settle"].contains($0.1["operation"] as? String ?? "") })
+
+    // A peer answer without a signed reply is reported, and still not settled.
+    sent.removeAll()
+    deliverError = nil
+    now = now.addingTimeInterval(5)
+    await loop.tick(profiles: [mac, dandy], now: now)
+    #expect(sent.filter { $0.1["operation"] as? String == "work_native_refused" }.map { $0.1["carrier_error"] as? String }
+            == ["the peer's relayd answered without a signed reply"])
+    #expect(!sent.contains { $0.1["operation"] as? String == "work_native_settle" })
+}
