@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-var handlerPath = "/Applications/Relay.app/Contents/MacOS/relay-mcp"
+var handlerPath = platformHandlerPath()
 
 const maxFrame = 1 << 20
 
@@ -36,6 +36,7 @@ func execute(request []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 95*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, handlerPath, "--work-request")
+	cmd.Env = platformHandlerEnv(os.Environ())
 	// The handler proves its origin by this pipe's live writer, so the writer
 	// stays open until the handler exits. The request is one newline frame.
 	stdin, err := cmd.StdinPipe()

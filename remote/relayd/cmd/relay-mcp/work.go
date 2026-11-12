@@ -201,7 +201,7 @@ func workDaemonRequest(packet map[string]any) ([]byte, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, workorigin.CLIPath, "communication-work")
+	cmd := exec.CommandContext(ctx, platformWorkCLIPath(), "communication-work")
 	// Keep the writer open for the CLI's lifetime: the CLI proves its caller by
 	// this pipe's live writer. The CLI reads exactly one newline-framed request.
 	stdin, err := cmd.StdinPipe()
