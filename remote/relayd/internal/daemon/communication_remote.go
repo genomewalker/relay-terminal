@@ -255,6 +255,13 @@ func communicationRemoteLinkOperation(root, node string, r CommunicationRequest)
 		}
 		sort.Strings(requested.AllowedPeerCallers)
 	}
+	if r.Operation == "route_link_retire" {
+		// A v2 typed (pane <-> Work) relationship is retired in place. A v1 pair
+		// file fails the strict typed read and continues to the v1 path below.
+		if typed, err := readTypedRemoteLink(root, node, id); err == nil {
+			return communicationRetireTypedLink(root, node, typed, r.ExpectedRemoteLinkRevision, time.Now)
+		}
+	}
 	previous, err := readRemoteLink(root, node, id)
 	exists := err == nil
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -315,6 +322,36 @@ func communicationRemoteLinkOperation(root, node string, r CommunicationRequest)
 		return nil, errors.New("remote pair saved but event append failed; read current revision before recovery")
 	}
 	return map[string]any{"link": link, "authority": "relayd", "desktop_required": false}, nil
+}
+
+// communicationRetireTypedLink marks one saved typed relationship retired on
+// this host. It is owner administration (the caller already refused agent and
+// client actors), requires the current revision, never deletes the file and
+// never revives or re-pins: send, receive and re-pin all refuse a retired link.
+func communicationRetireTypedLink(root, node string, link communicationTypedRemoteLink, expected uint64, now func() time.Time) (map[string]any, error) {
+	if link.Retired {
+		return nil, errors.New("typed relationship already retired")
+	}
+	if expected != link.Revision || link.Revision == math.MaxUint64 {
+		return nil, errors.New("remote pair revision conflict")
+	}
+	link.Revision++
+	link.Retired = true
+	stamp := now().UTC()
+	if stamp.Before(link.UpdatedAt) {
+		stamp = link.UpdatedAt
+	}
+	link.UpdatedAt = stamp
+	if !validTypedRemoteLink(link, node) {
+		return nil, errors.New("invalid typed relationship")
+	}
+	if err := communicationAtomic(remoteLinkPath(root, link.ID), link); err != nil {
+		return nil, err
+	}
+	if err := communicationEvent(root, node, "communication_remote_pair_retired", []map[string]string{{"link_id": link.ID, "peer_node_id": link.Peer.NodeID}}); err != nil {
+		return nil, errors.New("typed relationship retired but event append failed; read current revision before recovery")
+	}
+	return map[string]any{"typed_link": link, "authority": "relayd", "desktop_required": false}, nil
 }
 
 func remoteMessageFingerprint(message communicationRemoteMessage) string {
