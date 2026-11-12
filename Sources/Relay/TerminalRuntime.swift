@@ -3080,7 +3080,10 @@ final class TerminalRuntime: NSObject {
             }
             return "the screen's prompt or footer was not recognised"
         }
-        guard preparedMaintenancePrompt != nil else { return "the hidden pane's screen has not been read" }
+        guard preparedMaintenancePrompt != nil else {
+            return "the hidden pane's screen has not been read: " +
+                (preparedMaintenanceFailure ?? io.maintenanceScreenAvailability().reason ?? "no reading was attempted")
+        }
         guard let prepared = currentPreparedPrompt(observation) else { return "the hidden pane's screen reading is stale" }
         return prepared.empty(explainedAgents: explainedAgents) ? nil
             : "the hidden pane's prompt or footer was not recognised, or its footer agents are not accounted for"
@@ -3137,6 +3140,8 @@ final class TerminalRuntime: NSObject {
         var claudeOverlay = false
     }
     private var preparedMaintenancePrompt: PreparedMaintenancePrompt?
+    /// Why the last hidden-pane reading produced nothing; nil before any attempt.
+    private(set) var preparedMaintenanceFailure: String?
     private var promptParseMemo = RelayPromptParseMemo()
 
     /// Uses the provider's editor bridge to read exact bytes, including hard
@@ -3265,10 +3270,21 @@ final class TerminalRuntime: NSObject {
            cached.inputRevision == pane.agentInputRevision, io.maintenanceScreenIsCurrent(cached.token) { return }
         preparedMaintenancePrompt = nil
         let revision = pane.agentInputRevision
-        guard let snapshot = io.maintenanceScreenSnapshot(),
-              let screen = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport),
-              self.pane === pane, pane.agentInputRevision == revision,
-              io.maintenanceScreenIsCurrent(snapshot.token) else { return }
+        let snapshot: TerminalIOBridge.MaintenanceScreenSnapshot
+        switch io.maintenanceScreenAvailability() {
+        case .available(let available): snapshot = available
+        case .unavailable(let reason): preparedMaintenanceFailure = reason; return
+        }
+        guard let screen = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport) else {
+            preparedMaintenanceFailure = "the saved copy could not be rendered"
+            return
+        }
+        guard self.pane === pane, pane.agentInputRevision == revision,
+              io.maintenanceScreenIsCurrent(snapshot.token) else {
+            preparedMaintenanceFailure = "the screen or prompt changed while it was read"
+            return
+        }
+        preparedMaintenanceFailure = nil
         preparedMaintenancePrompt = PreparedMaintenancePrompt(token: snapshot.token, inputRevision: revision,
             agentEmpty: RelayAgentMaintenancePrompt.isEmpty(screen, provider: pane.kind == .codex ? "codex" : "claude"),
             agentEmptyIgnoringAgents: RelayAgentMaintenancePrompt.isEmpty(screen,
@@ -4539,6 +4555,20 @@ final class TerminalIOBridge: @unchecked Sendable {
     }
 
     func maintenanceScreenSnapshot() -> MaintenanceScreenSnapshot? {
+        if case .available(let snapshot) = maintenanceScreenAvailability() { return snapshot }
+        return nil
+    }
+
+    enum MaintenanceScreenAvailability {
+        case available(MaintenanceScreenSnapshot)
+        /// The first check that refused, named for held receipts.
+        case unavailable(String)
+        var reason: String? { if case .unavailable(let reason) = self { return reason }; return nil }
+    }
+
+    /// The saved screen a hidden pane's maintenance reading uses, or the
+    /// first of its checks that refused, in the order they are made.
+    func maintenanceScreenAvailability() -> MaintenanceScreenAvailability {
         outputOrderingLock.lock()
         defer { outputOrderingLock.unlock() }
         phaseReadWillLockReplayForTesting?()
@@ -4547,13 +4577,13 @@ final class TerminalIOBridge: @unchecked Sendable {
         let generation = replayGeneration
         let observed = maximumObservedRemoteSequence
         replayLock.unlock()
-        guard ready else { return nil }
+        guard ready else { return .unavailable("a replay is in progress") }
         // Sequence-zero bytes buffered in an open viewport transition change
         // neither the sequence nor the replay buffer: no token while it is open.
         presentationLock.lock()
         let transitionOpen = viewportTransitionActive
         presentationLock.unlock()
-        guard !transitionOpen else { return nil }
+        guard !transitionOpen else { return .unavailable("a viewport change is in progress") }
         resizeLock.lock()
         let producer = outputProducerID
         let viewport = latestViewport
@@ -4561,11 +4591,19 @@ final class TerminalIOBridge: @unchecked Sendable {
         resizeLock.unlock()
         receiveLock.lock()
         defer { receiveLock.unlock() }
-        guard connected, !snapshotBufferTruncated, !snapshotBuffer.isEmpty,
-              snapshotRemoteSequence > 0, observed <= snapshotRemoteSequence else { return nil }
-        return MaintenanceScreenSnapshot(token: MaintenanceScreenToken(producer: producer,
+        guard connected else { return .unavailable("the terminal has no live connection") }
+        guard snapshotPaneID != nil else { return .unavailable("the pane's screen is not being saved") }
+        guard !snapshotBufferTruncated else {
+            return .unavailable("the saved copy was cut short (no complete screen since restore)")
+        }
+        guard !snapshotBuffer.isEmpty else { return .unavailable("the saved copy is empty") }
+        guard snapshotRemoteSequence > 0 else { return .unavailable("the saved copy has no output sequence") }
+        guard observed <= snapshotRemoteSequence else {
+            return .unavailable("the saved copy is behind the received output (\(snapshotRemoteSequence) < \(observed))")
+        }
+        return .available(MaintenanceScreenSnapshot(token: MaintenanceScreenToken(producer: producer,
             sequence: snapshotRemoteSequence, replayGeneration: generation, viewport: viewport,
-            snapshotRevision: snapshotRevision), data: snapshotBuffer)
+            snapshotRevision: snapshotRevision), data: snapshotBuffer))
     }
 
     func maintenanceScreenIsCurrent(_ token: MaintenanceScreenToken) -> Bool {

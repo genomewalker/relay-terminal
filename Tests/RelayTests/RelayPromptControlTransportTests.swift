@@ -281,4 +281,28 @@ struct RelayPromptControlTransportTests {
         io.beginReplay()
         #expect(io.maintenanceScreenSnapshot() == nil)
     }
+
+    /// 0.5.61: a held update names the check that refused the saved screen.
+    @MainActor @Test
+    func maintenanceScreenAvailabilityNamesTheRefusingCheck() throws {
+        let profile = ConnectionProfile(name: "Named refusal", host: "named-refusal.invalid")
+        let paneID = UUID(), writer = OwnedPromptFrameWriter()
+        let original = transport(writer, profile: profile, paneID: paneID)
+        let io = TerminalIOBridge()
+        #expect(io.maintenanceScreenAvailability().reason == "the terminal has no live connection")
+        io.installTransport(original)
+        #expect(io.maintenanceScreenAvailability().reason == "the pane's screen is not being saved")
+        _ = io.restoreSnapshot(paneID: paneID)
+        defer {
+            _ = io.removeTransport(); original.detach()
+            TerminalSnapshotStore.shared.remove(paneID: paneID)
+        }
+        #expect(io.maintenanceScreenAvailability().reason == "the saved copy is empty")
+        io.receive(Data("\u{1b}[2J\u{1b}[H❯ \r\n────────\r\n⏵⏵ bypass permissions on".utf8), remoteSequence: 100)
+        #expect(io.maintenanceScreenAvailability().reason == nil)
+        #expect(io.maintenanceScreenSnapshot() != nil)
+        io.beginReplay()
+        #expect(io.maintenanceScreenAvailability().reason == "a replay is in progress")
+        #expect(io.maintenanceScreenSnapshot() == nil)
+    }
 }
