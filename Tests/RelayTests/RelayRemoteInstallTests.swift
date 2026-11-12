@@ -1087,6 +1087,45 @@ struct RelayRemoteInstallRunnerTests {
         #expect(host.operations.isEmpty)
     }
 
+    @MainActor @Test func anUnansweredApprovalClosesItselfAndFreesTheNextRequest() async throws {
+        let host = FakeHost()
+        var answers: [(NSApplication.ModalResponse) -> Void] = []
+        var dismissed = 0
+        let control = RelayRemoteInstallControl(present: { _, completion in answers.append(completion); return true },
+                                                dismiss: { _ in dismissed += 1; answers.last?(.abort) },
+                                                approvalWindow: 0.05)
+        var first = RelayRemoteInstallRequest(requestID: UUID(), action: .rollback, host: "dandy-07")
+        first.installID = "install-" + UUID().uuidString.lowercased()
+        _ = try control.propose(first, file: nil, send: host.send, direct: host.direct)
+        for _ in 0..<200 where control.receipt(first.requestID)?.status == "awaiting_approval" {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let expired = try #require(control.receipt(first.requestID))
+        #expect(expired.status == "expired")
+        #expect(expired.error?.contains("nothing was run") == true)
+        #expect(dismissed == 1)
+        // Approving the stale dialog afterwards runs nothing.
+        answers[0](.alertSecondButtonReturn)
+        #expect(control.receipt(first.requestID)?.status == "expired")
+        // The next request is shown instead of being refused as blocked.
+        var second = RelayRemoteInstallRequest(requestID: UUID(), action: .rollback, host: "dandy-07")
+        second.installID = "install-" + UUID().uuidString.lowercased()
+        #expect(try control.propose(second, file: nil, send: host.send, direct: host.direct).status == "awaiting_approval")
+        #expect(answers.count == 2)
+        #expect(host.operations.isEmpty)
+    }
+
+    @MainActor @Test func theApprovalDialogSaysWhenApprovalEnds() {
+        var request = RelayRemoteInstallRequest(requestID: UUID(), action: .rollback, host: "dandy-07")
+        request.installID = "install-" + UUID().uuidString.lowercased()
+        let deadline = Date().addingTimeInterval(RelayRemoteInstallControl.approvalWindow)
+        let time = DateFormatter.localizedString(from: deadline, dateStyle: .none, timeStyle: .short)
+        let detail = request.approval(size: nil, deadline: deadline).detail
+        #expect(detail.contains("Approve by \(time)."))
+        #expect(!detail.contains("two minutes"))
+        #expect(RelayRemoteInstallControl.approvalWindow >= 600)
+    }
+
     @MainActor @Test func aFailedScriptDoesNotBecomeACompletedControlReceipt() async throws {
         let host = FakeHost()
         host.stdout = Data("{\"ok\":\"false\",\"job_id\":\"fixture\",\"error\":\"blocked by fixture shared-storage gate\"}\n".utf8)

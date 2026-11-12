@@ -90,12 +90,13 @@ struct RelayRemoteInstallRequest: Equatable, Sendable {
     }
 
     /// What the approval sheet says. The user approves this exact host and file.
-    func approval(size: Int64?) -> (title: String, detail: String, button: String) {
+    func approval(size: Int64?, deadline: Date? = nil) -> (title: String, detail: String, button: String) {
         let bytes = size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "unknown size"
+        let expiry = Self.expiryNote(deadline)
         switch action {
         case .upload:
             return ("Upload a file to \(host)?",
-                    "\(localPath ?? "") (\(bytes)) will be copied to \(remoteDirectory ?? "") on \(host). Nothing is run. Approval expires in two minutes.",
+                    "\(localPath ?? "") (\(bytes)) will be copied to \(remoteDirectory ?? "") on \(host). Nothing is run." + expiry,
                     "Upload")
         case .install:
             var detail = "\(localPath ?? "") (\(bytes), SHA-256 \(sha256 ?? "")) replaces relayd-linux-\(architecture) on \(host). The current relayd is kept as a backup."
@@ -104,17 +105,27 @@ struct RelayRemoteInstallRequest: Equatable, Sendable {
             detail += allowSharedHome
                 ? " If that folder is on shared storage, every host that mounts it gets this relayd."
                 : " If that folder is on shared storage, the install stops without changing anything."
-            return ("Install relayd on \(host)?", detail + " Approval expires in two minutes.", "Install relayd")
+            return ("Install relayd on \(host)?", detail + expiry, "Install relayd")
         case .rollback:
             var detail = "Restores the relayd that \(installID ?? "") replaced, only if that install is still the one in place."
             if upgradeSupervisor { detail += " The supervisor restarts on the restored relayd." }
             return ("Roll back relayd on \(host)?",
-                    detail + " Running workers are not touched. Approval expires in two minutes.",
+                    detail + " Running workers are not touched." + expiry,
                     "Roll back")
         }
     }
 
     /// Refuses a local file whose SHA-256 differs from the one the request states.
+    /// Says when the approval ends, as a local clock time when it is known.
+    static func expiryNote(_ deadline: Date?) -> String {
+        let minutes = Int(RelayRemoteInstallControl.approvalWindow / 60)
+        guard let deadline else {
+            return " Approval expires after \(minutes) minutes; the dialog then closes and nothing runs."
+        }
+        let time = DateFormatter.localizedString(from: deadline, dateStyle: .none, timeStyle: .short)
+        return " Approve by \(time). After that this dialog closes and nothing runs."
+    }
+
     func verify(_ file: RelayRemoteInstallRunner.LocalFile?) throws {
         guard let expected = sha256 else { return }
         guard let file, file.sha256 == expected else {
@@ -577,12 +588,28 @@ struct RelayRemoteInstallReceipt: Encodable, Sendable {
 /// Runs an upload, install or rollback only after the user approves that exact
 /// request in Relay. A tool's own permission flags never stand in for this.
 @MainActor final class RelayRemoteInstallControl {
+    /// How long an approval dialog accepts an approval. When it ends Relay
+    /// closes the dialog itself, so a stale request can be neither approved
+    /// nor left blocking the next one.
+    nonisolated static let approvalWindow: TimeInterval = 600
+
     private let present: PeerNetworkApproval.Presenter
+    private let dismiss: (NSAlert) -> Void
+    private let window: TimeInterval
     private var requests: [UUID: RelayRemoteInstallRequest] = [:]
     private var receipts: [UUID: RelayRemoteInstallReceipt] = [:]
     private var pending = false
 
-    init(present: PeerNetworkApproval.Presenter? = nil) {
+    init(present: PeerNetworkApproval.Presenter? = nil, dismiss: ((NSAlert) -> Void)? = nil,
+         approvalWindow: TimeInterval = RelayRemoteInstallControl.approvalWindow) {
+        self.window = approvalWindow
+        self.dismiss = dismiss ?? { alert in
+            if let parent = alert.window.sheetParent {
+                parent.endSheet(alert.window, returnCode: .abort)
+            } else {
+                alert.window.orderOut(nil)
+            }
+        }
         self.present = present ?? { alert, completion in
             guard let window = NSApp.keyWindow ?? NSApp.mainWindow ??
                     NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }),
@@ -611,8 +638,8 @@ struct RelayRemoteInstallReceipt: Encodable, Sendable {
         requests[request.requestID] = request
         receipts[request.requestID] = initial
         pending = true
-        let deadline = Date().addingTimeInterval(120)
-        let text = request.approval(size: file?.size)
+        let deadline = Date().addingTimeInterval(window)
+        let text = request.approval(size: file?.size, deadline: deadline)
         let alert = RelayTheme.alert()
         alert.messageText = text.title
         alert.informativeText = text.detail
@@ -624,7 +651,7 @@ struct RelayRemoteInstallReceipt: Encodable, Sendable {
             guard let self, self.pending, self.receipts[request.requestID]?.status == "awaiting_approval" else { return }
             self.pending = false
             guard response == .alertSecondButtonReturn else { self.receipts[request.requestID]?.status = "cancelled"; return }
-            guard Date() < deadline else { self.receipts[request.requestID]?.status = "expired"; return }
+            guard Date() < deadline else { self.markExpired(request.requestID); return }
             self.receipts[request.requestID]?.status = "running"
             Task { @MainActor [weak self] in
                 do {
@@ -645,6 +672,25 @@ struct RelayRemoteInstallReceipt: Encodable, Sendable {
             receipts.removeValue(forKey: request.requestID)
             throw RelayRemoteInstallError.failed("Select Relay with no open dialog before requesting a remote install")
         }
+        let window = self.window
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(window))
+            self?.expire(request.requestID, alert: alert)
+        }
         return initial
+    }
+
+    /// Ends an approval that was not given in time: the receipt says so, the
+    /// dialog closes, and the next request can be shown.
+    func expire(_ id: UUID, alert: NSAlert) {
+        guard pending, receipts[id]?.status == "awaiting_approval" else { return }
+        pending = false
+        markExpired(id)
+        dismiss(alert)
+    }
+
+    private func markExpired(_ id: UUID) {
+        receipts[id]?.status = "expired"
+        receipts[id]?.error = "Not approved within \(Int(window / 60)) minutes; Relay closed the dialog and nothing was run. Send it again under a new request ID."
     }
 }
