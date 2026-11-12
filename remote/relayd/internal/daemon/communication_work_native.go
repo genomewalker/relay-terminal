@@ -79,6 +79,11 @@ type workNativePending struct {
 	Dispatched  bool      `json:"dispatched"`
 	Queries     int       `json:"queries"`
 	Created     time.Time `json:"created"`
+	// The latest reason this message was not delivered: the peer's refusal as
+	// reported by the carrier, or this host's own check failing at claim time.
+	LastRefusal   string    `json:"last_refusal,omitempty"`
+	LastRefusalAt time.Time `json:"last_refusal_at,omitempty"`
+	Refusals      int       `json:"refusals,omitempty"`
 }
 
 func workNativePendingPath(root, id string) string {
@@ -147,6 +152,11 @@ func workNativeReceiptResult(root string, receipt workTransportReceipt) map[stri
 		return result
 	}
 	result["queued_at"] = p.Created.UTC().Format(time.RFC3339Nano)
+	if p.LastRefusal != "" {
+		result["delivery_refused"] = p.LastRefusal
+		result["refused_at"] = p.LastRefusalAt.UTC().Format(time.RFC3339Nano)
+		result["refusals"] = p.Refusals
+	}
 	if p.Dispatched {
 		result["carrier_state"] = "dispatched"
 		result["note"] = "handed to the Relay app for the peer; waiting for the peer's answer. Query this receipt later, never resend"
@@ -246,6 +256,8 @@ func communicationWorkNativeWith(ctx context.Context, root, node string, r Commu
 			return remoteNativeDeliver(ctx, root, node, env, r.WorkEnvelope, hooks)
 		}
 		return workNativeDeliver(ctx, root, node, r.WorkEnvelope)
+	case "work_native_refused":
+		return workNativeRefused(root, r.MessageID, r.WorkRefusal)
 	case "work_native_settle":
 		if remoteNativePendingFor(root, r.MessageID) {
 			return remoteNativeSettle(root, node, r.MessageID, r.WorkReply)
@@ -280,6 +292,11 @@ func workNativeList(root, node string) (map[string]any, error) {
 			}
 			var p workNativePending
 			if communicationRead(path, &p) != nil || p.Version != 1 || workNativePendingPath(root, p.MessageID) != path {
+				continue
+			}
+			if expired, e := workNativeExpireLocked(root, p); e != nil {
+				return e
+			} else if expired {
 				continue
 			}
 			items = append(items, map[string]any{"message_id": p.MessageID, "link_id": p.LinkID, "peer_node_id": p.PeerNodeID, "dispatched": p.Dispatched})
@@ -349,26 +366,26 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 	var link communicationTypedRemoteLink
 	settled := false
 	err := communicationFanoutLocked(root, func() error {
+		// Expiry comes first and needs only the pending record and receipt, so
+		// a message whose link or route no longer checks out still ends with
+		// an explicit receipt instead of staying queued for ever.
+		var queued workNativePending
+		if communicationRead(workNativePendingPath(root, id), &queued) == nil && queued.Version == 1 && queued.MessageID == id {
+			if expired, e := workNativeExpireLocked(root, queued); e != nil {
+				return e
+			} else if expired {
+				return errors.New("not confirmed by the peer within 24 h; the receipt says so")
+			}
+		}
 		var e error
 		p, receipt, link, e = workNativeOutbound(ctx, root, node, id)
 		if e != nil {
+			workNativeRecordRefusalLocked(root, id, "not dispatched by the sending host: "+e.Error())
 			return e
 		}
 		if !workOutcomeUnknown(receipt.Result) {
 			settled = true
 			return workNativeDrop(root, id)
-		}
-		if workNativeNow().Sub(p.Created) > workNativeQueryWindow {
-			// Say so in the receipt the sender reads, then stop carrying.
-			receipt.Result = map[string]any{"status": "outcome_unknown", "carrier": "relay_host_channel",
-				"error": "the peer did not confirm this message within 24 h; ask the recipient before sending it again under a new ID"}
-			if e := communicationAtomic(workOutboundPath(root, id), receipt); e != nil {
-				return e
-			}
-			if e := workNativeDrop(root, id); e != nil {
-				return e
-			}
-			return errors.New("not confirmed by the peer within 24 h; the receipt says so")
 		}
 		return nil
 	})
@@ -623,4 +640,92 @@ func workNativeAttestPane(root, node string, link communicationTypedRemoteLink, 
 		return "", errors.New("the sending pane could not be attested again; message not dispatched: " + err.Error())
 	}
 	return signature, nil
+}
+
+const workNativeRefusalLimit = 300
+
+// workNativeRefusalText keeps a refusal reason to one bounded printable line.
+func workNativeRefusalText(reason string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(reason) {
+		if b.Len() >= workNativeRefusalLimit {
+			break
+		}
+		if r < 0x20 || r == 0x7f {
+			r = ' '
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// workNativeRecordRefusalLocked notes why a queued message was not delivered.
+// It never changes the receipt's status, the wire or the queue order. Called
+// under the communication lock; a missing pending record is not an error.
+func workNativeRecordRefusalLocked(root, id, reason string) {
+	var p workNativePending
+	if communicationRead(workNativePendingPath(root, id), &p) != nil || p.Version != 1 || p.MessageID != id {
+		return
+	}
+	p.LastRefusal = workNativeRefusalText(reason)
+	p.LastRefusalAt = workNativeNow()
+	p.Refusals++
+	_ = communicationAtomic(workNativePendingPath(root, id), p)
+}
+
+// workNativeRefused is the carrier's report that the peer refused (or could not
+// be asked to accept) a claimed message. The message stays queued; the reason
+// is shown on the sender's receipt until it settles or expires.
+func workNativeRefused(root, id, reason string) (map[string]any, error) {
+	if !validSessionID.MatchString(id) {
+		return nil, errors.New("message UUID required")
+	}
+	text := workNativeRefusalText(reason)
+	if text == "" {
+		return nil, errors.New("refusal reason required")
+	}
+	found := false
+	err := communicationFanoutLocked(root, func() error {
+		var p workNativePending
+		if communicationRead(workNativePendingPath(root, id), &p) != nil || p.Version != 1 || p.MessageID != id {
+			return nil
+		}
+		found = true
+		workNativeRecordRefusalLocked(root, id, "refused by the peer: "+text)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return map[string]any{"status": "not_pending", "message_id": id}, nil
+	}
+	return map[string]any{"status": "recorded", "message_id": id}, nil
+}
+
+// workNativeExpireLocked ends a message that has waited past the query window:
+// the receipt the sender reads gets an explicit error (with the last refusal
+// reason, if known) and the queue entry is dropped. It reports whether the
+// message expired. Called under the communication lock.
+func workNativeExpireLocked(root string, p workNativePending) (bool, error) {
+	if workNativeNow().Sub(p.Created) <= workNativeQueryWindow {
+		return false, nil
+	}
+	message := "not delivered: the peer did not confirm this message within 24 h"
+	if p.LastRefusal != "" {
+		message += " (last reason: " + p.LastRefusal + ")"
+	}
+	message += "; ask the recipient before sending it again under a new ID"
+	var receipt workTransportReceipt
+	if communicationRead(workOutboundPath(root, p.MessageID), &receipt) == nil && validWorkTransportReceipt(receipt) &&
+		receipt.Wire.MessageID == p.MessageID && workOutcomeUnknown(receipt.Result) {
+		receipt.Result = map[string]any{"status": "outcome_unknown", "carrier": "relay_host_channel", "error": message}
+		if p.LastRefusal != "" {
+			receipt.Result["delivery_refused"] = p.LastRefusal
+		}
+		if e := communicationAtomic(workOutboundPath(root, p.MessageID), receipt); e != nil {
+			return false, e
+		}
+	}
+	return true, workNativeDrop(root, p.MessageID)
 }

@@ -64,6 +64,7 @@ type CommunicationRequest struct {
 	SourceSignature            string                     `json:"source_signature,omitempty"`
 	WorkEnvelope               string                     `json:"work_envelope,omitempty"`
 	WorkReply                  string                     `json:"work_reply,omitempty"`
+	WorkRefusal                string                     `json:"work_refusal,omitempty"`
 	EstablishEnvelope          string                     `json:"establish_envelope,omitempty"`
 	EstablishReply             string                     `json:"establish_reply,omitempty"`
 	TrustedNodes               []communicationTrustedNode `json:"trusted_nodes,omitempty"`
