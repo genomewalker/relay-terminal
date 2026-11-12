@@ -377,6 +377,9 @@ func workNativeClaim(ctx context.Context, root, node, id string) (map[string]any
 				return errors.New("not confirmed by the peer within 24 h; the receipt says so")
 			}
 		}
+		if e := workNativeRetargetLocked(ctx, root, node, id); e != nil {
+			return e
+		}
 		var e error
 		p, receipt, link, e = workNativeOutbound(ctx, root, node, id)
 		if e != nil {
@@ -500,6 +503,9 @@ func workNativeDeliver(ctx context.Context, root, node, text string) (map[string
 	}
 	result, err := workReceiveWith(ctx, root, node, peerCert, m, fresh, workNativeAuth)
 	if err != nil {
+		if note := workNativeAutoRepin(ctx, root, node, m); note != "" {
+			return nil, errors.New(note + " (" + err.Error() + ")")
+		}
 		return nil, err
 	}
 	reply, err := json.Marshal(workNativeReply{MessageID: m.MessageID, LinkID: m.LinkID, Fingerprint: m.Fingerprint, Result: result})
@@ -728,4 +734,100 @@ func workNativeExpireLocked(root string, p workNativePending) (bool, error) {
 		}
 	}
 	return true, workNativeDrop(root, p.MessageID)
+}
+
+// workTargetRepinned starts the refusal a Work host returns after it re-pinned
+// a link because the Work application restarted. The carrier reports it to
+// the sender (work_native_refused); the sender re-addresses on its next claim.
+const workTargetRepinned = "work_target_repinned"
+
+// Replaced in tests.
+var (
+	workAutoRepinStale = workLinkStale
+	workAutoRepin      = repinWorkLink
+)
+
+// workNativeAutoRepin runs on the Work host after a carried send to one of its
+// Work conversations was refused. If the same thread now runs under a new
+// owner or incarnation, it re-pins the link with exactly the owner re-pin
+// (repinWorkLink: native socket proof before and after the reference refresh,
+// pin generation, audit, signed peer re-pin), as `communication-work-repin
+// --watch` would. It returns a refusal note when the message was addressed to
+// an older pin of the same thread, and "" otherwise. Never delivers anything.
+func workNativeAutoRepin(ctx context.Context, root, node string, m workWire) string {
+	if m.Operation != "send" || m.Target.Kind != "work" || m.Target.Work == nil {
+		return ""
+	}
+	link, err := communicationReadTypedActiveLink(ctx, root, node, m.LinkID)
+	if err != nil || link.Local.Kind != "work" || link.Local.Work == nil || link.Local.Work.Thread != m.Target.Work.Thread || link.Local.NodeID != m.Target.NodeID {
+		return ""
+	}
+	if stale, e := workAutoRepinStale(ctx, root, node, m.LinkID); e == nil && stale {
+		if _, e = workAutoRepin(ctx, root, node, m.LinkID); e != nil {
+			return ""
+		}
+		if link, err = communicationReadTypedActiveLink(ctx, root, node, m.LinkID); err != nil {
+			return ""
+		}
+	}
+	if communicationEndpointEqual(link.Local, m.Target) {
+		return ""
+	}
+	return workTargetRepinned + ": the Work application restarted and this link now pins incarnation " + link.Local.Work.Incarnation +
+		"; the sender re-addresses this message on its next claim, never under a new ID"
+}
+
+// workNativeRetargetLocked re-addresses a queued, unsettled message after the
+// Work host re-pinned its endpoint (received as a signed peer re-pin, so the
+// new pin comes from the pinned peer). Only the target's owner and incarnation
+// may differ: same node, kind and thread, same route, certificate, source,
+// revisions and message. The fingerprint is recomputed; a Work host that
+// already holds this message ID under the old fingerprint refuses it as an
+// identity conflict, so nothing is delivered twice. Called under the
+// communication lock; anything else is left to the normal checks.
+func workNativeRetargetLocked(ctx context.Context, root, node, id string) error {
+	var p workNativePending
+	var receipt workTransportReceipt
+	if communicationRead(workNativePendingPath(root, id), &p) != nil || p.Version != 1 || p.MessageID != id {
+		return nil
+	}
+	if communicationRead(workOutboundPath(root, id), &receipt) != nil || !validWorkTransportReceipt(receipt) || receipt.Node != node ||
+		receipt.Wire.MessageID != id || !workOutcomeUnknown(receipt.Result) {
+		return nil
+	}
+	link, err := communicationReadTypedActiveLink(ctx, root, node, receipt.Wire.LinkID)
+	if err != nil {
+		return nil
+	}
+	w, t := receipt.Wire, link.Peer
+	if t.Kind != "work" || w.Target.Kind != "work" || t.Work == nil || w.Target.Work == nil || t.NodeID != w.Target.NodeID ||
+		t.Work.Thread != w.Target.Work.Thread || communicationEndpointEqual(t, w.Target) {
+		return nil
+	}
+	if link.RouteID != receipt.RouteID || link.RouteRevision != receipt.RouteRevision || link.PeerCertificateSHA256 != receipt.PeerCertificateSHA256 ||
+		!communicationEndpointEqual(link.Local, w.Source) || link.Revision != w.SourceRevision || link.PeerRevision != w.TargetRevision || link.Peer.NodeID != p.PeerNodeID {
+		return nil
+	}
+	old := *w.Target.Work
+	w.Target = t
+	w.Fingerprint = ""
+	fingerprint := workFingerprint(w)
+	if fingerprint == "" || (p.Fingerprint != receipt.Wire.Fingerprint && p.Fingerprint != fingerprint) {
+		return nil
+	}
+	w.Fingerprint = fingerprint
+	// Pending first: after a crash between the writes the pending record
+	// already names the new fingerprint, which the check above accepts.
+	p.Fingerprint = fingerprint
+	p.LastRefusal = workNativeRefusalText("re-addressed from Work incarnation " + old.Incarnation + " to " + t.Work.Incarnation + " after the Work application restarted")
+	p.LastRefusalAt = workNativeNow()
+	if e := communicationAtomic(workNativePendingPath(root, id), p); e != nil {
+		return e
+	}
+	receipt.Wire = w
+	if e := communicationAtomic(workOutboundPath(root, id), receipt); e != nil {
+		return e
+	}
+	_ = communicationEvent(root, node, "communication_work_retargeted", []map[string]string{{"message_id": id, "link_id": w.LinkID, "from": old.Incarnation, "to": t.Work.Incarnation}})
+	return nil
 }
