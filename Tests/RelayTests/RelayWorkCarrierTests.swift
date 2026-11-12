@@ -396,7 +396,8 @@ private func runCarrier(_ hosts: FakeWorkHosts, _ loop: RelayWorkCarrierLoop, fo
     #expect(refusals.count == 1)
     #expect(refusals.first?.0 == dandy.connectionKey)
     #expect(refusals.first?.1["message_id"] as? String == "e1")
-    #expect(refusals.first?.1["carrier_error"] as? String == "relayd: Work target changed (incarnation 71513)")
+    #expect(refusals.first?.1["work_refusal"] as? String == "relayd: Work target changed (incarnation 71513)")
+    #expect(refusals.first?.1["carrier_error"] == nil)
     #expect(!sent.contains { $0.1["operation"] as? String == "work_native_settle" })
 
     // An unreachable peer is not a refusal: nothing is reported or settled.
@@ -412,7 +413,54 @@ private func runCarrier(_ hosts: FakeWorkHosts, _ loop: RelayWorkCarrierLoop, fo
     deliverError = nil
     now = now.addingTimeInterval(5)
     await loop.tick(profiles: [mac, dandy], now: now)
-    #expect(sent.filter { $0.1["operation"] as? String == "work_native_refused" }.map { $0.1["carrier_error"] as? String }
+    #expect(sent.filter { $0.1["operation"] as? String == "work_native_refused" }.map { $0.1["work_refusal"] as? String }
             == ["the peer's relayd answered without a signed reply"])
     #expect(!sent.contains { $0.1["operation"] as? String == "work_native_settle" })
+}
+
+/// A failed claim or settle is logged once per message and reason, not on
+/// every pass. A claim failure is not reported as a peer refusal (the sending
+/// relayd records its own reason), and a settled message clears its note.
+@MainActor
+@Test func workCarrierLogsFailedClaimsAndSettlesOncePerReason() async {
+    let mac = ConnectionProfile(name: "mac", kind: .ssh, host: "mac-host")
+    let dandy = ConnectionProfile(name: "dandy", kind: .ssh, host: "dandy-07")
+    var claimError: Error? = RemoteCatalogError.failed("Work relationship changed")
+    var settleError: Error?
+    var sent: [String] = []
+    let loop = RelayWorkCarrierLoop(workspace: nil, request: { profile, packet in
+        let operation = packet["operation"] as? String ?? ""
+        sent.append(operation)
+        switch operation {
+        case "work_native_pending":
+            if profile.connectionKey == mac.connectionKey { return ["node_id": "node-mac", "items": [], "native_routes": 1] }
+            return ["node_id": "node-dandy", "items": [["message_id": "s1", "peer_node_id": "node-mac"]], "native_routes": 1]
+        case "work_native_claim":
+            if let claimError { throw claimError }
+            return ["work_envelope": "signed"]
+        case "deliver_signed_work": return ["work_reply": "delivered"]
+        case "work_native_settle":
+            if let settleError { throw settleError }
+            return [:]
+        default: return [:]
+        }
+    })
+    var now = Date(timeIntervalSince1970: 3_000_000)
+    for _ in 0..<3 {
+        await loop.tick(profiles: [mac, dandy], now: now)
+        now = now.addingTimeInterval(5)
+    }
+    #expect(loop.noted["s1"] == "claim_failed: Work relationship changed")
+    #expect(!sent.contains("work_native_refused"))
+    #expect(!sent.contains("deliver_signed_work"))
+
+    claimError = nil
+    settleError = RemoteCatalogError.failed("receipt busy")
+    await loop.tick(profiles: [mac, dandy], now: now)
+    #expect(loop.noted["s1"] == "settle_failed: receipt busy")
+
+    settleError = nil
+    now = now.addingTimeInterval(5)
+    await loop.tick(profiles: [mac, dandy], now: now)
+    #expect(loop.noted["s1"] == nil)
 }

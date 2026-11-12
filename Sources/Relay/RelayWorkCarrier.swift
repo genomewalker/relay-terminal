@@ -46,7 +46,7 @@ enum RelayWorkCarrier {
     }
 
     static func refusedPacket(messageID: String, reason: String) -> [String: Any] {
-        ["operation": "work_native_refused", "message_id": messageID, "carrier_error": reason]
+        ["operation": "work_native_refused", "message_id": messageID, "work_refusal": reason]
     }
 
     /// The reason the peer's relayd gave for refusing a signed delivery, or nil
@@ -247,6 +247,28 @@ enum RelayWorkCarrier {
         wake()
     }
 
+    /// The last failure logged per message, so a stuck message is logged once
+    /// per reason rather than on every pass. In memory only.
+    private(set) var noted: [String: String] = [:]
+
+    private func note(_ step: RelayWorkCarrier.Step, _ name: String, _ reason: String) {
+        let key = name + ": " + reason
+        guard noted[step.messageID] != key else { return }
+        if noted.count >= 256 { noted.removeAll() }
+        noted[step.messageID] = key
+        RelayDiagnostics.shared.record(category: "work_carrier", name: name, details: [
+            "message_id": step.messageID, "from": step.fromHost, "to": step.toHost, "reason": reason,
+        ])
+    }
+
+    private func reportRefusal(_ step: RelayWorkCarrier.Step, from: ConnectionProfile, reason: String) async {
+        do {
+            _ = try await request(from, RelayWorkCarrier.refusedPacket(messageID: step.messageID, reason: reason))
+        } catch {
+            note(step, "refusal_not_recorded", RelayWorkCarrier.refusal(error) ?? error.localizedDescription)
+        }
+    }
+
     /// A pane on this host attached or caught up: its relayd (or supervisor)
     /// may have just come back, so check it on the next pass.
     func hostReady(_ key: String) {
@@ -285,33 +307,49 @@ enum RelayWorkCarrier {
         }
         for step in RelayWorkCarrier.plan(Array(outboxes.values)) {
             guard let from = byKey[step.fromHost], let to = byKey[step.toHost] else { continue }
-            guard let claim = try? await request(from, RelayWorkCarrier.claimPacket(messageID: step.messageID)),
-                  let envelope = claim["work_envelope"] as? String else { continue }
+            let claim: [String: Any]
+            do {
+                claim = try await request(from, RelayWorkCarrier.claimPacket(messageID: step.messageID))
+            } catch {
+                // The sending relayd records its own reason on the queue record.
+                note(step, "claim_failed", RelayWorkCarrier.refusal(error) ?? error.localizedDescription)
+                continue
+            }
+            guard let envelope = claim["work_envelope"] as? String else {
+                if claim["status"] as? String != "settled" {
+                    note(step, "claim_failed", "the sending relayd returned no signed message")
+                }
+                continue
+            }
             let delivered: [String: Any]
             do {
                 delivered = try await request(to, RelayWorkCarrier.deliverPacket(envelope: envelope))
             } catch {
                 // The peer's relayd refused the signed message (a changed
-                // target, say): tell the sending relayd, whose receipt shows it
-                // as unverified. The message stays queued there; nothing is
-                // settled or resent under a new ID.
+                // target, say): tell the sending relayd, whose receipt shows
+                // why. The message stays queued there; nothing is settled or
+                // resent under a new ID. An unreachable peer is only logged.
                 let reason = RelayWorkCarrier.refusal(error)
-                RelayDiagnostics.shared.record(category: "work_carrier", name: reason == nil ? "deliver_unreachable" : "deliver_refused",
-                    details: ["message_id": step.messageID, "from": step.fromHost, "to": step.toHost,
-                              "reason": reason ?? error.localizedDescription])
+                note(step, reason == nil ? "deliver_unreachable" : "deliver_refused", reason ?? error.localizedDescription)
                 if let reason {
-                    _ = try? await request(from, RelayWorkCarrier.refusedPacket(messageID: step.messageID, reason: reason))
+                    await reportRefusal(step, from: from, reason: reason)
                 }
                 continue
             }
             guard let reply = delivered["work_reply"] as? String else {
                 let reason = "the peer's relayd answered without a signed reply"
-                RelayDiagnostics.shared.record(category: "work_carrier", name: "deliver_refused",
-                    details: ["message_id": step.messageID, "from": step.fromHost, "to": step.toHost, "reason": reason])
-                _ = try? await request(from, RelayWorkCarrier.refusedPacket(messageID: step.messageID, reason: reason))
+                note(step, "deliver_refused", reason)
+                await reportRefusal(step, from: from, reason: reason)
                 continue
             }
-            _ = try? await request(from, RelayWorkCarrier.settlePacket(messageID: step.messageID, reply: reply))
+            do {
+                _ = try await request(from, RelayWorkCarrier.settlePacket(messageID: step.messageID, reply: reply))
+                noted[step.messageID] = nil
+            } catch {
+                // The next claim of the same message is a signed receipt query,
+                // never a second delivery.
+                note(step, "settle_failed", RelayWorkCarrier.refusal(error) ?? error.localizedDescription)
+            }
         }
         // A carried item is gone from the cached outbox until its host is
         // checked again; drop the cache so one envelope is not re-claimed
