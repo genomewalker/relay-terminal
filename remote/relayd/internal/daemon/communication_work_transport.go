@@ -246,7 +246,7 @@ func workSendOrReceipt(ctx context.Context, root, node, caller string, r WorkReq
 	if binding.Endpoint == workNativeEndpoint {
 		// The Relay app carries this message over its host channel and settles
 		// the receipt; this call never posts and never resends.
-		return workNativeReceiptResult(receipt), nil
+		return workNativeReceiptResult(root, receipt), nil
 	}
 	wire := receipt.Wire
 	if r.Operation == "send" {

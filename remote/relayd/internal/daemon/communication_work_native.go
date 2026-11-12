@@ -130,11 +130,29 @@ func workNativeQueue(root string, receipt workTransportReceipt, link communicati
 	return communicationAtomic(workNativePendingPath(root, receipt.Wire.MessageID), workNativePending{Version: 1, MessageID: receipt.Wire.MessageID, LinkID: link.ID, PeerNodeID: link.Peer.NodeID, Fingerprint: receipt.Wire.Fingerprint, Text: text, Created: workNativeNow()})
 }
 
-func workNativeReceiptResult(receipt workTransportReceipt) map[string]any {
+// workNativeReceiptResult reports an unsettled host-channel message with the
+// stage it has reached, so "outcome_unknown" is not read as a failure while the
+// message only waits for the carrier. The status itself is unchanged.
+func workNativeReceiptResult(root string, receipt workTransportReceipt) map[string]any {
 	result := workReceiptResult(receipt)
-	if workOutcomeUnknown(receipt.Result) {
-		result["carrier"] = "relay_host_channel"
-		result["note"] = "carried by the Relay app; query this receipt later, never resend"
+	if !workOutcomeUnknown(receipt.Result) {
+		return result
+	}
+	result["carrier"] = "relay_host_channel"
+	result["note"] = "carried by the Relay app; query this receipt later, never resend"
+	var p workNativePending
+	if communicationRead(workNativePendingPath(root, receipt.Wire.MessageID), &p) != nil || p.Version != 1 ||
+		p.MessageID != receipt.Wire.MessageID || p.Fingerprint != receipt.Wire.Fingerprint {
+		// No live queue entry: the receipt's own error (if any) explains why.
+		return result
+	}
+	result["queued_at"] = p.Created.UTC().Format(time.RFC3339Nano)
+	if p.Dispatched {
+		result["carrier_state"] = "dispatched"
+		result["note"] = "handed to the Relay app for the peer; waiting for the peer's answer. Query this receipt later, never resend"
+	} else {
+		result["carrier_state"] = "queued"
+		result["note"] = "queued on this host until the Relay app carries it; query this receipt later, never resend"
 	}
 	return result
 }
@@ -519,7 +537,7 @@ func workNativeSettle(ctx context.Context, root, node, id, text string) (map[str
 	if err != nil {
 		return nil, err
 	}
-	return workNativeReceiptResult(receipt), nil
+	return workNativeReceiptResult(root, receipt), nil
 }
 
 // communicationBindingTransportSet moves an existing peer binding between the
