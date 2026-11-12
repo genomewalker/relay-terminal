@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
@@ -41,7 +43,11 @@ func RelayNodeWithHostRequestHandlers(ctx context.Context, input io.Reader, outp
 	clientReader := protocol.NewFragmentReader(input)
 	upstreamReader := protocol.NewFragmentReader(upstream)
 	upstreamWriter := protocol.NewScheduledWriter(upstream)
-	clientWriter := protocol.NewScheduledWriter(output)
+	stats := newNodeStats(time.Now)
+	clientWriter := protocol.NewScheduledWriter(timedWriter{out: output, stats: stats})
+	measuring := make(chan struct{})
+	var startMeasuring sync.Once
+	go runNodeStats(ctx, stats, clientWriter, measuring)
 	var negotiated atomic.Bool
 	var upstreamFragments atomic.Bool
 	completed := make(chan error, 2)
@@ -53,9 +59,17 @@ func RelayNodeWithHostRequestHandlers(ctx context.Context, input io.Reader, outp
 				completed <- err
 				return
 			}
+			startMeasuring.Do(func() { close(measuring) })
+			if frame.Type == protocol.Pong && stats.pong(frame.Payload) {
+				continue
+			}
 			if frame.Type == protocol.Capabilities {
 				var capabilities struct {
 					WireFragments bool `json:"wire_fragments"`
+					NodePingEcho  bool `json:"node_ping_echo"`
+				}
+				if json.Unmarshal(frame.Payload, &capabilities) == nil && capabilities.NodePingEcho {
+					stats.enableRTT()
 				}
 				if json.Unmarshal(frame.Payload, &capabilities) == nil && capabilities.WireFragments {
 					clientReader.Enabled = true

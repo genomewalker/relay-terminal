@@ -129,6 +129,8 @@ func main() {
 		runDaemon(os.Args[2:])
 	case "node":
 		runNode(os.Args[2:])
+	case "node-stats":
+		runNodeStats(os.Args[2:])
 	case "pane-health-controller-rpc":
 		runPaneHealthControllerRPC(os.Args[2:])
 	case "worker":
@@ -1615,6 +1617,7 @@ func runNode(arguments []string) {
 	if err := protocol.NewWriter(connection).Write(hello); err != nil {
 		fatal(err.Error())
 	}
+	loopbackproxy.NodeStatsDir = nodeStatsDir(*socket)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := loopbackproxy.RelayNodeWithHostRequestHandlers(ctx, os.Stdin, os.Stdout, connection, daemon.HandleNodeHostRotationRequest, daemon.NodeHostAccountsHandler(*socket)); err != nil && err != io.EOF && ctx.Err() == nil {

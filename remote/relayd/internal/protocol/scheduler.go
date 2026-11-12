@@ -126,6 +126,17 @@ func (s *frameScheduler) choose() int {
 	}
 	return best
 }
+
+// Queued reports the scheduler's waiting bytes and frames (measurement only).
+func (writer *Writer) Queued() (bytes, frames int) {
+	if writer.scheduler == nil {
+		return 0, 0
+	}
+	writer.scheduler.mu.Lock()
+	defer writer.scheduler.mu.Unlock()
+	return writer.scheduler.bytes, len(writer.scheduler.pending)
+}
+
 func (writer *Writer) EnableFragments() {
 	if writer.scheduler != nil {
 		writer.scheduler.mu.Lock()
