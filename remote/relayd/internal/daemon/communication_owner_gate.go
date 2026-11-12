@@ -32,7 +32,7 @@ func communicationOwnerOperation(operation string) bool {
 // carrier sends: Work and route-link messages, and desktop link establishment.
 func communicationCarrierOperation(operation string) bool {
 	switch operation {
-	case "work_native_pending", "work_native_claim", "work_native_settle", "work_native_refused", "deliver_signed_work", "deliver_signed_desktop_establish":
+	case "work_native_pending", "work_native_claim", "work_native_settle", "deliver_signed_work", "deliver_signed_desktop_establish":
 		return true
 	}
 	return false
