@@ -2779,6 +2779,16 @@ final class RelaySidePanelServer: ObservableObject {
                     guard workspace.panes[paneID] === pane, pane.profile == profile else {
                         throw RelayHostRotationRPC.Failure.changedConnection
                     }
+                    if RelayInstalledUpdateScreenRefresh.admits(proof, paneID: paneID, pane: pane) {
+                        // A hidden pane whose saved screen was cut short at
+                        // restore gets one fresh screen, as if it were shown,
+                        // before its prompt is read for this request.
+                        _ = await pane.runtime.refreshHiddenScreenBaseForInstalledUpdate()
+                        await pane.runtime.prepareAgentMaintenancePromptProof()
+                        guard workspace.panes[paneID] === pane, pane.profile == profile else {
+                            throw RelayHostRotationRPC.Failure.changedConnection
+                        }
+                    }
                     let facts = RelayPaneHealthFacts.read(pane, proof: proof)
                     if proof.valid(for: paneID), RelayAgentMaintenancePolicy.installedImageVerified(proof) {
                         result = .object(["state": .string("already_current"), "pane": facts.value])

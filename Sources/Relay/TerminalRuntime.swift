@@ -3082,7 +3082,8 @@ final class TerminalRuntime: NSObject {
         }
         guard preparedMaintenancePrompt != nil else {
             return "the hidden pane's screen has not been read: " +
-                (preparedMaintenanceFailure ?? io.maintenanceScreenAvailability().reason ?? "no reading was attempted")
+                (preparedMaintenanceFailure ?? io.maintenanceScreenAvailability().reason ?? "no reading was attempted") +
+                (hiddenScreenRefreshNote.map { "; " + $0 } ?? "")
         }
         guard let prepared = currentPreparedPrompt(observation) else { return "the hidden pane's screen reading is stale" }
         return prepared.empty(explainedAgents: explainedAgents) ? nil
@@ -3261,6 +3262,36 @@ final class TerminalRuntime: NSObject {
             }
         }
         return "Relay has no complete screen for “\(pane.displayName)” yet"
+    }
+
+    /// Outcome of the last fresh-base request, named in held receipts.
+    private(set) var hiddenScreenRefreshNote: String?
+
+    /// 0.5.61, for a user-requested installed update only: a hidden pane
+    /// whose saved copy was cut short at restore gets one fresh screen
+    /// without being shown. Refused unless the pane has no surface, is
+    /// connected with no other viewer and the copy is cut short; the caller
+    /// also requires relayd's idle proof, no draft and no approval.
+    func refreshHiddenScreenBaseForInstalledUpdate() async -> Bool {
+        guard let pane, pane.profile.backend == .relay, pane.connectionState == .connected, started,
+              observeActiveScreen() == .noSurface, (pane.remoteClientCount ?? 1) <= 1,
+              io.maintenanceScreenAvailability().reason == TerminalIOBridge.savedCopyCutShort else { return false }
+        guard io.reconnectFromStartForFreshBase() else {
+            hiddenScreenRefreshNote = "Relay could not reopen the pane's route for a fresh screen"
+            recordInputDiagnostic("hidden-screen-base-refresh-refused")
+            return false
+        }
+        recordInputDiagnostic("hidden-screen-base-refresh")
+        for _ in 0..<60 {
+            try? await Task.sleep(for: .milliseconds(250))
+            guard self.pane === pane else { return false }
+            if case .available = io.maintenanceScreenAvailability() {
+                hiddenScreenRefreshNote = nil
+                return true
+            }
+        }
+        hiddenScreenRefreshNote = "a fresh screen was requested but did not arrive within 15 s"
+        return false
     }
 
     func prepareAgentMaintenancePromptProof() async {
@@ -4534,6 +4565,47 @@ final class TerminalIOBridge: @unchecked Sendable {
         return currentTransport?.reconnectExistingPaneRoute() == true
     }
 
+    /// The next replay rebuilds the saved copy from scratch. Refused while a
+    /// replay is open, so it never changes one already in progress.
+    func prepareFreshBaseReplay() -> Bool {
+        outputOrderingLock.lock()
+        defer { outputOrderingLock.unlock() }
+        replayLock.lock()
+        defer { replayLock.unlock() }
+        guard !replaying, replayCommitGeneration == nil else { return false }
+        replayRequiresFreshBase = true
+        replayUsesRetainedGrid = false
+        return true
+    }
+
+    /// Tests only: the state a viewport-mismatched restore leaves.
+    func markSnapshotCutShortForTesting() {
+        receiveLock.lock()
+        snapshotBufferTruncated = true
+        receiveLock.unlock()
+    }
+
+    /// 0.5.61: rebuilds a hidden pane's saved copy that was cut short at
+    /// restore. The route reopens on the grid it already uses and asks the
+    /// worker for its whole retained output; the worker's attach repaint is
+    /// the same redraw that showing the pane causes. The copy stays marked
+    /// cut short until that replay commits as a fresh base, so a refused or
+    /// failed reopen never makes a partial copy readable.
+    @discardableResult
+    func reconnectFromStartForFreshBase() -> Bool {
+        guard prepareFreshBaseReplay() else { return false }
+        resizeLock.lock()
+        let currentTransport = transport
+        resizeLock.unlock()
+        let accepted = currentTransport?.reconnectExistingPaneRoute(fromStart: true) == true
+        if !accepted {
+            replayLock.lock()
+            if !replaying { replayRequiresFreshBase = false }
+            replayLock.unlock()
+        }
+        return accepted
+    }
+
     func removeTransport() -> RelayRemoteTransport? {
         outputOrderingLock.lock()
         invalidatePromptEditorRestorationBarrier()
@@ -4558,6 +4630,8 @@ final class TerminalIOBridge: @unchecked Sendable {
         if case .available(let snapshot) = maintenanceScreenAvailability() { return snapshot }
         return nil
     }
+
+    static let savedCopyCutShort = "the saved copy was cut short (no complete screen since restore)"
 
     enum MaintenanceScreenAvailability {
         case available(MaintenanceScreenSnapshot)
@@ -4593,9 +4667,7 @@ final class TerminalIOBridge: @unchecked Sendable {
         defer { receiveLock.unlock() }
         guard connected else { return .unavailable("the terminal has no live connection") }
         guard snapshotPaneID != nil else { return .unavailable("the pane's screen is not being saved") }
-        guard !snapshotBufferTruncated else {
-            return .unavailable("the saved copy was cut short (no complete screen since restore)")
-        }
+        guard !snapshotBufferTruncated else { return .unavailable(Self.savedCopyCutShort) }
         guard !snapshotBuffer.isEmpty else { return .unavailable("the saved copy is empty") }
         guard snapshotRemoteSequence > 0 else { return .unavailable("the saved copy has no output sequence") }
         guard observed <= snapshotRemoteSequence else {
@@ -5299,7 +5371,11 @@ final class TerminalIOBridge: @unchecked Sendable {
         invalidatePromptEditorRestorationBarrier()
         replayLock.lock()
         if !replaying { replayKnownSequence = maximumObservedRemoteSequence }
-        if !replaying { replayUsesRetainedGrid = hasCommittedReplay && expectsExplicitReplayBoundary }
+        if !replaying {
+            // A replay requested from the worker's first retained byte rebuilds
+            // the screen from scratch; it never extends the retained grid.
+            replayUsesRetainedGrid = hasCommittedReplay && expectsExplicitReplayBoundary && !replayRequiresFreshBase
+        }
         if !replaying { TerminalBufferRetentionPolicy.clear(&replayBuffer) }
         replaying = true
         reconnectReplayExtendsRestoredScreen = false

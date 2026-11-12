@@ -1580,14 +1580,18 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// Exercise the normal route recovery without closing the shared node or worker.
     /// Only an attached multiplexed pane can enter this path; its next Hello
     /// must attach an existing worker rather than creating a replacement.
+    /// `fromStart` asks the worker for its whole retained output instead of
+    /// the bytes after the last acknowledged sequence, so the viewer can
+    /// rebuild a complete screen. It is set only when the reopen is accepted.
     @discardableResult
-    func reconnectExistingPaneRoute() -> Bool {
+    func reconnectExistingPaneRoute(fromStart: Bool = false) -> Bool {
         lock.lock()
         // A dedicated fallback route reopens through the same retained-worker
         // reconnect as an interrupted connection: the next Hello requires the
         // existing worker and resumes from the last acknowledged sequences.
         if !detached, !sessionEnded, attached, hasAttachedWorker, nodeChannel == nil,
            !reconnectScheduled, let dedicated = process, let context = connectionContext {
+            if fromStart { lastSequence = 0 }
             let dedicatedWriter = writer
             lock.unlock()
             context.onStatus(RelayStatus(state: "reconnecting",
@@ -1604,6 +1608,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             return false
         }
         attached = false
+        if fromStart { lastSequence = 0 }
         lock.unlock()
         context.onStatus(RelayStatus(state: "reconnecting",
             message: "Reopening this pane's terminal route."), deliveryEpochSnapshot())

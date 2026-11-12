@@ -305,4 +305,68 @@ struct RelayPromptControlTransportTests {
         #expect(io.maintenanceScreenAvailability().reason == "a replay is in progress")
         #expect(io.maintenanceScreenSnapshot() == nil)
     }
+
+    /// 0.5.61 step 2: an ordinary resume never makes a cut-short copy
+    /// readable; only a replay requested as a fresh base does.
+    @MainActor @Test
+    func onlyAFreshBaseReplayMakesACutShortCopyReadable() async throws {
+        let profile = ConnectionProfile(name: "Fresh base", host: "fresh-base.invalid")
+        let paneID = UUID(), writer = OwnedPromptFrameWriter()
+        let original = transport(writer, profile: profile, paneID: paneID)
+        let io = TerminalIOBridge()
+        io.installTransport(original)
+        _ = io.restoreSnapshot(paneID: paneID)
+        defer {
+            _ = io.removeTransport(); original.detach()
+            TerminalSnapshotStore.shared.remove(paneID: paneID)
+        }
+        func replay(_ text: String, sequence: UInt64) async {
+            io.beginReplay()
+            io.setExplicitReplayBoundary(true)
+            _ = io.receive(Data(text.utf8), remoteSequence: sequence)
+            await withCheckedContinuation { continuation in
+                io.onReplayFinished = { _ in continuation.resume() }
+                io.endReplay()
+            }
+            io.onReplayFinished = nil
+        }
+        let screen = "\u{1b}[2J\u{1b}[H❯ \r\n────────\r\n⏵⏵ bypass permissions on"
+        await replay(screen, sequence: 100)
+        #expect(io.maintenanceScreenAvailability().reason == nil)
+        io.markSnapshotCutShortForTesting()
+        #expect(io.maintenanceScreenAvailability().reason == TerminalIOBridge.savedCopyCutShort)
+        // A cursor resume carries only the bytes after the cursor.
+        await replay("\u{1b}[3;1Hdelta", sequence: 101)
+        #expect(io.maintenanceScreenAvailability().reason == TerminalIOBridge.savedCopyCutShort)
+        #expect(io.prepareFreshBaseReplay())
+        await replay(screen, sequence: 102)
+        #expect(io.maintenanceScreenAvailability().reason == nil)
+        let snapshot = try #require(io.maintenanceScreenSnapshot())
+        #expect(snapshot.token.sequence == 102)
+        // Never while a replay is open.
+        io.beginReplay()
+        #expect(!io.prepareFreshBaseReplay())
+    }
+
+    @MainActor @Test
+    func installedUpdateScreenRefreshNeedsAnIdleUpdateWithNoDraftOrApproval() throws {
+        let paneID = RelayMaintenanceOrchestrationTests.paneID
+        var proof = try RelayMaintenanceOrchestrationTests.probe()
+        proof.installedUpdate = true
+        proof.harnessStatus = "idle"
+        let admits = { (p: RelayAgentMaintenanceProbe, draft: Bool, approvals: Int) in
+            RelayInstalledUpdateScreenRefresh.admits(p, paneID: paneID, hasDraft: draft, pendingApprovals: approvals)
+        }
+        #expect(proof.valid(for: paneID))
+        #expect(admits(proof, false, 0))
+        #expect(!admits(proof, true, 0))
+        #expect(!admits(proof, false, 1))
+        var busy = proof; busy.harnessStatus = "busy"
+        #expect(!admits(busy, false, 0))
+        var unknown = proof; unknown.harnessStatus = nil
+        #expect(!admits(unknown, false, 0))
+        var none = proof; none.installedUpdate = false
+        #expect(!admits(none, false, 0))
+        #expect(!RelayInstalledUpdateScreenRefresh.admits(proof, paneID: UUID(), hasDraft: false, pendingApprovals: 0))
+    }
 }

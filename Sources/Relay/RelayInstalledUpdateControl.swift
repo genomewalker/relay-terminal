@@ -52,3 +52,22 @@ enum RelayInstalledUpdatePostcondition {
             RelayAgentMaintenancePolicy.installedImageVerified(after)
     }
 }
+
+/// 0.5.61: when a user-requested installed update may ask a hidden pane for a
+/// fresh screen. Only a pane with an installed update to adopt, a verified
+/// identity, relayd's idle harness proof, no draft and no pending approval.
+/// The runtime adds its own checks (no surface, one viewer, copy cut short).
+enum RelayInstalledUpdateScreenRefresh {
+    @MainActor
+    static func admits(_ proof: RelayAgentMaintenanceProbe, paneID: UUID, pane: PaneModel) -> Bool {
+        let draft = pane.composerStateIfCreated.map {
+            !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld
+        } ?? false
+        return admits(proof, paneID: paneID, hasDraft: draft, pendingApprovals: pane.pendingAgentApprovals)
+    }
+
+    static func admits(_ proof: RelayAgentMaintenanceProbe, paneID: UUID, hasDraft: Bool, pendingApprovals: Int) -> Bool {
+        proof.valid(for: paneID) && proof.installedUpdate == true && !RelayAgentMaintenancePolicy.installedImageVerified(proof) &&
+            proof.harnessStatus == "idle" && !hasDraft && pendingApprovals == 0
+    }
+}
