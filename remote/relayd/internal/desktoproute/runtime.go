@@ -21,6 +21,7 @@ type runtime struct {
 	host      func(string) hostAPI
 	service   func(context.Context, ...string) error
 	wait      func(context.Context, time.Duration) error
+	now       func() time.Time
 }
 
 func newRuntime() (*runtime, error) {
@@ -297,6 +298,35 @@ func reconnectDelay(attempt int) time.Duration {
 	return time.Duration(min(1<<min(max(attempt, 0), 5), 30)) * time.Second
 }
 
+// A route whose far end has not answered for a while retries slowly, and one
+// whose remote session or local desktop task has been gone for a day stops:
+// every attempt starts a listener job on the remote host, and a route waiting
+// for a session that never returns otherwise does so every 36 s for ever.
+const (
+	routeSlowAfter   = 10 * time.Minute
+	routeSlowDelay   = 5 * time.Minute
+	routeGiveUpAfter = 24 * time.Hour
+)
+
+// errLocalAbsent marks a failed check of the route's own desktop task.
+var errLocalAbsent = errors.New("desktop task unavailable")
+
+// routeRetryDelay is the wait before the next attempt after an outage of the
+// given length; ordinary reconnects keep the short bounded backoff.
+func routeRetryDelay(attempt int, outage time.Duration) time.Duration {
+	if outage >= routeSlowAfter {
+		return routeSlowDelay
+	}
+	return reconnectDelay(attempt)
+}
+
+// routeAbandoned reports whether the route should stop: the remote session or
+// the local desktop task has been missing for the whole give-up period.
+// Transport failures never abandon a route.
+func routeAbandoned(failure error, outage time.Duration) bool {
+	return outage >= routeGiveUpAfter && (errors.Is(failure, errOwnerAbsent) || errors.Is(failure, errLocalAbsent))
+}
+
 func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 	if e := r.desktop.Verify(ctx, c.Socket, c.Thread); e != nil {
 		return e
@@ -322,6 +352,11 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 	}()
 	seen := map[string]bool{}
 	attempt := 0
+	clock := r.now
+	if clock == nil {
+		clock = time.Now
+	}
+	lastReady := clock()
 	for ctx.Err() == nil {
 		state.State = "connecting"
 		state.Attempt = attempt
@@ -369,7 +404,7 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 				return errRecovered
 			case "ready", "heartbeat":
 				if e = r.desktop.Verify(ctx, c.Socket, c.Thread); e != nil {
-					return e
+					return fmt.Errorf("%w: %v", errLocalAbsent, e)
 				}
 				if event.Type == "ready" {
 					if event.Name != c.LocalName || !validStart(c.Host, event.Start) {
@@ -384,6 +419,7 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 					state.State = "online"
 					state.Error = ""
 					attempt = 0
+					lastReady = clock()
 				}
 				state.Heartbeat = float64(time.Now().UnixNano()) / 1e9
 			case "message":
@@ -461,6 +497,13 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		failure, outage := e, clock().Sub(lastReady)
+		if routeAbandoned(failure, outage) {
+			state.State = "needs_attention"
+			state.Mailbox = nil
+			state.Error = "stopped after 24 h without the remote session or desktop task (" + failure.Error() + "); reconnect this route from Relay once it is back"
+			return publish()
+		}
 		state.State = "offline"
 		state.Mailbox = nil
 		if e != nil {
@@ -476,7 +519,7 @@ func (r *runtime) listen(ctx context.Context, c Config, path string) error {
 		if wait == nil {
 			wait = waitContext
 		}
-		if e = wait(ctx, reconnectDelay(attempt)); e != nil {
+		if e = wait(ctx, routeRetryDelay(attempt, outage)); e != nil {
 			return e
 		}
 		attempt++
