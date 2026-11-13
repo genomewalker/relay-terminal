@@ -21,8 +21,8 @@ const hostJobArchiveAge = 2 * time.Minute
 
 // ArchiveCompletedHostJobs makes room for the bounded legacy upgrade guard.
 // Entire completed job directories are retained, including output and the
-// durable execution fingerprint. Recent and unresolved jobs, and peer
-// listener records, stay in place.
+// durable execution fingerprint. Recent and unresolved jobs, and listener
+// records the registry still names, stay in place.
 func ArchiveCompletedHostJobs(stateDir string) (HostJobArchiveResult, error) {
 	if stateDir == "" {
 		stateDir = defaultWorkerStateDir()
@@ -54,6 +54,7 @@ func archiveCompletedHostJobs(stateDir string, keep int, cutoff time.Time) (Host
 	if err := os.MkdirAll(archive, 0700); err != nil {
 		return result, err
 	}
+	listeners := registeredListenerJobs(stateDir)
 	for _, entry := range entries {
 		if result.Retained <= keep {
 			break
@@ -70,7 +71,7 @@ func archiveCompletedHostJobs(stateDir string, keep int, cutoff time.Time) (Host
 		raw, err := os.ReadFile(path)
 		var record hostJobRecord
 		if err != nil || json.Unmarshal(raw, &record) != nil || record.JobID != entry.Name() ||
-			!hostJobArchivable(record, cutoff) {
+			!hostJobArchivable(record, cutoff, listeners) {
 			continue
 		}
 		target := filepath.Join(archive, entry.Name())
@@ -89,18 +90,55 @@ func archiveCompletedHostJobs(stateDir string, keep int, cutoff time.Time) (Host
 	return result, nil
 }
 
-// hostJobArchivable: finished, not a peer listener, and last updated before
-// the cutoff. A listener's ledger entry carries its route and successor
-// chain; a supervisor follows it after a disconnect, so it never moves.
-func hostJobArchivable(record hostJobRecord, cutoff time.Time) bool {
+// hostJobArchivable: finished and last updated before the cutoff. A finished
+// peer listener moves too, unless the listener registry still names it: the
+// registry's job is the one a resume or upgrade links a successor into, so
+// its folder must not move under that write. A moved listener record stays
+// readable (status, disconnect and successor lookups read the archive as
+// well) and the archive cleanup never deletes listener records. listeners is
+// nil when the registry could not be read; then no listener moves.
+func hostJobArchivable(record hostJobRecord, cutoff time.Time, listeners map[string]bool) bool {
 	if record.State != "exited" && record.State != "failed" {
 		return false
 	}
 	if record.Kind == hostJobKindPeerListener || record.Listener != nil {
-		return false
+		if listeners == nil || listeners[record.JobID] {
+			return false
+		}
 	}
 	finished, err := time.Parse(time.RFC3339Nano, record.UpdatedAt)
 	return err == nil && finished.Before(cutoff)
+}
+
+// registeredListenerJobs names every job the listener registry refers to. It
+// returns nil when any registry file cannot be read or parsed, so an
+// unreadable registry keeps every listener record in place.
+func registeredListenerJobs(stateDir string) map[string]bool {
+	named := map[string]bool{}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "peer-listeners"))
+	if os.IsNotExist(err) {
+		return named
+	}
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(stateDir, "peer-listeners", entry.Name()))
+		if err != nil {
+			return nil
+		}
+		var head struct {
+			JobID string `json:"job_id"`
+		}
+		if json.Unmarshal(data, &head) != nil {
+			// A partial temp file or a foreign file: be conservative.
+			return nil
+		}
+		if head.JobID != "" {
+			named[head.JobID] = true
+		}
+	}
+	return named
 }
 
 // archiveFinishedHostJobsLocked is the daemon's periodic archive step, with
@@ -122,6 +160,7 @@ func (s *Server) archiveFinishedHostJobsLocked(now time.Time, limit int) (int, e
 		return 0, err
 	}
 	cutoff := now.Add(-hostJobArchiveAge)
+	listeners := registeredListenerJobs(s.stateDir)
 	archived := 0
 	for _, entry := range entries {
 		if limit > 0 && archived >= limit {
@@ -134,7 +173,7 @@ func (s *Server) archiveFinishedHostJobsLocked(now time.Time, limit int) (int, e
 		if value, ok := s.hostJobs.Load(entry.Name()); ok {
 			job := value.(*hostJob)
 			job.mu.Lock()
-			moved := job.directory == directory && hostJobArchivable(job.record, cutoff) && moveHostJobFolder(directory, target)
+			moved := job.directory == directory && hostJobArchivable(job.record, cutoff, listeners) && moveHostJobFolder(directory, target)
 			if moved {
 				job.directory = target
 				archived++
@@ -143,7 +182,7 @@ func (s *Server) archiveFinishedHostJobsLocked(now time.Time, limit int) (int, e
 			continue
 		}
 		record, err := readArchivedHostJobRecord(directory, entry.Name())
-		if err == nil && hostJobArchivable(record, cutoff) && moveHostJobFolder(directory, target) {
+		if err == nil && hostJobArchivable(record, cutoff, listeners) && moveHostJobFolder(directory, target) {
 			archived++
 		}
 	}

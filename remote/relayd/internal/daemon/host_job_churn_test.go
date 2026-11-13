@@ -100,8 +100,11 @@ func writeArchiveFixture(t *testing.T, root string, record hostJobRecord) string
 	return directory
 }
 
-// The upgrade step moves finished jobs after two minutes. It never touches
-// running, unresolved or listener records, and it deletes nothing.
+// The upgrade step moves finished jobs after two minutes, including finished
+// listener records the registry no longer names. It never touches running,
+// unresolved or registry-named listener records, and it deletes nothing.
+// (Until 2026-11-13 no listener record ever moved; on dandy-07 11,400 exited
+// listeners then held the live ledger above the upgrade limit.)
 func TestUpgradeArchiveMovesOnlyFinishedNonListenerJobsAfterTheShortCutoff(t *testing.T) {
 	if hostJobArchiveAge != 2*time.Minute {
 		t.Fatalf("archive age %v", hostJobArchiveAge)
@@ -111,15 +114,19 @@ func TestUpgradeArchiveMovesOnlyFinishedNonListenerJobsAfterTheShortCutoff(t *te
 	fresh := time.Now().UTC().Format(time.RFC3339Nano)
 	moved := []string{writeArchiveFixture(t, root, hostJobRecord{JobID: "old-exited", State: "exited", UpdatedAt: old}),
 		writeArchiveFixture(t, root, hostJobRecord{JobID: "old-failed", State: "failed", UpdatedAt: old}),
-		writeArchiveFixture(t, root, hostJobRecord{JobID: "old-read", State: "exited", UpdatedAt: old})}
+		writeArchiveFixture(t, root, hostJobRecord{JobID: "old-read", State: "exited", UpdatedAt: old}),
+		writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-kind", Kind: hostJobKindPeerListener, State: "exited", UpdatedAt: old}),
+		writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-binding", Listener: &peerListenerBinding{}, State: "failed", UpdatedAt: old})}
 	kept := []string{
 		writeArchiveFixture(t, root, hostJobRecord{JobID: "recent", State: "exited", UpdatedAt: fresh}),
 		writeArchiveFixture(t, root, hostJobRecord{JobID: "running", State: "running", UpdatedAt: old}),
 		writeArchiveFixture(t, root, hostJobRecord{JobID: "starting", State: "starting", UpdatedAt: old}),
 		writeArchiveFixture(t, root, hostJobRecord{JobID: "unknown", State: "unknown_after_daemon_restart", UpdatedAt: old}),
-		writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-kind", Kind: hostJobKindPeerListener, State: "exited", UpdatedAt: old}),
-		writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-binding", Listener: &peerListenerBinding{}, State: "exited", UpdatedAt: old}),
+		writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-registered", Kind: hostJobKindPeerListener, State: "exited", UpdatedAt: old}),
+		writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-running", Kind: hostJobKindPeerListener, State: "running", UpdatedAt: old}),
+		writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-recent", Kind: hostJobKindPeerListener, State: "exited", UpdatedAt: fresh}),
 	}
+	writeListenerRegistryFixture(t, root, "a.json", `{"job_id":"listener-registered","state":"suspended"}`)
 	result, err := archiveCompletedHostJobs(root, 0, time.Now().Add(-hostJobArchiveAge))
 	if result.Archived != len(moved) || result.Retained != len(kept) || err == nil {
 		t.Fatalf("archive: %+v %v", result, err)
@@ -133,5 +140,54 @@ func TestUpgradeArchiveMovesOnlyFinishedNonListenerJobsAfterTheShortCutoff(t *te
 		if _, err := os.Stat(filepath.Join(directory, "record.json")); err != nil {
 			t.Fatal("protected record moved", directory)
 		}
+	}
+}
+
+func writeListenerRegistryFixture(t *testing.T, root, name, body string) {
+	t.Helper()
+	dir := filepath.Join(root, "peer-listeners")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A registry that cannot be read keeps every listener record in place; other
+// finished jobs still move. A moved listener record stays readable, and the
+// archive cleanup still never deletes it.
+func TestUpgradeArchiveKeepsListenersWhenRegistryUnreadableAndArchivedListenerStaysReadable(t *testing.T) {
+	root := t.TempDir()
+	old := time.Now().Add(-3 * time.Minute).UTC().Format(time.RFC3339Nano)
+	listener := writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-old", Kind: hostJobKindPeerListener, State: "exited", UpdatedAt: old,
+		Listener: &peerListenerBinding{Route: "route-x"}})
+	plain := writeArchiveFixture(t, root, hostJobRecord{JobID: "plain-old", State: "exited", UpdatedAt: old})
+	writeListenerRegistryFixture(t, root, "torn.json", `{"job_id":`)
+	// keep 0: the retained listener makes this report "deferred".
+	if result, _ := archiveCompletedHostJobs(root, 0, time.Now().Add(-hostJobArchiveAge)); result.Archived != 1 || result.Retained != 1 {
+		t.Fatalf("archive with unreadable registry: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(listener, "record.json")); err != nil {
+		t.Fatal("listener moved although the registry was unreadable")
+	}
+	if _, err := os.Stat(filepath.Join(plain, "record.json")); !os.IsNotExist(err) {
+		t.Fatal("ordinary finished job was not archived")
+	}
+	if err := os.Remove(filepath.Join(root, "peer-listeners", "torn.json")); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := archiveCompletedHostJobs(root, 0, time.Now().Add(-hostJobArchiveAge)); err != nil || result.Archived != 1 {
+		t.Fatalf("listener not archived once the registry is readable: %+v %v", result, err)
+	}
+	s := &Server{stateDir: root}
+	raw, directory, tombstone, err := s.readHostJobRecord("listener-old")
+	var record hostJobRecord
+	if err != nil || tombstone != nil || json.Unmarshal(raw, &record) != nil || record.Listener == nil || record.Listener.Route != "route-x" ||
+		directory != filepath.Join(root, "host-jobs-completed", "listener-old") {
+		t.Fatalf("archived listener record not readable in full: %s %q %v", raw, directory, err)
+	}
+	if got, ok := s.peerListenerChainRecord("listener-old"); !ok || got.Listener == nil {
+		t.Fatal("disconnect lookup lost the archived listener")
 	}
 }
