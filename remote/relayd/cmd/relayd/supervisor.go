@@ -44,6 +44,8 @@ func runUpgradeSupervisor(arguments []string) {
 	force := flags.Bool("force", false, "replace the validated supervisor even when its version matches")
 	archiveJobs := flags.Bool("archive-host-jobs", false, "preserve older completed jobs outside the legacy upgrade inspection set")
 	stateDir := flags.String("state-dir", "", "worker state directory for completed job archival")
+	ledgerWait := flags.Duration("ledger-wait", upgradeLedgerWait, "how long to wait for the host job ledger lock while archiving")
+	prepareTimeout := flags.Duration("prepare-timeout", upgradePrepareTimeout, "how long an old supervisor may take to prepare the upgrade")
 	_ = flags.Parse(arguments)
 
 	current, currentErr := inspectSupervisor(*socket)
@@ -53,7 +55,7 @@ func runUpgradeSupervisor(arguments []string) {
 		return
 	}
 	if *archiveJobs {
-		archived, err := daemon.ArchiveCompletedHostJobs(*stateDir)
+		archived, err := daemon.ArchiveCompletedHostJobsWithin(*stateDir, *ledgerWait)
 		if err != nil {
 			fatal("cannot prepare completed job history: " + err.Error())
 		}
@@ -65,7 +67,7 @@ func runUpgradeSupervisor(arguments []string) {
 	var old *liveSupervisor
 	if *legacy != "" && *legacy != *socket {
 		if live, err := inspectSupervisor(*legacy); err == nil {
-			prepared, err := inspectSupervisorForUpgrade(*legacy)
+			prepared, err := inspectSupervisorForUpgrade(*legacy, *prepareTimeout)
 			if err != nil || !prepared.Status.UpgradePrepared {
 				fatal("legacy supervisor cannot guarantee host-job-safe upgrade; upgrade deferred")
 			}
@@ -74,7 +76,7 @@ func runUpgradeSupervisor(arguments []string) {
 		}
 	}
 	if currentErr == nil {
-		prepared, err := inspectSupervisorForUpgrade(*socket)
+		prepared, err := inspectSupervisorForUpgrade(*socket, *prepareTimeout)
 		if err != nil {
 			fatal("cannot prepare supervisor upgrade: " + err.Error())
 		}
@@ -122,15 +124,25 @@ func runUpgradeSupervisor(arguments []string) {
 	fmt.Printf("relayd supervisor upgraded to %s; pane workers were preserved\n", relaydVersion)
 }
 
+// An old supervisor prepares an upgrade by inspecting its host job ledger, which
+// can wait on a cleanup pass over a large archive. On the Mac on 2026-11-13 a
+// 0.5.36 supervisor with 172k archived jobs held the ledger lock and then missed
+// a 30 s prepare deadline three times. Waiting longer only delays the upgrade:
+// the supervisor keeps serving and nothing is stopped until it has prepared.
+const (
+	upgradeLedgerWait     = 5 * time.Minute
+	upgradePrepareTimeout = 5 * time.Minute
+)
+
 func inspectSupervisor(socket string) (liveSupervisor, error) {
-	return inspectSupervisorMode(socket, false)
+	return inspectSupervisorMode(socket, false, 0)
 }
 
-func inspectSupervisorForUpgrade(socket string) (liveSupervisor, error) {
-	return inspectSupervisorMode(socket, true)
+func inspectSupervisorForUpgrade(socket string, timeout time.Duration) (liveSupervisor, error) {
+	return inspectSupervisorMode(socket, true, timeout)
 }
 
-func inspectSupervisorMode(socket string, prepare bool) (liveSupervisor, error) {
+func inspectSupervisorMode(socket string, prepare bool, prepareTimeout time.Duration) (liveSupervisor, error) {
 	var live liveSupervisor
 	connection, err := dialDaemon(socket, 250*time.Millisecond)
 	if err != nil {
@@ -139,7 +151,7 @@ func inspectSupervisorMode(socket string, prepare bool) (liveSupervisor, error) 
 	defer connection.Close()
 	probeTimeout := 2 * time.Second
 	if prepare {
-		probeTimeout = 30 * time.Second
+		probeTimeout = prepareTimeout
 	}
 	_ = connection.SetDeadline(time.Now().Add(probeTimeout))
 	_, peerPID, err := daemon.PeerCredentials(connection)

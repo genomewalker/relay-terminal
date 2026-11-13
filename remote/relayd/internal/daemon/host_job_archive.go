@@ -28,10 +28,25 @@ func ArchiveCompletedHostJobs(stateDir string) (HostJobArchiveResult, error) {
 	if stateDir == "" {
 		stateDir = defaultWorkerStateDir()
 	}
-	return archiveCompletedHostJobs(stateDir, 3000, time.Now().Add(-hostJobArchiveAge))
+	return ArchiveCompletedHostJobsWithin(stateDir, hostJobLedgerWait)
+}
+
+// ArchiveCompletedHostJobsWithin is ArchiveCompletedHostJobs with an explicit
+// wait for the cross-process ledger lock. upgrade-supervisor passes a longer
+// wait: an old supervisor's cleanup pass over a large archive can hold the lock
+// for longer than the daemon's own 30 s (Mac 0.5.36, 2026-11-13: 172k records).
+func ArchiveCompletedHostJobsWithin(stateDir string, wait time.Duration) (HostJobArchiveResult, error) {
+	if stateDir == "" {
+		stateDir = defaultWorkerStateDir()
+	}
+	return archiveCompletedHostJobsWaiting(stateDir, 3000, time.Now().Add(-hostJobArchiveAge), wait)
 }
 
 func archiveCompletedHostJobs(stateDir string, keep int, cutoff time.Time) (HostJobArchiveResult, error) {
+	return archiveCompletedHostJobsWaiting(stateDir, keep, cutoff, hostJobLedgerWait)
+}
+
+func archiveCompletedHostJobsWaiting(stateDir string, keep int, cutoff time.Time, wait time.Duration) (HostJobArchiveResult, error) {
 	var result HostJobArchiveResult
 	root := filepath.Join(stateDir, "host-jobs")
 	entries, err := os.ReadDir(root)
@@ -46,7 +61,7 @@ func archiveCompletedHostJobs(stateDir string, keep int, cutoff time.Time) (Host
 		return result, nil
 	}
 	// Moves into the archive never interleave with its cleanup, in any process.
-	unlock, err := lockHostJobLedger(stateDir, hostJobLedgerWait)
+	unlock, err := lockHostJobLedger(stateDir, wait)
 	if err != nil {
 		return result, err
 	}
