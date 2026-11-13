@@ -563,9 +563,21 @@ func TestDaemonPassArchivesFinishedLiveJobsThenCleansUp(t *testing.T) {
 	running := finishedJob("job-running", now.Add(-time.Hour), 0)
 	running.State = "running"
 	runningDirectory := writeLiveJob(t, s.stateDir, running)
+	// A finished listener the registry no longer names moves like any job; the
+	// one the registry names stays, since resume links its successor into it.
 	listener := finishedJob("job-listener", now.Add(-time.Hour), 0)
 	listener.Kind = hostJobKindPeerListener
-	listenerDirectory := writeLiveJob(t, s.stateDir, listener)
+	listener.Listener = &peerListenerBinding{Route: "relay-old-route"}
+	writeLiveJob(t, s.stateDir, listener)
+	registered := finishedJob("job-registered-listener", now.Add(-time.Hour), 0)
+	registered.Kind = hostJobKindPeerListener
+	registeredDirectory := writeLiveJob(t, s.stateDir, registered)
+	if err := os.MkdirAll(s.peerListenerDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.peerListenerPath("relay-route"), []byte(`{"job_id":"job-registered-listener"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	// A job this daemon ran and still tracks.
 	tracked := hostRequest{RequestID: "exec", Operation: "exec", JobID: "job-tracked",
 		Argv: []string{"/bin/sh", "-c", "printf tracked-output"}, Cwd: s.stateDir}
@@ -575,15 +587,15 @@ func TestDaemonPassArchivesFinishedLiveJobsThenCleansUp(t *testing.T) {
 	waitHostJob(t, s, tracked.JobID)
 	activateCleanup(t, s, now)
 	result, err := s.archiveAndCleanupHostJobs(now.Add(3 * time.Minute))
-	if err != nil || result.Archived != 3 || result.Removed != 1 || result.TombstonesWritten != 1 {
+	if err != nil || result.Archived != 4 || result.Removed != 1 || result.TombstonesWritten != 1 {
 		t.Fatalf("pass %+v %v", result, err)
 	}
-	for _, id := range []string{"job-five-minutes", "job-tracked"} {
+	for _, id := range []string{"job-five-minutes", "job-tracked", "job-listener"} {
 		if _, err := os.Stat(filepath.Join(s.stateDir, "host-jobs-completed", id, "record.json")); err != nil {
 			t.Fatalf("%s not archived", id)
 		}
 	}
-	for _, directory := range []string{recent, runningDirectory, listenerDirectory} {
+	for _, directory := range []string{recent, runningDirectory, registeredDirectory} {
 		if _, err := os.Stat(filepath.Join(directory, "record.json")); err != nil {
 			t.Fatalf("%s moved", directory)
 		}
@@ -596,6 +608,13 @@ func TestDaemonPassArchivesFinishedLiveJobsThenCleansUp(t *testing.T) {
 	}
 	assertReserved(t, s, "job-five-minutes")
 	assertReserved(t, &Server{stateDir: s.stateDir}, "job-tracked")
+	// The moved listener is still found by the disconnect path.
+	s.hostJobsMu.Lock()
+	moved, ok := s.peerListenerChainRecord("job-listener")
+	s.hostJobsMu.Unlock()
+	if !ok || moved.Kind != hostJobKindPeerListener {
+		t.Fatalf("archived listener not found by its chain lookup: %+v %v", moved, ok)
+	}
 }
 
 // Status reads of a tracked job race the archive move without a data race
