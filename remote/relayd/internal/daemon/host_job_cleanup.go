@@ -56,6 +56,7 @@ type HostJobCleanupResult struct {
 	Removed           int      `json:"removed"`
 	BytesFreed        int64    `json:"bytes_freed"`
 	TombstonesWritten int      `json:"tombstones_written"`
+	EligibleQuery     int      `json:"eligible_query"` // of Eligible: app queries past their hour
 	KeptRecent        int      `json:"kept_recent"`
 	KeptUnresolved    int      `json:"kept_unresolved"`
 	KeptListener      int      `json:"kept_listener"`
@@ -304,7 +305,7 @@ func cleanupArchivedHostJobs(stateDir string, index *hostJobTombstoneIndex, opti
 	archive := filepath.Join(stateDir, "host-jobs-completed")
 	if options.DryRun {
 		// A dry run takes no lock and creates nothing.
-		_, err := classifyArchivedHostJobs(archive, cutoff, 0, time.Time{}, nil, &result)
+		_, err := classifyArchivedHostJobs(archive, cutoff, hostJobQueryCutoff(now, options.OlderThan), 0, time.Time{}, nil, &result)
 		return result, err
 	}
 	unlock, err := lockHostJobLedger(stateDir, options.Wait)
@@ -340,7 +341,7 @@ func cleanupArchivedHostJobsLocked(stateDir string, index *hostJobTombstoneIndex
 	if err != nil {
 		return result, err
 	}
-	candidates, err := classifyArchivedHostJobs(archive, cutoff, options.Limit, baseline, &unaware, &result)
+	candidates, err := classifyArchivedHostJobs(archive, cutoff, hostJobQueryCutoff(now, options.OlderThan), options.Limit, baseline, &unaware, &result)
 	if err != nil {
 		return result, err
 	}
@@ -396,10 +397,17 @@ func hostJobTombstoneFor(record hostJobRecord) hostJobTombstone {
 		UpdatedAt: record.UpdatedAt, State: record.State, ExitCode: record.ExitCode}
 }
 
+// hostJobQueryCutoff is the cutoff for app query records: an hour, or the
+// host retention when that is shorter.
+func hostJobQueryCutoff(now time.Time, retention time.Duration) time.Time {
+	return now.Add(-min(retention, hostJobQueryRetentionAge))
+}
+
 // classifyArchivedHostJobs counts every archive entry and returns the
 // eligible ones, at most limit when limit is positive: finished, older than
-// the cutoff, not a peer listener, with a readable record naming its folder.
-func classifyArchivedHostJobs(archive string, cutoff time.Time, limit int, baseline time.Time, unaware *[]hostJobRecord, result *HostJobCleanupResult) ([]hostJobCleanupCandidate, error) {
+// the cutoff (queryCutoff for app query records), not a peer listener, with
+// a readable record naming its folder.
+func classifyArchivedHostJobs(archive string, cutoff, queryCutoff time.Time, limit int, baseline time.Time, unaware *[]hostJobRecord, result *HostJobCleanupResult) ([]hostJobCleanupCandidate, error) {
 	entries, err := os.ReadDir(archive)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -442,7 +450,8 @@ func classifyArchivedHostJobs(archive string, cutoff time.Time, limit int, basel
 			}
 			continue
 		}
-		if !finished.Before(cutoff) {
+		query := record.Retention == hostJobRetentionQuery
+		if !finished.Before(cutoff) && !(query && finished.Before(queryCutoff)) {
 			result.KeptRecent++
 			continue
 		}
@@ -452,6 +461,9 @@ func classifyArchivedHostJobs(archive string, cutoff time.Time, limit int, basel
 		}
 		bytes := hostJobFolderBytes(directory)
 		result.Eligible++
+		if query && !finished.Before(cutoff) {
+			result.EligibleQuery++
+		}
 		result.BytesEligible += bytes
 		candidates = append(candidates, hostJobCleanupCandidate{record: record, bytes: bytes})
 	}

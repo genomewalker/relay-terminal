@@ -85,6 +85,9 @@ type hostJobRecord struct {
 	// Ledger is hostJobLedgerTombstones in every record a tombstone-aware
 	// daemon creates; see host_job_servers.go.
 	Ledger int `json:"ledger,omitempty"`
+	// Retention is hostJobRetentionQuery for the app's read-only queries,
+	// whose finished records are deleted after an hour.
+	Retention string `json:"retention,omitempty"`
 }
 type hostJob struct {
 	notify      chan struct{}
@@ -471,7 +474,7 @@ func (s *Server) launchHostJobLocked(r hostRequest, fingerprint, directory strin
 	if e := os.Mkdir(directory, 0700); e != nil {
 		return nil, errors.New("job ID already reserved")
 	}
-	job := &hostJob{notify: make(chan struct{}, 1), directory: directory, inputHashes: make(map[int64][32]byte), listener: r.Listener, record: hostJobRecord{JobID: r.JobID, Fingerprint: fingerprint, Kind: r.Kind, Listener: r.Listener.binding(), State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Ledger: hostJobLedgerTombstones}}
+	job := &hostJob{notify: make(chan struct{}, 1), directory: directory, inputHashes: make(map[int64][32]byte), listener: r.Listener, record: hostJobRecord{JobID: r.JobID, Fingerprint: fingerprint, Kind: r.Kind, Listener: r.Listener.binding(), State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Ledger: hostJobLedgerTombstones, Retention: hostJobQueryRetention(r)}}
 	if e := job.save(); e != nil {
 		return nil, e
 	}
