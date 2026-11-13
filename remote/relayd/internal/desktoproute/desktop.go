@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -301,6 +302,37 @@ func (d *nativeDesktop) Loaded(ctx context.Context, path string) ([]string, erro
 	}
 	return ids, nil
 }
+// workProbeTimeout bounds each listing check of a saved Work endpoint. The
+// Codex app answers thread-owner-discovery for a thread it has not loaded only
+// when its own 12 s timeout runs out, so checking stale saved threads one after
+// another took ~41 s for four of them and the app's 20 s listing limit turned
+// that into a 503 (2026-11-13). Listing now checks every saved thread at once
+// and gives each step this budget; a thread that does not answer in time stays
+// unverified, exactly as a failed check did before. Sends keep the full wait.
+const workProbeTimeout = 4 * time.Second
+
+// probeSavedWork reports, in refs order, which saved Work endpoints still
+// answer as pinned or can be re-pinned to the current app incarnation.
+func (d *nativeDesktop) probeSavedWork(ctx context.Context, path string, refs []workReference) []bool {
+	alive := make([]bool, len(refs))
+	var wg sync.WaitGroup
+	for i, ref := range refs {
+		wg.Add(1)
+		go func(i int, ref workReference) {
+			defer wg.Done()
+			step := func(check func(context.Context) bool) bool {
+				c, cancel := context.WithTimeout(ctx, workProbeTimeout)
+				defer cancel()
+				return check(c)
+			}
+			alive[i] = step(func(c context.Context) bool { return d.verifyWork(c, ref) }) ||
+				step(func(c context.Context) bool { return d.repinWork(c, path, ref) })
+		}(i, ref)
+	}
+	wg.Wait()
+	return alive
+}
+
 func (d *nativeDesktop) tasks(ctx context.Context, path string, details bool) ([]TaskInfo, error) {
 	refs, e := d.workRefs(path)
 	if e != nil {
@@ -316,9 +348,10 @@ func (d *nativeDesktop) tasks(ctx context.Context, path string, details bool) ([
 	rows := []TaskInfo{}
 	registered := map[string]bool{}
 	verified := map[string]bool{}
-	for _, ref := range refs {
+	alive := d.probeSavedWork(ctx, path, refs)
+	for i, ref := range refs {
 		registered[ref.Thread] = true
-		if d.verifyWork(ctx, ref) || d.repinWork(ctx, path, ref) {
+		if alive[i] {
 			verified[ref.Thread] = true
 			rows = append(rows, TaskInfo{ID: ref.Thread, Status: "unknown"})
 		}
