@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -111,8 +112,8 @@ func hostJobArchivable(record hostJobRecord, cutoff time.Time, listeners map[str
 }
 
 // registeredListenerJobs names every job the listener registry refers to. It
-// returns nil when any registry file cannot be read or parsed, so an
-// unreadable registry keeps every listener record in place.
+// returns nil when the directory or any registry record cannot be read or
+// parsed, so an unreadable registry keeps every listener record in place.
 func registeredListenerJobs(stateDir string) map[string]bool {
 	named := map[string]bool{}
 	entries, err := os.ReadDir(filepath.Join(stateDir, "peer-listeners"))
@@ -123,7 +124,16 @@ func registeredListenerJobs(stateDir string) map[string]bool {
 		return nil
 	}
 	for _, entry := range entries {
-		data, err := os.ReadFile(filepath.Join(stateDir, "peer-listeners", entry.Name()))
+		// Only <hash>.json entries are registry records, as resume reads them;
+		// a writer's .entry-* temp file left by a crash is not one.
+		name := entry.Name()
+		if entry.IsDir() || strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(stateDir, "peer-listeners", name))
+		if errors.Is(err, os.ErrNotExist) {
+			continue // removed since the listing: it names nothing now
+		}
 		if err != nil {
 			return nil
 		}

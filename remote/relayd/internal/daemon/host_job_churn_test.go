@@ -191,3 +191,23 @@ func TestUpgradeArchiveKeepsListenersWhenRegistryUnreadableAndArchivedListenerSt
 		t.Fatal("disconnect lookup lost the archived listener")
 	}
 }
+
+// A crash can leave a registry writer's .entry-* temp file behind. It is not
+// a registry record, so it must not hold every listener in the live ledger.
+func TestUpgradeArchiveIgnoresRegistryTempFiles(t *testing.T) {
+	root := t.TempDir()
+	old := time.Now().Add(-3 * time.Minute).UTC().Format(time.RFC3339Nano)
+	listener := writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-old", Kind: hostJobKindPeerListener, State: "exited", UpdatedAt: old})
+	named := writeArchiveFixture(t, root, hostJobRecord{JobID: "listener-named", Kind: hostJobKindPeerListener, State: "exited", UpdatedAt: old})
+	writeListenerRegistryFixture(t, root, ".entry-0123abcd", `{"job_id":`)
+	writeListenerRegistryFixture(t, root, "b.json", `{"job_id":"listener-named","state":"active"}`)
+	if result, _ := archiveCompletedHostJobs(root, 0, time.Now().Add(-hostJobArchiveAge)); result.Archived != 1 {
+		t.Fatalf("archive: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(listener, "record.json")); !os.IsNotExist(err) {
+		t.Fatal("a stale temp file kept an unregistered listener in place")
+	}
+	if _, err := os.Stat(filepath.Join(named, "record.json")); err != nil {
+		t.Fatal("registry-named listener moved")
+	}
+}
