@@ -192,3 +192,45 @@ func TestNodeMuxMeasuresOnlyWithEchoCapability(t *testing.T) {
 		}()
 	}
 }
+
+// A node that ends on stdin EOF must remove its snapshot before returning:
+// the process exits right after, so a goroutine left to do it never runs.
+func TestNodeMuxRemovesSnapshotBeforeReturningOnEOF(t *testing.T) {
+	sampleEvery, dir := nodeStatsSampleEvery, NodeStatsDir
+	nodeStatsSampleEvery, NodeStatsDir = time.Millisecond, t.TempDir()
+	defer func() { nodeStatsSampleEvery, NodeStatsDir = sampleEvery, dir }()
+	client, front := net.Pipe()
+	upstream, supervisor := net.Pipe()
+	defer supervisor.Close()
+	go func() {
+		for {
+			if _, err := protocol.ReadFrame(supervisor); err != nil {
+				return
+			}
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- RelayNode(context.Background(), front, front, upstream) }()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.NewWriter(client).Write(protocol.Frame{Type: protocol.Capabilities, Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	path := nodeStatsPath(NodeStatsDir, os.Getpid())
+	for start := time.Now(); ; time.Sleep(2 * time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		if time.Since(start) > 3*time.Second {
+			t.Fatal("no snapshot written")
+		}
+	}
+	client.Close() // stdin EOF
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("node did not return on EOF")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("snapshot left behind after EOF", err)
+	}
+}

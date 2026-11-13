@@ -47,7 +47,17 @@ func RelayNodeWithHostRequestHandlers(ctx context.Context, input io.Reader, outp
 	clientWriter := protocol.NewScheduledWriter(timedWriter{out: output, stats: stats})
 	measuring := make(chan struct{})
 	var startMeasuring sync.Once
-	go runNodeStats(ctx, stats, clientWriter, measuring)
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		runNodeStats(ctx, stats, clientWriter, measuring)
+	}()
+	// The node process exits as soon as this returns (stdin EOF included), so
+	// wait for the stats loop to remove its snapshot file first.
+	defer func() {
+		cancel()
+		<-statsDone
+	}()
 	var negotiated atomic.Bool
 	var upstreamFragments atomic.Bool
 	completed := make(chan error, 2)
