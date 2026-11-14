@@ -138,4 +138,40 @@ private final class FallbackNodes: @unchecked Sendable {
         try send(node.node, session: "busy-worker", #"{"state":"attached","capabilities":[]}"#)
         #expect(!statuses.messages.contains { $0.contains("dedicated") })
     }
+
+    @Test("A single pane's closed route reopens on its node without stopping it")
+    func singlePaneClosedRouteStaysShared() throws {
+        let nodes = FallbackNodes()
+        let statuses = FallbackFrames()
+        let transport = start(nodes.pool(), session: "only-closed", statuses: statuses)
+        defer { transport.detach() }
+        let node = try #require(nodes.first)
+        waitUntil { node.writer.hellos == 1 }
+        try send(node.node, session: "only-closed", #"{"state":"attached","capabilities":[]}"#)
+        try send(node.node, session: "only-closed", #"{"state":"route_closed"}"#)
+        waitUntil { node.writer.hellos == 2 }
+        #expect(node.writer.hellos == 2)
+        try send(node.node, session: "only-closed", #"{"state":"attached","capabilities":[]}"#)
+        #expect(transport.currentNodeChannel != nil)
+        #expect(node.node.networkSnapshot().attachedSubscriptions == 1)
+        #expect(!statuses.messages.contains { $0.contains("dedicated") })
+    }
+
+    @Test("A single pane's answered error retries once on its node without stopping it")
+    func singlePaneAnsweredErrorRetriesOnceShared() throws {
+        let nodes = FallbackNodes()
+        let statuses = FallbackFrames()
+        let transport = start(nodes.pool(), session: "only-missing", statuses: statuses)
+        defer { transport.detach() }
+        let node = try #require(nodes.first)
+        let missing = #"{"state":"error","message":"saved pane worker is missing; no replacement was started"}"#
+        waitUntil { node.writer.hellos == 1 }
+        try send(node.node, session: "only-missing", missing)
+        waitUntil { node.writer.hellos == 2 }
+        #expect(node.writer.hellos == 2)
+        try send(node.node, session: "only-missing", missing)
+        Thread.sleep(forTimeInterval: 1.6)
+        #expect(node.writer.hellos == 2)
+        #expect(!statuses.messages.contains { $0.contains("dedicated") })
+    }
 }

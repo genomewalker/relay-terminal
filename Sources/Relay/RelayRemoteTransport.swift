@@ -860,15 +860,21 @@ final class RelayRemoteTransport: @unchecked Sendable {
             self.supportsExactSupervisorViewportCommits = false
             self.attachRetryScheduled = false
             self.lock.unlock()
-            channel.close()
             if RelayPaneAttachPolicy.shouldUseDedicatedTransport(stalls: stalls) {
+                channel.close()
                 context.onStatus(RelayStatus(
                     state: "reconnecting",
                     message: "The shared pane channel did not answer; using a dedicated connection for this pane."
                 ), deliveryEpochSnapshot())
                 self.connect(context)
             } else {
+                // Rejoin before releasing the old route. Closing first would
+                // leave the only pane's node idle, which stops it and drops
+                // the new Hello. The join replaces this pane's subscription,
+                // so the old channel's close no longer touches the node, and
+                // relayd's next Hello supersedes the old virtual route.
                 self.connectMultiplexed(context)
+                channel.close()
             }
         }
     }
