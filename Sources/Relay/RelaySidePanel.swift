@@ -1784,7 +1784,7 @@ final class RelaySidePanelServer: ObservableObject {
             }
         }
         if request.method == "POST", request.path == "/api/workspace/show" {
-            return directTabRequests.show(request.body, instance: agentInputRequests.instance,
+            return await directTabRequests.show(request.body, instance: agentInputRequests.instance,
                                           permits: mcpWorkspaceGrant.permits, workspace: workspace)
         }
         if request.method == "POST", request.path == "/api/workspace/rename-pane" {

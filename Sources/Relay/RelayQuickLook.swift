@@ -319,6 +319,85 @@ final class RelayQuickLookStaging: @unchecked Sendable {
     }
 }
 
+/// What relay_show found for one item before showing anything.
+struct RelayShowItemResult: Codable, Equatable, Sendable {
+    /// shown, too_large, folder, not_found, unresolved or error.
+    let item: String
+    let result: String
+    let detail: String?
+
+    var shows: Bool { result == "shown" }
+}
+
+/// Checks each item where the pane's files live: this Mac, or the pane's
+/// relayd host (one stat each, no file read).
+enum RelayShowCheck {
+    static func run(items: [String], targets: [RelayQuickLookTarget],
+                    location: RelayQuickLookLocation) async -> [RelayShowItemResult] {
+        var results: [RelayShowItemResult] = []
+        for (item, target) in zip(items, targets) {
+            guard let resolved = RelayQuickLookItem.resolve(target, location: location) else {
+                results.append(unresolved(item, target: target, location: location)); continue
+            }
+            switch resolved.source {
+            case .web:
+                results.append(.init(item: item, result: "shown", detail: nil))
+            case .localFile(let path):
+                var directory: ObjCBool = false
+                let exists = FileManager.default.fileExists(atPath: path, isDirectory: &directory)
+                results.append(local(item, exists: exists))
+            case .remoteFile(let profile, let path, let cwd):
+                do {
+                    let context = RelayExecutionContext(profile: profile, directory: cwd ?? "/")
+                    let stat = try await RelayHostFiles.request(context: context, fields: ["operation": "file_stat", "path": path])
+                    results.append(remote(item, stat: stat, error: nil))
+                } catch {
+                    results.append(remote(item, stat: nil, error: error.localizedDescription))
+                }
+            }
+        }
+        return results
+    }
+
+    /// Quick Look on this Mac previews folders and files of any size.
+    static func local(_ item: String, exists: Bool) -> RelayShowItemResult {
+        exists ? .init(item: item, result: "shown", detail: nil)
+               : .init(item: item, result: "not_found", detail: "No such file on this Mac")
+    }
+
+    static func remote(_ item: String, stat: [String: Any]?, error: String?,
+                       maxBytes: Int = RelayHostFiles.previewMaxBytes) -> RelayShowItemResult {
+        if let error {
+            let lower = error.lowercased()
+            let missing = ["no such file", "not found", "does not exist", "not exist"].contains { lower.contains($0) }
+            return .init(item: item, result: missing ? "not_found" : "error", detail: error)
+        }
+        guard let stat else { return .init(item: item, result: "error", detail: "No answer from the host") }
+        if stat["directory"] as? Bool == true {
+            return .init(item: item, result: "folder", detail: "Folders on a remote host can't be previewed")
+        }
+        if let size = stat["size"] as? Int, size > maxBytes {
+            return .init(item: item, result: "too_large", detail: "\(size) bytes; the limit is \(maxBytes)")
+        }
+        do {
+            _ = try RelayHostFiles.previewable(stat: stat, maxBytes: maxBytes)
+            return .init(item: item, result: "shown", detail: nil)
+        } catch {
+            return .init(item: item, result: "error", detail: error.localizedDescription)
+        }
+    }
+
+    static func unresolved(_ item: String, target: RelayQuickLookTarget, location: RelayQuickLookLocation) -> RelayShowItemResult {
+        let detail: String
+        switch (target, location) {
+        case (.web, _): detail = "A remote pane's localhost opens only in its browser; show it on its own"
+        case (_, .unreadable): detail = "This pane's host has no Relay connection, so only URLs can be shown"
+        default: detail = "A relative path needs the pane's folder; use an absolute or ~/ path"
+        }
+        return .init(item: item, result: "unresolved", detail: detail)
+    }
+}
+
 /// Where relay_show displayed a pane's items.
 enum RelayShowOutcome: Equatable {
     case quickLook

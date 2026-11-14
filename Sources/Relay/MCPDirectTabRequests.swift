@@ -33,7 +33,16 @@ import Foundation
         let items: [String]
     }
     private var showRequests: [UUID: ShowProposal] = [:]
-    private var showResults: [UUID: [String: String]] = [:]
+    private var showResults: [UUID: ShowResponse] = [:]
+
+    struct ShowResponse: Codable, Equatable {
+        /// shown when a window opened; nothing_shown when no item could be.
+        let status: String
+        let paneID: String
+        let surface: String?
+        let url: String?
+        let items: [RelayShowItemResult]
+    }
     private var renameRequests: [UUID: PaneRenameProposal] = [:]
     private var renameResults: [UUID: [String: String]] = [:]
     private var tabRequests: [UUID: WorkspaceTabProposal] = [:]
@@ -91,10 +100,15 @@ import Foundation
     }
 
     /// `relay_show`: displays files or a page for one pane; takes no other action.
+    /// Each item is checked on the pane's host first (one stat, no read);
+    /// only the ones that will display are shown, and every item's result is
+    /// returned, so the agent knows what the user actually sees.
     func show(_ body: Data, instance: UUID, permits: (MCPWorkspaceCapability) -> Bool,
               workspace: WorkspaceModel,
+              check: (PaneModel, [String], [RelayQuickLookTarget]) async -> [RelayShowItemResult] = {
+                  await RelayShowCheck.run(items: $1, targets: $2, location: $0.runtime.quickLookLocation) },
               present: (PaneModel, [RelayQuickLookTarget]) -> RelayShowOutcome? = { $0.runtime.showForAgent($1) },
-              attention: () -> Void = { RelayShowAttention.request() })
+              attention: () -> Void = { RelayShowAttention.request() }) async
         -> RelaySidePanelHTTPResponse {
         guard Endpoint.show.capabilities.allSatisfy(permits) else {
             return .text("MCP workspace navigate capability is not granted", status: 403, reason: "Forbidden")
@@ -113,26 +127,34 @@ import Foundation
         }
         if let old = showRequests[proposal.requestID] {
             guard old == proposal, let result = showResults[proposal.requestID] else {
-                return .text("Conflicting show request ID", status: 409, reason: "Conflict")
+                return .text(old == proposal ? "Show request still in progress" : "Conflicting show request ID",
+                             status: 409, reason: "Conflict")
             }
             return .json(result)
         }
         guard showRequests.count < receiptLimit, let pane = workspace.panes[proposal.paneID] else {
             return .text("Pane unavailable or show receipt limit reached", status: 409, reason: "Conflict")
         }
-        guard let outcome = present(pane, targets) else {
-            return .text("Nothing to show: a relative path needs the pane's folder, and a remote pane without Relay "
-                + "can show only URLs", status: 409, reason: "Conflict")
-        }
-        var result = ["status": "shown", "paneID": proposal.paneID.uuidString.lowercased()]
+        showRequests[proposal.requestID] = proposal // claimed before waiting on the host
+        let checked = await check(pane, proposal.items, targets)
+        let results = checked.count == targets.count ? checked
+            : proposal.items.map { RelayShowItemResult(item: $0, result: "error", detail: "Not checked") }
+        let showable = zip(targets, results).filter { $0.1.shows }.map(\.0)
+        let outcome = showable.isEmpty ? nil : present(pane, showable)
+        var surface: String?, url: String?
         switch outcome {
-        case .quickLook: result["surface"] = "quick_look"
-        case .browser(let url): result["surface"] = "browser"; result["url"] = url.absoluteString
+        case .quickLook?: surface = "quick_look"
+        case .browser(let opened)?: surface = "browser"; url = opened.absoluteString
+        case nil: break
         }
-        showRequests[proposal.requestID] = proposal
-        showResults[proposal.requestID] = result
-        attention()
-        return .json(result)
+        let response = ShowResponse(status: outcome == nil ? "nothing_shown" : "shown",
+                                    paneID: proposal.paneID.uuidString.lowercased(), surface: surface, url: url,
+                                    items: outcome == nil && !showable.isEmpty
+                                        ? results.map { $0.shows ? .init(item: $0.item, result: "error", detail: "The window could not open") : $0 }
+                                        : results)
+        showResults[proposal.requestID] = response
+        if outcome != nil { attention() }
+        return .json(response)
     }
 
     func tabAction(_ body: Data, instance: UUID, permits: (MCPWorkspaceCapability) -> Bool,

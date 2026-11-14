@@ -3963,7 +3963,7 @@ final class TerminalRuntime: NSObject {
 
     /// Files of a local pane are read on this Mac; a relayd pane's from its
     /// host. Other remote panes preview URLs only.
-    private var quickLookLocation: RelayQuickLookLocation {
+    var quickLookLocation: RelayQuickLookLocation {
         guard let pane else { return .unreadable }
         if pane.profile.kind == .local { return .local(cwd: pane.directory) }
         if pane.profile.backend == .relay { return .remote(pane.profile, cwd: pane.directory) }
