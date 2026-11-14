@@ -6384,7 +6384,7 @@ struct RelayBrowserDockReceiver: ViewModifier {
     func body(content: Content) -> some View {
         content.onReceive(NotificationCenter.default.publisher(for: .relayDockBrowser)) { note in
             guard let request = note.object as? RelayBrowserDockRequest, workspace.panes[request.anchor] != nil else { return }
-            _ = try? workspace.newBrowserPane(onto: request.anchor, url: request.url)
+            _ = try? workspace.newBrowserPane(onto: request.anchor, url: request.url, placement: request.placement)
         }
     }
 }

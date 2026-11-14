@@ -111,15 +111,16 @@ import Foundation
         var submit: Bool?
         var key: String?
         var dy: Int?
-        /// open only: "stack" puts the browser in the pane's stack; default floating.
+        /// open only: stack, split or tab makes a browser pane for the pane; default floating.
         var placement: String? = nil
         static let keys: Set<String> = ["instance", "requestID", "paneID", "action", "url", "ref", "text", "submit", "key", "dy", "placement"]
-        var stacks: Bool { placement == "stack" }
+        var paneplacement: WorkspaceModel.BrowserPanePlacement? { placement.flatMap(WorkspaceModel.BrowserPanePlacement.init(rawValue:)) }
+        var stacks: Bool { paneplacement != nil }
 
         /// The argument each action needs, and nothing it cannot use.
         var isValid: Bool {
             let refOK = ref.map { (1...RelayBrowserAgentScripts.elementLimit).contains($0) } ?? false
-            guard placement == nil || (action == .open && ["stack", "floating"].contains(placement!)) else { return false }
+            guard placement == nil || (action == .open && ["stack", "split", "tab", "floating"].contains(placement!)) else { return false }
             switch action {
             case .open:
                 return url.flatMap(RelayQuickLookLinks.target(fromAgentItem:)).map { if case .web = $0 { true } else { false } } ?? false
@@ -154,7 +155,10 @@ import Foundation
                      // A browser pane stacked with this pane is the one the agent uses;
                      // otherwise the host's floating browser.
                      var docked = workspace.stackedBrowserPane(for: pane.id)?.browserSession
-                     if proposal.stacks, docked == nil { docked = try workspace.newBrowserPane(onto: pane.id, url: nil).browserSession }
+                     if let placement = proposal.paneplacement, docked == nil {
+                         // An agent's browser never switches the user's tab.
+                         docked = try workspace.newBrowserPane(onto: pane.id, url: nil, placement: placement, select: false).browserSession
+                     }
                      return try await RelayBrowserController.shared.agent(
                          proposal.action, profile: pane.profile, directory: pane.directory, near: NSApp?.mainWindow, anchor: pane.id,
                          docked: docked,

@@ -378,10 +378,11 @@ enum RelayBrowserRouting {
         let key = Self.key(profile)
         panel.contentView = NSHostingView(rootView: RelayBrowserView(
             session: session, close: { [weak panel] in panel?.close() },
-            dock: { [weak self, weak panel, weak session] in
+            dock: { [weak self, weak panel, weak session] placement in
                 guard let self, let session, let anchor = anchors[key] else { return }
                 let url = session.webView.url.map { RelayBrowserRouting.hostURL($0, tunnels: session.portMap) }
-                NotificationCenter.default.post(name: .relayDockBrowser, object: RelayBrowserDockRequest(anchor: anchor, url: url))
+                NotificationCenter.default.post(name: .relayDockBrowser,
+                                                object: RelayBrowserDockRequest(anchor: anchor, url: url, placement: placement))
                 panel?.close()
             }))
         return (session, panel)
@@ -398,8 +399,8 @@ struct RelayBrowserView: View {
     @ObservedObject var session: RelayBrowserSession
     /// Present in the floating panel; a browser pane closes like any pane.
     var close: (() -> Void)?
-    /// Moves the floating browser into the stack of the pane that opened it.
-    var dock: (() -> Void)? = nil
+    /// Moves the floating browser into a pane beside the pane that opened it.
+    var dock: ((WorkspaceModel.BrowserPanePlacement) -> Void)? = nil
 
     var body: some View {
         let _ = session.revision
@@ -429,8 +430,13 @@ struct RelayBrowserView: View {
                 Button { session.openElsewhere() } label: { Image(systemName: "safari") }
                     .disabled(!session.canOpenElsewhere).help("Open in the default browser")
                 if let dock {
-                    Button(action: dock) { Image(systemName: "rectangle.stack.badge.plus") }
-                        .help("Move into the pane's stack")
+                    Menu {
+                        Button("In the pane's stack") { dock(.stack) }
+                        Button("Split beside the pane") { dock(.split) }
+                        Button("In a new tab") { dock(.tab) }
+                    } label: { Image(systemName: "rectangle.stack.badge.plus") }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                        .help("Move into a pane")
                 }
                 if let close { Button(action: close) { Image(systemName: "xmark.circle") }.help("Close") }
             }
@@ -473,6 +479,7 @@ struct RelayBrowserView: View {
 struct RelayBrowserDockRequest {
     let anchor: UUID
     let url: URL?
+    var placement: WorkspaceModel.BrowserPanePlacement = .stack
 }
 
 extension Notification.Name {

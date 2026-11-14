@@ -981,8 +981,7 @@ final class WorkspaceModel: ObservableObject {
         // saved views agree; browser panes are reached through their stack-mate.
         let browsers = browserPaneIDs
         return RelaySidePanelState(
-            selectedPaneID: (activePaneID.map { BrowserPaneSave.savedFocus($0, stacks: tabs.flatMap(\.stacks), browsers: browsers) } ?? nil)?
-                .uuidString.lowercased(),
+            selectedPaneID: savedFocus().pane?.uuidString.lowercased(),
             terminalFontFamily: RelayPreferences.shared.resolvedFontFamily,
             terminalFontSize: RelayPreferences.shared.fontSize,
             sessions: orderedSessionIDs.compactMap { sessionID in
@@ -993,7 +992,8 @@ final class WorkspaceModel: ObservableObject {
                     id: sessionID.uuidString.lowercased(),
                     name: sessionDisplayName(sessionID, fallback: firstTab.name),
                     pinned: isSessionPinned(sessionID),
-                    tabs: sessionTabs.map { tab in
+                    // A tab of browser panes only is not saved, so it is not listed.
+                    tabs: sessionTabs.filter { !Set($0.allPaneIDs).subtracting(browsers).isEmpty }.map { tab in
                         RelaySidePanelState.Tab(
                             id: tab.id.uuidString.lowercased(),
                             name: tab.name,
@@ -3736,30 +3736,86 @@ final class WorkspaceModel: ObservableObject {
         return (stack, target.id, removed)
     }
 
-    /// Opens a new terminal pane directly as a member of the stack showing
-    /// `targetID`, on `profile` (This Mac or an exact SSH host). Like a new
-    /// tab, a Relay SSH pane on the target's host is born under the target.
+    enum BrowserPanePlacement: String, Sendable {
+        case stack, split, tab
+    }
+
+    /// Relay's browser for the anchor pane's host: in the anchor's stack, split
+    /// beside the anchor's slot, or in its own tab after the anchor's tab.
+    /// `select` false (agents) never changes the selected tab; within it, the
+    /// browser takes focus only when it covers the focused anchor.
     @discardableResult
-    /// Relay's browser for the target pane's host, as a member of its stack.
-    func newBrowserPane(onto targetID: UUID, url: URL?) throws -> PaneModel {
-        let target = try stackTarget(targetID)
-        guard let anchor = panes[targetID], anchor.contentKind != .browser else { throw WorkspaceLayoutError.unknownPane }
+    func newBrowserPane(onto anchorID: UUID, url: URL?, placement: BrowserPanePlacement = .stack,
+                        select: Bool = true) throws -> PaneModel {
+        let target = try stackTarget(anchorID)
+        guard let anchor = panes[anchorID], anchor.contentKind != .browser else { throw WorkspaceLayoutError.unknownPane }
         let pane = PaneModel(profile: anchor.profile, contentKind: .browser, directory: anchor.directory)
-        pane.assignRemoteHierarchy(workspaceSessionID: target.sessionID, tabID: target.id)
+        pane.browserAnchor = anchorID
         storePane(pane)
-        _ = joinStack(pane.id, onto: targetID, in: target)
-        finishLayoutChange(in: [target], active: pane.id, select: target)
+        var home = target
+        switch placement {
+        case .stack:
+            pane.assignRemoteHierarchy(workspaceSessionID: target.sessionID, tabID: target.id)
+            _ = joinStack(pane.id, onto: anchorID, in: target)
+        case .split:
+            pane.assignRemoteHierarchy(workspaceSessionID: target.sessionID, tabID: target.id)
+            // A hidden stack member's slot is its stack's shown member.
+            let slot = target.stack(containing: anchorID)?.selected ?? anchorID
+            target.layout = target.layout.splitting(slot, axis: .horizontal, with: pane.id, newPaneFirst: false)
+        case .tab:
+            let tab = TabModel(sessionID: target.sessionID, name: "Browser · " + (anchor.profile.kind == .local ? "This Mac" : anchor.profile.host),
+                               firstPane: pane.id)
+            pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
+            let index = (tabs.firstIndex { $0 === target } ?? tabs.count - 1) + 1
+            withTabAdmission(tabAdmission(forSourcePane: anchorID)) { tabs.insert(tab, at: min(index, tabs.count)) }
+            home = tab
+        }
+        if select {
+            finishLayoutChange(in: [home], active: pane.id, select: home)
+        } else {
+            home.reconcileStacks()
+            home.reconcileSplitRatios()
+            if placement == .stack, activePaneID == anchorID, selectedTabID == home.id { activePaneID = pane.id }
+            persistWorkspace()
+        }
         if let url { pane.browserSession.open(url) }
         return pane
     }
 
-    /// The browser pane stacked with this pane, if there is one.
+    /// The browser pane an agent's actions for this pane use: the pane itself,
+    /// one opened for it, or one stacked with it.
     func stackedBrowserPane(for paneID: UUID) -> PaneModel? {
         if let pane = panes[paneID], pane.contentKind == .browser { return pane }
+        if let opened = panes.values.first(where: { $0.contentKind == .browser && $0.browserAnchor == paneID }) { return opened }
         let members = tabs.lazy.compactMap { $0.stack(containing: paneID) }.first?.members ?? []
         return members.lazy.compactMap { self.panes[$0] }.first { $0.contentKind == .browser }
     }
 
+    private var browserAnchors: [UUID: UUID] {
+        Dictionary(uniqueKeysWithValues: panes.values.compactMap { pane in
+            pane.contentKind == .browser ? pane.browserAnchor.map { (pane.id, $0) } : nil
+        })
+    }
+
+    /// Focus as a save holds it: a browser's place goes to a saved pane, and the
+    /// selected tab is the one holding that pane when the browser's tab is not saved.
+    private func savedFocus() -> (tab: UUID?, pane: UUID?) {
+        let browsers = browserPaneIDs
+        let pane = activePaneID.flatMap {
+            BrowserPaneSave.savedFocus($0, stacks: tabs.flatMap(\.stacks), browsers: browsers, anchors: browserAnchors)
+        }.flatMap { panes[$0] != nil ? $0 : nil }
+        let savedTabs = tabs.filter { !Set($0.allPaneIDs).subtracting(browsers).isEmpty }
+        if let selectedTabID, savedTabs.contains(where: { $0.id == selectedTabID }),
+           pane.map({ id in savedTabs.first { $0.id == selectedTabID }!.allPaneIDs.contains(id) }) ?? true {
+            return (selectedTabID, pane)
+        }
+        return (pane.flatMap { id in savedTabs.first { $0.allPaneIDs.contains(id) }?.id } ?? savedTabs.first?.id, pane)
+    }
+
+    /// Opens a new terminal pane directly as a member of the stack showing
+    /// `targetID`, on `profile` (This Mac or an exact SSH host). Like a new
+    /// tab, a Relay SSH pane on the target's host is born under the target.
+    @discardableResult
     func newStackedPane(onto targetID: UUID, profile: ConnectionProfile) throws -> (paneID: UUID, stack: PaneStack, tabID: UUID) {
         let target = try stackTarget(targetID)
         guard let anchor = panes[targetID] else { throw WorkspaceLayoutError.unknownPane }
@@ -3853,13 +3909,14 @@ final class WorkspaceModel: ObservableObject {
         tab.reconcileStacks()
         guard let saved = BrowserPaneSave.strip(layout: tab.layout, stacks: tab.stacks, floating: tab.floatingPanes,
                                                 browsers: browserPaneIDs) else { return nil }
+        let legacy = saved.layout.legacyProjection(stacks: saved.stacks)
         var snapshot = TabSnapshot(
             id: tab.id,
             sessionID: tab.sessionID,
             name: tab.name,
-            layout: saved.layout.legacyProjection(stacks: saved.stacks),
+            layout: legacy,
             floatingPanes: saved.floating,
-            splitRatios: tab.splitRatios,
+            splitRatios: tab.splitRatios.filter { BrowserPaneSave.splitIDs(saved.layout).union(BrowserPaneSave.splitIDs(legacy)).contains($0.key) },
             executionContext: tab.executionContext,
             rLayoutEditorID: tab.rLayoutEditorID,
             rResultsVisible: tab.rLayoutEditorID.flatMap { panes[$0]?.editorRuntime.showsRResults }
@@ -3875,6 +3932,7 @@ final class WorkspaceModel: ObservableObject {
     func currentWorkspaceSnapshot() -> WorkspaceSnapshot {
         let rPresentations = captureRPresentations?() ?? savedRPresentations
         let browsers = browserPaneIDs
+        let focus = savedFocus()
         let usedPaneIDs = Set(tabs.flatMap(\.allPaneIDs) + rPresentations.flatMap(\.paneIDs)).subtracting(browsers)
         return WorkspaceSnapshot(
             tabs: tabs.compactMap(tabSnapshot),
@@ -3882,8 +3940,8 @@ final class WorkspaceModel: ObservableObject {
                 panes[id].map { PaneSnapshot(pane: $0) }
             },
             sessionNames: sessionNames,
-            selectedTabID: selectedTabID,
-            activePaneID: activePaneID.map { BrowserPaneSave.savedFocus($0, stacks: tabs.flatMap(\.stacks), browsers: browsers) } ?? nil,
+            selectedTabID: focus.tab,
+            activePaneID: focus.pane,
             rPresentations: rPresentations,
             sidebarVisible: savedSidebarVisible,
             paneVisits: paneVisits.visits.filter { usedPaneIDs.contains($0.paneID) }
@@ -4246,9 +4304,18 @@ enum BrowserPaneSave {
         return Tab(layout: layout, stacks: kept, floating: floating.filter { !browsers.contains($0.paneID) })
     }
 
-    /// The saved focus: a browser's place goes to the pane it is stacked with.
-    static func savedFocus(_ active: UUID, stacks: [PaneStack], browsers: Set<UUID>) -> UUID? {
+    static func splitIDs(_ layout: PaneLayout) -> Set<UUID> {
+        guard case let .split(id, _, first, second) = layout else { return [] }
+        return Set([id]).union(splitIDs(first)).union(splitIDs(second))
+    }
+
+    /// The saved focus: a browser's place goes to a saved pane it is stacked
+    /// with, else to the pane it was opened for.
+    static func savedFocus(_ active: UUID, stacks: [PaneStack], browsers: Set<UUID>, anchors: [UUID: UUID] = [:]) -> UUID? {
         guard browsers.contains(active) else { return active }
-        return stacks.first { $0.members.contains(active) }?.members.first { !browsers.contains($0) }
+        if let mate = stacks.first(where: { $0.members.contains(active) })?.members.first(where: { !browsers.contains($0) }) {
+            return mate
+        }
+        return anchors[active].flatMap { browsers.contains($0) ? nil : $0 }
     }
 }

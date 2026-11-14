@@ -786,6 +786,8 @@ final class PaneModel: ObservableObject, Identifiable {
     lazy var runtime = TerminalRuntime(pane: self)
     lazy var editorRuntime = RemoteEditorRuntime(pane: self)
     lazy var browserSession = RelayBrowserSession(profile: profile, directory: directory)
+    /// The pane a browser pane was opened for; its place in saved focus.
+    var browserAnchor: UUID?
     var networkForegroundPID: pid_t? { runtime.networkForegroundPID }
 
     init(
