@@ -20,7 +20,7 @@ func readHostRotationNativeObservationCandidate(ctx context.Context, pane string
 		return empty, err
 	}
 	if before.Producer.Provider != "codex" {
-		return readHostRotationNativeCandidate(ctx, pane)
+		return readHostRotationNativeResumedCandidate(ctx, pane)
 	}
 	path, err := bindingSourcePath(before, "codex")
 	if err != nil {
