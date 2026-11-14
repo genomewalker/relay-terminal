@@ -210,11 +210,27 @@ struct RelayQuickLookItem: Equatable, Sendable {
 struct RelayQuickLookBrowser: Equatable {
     private(set) var items: [RelayQuickLookItem]
     private(set) var index: Int
+    /// Web items the user asked to load. A URL is terminal text that anything
+    /// running in the pane could have printed, so it loads only after a
+    /// click on it, never just because it was on screen.
+    private(set) var loadedWeb: Set<Int> = []
 
-    init?(items: [RelayQuickLookItem], start: Int = 0) {
+    /// `clickedStart` means the start item was itself clicked, which counts
+    /// as asking to load it.
+    init?(items: [RelayQuickLookItem], start: Int = 0, clickedStart: Bool = false) {
         guard !items.isEmpty else { return nil }
         self.items = items
         index = min(max(start, 0), items.count - 1)
+        if clickedStart { loadedWeb.insert(index) }
+    }
+
+    /// What the panel shows for a web item; files are read by the controller.
+    var webContent: RelayQuickLookContent? {
+        guard case .web(let url) = current.source else { return nil }
+        return loadedWeb.contains(index) ? .web(url) : .webCard(url)
+    }
+    mutating func loadCurrentWeb() {
+        if case .web = current.source { loadedWeb.insert(index) }
     }
 
     var current: RelayQuickLookItem { items[index] }
@@ -276,6 +292,8 @@ enum RelayQuickLookContent: Equatable {
     case loading
     case file(URL)
     case web(URL)
+    /// A URL shown as a card until the user chooses to load it.
+    case webCard(URL)
     case failed(String)
 }
 
@@ -294,8 +312,9 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
     private weak var returnFocus: NSView?
     private var open: ((String) -> Void)?
 
-    func present(_ items: [RelayQuickLookItem], start: Int, returnFocus: NSView?, open: @escaping (String) -> Void) {
-        guard let browser = RelayQuickLookBrowser(items: items, start: start) else { NSSound.beep(); return }
+    func present(_ items: [RelayQuickLookItem], start: Int, clickedStart: Bool = false,
+                 returnFocus: NSView?, open: @escaping (String) -> Void) {
+        guard let browser = RelayQuickLookBrowser(items: items, start: start, clickedStart: clickedStart) else { NSSound.beep(); return }
         closeContent()
         self.browser = browser
         self.returnFocus = returnFocus
@@ -316,6 +335,7 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
     }
 
     func next() { browser?.next(); showCurrent() }
+    func loadCurrentWeb() { browser?.loadCurrentWeb(); showCurrent() }
     func previous() { browser?.previous(); showCurrent() }
 
     func openCurrent() {
@@ -356,8 +376,8 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
         load?.cancel()
         let index = browser.index
         switch browser.current.source {
-        case .web(let url):
-            content = .web(url)
+        case .web:
+            content = browser.webContent ?? .loading
         case .localFile(let path):
             var directory: ObjCBool = false
             content = FileManager.default.fileExists(atPath: path, isDirectory: &directory)
@@ -439,6 +459,21 @@ struct RelayQuickLookView: View {
                     RelayQuickLookFileView(url: url)
                 case .web(let url):
                     RelayQuickLookWebView(url: url)
+                case .webCard(let url):
+                    VStack(spacing: 8) {
+                        Image(systemName: "globe").font(.system(size: 22)).foregroundStyle(RelayTheme.textMuted)
+                        Text(url.host ?? url.absoluteString).font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(RelayTheme.text)
+                        Text(url.absoluteString).font(.caption).foregroundStyle(RelayTheme.textMuted)
+                            .lineLimit(3).truncationMode(.middle).multilineTextAlignment(.center)
+                            .textSelection(.enabled)
+                        Text("Printed in the terminal. Not loaded until you ask.")
+                            .font(.caption).foregroundStyle(RelayTheme.textFaint)
+                        Button("Load Page") { controller.loadCurrentWeb() }
+                            .keyboardShortcut("l", modifiers: [])
+                            .help("Load in a private web view (L)")
+                    }
+                    .padding(24)
                 case .failed(let message):
                     VStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle").foregroundStyle(RelayTheme.warning)

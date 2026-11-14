@@ -156,4 +156,28 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: unrelated.path))
         #expect(FileManager.default.fileExists(atPath: staging.directory.path))
     }
+
+    @Test func onScreenURLsWaitForAClickBeforeLoading() throws {
+        let page = URL(string: "https://example.org/x")!, other = URL(string: "https://example.org/y")!
+        let items = [RelayQuickLookItem.resolve(.web(page), location: .unreadable)!,
+                     RelayQuickLookItem.resolve(.path("/a.txt"), location: .local(cwd: nil))!,
+                     RelayQuickLookItem.resolve(.web(other), location: .unreadable)!]
+        // Command-Y: nothing loads by itself.
+        var browser = try #require(RelayQuickLookBrowser(items: items))
+        #expect(browser.webContent == .webCard(page))
+        browser.loadCurrentWeb()
+        #expect(browser.webContent == .web(page))
+        browser.next()
+        #expect(browser.webContent == nil) // a file
+        browser.loadCurrentWeb()
+        browser.next()
+        #expect(browser.webContent == .webCard(other))
+        browser.next()
+        #expect(browser.webContent == .web(page)) // stays loaded while the panel is open
+        // Shift-Command-click on a URL loads only the clicked one.
+        var clicked = try #require(RelayQuickLookBrowser(items: items, start: 2, clickedStart: true))
+        #expect(clicked.webContent == .web(other))
+        clicked.next()
+        #expect(clicked.webContent == .webCard(page))
+    }
 }
