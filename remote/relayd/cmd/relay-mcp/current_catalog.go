@@ -36,16 +36,26 @@ func (s *server) installedCatalogCommand(mode string, input []byte) ([]byte, err
 	return raw, nil
 }
 
+// currentInstalledCatalog prefers the installed image's full agent catalog;
+// an older installed image without it offers only Miko's subset. The plan
+// mode returned matches the catalog that was read.
 func (s *server) currentInstalledCatalog() ([]map[string]any, error) {
-	raw, err := s.installedCatalogCommand("--miko-catalog", nil)
-	if err != nil {
-		return nil, err
+	catalog, _, err := s.currentInstalledCatalogAndPlanMode()
+	return catalog, err
+}
+
+func (s *server) currentInstalledCatalogAndPlanMode() ([]map[string]any, string, error) {
+	for _, mode := range [][2]string{{"--agent-catalog", "--agent-plan"}, {"--miko-catalog", "--miko-plan"}} {
+		raw, err := s.installedCatalogCommand(mode[0], nil)
+		if err != nil {
+			continue
+		}
+		var catalog []map[string]any
+		if json.Unmarshal(raw, &catalog) == nil && catalog != nil {
+			return catalog, mode[1], nil
+		}
 	}
-	var catalog []map[string]any
-	if json.Unmarshal(raw, &catalog) != nil {
-		return nil, errors.New("invalid current MCP catalog")
-	}
-	return catalog, nil
+	return nil, "", errors.New("current installed MCP catalog unavailable")
 }
 
 func (s *server) currentInstalledCall(name string, args map[string]json.RawMessage) (any, bool) {
@@ -55,7 +65,7 @@ func (s *server) currentInstalledCall(name string, args map[string]json.RawMessa
 			return nil, false
 		}
 	}
-	catalog, err := s.currentInstalledCatalog()
+	catalog, planMode, err := s.currentInstalledCatalogAndPlanMode()
 	if err != nil {
 		return nil, false
 	}
@@ -73,7 +83,7 @@ func (s *server) currentInstalledCall(name string, args map[string]json.RawMessa
 	if err != nil {
 		return currentCatalogFailure("Invalid tool arguments"), true
 	}
-	compiled, err := s.installedCatalogCommand("--miko-plan", raw)
+	compiled, err := s.installedCatalogCommand(planMode, raw)
 	if err != nil {
 		return currentCatalogFailure("The current MCP tool schema refused these arguments; nothing was submitted"), true
 	}

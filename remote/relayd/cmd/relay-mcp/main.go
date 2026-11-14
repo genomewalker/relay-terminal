@@ -1602,7 +1602,8 @@ func main() {
 		return
 	}
 	// Pure catalog/request compilation: never load live credentials or state.
-	if len(os.Args) == 2 && (os.Args[1] == "--miko-catalog" || os.Args[1] == "--miko-plan") {
+	if len(os.Args) == 2 && (os.Args[1] == "--miko-catalog" || os.Args[1] == "--miko-plan" ||
+		os.Args[1] == "--agent-catalog" || os.Args[1] == "--agent-plan") {
 		if err := mikoCLI(os.Args[1], os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)

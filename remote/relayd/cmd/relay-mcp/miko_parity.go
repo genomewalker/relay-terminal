@@ -34,12 +34,22 @@ func mikoExcluded(name string) bool {
 	return false
 }
 
-func mikoCatalog() []map[string]any {
+func mikoCatalog() []map[string]any { return toolCatalog(mikoExcluded) }
+
+// agentCatalog is every tool an agent's own connector offers, as the current
+// installed image defines it, so relay_call_tool in a long-running session
+// reaches tools added after it started. Only the two generic helpers are left
+// out; each tool keeps Relay's own authorization at its endpoint.
+func agentCatalog() []map[string]any {
+	return toolCatalog(func(name string) bool { return name == "relay_available_tools" || name == "relay_call_tool" })
+}
+
+func toolCatalog(excluded func(string) bool) []map[string]any {
 	x, _, _ := (&server{}).handle(request{Method: "tools/list"})
 	var out []map[string]any
 	for _, entry := range x.(map[string]any)["tools"].([]any) {
 		t := entry.(map[string]any)
-		if mikoExcluded(t["name"].(string)) {
+		if excluded(t["name"].(string)) {
 			continue
 		}
 		// A model cannot impersonate another caller by supplying credentials.
@@ -265,7 +275,12 @@ func (c *mikoCapture) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
 }
-func compileMikoPlan(data []byte) (*mikoPlan, error) {
+func compileMikoPlan(data []byte) (*mikoPlan, error) { return compilePlan(data, mikoCatalog()) }
+
+// compileAgentPlan compiles relay_call_tool requests against agentCatalog.
+func compileAgentPlan(data []byte) (*mikoPlan, error) { return compilePlan(data, agentCatalog()) }
+
+func compilePlan(data []byte, catalog []map[string]any) (*mikoPlan, error) {
 	v, e := mikoJSON(data)
 	if e != nil {
 		return nil, e
@@ -283,7 +298,7 @@ func compileMikoPlan(data []byte) (*mikoPlan, error) {
 		return nil, errors.New("arguments object required")
 	}
 	var definition map[string]any
-	for _, t := range mikoCatalog() {
+	for _, t := range catalog {
 		if t["name"] == n {
 			definition = t
 			break
@@ -327,11 +342,18 @@ func mikoCLI(mode string, in io.Reader, out io.Writer) error {
 	if mode == "--miko-catalog" {
 		return json.NewEncoder(out).Encode(mikoCatalog())
 	}
+	if mode == "--agent-catalog" {
+		return json.NewEncoder(out).Encode(agentCatalog())
+	}
 	b, e := io.ReadAll(io.LimitReader(in, 65537))
 	if e != nil {
 		return e
 	}
-	p, e := compileMikoPlan(b)
+	compile := compileMikoPlan
+	if mode == "--agent-plan" {
+		compile = compileAgentPlan
+	}
+	p, e := compile(b)
 	if e != nil {
 		return e
 	}
