@@ -723,7 +723,7 @@ struct RelayApp: App {
                     .disabled(workspace.activePane?.profile.kind != .ssh || workspace.activePane?.profile.backend != .relay)
                 Button(RelayCommand.quickLookVisible.label) { workspace.quickLookVisibleLinks() }
                     .keyboardShortcut(shortcut(.quickLookVisible).keyEquivalent, modifiers: shortcut(.quickLookVisible).eventModifiers)
-                    .disabled(workspace.activePane == nil)
+                    .disabled(workspace.activePane?.contentKind != .terminal)
                 Divider()
                 Button(workspace.zoomedPaneID == workspace.activePaneID ? "Restore pane layout" : "Zoom active pane") {
                     workspace.toggleActivePaneZoom()

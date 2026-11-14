@@ -7714,12 +7714,17 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         var handledLocalSelectionClick = false
         // Shift-Command-click previews the link instead of selecting text or
         // reaching the remote program.
-        let quickLookClick = forcedLocalSelection && !completedLocalDrag &&
+        // When nothing there can be previewed, the click keeps its old meaning.
+        var quickLookClick = forcedLocalSelection && !completedLocalDrag &&
             pendingLocalDown.map {
                 $0.clickCount == 1 &&
                     $0.modifierFlags.intersection([.command, .option, .control, .shift]) == [.command, .shift]
             } == true &&
             pointerStart.map { hypot(end.x - $0.x, end.y - $0.y) < 4 } == true
+        if quickLookClick {
+            let cell = quickLookCell(at: end)
+            quickLookClick = owner?.quickLook(row: cell?.row, column: cell?.column) == true
+        }
         if quickLookClick {
             // Handled below, after the gesture state is cleared.
         } else if forcedLocalSelection {
@@ -7746,11 +7751,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         forcingLocalSelectionGesture = false
         pendingLocalSelectionMouseDown = nil
         localSelectionDidDrag = false
-        if quickLookClick {
-            let cell = quickLookCell(at: end)
-            if owner?.quickLook(row: cell?.row, column: cell?.column) != true { NSSound.beep() }
-            return
-        }
+        if quickLookClick { return }
         if handledLocalSelectionClick {
             // Read Ghostty's selection directly, without touching the clipboard.
             // Only a range proven against the live logical input may be edited.
@@ -9844,11 +9845,19 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     }
 
     /// The viewport cell under a terminal point (top-left origin).
+    /// Uses the grid metrics, not the cursor, so it works wherever the
+    /// cursor is (or when it is hidden).
     private func quickLookCell(at point: CGPoint) -> (row: Int, column: Int)? {
-        guard let geometry = activeCursorGeometry() else { return nil }
-        let column = Int(floor((point.x - geometry.gridOrigin.x) / geometry.cellSize.width))
-        let row = Int(floor((point.y - geometry.gridOrigin.y) / geometry.cellSize.height))
-        return row >= 0 && column >= 0 ? (row, column) : nil
+        let scale = window?.backingScaleFactor ?? 2
+        var cellSize = fallbackCellSize()
+        if let metrics = currentGridMetrics(), metrics.cellWidthPixels > 0, metrics.cellHeightPixels > 0 {
+            cellSize = CGSize(width: CGFloat(metrics.cellWidthPixels) / scale,
+                              height: CGFloat(metrics.cellHeightPixels) / scale)
+        } else if let grid = owner?.terminalGridGeometry(backingScaleFactor: scale) {
+            cellSize = grid.cellSize
+        }
+        let padding = CGFloat(Int(min(max(RelayPreferences.shared.terminalPadding.rounded(), 0), 32)))
+        return RelayQuickLookLinks.cell(at: point, origin: CGPoint(x: padding, y: padding), cellSize: cellSize)
     }
 
     private func fallbackCellSize() -> CGSize {

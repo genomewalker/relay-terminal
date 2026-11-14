@@ -132,4 +132,28 @@ import Testing
         #expect(RelayCommand.allCases.filter { $0.defaultBinding == binding } == [.quickLookVisible])
         #expect(RelayCommand.quickLookVisible.section == "Panes")
     }
+
+    @Test func clickedCellComesFromTheGridNotTheCursor() {
+        let cell = { (x: CGFloat, y: CGFloat) in
+            RelayQuickLookLinks.cell(at: CGPoint(x: x, y: y), origin: CGPoint(x: 4, y: 4), cellSize: CGSize(width: 8, height: 16))
+        }
+        #expect(cell(4, 4).map { [$0.row, $0.column] } == [0, 0])
+        #expect(cell(4 + 8 * 9 + 7, 4 + 16 * 2 + 1).map { [$0.row, $0.column] } == [2, 9])
+        #expect(cell(3, 10) == nil)
+        #expect(RelayQuickLookLinks.cell(at: .init(x: 10, y: 10), origin: .zero, cellSize: .zero) == nil)
+    }
+
+    @Test func leftoverStagingFromAQuitIsRemoved() throws {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent("rqlt-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let stale = parent.appendingPathComponent(RelayQuickLookStaging.prefix + "old")
+        let unrelated = parent.appendingPathComponent("keep-me")
+        try FileManager.default.createDirectory(at: stale, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: false)
+        let staging = try RelayQuickLookStaging(parent: parent)
+        #expect(!FileManager.default.fileExists(atPath: stale.path))
+        #expect(FileManager.default.fileExists(atPath: unrelated.path))
+        #expect(FileManager.default.fileExists(atPath: staging.directory.path))
+    }
 }

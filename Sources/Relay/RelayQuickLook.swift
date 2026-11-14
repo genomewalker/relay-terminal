@@ -29,6 +29,13 @@ enum RelayQuickLookLinks {
         return found
     }
 
+    /// The viewport cell under a point measured from the top-left corner.
+    static func cell(at point: CGPoint, origin: CGPoint, cellSize: CGSize) -> (row: Int, column: Int)? {
+        guard cellSize.width > 0, cellSize.height > 0, point.x.isFinite, point.y.isFinite,
+              point.x >= origin.x, point.y >= origin.y else { return nil }
+        return (Int(floor((point.y - origin.y) / cellSize.height)), Int(floor((point.x - origin.x) / cellSize.width)))
+    }
+
     /// The target whose text covers `column` (0-based, one per character).
     static func target(in line: String, column: Int) -> RelayQuickLookTarget? {
         tokens(in: line).first { $0.columns.contains(column) }.flatMap { classify($0.text) }
@@ -222,8 +229,16 @@ final class RelayQuickLookStaging: @unchecked Sendable {
     private let lock = NSLock()
     private var counter = 0
 
+    static let prefix = "relay-quicklook-"
+
+    /// Only one panel exists, so any other staging folder was left by a quit
+    /// or restart while a panel was open; it is removed first.
     init(parent: URL = FileManager.default.temporaryDirectory) throws {
-        directory = parent.appendingPathComponent("relay-quicklook-" + UUID().uuidString, isDirectory: true)
+        let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? []
+        for name in leftovers where name.hasPrefix(Self.prefix) {
+            try? FileManager.default.removeItem(at: parent.appendingPathComponent(name))
+        }
+        directory = parent.appendingPathComponent(Self.prefix + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700])
     }
@@ -323,6 +338,8 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
         closeContent()
         browser = nil
         open = nil
+        if let view = returnFocus { view.window?.makeFirstResponder(view) }
+        returnFocus = nil
     }
 
     private func closeContent() {
