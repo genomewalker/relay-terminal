@@ -121,6 +121,12 @@ import Testing
         let targets = items.compactMap(RelayQuickLookLinks.target(fromAgentItem:))
         let local = await RelayShowCheck.run(items: items, targets: targets, location: .local(cwd: nil))
         #expect(local.map(\.result) == ["shown", "not_found", "unresolved", "shown", "shown"])
+        // URLs alone: the first opens in the browser, even a remote pane's localhost.
+        let urls = ["http://localhost:5173/", "https://example.org/"]
+        let remote = ConnectionProfile(name: "q", kind: .ssh, host: "q.invalid", backend: .relay)
+        let browser = await RelayShowCheck.run(items: urls, targets: urls.compactMap(RelayQuickLookLinks.target(fromAgentItem:)),
+                                               location: .remote(remote, cwd: "/h"))
+        #expect(browser.map(\.result) == ["shown", "unresolved"])
         let unreadable = await RelayShowCheck.run(items: items, targets: targets, location: .unreadable)
         #expect(unreadable.map(\.result) == ["unresolved", "unresolved", "unresolved", "shown", "unresolved"])
     }

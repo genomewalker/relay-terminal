@@ -335,7 +335,15 @@ enum RelayShowCheck {
     static func run(items: [String], targets: [RelayQuickLookTarget],
                     location: RelayQuickLookLocation) async -> [RelayShowItemResult] {
         var results: [RelayShowItemResult] = []
-        for (item, target) in zip(items, targets) {
+        // With no path, the first URL opens in the pane's browser, which
+        // routes a remote pane's localhost to its host.
+        let browserOnly = !targets.contains { if case .path = $0 { true } else { false } }
+        for (index, (item, target)) in zip(items, targets).enumerated() {
+            if browserOnly {
+                results.append(index == 0 ? .init(item: item, result: "shown", detail: nil)
+                    : .init(item: item, result: "unresolved", detail: "Only the first URL opens in the browser"))
+                continue
+            }
             guard let resolved = RelayQuickLookItem.resolve(target, location: location) else {
                 results.append(unresolved(item, target: target, location: location)); continue
             }
