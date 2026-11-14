@@ -922,9 +922,14 @@ final class RelayNodeConnection: @unchecked Sendable {
     /// takes longer than the heartbeat timeout to arrive.
     func readNodeFrame(from handle: FileHandle, fragments: inout RelayWireFragmentAssembler,
         generation currentGeneration: Int) throws {
-        let before = inboundState(generation: currentGeneration)
-        let raw = try RelayWireFrame.read(from: handle) { noteInbound(generation: currentGeneration) }
-        if raw.type == .ping { restoreInbound(before, generation: currentGeneration) }
+        // Snapshot when this frame's first bytes arrive, not before the
+        // blocking read: misses counted while the reader waited must stay.
+        var before: (UInt64?, Int)??
+        let raw = try RelayWireFrame.read(from: handle) {
+            if before == nil { before = .some(inboundState(generation: currentGeneration)) }
+            noteInbound(generation: currentGeneration)
+        }
+        if raw.type == .ping, let before { restoreInbound(before, generation: currentGeneration) }
         if raw.type == .status,
            let status = try? JSONDecoder().decode(StatusWirePayload.self, from: raw.payload),
            status.state == "ready", status.capabilities?.contains("wire_fragments_v1") == true {

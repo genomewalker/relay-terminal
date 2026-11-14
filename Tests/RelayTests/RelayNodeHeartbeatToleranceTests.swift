@@ -162,6 +162,28 @@ struct RelayNodeHeartbeatToleranceTests {
         #expect(record.details["consecutive_misses"] == "3")
     }
 
+    /// The real reader blocks waiting for the next frame while the watchdog
+    /// counts misses. A node Ping that then arrives must not roll the count
+    /// back to what it was when the read started.
+    @Test func nodePingThroughTheReaderKeepsMissesCountedWhileWaiting() throws {
+        let f = fixture("heartbeat-node-ping-reader")
+        let pipe = Pipe()
+        #expect(f.tick(at: 0))
+        let done = DispatchSemaphore(value: 0)
+        let node = f.node
+        Thread.detachNewThread {
+            var fragments = RelayWireFragmentAssembler()
+            _ = try? node.readNodeFrame(from: pipe.fileHandleForReading, fragments: &fragments, generation: 0)
+            done.signal()
+        }
+        for seconds in [2.0, 4, 6, 8] { #expect(f.tick(at: seconds)) } // two misses while the reader waits
+        f.clock.set(f.start + UInt64(8.5 * Double(second)))
+        pipe.fileHandleForWriting.write(Data([RelayWireType.ping.rawValue, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 9]))
+        #expect(done.wait(timeout: .now() + 2) == .success)
+        #expect(f.tick(at: 10) == false)
+        #expect(try #require(f.watchdogRecords().first).details["consecutive_misses"] == "3")
+    }
+
     @Test func totalSilenceRestartsAfterExactlyTheThreshold() throws {
         let f = fixture("heartbeat-silence")
         for seconds in [0.0, 2, 4, 6, 8] { #expect(f.tick(at: seconds)) }
