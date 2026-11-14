@@ -247,13 +247,16 @@ extension RelayBrowserController {
     }
 
     /// Carries out one agent action on the pane's host browser and returns the page after it.
+    /// `docked` is a browser pane's session; without one the host's floating browser is used.
     func agent(_ action: RelayBrowserAgentAction, profile: ConnectionProfile, directory: String?, near window: NSWindow?,
+               anchor: UUID? = nil, docked: RelayBrowserSession? = nil,
                url: URL?, ref: Int?, text: String?, submit: Bool, key: String?, dy: Int?) async throws
         -> (page: RelayBrowserAgentPage, capture: Data?) {
         if action == .open, let url {
-            open(url, profile: profile, directory: directory, near: window, takeFocus: false)
+            if let docked { docked.open(url) }
+            else { open(url, profile: profile, directory: directory, near: window, takeFocus: false, anchor: anchor) }
         }
-        guard let session = session(for: profile) else { throw RelayBrowserAgentError.noBrowser }
+        guard let session = docked ?? session(for: profile) else { throw RelayBrowserAgentError.noBrowser }
         switch action {
         case .open, .read, .capture: break
         case .click: try await session.agentClick(ref ?? 0)

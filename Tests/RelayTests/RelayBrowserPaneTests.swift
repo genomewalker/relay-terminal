@@ -1,0 +1,63 @@
+import Foundation
+import Testing
+@testable import Relay
+
+@Suite("Browser panes", .serialized)
+@MainActor struct RelayBrowserPaneTests {
+    @Test func aShownBrowserGivesItsSlotBackToASavedStackMate() throws {
+        let a = UUID(), b = UUID(), c = UUID(), split = UUID()
+        let floating = FloatingPanePlacement.initial(paneID: b, index: 0)
+        // Two members: the stack disappears and its terminal takes the slot.
+        let two = try #require(BrowserPaneSave.strip(layout: .split(id: split, axis: .horizontal, first: .pane(b), second: .pane(c)),
+                                                     stacks: [PaneStack(id: UUID(), members: [a, b], selected: b)],
+                                                     floating: [floating], browsers: [b]))
+        #expect(two.layout == .split(id: split, axis: .horizontal, first: .pane(a), second: .pane(c)))
+        #expect(two.stacks.isEmpty && two.floating.isEmpty)
+        // Three members: the stack keeps its saved members, shown by a saved one.
+        let stack = PaneStack(id: UUID(), members: [a, b, c], selected: b)
+        let three = try #require(BrowserPaneSave.strip(layout: .pane(b), stacks: [stack], floating: [], browsers: [b]))
+        #expect(three.layout == .pane(a) && three.stacks == [PaneStack(id: stack.id, members: [a, c], selected: a)])
+        // A hidden browser leaves the layout as it is.
+        let hidden = try #require(BrowserPaneSave.strip(layout: .pane(a), stacks: [PaneStack(id: stack.id, members: [a, b], selected: a)],
+                                                        floating: [], browsers: [b]))
+        #expect(hidden.layout == .pane(a) && hidden.stacks.isEmpty)
+        // Nothing saved is left.
+        #expect(BrowserPaneSave.strip(layout: .pane(b), stacks: [], floating: [], browsers: [b]) == nil)
+        #expect(BrowserPaneSave.savedFocus(b, stacks: [stack], browsers: [b]) == a)
+        #expect(BrowserPaneSave.savedFocus(c, stacks: [stack], browsers: [b]) == c)
+    }
+
+    @Test func aBrowserPaneIsNeverSavedOrListedToTheUpdater() throws {
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let anchor = try #require(workspace.activePaneID)
+        let browser = try workspace.newBrowserPane(onto: anchor, url: nil)
+        #expect(browser.contentKind == .browser && browser.connectionState == .connected)
+        #expect(workspace.activePaneID == browser.id)                     // shown and focused in the stack
+        #expect(workspace.stackedBrowserPane(for: anchor) === browser)
+        #expect(workspace.stackedBrowserPane(for: browser.id) === browser)
+
+        let data = try JSONEncoder().encode(workspace.currentWorkspaceSnapshot())
+        let json = try #require(String(data: data, encoding: .utf8))
+        #expect(!json.contains(browser.id.uuidString) && !json.contains("\"browser\""))
+        let saved = try JSONDecoder().decode(WorkspaceSnapshot.self, from: data)
+        #expect(saved.activePaneID == anchor)
+        #expect(saved.panes.map(\.id).contains(anchor))
+        #expect(saved.tabs.allSatisfy { $0.layout.paneIDs.contains(anchor) || !$0.layout.paneIDs.isEmpty })
+
+        let live = workspace.sidePanelState()
+        #expect(live.selectedPaneID == anchor.uuidString.lowercased())
+        let listed = live.sessions.flatMap(\.tabs).flatMap(\.panes).map(\.id)
+        #expect(listed.contains(anchor.uuidString.lowercased()) && !listed.contains(browser.id.uuidString.lowercased()))
+        #expect(throws: (any Error).self) { try workspace.newBrowserPane(onto: browser.id, url: nil) } // not onto itself
+    }
+
+    @Test func stackPlacementIsOnlyForOpen() {
+        func proposal(_ action: RelayBrowserAgentAction, placement: String?) -> MCPDirectTabRequests.BrowserProposal {
+            MCPDirectTabRequests.BrowserProposal(instance: UUID(), requestID: UUID(), paneID: UUID(), action: action,
+                                                 url: action == .open ? "http://localhost:5173/" : nil, placement: placement)
+        }
+        #expect(proposal(.open, placement: "stack").isValid && proposal(.open, placement: "floating").isValid)
+        #expect(!proposal(.open, placement: "tab").isValid && !proposal(.read, placement: "stack").isValid)
+    }
+}

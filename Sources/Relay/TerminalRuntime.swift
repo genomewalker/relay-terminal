@@ -4000,7 +4000,7 @@ final class TerminalRuntime: NSObject {
         if paths.isEmpty {
             guard case .web(let url)? = targets.first else { return nil }
             RelayBrowserController.shared.open(url, profile: pane.profile, directory: pane.directory,
-                                               near: view.window, takeFocus: false)
+                                               near: view.window, takeFocus: false, anchor: pane.id)
             return .browser(url)
         }
         return presentQuickLook(targets, start: nil, takeFocus: false) ? .quickLook : nil
@@ -4207,7 +4207,8 @@ final class TerminalRuntime: NSObject {
         case .web(let url):
             // The floating browser: localhost is this pane's host, local or remote.
             guard let pane else { return false }
-            RelayBrowserController.shared.open(url, profile: pane.profile, directory: pane.directory, near: view.window)
+            RelayBrowserController.shared.open(url, profile: pane.profile, directory: pane.directory, near: view.window,
+                                               anchor: pane.id)
         case .image(let path):
             showArtifact(path: resolvedRemotePath(path))
         case .file(let path) where RelayFilePreviewKind.from(path: path) != nil:

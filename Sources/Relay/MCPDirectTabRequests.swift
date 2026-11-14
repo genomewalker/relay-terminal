@@ -111,11 +111,15 @@ import Foundation
         var submit: Bool?
         var key: String?
         var dy: Int?
-        static let keys: Set<String> = ["instance", "requestID", "paneID", "action", "url", "ref", "text", "submit", "key", "dy"]
+        /// open only: "stack" puts the browser in the pane's stack; default floating.
+        var placement: String? = nil
+        static let keys: Set<String> = ["instance", "requestID", "paneID", "action", "url", "ref", "text", "submit", "key", "dy", "placement"]
+        var stacks: Bool { placement == "stack" }
 
         /// The argument each action needs, and nothing it cannot use.
         var isValid: Bool {
             let refOK = ref.map { (1...RelayBrowserAgentScripts.elementLimit).contains($0) } ?? false
+            guard placement == nil || (action == .open && ["stack", "floating"].contains(placement!)) else { return false }
             switch action {
             case .open:
                 return url.flatMap(RelayQuickLookLinks.target(fromAgentItem:)).map { if case .web = $0 { true } else { false } } ?? false
@@ -140,14 +144,20 @@ import Foundation
     }
     private var browserRequests: [UUID: BrowserProposal] = [:]
     private var browserResults: [UUID: BrowserResponse] = [:]
+    private var browserOrder: [UUID] = []
 
     /// `relay_browser`: lets an agent use Relay's browser for one pane's host.
     /// Reading and capture need the navigate grant; anything that changes the
     /// page also needs the input grant. Page-changing requests are idempotent.
     func browser(_ body: Data, instance: UUID, permits: (MCPWorkspaceCapability) -> Bool, workspace: WorkspaceModel,
-                 perform: (PaneModel, BrowserProposal) async throws -> (page: RelayBrowserAgentPage, capture: Data?) = { pane, proposal in
-                     try await RelayBrowserController.shared.agent(
-                         proposal.action, profile: pane.profile, directory: pane.directory, near: NSApp?.mainWindow,
+                 perform: (WorkspaceModel, PaneModel, BrowserProposal) async throws -> (page: RelayBrowserAgentPage, capture: Data?) = { workspace, pane, proposal in
+                     // A browser pane stacked with this pane is the one the agent uses;
+                     // otherwise the host's floating browser.
+                     var docked = workspace.stackedBrowserPane(for: pane.id)?.browserSession
+                     if proposal.stacks, docked == nil { docked = try workspace.newBrowserPane(onto: pane.id, url: nil).browserSession }
+                     return try await RelayBrowserController.shared.agent(
+                         proposal.action, profile: pane.profile, directory: pane.directory, near: NSApp?.mainWindow, anchor: pane.id,
+                         docked: docked,
                          url: proposal.url.flatMap(RelayQuickLookLinks.target(fromAgentItem:)).flatMap { if case .web(let url) = $0 { url } else { nil } },
                          ref: proposal.ref, text: proposal.text, submit: proposal.submit ?? false, key: proposal.key, dy: proposal.dy)
                  }) async -> RelaySidePanelHTTPResponse {
@@ -164,6 +174,9 @@ import Foundation
         if proposal.action.changesPage, !permits(.input) {
             return .text("MCP terminal input capability is not granted", status: 403, reason: "Forbidden")
         }
+        if proposal.stacks, !permits(.create) || !permits(.layout) {
+            return .text("MCP workspace create and layout capabilities are required to add a browser pane", status: 403, reason: "Forbidden")
+        }
         if let old = browserRequests[proposal.requestID] {
             guard old == proposal, let result = browserResults[proposal.requestID] else {
                 return .text(old == proposal ? "Browser request still in progress" : "Conflicting browser request ID",
@@ -171,13 +184,25 @@ import Foundation
             }
             return .json(result)
         }
-        guard browserRequests.count < receiptLimit, let pane = workspace.panes[proposal.paneID] else {
-            return .text("Pane unavailable or browser receipt limit reached", status: 409, reason: "Conflict")
+        guard let pane = workspace.panes[proposal.paneID] else {
+            return .text("Pane unavailable", status: 409, reason: "Conflict")
         }
         // Reading repeats freely; a page change is claimed before it starts.
-        if proposal.action.changesPage { browserRequests[proposal.requestID] = proposal }
+        // The oldest finished receipts make room, so a long session keeps working.
+        if proposal.action.changesPage {
+            while browserRequests.count >= receiptLimit, let oldest = browserOrder.first(where: { browserResults[$0] != nil }) {
+                browserOrder.removeAll { $0 == oldest }
+                browserRequests[oldest] = nil
+                browserResults[oldest] = nil
+            }
+            guard browserRequests.count < receiptLimit else {
+                return .text("Too many browser actions in progress", status: 409, reason: "Conflict")
+            }
+            browserRequests[proposal.requestID] = proposal
+            browserOrder.append(proposal.requestID)
+        }
         do {
-            let (page, capture) = try await perform(pane, proposal)
+            let (page, capture) = try await perform(workspace, pane, proposal)
             let response = BrowserResponse(status: "ok", action: proposal.action.rawValue,
                                            paneID: proposal.paneID.uuidString.lowercased(), page: page,
                                            image: capture?.base64EncodedString(), mimeType: capture == nil ? nil : "image/png")
@@ -187,6 +212,7 @@ import Foundation
             if proposal.action.changesPage {
                 browserResults[proposal.requestID] = nil
                 browserRequests[proposal.requestID] = nil  // nothing ran, or the page refused it
+                browserOrder.removeAll { $0 == proposal.requestID }
             }
             return .text(error.localizedDescription, status: 409, reason: "Conflict")
         }

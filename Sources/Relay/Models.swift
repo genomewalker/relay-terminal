@@ -209,11 +209,16 @@ enum RemoteSessionBackend: String, Codable, CaseIterable, Identifiable, Sendable
 enum PaneContentKind: String, Codable, Sendable {
     case terminal
     case editor
+    /// Relay's browser for the pane's host, held in a pane stack. Never
+    /// saved: older Relay versions cannot read this kind, so a browser pane
+    /// is left out of every workspace snapshot.
+    case browser
 
     var label: String {
         switch self {
         case .terminal: "Terminal"
         case .editor: "Editor"
+        case .browser: "Browser"
         }
     }
 
@@ -221,6 +226,7 @@ enum PaneContentKind: String, Codable, Sendable {
         switch self {
         case .terminal: "terminal"
         case .editor: "curlybraces"
+        case .browser: "globe"
         }
     }
 }
@@ -779,6 +785,7 @@ final class PaneModel: ObservableObject, Identifiable {
     private var supervisorReconnectSamples: [Date] = []
     lazy var runtime = TerminalRuntime(pane: self)
     lazy var editorRuntime = RemoteEditorRuntime(pane: self)
+    lazy var browserSession = RelayBrowserSession(profile: profile, directory: directory)
     var networkForegroundPID: pid_t? { runtime.networkForegroundPID }
 
     init(
@@ -802,9 +809,9 @@ final class PaneModel: ObservableObject, Identifiable {
         self.customName = customName
         self.directory = directory
         self.requestedStartDirectory = startDirectory
-        self.title = contentKind == .editor ? "Editor" : profile.name
+        self.title = contentKind == .terminal ? profile.name : contentKind.label
         self.remoteExitCode = nil
-        self.connectionState = profile.backend == .relay
+        self.connectionState = profile.backend == .relay && contentKind != .browser
             ? .connecting
             : .connected
         dismissedArtifactIdentities = ArtifactDismissalStore.load(paneID: id)
@@ -883,6 +890,7 @@ final class PaneModel: ObservableObject, Identifiable {
         switch contentKind {
         case .terminal: runtime.focus()
         case .editor: editorRuntime.focus()
+        case .browser: browserSession.webView.window?.makeFirstResponder(browserSession.webView)
         }
     }
 
@@ -960,6 +968,7 @@ final class PaneModel: ObservableObject, Identifiable {
         switch contentKind {
         case .terminal: runtime.stop()
         case .editor: editorRuntime.stop()
+        case .browser: browserSession.close()
         }
     }
 
@@ -968,6 +977,7 @@ final class PaneModel: ObservableObject, Identifiable {
         switch contentKind {
         case .terminal: runtime.restart()
         case .editor: editorRuntime.restart()
+        case .browser: browserSession.webView.reload()
         }
     }
 

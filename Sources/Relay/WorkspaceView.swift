@@ -213,6 +213,7 @@ struct WorkspaceView: View {
         .background(RelayTheme.canvas)
         .environmentObject(workspace.paneLinkSelection)
         .task { workspace.refreshPaneLinkMemberships() }
+        .modifier(RelayBrowserDockReceiver(workspace: workspace))
         .onReceive(NotificationCenter.default.publisher(for: .relayShowHPC)) { _ in
             guard let pane = workspace.activePane else { return }
             workspace.selectedTab?.chrome.hide()
@@ -3932,6 +3933,9 @@ private struct PaneView: View {
                 } else if pane.contentKind == .editor {
                     QuickEditorPane(pane: pane)
                         .id(pane.id)
+                } else if pane.contentKind == .browser {
+                    RelayBrowserView(session: pane.browserSession, close: nil)
+                        .id(pane.id)
                 } else {
                     TerminalSurface(pane: pane, covered: networkCoverActive || pane.nativeConversationVisible)
                         .equatable()
@@ -5202,7 +5206,12 @@ struct ConnectionPath: View {
                 }
                 .layoutPriority(-1)
             }
-            if pane.contentKind == .editor {
+            if pane.contentKind == .browser {
+                Label("Browser", systemImage: "globe")
+                    .font(RelayTheme.font(size: 9.5, weight: .medium))
+                    .foregroundStyle(RelayTheme.blue)
+                    .lineLimit(1)
+            } else if pane.contentKind == .editor {
                 Label("Editor", systemImage: "curlybraces")
                     .font(RelayTheme.font(size: 9.5, weight: .medium))
                     .foregroundStyle(RelayTheme.blue)
@@ -6366,4 +6375,16 @@ struct HPCClusterWorkspaceOverlay: View {
 /// `onAppear` runs the same method. Used by tests of the shown workspace.
 @MainActor func relayRestoreToolWindowPresentations(_ workspace: WorkspaceModel) {
     RelayToolWindowCoordinator().restorePresentations(workspace: workspace)
+}
+
+/// Moves a floating browser into the stack of the pane that opened it; only
+/// the window that holds that pane acts.
+struct RelayBrowserDockReceiver: ViewModifier {
+    let workspace: WorkspaceModel
+    func body(content: Content) -> some View {
+        content.onReceive(NotificationCenter.default.publisher(for: .relayDockBrowser)) { note in
+            guard let request = note.object as? RelayBrowserDockRequest, workspace.panes[request.anchor] != nil else { return }
+            _ = try? workspace.newBrowserPane(onto: request.anchor, url: request.url)
+        }
+    }
 }

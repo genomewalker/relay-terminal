@@ -41,6 +41,16 @@ enum RelayBrowserRouting {
         return .tunnel(hostPort: port)
     }
 
+    /// The address as the pane's host sees it: a carried Mac port reads as
+    /// that host's localhost port again.
+    static func hostURL(_ url: URL, tunnels: [Int: Int]) -> URL {
+        guard isLoopback(url), let hostPort = tunnels.first(where: { $0.value == port(url) })?.key,
+              var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        parts.host = "localhost"
+        parts.port = hostPort
+        return parts.url ?? url
+    }
+
     static func mapped(_ url: URL, to port: Int) -> URL {
         var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)!
         parts.host = "127.0.0.1"
@@ -122,7 +132,11 @@ enum RelayBrowserRouting {
             webView.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.revision += 1 } },
             webView.observe(\.isLoading, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.revision += 1 } },
             webView.observe(\.url, options: [.new]) { [weak self] view, _ in
-                Task { @MainActor in self?.address = view.url?.absoluteString ?? ""; self?.revision += 1 }
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.address = view.url.map { RelayBrowserRouting.hostURL($0, tunnels: self.portMap).absoluteString } ?? ""
+                    self.revision += 1
+                }
             },
         ]
         if remote { updateGuard() }
@@ -315,8 +329,13 @@ enum RelayBrowserRouting {
         profile.kind == .local ? "local" : profile.id.uuidString
     }
 
-    func open(_ url: URL?, profile: ConnectionProfile, directory: String?, near window: NSWindow?, takeFocus: Bool = true) {
+    /// The pane each host's floating browser was last opened from.
+    private var anchors: [String: UUID] = [:]
+
+    func open(_ url: URL?, profile: ConnectionProfile, directory: String?, near window: NSWindow?, takeFocus: Bool = true,
+              anchor: UUID? = nil) {
         let key = Self.key(profile)
+        if let anchor { anchors[key] = anchor }
         let entry = panels[key].flatMap { $0.session.profile == profile ? $0 : nil } ?? make(profile: profile, directory: directory)
         panels[key] = entry
         entry.session.update(directory: directory)
@@ -356,7 +375,15 @@ enum RelayBrowserRouting {
         panel.minSize = NSSize(width: 420, height: 300)
         panel.delegate = self
         RelayTheme.configureAppearance(panel)
-        panel.contentView = NSHostingView(rootView: RelayBrowserView(session: session) { [weak panel] in panel?.close() })
+        let key = Self.key(profile)
+        panel.contentView = NSHostingView(rootView: RelayBrowserView(
+            session: session, close: { [weak panel] in panel?.close() },
+            dock: { [weak self, weak panel, weak session] in
+                guard let self, let session, let anchor = anchors[key] else { return }
+                let url = session.webView.url.map { RelayBrowserRouting.hostURL($0, tunnels: session.portMap) }
+                NotificationCenter.default.post(name: .relayDockBrowser, object: RelayBrowserDockRequest(anchor: anchor, url: url))
+                panel?.close()
+            }))
         return (session, panel)
     }
 }
@@ -369,7 +396,10 @@ private struct RelayBrowserSurface: NSViewRepresentable {
 
 struct RelayBrowserView: View {
     @ObservedObject var session: RelayBrowserSession
-    let close: () -> Void
+    /// Present in the floating panel; a browser pane closes like any pane.
+    var close: (() -> Void)?
+    /// Moves the floating browser into the stack of the pane that opened it.
+    var dock: (() -> Void)? = nil
 
     var body: some View {
         let _ = session.revision
@@ -398,11 +428,15 @@ struct RelayBrowserView: View {
                           : "localhost is this Mac")
                 Button { session.openElsewhere() } label: { Image(systemName: "safari") }
                     .disabled(!session.canOpenElsewhere).help("Open in the default browser")
-                Button(action: close) { Image(systemName: "xmark.circle") }.help("Close")
+                if let dock {
+                    Button(action: dock) { Image(systemName: "rectangle.stack.badge.plus") }
+                        .help("Move into the pane's stack")
+                }
+                if let close { Button(action: close) { Image(systemName: "xmark.circle") }.help("Close") }
             }
             .buttonStyle(.borderless)
             .foregroundStyle(RelayTheme.textMuted)
-            .padding(.leading, 76).padding(.trailing, 12).padding(.vertical, 8)
+            .padding(.leading, close == nil ? 12 : 76).padding(.trailing, 12).padding(.vertical, 8)
             .background(RelayTheme.surface)
             if let url = session.confirm {
                 HStack(spacing: 8) {
@@ -434,4 +468,13 @@ struct RelayBrowserView: View {
         }
         .background(RelayTheme.canvas)
     }
+}
+
+struct RelayBrowserDockRequest {
+    let anchor: UUID
+    let url: URL?
+}
+
+extension Notification.Name {
+    static let relayDockBrowser = Notification.Name("relay.dock-browser")
 }

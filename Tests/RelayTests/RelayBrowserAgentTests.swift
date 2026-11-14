@@ -40,7 +40,7 @@ import WebKit
         let page = RelayBrowserAgentPage(url: "http://localhost:5173/", title: "t", loading: false, waitingForUser: nil, error: nil,
                                          text: "", textTruncated: false, elements: [], elementsTruncated: false, scrollY: 0, scrollHeight: 0)
         func call(_ proposal: Proposal, _ permits: @escaping (MCPWorkspaceCapability) -> Bool) async throws -> RelaySidePanelHTTPResponse {
-            await handler.browser(try JSONEncoder().encode(proposal), instance: instance, permits: permits, workspace: workspace) { pane, p in
+            await handler.browser(try JSONEncoder().encode(proposal), instance: instance, permits: permits, workspace: workspace) { _, pane, p in
                 #expect(pane.id == paneID)
                 performed.append(p.action)
                 return (page, nil)
@@ -64,7 +64,7 @@ import WebKit
         var extra = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(Self.proposal(.read, pane: paneID, instance: instance))) as? [String: Any])
         extra["script"] = "alert(1)"
         let refused = await handler.browser(try JSONSerialization.data(withJSONObject: extra), instance: instance, permits: both,
-                                            workspace: workspace) { _, _ in performed.append(.read); return (page, nil) }
+                                            workspace: workspace) { _, _, _ in performed.append(.read); return (page, nil) }
         #expect(refused.status == 400)
         #expect(performed == [.read, .click])
     }
