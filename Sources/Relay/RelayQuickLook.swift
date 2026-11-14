@@ -220,11 +220,15 @@ struct RelayQuickLookBrowser: Equatable {
 
     /// `clickedStart` means the start item was itself clicked, which counts
     /// as asking to load it.
-    init?(items: [RelayQuickLookItem], start: Int = 0, clickedStart: Bool = false) {
+    /// False for a remote pane: its pages open in the guarded browser, never inline.
+    let inlineWeb: Bool
+
+    init?(items: [RelayQuickLookItem], start: Int = 0, clickedStart: Bool = false, inlineWeb: Bool = true) {
         guard !items.isEmpty else { return nil }
         self.items = items
+        self.inlineWeb = inlineWeb
         index = min(max(start, 0), items.count - 1)
-        if clickedStart { loadedWeb.insert(index) }
+        if clickedStart && inlineWeb { loadedWeb.insert(index) }
     }
 
     /// What the panel shows for a web item; files are read by the controller.
@@ -233,7 +237,7 @@ struct RelayQuickLookBrowser: Equatable {
         return loadedWeb.contains(index) ? .web(url) : .webCard(url)
     }
     mutating func loadCurrentWeb() {
-        if case .web = current.source { loadedWeb.insert(index) }
+        if inlineWeb, case .web = current.source { loadedWeb.insert(index) }
     }
 
     var current: RelayQuickLookItem { items[index] }
@@ -315,9 +319,10 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
     private weak var returnFocus: NSView?
     private var open: ((String) -> Void)?
 
-    func present(_ items: [RelayQuickLookItem], start: Int, clickedStart: Bool = false,
+    func present(_ items: [RelayQuickLookItem], start: Int, clickedStart: Bool = false, inlineWeb: Bool = true,
                  returnFocus: NSView?, open: @escaping (String) -> Void) {
-        guard let browser = RelayQuickLookBrowser(items: items, start: start, clickedStart: clickedStart) else { NSSound.beep(); return }
+        guard let browser = RelayQuickLookBrowser(items: items, start: start, clickedStart: clickedStart,
+                                                  inlineWeb: inlineWeb) else { NSSound.beep(); return }
         closeContent()
         self.browser = browser
         self.returnFocus = returnFocus
@@ -338,7 +343,10 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
     }
 
     func next() { browser?.next(); showCurrent() }
-    func loadCurrentWeb() { browser?.loadCurrentWeb(); showCurrent() }
+    func loadCurrentWeb() {
+        guard browser?.inlineWeb == true else { openCurrent(); return } // the pane's browser
+        browser?.loadCurrentWeb(); showCurrent()
+    }
     func previous() { browser?.previous(); showCurrent() }
 
     func openCurrent() {
@@ -472,9 +480,11 @@ struct RelayQuickLookView: View {
                             .textSelection(.enabled)
                         Text("Printed in the terminal. Not loaded until you ask.")
                             .font(.caption).foregroundStyle(RelayTheme.textFaint)
-                        Button("Load Page") { controller.loadCurrentWeb() }
-                            .keyboardShortcut("l", modifiers: [])
-                            .help("Load in a private web view (L)")
+                        Button(controller.browser?.inlineWeb == false ? "Open in Browser" : "Load Page") {
+                            controller.loadCurrentWeb()
+                        }
+                        .keyboardShortcut("l", modifiers: [])
+                        .help("Load it (L)")
                     }
                     .padding(24)
                 case .failed(let message):

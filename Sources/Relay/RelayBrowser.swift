@@ -60,7 +60,7 @@ enum RelayBrowserRouting {
     static func macGuardRules(macPorts: [Int]) -> String {
         var rules: [[String: Any]] = [
             "^[a-z]+://localhost[:/]", "^[a-z]+://[^/]*\\.localhost[:/]", "^[a-z]+://127\\.",
-            "^[a-z]+://\\[::1\\]", "^[a-z]+://\\[::ffff:127\\.", "^[a-z]+://\\[::ffff:7f", "^[a-z]+://0\\.0\\.0\\.0[:/]",
+            "^[a-z]+://\\[::1\\]", "^[a-z]+://\\[::\\][:/]", "^[a-z]+://\\[::ffff:127\\.", "^[a-z]+://\\[::ffff:7f", "^[a-z]+://0\\.0\\.0\\.0[:/]",
         ].map { ["trigger": ["url-filter": $0], "action": ["type": "block"]] }
         for port in macPorts.sorted() {
             rules.append(["trigger": ["url-filter": "^[a-z]+://127\\.0\\.0\\.1:\(port)/"], "action": ["type": "ignore-previous-rules"]])
@@ -78,6 +78,8 @@ enum RelayBrowserRouting {
     @Published private(set) var error: String?
     @Published private(set) var busy = false
     @Published private(set) var revision = 0
+    /// A host port a page (not the user) asked for; opened only on confirm.
+    @Published private(set) var confirm: URL?
     private var directory: String
     private var tunnels: [Int: RHttpgdRelayBridge] = [:]
     private var opening: [Int: Task<Void, Never>] = [:]
@@ -85,6 +87,7 @@ enum RelayBrowserRouting {
     private var guarded = false
     private var pending: URL?
     private var generation = UUID()
+    private var guardSequence = 0
     private var observations: [NSKeyValueObservation] = []
 
     var remote: Bool { profile.kind != .local }
@@ -127,17 +130,25 @@ enum RelayBrowserRouting {
         if let directory, directory.hasPrefix("/") { self.directory = directory }
     }
 
+    /// A URL the user chose: a pane click or the address bar.
     func open(_ url: URL) {
         address = url.absoluteString
-        go(url)
+        go(url, byUser: true)
     }
+
+    func confirmPort() {
+        guard let url = confirm else { return }
+        confirm = nil
+        go(url, byUser: true)
+    }
+    func declinePort() { confirm = nil }
 
     func navigate() {
         guard let url = WorkspaceBrowserAddress.parse(address) else {
             error = "Enter an HTTP or HTTPS address without embedded credentials."
             return
         }
-        go(url)
+        go(url, byUser: true)
     }
 
     func openElsewhere() {
@@ -153,16 +164,18 @@ enum RelayBrowserRouting {
         webView.loadHTMLString("", baseURL: nil)
         tunnels.values.forEach { $0.close() }; tunnels = [:]
         pending = nil
+        confirm = nil
         busy = false
         error = nil
         address = ""
         if remote { updateGuard() }
     }
 
-    private func go(_ url: URL) {
+    private func go(_ url: URL, byUser: Bool) {
         switch RelayBrowserRouting.route(url, remote: remote, tunnels: portMap) {
         case .load(let target): load(target)
-        case .tunnel(let port): carry(port, then: url)
+        case .tunnel(let port) where byUser: carry(port, then: url)
+        case .tunnel: confirm = url
         case .blocked(let message): error = message
         }
     }
@@ -212,11 +225,14 @@ enum RelayBrowserRouting {
     private func updateGuard() {
         let ports = Array(portMap.values)
         let token = generation
+        guardSequence += 1
+        let sequence = guardSequence
         let identifier = "relay-browser-mac-guard-" + ports.sorted().map(String.init).joined(separator: "-")
         Task { [weak self] in
             let compiled = try? await WKContentRuleListStore.default().compileContentRuleList(
                 forIdentifier: identifier, encodedContentRuleList: RelayBrowserRouting.macGuardRules(macPorts: ports))
-            guard let self, token == generation else { return }
+            // A later update supersedes this one, whichever compiles first.
+            guard let self, token == generation, sequence == guardSequence else { return }
             guard let compiled else {
                 error = "The browser's network guard could not be set up, so nothing will load from \(hostLabel)."
                 return
@@ -226,7 +242,7 @@ enum RelayBrowserRouting {
             if let old = rules { controller.remove(old) }
             rules = compiled
             guarded = true
-            if let next = pending { pending = nil; go(next) }
+            if let next = pending { pending = nil; go(next, byUser: true) }
         }
     }
 
@@ -247,7 +263,11 @@ enum RelayBrowserRouting {
             if mainFrame { load(target) }
         case .tunnel(let port):
             decisionHandler(.cancel)
-            if mainFrame { carry(port, then: url) }
+            // Only the user, or a page on a host port the user opened, opens
+            // another host port; anything else asks first.
+            let source = navigationAction.sourceFrame.request.url
+            let fromCarried = source.map { RelayBrowserRouting.isLoopback($0) && portMap.values.contains(RelayBrowserRouting.port($0)) } ?? false
+            if mainFrame { fromCarried ? carry(port, then: url) : (confirm = url) }
         case .blocked(let message):
             decisionHandler(.cancel)
             if mainFrame { error = message }
@@ -264,7 +284,7 @@ enum RelayBrowserRouting {
     /// Links that ask for a new window open in this one.
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if let url = navigationAction.request.url { open(url) }
+        if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) } // through the policy above
         return nil
     }
 
@@ -369,6 +389,18 @@ struct RelayBrowserView: View {
             .foregroundStyle(RelayTheme.textMuted)
             .padding(.leading, 76).padding(.trailing, 12).padding(.vertical, 8)
             .background(RelayTheme.surface)
+            if let url = session.confirm {
+                HStack(spacing: 8) {
+                    Text("This page wants \(session.hostLabel) localhost:\(RelayBrowserRouting.port(url)).")
+                        .font(.caption).foregroundStyle(RelayTheme.text)
+                    Spacer()
+                    Button("Open Port") { session.confirmPort() }
+                    Button("Don't Open") { session.declinePort() }
+                }
+                .buttonStyle(.borderless).font(.caption)
+                .padding(.horizontal, 12).padding(.vertical, 4)
+                .background(RelayTheme.surface)
+            }
             if let error = session.error {
                 Text(error).font(.caption).foregroundStyle(RelayTheme.warning)
                     .frame(maxWidth: .infinity, alignment: .leading)

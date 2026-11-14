@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import WebKit
 @testable import Relay
 
 @Suite struct RelayBrowserRoutingTests {
@@ -46,7 +47,7 @@ import Testing
             patterns.contains { s.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil }
         }
         for mac in ["http://localhost:22/", "http://LOCALHOST/", "http://a.localhost/", "ws://127.0.0.1:8080/",
-                    "http://127.1.2.3/", "http://[::1]:631/", "http://0.0.0.0:7000/", "http://[::ffff:127.0.0.1]/"] {
+                    "http://127.1.2.3/", "http://[::1]:631/", "http://0.0.0.0:7000/", "http://[::]:7000/", "http://[::ffff:127.0.0.1]/"] {
             #expect(matches(blocks, mac) && !matches(allows, mac), "\(mac)")
         }
         for carried in ["http://127.0.0.1:5173/", "ws://127.0.0.1:5173/hmr", "http://localhost:5173/x"] {
@@ -55,5 +56,17 @@ import Testing
         #expect(!matches(allows, "http://127.0.0.1:51730/"))
         #expect(!matches(blocks, "https://example.org/localhost/"))
         #expect(rules.first?["action"]?["type"] == "block") // blocks precede the exceptions
+    }
+
+    /// WebKit accepts only a subset of regex syntax; a rule it rejects would
+    /// leave every remote browser unable to load anything.
+    @MainActor @Test func webKitCompilesTheGuard() async throws {
+        let store = try #require(WKContentRuleListStore(url: FileManager.default.temporaryDirectory
+            .appendingPathComponent("relay-guard-test-" + UUID().uuidString)))
+        for ports in [[], [5173], [5173, 50111]] {
+            let list = try await store.compileContentRuleList(forIdentifier: "guard-\(ports.count)",
+                encodedContentRuleList: RelayBrowserRouting.macGuardRules(macPorts: ports))
+            #expect(list != nil)
+        }
     }
 }

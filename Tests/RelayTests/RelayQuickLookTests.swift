@@ -188,4 +188,13 @@ import Testing
         #expect(RelayQuickLookItem.resolve(.web(dev), location: .unreadable) == nil)
         #expect(RelayQuickLookItem.resolve(.web(URL(string: "https://example.org")!), location: .remote(remote, cwd: nil)) != nil)
     }
+
+    @Test func remotePanesNeverLoadPagesInline() throws {
+        let page = URL(string: "https://example.org/x")!
+        let items = [RelayQuickLookItem.resolve(.web(page), location: .remote(remote, cwd: nil))!]
+        var browser = try #require(RelayQuickLookBrowser(items: items, clickedStart: true, inlineWeb: false))
+        #expect(browser.webContent == .webCard(page))
+        browser.loadCurrentWeb()
+        #expect(browser.webContent == .webCard(page))
+    }
 }

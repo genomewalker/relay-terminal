@@ -4003,8 +4003,10 @@ final class TerminalRuntime: NSObject {
         // A clicked path that cannot be resolved here is not replaced by another item.
         guard !items.isEmpty, start == nil || startIndex != nil else { return false }
         // Shift-Command-click on a URL is a request to load that page; Command-Y is not.
+        var inlineWeb = false
+        if case .local = location { inlineWeb = true }
         RelayQuickLookController.shared.present(items, start: startIndex ?? 0, clickedStart: start != nil,
-                                                 returnFocus: view) { [weak self] link in
+                                                 inlineWeb: inlineWeb, returnFocus: view) { [weak self] link in
             _ = self?.openTerminalLink(link)
         }
         return true
