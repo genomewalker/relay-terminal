@@ -8,11 +8,12 @@ import Foundation
 @MainActor final class MCPDirectTabRequests {
     /// The one capability each endpoint requires.
     enum Endpoint: CaseIterable {
-        case tabAction, newLocalTab, stackPane, newStackedPane, renamePane
+        case tabAction, newLocalTab, stackPane, newStackedPane, renamePane, show
         /// Every capability the endpoint requires; all must be permitted.
         var capabilities: Set<MCPWorkspaceCapability> {
             switch self {
             case .tabAction, .stackPane, .renamePane: [.layout]
+            case .show: [.navigate]
             case .newLocalTab: [.create]
             case .newStackedPane: [.create, .layout]
             }
@@ -25,6 +26,14 @@ import Foundation
         let paneID: UUID
         let name: String
     }
+    struct ShowProposal: Codable, Equatable {
+        let instance: UUID
+        let requestID: UUID
+        let paneID: UUID
+        let items: [String]
+    }
+    private var showRequests: [UUID: ShowProposal] = [:]
+    private var showResults: [UUID: [String: String]] = [:]
     private var renameRequests: [UUID: PaneRenameProposal] = [:]
     private var renameResults: [UUID: [String: String]] = [:]
     private var tabRequests: [UUID: WorkspaceTabProposal] = [:]
@@ -78,6 +87,49 @@ import Foundation
         let result = ["status": "applied", "paneID": proposal.paneID.uuidString.lowercased(), "name": name]
         renameRequests[proposal.requestID] = proposal
         renameResults[proposal.requestID] = result
+        return .json(result)
+    }
+
+    /// `relay_show`: displays files or a page for one pane; takes no other action.
+    func show(_ body: Data, instance: UUID, permits: (MCPWorkspaceCapability) -> Bool,
+              workspace: WorkspaceModel,
+              present: (PaneModel, [RelayQuickLookTarget]) -> RelayShowOutcome? = { $0.runtime.showForAgent($1) })
+        -> RelaySidePanelHTTPResponse {
+        guard Endpoint.show.capabilities.allSatisfy(permits) else {
+            return .text("MCP workspace navigate capability is not granted", status: 403, reason: "Forbidden")
+        }
+        guard body.count <= 40960, (try? RelayCapacityJSON.validate(body)) != nil,
+              let fields = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(fields.keys) == ["instance", "requestID", "paneID", "items"],
+              let proposal = try? JSONDecoder().decode(ShowProposal.self, from: body),
+              proposal.instance == instance, (1...16).contains(proposal.items.count),
+              proposal.items.allSatisfy({ !$0.isEmpty && $0.count <= 2048 }) else {
+            return .text("Invalid or stale show request", status: 400, reason: "Bad Request")
+        }
+        let targets = proposal.items.compactMap(RelayQuickLookLinks.target(fromAgentItem:))
+        guard targets.count == proposal.items.count else {
+            return .text("Items must be paths or http/https URLs", status: 400, reason: "Bad Request")
+        }
+        if let old = showRequests[proposal.requestID] {
+            guard old == proposal, let result = showResults[proposal.requestID] else {
+                return .text("Conflicting show request ID", status: 409, reason: "Conflict")
+            }
+            return .json(result)
+        }
+        guard showRequests.count < receiptLimit, let pane = workspace.panes[proposal.paneID] else {
+            return .text("Pane unavailable or show receipt limit reached", status: 409, reason: "Conflict")
+        }
+        guard let outcome = present(pane, targets) else {
+            return .text("Nothing to show: a relative path needs the pane's folder, and a remote pane without Relay "
+                + "can show only URLs", status: 409, reason: "Conflict")
+        }
+        var result = ["status": "shown", "paneID": proposal.paneID.uuidString.lowercased()]
+        switch outcome {
+        case .quickLook: result["surface"] = "quick_look"
+        case .browser(let url): result["surface"] = "browser"; result["url"] = url.absoluteString
+        }
+        showRequests[proposal.requestID] = proposal
+        showResults[proposal.requestID] = result
         return .json(result)
     }
 

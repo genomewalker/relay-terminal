@@ -383,6 +383,15 @@ func (b *Bridge) route(r *http.Request, caller string) (int, []byte, error) {
 		return b.workspaceApply(r, caller, allowed, tabs, paneTab)
 	case method == "POST" && (path == "/api/workspace/stack-pane" || path == "/api/workspace/new-stacked-pane"):
 		return b.workspaceStack(r, caller, path, allowed)
+	case method == "POST" && path == "/api/workspace/show":
+		// A remote agent shows the user files and pages only for its own host's panes.
+		raw, proposal, e = body(r, 40960, "Bounded show request required")
+		if e != nil {
+			return 0, nil, e
+		}
+		if !allowed[lower(proposal["paneID"])] {
+			return deny("Pane is outside this bridge scope")
+		}
 	case method == "POST" && path == "/api/workspace/tab-action":
 		raw, proposal, e = body(r, 4096, "Bounded request required")
 		if e != nil {

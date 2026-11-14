@@ -1783,6 +1783,10 @@ final class RelaySidePanelServer: ObservableObject {
                 return .text(message, status: status, reason: status == 400 ? "Bad Request" : status == 403 ? "Forbidden" : "Conflict")
             }
         }
+        if request.method == "POST", request.path == "/api/workspace/show" {
+            return directTabRequests.show(request.body, instance: agentInputRequests.instance,
+                                          permits: mcpWorkspaceGrant.permits, workspace: workspace)
+        }
         if request.method == "POST", request.path == "/api/workspace/rename-pane" {
             return directTabRequests.renamePane(request.body, instance: agentInputRequests.instance,
                                                permits: mcpWorkspaceGrant.permits, workspace: workspace)

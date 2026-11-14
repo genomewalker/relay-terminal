@@ -92,7 +92,7 @@ func tool(name, description string, properties map[string]any, required []string
 		mutation = true
 	case "relay_request_secret", "relay_miko_turn", "relay_miko_card", "relay_miko_set_instructions", "relay_miko_set_memory", "relay_miko_set_capabilities", "relay_miko_revert", "relay_ask_miko":
 		mutation = true
-	case "relay_apply_installed_update", "relay_codex_resume_pane", "relay_terminal_edit", "relay_rename_pane", "relay_tab_action", "relay_stack_pane", "relay_new_stacked_pane", "relay_update_settings", "relay_check_host_installation", "relay_check_intelligence", "relay_register_caller", "relay_control_caller", "relay_render_content", "relay_publish_surface":
+	case "relay_apply_installed_update", "relay_codex_resume_pane", "relay_terminal_edit", "relay_rename_pane", "relay_show", "relay_tab_action", "relay_stack_pane", "relay_new_stacked_pane", "relay_update_settings", "relay_check_host_installation", "relay_check_intelligence", "relay_register_caller", "relay_control_caller", "relay_render_content", "relay_publish_surface":
 		mutation = true
 	case "relay_exec", "relay_exec_cancel", "relay_host_request", "relay_upload_file", "relay_install_relayd", "relay_update_host_relayd", "relay_rollback_relayd", "relay_workspace_request", "relay_bind_workspace_context", "relay_workspace_migration_stage_plan", "relay_workspace_migration_apply", "relay_workspace_migration_undo":
 		mutation = true
@@ -230,6 +230,7 @@ func (s *server) handle(r request) (any, int, string) {
 			tool("relay_begin_terminal_control", "Present one Relay approval for MCP terminal and workspace control. All capabilities are selected by default; the user can opt out of navigation, creation, layout, command input or process termination. Call relay_control_info to check grant status. Approved capabilities survive restarts and updates for this installation. A fresh installation identity or Diagnostics > Reset MCP permissions requires approval again.", map[string]any{}, []string{}),
 			tool("relay_select_pane", "Select and focus an exact existing Relay pane after the one-time terminal control grant. Find pane_id with relay_list_panes.", map[string]any{"pane_id": map[string]string{"type": "string"}}, []string{"pane_id"}),
 			tool("relay_workspace_action", "Apply a workspace action under the one-time terminal control grant. Use an exact pane ID, current instance and fresh request UUID. For newTab, splitRight or splitDown, optional host selects This Mac or an exact configured SSH alias; without it the target pane's profile is used. New tabs stay in the target pane's Relay session. Returns exact resulting IDs. Repeating a request ID returns the same result.", map[string]any{"instance": map[string]string{"type": "string"}, "request_id": map[string]string{"type": "string"}, "pane_id": map[string]string{"type": "string"}, "action": map[string]any{"type": "string", "enum": []string{"select", "newTab", "splitRight", "splitDown", "zoom", "unzoom", "float", "dock", "balance", "close", "conversation", "terminal", "overview", "back", "forward", "up"}}, "host": map[string]string{"type": "string"}}, []string{"instance", "request_id", "pane_id", "action"}),
+			tool("relay_show", "Show the user files or web pages for one exact Relay pane under the existing navigate grant: paths open in Quick Look, read from that pane's own host (~/ and absolute paths, or relative to the pane's reported folder; up to 32 MiB, no folders), and when no path is given the first URL opens in Relay's floating browser, where localhost is that pane's host and pages cannot reach the Mac's own services. Only displays; the window does not take keyboard focus. Requires current instance and a fresh request_id; identical repeats return the saved result.", map[string]any{"instance": map[string]string{"type": "string"}, "request_id": map[string]string{"type": "string"}, "pane_id": map[string]string{"type": "string"}, "items": map[string]any{"type": "array", "minItems": 1, "maxItems": 16, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": 2048}}}, []string{"instance", "request_id", "pane_id", "items"}),
 			tool("relay_rename_pane", "Rename one exact Relay pane with a persistent display name under the existing layout grant. Preserves its conversation, process, pane ID, tab and focus. Requires current instance and a fresh request_id; identical repeats return the saved result.", map[string]any{"instance": map[string]string{"type": "string"}, "request_id": map[string]string{"type": "string"}, "pane_id": map[string]string{"type": "string"}, "name": map[string]any{"type": "string", "minLength": 1, "maxLength": 80}}, []string{"instance", "request_id", "pane_id", "name"}),
 			tool("relay_tab_action", "Rename, close, or move one exact Relay tab under the one-time layout grant. move places the tab immediately before or after target_tab_id, in the target's workspace and session group, also across Relay sessions and workspaces; the tab keeps its panes, processes, agent sessions, pane IDs, bindings, pane links and remote attachments, and nothing is restarted, detached or closed. The tab's birth session_id does not change; the result names the destination workspaceID. close closes every pane in the tab; local processes stop, while remote Relay processes detach and remain manageable through relay_list_managed_panes, relay_recover_pane and relay_terminate_managed_pane. Unsaved editor changes can block close. Use a fresh request_id; repeated identical requests return the same result.", map[string]any{"instance": map[string]string{"type": "string"}, "request_id": map[string]string{"type": "string"}, "tab_id": map[string]string{"type": "string"}, "action": map[string]any{"type": "string", "enum": []string{"rename", "close", "move"}}, "name": map[string]any{"type": "string", "maxLength": 80}, "target_tab_id": map[string]string{"type": "string"}, "placement": map[string]any{"type": "string", "enum": []string{"before", "after"}}}, []string{"instance", "request_id", "tab_id", "action"}),
 			tool("relay_new_local_tab", "Create a local shell tab under the one-time terminal control grant. Without an anchor it opens in the active Relay session. With exactly one of anchor_pane_id or anchor_tab_id it opens immediately after that pane's tab (or that tab), in the anchor's Relay session and workspace. No command or environment override is accepted. Use the current instance and a fresh request UUID.", map[string]any{"instance": map[string]string{"type": "string"}, "request_id": map[string]string{"type": "string"}, "anchor_pane_id": map[string]string{"type": "string"}, "anchor_tab_id": map[string]string{"type": "string"}}, []string{"instance", "request_id"}),
@@ -739,6 +740,18 @@ func (s *server) handle(r request) (any, int, string) {
 				payload["connectionHost"] = host
 			}
 			body, _ = json.Marshal(payload)
+		case "relay_show":
+			var instance, id, pane string
+			var items []string
+			if len(p.Arguments) != 4 ||
+				json.Unmarshal(p.Arguments["instance"], &instance) != nil || !paneID.MatchString(instance) ||
+				json.Unmarshal(p.Arguments["request_id"], &id) != nil || !paneID.MatchString(id) ||
+				json.Unmarshal(p.Arguments["pane_id"], &pane) != nil || !paneID.MatchString(pane) ||
+				json.Unmarshal(p.Arguments["items"], &items) != nil || !validShowItems(items) {
+				return nil, -32602, "Valid instance, request_id, pane_id and 1-16 items (paths or http/https URLs of 1-2048 characters, no control characters) required"
+			}
+			path, method = "/api/workspace/show", "POST"
+			body, _ = json.Marshal(map[string]any{"instance": instance, "requestID": id, "paneID": pane, "items": items})
 		case "relay_rename_pane":
 			var instance, id, pane, name string
 			if len(p.Arguments) != 4 ||
@@ -1694,4 +1707,22 @@ func main() {
 
 func validLocalToken(token string) bool {
 	return regexp.MustCompile(`^[a-fA-F0-9]{64}$`).MatchString(token)
+}
+
+// validShowItems bounds relay_show items; the app decides what each one is.
+func validShowItems(items []string) bool {
+	if len(items) < 1 || len(items) > 16 {
+		return false
+	}
+	for _, item := range items {
+		if item == "" || len([]rune(item)) > 2048 {
+			return false
+		}
+		for _, r := range item {
+			if r < 32 || r == 127 {
+				return false
+			}
+		}
+	}
+	return true
 }

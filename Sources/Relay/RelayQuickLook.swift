@@ -43,6 +43,19 @@ enum RelayQuickLookLinks {
 
     /// A target from a link Ghostty reported under the pointer: a URL, a
     /// Relay-encoded file link or a plain path.
+    /// An item an agent asked to show: an http(s) URL or a path. Other
+    /// schemes are refused; a path need not have an extension.
+    static func target(fromAgentItem item: String) -> RelayQuickLookTarget? {
+        let value = item.trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty, !value.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else { return nil }
+        if value.range(of: "^[A-Za-z][A-Za-z0-9+.-]*:", options: .regularExpression) != nil {
+            guard let url = URL(string: value), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+                  WorkspaceBrowserAddress.parse(value) != nil else { return nil }
+            return .web(url)
+        }
+        return .path(value)
+    }
+
     static func target(fromLink link: String) -> RelayQuickLookTarget? {
         switch TerminalLinkResolver.target(from: link) {
         case .web(let url): return ["http", "https"].contains(url.scheme?.lowercased() ?? "") ? .web(url) : nil
@@ -294,6 +307,12 @@ final class RelayQuickLookStaging: @unchecked Sendable {
     func remove() { try? FileManager.default.removeItem(at: directory) }
 }
 
+/// Where relay_show displayed a pane's items.
+enum RelayShowOutcome: Equatable {
+    case quickLook
+    case browser(URL)
+}
+
 /// What the panel shows for the current item.
 enum RelayQuickLookContent: Equatable {
     case loading
@@ -320,7 +339,7 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
     private var open: ((String) -> Void)?
 
     func present(_ items: [RelayQuickLookItem], start: Int, clickedStart: Bool = false, inlineWeb: Bool = true,
-                 returnFocus: NSView?, open: @escaping (String) -> Void) {
+                 takeFocus: Bool = true, returnFocus: NSView?, open: @escaping (String) -> Void) {
         guard let browser = RelayQuickLookBrowser(items: items, start: start, clickedStart: clickedStart,
                                                   inlineWeb: inlineWeb) else { NSSound.beep(); return }
         closeContent()
@@ -337,7 +356,8 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
                 panel.center()
             }
         }
-        panel.makeKeyAndOrderFront(nil)
+        // An agent's request shows the panel without taking the keyboard.
+        if takeFocus { panel.makeKeyAndOrderFront(nil) } else { panel.orderFront(nil) }
         installKeyMonitor()
         showCurrent()
     }

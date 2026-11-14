@@ -305,7 +305,7 @@ enum RelayBrowserRouting {
         profile.kind == .local ? "local" : profile.id.uuidString
     }
 
-    func open(_ url: URL?, profile: ConnectionProfile, directory: String?, near window: NSWindow?) {
+    func open(_ url: URL?, profile: ConnectionProfile, directory: String?, near window: NSWindow?, takeFocus: Bool = true) {
         let key = Self.key(profile)
         let entry = panels[key].flatMap { $0.session.profile == profile ? $0 : nil } ?? make(profile: profile, directory: directory)
         panels[key] = entry
@@ -317,7 +317,7 @@ enum RelayBrowserRouting {
                 entry.panel.center()
             }
         }
-        entry.panel.makeKeyAndOrderFront(nil)
+        if takeFocus { entry.panel.makeKeyAndOrderFront(nil) } else { entry.panel.orderFront(nil) }
         if let url { entry.session.open(url) }
     }
 

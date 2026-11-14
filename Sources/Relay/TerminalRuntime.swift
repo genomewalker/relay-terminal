@@ -3991,7 +3991,23 @@ final class TerminalRuntime: NSObject {
         return presentQuickLook(targets, start: clicked)
     }
 
-    private func presentQuickLook(_ targets: [RelayQuickLookTarget], start: RelayQuickLookTarget?) -> Bool {
+    /// relay_show: paths open in Quick Look (with any URLs as cards); with no
+    /// path, the first URL opens in the floating browser. Nothing takes the
+    /// keyboard from whatever the user is typing in.
+    func showForAgent(_ targets: [RelayQuickLookTarget]) -> RelayShowOutcome? {
+        guard let pane else { return nil }
+        let paths = targets.filter { if case .path = $0 { true } else { false } }
+        if paths.isEmpty {
+            guard case .web(let url)? = targets.first else { return nil }
+            RelayBrowserController.shared.open(url, profile: pane.profile, directory: pane.directory,
+                                               near: view.window, takeFocus: false)
+            return .browser(url)
+        }
+        return presentQuickLook(targets, start: nil, takeFocus: false) ? .quickLook : nil
+    }
+
+    private func presentQuickLook(_ targets: [RelayQuickLookTarget], start: RelayQuickLookTarget?,
+                                  takeFocus: Bool = true) -> Bool {
         let location = quickLookLocation
         var items: [RelayQuickLookItem] = []
         var startIndex: Int?
@@ -4006,7 +4022,8 @@ final class TerminalRuntime: NSObject {
         var inlineWeb = false
         if case .local = location { inlineWeb = true }
         RelayQuickLookController.shared.present(items, start: startIndex ?? 0, clickedStart: start != nil,
-                                                 inlineWeb: inlineWeb, returnFocus: view) { [weak self] link in
+                                                 inlineWeb: inlineWeb, takeFocus: takeFocus,
+                                                 returnFocus: takeFocus ? view : nil) { [weak self] link in
             _ = self?.openTerminalLink(link)
         }
         return true
