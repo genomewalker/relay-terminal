@@ -1007,7 +1007,8 @@ func paneAttachRetryPolicy() {
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: false) == 4_000)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 1, waitingForInputLease: true) == 5_500)
     #expect(RelayPaneAttachPolicy.retryDelayMilliseconds(attempt: 20, waitingForInputLease: true) == 15_000)
-    #expect(RelayPaneAttachPolicy.shouldUseDedicatedTransport(attempt: 1))
+    #expect(!RelayPaneAttachPolicy.shouldUseDedicatedTransport(stalls: 0))
+    #expect(RelayPaneAttachPolicy.shouldUseDedicatedTransport(stalls: 1))
 }
 
 @Test("Relay pane handshakes never advertise an invalid viewport")

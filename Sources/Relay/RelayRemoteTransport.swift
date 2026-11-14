@@ -167,7 +167,15 @@ enum RelayPaneAttachPolicy {
     /// A pane still waiting this long for its shared node checks that the
     /// node is still the pooled one for its host and, if it is not, rejoins.
     static let nodeRecoveryCheckMilliseconds = 15_000
-    static let dedicatedTransportAfterAttempt = 1
+    /// Unanswered Hellos before a pane leaves its shared node. Only a Hello
+    /// that got no reply at all counts: an error, a closed route or a held
+    /// input lease is an answer from a live node, and a dedicated SSH stream
+    /// would reach the same supervisor.
+    static let dedicatedTransportAfterStalls = 1
+    /// Retries for a Hello the node answered without attaching (for example
+    /// "worker is still alive but unavailable"). A missing worker answers the
+    /// same way every time, so this is bounded.
+    static let answeredRetryLimit = 1
 
     static func retryDelayMilliseconds(attempt: Int, waitingForInputLease: Bool) -> Int {
         if waitingForInputLease {
@@ -179,9 +187,20 @@ enum RelayPaneAttachPolicy {
         return min(5_000, 250 * (1 << min(max(0, attempt - 1), 4)))
     }
 
-    static func shouldUseDedicatedTransport(attempt: Int) -> Bool {
-        attempt >= dedicatedTransportAfterAttempt
+    static func shouldUseDedicatedTransport(stalls: Int) -> Bool {
+        stalls >= dedicatedTransportAfterStalls
     }
+}
+
+/// Why a shared-node pane reopens its route. Only `.handshakeStall` is
+/// evidence that the shared node is not answering.
+enum RelayMultiplexedRetryReason: Equatable {
+    case handshakeStall
+    /// The node answered the Hello but did not attach.
+    case answered
+    case routeClosed
+    case inputLease
+    case routeReopen
 }
 
 enum TerminalViewportCommitPolicy {
@@ -273,6 +292,14 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var sessionEnded = false
     private var attachRetryCount = 0
     private var attachRetryScheduled = false
+    /// Hellos the shared node left unanswered since the last attach.
+    private var handshakeStallCount = 0
+    /// Retries of answered, unattached Hellos since the last attach.
+    private var answeredRetryCount = 0
+    /// A status for this pane arrived since its latest shared-node Hello.
+    private var helloAnswered = false
+    /// The host's relayd has no node mux; only dedicated routes work.
+    private var nodeUnsupported = false
     private var nodeRecoveryScheduled = false
     /// The current attempt to join a shared node. Replaced by every attempt
     /// and cancelled by detach, so a superseded attempt cannot register.
@@ -280,6 +307,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// The shared node pool; tests supply their own.
     var nodePool = RelayNodeTransportPool.shared
     var nodeRecoveryCheckMilliseconds = RelayPaneAttachPolicy.nodeRecoveryCheckMilliseconds
+    var handshakeTimeoutMilliseconds = RelayPaneAttachPolicy.handshakeTimeoutMilliseconds
     private var diagnosticSessionID = "unknown"
     private var inputDiagnosticCount = 0
     private var connectionContext: RelayConnectionContext?
@@ -430,6 +458,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         sessionEnded = false
         attachRetryCount = 0
         attachRetryScheduled = false
+        handshakeStallCount = 0
+        answeredRetryCount = 0
+        nodeUnsupported = false
         if latestResize == nil {
             latestResize = (RelayViewport.default.columns, RelayViewport.default.rows)
         }
@@ -576,6 +607,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             channel.supports("viewport_commit_compat_v2")
         supportsExactSupervisorViewportCommits = channel.supports("viewport_commit_compat_v2")
         let isFocused = focused
+        helloAnswered = false
         lock.unlock()
         if isFocused { channel.setFocused(true) }
         let hello = multiplexedHello(context, viewport: viewport,
@@ -643,6 +675,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         deliveryEpoch = UUID()
         attached = false
         if failure.kind == .remoteConfiguration {
+            nodeUnsupported = true
             let channel = nodeChannel
             nodeChannel = nil
             writer = nil
@@ -683,6 +716,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
             receiveOutput(frame.payload, context: context)
         case .status:
             guard let decoded = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload) else { return }
+            lock.lock()
+            helloAnswered = true
+            lock.unlock()
             if decoded.outputReset == true || decoded.eventReset == true {
                 lock.lock()
                 if decoded.outputReset == true { lastSequence = 0 }
@@ -706,7 +742,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                         eventReset: decoded.eventReset ?? false,
                         capabilities: capabilities
                     ), deliveryEpochSnapshot())
-                    scheduleMultiplexedRetry(context, waitingForInputLease: true)
+                    scheduleMultiplexedRetry(context, reason: .inputLease)
                     return
                 }
             }
@@ -724,7 +760,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                     state: "reconnecting",
                     message: "This pane fell behind a fast terminal redraw; replaying its current screen."
                 ), deliveryEpochSnapshot())
-                scheduleMultiplexedRetry(context, waitingForInputLease: false)
+                scheduleMultiplexedRetry(context, reason: .routeClosed)
                 return
             }
             if decoded.state == "exited" || decoded.state == "error" { markSessionEnded() }
@@ -759,26 +795,39 @@ final class RelayRemoteTransport: @unchecked Sendable {
     }
 
     private func scheduleAttachWatchdog(_ context: RelayConnectionContext, channel: RelayNodeChannel) {
-        DispatchQueue.global(qos: .utility).asyncAfter(
-            deadline: .now() + .milliseconds(RelayPaneAttachPolicy.handshakeTimeoutMilliseconds)
-        ) { [weak self, weak channel] in
+        lock.lock()
+        let timeout = handshakeTimeoutMilliseconds
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(timeout)) { [weak self, weak channel] in
             guard let self, let channel else { return }
             self.lock.lock()
             let waiting = !self.detached && !self.attached && !self.attachRetryScheduled && self.nodeChannel === channel
+            let answered = self.helloAnswered
             self.lock.unlock()
-            if waiting { self.scheduleMultiplexedRetry(context, waitingForInputLease: false) }
+            if waiting { self.scheduleMultiplexedRetry(context, reason: answered ? .answered : .handshakeStall) }
         }
     }
 
     private func scheduleMultiplexedRetry(
         _ context: RelayConnectionContext,
-        waitingForInputLease: Bool
+        reason: RelayMultiplexedRetryReason
     ) {
+        let waitingForInputLease = reason == .inputLease
         lock.lock()
-        guard !detached, !attached, !attachRetryScheduled, let channel = nodeChannel else {
+        // An ended pane is retried only for a bounded answered error, which
+        // can be transient ("worker still alive but unavailable").
+        let mayRetryEnded = reason == .answered && answeredRetryCount < RelayPaneAttachPolicy.answeredRetryLimit
+        guard !detached, !attached, !attachRetryScheduled, !sessionEnded || mayRetryEnded,
+              let channel = nodeChannel else {
             lock.unlock()
             return
         }
+        if sessionEnded {
+            answeredRetryCount += 1
+            sessionEnded = false
+        }
+        if reason == .handshakeStall { handshakeStallCount += 1 }
+        let stalls = handshakeStallCount
         attachRetryScheduled = true
         attachRetryCount += 1
         let attempt = attachRetryCount
@@ -792,7 +841,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
             state: "reconnecting",
             message: waitingForInputLease
                 ? "Waiting to recover this pane's input lease."
-                : "The pane handshake stalled; reopening only this pane."
+                : reason == .handshakeStall
+                ? "The pane handshake stalled; reopening only this pane."
+                : "Reopening only this pane."
         ), deliveryEpochSnapshot())
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self, weak channel] in
             guard let self, let channel else { return }
@@ -810,7 +861,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             self.attachRetryScheduled = false
             self.lock.unlock()
             channel.close()
-            if RelayPaneAttachPolicy.shouldUseDedicatedTransport(attempt: attempt) {
+            if RelayPaneAttachPolicy.shouldUseDedicatedTransport(stalls: stalls) {
                 context.onStatus(RelayStatus(
                     state: "reconnecting",
                     message: "The shared pane channel did not answer; using a dedicated connection for this pane."
@@ -1233,6 +1284,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         attachRepaintPending = false
         attachRetryCount = 0
         attachRetryScheduled = false
+        handshakeStallCount = 0
+        answeredRetryCount = 0
+        sessionEnded = false
         supportsInputAcknowledgements = capabilities.contains("input_ack_v1")
         supportsAutomationInput = supportsInputAcknowledgements && capabilities.contains("automation_input_v1")
         supportsFreshRedraw = capabilities.contains("fresh_redraw_v1")
@@ -1328,8 +1382,19 @@ final class RelayRemoteTransport: @unchecked Sendable {
             }
             self.reconnectScheduled = false
             self.lock.unlock()
-            self.connect(context)
+            self.reconnectRoute(context)
         }
+    }
+
+    /// A dedicated route is a fallback, not a new home: when it reconnects,
+    /// the pane tries its host's shared node again, unless that host's relayd
+    /// has no node mux.
+    private func reconnectRoute(_ context: RelayConnectionContext) {
+        lock.lock()
+        let dedicatedOnly = nodeUnsupported
+        if !dedicatedOnly { handshakeStallCount = 0 }
+        lock.unlock()
+        if dedicatedOnly { connect(context) } else { connectMultiplexed(context) }
     }
 
     /// This phase only validates and records the packet. It performs no
@@ -1449,7 +1514,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         processToRestart?.terminate()
         if processToRestart != nil { return admitted }
         if let multiplexedRetryContext {
-            scheduleMultiplexedRetry(multiplexedRetryContext, waitingForInputLease: false)
+            scheduleMultiplexedRetry(multiplexedRetryContext, reason: .routeReopen)
             return admitted
         }
         guard canSend, let writer else { return admitted }
@@ -1648,7 +1713,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         // Older busy supervisors may not advertise a closed virtual route.
         // Schedule our own scoped retry as well; the normal route_closed status
         // shares the same guard and cannot queue a second retry.
-        scheduleMultiplexedRetry(context, waitingForInputLease: false)
+        scheduleMultiplexedRetry(context, reason: .routeReopen)
         return true
     }
 
