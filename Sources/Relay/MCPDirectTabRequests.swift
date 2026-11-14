@@ -154,7 +154,7 @@ import Foundation
                  perform: @MainActor (WorkspaceModel, PaneModel, BrowserProposal) async throws -> (page: RelayBrowserAgentPage, capture: Data?) = { workspace, pane, proposal in
                      // A browser pane stacked with this pane is the one the agent uses;
                      // otherwise the host's floating browser.
-                     var docked = workspace.stackedBrowserPane(for: pane.id)?.browserSession
+                     var docked = workspace.stackedBrowserPane(for: pane.id, placement: proposal.paneplacement)?.browserSession
                      if let placement = proposal.paneplacement, docked == nil {
                          // An agent's browser never switches the user's tab.
                          docked = try workspace.newBrowserPane(onto: pane.id, url: nil, placement: placement, select: false).browserSession

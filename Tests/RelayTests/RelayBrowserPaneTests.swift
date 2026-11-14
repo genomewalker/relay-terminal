@@ -133,6 +133,29 @@ import Testing
         #expect(throws: (any Error).self) { try workspace.newBrowserPane(onto: split.id, url: nil, placement: .tab) }
     }
 
+    @Test func eachPlacementFindsItsOwnBrowserAndActionsUseTheNewest() throws {
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let anchor = try #require(workspace.activePaneID)
+        let split = try workspace.newBrowserPane(onto: anchor, url: nil, placement: .split, select: false)
+        #expect(workspace.browserPlacement(split) == .split)
+        #expect(workspace.stackedBrowserPane(for: anchor, placement: .tab) == nil)   // so a tab is made, not the split reused
+        let tabbed = try workspace.newBrowserPane(onto: anchor, url: nil, placement: .tab, select: false)
+        let stacked = try workspace.newBrowserPane(onto: anchor, url: nil, placement: .stack, select: false)
+        #expect(workspace.browserPlacement(tabbed) == .tab && workspace.browserPlacement(stacked) == .stack)
+        #expect(workspace.stackedBrowserPane(for: anchor, placement: .split) === split)
+        #expect(workspace.stackedBrowserPane(for: anchor, placement: .tab) === tabbed)
+        #expect(workspace.stackedBrowserPane(for: anchor) === stacked)                // the newest
+    }
+
+    @Test func agentsSeeTheHostsAddressNotTheMacPort() {
+        let carried = URL(string: "http://127.0.0.1:61345/form.html?q=1")!
+        #expect(RelayBrowserRouting.hostURL(carried, tunnels: [5173: 61345]).absoluteString == "http://localhost:5173/form.html?q=1")
+        #expect(RelayBrowserRouting.hostURL(carried, tunnels: [:]) == carried)
+        let web = URL(string: "https://example.org/")!
+        #expect(RelayBrowserRouting.hostURL(web, tunnels: [5173: 61345]) == web)
+    }
+
     @Test func stackPlacementIsOnlyForOpen() {
         func proposal(_ action: RelayBrowserAgentAction, placement: String?) -> MCPDirectTabRequests.BrowserProposal {
             MCPDirectTabRequests.BrowserProposal(instance: UUID(), requestID: UUID(), paneID: UUID(), action: action,

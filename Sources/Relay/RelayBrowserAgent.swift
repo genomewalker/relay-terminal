@@ -166,7 +166,11 @@ extension RelayBrowserSession {
     }
 
     func agentPage() async -> RelayBrowserAgentPage {
-        var page = RelayBrowserAgentPage(url: webView.url?.absoluteString ?? "", title: webView.title ?? "",
+        // Addresses as the pane's host sees them, not the Mac port carrying them.
+        let host: (String) -> String = { [portMap] raw in
+            URL(string: raw).map { RelayBrowserRouting.hostURL($0, tunnels: portMap).absoluteString } ?? raw
+        }
+        var page = RelayBrowserAgentPage(url: webView.url.map { host($0.absoluteString) } ?? "", title: webView.title ?? "",
                                          loading: webView.isLoading, waitingForUser: confirm?.absoluteString,
                                          error: error, text: "", textTruncated: false, elements: [],
                                          elementsTruncated: false, scrollY: 0, scrollHeight: 0)
@@ -177,7 +181,11 @@ extension RelayBrowserSession {
         page.title = read.title
         page.text = read.text
         page.textTruncated = read.textTruncated
-        page.elements = read.elements
+        page.elements = read.elements.map { element in
+            var element = element
+            element.href = element.href.map(host)
+            return element
+        }
         page.elementsTruncated = read.elementsTruncated
         page.scrollY = read.scrollY
         page.scrollHeight = read.scrollHeight

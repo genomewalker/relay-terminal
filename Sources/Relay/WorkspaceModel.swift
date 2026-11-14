@@ -3752,6 +3752,7 @@ final class WorkspaceModel: ObservableObject {
         let pane = PaneModel(profile: anchor.profile, contentKind: .browser, directory: anchor.directory)
         pane.browserAnchor = anchorID
         storePane(pane)
+        browserSequence.append(pane.id)
         var home = target
         switch placement {
         case .stack:
@@ -3782,13 +3783,27 @@ final class WorkspaceModel: ObservableObject {
         return pane
     }
 
+    /// Browser panes in the order they were made, newest last.
+    private var browserSequence: [UUID] = []
+
+    /// Where a browser pane is relative to the pane it was opened for.
+    func browserPlacement(_ browser: PaneModel) -> BrowserPanePlacement? {
+        guard browser.contentKind == .browser, let home = tab(holding: browser.id) else { return nil }
+        guard let anchor = browser.browserAnchor, home.allPaneIDs.contains(anchor) else { return .tab }
+        return home.stack(containing: browser.id)?.members.contains(anchor) == true ? .stack : .split
+    }
+
     /// The browser pane an agent's actions for this pane use: the pane itself,
-    /// one opened for it, or one stacked with it.
-    func stackedBrowserPane(for paneID: UUID) -> PaneModel? {
+    /// else the newest one opened for it or stacked with it, in `placement`
+    /// when one is asked for.
+    func stackedBrowserPane(for paneID: UUID, placement: BrowserPanePlacement? = nil) -> PaneModel? {
         if let pane = panes[paneID], pane.contentKind == .browser { return pane }
-        if let opened = panes.values.first(where: { $0.contentKind == .browser && $0.browserAnchor == paneID }) { return opened }
-        let members = tabs.lazy.compactMap { $0.stack(containing: paneID) }.first?.members ?? []
-        return members.lazy.compactMap { self.panes[$0] }.first { $0.contentKind == .browser }
+        browserSequence.removeAll { panes[$0] == nil }
+        let mates = Set(tabs.lazy.compactMap { $0.stack(containing: paneID) }.first?.members ?? [])
+        return browserSequence.reversed().lazy.compactMap { self.panes[$0] }.first { browser in
+            (browser.browserAnchor == paneID || mates.contains(browser.id))
+                && (placement == nil || self.browserPlacement(browser) == placement)
+        }
     }
 
     private var browserAnchors: [UUID: UUID] {
