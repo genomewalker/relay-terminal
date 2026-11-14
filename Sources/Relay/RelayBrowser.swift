@@ -91,6 +91,8 @@ enum RelayBrowserRouting {
     private var observations: [NSKeyValueObservation] = []
 
     var remote: Bool { profile.kind != .local }
+    /// A page waiting for its port to be carried or for the Mac guard.
+    var hasPendingLoad: Bool { pending != nil || !opening.isEmpty }
     var hostLabel: String { remote ? profile.host : "This Mac" }
     var portMap: [Int: Int] { tunnels.mapValues { Int($0.endpoint.port) } }
     var tunnelSummary: String {

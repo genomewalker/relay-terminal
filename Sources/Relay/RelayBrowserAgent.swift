@@ -153,7 +153,7 @@ extension RelayBrowserSession {
         let clock = ContinuousClock(), deadline = clock.now + timeout
         try? await Task.sleep(for: .milliseconds(250))
         while clock.now < deadline, confirm == nil {
-            if !webView.isLoading, !busy, await documentMatchesAddress() { return }
+            if !webView.isLoading, !busy, !hasPendingLoad, await documentMatchesAddress() { return }
             try? await Task.sleep(for: .milliseconds(100))
         }
     }
