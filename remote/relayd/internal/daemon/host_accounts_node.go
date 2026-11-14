@@ -11,13 +11,32 @@ import (
 	"time"
 )
 
+// The app checks every pane's capacity on the same minute. The node process
+// also carries every pane's terminal stream, so at most this many checks run
+// at once; the rest wait their turn rather than fail.
+const nodeCapacityConcurrency = 4
+
+var nodeCapacitySlots = make(chan struct{}, nodeCapacityConcurrency)
+
+func withNodeCapacitySlot(ctx context.Context, run func() ([]byte, error)) ([]byte, error) {
+	select {
+	case nodeCapacitySlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-nodeCapacitySlots }()
+	return run()
+}
+
 // Host accounts are user settings shared by all workers on this execution host.
 // The authenticated node connection owns this route; no pane, PTY controller,
 // input lease or supervisor upgrade is needed. Native session controls retain
 // their separate worker admission checks.
 func HandleNodeHostAccountsRequest(ctx context.Context, data []byte) ([]byte, error) {
 	if nodeCapacityEnvelope(data) {
-		return handleNodeCapacityRequest(ctx, data, defaultWorkerStateDir(), capacityNativeObserve, capacityNativeAccounts)
+		return withNodeCapacitySlot(ctx, func() ([]byte, error) {
+			return handleNodeCapacityRequest(ctx, data, defaultWorkerStateDir(), capacityNativeObserve, capacityNativeAccounts)
+		})
 	}
 	if nodePaneHealthEnvelope(data) {
 		return handleNodePaneHealthRequest(ctx, data, defaultWorkerStateDir(), hostRotationTextService)
