@@ -144,6 +144,24 @@ struct RelayNodeHeartbeatToleranceTests {
         #expect(f.watchdogRecords().count == 1)
     }
 
+    /// relayd node pings the app every 5 s (node_ping_echo). Those pings come
+    /// from the node process, not the supervisor, so a supervisor that stopped
+    /// answering must still be restarted after exactly the threshold.
+    @Test func nodePingsDoNotHideASilentSupervisor() throws {
+        let f = fixture("heartbeat-node-pings")
+        let nodePing = { (seconds: Double) in
+            f.clock.set(f.start + UInt64(seconds * Double(second)))
+            f.node.receiveAttachedFrame(.init(type: .ping, payload: Data([0, 0, 0, 0, 0, 0, 0, 9])), generation: 0)
+        }
+        for seconds in [0.0, 2, 4, 6, 8] {
+            #expect(f.tick(at: seconds))
+            nodePing(seconds + 1)
+        }
+        #expect(f.tick(at: 10) == false)
+        let record = try #require(f.watchdogRecords().first)
+        #expect(record.details["consecutive_misses"] == "3")
+    }
+
     @Test func totalSilenceRestartsAfterExactlyTheThreshold() throws {
         let f = fixture("heartbeat-silence")
         for seconds in [0.0, 2, 4, 6, 8] { #expect(f.tick(at: seconds)) }

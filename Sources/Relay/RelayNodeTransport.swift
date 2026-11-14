@@ -922,7 +922,9 @@ final class RelayNodeConnection: @unchecked Sendable {
     /// takes longer than the heartbeat timeout to arrive.
     func readNodeFrame(from handle: FileHandle, fragments: inout RelayWireFragmentAssembler,
         generation currentGeneration: Int) throws {
+        let before = inboundState(generation: currentGeneration)
         let raw = try RelayWireFrame.read(from: handle) { noteInbound(generation: currentGeneration) }
+        if raw.type == .ping { restoreInbound(before, generation: currentGeneration) }
         if raw.type == .status,
            let status = try? JSONDecoder().decode(StatusWirePayload.self, from: raw.payload),
            status.state == "ready", status.capabilities?.contains("wire_fragments_v1") == true {
@@ -935,8 +937,29 @@ final class RelayNodeConnection: @unchecked Sendable {
 
     /// Owned framed peers enter the same generation-checked reader path.
     func receiveAttachedFrame(_ frame: RelayWireFrame, generation: Int) {
+        let before = inboundState(generation: generation)
         noteInbound(generation: generation)
+        if frame.type == .ping { restoreInbound(before, generation: generation) }
         receive(frame, generation: generation)
+    }
+
+    /// relayd node's own Pings (node_ping_echo) prove only that SSH and the
+    /// node process are up, not the supervisor behind them. They must not
+    /// clear heartbeat misses, or a wedged supervisor is never detected.
+    private func inboundState(generation currentGeneration: Int) -> (UInt64?, Int)? {
+        lock.lock(); defer { lock.unlock() }
+        guard generation == currentGeneration, !stopped else { return nil }
+        return (lastInboundUptime, consecutiveHeartbeatMisses)
+    }
+
+    private func restoreInbound(_ state: (UInt64?, Int)?, generation currentGeneration: Int) {
+        guard let state else { return }
+        lock.lock()
+        if generation == currentGeneration, !stopped {
+            lastInboundUptime = state.0
+            consecutiveHeartbeatMisses = state.1
+        }
+        lock.unlock()
     }
 
     /// Inbound data of any kind proves the transport alive and ends a run of
