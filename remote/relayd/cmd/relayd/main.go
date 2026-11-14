@@ -1974,6 +1974,10 @@ func connectOrStart(socket string) (net.Conn, error) {
 		return nil, err
 	}
 	defer logFile.Close()
+	// Say who started this supervisor, so a daemon found on an unexpected node
+	// can be traced to the command and SSH client that started it.
+	_, _ = fmt.Fprintln(logFile, autoStartLine(os.Args, os.Getpid(), os.Getppid(), parentProcessName(os.Getppid()),
+		os.Getenv("SSH_CLIENT"), os.Getenv("RELAY_INVOKED_AS"), time.Now()))
 	child := exec.Command(os.Args[0], "daemon", "--socket", socket)
 	child.Env = daemon.TerminalEnvironment(os.Environ())
 	child.Stdin = nil

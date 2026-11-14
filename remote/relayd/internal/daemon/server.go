@@ -24,6 +24,8 @@ import (
 var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,96}$`)
 
 type Server struct {
+	// clients counts open client connections, for the idle exit.
+	clients               atomic.Int64
 	hostJobs              sync.Map
 	hostJobsMu            sync.Mutex
 	tombstonesOnce        sync.Once
@@ -135,10 +137,16 @@ func (server *Server) Serve(socketPath string) error {
 	// Before accepting clients, so a racing client respawn of the same route
 	// is reserved as superseded by the resumed listener, never run beside it.
 	server.resumePeerListeners()
+	var idleExit atomic.Bool
+	go server.watchIdle(healthContext, listener, &idleExit)
 	var acceptBackoff time.Duration
 	for {
 		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {
+			if idleExit.Load() {
+				server.waitForClients(5 * time.Second)
+				return nil
+			}
 			// A transient error (e.g. EMFILE under fd pressure) must not kill
 			// the whole supervisor and drop every attached client; back off
 			// and keep serving. Only a permanent error (closed listener) ends
@@ -160,7 +168,11 @@ func (server *Server) Serve(socketPath string) error {
 			_ = connection.Close()
 			continue
 		}
-		go server.serveConnection(connection)
+		server.clients.Add(1)
+		go func() {
+			defer server.clients.Add(-1)
+			server.serveConnection(connection)
+		}()
 	}
 }
 

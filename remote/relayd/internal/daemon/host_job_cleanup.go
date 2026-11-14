@@ -50,6 +50,9 @@ type HostJobCleanupResult struct {
 	RetentionWarnings []string `json:"retention_warnings,omitempty"`
 	Archived          int      `json:"archived"` // daemon pass only: live jobs moved first
 	CleanupInactive   bool     `json:"cleanup_inactive,omitempty"`
+	// CleanupOtherNode names the activation node when this daemon runs on
+	// another node sharing the state directory and therefore only archived.
+	CleanupOtherNode  string   `json:"cleanup_other_node,omitempty"`
 	Examined          int      `json:"examined"`
 	Eligible          int      `json:"eligible"`
 	BytesEligible     int64    `json:"bytes_eligible"`
@@ -241,8 +244,15 @@ func (s *Server) archiveAndCleanupHostJobsWith(retention HostJobRetention, now t
 		return HostJobCleanupResult{Archived: archived}, err
 	}
 	// Archiving deletes nothing; deleting waits for activation.
-	if _, err := readHostJobActivation(s.stateDir); errors.Is(err, errHostJobCleanupInactive) {
+	activation, err := readHostJobActivation(s.stateDir)
+	if errors.Is(err, errHostJobCleanupInactive) {
 		return HostJobCleanupResult{Archived: archived, CleanupInactive: true}, nil
+	}
+	// A shared state directory is cleaned by one daemon: the one on the node
+	// that activated deletion. A daemon on another node may run an older
+	// release with older retention rules, so it only archives.
+	if err == nil && !hostJobActivationNodeIs(activation.Node, hostJobServerNode()) {
+		return HostJobCleanupResult{Archived: archived, CleanupOtherNode: activation.Node}, nil
 	}
 	// The same local handshake as gc-host-jobs: every relayd on this node,
 	// this one included, must support tombstones and be registered.
@@ -271,6 +281,9 @@ func recordHostJobCleanup(stateDir string, result HostJobCleanupResult, runErr e
 	outcome := "ok"
 	if result.CleanupInactive {
 		outcome = "cleanup inactive (not activated; archived only)"
+	}
+	if result.CleanupOtherNode != "" {
+		outcome = "deletion runs on " + result.CleanupOtherNode + ", the activation node; archived only"
 	}
 	if runErr != nil {
 		outcome = runErr.Error()

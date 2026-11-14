@@ -467,3 +467,19 @@ func probeHostJobTombstoneServer(connection net.Conn) (int, error) {
 	}
 	return pid, nil
 }
+
+// hostJobActivationNodeIs reports whether node is the activation node. Host
+// names are compared without case and, when one side carries a domain, by the
+// first label, so "dandycomp07fl" matches "dandycomp07fl.unicph.domain". An
+// activation that could not name its node keeps the earlier behaviour.
+func hostJobActivationNodeIs(activationNode, node string) bool {
+	if activationNode == "" || activationNode == "unknown" {
+		return true
+	}
+	if strings.EqualFold(activationNode, node) {
+		return true
+	}
+	short := func(name string) string { label, _, _ := strings.Cut(name, "."); return label }
+	return (!strings.Contains(activationNode, ".") || !strings.Contains(node, ".")) &&
+		strings.EqualFold(short(activationNode), short(node))
+}
