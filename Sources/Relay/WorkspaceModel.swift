@@ -2997,6 +2997,7 @@ final class WorkspaceModel: ObservableObject {
     /// broken in Codex and Claude.
     func updateTerminalFocusOwnership() {
         for (id, pane) in panes {
+            pane.runtime.setTransportFocused(id == activePaneID)
             pane.runtime.setKeyboardFocusEligible(id == activePaneID && !paneLinkSelection.active && !networkVisible && !isQuickNavigatePresented && !isFleetBoardPresented)
         }
         if paneLinkSelection.active { NSApp?.keyWindow?.makeFirstResponder(nil) }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -31,6 +32,8 @@ type frameScheduler struct {
 	burst         int
 	fragments     bool
 	nextMessageID uint64
+	// focus holds the scheduling keys ("pane:<route>") of the focused pane.
+	focus map[string]bool
 }
 
 // NewScheduledWriter leaves the wire format untouched. Only independent route
@@ -115,7 +118,7 @@ func (s *frameScheduler) choose() int {
 			continue
 		}
 		seen[item.key] = true
-		if item.priority < s.pending[best].priority {
+		if s.rank(item) < s.rank(s.pending[best]) {
 			best = i
 		}
 	}
@@ -125,6 +128,34 @@ func (s *frameScheduler) choose() int {
 		s.burst = 0
 	}
 	return best
+}
+
+// rank orders queue heads. With no focus it is the frame priority (doubled),
+// so the order is unchanged. With a focus, an unfocused pane's frame ranks one
+// step lower, so the focused pane's output goes before other panes' output of
+// the same kind, while input, acks and heartbeats of every pane still go
+// first. Connection-level frames are not affected.
+func (s *frameScheduler) rank(item *scheduledFrame) int {
+	rank := item.priority * 2
+	if len(s.focus) > 0 && strings.HasPrefix(item.key, "pane:") && !s.focus[item.key] {
+		rank++
+	}
+	return rank
+}
+
+// SetFocus names the routes of the focused pane; nil or empty clears it. It
+// re-ranks frames already queued and never drops or splits one.
+func (writer *Writer) SetFocus(routes []string) {
+	if writer.scheduler == nil {
+		return
+	}
+	focus := make(map[string]bool, len(routes))
+	for _, route := range routes {
+		focus["pane:"+route] = true
+	}
+	writer.scheduler.mu.Lock()
+	writer.scheduler.focus = focus
+	writer.scheduler.mu.Unlock()
 }
 
 // Queued reports the scheduler's waiting bytes and frames (measurement only).

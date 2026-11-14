@@ -42,6 +42,11 @@ const (
 	// FreshRedraw asks the worker for one screen built only from a reset and
 	// the foreground program's redraw, never from retained output.
 	FreshRedraw Type = 23
+	// Focus names the route(s) of the pane the user is looking at, as
+	// {"routes":["<route>"]}; an empty list clears it. Sent by the app on a
+	// node connection that advertises node_focus_v1. It only reorders queued
+	// frames for that connection; nothing is dropped.
+	Focus Type = 24
 )
 
 const MaxPayload = 16 << 20

@@ -1600,6 +1600,9 @@ final class TerminalRuntime: NSObject {
 
     fileprivate func clearPreservedTypingNotice() { pane?.terminalInputDraftMessage = nil }
 
+    /// The pane the user is looking at: its node sends its output first.
+    func setTransportFocused(_ focused: Bool) { io.setTransportFocused(focused) }
+
     func setKeyboardFocusEligible(_ eligible: Bool) {
         guard keyboardFocusEligible != eligible else { return }
         keyboardFocusEligible = eligible
@@ -4519,6 +4522,16 @@ final class TerminalIOBridge: @unchecked Sendable {
         resizeLock.unlock()
     }
 
+    private var transportFocused = false
+
+    func setTransportFocused(_ focused: Bool) {
+        resizeLock.lock()
+        transportFocused = focused
+        let transport = self.transport
+        resizeLock.unlock()
+        transport?.setFocused(focused)
+    }
+
     func installTransport(_ transport: RelayRemoteTransport) {
         outputOrderingLock.lock()
         invalidatePromptEditorRestorationBarrier()
@@ -4527,9 +4540,11 @@ final class TerminalIOBridge: @unchecked Sendable {
         outputProducerID = UUID()
         let viewport = latestViewport
         lastSentViewport = nil
+        let focused = transportFocused
         resizeLock.unlock()
         outputOrderingLock.unlock()
         transport.setInitialViewport(viewport)
+        if focused { transport.setFocused(true) }
         transport.setViewportCommitHandler { [weak self, weak transport] generation, deliveryEpoch in
             guard let self, let transport else { return }
             _ = self.performForTransport(transport) {

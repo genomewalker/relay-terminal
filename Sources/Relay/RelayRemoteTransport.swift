@@ -216,6 +216,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var process: Process?
     private var writer: (any RelayFrameWriting)?
     private var nodeChannel: RelayNodeChannel?
+    /// The user is looking at this pane; its node sends its output first.
+    private var focused = false
     private var detached = false
     private var deliveryEpoch = UUID() {
         didSet {
@@ -469,9 +471,22 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let replaced = nodeChannel === channel ? nil : nodeChannel
         nodeChannel = channel
         writer = channel
+        let focusChannel = focused ? channel : nil
         lock.unlock()
         replaced?.close()
+        focusChannel?.setFocused(true)
         scheduleNodeRecoveryCheck(context)
+    }
+
+    /// Marks this pane as the one the user is looking at, so its node sends
+    /// its queued output ahead of other panes'. Kept across channel changes.
+    func setFocused(_ value: Bool) {
+        lock.lock()
+        guard focused != value else { lock.unlock(); return }
+        focused = value
+        let channel = nodeChannel
+        lock.unlock()
+        channel?.setFocused(value)
     }
 
     /// The shared-node channel this pane currently uses (tests).
@@ -560,7 +575,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
             channel.supports("viewport_commit_compat_v1") ||
             channel.supports("viewport_commit_compat_v2")
         supportsExactSupervisorViewportCommits = channel.supports("viewport_commit_compat_v2")
+        let isFocused = focused
         lock.unlock()
+        if isFocused { channel.setFocused(true) }
         let hello = multiplexedHello(context, viewport: viewport,
             resumeSequence: resumeSequence, resumeEventSequence: resumeEventSequence)
         let payload = (try? JSONSerialization.data(withJSONObject: hello.compactMapValues { $0 })) ?? Data()
@@ -1816,6 +1833,8 @@ enum RelayWireType: UInt8 {
     case automationInputV2 = 22
     /// Empty payload: one screen from a reset and the agent's redraw (fresh_redraw_v1).
     case freshRedraw = 23
+    /// Node-level {"routes":[...]}: panes the user is looking at (node_focus_v1).
+    case focus = 24
 }
 
 struct RelayWireFrame {

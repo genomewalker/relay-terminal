@@ -480,7 +480,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 	ready, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
 		State: "ready", Version: server.buildVersion,
 		ProtocolVersion: server.protocolVersion, SupervisorPID: os.Getpid(),
-		Capabilities: []string{"wire_fragments_v1", "node_scheduling_v1", "host_rpc_v1", "node_mux_v1", "node_mux_v2", "viewport_commit_compat_v1", "viewport_commit_compat_v2", "host_pane_health_controller_v1", "agent_accounts_v1", "native_chat_v1", HostJobTombstonesCapability},
+		Capabilities: []string{"wire_fragments_v1", "node_scheduling_v1", "host_rpc_v1", "node_mux_v1", "node_mux_v2", "viewport_commit_compat_v1", "viewport_commit_compat_v2", "host_pane_health_controller_v1", "agent_accounts_v1", "native_chat_v1", HostJobTombstonesCapability, "node_focus_v1"},
 	})
 	if writer.Write(ready) != nil {
 		return
@@ -539,6 +539,15 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 		}
 		if envelope.Type == protocol.HostRequest {
 			go server.serveHostRPCFrom(writer, envelope, hostCaller{pid: peerPID, err: peerErr})
+			continue
+		}
+		// The app names the pane the user is looking at; this connection's
+		// writer sends that pane's queued frames first. A malformed frame is
+		// ignored like any unknown top-level frame.
+		if envelope.Type == protocol.Focus {
+			if routes, ok := ParseFocusRoutes(envelope.Payload); ok {
+				writer.SetFocus(routes)
+			}
 			continue
 		}
 		sessionID, inner, err := protocol.ParseHostEvent(envelope)

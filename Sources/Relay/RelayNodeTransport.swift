@@ -78,6 +78,11 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
         openConnection?.supports(capability) == true
     }
 
+    /// Tells the node whether the user is looking at this pane.
+    func setFocused(_ focused: Bool) {
+        openConnection?.setFocus(sessionID: sessionID, focused: focused, channel: self)
+    }
+
     func close() {
         lock.lock()
         guard !closed else { lock.unlock(); return }
@@ -90,6 +95,20 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
 }
 
 enum RelayNodeTransportError: Error { case disconnected, invalidEnvelope }
+
+/// The Focus frame relayd's node scheduler reads (node_focus_v1).
+enum RelayNodeFocus {
+    /// relayd accepts at most this many routes; more rejects the frame.
+    static let maxRoutes = 4
+
+    /// {"routes":[...]} sorted, so the same set always encodes the same way.
+    /// Beyond the limit the frame lists none, which falls back to the
+    /// oldest-first order instead of favouring an arbitrary subset.
+    static func payload(routes: Set<String>) -> Data {
+        let listed = routes.count <= maxRoutes ? routes.sorted() : []
+        return (try? JSONSerialization.data(withJSONObject: ["routes": listed])) ?? Data(#"{"routes":[]}"#.utf8)
+    }
+}
 
 /// Keeps a busy pane from doing terminal parsing on the one shared SSH reader.
 ///
@@ -480,6 +499,26 @@ final class RelayNodeConnection: @unchecked Sendable {
         return true
     }
 
+    func setFocus(sessionID: String, focused: Bool, channel: RelayNodeChannel) {
+        lock.lock()
+        guard subscriptions[sessionID]?.channel === channel else { lock.unlock(); return }
+        let changed = focused ? focusedRoutes.insert(sessionID).inserted : focusedRoutes.remove(sessionID) != nil
+        lock.unlock()
+        if changed { flushFocus() }
+    }
+
+    /// Sends the current focus set when the node understands it. A node
+    /// without node_focus_v1 keeps its oldest-first order.
+    private func flushFocus() {
+        focusSendLock.lock()
+        defer { focusSendLock.unlock() }
+        lock.lock()
+        guard ready, !systemSleeping, let writer, capabilities.contains("node_focus_v1") else { lock.unlock(); return }
+        let payload = RelayNodeFocus.payload(routes: focusedRoutes)
+        lock.unlock()
+        try? writer.write(type: .focus, payload: payload)
+    }
+
     private func flushHostRequests() {
         lock.lock()
         guard ready, !systemSleeping, let writer else { lock.unlock(); return }
@@ -516,6 +555,10 @@ final class RelayNodeConnection: @unchecked Sendable {
     /// Set once, under this lock, when the pool evicts the idle node.
     private var retired = false
     private var capabilities: Set<String> = []
+    /// Routes of panes the user is looking at; sent as one Focus frame.
+    private var focusedRoutes: Set<String> = []
+    /// Serializes Focus sends so the node always ends on the newest set.
+    private let focusSendLock = NSLock()
     private var systemSleeping = false
     private var heartbeatSequence: UInt64 = 0
     private var pendingHeartbeats: [UInt64: UInt64] = [:]
@@ -687,6 +730,7 @@ final class RelayNodeConnection: @unchecked Sendable {
             return
         }
         let removed = subscriptions.removeValue(forKey: sessionID)
+        let focusChanged = focusedRoutes.remove(sessionID) != nil
         let activeWriter = ready ? writer : nil
         if subscriptions.isEmpty && !retainsHostConnection {
             stopped = true
@@ -711,6 +755,7 @@ final class RelayNodeConnection: @unchecked Sendable {
         ) {
             try? activeWriter?.write(type: envelope.type, payload: envelope.payload)
         }
+        if focusChanged { flushFocus() }
     }
 
     func write(sessionID: String, frame: RelayWireFrame, expectedChannel: RelayNodeChannel? = nil) throws {
@@ -962,6 +1007,7 @@ final class RelayNodeConnection: @unchecked Sendable {
                 NotificationCenter.default.post(name: .relayNodeReady, object: profile.connectionKey)
             }
             flushHostRequests()
+            flushFocus()
             RelayDiagnostics.shared.record(category: "connection", name: "ready", details: [
                 "connection_id": diagnosticConnectionID,
             ])
