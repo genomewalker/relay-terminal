@@ -93,7 +93,8 @@ import Foundation
     /// `relay_show`: displays files or a page for one pane; takes no other action.
     func show(_ body: Data, instance: UUID, permits: (MCPWorkspaceCapability) -> Bool,
               workspace: WorkspaceModel,
-              present: (PaneModel, [RelayQuickLookTarget]) -> RelayShowOutcome? = { $0.runtime.showForAgent($1) })
+              present: (PaneModel, [RelayQuickLookTarget]) -> RelayShowOutcome? = { $0.runtime.showForAgent($1) },
+              attention: () -> Void = { RelayShowAttention.request() })
         -> RelaySidePanelHTTPResponse {
         guard Endpoint.show.capabilities.allSatisfy(permits) else {
             return .text("MCP workspace navigate capability is not granted", status: 403, reason: "Forbidden")
@@ -130,6 +131,7 @@ import Foundation
         }
         showRequests[proposal.requestID] = proposal
         showResults[proposal.requestID] = result
+        attention()
         return .json(result)
     }
 

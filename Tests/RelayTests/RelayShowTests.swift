@@ -67,4 +67,29 @@ import Testing
                                                    present: { _, _ in nil })
         #expect(response.status == 409)
     }
+
+    @Test func aShowBouncesTheDockOnlyWhenRelayIsBehind() throws {
+        var bounces = 0
+        #expect(RelayShowAttention.request(isActive: true, bounce: { bounces += 1 }) == false)
+        #expect(RelayShowAttention.request(isActive: false, bounce: { bounces += 1 }) == true)
+        #expect(bounces == 1)
+
+        // Once per new show: not for a repeat or a refusal.
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let paneID = try #require(workspace.activePaneID)
+        let instance = UUID(), request = UUID()
+        let handler = MCPDirectTabRequests()
+        var asked = 0
+        func call(_ items: [String], id: UUID = request, outcome: RelayShowOutcome? = .quickLook) throws -> Int {
+            let data = try JSONEncoder().encode(MCPDirectTabRequests.ShowProposal(instance: instance, requestID: id, paneID: paneID, items: items))
+            return handler.show(data, instance: instance, permits: { _ in true }, workspace: workspace,
+                                present: { _, _ in outcome }, attention: { asked += 1 }).status
+        }
+        #expect(try call(["/a"]) == 200 && asked == 1)
+        #expect(try call(["/a"]) == 200 && asked == 1)                   // repeat
+        #expect(try call(["mailto:x@y.org"], id: UUID()) == 400 && asked == 1)
+        #expect(try call(["rel/x"], id: UUID(), outcome: nil) == 409 && asked == 1)
+        #expect(try call(["https://example.org/"], id: UUID(), outcome: .browser(URL(string: "https://example.org/")!)) == 200 && asked == 2)
+    }
 }

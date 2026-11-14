@@ -307,6 +307,18 @@ final class RelayQuickLookStaging: @unchecked Sendable {
     func remove() { try? FileManager.default.removeItem(at: directory) }
 }
 
+/// relay_show's panels never take focus and hide while another app is in
+/// front, so a show that arrives then bounces the Dock icon once.
+@MainActor enum RelayShowAttention {
+    @discardableResult
+    static func request(isActive: Bool = NSApp?.isActive ?? true,
+                        bounce: () -> Void = { _ = NSApp?.requestUserAttention(.informationalRequest) }) -> Bool {
+        guard !isActive else { return false }
+        bounce()
+        return true
+    }
+}
+
 /// Where relay_show displayed a pane's items.
 enum RelayShowOutcome: Equatable {
     case quickLook
