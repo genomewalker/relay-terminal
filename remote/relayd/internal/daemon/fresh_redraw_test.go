@@ -65,6 +65,7 @@ func collectFreshRedraw(t *testing.T, viewer *client) freshRedrawFrames {
 
 func startFreshRedrawSession(t *testing.T, name string, agent bool) *Session {
 	t.Helper()
+	isolatePaneShell(t)
 	session, err := startSession(name, attachRepaintScript, "", 80, 24)
 	if err != nil {
 		t.Fatal(err)

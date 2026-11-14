@@ -31,6 +31,15 @@ func ringBytesAfter(session *Session, sequence uint64) []byte {
 	return stream
 }
 
+// isolatePaneShell keeps a test pane off the caller's login shell. A pane
+// command runs inside two login shells, and a slow profile (several seconds
+// each with conda or module setup) otherwise outlasts waitForRingBytes.
+func isolatePaneShell(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SHELL", "/bin/sh")
+}
+
 func waitForRingBytes(t *testing.T, session *Session, marker string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -149,6 +158,7 @@ func assertNoSyntheticClear(t *testing.T, capture attachCapture, lastSequence ui
 // ESC[2J ESC[H, erasing every transcript row the repaint did not touch.
 func TestAttachResizeReplayPreservesTranscriptBytes(t *testing.T) {
 	config := WorkerConfig{SessionID: "attach-resize-test", Token: "token"}
+	isolatePaneShell(t)
 	session, err := startSession(config.SessionID, attachRepaintScript, "", 80, 24)
 	if err != nil {
 		t.Fatal(err)
@@ -190,6 +200,7 @@ func TestAttachResizeReplayPreservesTranscriptBytes(t *testing.T) {
 // Exercise a real foreground PTY instead of assuming TIOCSWINSZ emits it.
 func TestAttachUnchangedAgentGridProducesRepaint(t *testing.T) {
 	command := strings.Replace(attachRepaintScript, `trap "printf`, `trap "stty size; printf`, 1)
+	isolatePaneShell(t)
 	session, err := startSession("attach-unchanged-agent-test", command, "", 80, 24)
 	if err != nil {
 		t.Fatal(err)
