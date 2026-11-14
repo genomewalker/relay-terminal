@@ -225,3 +225,52 @@ func TestNativeDirectoryScanRotationRereadsAMiddleRewrite(t *testing.T) {
 		t.Fatalf("rotation scan started at %d and returned %v; want a full reread that refuses the rewrite", p.start, err)
 	}
 }
+
+// A refused complete line is final for an append-only transcript, so later
+// checks return the saved refusal without rereading the file.
+func TestNativeDirectoryScanKeepsARefusalWithoutRereading(t *testing.T) {
+	p := newDirectoryScanProbe(t)
+	p.write(directoryRow("a", "/project") + directoryRow("b", "/elsewhere"))
+	if _, _, err := p.scan(); err == nil || p.start != 0 {
+		t.Fatalf("first scan start=%d err=%v", p.start, err)
+	}
+	refused := p.size()
+	p.append(directoryRow("c", "/project"))
+	if _, _, err := p.scan(); err == nil || p.start != refused {
+		t.Fatalf("refusal reread from %d (want %d): %v", p.start, refused, err)
+	}
+	// Replacing the file clears the refusal.
+	p.write(directoryRow("a", "/project"))
+	if _, _, err := p.scan(); err != nil || p.start != 0 {
+		t.Fatalf("replaced file start=%d err=%v", p.start, err)
+	}
+}
+
+// Capacity observation resumes; rotation admission rereads from the start.
+func TestNativeDirectoryResumesOnlyForObservation(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	directory := filepath.Join(home, ".claude", "projects", "fixture")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := newDirectoryScanProbe(t)
+	p.path = filepath.Join(directory, "fixture-session.jsonl")
+	p.write(directoryRow("a", "/project"))
+	binding := AgentBindingRecord{Version: 1, SessionID: "fixture-session", TranscriptPath: p.path, Revision: "native-revision",
+		Producer: agentProducer{PaneID: "fixture-pane", Provider: "claude", ProcessID: 101, ProcessStart: 102}}
+	if _, err := readHostRotationNativeDirectoryFrom(context.Background(), binding, true); err != nil || p.start != 0 {
+		t.Fatalf("first observation start=%d err=%v", p.start, err)
+	}
+	before := p.size()
+	p.append(directoryRow("b", "/project/hooks"))
+	if c, err := readHostRotationNativeDirectoryFrom(context.Background(), binding, true); err != nil || p.start != before || len(c.directories) != 2 {
+		t.Fatalf("observation resumed at %d (want %d): %v", p.start, before, err)
+	}
+	if c, err := readHostRotationNativeDirectory(context.Background(), binding); err != nil || p.start != 0 || len(c.directories) != 2 {
+		t.Fatalf("rotation scan started at %d: %v", p.start, err)
+	}
+}

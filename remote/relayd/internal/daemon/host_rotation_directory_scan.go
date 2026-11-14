@@ -118,8 +118,10 @@ func (s *nativeDirectoryScan) result() (string, []string, error) {
 // scanNativeDirectoryLines feeds every line of reader to scan, starting at a
 // line boundary. Complete (newline-terminated) lines advance scan and the
 // returned count of consumed bytes; a final unterminated line is checked on a
-// copy, exactly as a whole-file scan would, without being committed.
-func scanNativeDirectoryLines(ctx context.Context, reader io.Reader, scan *nativeDirectoryScan) (*nativeDirectoryScan, int64, error) {
+// copy, exactly as a whole-file scan would, without being committed. When a
+// complete line is refused, consumed includes that line and permanent is set:
+// appending to the file cannot change the result.
+func scanNativeDirectoryLines(ctx context.Context, reader io.Reader, scan *nativeDirectoryScan) (final *nativeDirectoryScan, consumed int64, permanent bool, err error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64<<10), rotationSourceLineLimit)
 	complete, lastAdvance := false, 0
@@ -130,16 +132,15 @@ func scanNativeDirectoryLines(ctx context.Context, reader io.Reader, scan *nativ
 		}
 		return advance, token, err
 	})
-	final := scan
-	var consumed int64
+	final = scan
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return nil, 0, ctx.Err()
+			return nil, 0, false, ctx.Err()
 		}
 		line := scanner.Bytes()
 		if complete {
 			if err := scan.line(line); err != nil {
-				return nil, 0, err
+				return nil, consumed + int64(lastAdvance), true, err
 			}
 			consumed += int64(lastAdvance)
 			final = scan
@@ -147,17 +148,17 @@ func scanNativeDirectoryLines(ctx context.Context, reader io.Reader, scan *nativ
 		}
 		partial := scan.clone()
 		if err := partial.line(line); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 		final = partial
 	}
 	if scanner.Err() != nil {
-		return nil, 0, errors.New("native directory line limit or read failure")
+		return nil, 0, false, errors.New("native directory line limit or read failure")
 	}
 	if ctx.Err() != nil {
-		return nil, 0, ctx.Err()
+		return nil, 0, false, ctx.Err()
 	}
-	return final, consumed, nil
+	return final, consumed, false, nil
 }
 
 const nativeDirectoryFingerprintBytes = 4096
@@ -171,8 +172,11 @@ type nativeDirectoryCacheEntry struct {
 	// offset when the scan was saved; a replaced or rewritten file whose
 	// identity survived differs in one of them.
 	head, tail []byte
-	scan       *nativeDirectoryScan
-	used       uint64
+	// Exactly one of scan and failure is set; failure is a refused complete
+	// line ending at offset.
+	scan    *nativeDirectoryScan
+	failure error
+	used    uint64
 }
 
 var nativeDirectoryCache = struct {
@@ -229,6 +233,12 @@ func scanHostRotationNativeDirectory(ctx context.Context, file *os.File, info os
 	if resume && entry != nil && identified && entry.dev == dev && entry.ino == ino && entry.provider == provider &&
 		entry.session == session && entry.offset <= size && len(head) >= len(entry.head) && bytes.HasPrefix(head, entry.head) {
 		if tail, ok := readFingerprint(file, entry.offset); ok && bytes.Equal(tail, entry.tail) {
+			if entry.failure != nil {
+				if nativeDirectoryScanStarted != nil {
+					nativeDirectoryScanStarted(path, entry.offset)
+				}
+				return "", nil, entry.failure
+			}
 			scan, start = entry.scan.clone(), entry.offset
 		}
 	}
@@ -242,26 +252,38 @@ func scanHostRotationNativeDirectory(ctx context.Context, file *os.File, info os
 	if nativeDirectoryScanStarted != nil {
 		nativeDirectoryScanStarted(path, start)
 	}
-	final, consumed, err := scanNativeDirectoryLines(ctx, io.NewSectionReader(file, start, size-start), scan)
+	final, consumed, permanent, err := scanNativeDirectoryLines(ctx, io.NewSectionReader(file, start, size-start), scan)
 	if err != nil {
+		if permanent {
+			saveNativeDirectoryScan(file, path, &nativeDirectoryCacheEntry{dev: dev, ino: ino, provider: provider,
+				session: session, offset: start + consumed, head: head, failure: err}, identified)
+		}
 		return "", nil, err
 	}
 	cwd, directories, err := final.result()
 	if err != nil {
 		return "", nil, err
 	}
-	if identified {
-		offset := start + consumed
-		if tail, ok := readFingerprint(file, offset); ok {
-			nativeDirectoryCache.Lock()
-			nativeDirectoryCache.clock++
-			nativeDirectoryCache.entries[path] = &nativeDirectoryCacheEntry{dev: dev, ino: ino, provider: provider,
-				session: session, offset: offset, head: head, tail: tail, scan: scan.clone(), used: nativeDirectoryCache.clock}
-			evictNativeDirectoryCacheLocked()
-			nativeDirectoryCache.Unlock()
-		}
-	}
+	saveNativeDirectoryScan(file, path, &nativeDirectoryCacheEntry{dev: dev, ino: ino, provider: provider,
+		session: session, offset: start + consumed, head: head, scan: scan.clone()}, identified)
 	return cwd, directories, nil
+}
+
+func saveNativeDirectoryScan(file *os.File, path string, entry *nativeDirectoryCacheEntry, identified bool) {
+	if !identified {
+		return
+	}
+	tail, ok := readFingerprint(file, entry.offset)
+	if !ok {
+		return
+	}
+	entry.tail = tail
+	nativeDirectoryCache.Lock()
+	defer nativeDirectoryCache.Unlock()
+	nativeDirectoryCache.clock++
+	entry.used = nativeDirectoryCache.clock
+	nativeDirectoryCache.entries[path] = entry
+	evictNativeDirectoryCacheLocked()
 }
 
 func evictNativeDirectoryCacheLocked() {

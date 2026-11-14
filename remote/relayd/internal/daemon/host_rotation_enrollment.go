@@ -150,7 +150,7 @@ func parseHostRotationNativeDirectoryEvidence(ctx context.Context, reader io.Rea
 	if err != nil {
 		return "", nil, err
 	}
-	final, _, err := scanNativeDirectoryLines(ctx, reader, scan)
+	final, _, _, err := scanNativeDirectoryLines(ctx, reader, scan)
 	if err != nil {
 		return "", nil, err
 	}
