@@ -9725,6 +9725,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             clickCount: 1,
             pressure: 0
         ) else { return false }
+        // Every arrow press re-sends a press at the same anchor cell. Ghostty
+        // counts its own clicks, so presses inside the double-click interval
+        // would become word or line selections and snap the highlight to a
+        // whole word or row. Clear its selection and click state first.
+        resetSelection()
         super.mouseDown(with: down)
         super.mouseDragged(with: drag)
         super.mouseUp(with: up)
