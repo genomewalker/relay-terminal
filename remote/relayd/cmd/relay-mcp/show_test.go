@@ -60,8 +60,10 @@ func TestRelayShowRoutesBoundedItems(t *testing.T) {
 	}
 }
 
-func TestRelayShowIsAMutationOutsideMiko(t *testing.T) {
-	if !mikoExcluded("relay_show") {
-		t.Fatal("relay_show must stay out of Miko's catalog")
+// In Miko's catalog, so connectors that predate --agent-catalog reach it
+// through relay_call_tool without a restart.
+func TestRelayShowIsInMikosCatalog(t *testing.T) {
+	if mikoExcluded("relay_show") {
+		t.Fatal("relay_show must be in Miko's catalog")
 	}
 }

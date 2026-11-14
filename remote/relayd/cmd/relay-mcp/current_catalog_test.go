@@ -64,8 +64,11 @@ func TestAgentCatalogKeepsToolsMikoLeavesOut(t *testing.T) {
 		return out
 	}
 	agent, miko := names(agentCatalog()), names(mikoCatalog())
-	if !agent["relay_show"] || miko["relay_show"] {
-		t.Fatal("relay_show must reach agents through relay_call_tool but stay out of Miko")
+	if !agent["relay_show"] || !miko["relay_show"] {
+		t.Fatal("relay_show must reach agents through both catalogs")
+	}
+	if !agent["relay_broadcast_message"] || miko["relay_broadcast_message"] {
+		t.Fatal("a tool Miko leaves out must still reach agents")
 	}
 	if agent["relay_call_tool"] || agent["relay_available_tools"] {
 		t.Fatal("the generic helpers must not be callable through themselves")
@@ -81,8 +84,9 @@ func TestAgentCatalogKeepsToolsMikoLeavesOut(t *testing.T) {
 	if p, e := compileAgentPlan(raw); e != nil || p.Path != "/api/workspace/show" || p.Method != "POST" {
 		t.Fatalf("relay_show did not compile for agents: %v %#v", e, p)
 	}
-	if _, e := compileMikoPlan(raw); e == nil {
-		t.Fatal("Miko compiled an excluded tool")
+	excluded, _ := json.Marshal(map[string]any{"tool_name": "relay_broadcast_message", "arguments": map[string]any{}})
+	if _, e := compileMikoPlan(excluded); e == nil || strings.Contains(e.Error(), "Relay refused") {
+		t.Fatal("Miko compiled an excluded tool", e)
 	}
 	bad, _ := json.Marshal(map[string]any{"tool_name": "relay_show", "arguments": map[string]any{"items": []string{"/a"}}})
 	if _, e := compileAgentPlan(bad); e == nil {

@@ -22,7 +22,7 @@ enum RelayMikoToolCatalog {
     }
     static func catalogDataMatchesBuild(_ data: Data) -> Bool {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() ==
-            "ac3ee1fff051aa1825a9153b2a884d595019ffd1559c6dbc3efebbede6f054b4"
+            "46b4e33d8d2959faa1e4b8231e6e192faa391f2185ba7252fa867231bc8eadde"
     }
     static let definitions: [RelayPaneHealthJSON] = {
         guard let url = Bundle.module.url(forResource: "miko_tool_catalog", withExtension: "json", subdirectory: "Rotation"),
@@ -82,7 +82,7 @@ struct RelayMikoToolRequest: Equatable, Sendable {
         if tool == "relay_workspace_image" || ["relay_account_mcp_preview", "relay_account_mcp_sync", "relay_account_mcp_sync_receipt"].contains(tool) { return [.input] }
         if tier == "read" { return [] }
         switch tool {
-        case "relay_select_pane": return [.navigate]
+        case "relay_select_pane", "relay_show": return [.navigate]
         case "relay_new_local_tab", "relay_recover_pane": return [.create]
         case "relay_new_stacked_pane": return [.create, .layout]
         case "relay_stack_pane", "relay_rename_pane": return [.layout]

@@ -149,7 +149,7 @@ import Testing
     }
 
     @Test func bundledCatalogMatchesRecoverySemantics() {
-        #expect(RelayMikoToolCatalog.names.count == 98)   // source23 adds guarded installed-update request and receipt; relay_update_host_relayd
+        #expect(RelayMikoToolCatalog.names.count == 99)   // source23 adds guarded installed-update request and receipt; relay_update_host_relayd; relay_show
         let description = RelayMikoToolCatalog.definition("relay_recover_pane")?["description"]?.string ?? ""
         #expect(description.contains("an identical repeat returns pending"))
         #expect(description.contains("After an app restart reconcile"))
@@ -617,7 +617,7 @@ import Testing
                 transitions += 1
             }
         }
-        #expect(states == 254_016) // 98 published tools × 2_592 policy tuples
+        #expect(states == 256_608) // 99 published tools × 2_592 policy tuples
         #expect(transitions == 16_384)
         print("MP bounded: tuples=\(states), two-actor sequences=4096 depth=4 transitions=\(transitions)")
     }
@@ -692,7 +692,7 @@ import Testing
         var seed: UInt64 = 0x4d_49_4b_4f
         func next() -> UInt64 { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return seed }
         let first = try RelayMikoToolCatalog.discover(.object([:]))
-        #expect(first["tools"]?.array?.count == 12 && first["total"] == .integer(98))
+        #expect(first["tools"]?.array?.count == 12 && first["total"] == .integer(99))
         for name in ["relay_miko_set_capabilities", "relay_register_caller", "relay_call_tool", "relay_ask_miko"] {
             #expect(throws: (any Error).self) { try RelayMikoToolCatalog.discover(.object(["tool_name": .string(name)])) }
         }

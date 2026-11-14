@@ -21,8 +21,7 @@ func TestMikoCatalogComplete(t *testing.T) {
 		}
 		switch name {
 		case "relay_read_desktop_inbox", "relay_ask_miko", "relay_register_caller", "relay_control_caller", "relay_begin_terminal_control", "relay_authorize_r_session", "relay_call_tool", "relay_available_tools", "relay_research_capability", "relay_prompt_provenance", "relay_wait_for_command",
-			"relay_broadcast_message", // not offered to Miko yet
-			"relay_show": // agents show the user files and pages; Miko is already in the app
+			"relay_broadcast_message": // not offered to Miko yet
 			continue
 		}
 		expected[name] = true
@@ -36,7 +35,7 @@ func TestMikoCatalogComplete(t *testing.T) {
 			t.Fatal("Miko can impersonate a caller")
 		}
 	}
-	if !reflect.DeepEqual(actual, expected) || len(actual) != 98 {
+	if !reflect.DeepEqual(actual, expected) || len(actual) != 99 {
 		t.Fatalf("catalog omission or self/grant exposure: got %d expected %d", len(actual), len(expected))
 	}
 	file, e := os.ReadFile("../../../../Sources/Relay/Resources/Rotation/miko_tool_catalog.json")
