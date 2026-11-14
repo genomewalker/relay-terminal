@@ -258,6 +258,28 @@ final class RelayCapacityManagementTests: XCTestCase {
         XCTAssertGreaterThan(colors.count, 8, "RENDER_VISIBLE_NATIVE_CONTROLS")
         if let path = ProcessInfo.processInfo.environment["CTXQ_SETTINGS_SNAPSHOT"] { try png.write(to: URL(fileURLWithPath: path)) }
     }
+
+    func testCapacityChecksKeepEachPanesOwnSlotWithinTheMinute() {
+        let panes = (0..<200).map { _ in UUID() }
+        for pane in panes {
+            let phase = RelayCapacitySchedule.phase(for: pane)
+            XCTAssert(phase >= 0 && phase < 60)
+            XCTAssertEqual(phase, RelayCapacitySchedule.phase(for: pane), "a pane's slot is stable")
+            let now = Date(timeIntervalSinceReferenceDate: 815_000_000.25)
+            let next = RelayCapacitySchedule.nextDue(after: now, pane: pane)
+            XCTAssert(next > now && next.timeIntervalSince(now) <= 60.0001)
+            let offset = next.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 60)
+            XCTAssertEqual(offset, phase, accuracy: 0.0001)
+            // The following check is exactly one minute later, in the same slot.
+            XCTAssertEqual(RelayCapacitySchedule.nextDue(after: next, pane: pane).timeIntervalSince(next), 60, accuracy: 0.0001)
+        }
+        // 200 panes spread over the minute: no ten-second window holds more
+        // than a third of them (all in one second was the failure).
+        let phases = panes.map(RelayCapacitySchedule.phase(for:))
+        for window in stride(from: 0.0, to: 60.0, by: 10.0) {
+            XCTAssertLessThan(phases.filter { $0 >= window && $0 < window + 10 }.count, 67)
+        }
+    }
 }
 
 @MainActor private final class CapacityCardExecutor: RelayAssistantActionExecutor {

@@ -479,6 +479,31 @@ struct RelayCapacityActionReceipts {
     func result(for requestID: UUID) -> [String: String]? { entries[requestID]?.result }
 }
 
+/// When each pane's once-a-minute capacity check runs. Every check makes the
+/// pane's node read native session evidence, and that node also carries the
+/// pane's terminal stream; checking every pane in the same second made each
+/// node busy for seconds at a time. Each pane keeps a fixed offset within the
+/// minute instead, so the checks are spread evenly.
+enum RelayCapacitySchedule {
+    static let interval: TimeInterval = 60
+
+    /// A stable offset in [0, interval) from the pane's identity.
+    static func phase(for pane: UUID) -> TimeInterval {
+        let bytes = pane.uuid
+        let value = [bytes.8, bytes.9, bytes.10, bytes.11, bytes.12, bytes.13, bytes.14, bytes.15]
+            .reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        return TimeInterval(value % 60_000) / 1_000
+    }
+
+    /// The pane's next slot strictly after `now`.
+    static func nextDue(after now: Date, pane: UUID) -> Date {
+        let phase = phase(for: pane)
+        let seconds = now.timeIntervalSinceReferenceDate
+        let slot = (((seconds - phase) / interval).rounded(.down) + 1) * interval + phase
+        return Date(timeIntervalSinceReferenceDate: slot)
+    }
+}
+
 @MainActor final class RelayCapacityManagementCoordinator {
     static let shared = RelayCapacityManagementCoordinator()
     private(set) var statuses: [UUID: RelayCapacityManagement.Status] = [:]
@@ -498,8 +523,13 @@ struct RelayCapacityActionReceipts {
     func tick(_ workspace: WorkspaceModel, now: Date) {
         guard !RelayLaunchMode.isRunningTests else { return }
         for pane in workspace.panes.values where pane.contentKind == .terminal && pane.profile.backend == .relay && pane.connectionState == .connected {
+            // A pane created now registers at once; a restored pane waits
+            // for its own slot, so a launch does not check every pane at once.
+            if due[pane.id] == nil, !newPanes.contains(pane.id) {
+                due[pane.id] = RelayCapacitySchedule.nextDue(after: now, pane: pane.id)
+            }
             guard tasks[pane.id] == nil, now >= due[pane.id, default: .distantPast] else { continue }
-            let id = pane.id; due[id] = now.addingTimeInterval(60)
+            let id = pane.id; due[id] = RelayCapacitySchedule.nextDue(after: now, pane: id)
             tasks[id] = Task { @MainActor [weak self, weak pane, weak workspace] in
                 guard let self, let pane else { return }; defer { self.tasks.removeValue(forKey: id) }
                 await self.evaluate(pane, workspace: workspace, now: now)
