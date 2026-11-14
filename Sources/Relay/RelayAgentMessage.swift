@@ -16,6 +16,11 @@ struct RelayAgentMessageView: View {
     var live = false
 
     var body: some View {
+        // Web links in a conversation open in Relay's browser for this pane's host.
+        content.environment(\.openURL, OpenURLAction { url in RelayAgentLinks.open(url, pane: pane) ? .handled : .systemAction })
+    }
+
+    @ViewBuilder private var content: some View {
         switch item.role {
         case .user:
             VStack(alignment: .trailing, spacing: RelayAgentDesign.blockSpacing) {
@@ -93,6 +98,21 @@ struct RelayAgentMessageView: View {
             case .artifact(let id, _): return id
             }
         }.joined(separator: "\n\n")
+    }
+}
+
+/// Where a link clicked in an agent conversation opens.
+enum RelayAgentLinks {
+    static func isWeb(_ url: URL) -> Bool { ["http", "https"].contains(url.scheme?.lowercased() ?? "") }
+
+    /// True when Relay's browser took the link; anything else goes to the system.
+    @discardableResult @MainActor static func open(_ url: URL, pane: PaneModel,
+                                browser: (URL, ConnectionProfile, String?) -> Void = { url, profile, directory in
+                                    RelayBrowserController.shared.open(url, profile: profile, directory: directory, near: NSApp?.keyWindow)
+                                }) -> Bool {
+        guard isWeb(url) else { return false }
+        browser(url, pane.profile, pane.directory)
+        return true
     }
 }
 
@@ -412,6 +432,7 @@ struct RelayAgentRichMessage: NSViewRepresentable {
         let web = WKWebView(frame: .zero, configuration: configuration)
         web.underPageBackgroundColor = NSColor(calibratedWhite: 0.106, alpha: 1)
         web.navigationDelegate = context.coordinator; context.coordinator.source = source
+        context.coordinator.openURL = context.environment.openURL
         if let root = RelayResources.bundle?.url(forResource: "RichContent", withExtension: nil) {
             let page = root.appendingPathComponent("viewer/index.html"); context.coordinator.page = page
             web.loadFileURL(page, allowingReadAccessTo: root)
@@ -419,6 +440,7 @@ struct RelayAgentRichMessage: NSViewRepresentable {
         return web
     }
     func updateNSView(_ view: WKWebView, context: Context) {
+        context.coordinator.openURL = context.environment.openURL
         guard context.coordinator.source != source else { return }
         context.coordinator.source = source; context.coordinator.render(view)
     }
@@ -430,6 +452,7 @@ struct RelayAgentRichMessage: NSViewRepresentable {
         var source = ""
         var page: URL?
         var ready = false
+        var openURL: OpenURLAction?
         let height: Binding<CGFloat>
         init(height: Binding<CGFloat>) { self.height = height }
         func render(_ web: WKWebView) {
@@ -441,7 +464,9 @@ struct RelayAgentRichMessage: NSViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { ready = true; render(webView) }
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
             if navigationAction.request.url == page && navigationAction.navigationType == .other { return .allow }
-            if navigationAction.navigationType == .linkActivated, let url = navigationAction.request.url, ["https", "http"].contains(url.scheme) { NSWorkspace.shared.open(url) }
+            if navigationAction.navigationType == .linkActivated, let url = navigationAction.request.url, ["https", "http"].contains(url.scheme) {
+                if let openURL { openURL(url) } else { NSWorkspace.shared.open(url) }
+            }
             return .cancel
         }
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {

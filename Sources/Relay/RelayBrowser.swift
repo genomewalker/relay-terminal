@@ -104,11 +104,11 @@ enum RelayBrowserRouting {
         return !remote || !RelayBrowserRouting.isLoopback(url)
     }
 
-    init(profile: ConnectionProfile, directory: String?) {
+    init(profile: ConnectionProfile, directory: String?, store: WKWebsiteDataStore? = nil) {
         self.profile = profile
         self.directory = directory.flatMap { $0.hasPrefix("/") ? $0 : nil } ?? "/"
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
+        configuration.websiteDataStore = store ?? WKWebsiteDataStore(forIdentifier: Self.storeIdentifier(profile))
         configuration.userContentController = WKUserContentController()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         webView = WKWebView(frame: .zero, configuration: configuration)
@@ -124,6 +124,14 @@ enum RelayBrowserRouting {
             },
         ]
         if remote { updateGuard() }
+    }
+
+    /// Logins and site data are kept per host: everything opened for This Mac
+    /// shares one store, and each remote host has its own, so a remote host's
+    /// pages never see This Mac's sign-ins or another host's.
+    static let localStore = UUID(uuidString: "5E1A7B0C-0000-4000-8000-000000000001")!
+    static func storeIdentifier(_ profile: ConnectionProfile) -> UUID {
+        profile.kind == .local ? localStore : profile.id
     }
 
     func update(directory: String?) {
@@ -319,6 +327,11 @@ enum RelayBrowserRouting {
         }
         if takeFocus { entry.panel.makeKeyAndOrderFront(nil) } else { entry.panel.orderFront(nil) }
         if let url { entry.session.open(url) }
+    }
+
+    /// The session of a panel that is open now; a closed panel's page is gone.
+    func existing(_ key: String) -> RelayBrowserSession? {
+        panels[key].flatMap { $0.panel.isVisible ? $0.session : nil }
     }
 
     func windowWillClose(_ notification: Notification) {

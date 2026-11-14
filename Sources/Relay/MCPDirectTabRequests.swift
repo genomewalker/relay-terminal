@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// The direct (pre-granted) MCP tab endpoints: `relay_tab_action` and
@@ -8,12 +9,12 @@ import Foundation
 @MainActor final class MCPDirectTabRequests {
     /// The one capability each endpoint requires.
     enum Endpoint: CaseIterable {
-        case tabAction, newLocalTab, stackPane, newStackedPane, renamePane, show
+        case tabAction, newLocalTab, stackPane, newStackedPane, renamePane, show, browser
         /// Every capability the endpoint requires; all must be permitted.
         var capabilities: Set<MCPWorkspaceCapability> {
             switch self {
             case .tabAction, .stackPane, .renamePane: [.layout]
-            case .show: [.navigate]
+            case .show, .browser: [.navigate]
             case .newLocalTab: [.create]
             case .newStackedPane: [.create, .layout]
             }
@@ -97,6 +98,98 @@ import Foundation
         renameRequests[proposal.requestID] = proposal
         renameResults[proposal.requestID] = result
         return .json(result)
+    }
+
+    struct BrowserProposal: Codable, Equatable {
+        let instance: UUID
+        let requestID: UUID
+        let paneID: UUID
+        let action: RelayBrowserAgentAction
+        var url: String?
+        var ref: Int?
+        var text: String?
+        var submit: Bool?
+        var key: String?
+        var dy: Int?
+        static let keys: Set<String> = ["instance", "requestID", "paneID", "action", "url", "ref", "text", "submit", "key", "dy"]
+
+        /// The argument each action needs, and nothing it cannot use.
+        var isValid: Bool {
+            let refOK = ref.map { (1...RelayBrowserAgentScripts.elementLimit).contains($0) } ?? false
+            switch action {
+            case .open:
+                return url.flatMap(RelayQuickLookLinks.target(fromAgentItem:)).map { if case .web = $0 { true } else { false } } ?? false
+            case .click: return refOK
+            case .type:
+                guard refOK, let text, text.count <= 4096 else { return false }
+                return !text.unicodeScalars.contains { ($0.value < 32 && $0 != "\n" && $0 != "\t") || $0.value == 127 }
+            case .press: return key.map(RelayBrowserAgentScripts.keys.contains) ?? false
+            case .scroll: return dy.map { (-50_000...50_000).contains($0) } ?? false
+            case .read, .back, .forward, .reload, .capture: return true
+            }
+        }
+    }
+    struct BrowserResponse: Codable, Equatable {
+        let status: String
+        let action: String
+        let paneID: String
+        let page: RelayBrowserAgentPage
+        var image: String?
+        var mimeType: String?
+        enum CodingKeys: String, CodingKey { case status, action, paneID, page, image, mimeType = "mime_type" }
+    }
+    private var browserRequests: [UUID: BrowserProposal] = [:]
+    private var browserResults: [UUID: BrowserResponse] = [:]
+
+    /// `relay_browser`: lets an agent use Relay's browser for one pane's host.
+    /// Reading and capture need the navigate grant; anything that changes the
+    /// page also needs the input grant. Page-changing requests are idempotent.
+    func browser(_ body: Data, instance: UUID, permits: (MCPWorkspaceCapability) -> Bool, workspace: WorkspaceModel,
+                 perform: (PaneModel, BrowserProposal) async throws -> (page: RelayBrowserAgentPage, capture: Data?) = { pane, proposal in
+                     try await RelayBrowserController.shared.agent(
+                         proposal.action, profile: pane.profile, directory: pane.directory, near: NSApp?.mainWindow,
+                         url: proposal.url.flatMap(RelayQuickLookLinks.target(fromAgentItem:)).flatMap { if case .web(let url) = $0 { url } else { nil } },
+                         ref: proposal.ref, text: proposal.text, submit: proposal.submit ?? false, key: proposal.key, dy: proposal.dy)
+                 }) async -> RelaySidePanelHTTPResponse {
+        guard Endpoint.browser.capabilities.allSatisfy(permits) else {
+            return .text("MCP workspace navigate capability is not granted", status: 403, reason: "Forbidden")
+        }
+        guard body.count <= 16384, (try? RelayCapacityJSON.validate(body)) != nil,
+              let fields = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(fields.keys).isSubset(of: BrowserProposal.keys),
+              let proposal = try? JSONDecoder().decode(BrowserProposal.self, from: body),
+              proposal.instance == instance, proposal.isValid else {
+            return .text("Invalid or stale browser request", status: 400, reason: "Bad Request")
+        }
+        if proposal.action.changesPage, !permits(.input) {
+            return .text("MCP terminal input capability is not granted", status: 403, reason: "Forbidden")
+        }
+        if let old = browserRequests[proposal.requestID] {
+            guard old == proposal, let result = browserResults[proposal.requestID] else {
+                return .text(old == proposal ? "Browser request still in progress" : "Conflicting browser request ID",
+                             status: 409, reason: "Conflict")
+            }
+            return .json(result)
+        }
+        guard browserRequests.count < receiptLimit, let pane = workspace.panes[proposal.paneID] else {
+            return .text("Pane unavailable or browser receipt limit reached", status: 409, reason: "Conflict")
+        }
+        // Reading repeats freely; a page change is claimed before it starts.
+        if proposal.action.changesPage { browserRequests[proposal.requestID] = proposal }
+        do {
+            let (page, capture) = try await perform(pane, proposal)
+            let response = BrowserResponse(status: "ok", action: proposal.action.rawValue,
+                                           paneID: proposal.paneID.uuidString.lowercased(), page: page,
+                                           image: capture?.base64EncodedString(), mimeType: capture == nil ? nil : "image/png")
+            if proposal.action.changesPage { browserResults[proposal.requestID] = response }
+            return .json(response)
+        } catch {
+            if proposal.action.changesPage {
+                browserResults[proposal.requestID] = nil
+                browserRequests[proposal.requestID] = nil  // nothing ran, or the page refused it
+            }
+            return .text(error.localizedDescription, status: 409, reason: "Conflict")
+        }
     }
 
     /// `relay_show`: displays files or a page for one pane; takes no other action.

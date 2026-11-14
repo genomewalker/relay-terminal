@@ -392,6 +392,15 @@ func (b *Bridge) route(r *http.Request, caller string) (int, []byte, error) {
 		if !allowed[lower(proposal["paneID"])] {
 			return deny("Pane is outside this bridge scope")
 		}
+	case method == "POST" && path == "/api/workspace/browser":
+		// A remote agent uses the browser only for its own host's panes.
+		raw, proposal, e = body(r, 16384, "Bounded browser request required")
+		if e != nil {
+			return 0, nil, e
+		}
+		if !allowed[lower(proposal["paneID"])] {
+			return deny("Pane is outside this bridge scope")
+		}
 	case method == "POST" && path == "/api/workspace/tab-action":
 		raw, proposal, e = body(r, 4096, "Bounded request required")
 		if e != nil {
