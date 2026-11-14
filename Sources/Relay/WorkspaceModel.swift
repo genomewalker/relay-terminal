@@ -2995,6 +2995,11 @@ final class WorkspaceModel: ObservableObject {
     /// bounded recovery task can steal first responder after the user clicks a
     /// different pane, making typing and Command-C/V appear intermittently
     /// broken in Codex and Claude.
+    /// Quick Look every link and path visible in the active pane.
+    func quickLookVisibleLinks() {
+        if activePane?.runtime.quickLookVisibleLinks() != true { NSSound.beep() }
+    }
+
     func updateTerminalFocusOwnership() {
         for (id, pane) in panes {
             pane.runtime.setTransportFocused(id == activePaneID)

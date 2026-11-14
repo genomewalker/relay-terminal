@@ -37,6 +37,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
     case saveWorkspaceView
     case openWorkspaceView
     case recentPlaces
+    case quickLookVisible
 
     var id: String { rawValue }
 
@@ -76,6 +77,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .saveWorkspaceView: "Save current view"
         case .openWorkspaceView: "Open saved view"
         case .recentPlaces: "Recent places"
+        case .quickLookVisible: "Quick Look visible links"
         }
     }
 
@@ -89,7 +91,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .toggleSidebar, .agentActivity: "Workspace"
         case .workspaceOverview, .workspaceBack, .workspaceForward, .workspaceUp,
              .saveWorkspaceView, .openWorkspaceView: "Workspace"
-        case .stackPane, .unstackPane, .previousStackPane, .nextStackPane, .recentPlaces: "Panes"
+        case .stackPane, .unstackPane, .previousStackPane, .nextStackPane, .recentPlaces, .quickLookVisible: "Panes"
         }
     }
 
@@ -130,6 +132,7 @@ enum RelayCommand: String, CaseIterable, Identifiable, Codable, Sendable {
         case .openWorkspaceView: .init("o", command: true, control: true, shift: true)
         // Held like ⌘Tab: tap to move, release the modifier to go.
         case .recentPlaces: .init("tab", control: true)
+        case .quickLookVisible: .init("y", command: true)
         }
     }
 }

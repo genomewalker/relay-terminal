@@ -46,6 +46,38 @@ enum RelayHostFiles {
             failure: "Log changed or transfer was incomplete")
         return RelayLogTail(bytes: bytes, totalBytes: size)
     }
+    /// Quick Look reads whole files up to this size.
+    static let previewMaxBytes = 32 << 20
+
+    /// A whole remote file for Quick Look. "~/" and relative paths are
+    /// resolved by the host (relative ones against `cwd`). Every chunk is
+    /// verified against the version and size from one stat.
+    static func file(path: String, cwd: String?, profile: ConnectionProfile,
+                     maxBytes: Int = previewMaxBytes) async throws -> Data {
+        let context = RelayExecutionContext(profile: profile, directory: cwd ?? "/")
+        let stat = try await request(context: context, fields: ["operation": "file_stat", "path": path])
+        let (size, version) = try previewable(stat: stat, maxBytes: maxBytes)
+        guard size > 0 else { return Data() }
+        return try await read(context: context, path: path, version: version, from: 0, to: size,
+            failure: "File changed or transfer was incomplete")
+    }
+
+    /// The size and version of a stat result Quick Look may read.
+    static func previewable(stat: [String: Any], maxBytes: Int) throws -> (size: Int, version: String) {
+        if stat["directory"] as? Bool == true {
+            throw RemoteCatalogError.failed("Folders on a remote host can't be previewed")
+        }
+        guard let size = stat["size"] as? Int, size >= 0, let version = stat["version"] as? String,
+              stat["directory"] as? Bool == false else {
+            throw RemoteCatalogError.failed("Not a regular file")
+        }
+        guard size <= maxBytes else {
+            throw RemoteCatalogError.failed("File is \(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)); "
+                + "Quick Look reads remote files up to \(ByteCountFormatter.string(fromByteCount: Int64(maxBytes), countStyle: .file))")
+        }
+        return (size, version)
+    }
+
     private static func read(context: RelayExecutionContext, path: String, version: String, from start: Int, to size: Int,
                              failure: String) async throws -> Data {
         var bytes = Data(), offset = start

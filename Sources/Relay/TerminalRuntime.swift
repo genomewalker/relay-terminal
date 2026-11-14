@@ -3961,6 +3961,53 @@ final class TerminalRuntime: NSObject {
         return openTerminalLink(hoveredLink)
     }
 
+    /// Files of a local pane are read on this Mac; a relayd pane's from its
+    /// host. Other remote panes preview URLs only.
+    private var quickLookLocation: RelayQuickLookLocation {
+        guard let pane else { return .unreadable }
+        if pane.profile.kind == .local { return .local(cwd: pane.directory) }
+        if pane.profile.backend == .relay { return .remote(pane.profile, cwd: pane.directory) }
+        return .unreadable
+    }
+
+    /// Command-Y: every link and path on screen, from the top.
+    @discardableResult
+    func quickLookVisibleLinks() -> Bool {
+        presentQuickLook(RelayQuickLookLinks.extract(text: sidePanelViewportText() ?? ""), start: nil)
+    }
+
+    /// Shift-Command-click: the link Ghostty reports under the pointer, else
+    /// the word in the clicked cell. The other items on screen follow it.
+    fileprivate func quickLook(row: Int?, column: Int?) -> Bool {
+        let text = sidePanelViewportText() ?? ""
+        var clicked = hoveredLink.flatMap(RelayQuickLookLinks.target(fromLink:))
+        if clicked == nil, let row, let column {
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            if lines.indices.contains(row) { clicked = RelayQuickLookLinks.target(in: String(lines[row]), column: column) }
+        }
+        guard let clicked else { return false }
+        var targets = RelayQuickLookLinks.extract(text: text)
+        if !targets.contains(clicked) { targets.insert(clicked, at: 0) }
+        return presentQuickLook(targets, start: clicked)
+    }
+
+    private func presentQuickLook(_ targets: [RelayQuickLookTarget], start: RelayQuickLookTarget?) -> Bool {
+        let location = quickLookLocation
+        var items: [RelayQuickLookItem] = []
+        var startIndex: Int?
+        for target in targets {
+            guard let item = RelayQuickLookItem.resolve(target, location: location) else { continue }
+            if target == start { startIndex = items.count }
+            items.append(item)
+        }
+        // A clicked path that cannot be resolved here is not replaced by another item.
+        guard !items.isEmpty, start == nil || startIndex != nil else { return false }
+        RelayQuickLookController.shared.present(items, start: startIndex ?? 0, returnFocus: view) { [weak self] link in
+            _ = self?.openTerminalLink(link)
+        }
+        return true
+    }
+
     fileprivate var allowsPromptSelectionEditing: Bool {
         guard let pane else { return false }
         return TerminalPromptSelectionEdit.isEnabled(
@@ -7665,7 +7712,17 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         let pendingLocalDown = pendingLocalSelectionMouseDown
         let completedLocalDrag = localSelectionDidDrag
         var handledLocalSelectionClick = false
-        if forcedLocalSelection {
+        // Shift-Command-click previews the link instead of selecting text or
+        // reaching the remote program.
+        let quickLookClick = forcedLocalSelection && !completedLocalDrag &&
+            pendingLocalDown.map {
+                $0.clickCount == 1 &&
+                    $0.modifierFlags.intersection([.command, .option, .control, .shift]) == [.command, .shift]
+            } == true &&
+            pointerStart.map { hypot(end.x - $0.x, end.y - $0.y) < 4 } == true
+        if quickLookClick {
+            // Handled below, after the gesture state is cleared.
+        } else if forcedLocalSelection {
             if completedLocalDrag {
                 super.mouseUp(with: localSelectionEvent(from: event, clickCount: 1) ?? event)
             } else if let pendingLocalDown,
@@ -7689,6 +7746,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         forcingLocalSelectionGesture = false
         pendingLocalSelectionMouseDown = nil
         localSelectionDidDrag = false
+        if quickLookClick {
+            let cell = quickLookCell(at: end)
+            if owner?.quickLook(row: cell?.row, column: cell?.column) != true { NSSound.beep() }
+            return
+        }
         if handledLocalSelectionClick {
             // Read Ghostty's selection directly, without touching the clipboard.
             // Only a range proven against the live logical input may be edited.
@@ -9779,6 +9841,14 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             cellSize: cellSize,
             columns: columns
         )
+    }
+
+    /// The viewport cell under a terminal point (top-left origin).
+    private func quickLookCell(at point: CGPoint) -> (row: Int, column: Int)? {
+        guard let geometry = activeCursorGeometry() else { return nil }
+        let column = Int(floor((point.x - geometry.gridOrigin.x) / geometry.cellSize.width))
+        let row = Int(floor((point.y - geometry.gridOrigin.y) / geometry.cellSize.height))
+        return row >= 0 && column >= 0 ? (row, column) : nil
     }
 
     private func fallbackCellSize() -> CGSize {
