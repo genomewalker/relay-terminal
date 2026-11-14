@@ -150,7 +150,7 @@ import Foundation
     /// Reading and capture need the navigate grant; anything that changes the
     /// page also needs the input grant. Page-changing requests are idempotent.
     func browser(_ body: Data, instance: UUID, permits: (MCPWorkspaceCapability) -> Bool, workspace: WorkspaceModel,
-                 perform: (WorkspaceModel, PaneModel, BrowserProposal) async throws -> (page: RelayBrowserAgentPage, capture: Data?) = { workspace, pane, proposal in
+                 perform: @MainActor (WorkspaceModel, PaneModel, BrowserProposal) async throws -> (page: RelayBrowserAgentPage, capture: Data?) = { workspace, pane, proposal in
                      // A browser pane stacked with this pane is the one the agent uses;
                      // otherwise the host's floating browser.
                      var docked = workspace.stackedBrowserPane(for: pane.id)?.browserSession

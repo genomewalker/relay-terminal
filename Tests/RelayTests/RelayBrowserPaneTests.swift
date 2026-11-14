@@ -52,6 +52,28 @@ import Testing
         #expect(throws: (any Error).self) { try workspace.newBrowserPane(onto: browser.id, url: nil) } // not onto itself
     }
 
+    /// WebKit aborts the app when a web view is first made off the main
+    /// thread; 0.5.87 crashed this way on its first stacked browser, from the
+    /// default action handler. This uses that handler, on a closed port.
+    @Test func theDefaultHandlerMakesTheStackedBrowserOnTheMainThread() async throws {
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let anchor = try #require(workspace.activePaneID)
+        let instance = UUID()
+        let proposal = MCPDirectTabRequests.BrowserProposal(instance: instance, requestID: UUID(), paneID: anchor, action: .open,
+                                                           url: "http://127.0.0.1:9/", placement: "stack")
+        let handler = MCPDirectTabRequests()
+        let refused = await handler.browser(try JSONEncoder().encode(proposal), instance: instance,
+                                            permits: { $0 != .create }, workspace: workspace)
+        #expect(refused.status == 403)
+        #expect(workspace.stackedBrowserPane(for: anchor) == nil)
+        let response = await handler.browser(try JSONEncoder().encode(proposal), instance: instance,
+                                             permits: { _ in true }, workspace: workspace)
+        #expect(response.status == 200)
+        let browser = try #require(workspace.stackedBrowserPane(for: anchor))
+        browser.browserSession.close()
+    }
+
     @Test func stackPlacementIsOnlyForOpen() {
         func proposal(_ action: RelayBrowserAgentAction, placement: String?) -> MCPDirectTabRequests.BrowserProposal {
             MCPDirectTabRequests.BrowserProposal(instance: UUID(), requestID: UUID(), paneID: UUID(), action: action,
