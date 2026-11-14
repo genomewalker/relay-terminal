@@ -146,12 +146,23 @@ extension RelayBrowserSession {
     }
 
     /// Waits for a started navigation and any port being carried to finish.
+    /// A click's navigation can start after the click returns and reports its
+    /// new address before the new document exists, so this waits until the
+    /// loaded document is the one at the shown address and is complete.
     func settle(timeout: Duration = .seconds(10)) async {
         let clock = ContinuousClock(), deadline = clock.now + timeout
         try? await Task.sleep(for: .milliseconds(250))
-        while clock.now < deadline, confirm == nil, webView.isLoading || busy {
+        while clock.now < deadline, confirm == nil {
+            if !webView.isLoading, !busy, await documentMatchesAddress() { return }
             try? await Task.sleep(for: .milliseconds(100))
         }
+    }
+
+    private func documentMatchesAddress() async -> Bool {
+        guard let shown = webView.url?.absoluteString else { return true }
+        guard let state = try? await call("return [document.readyState, location.href]") as? [String],
+              state.count == 2 else { return false }
+        return state[0] == "complete" && (state[1] == shown || shown == "about:blank")
     }
 
     func agentPage() async -> RelayBrowserAgentPage {
