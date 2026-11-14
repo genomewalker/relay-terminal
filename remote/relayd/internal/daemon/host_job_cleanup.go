@@ -52,7 +52,10 @@ type HostJobCleanupResult struct {
 	CleanupInactive   bool     `json:"cleanup_inactive,omitempty"`
 	// CleanupOtherNode names the activation node when this daemon runs on
 	// another node sharing the state directory and therefore only archived.
-	CleanupOtherNode  string   `json:"cleanup_other_node,omitempty"`
+	CleanupOtherNode string `json:"cleanup_other_node,omitempty"`
+	// CleanupFallback is the warning when this daemon deleted because the
+	// activation node's daemon has stopped running cleanup passes.
+	CleanupFallback   string   `json:"cleanup_fallback,omitempty"`
 	Examined          int      `json:"examined"`
 	Eligible          int      `json:"eligible"`
 	BytesEligible     int64    `json:"bytes_eligible"`
@@ -251,8 +254,20 @@ func (s *Server) archiveAndCleanupHostJobsWith(retention HostJobRetention, now t
 	// A shared state directory is cleaned by one daemon: the one on the node
 	// that activated deletion. A daemon on another node may run an older
 	// release with older retention rules, so it only archives.
+	// If that node's daemon has stopped checking in (the node is gone or the
+	// name changed), this daemon cleans instead and says so on every pass.
+	fallback := ""
 	if err == nil && !hostJobActivationNodeIs(activation.Node, hostJobServerNode()) {
-		return HostJobCleanupResult{Archived: archived, CleanupOtherNode: activation.Node}, nil
+		active, markerErr := hostJobActivationNodeActive(s.stateDir, activation.Node, now)
+		if markerErr != nil {
+			return HostJobCleanupResult{Archived: archived}, markerErr
+		}
+		if active {
+			return HostJobCleanupResult{Archived: archived, CleanupOtherNode: activation.Node}, nil
+		}
+		fallback = fmt.Sprintf("activation node %s has not run a cleanup pass for %v; this node (%s) deletes instead. "+
+			"Run `relayd gc-host-jobs --activate` on the node that should clean to make it the cleaning node.",
+			activation.Node, hostJobActivationNodeStale, hostJobServerNode())
 	}
 	// The same local handshake as gc-host-jobs: every relayd on this node,
 	// this one included, must support tombstones and be registered.
@@ -266,6 +281,7 @@ func (s *Server) archiveAndCleanupHostJobsWith(retention HostJobRetention, now t
 	options := HostJobCleanupOptions{OlderThan: retention.Duration, Limit: hostJobCleanupDaemonMax, LiveServerPIDs: live}
 	result, err := cleanupArchivedHostJobsLocked(s.stateDir, s.hostJobTombstones(), options, now, nil)
 	result.Archived = archived
+	result.CleanupFallback = fallback
 	return result, err
 }
 
@@ -277,6 +293,9 @@ func (s *Server) SetHostJobPeerSockets(sockets []string) { s.hostJobPeerSockets 
 func recordHostJobCleanup(stateDir string, result HostJobCleanupResult, runErr error) {
 	for _, warning := range result.RetentionWarnings {
 		fmt.Fprintf(os.Stderr, "relay: host job cleanup warning: %s\n", warning)
+	}
+	if result.CleanupFallback != "" {
+		fmt.Fprintf(os.Stderr, "relay: host job cleanup warning: %s\n", result.CleanupFallback)
 	}
 	outcome := "ok"
 	if result.CleanupInactive {

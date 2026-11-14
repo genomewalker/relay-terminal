@@ -483,3 +483,26 @@ func hostJobActivationNodeIs(activationNode, node string) bool {
 	return (!strings.Contains(activationNode, ".") || !strings.Contains(node, ".")) &&
 		strings.EqualFold(short(activationNode), short(node))
 }
+
+// The activation node's daemon refreshes its marker on every hourly pass.
+// Three missed passes mean it is gone or its name changed.
+const hostJobActivationNodeStale = 3 * time.Hour
+
+// hostJobActivationNodeActive reports whether a daemon on the activation node
+// has refreshed its marker within hostJobActivationNodeStale.
+func hostJobActivationNodeActive(stateDir, activationNode string, now time.Time) (bool, error) {
+	markers, err := readHostJobServerMarkers(stateDir)
+	if err != nil {
+		return false, err
+	}
+	for _, marker := range markers {
+		if !hostJobActivationNodeIs(activationNode, marker.Node) {
+			continue
+		}
+		refreshed, err := time.Parse(time.RFC3339Nano, marker.RefreshedAt)
+		if err == nil && now.Sub(refreshed) < hostJobActivationNodeStale {
+			return true, nil
+		}
+	}
+	return false, nil
+}
