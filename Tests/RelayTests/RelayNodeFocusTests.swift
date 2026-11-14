@@ -10,6 +10,10 @@ private final class FocusFrameRecorder: RelayFrameWriting, @unchecked Sendable {
     private func append(_ type: RelayWireType, _ payload: Data) {
         lock.lock(); recorded.append(.init(type: type, payload: payload)); lock.unlock()
     }
+    func frames(of type: RelayWireType) -> [Data] {
+        lock.lock(); defer { lock.unlock() }
+        return recorded.filter { $0.type == type }.map(\.payload)
+    }
     /// The routes of each Focus frame sent, in order.
     var focusSends: [[String]] {
         lock.lock(); defer { lock.unlock() }
@@ -70,5 +74,20 @@ struct RelayNodeFocusTests {
         connection.receiveAttachedFrame(readyStatus(["node_mux_v1"]), generation: 1)
         a.setFocused(true)
         #expect(writer.focusSends.isEmpty)
+    }
+
+    @Test func appAdvertisesPingEchoAndAnswersNodePings() throws {
+        let caps = try #require((try? JSONSerialization.jsonObject(with: RelayNodeCapabilities.payload)) as? [String: Bool])
+        #expect(caps == ["wire_fragments": true, "node_ping_echo": true])
+        let writer = FocusFrameRecorder()
+        let connection = node(writer)
+        let a = add(connection, "focus-pane-a")
+        defer { a.close() }
+        connection.receiveAttachedFrame(readyStatus(["node_mux_v1"]), generation: 1)
+        let probe = Data([0, 0, 0, 0, 0, 0, 0, 7])
+        connection.receiveAttachedFrame(RelayWireFrame(type: .ping, payload: probe), generation: 1)
+        #expect(writer.frames(of: .pong) == [probe])
+        connection.receiveAttachedFrame(RelayWireFrame(type: .ping, payload: probe), generation: 0) // retired reader
+        #expect(writer.frames(of: .pong) == [probe])
     }
 }

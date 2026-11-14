@@ -64,7 +64,7 @@ struct RelayNodeChannelOwnershipTests {
         #expect(ready.wait(timeout: .now() + 2) == .success)
         channel.close()
         #expect(observations.frames.map(\.type) == [.capabilities])
-        #expect(observations.frames.first?.payload == Data("{\"wire_fragments\":true}".utf8))
+        #expect(observations.frames.first?.payload == RelayNodeCapabilities.payload)
     }
 
     @Test func retiredReaderCannotRouteIntoCurrentSubscription() throws {

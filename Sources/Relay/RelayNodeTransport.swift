@@ -96,6 +96,13 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
 
 enum RelayNodeTransportError: Error { case disconnected, invalidEnvelope }
 
+/// The Capabilities frame this app sends once the node is ready.
+enum RelayNodeCapabilities {
+    /// wire_fragments: large frames may be split. node_ping_echo: this app
+    /// answers relayd node's Pings, so the host measures the path's RTT.
+    static let payload = Data(#"{"wire_fragments":true,"node_ping_echo":true}"#.utf8)
+}
+
 /// The Focus frame relayd's node scheduler reads (node_focus_v1).
 enum RelayNodeFocus {
     /// relayd accepts at most this many routes; more rejects the frame.
@@ -973,7 +980,7 @@ final class RelayNodeConnection: @unchecked Sendable {
             // pane Hellos and host RPCs must use this connection's framing.
             if status.capabilities?.contains("wire_fragments_v1") == true {
                 do {
-                    try negotiatedWriter?.write(type: .capabilities, payload: Data("{\"wire_fragments\":true}".utf8))
+                    try negotiatedWriter?.write(type: .capabilities, payload: RelayNodeCapabilities.payload)
                     (negotiatedWriter as? RelayScheduledWireWriter)?.enableFragments()
                 } catch {
                     if negotiatedProcess?.isRunning == true { negotiatedProcess?.terminate() }
@@ -1011,6 +1018,15 @@ final class RelayNodeConnection: @unchecked Sendable {
             RelayDiagnostics.shared.record(category: "connection", name: "ready", details: [
                 "connection_id": diagnosticConnectionID,
             ])
+            return
+        }
+        // relayd node measures the path to this app with its own Pings
+        // (node_ping_echo); answer each at once with the same payload.
+        if frame.type == .ping {
+            lock.lock()
+            let echoWriter = generation == currentGeneration && !stopped ? writer : nil
+            lock.unlock()
+            echoWriter?.writeAsync(type: .pong, payload: frame.payload)
             return
         }
         if frame.type == .pong, frame.payload.count == 8 {

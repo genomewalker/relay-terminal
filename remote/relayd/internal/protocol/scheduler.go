@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 )
 
 const maxQueuedBytes = 32 << 20
@@ -34,6 +35,35 @@ type frameScheduler struct {
 	nextMessageID uint64
 	// focus holds the scheduling keys ("pane:<route>") of the focused pane.
 	focus map[string]bool
+	// path is relayd node's latest view of the link to the app.
+	path PathQuality
+}
+
+// PathQuality is the round trip relayd node measured to the app (step 2).
+type PathQuality struct {
+	LastRTT, MinRTT, SmoothedRTT time.Duration
+	Samples, Lost                uint64
+	At                           time.Time
+}
+
+// SetPathQuality records relayd node's latest path measurement.
+func (writer *Writer) SetPathQuality(quality PathQuality) {
+	if writer.scheduler == nil {
+		return
+	}
+	writer.scheduler.mu.Lock()
+	writer.scheduler.path = quality
+	writer.scheduler.mu.Unlock()
+}
+
+// PathQuality returns the latest path measurement, zero when none arrived.
+func (writer *Writer) PathQuality() PathQuality {
+	if writer.scheduler == nil {
+		return PathQuality{}
+	}
+	writer.scheduler.mu.Lock()
+	defer writer.scheduler.mu.Unlock()
+	return writer.scheduler.path
 }
 
 // NewScheduledWriter leaves the wire format untouched. Only independent route

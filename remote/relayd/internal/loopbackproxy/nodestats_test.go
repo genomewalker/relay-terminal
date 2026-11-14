@@ -147,6 +147,13 @@ func TestNodeMuxMeasuresOnlyWithEchoCapability(t *testing.T) {
 				if frame, err := protocol.ReadFrame(client); err == nil {
 					t.Fatal("mux sent a frame to an app without node_ping_echo", frame.Type)
 				}
+				select {
+				case frame, ok := <-daemonFrames:
+					if ok && frame.Type == protocol.Quality {
+						t.Fatal("quality sent without any RTT sample")
+					}
+				default:
+				}
 				return
 			}
 			ping, err := protocol.ReadFrame(client)
@@ -160,13 +167,27 @@ func TestNodeMuxMeasuresOnlyWithEchoCapability(t *testing.T) {
 			if err := writer.Write(protocol.Frame{Type: protocol.Pong, Payload: unmatched}); err != nil {
 				t.Fatal(err)
 			}
-			select {
-			case frame := <-daemonFrames:
-				if frame.Type != protocol.Pong || string(frame.Payload) != string(unmatched) {
-					t.Fatal("daemon got the mux's own echo or something else", frame)
+			// The daemon also receives the node's path summary (Quality)
+			// after the echo; every other frame must be the unmatched Pong.
+			var quality *NodeQuality
+			for gotPong := false; !gotPong || quality == nil; {
+				select {
+				case frame := <-daemonFrames:
+					switch {
+					case frame.Type == protocol.Quality:
+						var q NodeQuality
+						if json.Unmarshal(frame.Payload, &q) != nil || q.RTTSamples < 1 {
+							t.Fatal("bad quality frame", string(frame.Payload))
+						}
+						quality = &q
+					case frame.Type == protocol.Pong && string(frame.Payload) == string(unmatched):
+						gotPong = true
+					default:
+						t.Fatal("daemon got the mux's own echo or something else", frame)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("unmatched Pong or path quality was not forwarded", gotPong, quality)
 				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("unmatched Pong was not forwarded")
 			}
 			// Keep answering so the client side never blocks, until a snapshot shows the sample.
 			go func() {
@@ -232,5 +253,25 @@ func TestNodeMuxRemovesSnapshotBeforeReturningOnEOF(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("snapshot left behind after EOF", err)
+	}
+}
+
+// A path summary goes upstream once per new RTT sample, never before one.
+func TestNodeQualityFollowsNewSamples(t *testing.T) {
+	clock := time.Unix(1000, 0)
+	stats := newNodeStats(func() time.Time { return clock })
+	if _, _, ok := stats.qualityFrame(0); ok {
+		t.Fatal("quality without a sample")
+	}
+	ping, _ := stats.pingFrame()
+	clock = clock.Add(40 * time.Millisecond)
+	stats.pong(ping.Payload)
+	frame, reported, ok := stats.qualityFrame(0)
+	var q NodeQuality
+	if !ok || reported != 1 || frame.Type != protocol.Quality || json.Unmarshal(frame.Payload, &q) != nil || q.RTTLastMs != 40 || q.RTTMinMs != 40 {
+		t.Fatalf("quality %v %d %+v", ok, reported, q)
+	}
+	if _, _, ok := stats.qualityFrame(reported); ok {
+		t.Fatal("same sample reported twice")
 	}
 }

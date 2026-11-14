@@ -50,7 +50,7 @@ func RelayNodeWithHostRequestHandlers(ctx context.Context, input io.Reader, outp
 	statsDone := make(chan struct{})
 	go func() {
 		defer close(statsDone)
-		runNodeStats(ctx, stats, clientWriter, measuring)
+		runNodeStats(ctx, stats, clientWriter, upstreamWriter, measuring)
 	}()
 	// The node process exits as soon as this returns (stdin EOF included), so
 	// wait for the stats loop to remove its snapshot file first.

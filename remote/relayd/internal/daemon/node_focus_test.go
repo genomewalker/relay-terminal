@@ -66,3 +66,45 @@ func TestNodeMultiplexAcceptsFocusFrames(t *testing.T) {
 		}
 	}
 }
+
+func TestPathQualityPayloadIsBounded(t *testing.T) {
+	now := time.Unix(2000, 0)
+	q, ok := ParsePathQuality([]byte(`{"rtt_last_ms":42.5,"rtt_min_ms":30,"rtt_smoothed_ms":40,"rtt_samples":3,"rtt_lost":1}`), now)
+	if !ok || q.LastRTT != 42500*time.Microsecond || q.MinRTT != 30*time.Millisecond || q.Samples != 3 || q.Lost != 1 || !q.At.Equal(now) {
+		t.Fatalf("parsed %+v %v", q, ok)
+	}
+	for _, bad := range []string{`{"rtt_samples":0}`, `{"rtt_last_ms":-1,"rtt_samples":1}`, `{"rtt_last_ms":1e12,"rtt_samples":1}`, `nope`} {
+		if _, ok := ParsePathQuality([]byte(bad), now); ok {
+			t.Errorf("accepted %s", bad)
+		}
+	}
+}
+
+// The daemon advertises node_quality_v1 and records relayd node's Quality
+// frame on that connection's writer; the connection stays up.
+func TestNodeMultiplexRecordsPathQuality(t *testing.T) {
+	client, serverConnection := net.Pipe()
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(3 * time.Second))
+	server := NewServer()
+	go server.serveConnection(serverConnection)
+	writer := protocol.NewWriter(client)
+	hello, _ := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{Version: 1, NodeMux: true})
+	if err := writer.Write(hello); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := protocol.ReadFrame(client)
+	var status protocol.StatusPayload
+	if err != nil || protocol.DecodeJSON(ready, &status) != nil || !containsCapability(status.Capabilities, "node_quality_v1") {
+		t.Fatalf("no node_quality_v1: %#v %v", status.Capabilities, err)
+	}
+	if err := writer.Write(protocol.Frame{Type: protocol.Quality, Payload: []byte(`{"rtt_last_ms":12,"rtt_min_ms":10,"rtt_smoothed_ms":11,"rtt_samples":2}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Write(protocol.Frame{Type: protocol.Ping, Payload: []byte("after-quality")}); err != nil {
+		t.Fatal(err)
+	}
+	if pong, err := protocol.ReadFrame(client); err != nil || pong.Type != protocol.Pong {
+		t.Fatalf("quality frame disturbed the connection: %#v %v", pong, err)
+	}
+}

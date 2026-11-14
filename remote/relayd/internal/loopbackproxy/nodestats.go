@@ -158,6 +158,34 @@ func (s *nodeStats) pong(payload []byte) bool {
 	return true
 }
 
+// NodeQuality is the path summary relayd node sends upstream to the daemon
+// (protocol.Quality) after each new RTT sample.
+type NodeQuality struct {
+	RTTLastMs      float64 `json:"rtt_last_ms"`
+	RTTMinMs       float64 `json:"rtt_min_ms"`
+	RTTSmoothedMs  float64 `json:"rtt_smoothed_ms"`
+	RTTVariationMs float64 `json:"rtt_variation_ms"`
+	RTTSamples     uint64  `json:"rtt_samples"`
+	RTTLost        uint64  `json:"rtt_lost"`
+	BytesWritten   uint64  `json:"bytes_written_total"`
+	WriteBlockedMs float64 `json:"write_blocked_ms_total"`
+}
+
+// qualityFrame returns the path summary when an RTT sample arrived since
+// sentSamples, without closing the snapshot's rate window.
+func (s *nodeStats) qualityFrame(sentSamples uint64) (protocol.Frame, uint64, bool) {
+	s.mu.Lock()
+	quality := NodeQuality{RTTLastMs: s.rtt.LastMs, RTTMinMs: s.rtt.MinMs, RTTSmoothedMs: s.rtt.SmoothedMs,
+		RTTVariationMs: s.rtt.VariationMs, RTTSamples: s.rtt.Samples, RTTLost: s.rtt.Lost,
+		BytesWritten: s.drain.BytesWritten, WriteBlockedMs: float64(s.blocked) / float64(time.Millisecond)}
+	s.mu.Unlock()
+	if quality.RTTSamples == sentSamples {
+		return protocol.Frame{}, sentSamples, false
+	}
+	frame, err := protocol.JSONFrame(protocol.Quality, quality)
+	return frame, quality.RTTSamples, err == nil
+}
+
 func (s *nodeStats) enableRTT() {
 	s.mu.Lock()
 	s.rtt.Enabled = true
@@ -250,7 +278,10 @@ var (
 // runNodeStats starts after the app's first frame, so a heartbeat never
 // precedes the app's own handshake. Pings go out only after the app has
 // advertised node_ping_echo.
-func runNodeStats(ctx context.Context, stats *nodeStats, client *protocol.Writer, measuring <-chan struct{}) {
+//
+// After each new RTT sample the path summary goes upstream, so the daemon
+// that schedules pane output sees the same measurements (step 2).
+func runNodeStats(ctx context.Context, stats *nodeStats, client, upstream *protocol.Writer, measuring <-chan struct{}) {
 	select {
 	case <-measuring:
 	case <-ctx.Done():
@@ -265,12 +296,19 @@ func runNodeStats(ctx context.Context, stats *nodeStats, client *protocol.Writer
 	ping := time.NewTicker(nodeStatsPingEvery)
 	defer ping.Stop()
 	samples := 0
+	var reportedRTT uint64
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-sample.C:
 			stats.queued(client.Queued())
+			if upstream != nil {
+				if frame, reported, ok := stats.qualityFrame(reportedRTT); ok {
+					reportedRTT = reported
+					go func() { _ = upstream.Write(frame) }()
+				}
+			}
 			samples++
 			if dir != "" && samples%5 == 0 {
 				_ = writeNodeStats(dir, stats.snapshot())

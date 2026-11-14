@@ -47,6 +47,9 @@ const (
 	// node connection that advertises node_focus_v1. It only reorders queued
 	// frames for that connection; nothing is dropped.
 	Focus Type = 24
+	// Quality is relayd node's view of the path to the app, sent upstream
+	// to the daemon: {"rtt_last_ms":..,"rtt_min_ms":..,...} (node_quality_v1).
+	Quality Type = 25
 )
 
 const MaxPayload = 16 << 20
