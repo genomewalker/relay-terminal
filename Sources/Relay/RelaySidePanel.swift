@@ -506,6 +506,10 @@ struct RelaySidePanelHTTPResponse: Sendable {
     static func json(_ value: some Encodable, status: Int = 200, reason: String = "OK") -> Self {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
+        // JSONEncoder can write one dictionary's keys in a different order on
+        // different calls. Sorted keys keep a replayed idempotent receipt
+        // byte-identical to the first reply.
+        encoder.outputFormatting = .sortedKeys
         let data = (try? encoder.encode(value)) ?? Data("{}".utf8)
         return Self(status: status, reason: reason, contentType: "application/json; charset=utf-8", body: data)
     }
