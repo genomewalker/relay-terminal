@@ -23,26 +23,4 @@ enum WorkspaceBrowserAddress {
         guard let url, let scheme = url.scheme, let host = url.host else { return "No page loaded" }
         return scheme + "://" + host + (url.port.map { ":\($0)" } ?? "")
     }
-
-    static func allows(_ url: URL, remotePort: Int?) -> Bool {
-        guard parse(url.absoluteString) != nil else { return false }
-        guard let remotePort else { return true }
-        // A remote session is confined to the explicitly forwarded origin.
-        // Absolute redirects to another loopback port must never hit a Mac service.
-        return url.host?.lowercased() == "127.0.0.1" &&
-            (url.port ?? (url.scheme == "https" ? 443 : 80)) == remotePort && url.scheme == "http"
-    }
-
-    static func remoteRules(port: Int) -> String {
-        // Remote browsing has no network access except its exact loopback origin.
-        // Apply to every resource type, including script-initiated requests.
-        let origin = "^http://127\\.0\\.0\\.1:\(port)/"
-        let socketOrigin = "^ws://127\\.0\\.0\\.1:\(port)/"
-        let rules: [[String: Any]] = [
-            ["trigger": ["url-filter": ".*"], "action": ["type": "block"]],
-            ["trigger": ["url-filter": origin], "action": ["type": "ignore-previous-rules"]],
-            ["trigger": ["url-filter": socketOrigin], "action": ["type": "ignore-previous-rules"]],
-        ]
-        return String(data: try! JSONSerialization.data(withJSONObject: rules), encoding: .utf8)!
-    }
 }

@@ -4186,7 +4186,9 @@ final class TerminalRuntime: NSObject {
         guard let target = TerminalLinkResolver.target(from: link) else { return false }
         switch target {
         case .web(let url):
-            NSWorkspace.shared.open(url)
+            // The floating browser: localhost is this pane's host, local or remote.
+            guard let pane else { return false }
+            RelayBrowserController.shared.open(url, profile: pane.profile, directory: pane.directory, near: view.window)
         case .image(let path):
             showArtifact(path: resolvedRemotePath(path))
         case .file(let path) where RelayFilePreviewKind.from(path: path) != nil:

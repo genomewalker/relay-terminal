@@ -180,4 +180,12 @@ import Testing
         clicked.next()
         #expect(clicked.webContent == .webCard(page))
     }
+
+    @Test func remoteLocalhostIsLeftToTheBrowser() {
+        let dev = URL(string: "http://localhost:5173/")!
+        #expect(RelayQuickLookItem.resolve(.web(dev), location: .local(cwd: nil)) != nil)
+        #expect(RelayQuickLookItem.resolve(.web(dev), location: .remote(remote, cwd: "/h")) == nil)
+        #expect(RelayQuickLookItem.resolve(.web(dev), location: .unreadable) == nil)
+        #expect(RelayQuickLookItem.resolve(.web(URL(string: "https://example.org")!), location: .remote(remote, cwd: nil)) != nil)
+    }
 }

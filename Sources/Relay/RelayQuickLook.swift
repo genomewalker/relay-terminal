@@ -180,6 +180,9 @@ struct RelayQuickLookItem: Equatable, Sendable {
                         home: String = NSHomeDirectory()) -> RelayQuickLookItem? {
         switch target {
         case .web(let url):
+            // A remote pane's localhost is its host's, which only the browser
+            // can reach; Quick Look would load the Mac's.
+            if RelayBrowserRouting.isLoopback(url) { guard case .local = location else { return nil } }
             return RelayQuickLookItem(source: .web(url), openLink: url.absoluteString)
         case .path(let path):
             switch location {
