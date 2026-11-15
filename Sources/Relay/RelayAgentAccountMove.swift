@@ -197,8 +197,15 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
     /// at any later step leaves it on disk.
     var drafts = RelayAgentMaintenanceDraftStore()
 
+    /// `force` is the user's choice to move a busy pane: Relay records the
+    /// shells the agent started, interrupts its turn with one Esc, exits it
+    /// with that background work still running, resumes and verifies it in
+    /// the target account, tells the resumed agent what was interrupted and
+    /// stopped, and then puts a saved draft back. Identity, approval, input
+    /// revision, typing and screen fences still apply; only user and MCP
+    /// moves can force.
     func move(_ pane: PaneModel, in workspace: WorkspaceModel, to target: RelayAgentAccount,
-              origin: RelayAgentAccountMoveOrigin, inputGranted: Bool) async -> Outcome {
+              origin: RelayAgentAccountMoveOrigin, inputGranted: Bool, force: Bool = false) async -> Outcome {
         let id = UUID().uuidString.lowercased()
         let profile = pane.profile
         let from = pane.agentAccount?.recorded
@@ -206,6 +213,8 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
         let draftPath = drafts.directory.appendingPathComponent(draftID + ".json").path
         // A saved draft that is not back in the prompt is named in every outcome.
         var savedDraft: RelayAgentMaintenanceDraft?
+        // A forced move's interrupt, named in every outcome after it was sent.
+        var interrupted = false
         func record(_ state: String, _ proof: RelayAgentMaintenanceProbe?, _ detail: String?) {
             audit.append(.init(id: id, at: Date(), paneID: pane.id, host: profile.connectionKey, origin: origin,
                 provider: proof?.provider ?? target.provider, sessionID: proof?.sessionID, from: from, to: target,
@@ -213,6 +222,9 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
         }
         func finish(_ state: String, _ message: String, _ proof: RelayAgentMaintenanceProbe? = nil) -> Outcome {
             var message = message
+            if interrupted && state != "verified" {
+                message += " Relay had interrupted the agent's turn with Esc for the forced move."
+            }
             if savedDraft != nil {
                 record("draft_kept", proof, draftPath)
                 message += " Your unsent prompt was saved and not restored; it is kept at " + draftPath + "."
@@ -223,6 +235,9 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
         }
         if let refused = RelayAgentAccountMovePolicy.originRefusal(origin, inputGranted: inputGranted) {
             return finish("refused", refused)
+        }
+        if force && origin != .user && origin != .mcp {
+            return finish("refused", "Only the user can force an account move.")
         }
         if await capacityRoute(pane) {
             return finish("held", await capacityAction(pane, target))
@@ -297,17 +312,21 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
         var exitPending = false
         var reinspected = false
         func read() async throws -> RelayAgentMaintenanceProbe {
+            var proof: RelayAgentMaintenanceProbe
             do {
-                return try await inspect(pane, target, nil)
+                proof = try await inspect(pane, target, nil)
             } catch let failure as RelayAgentMaintenanceReader.InspectFailure where failure.timedOut && !reinspected {
                 reinspected = true
                 record("inspect_retry", nil, failure.localizedDescription)
-                return try await inspect(pane, target, nil)
+                proof = try await inspect(pane, target, nil)
             }
+            proof.forcedByUser = force
+            return proof
         }
+        var stopped: [RelayForcedMoveCommand] = []
         do {
             let revision = pane.agentInputRevision
-            let proof = try await read()
+            var proof = try await read()
             guard workspace.panes[pane.id] === pane, pane.profile == profile else { return finish("refused", "The pane changed.") }
             if origin == .quotaFailover {
                 guard RelayClaudeQuotaScheduler.shared.authorizes(pane.id, target: target, proof: proof) else {
@@ -332,6 +351,47 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                     if !prompt.overlay && (prompt.empty || prompt.typed) { break }
                     try? await Task.sleep(nanoseconds: UInt64(screenInterval * 1e9))
                 }
+            }
+            if force {
+                guard proof.valid(for: pane.id), let agentPID = proof.processID else {
+                    return finish("refused", proof.unavailable ?? "The agent's native identity could not be verified; nothing was sent.", proof)
+                }
+                if !RelayAgentMaintenancePolicy.forcedIdle(proof) {
+                    statuses[pane.id] = "Forced move: interrupting the agent's turn"
+                    guard pane.pendingAgentApprovals == 0 else {
+                        return finish("refused", "A permission prompt is waiting for your answer; a forced move does not answer it. Nothing was sent.", proof)
+                    }
+                    guard !shownForInput(), interrupt(pane, proof, revision) else {
+                        return finish("refused", "Relay could not send the interrupt to the agent; nothing was sent.", proof)
+                    }
+                    interrupted = true
+                    record("force_interrupt", proof, nil)
+                    let deadline = Date().addingTimeInterval(interruptTimeout)
+                    while true {
+                        try await Task.sleep(nanoseconds: UInt64(verifyInterval * 1e9))
+                        guard workspace.panes[pane.id] === pane, pane.profile == profile else { return finish("refused", "The pane changed.") }
+                        let next = try await read()
+                        // The interrupt changes the transcript and the harness
+                        // status; the process and conversation must not.
+                        guard next.valid(for: pane.id), next.provider == proof.provider, next.processID == proof.processID,
+                              next.processStart == proof.processStart, next.sessionID == proof.sessionID,
+                              next.owner == proof.owner else {
+                            return finish("refused", "The agent changed after the interrupt; nothing more was sent.", next)
+                        }
+                        if RelayAgentMaintenancePolicy.forcedIdle(next) { proof = next; break }
+                        guard Date() < deadline else {
+                            return finish("refused", "The agent's turn did not stop within \(Int(interruptTimeout)) s of the interrupt; " +
+                                "nothing more was sent.", next)
+                        }
+                    }
+                }
+                statuses[pane.id] = "Forced move: recording the agent's background commands"
+                guard let commands = await backgroundCommands(pane, agentPID) else {
+                    return finish("refused", "Relay could not read the host's process table to record the agent's background " +
+                        "commands; nothing more was sent.", proof)
+                }
+                stopped = commands
+                record("force_background", proof, commands.isEmpty ? "none" : commands.map(\.command).joined(separator: " | "))
             }
             if let refused = await admission(pane, proof: proof, target: target).refusal {
                 return finish(origin == .quotaFailover && proof.moveCommand != nil && proof.resumeCommand != nil ? "deferred" : "refused", refused, proof)
@@ -449,18 +509,47 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                     if let directory = after.configDir {
                         pane.observeAgentAccount(provider: target.provider, directory: directory, label: target.label, matches: true)
                     }
-                    let moved = "Moved to \(target.label); the same conversation resumed and was verified."
+                    var moved = "Moved to \(target.label); the same conversation resumed and was verified."
+                    var restoreRevision = afterResume
+                    var idle: RelayAgentMaintenanceProbe?
+                    if force {
+                        let survivors: Set<Int>? = stopped.isEmpty ? [] : await survivingCommands(pane, stopped.map(\.pid))
+                        if let notice = RelayForcedAccountMove.notice(account: target.label, interrupted: interrupted,
+                                                                       commands: stopped, survivors: survivors) {
+                            moved += interrupted ? " Its turn had been interrupted." : ""
+                            moved += stopped.isEmpty ? "" : " Background commands found before the exit: " +
+                                stopped.map { "`\($0.command)`" + ((survivors?.contains($0.pid) ?? false) ? " (still running)" : "") }
+                                    .joined(separator: "; ") + "."
+                            statuses[pane.id] = "Telling the agent what the forced move stopped"
+                            let ready = await idleAfterResume(pane, workspace: workspace, after: after, target: target)
+                            if pane.agentInputRevision == afterResume, sendNotice(pane, notice, ready, afterResume) {
+                                record("force_notice", ready, notice)
+                                moved += " The agent was told."
+                                restoreRevision = pane.agentInputRevision
+                                if savedDraft != nil {
+                                    statuses[pane.id] = "Waiting for the agent to read the notice before putting the prompt back"
+                                    idle = await idleAfterNotice(pane, workspace: workspace, after: ready, target: target)
+                                }
+                            } else {
+                                record("force_notice_failed", ready, nil)
+                                moved += " Relay could not submit its notice to the agent; tell it yourself."
+                            }
+                        }
+                    }
                     guard let draft = savedDraft else { return finish("verified", moved, after) }
                     statuses[pane.id] = "Putting the unsent prompt back"
-                    let idle = await idleAfterResume(pane, workspace: workspace, after: after, target: target)
-                    savedDraft = nil
-                    if let failure = await restoreDraft(draft, pane: pane, proof: idle, revision: afterResume) {
-                        record("draft_restore_failed", idle, failure)
-                        return finish("verified", moved + " Your unsent prompt could not be put back (\(failure)); " +
-                            "it is kept at " + draftPath + ".", idle)
+                    let settled: RelayAgentMaintenanceProbe
+                    if let idle { settled = idle } else {
+                        settled = await idleAfterResume(pane, workspace: workspace, after: after, target: target)
                     }
-                    record("draft_restored", idle, nil)
-                    return finish("verified", moved + " Your unsent prompt was put back.", idle)
+                    savedDraft = nil
+                    if let failure = await restoreDraft(draft, pane: pane, proof: settled, revision: restoreRevision) {
+                        record("draft_restore_failed", settled, failure)
+                        return finish("verified", moved + " Your unsent prompt could not be put back (\(failure)); " +
+                            "it is kept at " + draftPath + ".", settled)
+                    }
+                    record("draft_restored", settled, nil)
+                    return finish("verified", moved + " Your unsent prompt was put back.", settled)
                 }
             }
             return finish("unknown", "The resumed agent could not be verified in the \(target.label) account. Check the pane; nothing will be retried.", fresh)
@@ -561,6 +650,59 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
     var resume: @MainActor (PaneModel, String, RelayAgentMaintenanceProbe, UInt64, () throws -> Void) async throws
         -> Bool = { pane, command, original, revision, willSend in
         try await pane.runtime.resumeAgentAfterMaintenance(command, original: original, inputRevision: revision, willSend: willSend)
+    }
+
+    /// How long a forced move waits for the interrupted turn to stop.
+    var interruptTimeout: TimeInterval = 20
+    /// How long a forced move waits for the agent to finish reading its
+    /// notice before a saved draft is put back.
+    var noticeTurnTimeout: TimeInterval = 300
+    /// A notice turn not seen running within this long is taken as done.
+    var noticeTurnStartGrace: TimeInterval = 10
+    /// One Esc that interrupts the agent's turn for a forced move.
+    var interrupt: @MainActor (PaneModel, RelayAgentMaintenanceProbe, UInt64) -> Bool = { pane, proof, revision in
+        pane.runtime.interruptAgentTurnForForcedMove(proof: proof, inputRevision: revision)
+    }
+    /// The shells the agent process started, from the host's process table;
+    /// nil when the table could not be read.
+    var backgroundCommands: @MainActor (PaneModel, Int) async -> [RelayForcedMoveCommand]? = { pane, pid in
+        guard let result = try? await RelayHostExecution.capture(profile: pane.profile,
+                command: RelayForcedAccountMove.processTableCommand, timeout: 10, maximumBytes: 4 << 20),
+              result.exitCode == 0 else { return nil }
+        return RelayForcedAccountMove.backgroundCommands(processTable: String(decoding: result.stdout, as: UTF8.self), agentPID: pid)
+    }
+    /// Which of the recorded pids still run after the resume; nil when unknown.
+    var survivingCommands: @MainActor (PaneModel, [Int]) async -> Set<Int>? = { pane, pids in
+        guard let result = try? await RelayHostExecution.capture(profile: pane.profile,
+                command: RelayForcedAccountMove.survivorCommand(pids), timeout: 10, maximumBytes: 64 << 10),
+              result.exitCode == 0 else { return nil }
+        return RelayForcedAccountMove.survivors(processList: String(decoding: result.stdout, as: UTF8.self), pids: pids)
+    }
+    /// Submits Relay's notice to the resumed agent; false when it was not sent.
+    var sendNotice: @MainActor (PaneModel, String, RelayAgentMaintenanceProbe, UInt64) -> Bool = { pane, text, proof, revision in
+        pane.runtime.sendForcedMoveNotice(text, proof: proof, inputRevision: revision)
+    }
+
+    /// After the notice is submitted, waits, bounded, for the agent's turn
+    /// on it to start and finish, so a draft is put back into an idle prompt.
+    private func idleAfterNotice(_ pane: PaneModel, workspace: WorkspaceModel, after: RelayAgentMaintenanceProbe,
+                                 target: RelayAgentAccount) async -> RelayAgentMaintenanceProbe {
+        var proof = after
+        var sawTurn = false
+        let started = Date()
+        let deadline = started.addingTimeInterval(noticeTurnTimeout)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: UInt64(verifyInterval * 1e9))
+            guard workspace.panes[pane.id] === pane else { break }
+            guard let next = try? await inspect(pane, nil, target), next.valid(for: pane.id),
+                  next.processID == after.processID, next.processStart == after.processStart,
+                  next.sessionID == after.sessionID else { continue }
+            proof = next
+            let idle = next.lifecycle == "quiet" && next.backgroundWork == false &&
+                (next.provider != "claude" || next.harnessStatus == nil || next.harnessStatus == "idle")
+            if !idle { sawTurn = true } else if sawTurn || Date().timeIntervalSince(started) >= noticeTurnStartGrace { break }
+        }
+        return proof
     }
 
     private func admission(_ pane: PaneModel, proof: RelayAgentMaintenanceProbe,

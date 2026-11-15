@@ -1636,7 +1636,7 @@ final class RelaySidePanelServer: ObservableObject {
             let targetWorkspace = workspace
             Task { @MainActor [weak self] in
                 let outcome = await RelayAgentAccountMove.shared.move(pane, in: targetWorkspace, to: target, origin: .mcp,
-                    inputGranted: self?.mcpWorkspaceGrant.permits(.input) == true)
+                    inputGranted: self?.mcpWorkspaceGrant.permits(.input) == true, force: input.force == true)
                 self?.accountMoveReceipts.finish(requestID, result: base.merging(["status": outcome.state, "message": outcome.message]) { $1 },
                                                  now: Date())
             }

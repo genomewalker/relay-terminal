@@ -468,12 +468,12 @@ func TestHostInstallationCheckMutationHintsAndExactPost(t *testing.T) {
 }
 
 func TestMovePaneAccountIsExactAndPostsOnce(t *testing.T) {
-	var bodies []map[string]string
+	var bodies []map[string]any
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" || r.URL.Path != "/api/agent-accounts/move" {
 			t.Errorf("wrong move request: %s %s", r.Method, r.URL.Path)
 		}
-		var body map[string]string
+		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		bodies = append(bodies, body)
 		w.Write([]byte(`{"status":"moving"}`))
@@ -490,6 +490,18 @@ func TestMovePaneAccountIsExactAndPostsOnce(t *testing.T) {
 	if code := call(valid); code != 0 || len(bodies) != 1 || bodies[0]["account"] != "personal" || bodies[0]["paneID"] != id {
 		t.Fatalf("move: %d %v", code, bodies)
 	}
+	if _, sent := bodies[0]["force"]; sent {
+		t.Fatalf("an unforced move sent force: %v", bodies[0])
+	}
+	forced := map[string]any{"instance": id, "request_id": id, "pane_id": id, "account": "personal", "force": true}
+	if code := call(forced); code != 0 || len(bodies) != 2 || bodies[1]["force"] != true {
+		t.Fatalf("forced move: %d %v", code, bodies)
+	}
+	if code := call(map[string]any{"instance": id, "request_id": id, "pane_id": id, "account": "personal", "force": false}); code != 0 || len(bodies) != 3 {
+		t.Fatalf("force false: %d %v", code, bodies)
+	} else if _, sent := bodies[2]["force"]; sent {
+		t.Fatalf("force false was sent as a forced move: %v", bodies[2])
+	}
 	for _, bad := range []map[string]any{
 		{"instance": id, "request_id": id, "pane_id": id},
 		{"instance": id, "request_id": id, "pane_id": "here", "account": "personal"},
@@ -498,12 +510,14 @@ func TestMovePaneAccountIsExactAndPostsOnce(t *testing.T) {
 		{"instance": id, "request_id": id, "pane_id": id, "account": "personal · default (~/.claude)"},
 		{"instance": id, "request_id": id, "pane_id": id, "account": "default (~/.claude)"},
 		{"instance": id, "request_id": id, "pane_id": id, "account": "personal", "config_dir": "/tmp/x"},
+		{"instance": id, "request_id": id, "pane_id": id, "account": "personal", "force": "yes"},
+		{"instance": id, "request_id": id, "pane_id": id, "account": "personal", "force": true, "config_dir": "/tmp/x"},
 	} {
 		if code := call(bad); code != -32602 {
 			t.Fatalf("invalid move accepted: %v -> %d", bad, code)
 		}
 	}
-	if len(bodies) != 1 {
+	if len(bodies) != 3 {
 		t.Fatal("an invalid move reached Relay")
 	}
 }

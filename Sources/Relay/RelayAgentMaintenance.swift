@@ -46,6 +46,11 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
     var unavailable: String? = nil
     var worker: RelayPaneWorkerObservation? = nil
     var context: RelayPaneContextObservation? = nil
+    /// Set by Relay, never decoded: the user forced an account move of this
+    /// pane, choosing to interrupt its turn and stop its background work.
+    /// Background, subagent and footer-work evidence then do not hold the
+    /// move's own inputs; identity, revision, approval and screen fences do.
+    var forcedByUser = false
 
     enum CodingKeys: String, CodingKey {
         case version, provider, bound, lifecycle, revision, owner, unavailable
@@ -192,6 +197,7 @@ enum RelayAgentMaintenancePolicy {
     }
 
     static func explainedFooterAgents(_ proof: RelayAgentMaintenanceProbe, activeSubagents: Int) -> Int {
+        if proof.forcedByUser { return RelayAgentMaintenancePrompt.allWorkExplained }
         guard proof.provider == "claude", proof.subagentWork == false, activeSubagents == 0,
               proof.harnessStatus == "idle" else { return 0 }
         if proof.backgroundWork == false { return RelayAgentMaintenancePrompt.waitingSessionsExplained }
@@ -200,10 +206,19 @@ enum RelayAgentMaintenancePolicy {
     }
 
     static func idleEvidence(_ proof: RelayAgentMaintenanceProbe, emptyPrompt: Bool, hasDraft: Bool) -> Bool {
+        if proof.forcedByUser { return forcedIdle(proof) }
         let harnessIdle = proof.provider == "claude" && proof.harnessStatus == "idle" &&
             proof.backgroundWork == false && proof.subagentWork == false && emptyPrompt && !hasDraft
         let harnessBusy = proof.provider == "claude" && proof.harnessStatus != nil && proof.harnessStatus != "idle"
         return !harnessBusy && (proof.lifecycle == "quiet" || harnessIdle)
+    }
+
+    /// A forced move's turn evidence: Claude's own harness status when it is
+    /// known ("busy" or "shell" is a running turn), else a quiet transcript.
+    /// Background shells and subagents are not consulted.
+    static func forcedIdle(_ proof: RelayAgentMaintenanceProbe) -> Bool {
+        if proof.provider == "claude", let status = proof.harnessStatus { return status == "idle" }
+        return proof.lifecycle == "quiet"
     }
 
     static func deferral(_ proof: RelayAgentMaintenanceProbe, paneID: UUID,
@@ -223,15 +238,15 @@ enum RelayAgentMaintenancePolicy {
         }
         guard pendingApprovals == 0 else { return "Waiting for the pending approval" }
         guard preservingDraft || !hasDraft else { return "Waiting for the unsent prompt to be cleared or sent" }
-        if proof.backgroundWork == true {
+        if !proof.forcedByUser && proof.backgroundWork == true {
             return "Waiting for the agent's background shells or agent processes to finish"
         }
-        if proof.provider == "claude" && proof.backgroundWork == nil {
+        if !proof.forcedByUser && proof.provider == "claude" && proof.backgroundWork == nil {
             return "Waiting for background work to be verified absent: the native process check is unavailable"
         }
         // Lifecycle evidence of a running subagent holds on its own, whatever
         // the screen shows: a footer can be stale, clipped or absent.
-        if proof.provider == "claude" && proof.subagentWork == true {
+        if !proof.forcedByUser && proof.provider == "claude" && proof.subagentWork == true {
             return "Waiting for the session's subagents to finish: Claude's lifecycle records show one still running"
         }
         guard preservingDraft || emptyPrompt else {
@@ -242,6 +257,7 @@ enum RelayAgentMaintenancePolicy {
         // "Claude session ended"). CPU usage and summary text are not proof.
         // An explicitly busy harness overrides even a quiet transcript.
         guard idleEvidence(proof, emptyPrompt: emptyPrompt, hasDraft: hasDraft) else {
+            if proof.forcedByUser { return "The agent's turn did not stop after Relay's interrupt" }
             return proof.lifecycle == "settling" ? "Waiting for the conversation transcript to stop changing"
                 : "Waiting for the current turn to finish"
         }

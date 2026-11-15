@@ -200,6 +200,9 @@ struct MCPMovePaneAccountRequest: Codable, Equatable {
     let requestID: UUID
     let paneID: UUID
     let account: String
+    /// The user chose to interrupt the agent's turn and stop its background
+    /// work for this move (see RelayAgentAccountMove.move's `force`).
+    var force: Bool? = nil
 }
 
 struct MCPTerminatePaneRequest: Codable, Equatable {

@@ -39,6 +39,7 @@ enum RelayAgentMaintenancePrompt {
     }
 
     private static func busy(_ value: String, explainedAgents: Int) -> Bool {
+        if explainedAgents == allWorkExplained { return false }
         if value.range(of: footerWork, options: [.regularExpression, .caseInsensitive]) != nil { return true }
         if explainedAgents == waitingSessionsExplained { return agentCount(withoutWaitingSessions(value)) > 0 }
         return agentCount(value) > explainedAgents
@@ -50,6 +51,19 @@ enum RelayAgentMaintenancePrompt {
     /// that are blocked waiting for the user, so restarting this pane cannot
     /// stop them. Any other footer agent count still holds the prompt.
     static let waitingSessionsExplained = Int.max - 1
+
+    /// `explainedAgents` value for a forced account move: the user chose to
+    /// stop the pane's running turn and background work, so footer work rows
+    /// ("2 shells", "1 background terminal running · /ps to view") and stale
+    /// status tool rows do not hold an otherwise empty prompt. Typed text,
+    /// an unknown footer and a running Codex turn still do.
+    static let allWorkExplained = Int.max - 2
+
+    /// A Codex footer row that reports background terminals.
+    static func codexBackgroundRow(_ value: String) -> Bool {
+        value.range(of: #"\bbackground\b"#, options: [.regularExpression, .caseInsensitive]) != nil &&
+            (value.localizedCaseInsensitiveContains("running") || value.contains("/ps"))
+    }
 
     /// The footer's agent count other than the "← N agent(s)" waiting-sessions
     /// nudge, 0 when none is shown.
@@ -113,7 +127,7 @@ enum RelayAgentMaintenancePrompt {
         }
         let footer = prompt.rows.dropFirst(prompt.footer).map {
             String(String.UnicodeScalarView($0.map(\.character))).trimmingCharacters(in: .whitespaces)
-        }.filter { !$0.isEmpty }
+        }.filter { !$0.isEmpty && !(provider == "codex" && explainedAgents == allWorkExplained && codexBackgroundRow($0)) }
         if provider == "claude", footer.contains(where: { busy($0, explainedAgents: explainedAgents) }) { return false }
         if provider == "codex" {
             // The status line's items are user-configured: it opens with the
@@ -160,7 +174,8 @@ enum RelayAgentMaintenancePrompt {
                 // transcript that never recorded its result (interrupted or
                 // restored turn). Only relayd's proof that Claude's harness is
                 // idle with no subagent or background work lets it through.
-                let staleToolRow = explainedAgents == waitingSessionsExplained && statusToolRow(value)
+                let staleToolRow = (explainedAgents == waitingSessionsExplained || explainedAgents == allWorkExplained) &&
+                    statusToolRow(value)
                 let known = value.hasPrefix("⏵") || value.hasPrefix("⏸") || value.hasPrefix("◈") ||
                     value.hasPrefix("+ ") || value.hasPrefix("$") || centsCost || commandNotice || waitingStatus ||
                     staleToolRow ||

@@ -78,7 +78,7 @@ import Testing
     @Test func compilerRefusalSuppliesTrustedAccountFieldNames() {
         let message = RelayMikoToolCompiler.argumentRefusal(tool: "relay_move_pane_account")
         #expect(message.contains("nothing ran"))
-        #expect(message.contains("Allowed fields: account, instance, pane_id, request_id."))
+        #expect(message.contains("Allowed fields: account, force, instance, pane_id, request_id."))
         #expect(message.contains("Required fields: account, instance, pane_id, request_id."))
         #expect(!message.contains("target_account"))
         #expect(!message.contains("host,"))

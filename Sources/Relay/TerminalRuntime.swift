@@ -3171,12 +3171,15 @@ final class TerminalRuntime: NSObject {
         let footerAgents: Int
         /// The footer agent count other than the "← N agent(s)" waiting-sessions nudge.
         let footerOtherAgents: Int
+        /// Empty for a forced account move (footer work rows ignored).
+        var agentEmptyForced = false
 
         func empty(explainedAgents: Int) -> Bool {
             if explainedAgents == 0 { return agentEmpty }
             if explainedAgents == RelayAgentMaintenancePrompt.waitingSessionsExplained {
                 return agentEmptyIdleProven && footerOtherAgents == 0
             }
+            if explainedAgents == RelayAgentMaintenancePrompt.allWorkExplained { return agentEmptyForced }
             return agentEmptyIgnoringAgents && footerAgents <= explainedAgents
         }
         let agentTyped: Bool
@@ -3197,8 +3200,9 @@ final class TerminalRuntime: NSObject {
         for (admitted, reason) in [
             (proof.valid(for: pane.id) && proof.owner != nil, "the native agent identity is not verified"),
             (proof.provider == "claude", "only Claude drafts can be captured exactly"),
-            (proof.lifecycle == "quiet", "the agent is not idle"),
-            (proof.backgroundWork == false, "background work is not verified absent"),
+            (proof.forcedByUser ? RelayAgentMaintenancePolicy.forcedIdle(proof) : proof.lifecycle == "quiet",
+             "the agent is not idle"),
+            (proof.forcedByUser || proof.backgroundWork == false, "background work is not verified absent"),
             (pane.agentInputRevision == inputRevision, "new input arrived"),
             (pane.connectionState == .connected, "the pane is not connected"),
             (pane.pendingAgentApprovals == 0, "an approval prompt is pending"),
@@ -3378,6 +3382,8 @@ final class TerminalRuntime: NSObject {
             agentTyped: RelayAgentMaintenancePrompt.hasTypedText(screen, provider: pane.kind == .codex ? "codex" : "claude"),
             shellEmpty: RelayAgentMaintenancePrompt.retainedShellIsEmpty(screen))
         preparedMaintenancePrompt?.claudeOverlay = pane.kind != .codex && RelayAgentMaintenancePrompt.isClaudeSettingsOverlay(screen)
+        preparedMaintenancePrompt?.agentEmptyForced = RelayAgentMaintenancePrompt.isEmpty(screen,
+            provider: pane.kind == .codex ? "codex" : "claude", explainedAgents: RelayAgentMaintenancePrompt.allWorkExplained)
     }
 
     /// Fixed native commands only. The model, terminal transcript and peer
@@ -3406,8 +3412,10 @@ final class TerminalRuntime: NSObject {
         if observation == .unstable, io.outputPhaseOpenNow { return .outputPhaseOpen }
         let empty = agentMaintenancePromptIsEmpty(observation, preservingComposerDraft: preservingComposerDraft,
             explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents))
-        guard proof.valid(for: pane.id), RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: empty, hasDraft: false), proof.backgroundWork != true,
-              proof.subagentWork != true,
+        // A forced move's proof stops background work and subagents by exiting.
+        guard proof.valid(for: pane.id), RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: empty, hasDraft: false),
+              proof.forcedByUser || proof.backgroundWork != true,
+              proof.forcedByUser || proof.subagentWork != true,
               command == RelayAgentMaintenancePolicy.exitCommand(provider: proof.provider),
               pane.agentInputRevision == inputRevision,
               empty, let fence = screenFence(observation),
@@ -3482,6 +3490,48 @@ final class TerminalRuntime: NSObject {
         let sent = io.sendPromptEditorControlInput(Data([0x1b]), expectedControlLease: lease,
             expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
         if sent { preparedMaintenancePrompt = nil; view.unobservedPromptInput() }
+        return sent
+    }
+
+    /// One Esc that interrupts the agent's running turn for an account move
+    /// the user forced. It needs the verified native agent, the move's input
+    /// revision, no pending approval and the control lease; a running turn's
+    /// screen keeps changing, so no screen fence is required. A single Esc
+    /// interrupts Claude and Codex turns and leaves a typed draft in place.
+    /// It is automation: the pane's input revision is not advanced.
+    func interruptAgentTurnForForcedMove(proof: RelayAgentMaintenanceProbe, inputRevision: UInt64) -> Bool {
+        guard let pane, proof.forcedByUser, proof.valid(for: pane.id), pane.connectionState == .connected,
+              pane.agentInputRevision == inputRevision, pane.pendingAgentApprovals == 0,
+              conversationInputLease == nil, (pane.remoteClientCount ?? 1) <= 1,
+              !view.promptInspectionBlocksExternalInput, view.markedRange().location == NSNotFound,
+              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id) else { return false }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        let sent = io.sendPromptEditorControlInput(Data([0x1b]), expectedControlLease: lease, automation: true)
+        if sent { preparedMaintenancePrompt = nil; view.unobservedPromptInput(); noteProgrammaticInput("forced_move_interrupt", "esc") }
+        return sent
+    }
+
+    /// Submits Relay's one-line notice to an agent resumed by a forced
+    /// account move, under the same native proof, idle evidence, input
+    /// revision, empty-prompt, screen and control-lease fences as a
+    /// maintenance command.
+    func sendForcedMoveNotice(_ text: String, proof: RelayAgentMaintenanceProbe, inputRevision: UInt64) -> Bool {
+        guard let pane, !text.isEmpty, text.count <= 4_000, !text.contains(where: \.isNewline) else { return false }
+        let observation = observeActiveScreen()
+        let empty = agentMaintenancePromptIsEmpty(observation, preservingComposerDraft: true,
+            explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents))
+        guard proof.valid(for: pane.id), !proof.forcedByUser,
+              RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: empty, hasDraft: false),
+              proof.backgroundWork != true, proof.subagentWork != true,
+              pane.agentInputRevision == inputRevision, empty, let fence = screenFence(observation),
+              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id),
+              let payload = TerminalPastePayload.directPayload(for: text, bracketed: true) else { return false }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        let sent = io.sendPromptEditorControlInput(Data((payload + "\r").utf8), expectedControlLease: lease,
+            expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
+        if sent { view.unobservedPromptInput(); pane.userEnteredInput(); noteProgrammaticInput("forced_move_notice", text) }
         return sent
     }
 

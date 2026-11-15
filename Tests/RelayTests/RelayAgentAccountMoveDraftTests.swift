@@ -110,6 +110,84 @@ struct RelayAgentAccountMoveDraftTests {
         (try? FileManager.default.contentsOfDirectory(atPath: mover.drafts.directory.path)) ?? []
     }
 
+    // 07fa914c (dandy-07, 2026-11-15) ran KapK monitor loops in background
+    // shells, so every move waited for work that never ends. The user asked
+    // to force such moves and restore the pane afterwards.
+    @Test("A forced move interrupts the turn, exits with background work, tells the agent and puts the draft back")
+    func forcedMoveOfABusyPane() async throws {
+        let agent = MovedAgent()
+        agent.readable = true
+        agent.prompt = Data("half-written follow-up".utf8)
+        var turnRunning = true
+        var forcedExit: Bool?
+        var notices: [String] = []
+        let (mover, workspace, pane, _) = try harness(agent)
+        defer { workspace.shutdown() }
+        mover.noticeTurnStartGrace = 0.05
+        mover.inspect = { pane, _, expect in
+            agent.events.append(expect == nil ? "inspect" : "verify")
+            if expect != nil {
+                return try moveProbe(pane.id, pid: 77, start: 120, extra: #","account_matches":true"#)
+            }
+            var probe = try moveProbe(pane.id)
+            probe.backgroundWork = true
+            probe.subagentWork = true
+            probe.harnessStatus = turnRunning ? "busy" : "idle"
+            probe.lifecycle = turnRunning ? "active" : "quiet"
+            return probe
+        }
+        mover.interrupt = { _, proof, _ in
+            #expect(proof.forcedByUser)
+            agent.events.append("esc"); turnRunning = false
+            return true
+        }
+        mover.backgroundCommands = { _, pid in
+            #expect(pid == 42)
+            return [.init(pid: 5001, command: "kapk-monitor --loop")]
+        }
+        mover.survivingCommands = { _, pids in
+            #expect(pids == [5001])
+            return []
+        }
+        mover.sendExit = { _, _, proof, _ in
+            forcedExit = proof.forcedByUser
+            agent.events.append("exit")
+            return agent.prompt.isEmpty
+        }
+        mover.sendNotice = { pane, text, proof, _ in
+            #expect(!proof.forcedByUser && proof.processID == 77)
+            notices.append(text); agent.events.append("notice"); pane.userEnteredInput()
+            return true
+        }
+        let unforced = await mover.move(pane, in: workspace, to: personal, origin: .user, inputGranted: true)
+        #expect(unforced.state == "refused", "\(unforced.message)")
+        #expect(!agent.events.contains("esc") && !agent.events.contains("exit"))
+        agent.events.removeAll()
+
+        let outcome = await mover.move(pane, in: workspace, to: personal, origin: .mcp, inputGranted: true, force: true)
+        #expect(outcome.state == "verified", "\(outcome.message)")
+        #expect(forcedExit == true)
+        let esc = try #require(agent.events.firstIndex(of: "esc"))
+        let exit = try #require(agent.events.firstIndex(of: "exit"))
+        let notice = try #require(agent.events.firstIndex(of: "notice"))
+        let restored = try #require(agent.events.lastIndex(of: "commit"))
+        #expect(esc < exit && exit < notice && notice < restored)
+        #expect(notices.count == 1 && notices[0].contains("kapk-monitor --loop") && notices[0].contains("interrupted"))
+        #expect(agent.prompt == Data("half-written follow-up".utf8))
+        #expect(outcome.message.contains("kapk-monitor --loop") && outcome.message.contains("The agent was told"))
+        #expect(draftFiles(mover).isEmpty)
+    }
+
+    @Test("Maintenance and quota failover cannot force a move")
+    func onlyTheUserForces() async throws {
+        let agent = MovedAgent()
+        let (mover, workspace, pane, _) = try harness(agent)
+        defer { workspace.shutdown() }
+        mover.interrupt = { _, _, _ in Issue.record("no interrupt may be sent"); return false }
+        let outcome = await mover.move(pane, in: workspace, to: personal, origin: .quotaFailover, inputGranted: true, force: true)
+        #expect(outcome.state == "refused")
+    }
+
     @Test("A pane not shown since launch is shown, read once its screen is complete, moved, and the earlier selection returns")
     func unopenedPaneIsShownThenMoved() async throws {
         let agent = MovedAgent()
