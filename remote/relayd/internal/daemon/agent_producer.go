@@ -289,7 +289,32 @@ func ValidateAccountTranscript(transcript, provider, override string) error {
 	if override != "" && (!filepath.IsAbs(override) || filepath.Clean(override) != override || len(override) > 4096) {
 		return errors.New("agent account directory is invalid")
 	}
+	if provider == "codex" && phCodexCompressed(transcript) {
+		return validateCompressedCodexTranscript(transcript, override)
+	}
 	return validateAccountTranscript(transcript, provider, override)
+}
+
+// validateCompressedCodexTranscript is the account move's check for an idle
+// thread whose only saved rollout Codex has compressed: the same strict
+// namespace walk, inside the target account (or the host default).
+func validateCompressedCodexTranscript(transcript, override string) error {
+	if len(transcript) > 4096 || strings.ContainsRune(transcript, 0) {
+		return errors.New("invalid transcript binding")
+	}
+	root := override
+	if root == "" {
+		root = os.Getenv("CODEX_HOME")
+	}
+	if root == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return errors.New("source home unavailable")
+		}
+		root = filepath.Join(home, ".codex")
+	}
+	_, err := sourcePathIn(transcript, "codex", root, true)
+	return err
 }
 
 // validateAccountTranscript checks a transcript against the producer's own

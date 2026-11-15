@@ -142,6 +142,13 @@ func bindingSourcePath(binding AgentBindingRecord, provider string) (string, err
 // rotationSourcePathIn accepts only a regular, owner-controlled transcript
 // below logicalRoot's projects (Claude) or sessions (Codex) directory.
 func rotationSourcePathIn(path, provider, logicalRoot string) (string, error) {
+	return sourcePathIn(path, provider, logicalRoot, false)
+}
+
+// sourcePathIn is rotationSourcePathIn; compressed also accepts a Codex
+// rollout Codex itself compressed (.jsonl.zst), for checks that only locate
+// the saved conversation and never read it as JSONL.
+func sourcePathIn(path, provider, logicalRoot string, compressed bool) (string, error) {
 	if !filepath.IsAbs(logicalRoot) || filepath.Clean(logicalRoot) != logicalRoot ||
 		len(logicalRoot) > 4096 || strings.ContainsRune(logicalRoot, 0) {
 		return "", errors.New("invalid source namespace")
@@ -175,7 +182,9 @@ func rotationSourcePathIn(path, provider, logicalRoot string) (string, error) {
 		return "", errors.New("source outside provider namespace")
 	}
 	pieces := strings.Split(relative, string(filepath.Separator))
-	if pieces[0] != history || !strings.HasSuffix(relative, ".jsonl") {
+	suffixOK := strings.HasSuffix(relative, ".jsonl") ||
+		(compressed && provider == "codex" && strings.HasSuffix(relative, phCodexCompressedSuffix))
+	if pieces[0] != history || !suffixOK {
 		return "", errors.New("unsupported source location")
 	}
 	current := root

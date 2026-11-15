@@ -587,7 +587,9 @@ func (r *phReader) transcriptMetadata(path, kind string) any {
 	if phStatUID(info) != r.uid || info.Mode().Perm()&0o022 != 0 || !info.Mode().IsRegular() {
 		return nil
 	}
-	reader := bufio.NewReader(file)
+	stream, done := phTranscriptStream(file, path)
+	defer done()
+	reader := bufio.NewReader(stream)
 	for i := 0; i < 16; i++ {
 		line := phReadLine(reader, phMaxLine+1)
 		if len(line) == 0 || len(line) > phMaxLine {

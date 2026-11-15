@@ -244,7 +244,7 @@ func (r *phReader) exactCodexTranscript(session, root string) string {
 			phRaise(phValueError, "The exact transcript lookup exceeded its limit.")
 		}
 		for _, name := range files {
-			if strings.HasSuffix(name, "-"+session+".jsonl") {
+			if phCodexRolloutName(name, session) {
 				path := phJoin(directory, name)
 				if pyEqual(r.metadata(path, "codex"), session) {
 					matches = append(matches, path)
@@ -259,6 +259,7 @@ func (r *phReader) exactCodexTranscript(session, root string) string {
 		}
 	}
 	walk(base)
+	matches = phPreferPlainRollout(matches)
 	if len(matches) != 1 {
 		phRaise(phValueError, "An exact saved conversation is required for restart.")
 	}
@@ -320,25 +321,40 @@ func (r *phReader) tailEvidence(path, provider string) (string, any, string) {
 		file.Close()
 		phRaise(phValueError, "The transcript is not owner controlled.")
 	}
-	offset := before.Size() - phMaxTail
-	if offset < 0 {
-		offset = 0
-	}
-	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		file.Close()
-		phRaiseOS(err)
-	}
-	stream := bufio.NewReaderSize(file, 1<<20)
-	if offset > 0 {
-		if _, err := stream.ReadBytes('\n'); err != nil && err != io.EOF {
+	var raw []byte
+	if provider == "codex" && phCodexCompressed(path) {
+		func() {
+			closed := false
+			defer func() {
+				if !closed {
+					file.Close()
+				}
+			}()
+			raw = phDecodedTail(file, path, phMaxTail)
+			closed = true
+		}()
+	} else {
+		offset := before.Size() - phMaxTail
+		if offset < 0 {
+			offset = 0
+		}
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
 			file.Close()
 			phRaiseOS(err)
 		}
-	}
-	raw, err := io.ReadAll(io.LimitReader(stream, phMaxTail))
-	if err != nil {
-		file.Close()
-		phRaiseOS(err)
+		stream := bufio.NewReaderSize(file, 1<<20)
+		if offset > 0 {
+			if _, err := stream.ReadBytes('\n'); err != nil && err != io.EOF {
+				file.Close()
+				phRaiseOS(err)
+			}
+		}
+		var err error
+		raw, err = io.ReadAll(io.LimitReader(stream, phMaxTail))
+		if err != nil {
+			file.Close()
+			phRaiseOS(err)
+		}
 	}
 	after, err := file.Stat()
 	file.Close()
