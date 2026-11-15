@@ -334,6 +334,35 @@ func TestNativeMaintenanceOriginalBackgroundAndMCPAssertions(t *testing.T) {
 		r.inventory = func() *phProcesses { return mrProcesses(map[int64]phProcess{3: {4, "bash"}, 4: {3, "bash"}}) }
 		mrEq(t, r.backgroundShellWork(42, nil), false)
 	})
+	// Claude refreshes its status line through `bash cc-status.sh`, which runs
+	// relayd claude-statusline and a node helper. A move sampled during that
+	// refresh was refused as "background shells or agent processes".
+	t.Run("status_line_refresh_is_not_background_work", func(t *testing.T) {
+		argv := map[int64][]string{}
+		r := newPHReader(nil)
+		r.arguments = func(pid int64) []string { return argv[pid] }
+		p := mrProcesses(map[int64]phProcess{42: {10, "claude"}, 50: {42, "bash"}, 51: {50, "relayd-linux-amd64"}, 52: {51, "node"}})
+		r.inventory = func() *phProcesses { return p }
+		argv[50] = []string{"bash", "/home/u/.config/relay/cc-status.sh"}
+		mrEq(t, r.backgroundShellWork(42, nil), false)
+		for _, top := range [][]string{
+			{"/home/u/.local/share/relay/bin/relayd-linux-amd64", "claude-statusline"},
+			{"/Users/u/.local/bin/relayd", "subscription-quota-statusline", "YmFzaA=="},
+			{"/bin/sh", "-c", `bash "$HOME/.config/relay/cc-status.sh"`},
+			{"/bin/sh", "-c", `'/Users/u/.local/bin/relayd' subscription-quota-statusline 'YmFzaA=='`},
+		} {
+			argv[50] = top
+			mrEq(t, r.backgroundShellWork(42, nil), false)
+		}
+		// Real work beside the status line still counts.
+		p.set(60, phProcess{42, "bash"})
+		argv[60] = []string{"bash", "-c", "sleep 600"}
+		mrEq(t, r.backgroundShellWork(42, nil), true)
+		// Other shells and relayd subcommands are not status lines.
+		for _, other := range [][]string{{"bash", "-c", "make test"}, {"relayd", "agent", "claude"}, {"node", "/x/cc-status.sh"}, {"bash"}} {
+			mrEq(t, phStatusLineProcess(other), false)
+		}
+	})
 	t.Run("M9_exact_mcp_argv", func(t *testing.T) {
 		root := t.TempDir()
 		smdb := phWrite(t, filepath.Join(root, "smdb-mcp"), "#!/opt/bin/python3.12\nprint()\n", 0o644)

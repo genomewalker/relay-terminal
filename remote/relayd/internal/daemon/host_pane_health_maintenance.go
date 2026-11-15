@@ -1400,6 +1400,43 @@ func phMCPServerProcess(argv []string, entries []phMCPEntry) bool {
 	return false
 }
 
+// phStatusLineSubcommands are relayd's Claude status-line entry points.
+var phStatusLineSubcommands = []string{"claude-statusline", "subscription-quota-statusline"}
+
+// phStatusLineProcess reports whether argv is a Claude status-line command
+// Relay configures: relayd's status-line subcommand, or a shell running
+// Relay's cc-status.sh or that subcommand.
+func phStatusLineProcess(argv []string) bool {
+	if len(argv) < 2 {
+		return false
+	}
+	base := phName(argv[0])
+	if strings.HasPrefix(base, "relayd") {
+		return phContains(phStatusLineSubcommands, argv[1])
+	}
+	if !phContains(phBackgroundShells, base) {
+		return false
+	}
+	for _, argument := range argv[1:] {
+		if strings.HasSuffix(argument, "/.config/relay/cc-status.sh") {
+			return true
+		}
+	}
+	if argv[1] == "-c" && len(argv) >= 3 {
+		words := strings.Fields(argv[2])
+		for i, word := range words {
+			word = strings.Trim(word, `'"`)
+			if strings.HasSuffix(word, "/.config/relay/cc-status.sh") {
+				return true
+			}
+			if i > 0 && phContains(phStatusLineSubcommands, word) && strings.HasPrefix(phName(strings.Trim(words[i-1], `'"`)), "relayd") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // backgroundShellWork is background_shell_work(reader, pid, servers): true
 // for any shell below the agent, or an agent process outside a configured
 // MCP server's subtree; nil when the evidence cannot be read.
@@ -1409,6 +1446,7 @@ func (r *phReader) backgroundShellWork(pid int64, servers func() ([]phMCPEntry, 
 	}
 	processes := r.inventory()
 	var agents []int64
+	statusLine := map[int64]bool{}
 	for _, child := range processes.order {
 		if child == pid {
 			continue
@@ -1427,10 +1465,29 @@ func (r *phReader) backgroundShellWork(pid int64, servers func() ([]phMCPEntry, 
 		}
 		name := processes.rows[child].name
 		base := phName(name)
-		if phContains(phBackgroundShells, base) {
+		shell := phContains(phBackgroundShells, base)
+		agent := !shell && (phContains(phBackgroundAgents, strings.ToLower(base)) || phContains([]string{"claude", "codex"}, r.provider(name)))
+		if !shell && !agent {
+			continue
+		}
+		// Claude runs its status-line command every few seconds; that
+		// subtree is display work, not the agent's.
+		top := chain[len(chain)-1]
+		known, ok := statusLine[top]
+		if !ok && r.arguments != nil {
+			var argv []string
+			if phCatch(func() { argv = r.arguments(top) }, phOSError, phValueError) == nil {
+				known = phStatusLineProcess(argv)
+			}
+			statusLine[top] = known
+		}
+		if known {
+			continue
+		}
+		if shell {
 			return true
 		}
-		if phContains(phBackgroundAgents, strings.ToLower(base)) || phContains([]string{"claude", "codex"}, r.provider(name)) {
+		if agent {
 			agents = append(agents, chain[len(chain)-1])
 		}
 	}
