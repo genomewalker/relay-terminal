@@ -88,7 +88,18 @@ struct RelayCodexSegmentedFooterTests {
         #expect(!empty(CapturedCodex.screen(footer: [model, wrapped, wrapped, wrapped, hint])))
         #expect(!empty(CapturedCodex.screen(input: "run the pilot", footer: [model, wrapped, hint])))
         #expect(!empty(CapturedCodex.screen(footer: [model, wrapped, hint, "  something else"])))
-        #expect(!empty(CapturedCodex.screen(footer: [model, "  something else", hint])))
+        for marker in ["› typed", "• Working (3s • esc to interrupt)", "↳ queued message", "⚠ something"] {
+            #expect(!empty(CapturedCodex.screen(footer: [model, "  " + marker, hint])), "\(marker)")
+        }
+    }
+
+    /// The same pane at a wider size: Codex wrapped mid-word, so the
+    /// continuation row has no leading "· ".
+    @Test func aStatusLineWrappedMidWordIsStillTheIdleFooter() {
+        let model = "  GPT-6.1 Terra medium · /maps/projects/fernandezguerra/apps/repos/convergence · GPT-6.1 Terra · convergence · fix/compound-"
+        let hint = "  ← for agents · ? for shortcuts" + String(repeating: " ", count: 73) + "⚠ 3 warnings · f2 to view"
+        #expect(empty(CapturedCodex.screen(footer: [model, "  linkage-routing-20261007", hint])))
+        #expect(!empty(CapturedCodex.screen(footer: [model, "  linkage-routing-20261007"])))
     }
 
     @Test func theSegmentRuleItself() {

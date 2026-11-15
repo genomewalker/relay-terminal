@@ -119,10 +119,19 @@ enum RelayAgentMaintenancePrompt {
             // The status line's items are user-configured: it opens with the
             // model and may omit the context segment ("GPT-6.1 Terra high ·
             // ~/cwd · thread title"). At most one row may name the context.
-            // The model row, which a narrow pane wraps onto at most two rows
-            // that continue its " · " list ("· convergence · fix/branch"),
-            // then one or two hint rows directly below it.
-            let continuation = footer.dropFirst().prefix { $0.hasPrefix("· ") && !$0.hasPrefix("· ?") }.count
+            // The model row, which a narrow pane wraps at any column onto at
+            // most two rows ("· convergence · fix/compound-",
+            // "linkage-routing-20261007"), then one or two hint rows. A row
+            // that opens with a composer, turn, notice or warning marker is
+            // never status-line text.
+            let continuation = footer.dropFirst().prefix { value in
+                !(codexIdleHints.contains { value.hasPrefix($0) } || codexSegmentedIdleHint(value)) &&
+                    !["›", "❯", "•", "◦", "↳", "⚠", "■", "└"].contains { value.hasPrefix($0) } &&
+                    // "1 background terminal running · /ps to view" is work.
+                    !value.localizedCaseInsensitiveContains("running") && !value.contains("/ps") &&
+                    value.range(of: footerWork, options: [.regularExpression, .caseInsensitive]) == nil &&
+                    value.range(of: #"\bbackground\b"#, options: [.regularExpression, .caseInsensitive]) == nil
+            }.count
             let hints = footer.dropFirst(1 + continuation)
             guard continuation <= 2, (1...2).contains(hints.count), let first = footer.first, first.contains(" · "),
                   (first.lowercased().hasPrefix("gpt-") || first.lowercased().hasPrefix("openai")),
