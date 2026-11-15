@@ -477,6 +477,7 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
             var resumable = fresh
             resumable.resumeCommand = command
             var attempted = false
+            var exitDialogAnswered = false
             let exitDeadline = Date().addingTimeInterval(exitTimeout)
             while true {
                 guard workspace.panes[pane.id] === pane, pane.profile == profile else {
@@ -484,6 +485,15 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                 }
                 guard pane.agentInputRevision == afterExit else {
                     return finish("held", "Input arrived after the agent exited; the resume was not sent. Resume it yourself with the target account.", fresh)
+                }
+                // With background work running Claude asks before exiting; a
+                // forced move chose to stop that work, so it confirms once.
+                if force, !exitDialogAnswered, await confirmExitDialog(pane, fresh) {
+                    exitDialogAnswered = true
+                    record("force_exit_dialog", fresh, "Exit and stop tasks")
+                    statuses[pane.id] = "Forced move: confirmed Exit and stop tasks"
+                    try await Task.sleep(nanoseconds: UInt64(exitInterval * 1e9))
+                    continue
                 }
                 let sent = try await resume(pane, command, resumable, afterExit) { attempted = true; record("resume_pending", fresh, nil) }
                 if sent { break }
@@ -677,6 +687,12 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                 command: RelayForcedAccountMove.survivorCommand(pids), timeout: 10, maximumBytes: 64 << 10),
               result.exitCode == 0 else { return nil }
         return RelayForcedAccountMove.survivors(processList: String(decoding: result.stdout, as: UTF8.self), pids: pids)
+    }
+    /// Confirms "Exit and stop tasks" in Claude's exit dialog for a forced
+    /// move; false when the dialog is not shown or nothing was sent.
+    var confirmExitDialog: @MainActor (PaneModel, RelayAgentMaintenanceProbe) async -> Bool = { pane, proof in
+        await pane.runtime.prepareAgentMaintenancePromptProof()
+        return pane.runtime.confirmForcedExitStopTasks(proof: proof)
     }
     /// Submits Relay's notice to the resumed agent; false when it was not sent.
     var sendNotice: @MainActor (PaneModel, String, RelayAgentMaintenanceProbe, UInt64) -> Bool = { pane, text, proof, revision in

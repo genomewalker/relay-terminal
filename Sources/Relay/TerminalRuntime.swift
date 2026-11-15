@@ -3173,6 +3173,8 @@ final class TerminalRuntime: NSObject {
         let footerOtherAgents: Int
         /// Empty for a forced account move (footer work rows ignored).
         var agentEmptyForced = false
+        /// Claude's exit dialog with "Exit and stop tasks" selected.
+        var claudeExitStopTasks = false
 
         func empty(explainedAgents: Int) -> Bool {
             if explainedAgents == 0 { return agentEmpty }
@@ -3382,6 +3384,8 @@ final class TerminalRuntime: NSObject {
             agentTyped: RelayAgentMaintenancePrompt.hasTypedText(screen, provider: pane.kind == .codex ? "codex" : "claude"),
             shellEmpty: RelayAgentMaintenancePrompt.retainedShellIsEmpty(screen))
         preparedMaintenancePrompt?.claudeOverlay = pane.kind != .codex && RelayAgentMaintenancePrompt.isClaudeSettingsOverlay(screen)
+        preparedMaintenancePrompt?.claudeExitStopTasks = pane.kind != .codex &&
+            RelayAgentMaintenancePrompt.isClaudeExitStopTasksDialog(screen)
         preparedMaintenancePrompt?.agentEmptyForced = RelayAgentMaintenancePrompt.isEmpty(screen,
             provider: pane.kind == .codex ? "codex" : "claude", explainedAgents: RelayAgentMaintenancePrompt.allWorkExplained)
     }
@@ -3509,6 +3513,33 @@ final class TerminalRuntime: NSObject {
         defer { conversationInputLease = nil }
         let sent = io.sendPromptEditorControlInput(Data([0x1b]), expectedControlLease: lease, automation: true)
         if sent { preparedMaintenancePrompt = nil; view.unobservedPromptInput(); noteProgrammaticInput("forced_move_interrupt", "esc") }
+        return sent
+    }
+
+    /// One Return that confirms "1. Exit and stop tasks" in Claude's exit
+    /// dialog, after a forced move's /exit met running background work. The
+    /// dialog must be on the fenced screen with that choice selected; the
+    /// proof must be the forced move's own. Automation: the pane's input
+    /// revision is not advanced, so the move still resumes the agent.
+    func confirmForcedExitStopTasks(proof: RelayAgentMaintenanceProbe) -> Bool {
+        let observation = observeActiveScreen()
+        guard let pane, proof.forcedByUser, proof.provider == "claude", proof.valid(for: pane.id),
+              pane.kind != .codex, pane.connectionState == .connected,
+              conversationInputLease == nil, (pane.remoteClientCount ?? 1) <= 1,
+              !view.promptInspectionBlocksExternalInput, view.markedRange().location == NSNotFound else { return false }
+        let dialog: Bool
+        switch observation {
+        case .screen(let screen, _): dialog = RelayAgentMaintenancePrompt.isClaudeExitStopTasksDialog(screen)
+        case .unstable: dialog = false
+        case .noSurface: dialog = currentPreparedPrompt(observation)?.claudeExitStopTasks ?? false
+        }
+        guard dialog, let fence = screenFence(observation),
+              let lease = io.promptEditorControlLease(paneID: pane.id, hostID: pane.profile.id) else { return false }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        let sent = io.sendPromptEditorControlInput(Data("\r".utf8), expectedControlLease: lease,
+            expectedMaintenanceScreen: fence.replay, expectedLiveScreen: fence.live, automation: true)
+        if sent { preparedMaintenancePrompt = nil; view.unobservedPromptInput(); noteProgrammaticInput("forced_move_exit_dialog", "enter") }
         return sent
     }
 

@@ -103,4 +103,26 @@ struct RelayForcedAccountMoveTests {
         proof.harnessStatus = "idle"
         #expect(!RelayAgentMaintenancePolicy.forcedNeedsInterrupt(proof))
     }
+
+    // 07fa914c (dandy-07, 2026-11-15): the screen after a forced move's /exit.
+    static func exitDialog(selected: Int = 1, title: String = "Background work is running") -> String {
+        let choices = ["1. Exit and stop tasks", "2. Move to background and exit", "3. Stay"].enumerated().map {
+            "     " + ($0.offset + 1 == selected ? "❯ " : "  ") + $0.element
+        }
+        return (["✻ Brewed for 11m 19s · done 2:13 PM · 2 shells still running", "",
+                 String(repeating: "▔", count: 80), "   " + title, "   The following will stop when you exit:", "",
+                 "   shell · O=/projects/caeg/scratch/kbd606/tmp/bin32013_chec…",
+                 "   shell · cd /projects/caeg/scratch/kbd606/tmp/bin32013_che…", ""] + choices +
+                ["", "   Enter to confirm · Esc to cancel"]).joined(separator: "\r\n")
+    }
+
+    @Test("Claude's exit dialog is recognised only with Exit and stop tasks selected")
+    func exitStopTasksDialog() {
+        #expect(RelayAgentMaintenancePrompt.isClaudeExitStopTasksDialog(Self.exitDialog()))
+        #expect(!RelayAgentMaintenancePrompt.isClaudeExitStopTasksDialog(Self.exitDialog(selected: 2)))
+        #expect(!RelayAgentMaintenancePrompt.isClaudeExitStopTasksDialog(Self.exitDialog(selected: 3)))
+        #expect(!RelayAgentMaintenancePrompt.isClaudeExitStopTasksDialog(Self.exitDialog(title: "Delete these files?")))
+        #expect(!RelayAgentMaintenancePrompt.isClaudeExitStopTasksDialog(
+            RelayAgentFleetFooterTests.screen(prompt: "❯ \n", tail: " · 2 shells")))
+    }
 }

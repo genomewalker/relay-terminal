@@ -178,6 +178,60 @@ struct RelayAgentAccountMoveDraftTests {
         #expect(draftFiles(mover).isEmpty)
     }
 
+    // 07fa914c: Claude asked "Background work is running" after the forced
+    // /exit, and the move waited out its exit timeout without resuming.
+    @Test("A forced move confirms Claude's exit dialog once and resumes; an unforced move never answers it")
+    func forcedMoveConfirmsTheExitDialog() async throws {
+        let agent = MovedAgent()
+        agent.readable = true
+        var dialog = false
+        var confirmed = 0
+        let (mover, workspace, pane, _) = try harness(agent)
+        defer { workspace.shutdown() }
+        mover.inspect = { pane, _, expect in
+            if expect != nil { return try moveProbe(pane.id, pid: 77, start: 120, extra: #","account_matches":true"#) }
+            var probe = try moveProbe(pane.id)
+            probe.backgroundWork = true
+            probe.harnessStatus = "shell"
+            return probe
+        }
+        mover.interrupt = { _, _, _ in agent.events.append("esc"); return true }
+        mover.backgroundCommands = { _, _ in [.init(pid: 5001, command: "until done; do sleep 60; done")] }
+        mover.survivingCommands = { _, _ in [] }
+        mover.sendNotice = { _, _, _, _ in agent.events.append("notice"); return true }
+        mover.sendExit = { _, _, _, _ in agent.events.append("exit"); dialog = true; return true }
+        mover.confirmExitDialog = { _, proof in
+            #expect(proof.forcedByUser)
+            guard dialog else { return false }
+            confirmed += 1; dialog = false; agent.events.append("confirm")
+            return true
+        }
+        mover.resume = { _, _, _, _, willSend in
+            guard !dialog else { return false }
+            try willSend(); agent.events.append("resume"); return true
+        }
+        let outcome = await mover.move(pane, in: workspace, to: personal, origin: .user, inputGranted: true, force: true)
+        #expect(outcome.state == "verified", "\(outcome.message)")
+        #expect(confirmed == 1)
+        let exit = try #require(agent.events.firstIndex(of: "exit"))
+        let confirm = try #require(agent.events.firstIndex(of: "confirm"))
+        let resume = try #require(agent.events.firstIndex(of: "resume"))
+        #expect(exit < confirm && confirm < resume)
+        #expect(mover.audit.memory.contains { $0.state == "force_exit_dialog" })
+
+        // Without force the dialog is left for the user and nothing resumes.
+        agent.events.removeAll(); confirmed = 0
+        mover.inspect = { pane, _, expect in
+            if expect != nil { return try moveProbe(pane.id, pid: 78, start: 121, extra: #","account_matches":true"#) }
+            return try moveProbe(pane.id, pid: 77, start: 120)
+        }
+        mover.exitTimeout = 0.2
+        let unforced = await mover.move(pane, in: workspace, to: personal, origin: .user, inputGranted: true)
+        #expect(confirmed == 0)
+        #expect(unforced.state == "unknown", "\(unforced.message)")
+        #expect(!agent.events.contains("resume"))
+    }
+
     @Test("Maintenance and quota failover cannot force a move")
     func onlyTheUserForces() async throws {
         let agent = MovedAgent()

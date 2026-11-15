@@ -216,6 +216,28 @@ enum RelayAgentMaintenancePrompt {
         }
     }
 
+    /// Claude's exit confirmation while background work runs, with its
+    /// first choice selected (07fa914c, 2026-11-15, after a forced move's
+    /// /exit): "Background work is running", the tasks that will stop,
+    /// "❯ 1. Exit and stop tasks", "2. Move to background and exit",
+    /// "3. Stay", "Enter to confirm · Esc to cancel". Classification only;
+    /// the Enter is fenced to the same screen by the caller.
+    static func isClaudeExitStopTasksDialog(_ vt: String?) -> Bool {
+        guard let vt, vt.utf8.count <= maximumScreenBytes, let rows = parse(vt) else { return false }
+        let lines = rows.map {
+            String(String.UnicodeScalarView($0.map(\.character))).trimmingCharacters(in: .whitespaces)
+        }.filter { !$0.isEmpty }
+        guard let title = lines.lastIndex(of: "Background work is running"),
+              lines.last == "Enter to confirm · Esc to cancel" else { return false }
+        let choices = lines[(title + 1)...].filter {
+            $0.range(of: #"^(?:❯ )?[0-9]+\. "#, options: .regularExpression) != nil
+        }
+        guard choices.count == 3, choices.filter({ $0.hasPrefix("❯ ") }).count == 1,
+              choices.first?.hasPrefix("❯ ") == true else { return false }
+        let clean = choices.map { $0.hasPrefix("❯ ") ? String($0.dropFirst(2)) : $0 }
+        return clean == ["1. Exit and stop tasks", "2. Move to background and exit", "3. Stay"]
+    }
+
     /// Classifies the visible weekly-limit menu only; this is not evidence
     /// that the hidden editor is empty or authority to send a key. Bind any
     /// action separately to the current screen token and provider incarnation.
