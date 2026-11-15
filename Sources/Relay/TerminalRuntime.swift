@@ -192,11 +192,15 @@ enum TerminalPromptSelectionEdit {
 }
 
 enum TerminalKeyboardSelectionGeometry {
+    /// `caretColumn` is the caret's grid column when the caller knows it.
+    /// The reported caret x is half a cell right of the IME origin, so
+    /// deriving the column from x alone puts it one column too far right.
     static func anchor(
         for cursor: CGPoint,
         cellSize: CGSize,
         columns: Int,
-        gridOriginX: CGFloat = 0
+        gridOriginX: CGFloat = 0,
+        caretColumn: Int? = nil
     ) -> CGPoint? {
         guard cursor.x.isFinite, cursor.y.isFinite,
               cellSize.width.isFinite, cellSize.height.isFinite,
@@ -204,7 +208,7 @@ enum TerminalKeyboardSelectionGeometry {
               cellSize.width > 0, cellSize.height > 0,
               columns > 0
         else { return nil }
-        let cursorColumn = Int(floor((cursor.x - gridOriginX) / cellSize.width))
+        let cursorColumn = caretColumn ?? Int(floor((cursor.x - gridOriginX) / cellSize.width))
         guard cursorColumn >= 0, cursorColumn < columns else { return nil }
         // Preserve Ghostty's exact caret x. The unused horizontal pixels are
         // not guaranteed to be distributed symmetrically, so snapping the
@@ -220,7 +224,8 @@ enum TerminalKeyboardSelectionGeometry {
         visualCellDelta: Int,
         cellSize: CGSize,
         columns: Int,
-        gridOriginX: CGFloat = 0
+        gridOriginX: CGFloat = 0,
+        caretColumn: Int? = nil
     ) -> CGPoint? {
         guard cursor.x.isFinite, cursor.y.isFinite,
               cellSize.width.isFinite, cellSize.height.isFinite,
@@ -229,7 +234,7 @@ enum TerminalKeyboardSelectionGeometry {
               columns > 0, abs(visualCellDelta) <= 4_096
         else { return nil }
 
-        let cursorColumn = Int(floor((cursor.x - gridOriginX) / cellSize.width))
+        let cursorColumn = caretColumn ?? Int(floor((cursor.x - gridOriginX) / cellSize.width))
         guard cursorColumn >= 0, cursorColumn < columns else { return nil }
         let unwrappedColumn = cursorColumn + visualCellDelta
         let rowDelta = Int(floor(Double(unwrappedColumn) / Double(columns)))
@@ -9659,11 +9664,17 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             y: geometry.point.y - geometry.cellSize.height
         )
         let gridOriginX = geometry.gridOrigin.x
+        // The column the selection offsets below are measured from: the IME
+        // origin's cell, as in renderedProviderRowSelectionOffsets. The point
+        // is half a cell further right, which crosses into the next column
+        // and would misplace every endpoint that wraps to another row.
+        let caretColumn = Int(floor((geometry.origin.x - gridOriginX) / geometry.cellSize.width))
         guard let cursorAnchor = TerminalKeyboardSelectionGeometry.anchor(
             for: reportedSelectionCursor,
             cellSize: geometry.cellSize,
             columns: geometry.columns,
-            gridOriginX: gridOriginX
+            gridOriginX: gridOriginX,
+            caretColumn: caretColumn
         ) else { return false }
         let resolvedOffsets = visualOffsets ?? renderedPromptSelectionOffsets(
             delta: delta, anchorOffset: anchorOffset, geometry: geometry
@@ -9680,13 +9691,15 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
             visualCellDelta: resolvedOffsets?.start ?? anchorOffset,
             cellSize: geometry.cellSize,
             columns: geometry.columns,
-            gridOriginX: gridOriginX
+            gridOriginX: gridOriginX,
+            caretColumn: caretColumn
         ), let selectionEnd = TerminalKeyboardSelectionGeometry.endpoint(
             from: cursorAnchor,
             visualCellDelta: resolvedOffsets?.end ?? delta,
             cellSize: geometry.cellSize,
             columns: geometry.columns,
-            gridOriginX: gridOriginX
+            gridOriginX: gridOriginX,
+            caretColumn: caretColumn
         ) else { return false }
         guard selectionCursor.y >= 0, selectionCursor.y <= bounds.height,
               selectionEnd.y >= 0, selectionEnd.y <= bounds.height
