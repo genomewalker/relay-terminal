@@ -130,6 +130,10 @@ struct RelayBackgroundAttachPolicy {
     var nodes: () -> [NetworkTransportSnapshot] = { RelayNodeTransportPool.shared.networkSnapshots() }
     var uptime: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     var savedViewport: (UUID) -> RelayViewport? = { TerminalSnapshotStore.shared.savedViewport(paneID: $0) }
+    /// The grid the pane's tab would give it now, if it can be computed.
+    /// Preferred to the saved grid, which can be stale (RelayHiddenPaneGrid).
+    var layoutViewport: (@MainActor (PaneModel) -> RelayViewport?)?
+    private var owners: [UUID: WeakWorkspace] = [:]
     var start: @MainActor (PaneModel, RelayViewport) -> Void = { pane, viewport in
         pane.runtime.startInBackground(viewport: viewport)
     }
@@ -154,7 +158,20 @@ struct RelayBackgroundAttachPolicy {
     @discardableResult
     func step() -> Bool {
         let now = uptime()
-        let current = Self.attachOrder(panes?() ?? workspaces.compactMap(\.value).flatMap(Self.hiddenPanes))
+        let current: [PaneModel]
+        if let panes {
+            current = Self.attachOrder(panes())
+        } else {
+            owners.removeAll(keepingCapacity: true)
+            var hidden: [PaneModel] = []
+            for workspace in workspaces.compactMap(\.value) {
+                for pane in Self.hiddenPanes(workspace) {
+                    owners[pane.id] = WeakWorkspace(workspace)
+                    hidden.append(pane)
+                }
+            }
+            current = Self.attachOrder(hidden)
+        }
         var byID: [UUID: PaneModel] = [:]
         var candidates: [RelayBackgroundAttachCandidate] = []
         for pane in current {
@@ -177,10 +194,15 @@ struct RelayBackgroundAttachPolicy {
         let chosen = policy.next(candidates, nodes: nodeStates,
             settled: { byID[$0].map { $0.connectionState != .connecting } ?? true }, now: now)
         for candidate in chosen {
-            guard let pane = byID[candidate.paneID], let viewport = candidate.savedViewport else { continue }
+            guard let pane = byID[candidate.paneID], let saved = candidate.savedViewport else { continue }
+            let layout = layoutViewport.map { $0(pane) } ??
+                owners[pane.id]?.value.flatMap { RelayHiddenPaneGrid.viewport(for: pane.id, in: $0) }
+            let viewport = layout ?? saved
             RelayDiagnostics.shared.record(category: "pane", name: "background-attach", details: [
                 "pane_id": pane.id.uuidString.lowercased(), "profile": pane.profile.name,
                 "viewport": "\(viewport.columns)x\(viewport.rows)",
+                "saved_viewport": "\(saved.columns)x\(saved.rows)",
+                "source": layout == nil ? "saved" : "layout",
             ])
             start(pane, viewport)
         }

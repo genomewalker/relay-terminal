@@ -896,6 +896,19 @@ final class TerminalRuntime: NSObject {
     var viewIsMadeForTesting: Bool { viewIsMade }
     #endif
 
+    /// The grid this pane's surface reports while it is laid out in a
+    /// window, or nil. Reading it never makes the view. Hidden panes are
+    /// sized from it (RelayHiddenPaneGrid).
+    var laidOutGrid: RelayViewport? {
+        guard viewIsMade, view.window != nil, let viewport = latestSurfaceViewport,
+              viewport.columns > 0, viewport.rows > 0 else { return nil }
+        return viewport
+    }
+
+    #if DEBUG
+    func setLaidOutGridForTesting(_ viewport: RelayViewport?) { latestSurfaceViewport = viewport }
+    #endif
+
     var networkForegroundPID: pid_t? {
         guard started else { return nil }
         return view.foregroundPid
