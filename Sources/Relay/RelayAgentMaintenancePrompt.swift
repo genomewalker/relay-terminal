@@ -132,7 +132,7 @@ enum RelayAgentMaintenancePrompt {
         if provider == "codex" {
             // The status line's items are user-configured: it opens with the
             // model and may omit the context segment ("GPT-6.1 Terra high ·
-            // ~/cwd · thread title"). At most one row may name the context.
+            // ~/cwd · thread title"). At most two status-line rows may name the context.
             // The model row, which a narrow pane wraps at any column onto at
             // most two rows ("· convergence · fix/compound-",
             // "linkage-routing-20261007"), then one or two hint rows. A row
@@ -141,6 +141,8 @@ enum RelayAgentMaintenancePrompt {
             let continuation = footer.dropFirst().prefix { value in
                 !(codexIdleHints.contains { value.hasPrefix($0) } || codexSegmentedIdleHint(value)) &&
                     !["›", "❯", "•", "◦", "↳", "⚠", "■", "└"].contains { value.hasPrefix($0) } &&
+                    // A second whole status line is a repeat, not its wrapped tail.
+                    !value.lowercased().hasPrefix("gpt-") && !value.lowercased().hasPrefix("openai") &&
                     // "1 background terminal running · /ps to view" is work.
                     !value.localizedCaseInsensitiveContains("running") && !value.contains("/ps") &&
                     value.range(of: footerWork, options: [.regularExpression, .caseInsensitive]) == nil &&
@@ -149,7 +151,10 @@ enum RelayAgentMaintenancePrompt {
             let hints = footer.dropFirst(1 + continuation)
             guard continuation <= 2, (1...2).contains(hints.count), let first = footer.first, first.contains(" · "),
                   (first.lowercased().hasPrefix("gpt-") || first.lowercased().hasPrefix("openai")),
-                  footer.filter({ $0.localizedCaseInsensitiveContains("context") }).count <= 1,
+                  // A status line configured with two context items ("Context 36% left ·
+                  // … · Context 64% used") wraps one onto its continuation row (17f3e232,
+                  // 2540262d, 2026-11-15); only the status-line rows may name the context.
+                  footer.prefix(1 + continuation).filter({ $0.localizedCaseInsensitiveContains("context") }).count <= 2,
                   hints.allSatisfy({ value in
                       codexIdleHints.contains { value.hasPrefix($0) } || codexSegmentedIdleHint(value) })
             else { return false }

@@ -169,9 +169,16 @@ struct RelayPaneAgentAccountState: Codable, Equatable, Sendable {
     /// The account as shown in the GUI and relay_list_panes' "accountDisplay": the
     /// recorded label, else the inferred label with the observed directory
     /// ("personal · default (~/.claude)", "default (~/.claude)",
-    /// "~/.claude-team"). Display only; no decision reads it.
+    /// "~/.claude-team"). A running agent that uses another account than the
+    /// recorded one shows that account first ("personal · ~/.claude-max,
+    /// recorded business"): panes 57c1dd5b and bc08e46f showed "business"
+    /// while they spent the personal quota. Display only; no decision reads it.
     var displayLabel: String? {
-        if let recorded { return recorded.label }
+        if let recorded {
+            guard mismatch, let directory = observedDirectory else { return recorded.label }
+            let place = directory.isEmpty ? "default (~/.\(observedProvider ?? "claude"))" : directory
+            return (observedLabel.map { "\($0) · \(place)" } ?? place) + ", recorded \(recorded.label)"
+        }
         guard let directory = observedDirectory else { return observedLabel }
         let place = directory.isEmpty ? "default (~/.\(observedProvider ?? "claude"))" : directory
         return observedLabel.map { "\($0) · \(place)" } ?? place

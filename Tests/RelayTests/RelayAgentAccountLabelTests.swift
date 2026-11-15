@@ -102,6 +102,15 @@ struct RelayAgentAccountLabelTests {
         launched.observedLabel = "business"
         #expect(launched.displayLabel == "business")
         #expect(launched.displayLabel == launched.label)
+
+        // 57c1dd5b and bc08e46f (Mac, 2026-11-15): recorded business, running personal.
+        var drifted = RelayPaneAgentAccountState(recorded: recorded)
+        drifted.observedProvider = "claude"
+        drifted.observedDirectory = "~/.claude-max"
+        drifted.observedLabel = "personal"
+        drifted.observedMatches = false
+        #expect(drifted.displayLabel == "personal · ~/.claude-max, recorded business")
+        #expect(drifted.label == "business")
     }
 
     @Test("A recorded account keeps precedence when the registry relabels")
@@ -180,6 +189,10 @@ struct RelayAgentAccountLabelTests {
         // Recorded at launch.
         pane.recordAgentAccount(RelayAgentAccount(provider: "claude", label: "business", dir: "~/.claude-team"))
         #expect(try exported()["account"] as? String == "business")
+        // The agent last seen still runs the default account, so
+        // the display names that first; the move target stays the label.
+        #expect(try exported()["accountDisplay"] as? String == "default (~/.claude), recorded business")
+        pane.observeAgentAccount(provider: "claude", directory: "~/.claude-team", label: "business")
         #expect(try exported()["accountDisplay"] as? String == "business")
 
         // The display text is never an account label, so a move rejects it.

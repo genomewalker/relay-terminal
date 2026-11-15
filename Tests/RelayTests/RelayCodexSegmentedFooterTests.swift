@@ -109,4 +109,21 @@ struct RelayCodexSegmentedFooterTests {
         #expect(!RelayAgentMaintenancePrompt.codexSegmentedIdleHint("← for agents · ? for shortcuts   ⚠ 2 warnings · f2 to view   ⚠ 2 warnings · f2 to view"))
         #expect(!RelayAgentMaintenancePrompt.codexSegmentedIdleHint("← for agents · ? for shortcuts   ⚠ two warnings · f2 to view"))
     }
+
+    // 17f3e232 (dandy-07, 2026-11-15): the status line names the context twice
+    // and wraps the second onto its continuation row.
+    @Test func aStatusLineWithTwoContextItemsWrappedIsStillIdle() {
+        let screen = CapturedCodex.screen(footer: [
+            "  GPT-6.1-Sol high · Context 36% left · /maps/projects/caeg/people/kbd606/projects/faro-",
+            "  platform · GPT-6.1-Sol · faro-platform · main · Context 64% used",
+            "  ← for agents · ? for shortcuts" + String(repeating: " ", count: 36) + "⚠ 3 warnings · f2 to view"])
+        #expect(empty(screen))
+        // A third context row is not status-line text.
+        let extra = CapturedCodex.screen(footer: [
+            "  GPT-6.1-Sol high · Context 36% left · ~",
+            "  Context 64% used",
+            "  Context window 10%",
+            "  ← for agents · ? for shortcuts"])
+        #expect(!empty(extra))
+    }
 }
