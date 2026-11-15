@@ -420,21 +420,89 @@ func (e *Engine) AppPIDs(app string) ([]int, error) {
 	}
 	return out, nil
 }
+
+// ErrProcessExited reports that a pid has no live kernel process record.
+var ErrProcessExited = errors.New("process exited")
+
+// parents maps each pid to its parent pid.
+func (e *Engine) parents() (map[int]int, error) {
+	raw, err := e.command(15*time.Second, "/bin/ps", "-axo", "pid=,ppid=")
+	if err != nil {
+		return nil, err
+	}
+	return parseParents(raw)
+}
+func parseParents(raw []byte) (map[int]int, error) {
+	if len(raw) > maxState {
+		return nil, errors.New("process listing bound exceeded")
+	}
+	out := map[int]int{}
+	for _, row := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(row)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 2 {
+			return nil, errors.New("invalid process parent row")
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 || pid > 1<<31-1 {
+			return nil, errors.New("invalid process id")
+		}
+		ppid, err := strconv.Atoi(fields[1])
+		if err != nil || ppid < 0 || ppid > 1<<31-1 {
+			return nil, errors.New("invalid parent process id")
+		}
+		if _, ok := out[pid]; ok {
+			return nil, errors.New("duplicate process id")
+		}
+		out[pid] = ppid
+	}
+	return out, nil
+}
+func agentCommand(command string) bool {
+	name := filepath.Base(command)
+	return name == "codex" || name == "claude" || strings.Contains(command, "/.local/share/claude/versions/")
+}
+
+// paneAgents selects the agent processes Relay hosts: a claude or codex
+// process anywhere below a Relay worker, its shell or the Relay UI. That keeps
+// pane agents and their managed Codex backends, and leaves out agents Relay
+// does not host, such as relayd's own one-shot claude -p helpers, the ChatGPT
+// app's codex and orphaned processes. Those exit on their own, and a baseline
+// holding one fails the update after it exits.
+func paneAgents(rows map[int]string, parents map[int]int, roots map[int]bool) []int {
+	out := []int{}
+	for pid, command := range rows {
+		if !agentCommand(command) {
+			continue
+		}
+		seen := map[int]bool{pid: true}
+		for p := parents[pid]; p > 1 && !seen[p]; p = parents[p] {
+			seen[p] = true
+			if roots[p] {
+				out = append(out, pid)
+				break
+			}
+		}
+	}
+	return out
+}
 func (e *Engine) identities() (map[string]string, error) {
 	rows, err := e.processes()
 	if err != nil {
 		return nil, err
 	}
+	parents, err := e.parents()
+	if err != nil {
+		return nil, err
+	}
 	out := map[string]string{}
+	roots := map[int]bool{}
+	ui := filepath.Join(e.Config.Installed, "Contents/MacOS/Relay")
 	for pid, command := range rows {
-		if command == filepath.Join(e.Config.Installed, "Contents/MacOS/Relay") {
-			continue
-		}
-		name := filepath.Base(command)
-		if name == "codex" || name == "claude" || strings.Contains(command, "/.local/share/claude/versions/") {
-			if id, x := e.Kernel(pid); x == nil {
-				out[strconv.Itoa(pid)] = id
-			}
+		if command == ui {
+			roots[pid] = true
 		}
 	}
 	live, err := e.command(15*time.Second, filepath.Join(e.Config.Installed, "Contents/MacOS/relayd"), "live-status")
@@ -481,7 +549,13 @@ func (e *Engine) identities() (map[string]string, error) {
 			}
 			if id, x := e.Kernel(pid); x == nil {
 				out[strconv.Itoa(pid)] = id
+				roots[pid] = true
 			}
+		}
+	}
+	for _, pid := range paneAgents(rows, parents, roots) {
+		if id, x := e.Kernel(pid); x == nil {
+			out[strconv.Itoa(pid)] = id
 		}
 	}
 	return out, nil
@@ -496,6 +570,9 @@ func (e *Engine) retained(ids map[string]string) error {
 			return errors.New("invalid kernel identity baseline")
 		}
 		got, err := e.Kernel(pid)
+		if errors.Is(err, ErrProcessExited) {
+			return fmt.Errorf("preserved process %s exited after staging; stage the update again: %w", p, err)
+		}
 		if err != nil {
 			return err
 		}

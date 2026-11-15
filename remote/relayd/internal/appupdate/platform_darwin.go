@@ -20,10 +20,21 @@ func kernelIdentity(pid int) (string, error) {
 		return "", err
 	}
 	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if errors.Is(err, unix.EIO) || errors.Is(err, unix.ESRCH) {
+		// The kernel returns no record for an exited pid, which x/sys reports
+		// as a bare EIO ("input/output error").
+		return "", fmt.Errorf("%w: pid %d", ErrProcessExited, pid)
+	}
 	if err != nil {
 		return "", err
 	}
-	if info == nil || int(info.Proc.P_pid) != pid || info.Proc.P_stat == 5 || info.Proc.P_starttime.Sec <= 0 || info.Proc.P_starttime.Usec < 0 || info.Proc.P_starttime.Usec >= 1000000 {
+	if info == nil || int(info.Proc.P_pid) != pid {
+		return "", fmt.Errorf("%w: pid %d", ErrProcessExited, pid)
+	}
+	if info.Proc.P_stat == 5 { // SZOMB: exited, not yet reaped.
+		return "", fmt.Errorf("%w: pid %d", ErrProcessExited, pid)
+	}
+	if info.Proc.P_starttime.Sec <= 0 || info.Proc.P_starttime.Usec < 0 || info.Proc.P_starttime.Usec >= 1000000 {
 		return "", errors.New("kernel process identity unavailable")
 	}
 	boot = strings.TrimSpace(boot)

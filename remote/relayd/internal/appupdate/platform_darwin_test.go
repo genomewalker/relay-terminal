@@ -3,6 +3,7 @@
 package appupdate
 
 import (
+	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"io"
@@ -70,8 +71,8 @@ func TestKernelIdentityAndExitEvent(t *testing.T) {
 	if e = cmd.Wait(); e != nil {
 		t.Fatal(e)
 	}
-	if _, e = kernelIdentity(pid); e == nil {
-		t.Fatal("reaped process identity accepted")
+	if _, e = kernelIdentity(pid); !errors.Is(e, ErrProcessExited) {
+		t.Fatal("reaped process must report ErrProcessExited, not a bare errno", e)
 	}
 }
 func TestBinaryPlistAdapter(t *testing.T) {

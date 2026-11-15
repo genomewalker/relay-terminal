@@ -90,6 +90,7 @@ func (e *Engine) Restart(o RestartOptions) (map[string]any, error) {
 		return nil, err
 	}
 	var preservation, candidate string
+	var baseline Baseline
 	if o.Preservation != "" {
 		canonical, err := absolute(e.Config.Installed)
 		if err != nil {
@@ -102,7 +103,7 @@ func (e *Engine) Restart(o RestartOptions) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, err = e.baseline(preservation); err != nil {
+		if baseline, err = e.baseline(preservation); err != nil {
 			return nil, err
 		}
 	}
@@ -148,6 +149,14 @@ func (e *Engine) Restart(o RestartOptions) (map[string]any, error) {
 		return nil, err
 	}
 	defer lock.Close()
+	if preservation != "" {
+		// Check the preserved processes while the UI is still up. A process
+		// that exited after staging fails here without quitting the UI;
+		// apply repeats the check after the quit.
+		if err = e.retained(baseline.Identities); err != nil {
+			return nil, err
+		}
+	}
 	if trace != "" {
 		if err = writePrivate(trace, nil); err != nil {
 			return nil, err

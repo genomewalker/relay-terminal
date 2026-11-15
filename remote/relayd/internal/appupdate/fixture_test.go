@@ -195,6 +195,14 @@ func (f *fixture) run(c Command) ([]byte, error) {
 	switch a[0] {
 	case "/bin/ps":
 		var b strings.Builder
+		if len(a) > 2 && a[2] == "pid=,ppid=" {
+			// The provider (100) runs in the worker's shell (400).
+			for _, pid := range f.ui {
+				fmt.Fprintf(&b, "%d 1\n", pid)
+			}
+			b.WriteString("100 400\n300 1\n400 300\n")
+			return []byte(b.String()), nil
+		}
 		for _, pid := range f.ui {
 			fmt.Fprintf(&b, "%d %s\n", pid, filepath.Join(f.e.Config.Installed, "Contents/MacOS/Relay"))
 		}
