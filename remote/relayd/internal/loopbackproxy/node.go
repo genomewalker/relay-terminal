@@ -3,6 +3,7 @@ package loopbackproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -16,6 +17,47 @@ import (
 // frames continue to the retained supervisor unchanged. No host job, file or
 // terminal command carries HTTP bytes; disconnect closes only owned sockets.
 type HostRequestHandler func(context.Context, []byte) ([]byte, error)
+
+// ErrClientSilent ends a node whose app stopped sending anything. The app
+// heartbeats every 2 s and abandons a link after about 12 s of silence, then
+// reconnects with a new node. When that link died without a FIN (a VPN or
+// Wi-Fi change), sshd never noticed, and the orphaned node kept its pane
+// attachments: every pane then reported a second viewer and Relay refused to
+// restart or move it.
+var ErrClientSilent = errors.New("relay app stopped sending heartbeats")
+
+// Variables only so tests can shorten them.
+var (
+	nodeClientSilence = time.Minute
+	nodeSilenceCheck  = 5 * time.Second
+	nodeClock         = time.Now
+)
+
+// watchClientSilence arms once the client has sent a heartbeat Ping, so a
+// client that never heartbeats is never cut off.
+func watchClientSilence(ctx context.Context, last *atomic.Int64, armed <-chan struct{}, completed chan<- error) {
+	select {
+	case <-armed:
+	case <-ctx.Done():
+		return
+	}
+	ticker := time.NewTicker(nodeSilenceCheck)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if nodeClock().Sub(time.Unix(0, last.Load())) >= nodeClientSilence {
+				select {
+				case completed <- ErrClientSilent:
+				default:
+				}
+				return
+			}
+		}
+	}
+}
 
 func RelayNode(ctx context.Context, input io.Reader, output io.Writer, upstream net.Conn) error {
 	return RelayNodeWithHostRequestHandler(ctx, input, output, upstream, nil)
@@ -60,14 +102,22 @@ func RelayNodeWithHostRequestHandlers(ctx context.Context, input io.Reader, outp
 	}()
 	var negotiated atomic.Bool
 	var upstreamFragments atomic.Bool
-	completed := make(chan error, 2)
+	completed := make(chan error, 3)
 	slots := make(chan struct{}, 64)
+	var lastClientFrame atomic.Int64
+	heartbeats := make(chan struct{})
+	var startWatchdog sync.Once
+	go watchClientSilence(ctx, &lastClientFrame, heartbeats, completed)
 	go func() {
 		for {
 			frame, err := clientReader.Read()
 			if err != nil {
 				completed <- err
 				return
+			}
+			lastClientFrame.Store(nodeClock().UnixNano())
+			if frame.Type == protocol.Ping {
+				startWatchdog.Do(func() { close(heartbeats) })
 			}
 			startMeasuring.Do(func() { close(measuring) })
 			if frame.Type == protocol.Pong && stats.pong(frame.Payload) {
