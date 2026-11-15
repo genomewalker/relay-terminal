@@ -108,6 +108,38 @@ struct RelayInputDiagnosticSamplerTests {
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
     }
 
+    /// 234 live prompt-click-rejected events carried no reason because these
+    /// keys were dropped. They are booleans and a cell count, never text.
+    @Test func promptRefusalReasonsAreKeptAndTextIsNot() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("input.jsonl")
+        let diagnostics = RelayDiagnostics(inputLogURL: url)
+        diagnostics.record(category: "terminal-input", name: "prompt-click-rejected", details: [
+            "pane_id": "fixture", "selection_allowed": "true", "placement_allowed": "false",
+            "semantic_editing": "true", "near_prompt": "false", "movement": "-17", "mirror_reliable": "false",
+        ])
+        diagnostics.record(category: "terminal-input", name: "prompt-click-rejected", details: [
+            "pane_id": "fixture2", "movement": "unresolved", "reliable": "true", "redo": "false", "history": "true",
+        ])
+        diagnostics.record(category: "terminal-input", name: "prompt-click-rejected", details: [
+            "pane_id": "fixture3", "selection_allowed": "private-content-marker", "movement": "private-content-marker",
+            "near_prompt": "1", "mirror_reliable": "TRUE",
+        ])
+        diagnostics.flushInputLog()
+        let content = String(decoding: try Data(contentsOf: url), as: UTF8.self)
+        #expect(!content.contains("private-"))
+        let events = diagnostics.snapshot().events.filter { $0.name == "prompt-click-rejected" }
+        let first = try #require(events.first { $0.details["pane_id"] == "fixture" })
+        #expect(first.details == ["pane_id": "fixture", "selection_allowed": "true", "placement_allowed": "false",
+            "semantic_editing": "true", "near_prompt": "false", "movement": "-17", "mirror_reliable": "false"])
+        let second = try #require(events.first { $0.details["pane_id"] == "fixture2" })
+        #expect(second.details == ["pane_id": "fixture2", "movement": "unresolved", "reliable": "true",
+            "redo": "false", "history": "true"])
+        let third = try #require(events.first { $0.details["pane_id"] == "fixture3" })
+        #expect(third.details == ["pane_id": "fixture3"])
+    }
+
     @Test func journalRotatesAtBoundAndKeepsThreeArchives() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

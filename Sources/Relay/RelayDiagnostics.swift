@@ -70,7 +70,15 @@ final class RelayDiagnostics: @unchecked Sendable {
             "first_responder", "surface_visible", "focus_claimed", "window_key", "eligible",
             "presented", "app_active", "sheet_active", "success", "inspection_active", "paste_active",
             "bytes", "characters", "terminal_report", "acknowledged", "line"]
+        // Why a prompt click or history action was refused. Booleans and a
+        // signed cell count only; they never carry prompt text.
+        let flags: Set<String> = ["selection_allowed", "placement_allowed", "semantic_editing",
+            "near_prompt", "mirror_reliable", "reliable", "redo", "history"]
         return details.filter {
+                if flags.contains($0.key) { return $0.value == "true" || $0.value == "false" }
+                if $0.key == "movement" {
+                    return $0.value == "unresolved" || Int($0.value).map { abs($0) <= 1_000_000 } == true
+                }
                 guard allowed.contains($0.key) else { return false }
                 if $0.key == "bytes" || $0.key == "characters" || $0.key == "line" {
                     guard let count = Int($0.value), count >= 0, count <= 1_000_000_000 else { return false }
