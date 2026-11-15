@@ -951,11 +951,23 @@ struct RelayAgentAccountSyncResult: Decodable, Equatable, Sendable {
                            provider: provider, observedDirectory: observedDirectory)
     }
 
+    /// The host's configured account the running agent uses, when its
+    /// registry is read.
+    func account(for profile: ConnectionProfile, provider: String, observedDirectory: String) -> RelayAgentAccount? {
+        Self.observedAccount(registry: statuses[Self.hostKey(profile)]?.map(\.account),
+                             provider: provider, observedDirectory: observedDirectory)
+    }
+
     /// `registry` nil (not read yet) or empty gives no label.
     nonisolated static func observedLabel(registry: [RelayAgentAccount]?, provider: String,
                                           observedDirectory: String) -> String? {
+        observedAccount(registry: registry, provider: provider, observedDirectory: observedDirectory)?.label
+    }
+
+    nonisolated static func observedAccount(registry: [RelayAgentAccount]?, provider: String,
+                                            observedDirectory: String) -> RelayAgentAccount? {
         guard let registry, !registry.isEmpty else { return nil }
-        return registry.first { $0.provider == provider && $0.matches(observedDirectory: observedDirectory) }?.label
+        return registry.first { $0.provider == provider && $0.matches(observedDirectory: observedDirectory) }
     }
 
     /// Panes whose running agent's account was observed, so a registry that
@@ -1029,17 +1041,19 @@ struct RelayAgentAccountSyncResult: Decodable, Equatable, Sendable {
 
     /// Re-derives the observed label of every pane on `key` that has an
     /// observed directory from the registry now cached for it, through the
-    /// same path a probe uses. Display only; `recorded` keeps precedence and
-    /// is never changed here.
+    /// same path a probe uses. `recorded` keeps precedence, except that a
+    /// recorded account the agent no longer uses is replaced by the
+    /// configured account it does use (see `observeAgentAccount`).
     func relabelObservedPanes(_ panes: [PaneModel], hostKey key: String) {
         let registry = statuses[key]?.map(\.account)
         for pane in panes where Self.hostKey(pane.profile) == key {
             guard let state = pane.agentAccount, let provider = state.observedProvider,
                   let directory = state.observedDirectory else { continue }
+            let configured = Self.observedAccount(registry: registry, provider: provider, observedDirectory: directory)
             let label = state.observedMatches == true && state.recorded?.provider == provider
-                ? state.recorded?.label
-                : Self.observedLabel(registry: registry, provider: provider, observedDirectory: directory)
-            pane.observeAgentAccount(provider: provider, directory: directory, label: label, matches: state.observedMatches)
+                ? state.recorded?.label : configured?.label
+            pane.observeAgentAccount(provider: provider, directory: directory, label: label,
+                                     matches: state.observedMatches, configured: configured)
         }
     }
 

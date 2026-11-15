@@ -7,6 +7,10 @@ import Foundation
 /// maintenance cannot switch accounts.
 enum RelayAgentAccountMoveOrigin: String, Codable, Sendable {
     case user, mcp, assistant, maintenance, quotaFailover
+    /// Not a move: Relay updated a pane's recorded account to the configured
+    /// account its running agent was found using. Logged so an account change
+    /// made outside Relay stays visible.
+    case observed
 }
 
 enum RelayAgentAccountMovePolicy {
@@ -33,7 +37,7 @@ enum RelayAgentAccountMovePolicy {
         case .user: return nil
         case .quotaFailover: return nil // additionally fenced by the durable scheduler intent below
         case .mcp: return inputGranted ? nil : "Moving a pane to another account requires the terminal input grant."
-        case .assistant, .maintenance:
+        case .assistant, .maintenance, .observed:
             return "Moving a pane to another account is user-initiated only; Miko and maintenance never switch accounts."
         }
     }

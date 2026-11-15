@@ -126,6 +126,55 @@ struct RelayAgentAccountLabelTests {
         #expect(pane.agentAccountLabel == "business")
     }
 
+    @Test("A recorded account the agent no longer uses becomes the configured account it does use, and is logged")
+    func driftedRecordFollowsTheConfiguredAccount() throws {
+        let directory = RelayAgentAccountDirectory()
+        directory.record(try dandyRegistry(), executables: nil, fromHost: "dandy-07", probeRequested: false)
+        let business = RelayAgentAccount(provider: "claude", label: "business", dir: "~/.claude-team")
+        let personal = RelayAgentAccount(provider: "claude", label: "personal", dir: "")
+        let configured = try #require(directory.account(for: dandy, provider: "claude", observedDirectory: ""))
+        #expect(configured == personal)
+
+        // 07fa914c (dandy-07, 2026-11-15): recorded personal, resumed by hand on ~/.claude-team.
+        let pane = PaneModel(profile: dandy)
+        pane.recordAgentAccount(personal)
+        pane.observeAgentAccount(provider: "claude", directory: "~/.claude-team", label: "business", matches: false,
+                                 configured: directory.account(for: dandy, provider: "claude",
+                                                               observedDirectory: "~/.claude-team"))
+        #expect(pane.agentAccount?.recorded == business)
+        #expect(pane.agentAccount?.mismatch == false)
+        #expect(pane.agentAccountDisplay == "business")
+        let logged = { RelayAgentAccountMoveAudit.shared.memory.filter { $0.paneID == pane.id } }
+        let record = try #require(logged().last)
+        #expect(logged().count == 1)
+        #expect(record.origin == .observed && record.from == personal && record.to == business)
+        // Seen again: nothing changes and nothing more is logged.
+        pane.observeAgentAccount(provider: "claude", directory: "~/.claude-team", label: "business", matches: true,
+                                 configured: business)
+        #expect(logged().count == 1)
+
+        // An unconfigured directory keeps the record and its warning.
+        let stray = PaneModel(profile: dandy)
+        stray.recordAgentAccount(business)
+        stray.observeAgentAccount(provider: "claude", directory: "~/.claude-other", label: nil, matches: false,
+                                  configured: directory.account(for: dandy, provider: "claude",
+                                                                observedDirectory: "~/.claude-other"))
+        #expect(stray.agentAccount?.recorded == business)
+        #expect(stray.agentAccount?.mismatch == true)
+
+        // Nothing recorded stays unrecorded; another provider's account is never taken.
+        let bare = PaneModel(profile: dandy)
+        bare.observeAgentAccount(provider: "claude", directory: "", label: "personal", configured: personal)
+        #expect(bare.agentAccount?.recorded == nil)
+        let codex = PaneModel(profile: dandy)
+        codex.recordAgentAccount(RelayAgentAccount(provider: "codex", label: "personal", dir: "~/.codex-personal"))
+        codex.observeAgentAccount(provider: "claude", directory: "", label: "personal", configured: personal)
+        #expect(codex.agentAccount?.recorded?.provider == "codex")
+
+        // Moves never start from an observation.
+        #expect(RelayAgentAccountMovePolicy.originRefusal(.observed, inputGranted: true) != nil)
+    }
+
     @Test("Move, resume and deferral sources stay the recorded account, never the observed or display label")
     func moveSourceIgnoresDisplay() throws {
         let directory = RelayAgentAccountDirectory()

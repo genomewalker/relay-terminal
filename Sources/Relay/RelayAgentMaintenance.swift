@@ -330,10 +330,11 @@ enum RelayAgentMaintenancePolicy {
         let proof = try decoder.decode(RelayAgentMaintenanceProbe.self, from: result.stdout)
         if expectAccount == nil, proof.valid(for: pane.id), let provider = proof.provider, let directory = proof.configDir {
             let matches = pane.agentAccount?.recorded?.provider == provider ? proof.accountMatches : nil
+            let configured = RelayAgentAccountDirectory.shared.account(for: profile, provider: provider,
+                                                                       observedDirectory: directory)
             pane.observeAgentAccount(provider: provider, directory: directory,
-                label: matches == true ? pane.agentAccount?.recorded?.label
-                    : RelayAgentAccountDirectory.shared.label(for: profile, provider: provider, observedDirectory: directory),
-                matches: matches)
+                label: matches == true ? pane.agentAccount?.recorded?.label : configured?.label,
+                matches: matches, configured: configured)
         }
         return proof
     }

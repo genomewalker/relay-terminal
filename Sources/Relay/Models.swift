@@ -2147,11 +2147,32 @@ extension PaneModel {
         if cached { accounts.relabelObservedPanes([self], hostKey: key) }
     }
 
-    func observeAgentAccount(provider: String, directory: String, label: String?, matches: Bool? = nil) {
+    /// `configured` is the host's configured account whose directory the
+    /// agent runs with. When the pane recorded a different account of the
+    /// same provider (the agent was restarted outside Relay's move), the
+    /// recorded account becomes `configured`, so the pane shows and resumes
+    /// with the account it really uses. A pane with nothing recorded, or an
+    /// agent on an unconfigured directory, keeps its record.
+    func observeAgentAccount(provider: String, directory: String, label: String?, matches: Bool? = nil,
+                             configured: RelayAgentAccount? = nil) {
         guard RelayAgentAccount.providers.contains(provider), RelayAgentAccount.validDirectory(directory) else { return }
         RelayAgentAccountDirectory.shared.trackObservedPane(self)
         var state = agentAccount ?? RelayPaneAgentAccountState()
-        guard state.observedProvider != provider || state.observedDirectory != directory || state.observedLabel != label ||
+        var label = label, matches = matches
+        if let configured, configured.isValid, configured.provider == provider,
+           configured.matches(observedDirectory: directory),
+           let recorded = state.recorded, recorded.provider == provider, recorded != configured,
+           matches == false || !recorded.matches(observedDirectory: directory) {
+            state.recorded = configured
+            label = configured.label
+            matches = true
+            RelayAgentAccountMoveAudit.shared.append(.init(id: UUID().uuidString, at: Date(), paneID: id,
+                host: profile.connectionKey, origin: .observed, provider: provider, sessionID: nil, from: recorded,
+                to: configured, state: "recorded",
+                detail: "The running agent uses \(configured.label), not the recorded \(recorded.label); Relay updated the record."))
+        }
+        guard state.recorded != agentAccount?.recorded ||
+              state.observedProvider != provider || state.observedDirectory != directory || state.observedLabel != label ||
               state.observedMatches != matches else { return }
         state.observedProvider = provider
         state.observedDirectory = directory
