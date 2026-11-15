@@ -356,7 +356,7 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                 guard proof.valid(for: pane.id), let agentPID = proof.processID else {
                     return finish("refused", proof.unavailable ?? "The agent's native identity could not be verified; nothing was sent.", proof)
                 }
-                if !RelayAgentMaintenancePolicy.forcedIdle(proof) {
+                if RelayAgentMaintenancePolicy.forcedNeedsInterrupt(proof) {
                     statuses[pane.id] = "Forced move: interrupting the agent's turn"
                     guard pane.pendingAgentApprovals == 0 else {
                         return finish("refused", "A permission prompt is waiting for your answer; a forced move does not answer it. Nothing was sent.", proof)

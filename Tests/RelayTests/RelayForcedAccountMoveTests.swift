@@ -94,7 +94,13 @@ struct RelayForcedAccountMoveTests {
         proof.forcedByUser = true
         #expect(RelayAgentMaintenancePolicy.explainedFooterAgents(proof, activeSubagents: 3)
             == RelayAgentMaintenancePrompt.allWorkExplained)
+        // 07fa914c: an ended turn with background shells reports "shell".
         proof.harnessStatus = "shell"
+        #expect(RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: true, hasDraft: false))
+        #expect(RelayAgentMaintenancePolicy.forcedNeedsInterrupt(proof))
+        proof.lifecycle = "active"
         #expect(!RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: true, hasDraft: false))
+        proof.harnessStatus = "idle"
+        #expect(!RelayAgentMaintenancePolicy.forcedNeedsInterrupt(proof))
     }
 }

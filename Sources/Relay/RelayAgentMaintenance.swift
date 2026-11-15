@@ -214,11 +214,23 @@ enum RelayAgentMaintenancePolicy {
     }
 
     /// A forced move's turn evidence: Claude's own harness status when it is
-    /// known ("busy" or "shell" is a running turn), else a quiet transcript.
-    /// Background shells and subagents are not consulted.
+    /// known, else a quiet transcript. Claude reports "shell" while background
+    /// shells run, also after its turn ended (07fa914c, 2026-11-15: "done ·
+    /// 2 shells still running"), so "shell" with a quiet transcript is idle.
+    /// Background shells and subagents are not otherwise consulted.
     static func forcedIdle(_ proof: RelayAgentMaintenanceProbe) -> Bool {
-        if proof.provider == "claude", let status = proof.harnessStatus { return status == "idle" }
+        if proof.provider == "claude", let status = proof.harnessStatus {
+            return status == "idle" || (status == "shell" && proof.lifecycle == "quiet")
+        }
         return proof.lifecycle == "quiet"
+    }
+
+    /// Whether a forced move first sends its Esc: anything but a harness that
+    /// says idle, since "shell" can also be a foreground command in a turn.
+    /// One Esc at an idle prompt changes nothing.
+    static func forcedNeedsInterrupt(_ proof: RelayAgentMaintenanceProbe) -> Bool {
+        if proof.provider == "claude", let status = proof.harnessStatus { return status != "idle" }
+        return proof.lifecycle != "quiet"
     }
 
     static func deferral(_ proof: RelayAgentMaintenanceProbe, paneID: UUID,

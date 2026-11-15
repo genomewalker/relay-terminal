@@ -132,7 +132,7 @@ struct RelayAgentAccountMoveDraftTests {
             var probe = try moveProbe(pane.id)
             probe.backgroundWork = true
             probe.subagentWork = true
-            probe.harnessStatus = turnRunning ? "busy" : "idle"
+            probe.harnessStatus = turnRunning ? "busy" : "shell"
             probe.lifecycle = turnRunning ? "active" : "quiet"
             return probe
         }
