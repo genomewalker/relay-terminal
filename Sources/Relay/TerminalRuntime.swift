@@ -1361,7 +1361,11 @@ final class TerminalRuntime: NSObject {
         applyLegacyTerminalModeCompatibilityIfNeeded(agentKind: kind)
     }
 
+    /// Tests only: observes each request for the attach repaint.
+    var initialRepaintRequestedForTesting: (() -> Void)?
+
     private func requestInitialRepaintIfReady() {
+        initialRepaintRequestedForTesting?()
         guard initialAuthoritativeRepaintPending, terminalWorkerCapabilitiesKnown,
               terminalReplayCaughtUp, initialReplayDisplayCommitted, initialReplayWritesResumed,
               allowsRendering, presentationAttachment.isPresented, view.window != nil,
@@ -1423,6 +1427,7 @@ final class TerminalRuntime: NSObject {
             var restoring = false
             var frameID: UUID?
             var succeeded = false
+            var outcome = "cancelled"
             defer {
                 native.cancel()
                 deadline.cancel()
@@ -1451,11 +1456,19 @@ final class TerminalRuntime: NSObject {
                 }
                 RelayDiagnostics.shared.record(category: "snapshot",
                     name: succeeded ? "agent-width-repaint-completed" : "agent-width-repaint-incomplete",
-                    details: ["pane_id": self.pane?.id.uuidString.lowercased() ?? "unknown"])
+                    details: ["pane_id": self.pane?.id.uuidString.lowercased() ?? "unknown",
+                              "reason": succeeded ? "frame" : outcome])
             }
             for await event in events {
-                guard !Task.isCancelled, self.started, self.presentationAttachment.isPresented,
-                      self.view.window != nil, self.view.bounds.size == originalBounds else { return }
+                guard !Task.isCancelled else { return }
+                guard self.started, self.presentationAttachment.isPresented, self.view.window != nil else {
+                    outcome = "hidden"
+                    return
+                }
+                guard self.view.bounds.size == originalBounds else {
+                    outcome = "bounds-changed"
+                    return
+                }
                 switch event {
                 case .viewport(let viewport):
                     let target = restoring ? original : wide
@@ -1476,6 +1489,7 @@ final class TerminalRuntime: NSObject {
                     self.io.beginObservedViewportResize()
                     self.view.restoreViewportAfterInspection()
                 case .timeout:
+                    outcome = restoring ? "timeout-restoring" : "timeout"
                     return
                 }
             }

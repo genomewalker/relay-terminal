@@ -49,8 +49,9 @@ final class RelayDiagnostics: @unchecked Sendable {
     private let inputLogURL: URL
 
     /// Categories also written to the connection journal as they happen, so
-    /// the lead-up to a stuck reconnect survives a restart or crash.
-    static let connectionJournalCategories: Set<String> = ["connection", "pane", "network", "app"]
+    /// the lead-up to a stuck reconnect, or a restored pane that never got
+    /// its repaint, survives a restart or crash.
+    static let connectionJournalCategories: Set<String> = ["connection", "pane", "network", "app", "snapshot"]
     /// Journal events included in an export: earlier launches as well as this one.
     static let exportedJournalLimit = 2_000
     private let connectionLogURL: URL?

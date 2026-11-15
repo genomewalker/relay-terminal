@@ -22,15 +22,16 @@ struct RelayConnectionJournalTests {
         diagnostics.record(category: "pane", name: "reconnecting", details: ["pane_id": "fixture"])
         diagnostics.record(category: "network", name: "peer-discovery-failed", details: ["host": "This Mac"])
         diagnostics.record(category: "app", name: "launched")
-        // Other categories stay in memory only.
+        // A restored pane's repaint outcome must survive the next restart.
         diagnostics.record(category: "snapshot", name: "restored")
+        // Other categories stay in memory only.
         diagnostics.record(category: "assistant", name: "turn")
         diagnostics.flushInputLog()
 
         let content = try String(contentsOf: url, encoding: .utf8)
         #expect(!content.contains("must-not-survive"))
         let names = diagnostics.connectionJournal().map(\.name)
-        #expect(names == ["disconnected", "reconnecting", "peer-discovery-failed", "launched"])
+        #expect(names == ["disconnected", "reconnecting", "peer-discovery-failed", "launched", "restored"])
         #expect(diagnostics.connectionJournal().first?.details["retry"] == "true")
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
