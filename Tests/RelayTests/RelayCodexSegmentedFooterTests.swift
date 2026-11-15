@@ -72,6 +72,25 @@ struct RelayCodexSegmentedFooterTests {
         #expect(!empty(CapturedCodex.screen(footer: [CapturedCodex.contextLine, CapturedCodex.contextLine, CapturedCodex.hintLine])))
     }
 
+    /// Pane 372a79db (dandy-07, 2026-11-15): the status line wrapped onto a
+    /// second row in a narrow pane, and every account move was refused with
+    /// "the screen's prompt or footer was not recognised".
+    @Test func aWrappedStatusLineIsStillTheIdleFooter() {
+        let model = "  GPT-6.1 Terra medium · /maps/projects/fernandezguerra/apps/repos/convergence · GPT-6.1 Terra"
+        let wrapped = "  · convergence · fix/compound-linkage-routing-20261007"
+        let hint = "  ← for agents · ? for shortcuts" + String(repeating: " ", count: 36) + "⚠ 3 warnings · f2 to view"
+        let above = String(repeating: " ", count: 55) + "⚠ weekly limit: only 1% left · /status"
+        #expect(empty(CapturedCodex.screen(above: above, footer: [model, wrapped, hint])))
+        #expect(empty(CapturedCodex.screen(footer: [model, wrapped, wrapped, hint])))
+        // Still refused: a hint row is required, at most two wrapped rows,
+        // a typed draft, and unknown rows after the hint.
+        #expect(!empty(CapturedCodex.screen(footer: [model, wrapped])))
+        #expect(!empty(CapturedCodex.screen(footer: [model, wrapped, wrapped, wrapped, hint])))
+        #expect(!empty(CapturedCodex.screen(input: "run the pilot", footer: [model, wrapped, hint])))
+        #expect(!empty(CapturedCodex.screen(footer: [model, wrapped, hint, "  something else"])))
+        #expect(!empty(CapturedCodex.screen(footer: [model, "  something else", hint])))
+    }
+
     @Test func theSegmentRuleItself() {
         #expect(RelayAgentMaintenancePrompt.codexSegmentedIdleHint("← for agents · ? for shortcuts"))
         #expect(RelayAgentMaintenancePrompt.codexSegmentedIdleHint("← for agents · ? for shortcuts   ⚠ 1 warning · f2 to view"))

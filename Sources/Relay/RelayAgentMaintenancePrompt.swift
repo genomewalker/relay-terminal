@@ -119,11 +119,15 @@ enum RelayAgentMaintenancePrompt {
             // The status line's items are user-configured: it opens with the
             // model and may omit the context segment ("GPT-6.1 Terra high ·
             // ~/cwd · thread title"). At most one row may name the context.
-            // The model row, then one or two hint rows directly below it.
-            guard (2...3).contains(footer.count), let first = footer.first, first.contains(" · "),
+            // The model row, which a narrow pane wraps onto at most two rows
+            // that continue its " · " list ("· convergence · fix/branch"),
+            // then one or two hint rows directly below it.
+            let continuation = footer.dropFirst().prefix { $0.hasPrefix("· ") && !$0.hasPrefix("· ?") }.count
+            let hints = footer.dropFirst(1 + continuation)
+            guard continuation <= 2, (1...2).contains(hints.count), let first = footer.first, first.contains(" · "),
                   (first.lowercased().hasPrefix("gpt-") || first.lowercased().hasPrefix("openai")),
                   footer.filter({ $0.localizedCaseInsensitiveContains("context") }).count <= 1,
-                  footer.dropFirst().allSatisfy({ value in
+                  hints.allSatisfy({ value in
                       codexIdleHints.contains { value.hasPrefix($0) } || codexSegmentedIdleHint(value) })
             else { return false }
             // A running turn shows its status row just above the composer.
