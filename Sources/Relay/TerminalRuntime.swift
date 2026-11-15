@@ -4014,7 +4014,7 @@ final class TerminalRuntime: NSObject {
         if paths.isEmpty {
             guard case .web(let url)? = targets.first else { return nil }
             RelayBrowserController.shared.open(url, profile: pane.profile, directory: pane.directory,
-                                               near: view.window, takeFocus: false, anchor: pane.id)
+                                               near: view.window, takeFocus: false, anchor: pane.id, byAgent: true)
             return .browser(url)
         }
         return presentQuickLook(targets, start: nil, takeFocus: false) ? .quickLook : nil

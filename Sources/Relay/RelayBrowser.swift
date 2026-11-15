@@ -88,8 +88,10 @@ enum RelayBrowserRouting {
     @Published private(set) var error: String?
     @Published private(set) var busy = false
     @Published private(set) var revision = 0
-    /// A host port a page (not the user) asked for; opened only on confirm.
+    /// A host port a page or an agent (not the user) asked for; opened only on confirm.
     @Published private(set) var confirm: URL?
+    /// Whether `confirm` came from an agent rather than from a page.
+    @Published private(set) var confirmFromAgent = false
     private var directory: String
     private var tunnels: [Int: RHttpgdRelayBridge] = [:]
     private var opening: [Int: Task<Void, Never>] = [:]
@@ -154,18 +156,21 @@ enum RelayBrowserRouting {
         if let directory, directory.hasPrefix("/") { self.directory = directory }
     }
 
-    /// A URL the user chose: a pane click or the address bar.
-    func open(_ url: URL) {
+    /// A URL the user chose (a pane click or the address bar) or, with
+    /// `byAgent`, one an agent asked for. An agent's page on a host port that
+    /// is not carried yet waits for the user to open that port.
+    func open(_ url: URL, byAgent: Bool = false) {
         address = url.absoluteString
-        go(url, byUser: true)
+        go(url, byUser: !byAgent, byAgent: byAgent)
     }
 
     func confirmPort() {
         guard let url = confirm else { return }
         confirm = nil
+        confirmFromAgent = false
         go(url, byUser: true)
     }
-    func declinePort() { confirm = nil }
+    func declinePort() { confirm = nil; confirmFromAgent = false }
 
     func navigate() {
         guard let url = WorkspaceBrowserAddress.parse(address) else {
@@ -189,17 +194,18 @@ enum RelayBrowserRouting {
         tunnels.values.forEach { $0.close() }; tunnels = [:]
         pending = nil
         confirm = nil
+        confirmFromAgent = false
         busy = false
         error = nil
         address = ""
         if remote { updateGuard() }
     }
 
-    private func go(_ url: URL, byUser: Bool) {
+    private func go(_ url: URL, byUser: Bool, byAgent: Bool = false) {
         switch RelayBrowserRouting.route(url, remote: remote, tunnels: portMap) {
         case .load(let target): load(target)
         case .tunnel(let port) where byUser: carry(port, then: url)
-        case .tunnel: confirm = url
+        case .tunnel: confirm = url; confirmFromAgent = byAgent
         case .blocked(let message): error = message
         }
     }
@@ -291,7 +297,9 @@ enum RelayBrowserRouting {
             // another host port; anything else asks first.
             let source = navigationAction.sourceFrame.request.url
             let fromCarried = source.map { RelayBrowserRouting.isLoopback($0) && portMap.values.contains(RelayBrowserRouting.port($0)) } ?? false
-            if mainFrame { fromCarried ? carry(port, then: url) : (confirm = url) }
+            if mainFrame {
+                if fromCarried { carry(port, then: url) } else { confirm = url; confirmFromAgent = false }
+            }
         case .blocked(let message):
             decisionHandler(.cancel)
             if mainFrame { error = message }
@@ -333,7 +341,7 @@ enum RelayBrowserRouting {
     private var anchors: [String: UUID] = [:]
 
     func open(_ url: URL?, profile: ConnectionProfile, directory: String?, near window: NSWindow?, takeFocus: Bool = true,
-              anchor: UUID? = nil) {
+              anchor: UUID? = nil, byAgent: Bool = false) {
         let key = Self.key(profile)
         if let anchor { anchors[key] = anchor }
         let entry = panels[key].flatMap { $0.session.profile == profile ? $0 : nil } ?? make(profile: profile, directory: directory)
@@ -347,7 +355,7 @@ enum RelayBrowserRouting {
             }
         }
         if takeFocus { entry.panel.makeKeyAndOrderFront(nil) } else { entry.panel.orderFront(nil) }
-        if let url { entry.session.open(url) }
+        if let url { entry.session.open(url, byAgent: byAgent) }
     }
 
     /// The session of a panel that is open now; a closed panel's page is gone.
@@ -446,7 +454,7 @@ struct RelayBrowserView: View {
             .background(RelayTheme.surface)
             if let url = session.confirm {
                 HStack(spacing: 8) {
-                    Text("This page wants \(session.hostLabel) localhost:\(RelayBrowserRouting.port(url)).")
+                    Text("\(session.confirmFromAgent ? "An agent" : "This page") wants \(session.hostLabel) localhost:\(RelayBrowserRouting.port(url)).")
                         .font(.caption).foregroundStyle(RelayTheme.text)
                     Spacer()
                     Button("Open Port") { session.confirmPort() }
