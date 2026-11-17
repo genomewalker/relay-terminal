@@ -1513,3 +1513,43 @@ struct RelayContextRotationSendObservationTests {
         #expect(fixture.writer.inputs.count == 1)
     }
 }
+
+// MARK: - relay_launch_agent typing into a pane that was never shown
+
+@MainActor @Suite("Launch command on a never-shown shell pane", .serialized)
+struct RelayLaunchHiddenShellTests {
+    @Test("A hidden shell's OSC 133 empty prompt and current replay proof admit the launch command", .timeLimit(.minutes(1)))
+    func hiddenPromptAdmitsLaunch() async throws {
+        let fixture = HiddenShellFixture(replay: true)
+        defer { fixture.close() }
+        let runtime = fixture.pane.runtime
+        #expect(runtime.observeActiveScreen() == .noSurface)
+        // The visible-only check cannot see a hidden prompt; the launch gate can.
+        #expect(!runtime.assistantShellPromptIsEmpty())
+        #expect(await runtime.launchShellPromptIsEmpty())
+        #expect(await runtime.sendLaunchShellCommand("{ cd -- '/tmp' || (exit 97); } && (true)"))
+        #expect(fixture.writer.inputs.count == 1)
+        #expect(fixture.writer.inputs.first.map { String(decoding: $0, as: UTF8.self).contains("cd -- '/tmp'") } == true)
+    }
+
+    @Test("Without a replay proof, an unauthorized caller, or after new output, nothing is typed", .timeLimit(.minutes(1)))
+    func hiddenLaunchRefusals() async throws {
+        let noProof = HiddenShellFixture(replay: false)
+        #expect(await !noProof.pane.runtime.sendLaunchShellCommand("true"))
+        #expect(noProof.writer.inputs.isEmpty)
+        noProof.close()
+
+        let unauthorized = HiddenShellFixture(replay: true)
+        #expect(await !unauthorized.pane.runtime.sendLaunchShellCommand("true", authorization: { false }))
+        #expect(unauthorized.writer.inputs.isEmpty)
+        unauthorized.close()
+
+        let typed = HiddenShellFixture(replay: true)
+        defer { typed.close() }
+        // The shell echoed a draft after its input start: not empty.
+        #expect(typed.pane.runtime.ioForTesting.receive(Data("ls".utf8), remoteSequence: 101))
+        #expect(await !typed.pane.runtime.launchShellPromptIsEmpty())
+        #expect(await !typed.pane.runtime.sendLaunchShellCommand("true"))
+        #expect(typed.writer.inputs.isEmpty)
+    }
+}

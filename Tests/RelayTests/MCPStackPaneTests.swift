@@ -121,7 +121,9 @@ struct MCPStackPaneTests {
         #expect(f.workspace.panes[created]?.profile.kind == .local)
         #expect(f.b1.stack(containing: y)?.members == [y, created])
         #expect(result.stackID == f.b1.stack(containing: y)?.id.uuidString.lowercased())
-        #expect(f.b1.layout.paneIDs == [created] && Self.isStacked(created, with: y, in: f.workspace))
+        // An agent's new pane joins hidden: the stack keeps showing y.
+        #expect(f.b1.layout.paneIDs == [y] && Self.isStacked(created, with: y, in: f.workspace))
+        #expect(result.selectedPaneID == y.uuidString.lowercased())
         // Idempotent by request ID: the same request creates nothing more.
         let again = handler.newStackedPane(Self.newStacked(instance, id, onto: y, host: "This Mac"), instance: instance,
                                            permits: F.all, workspace: f.workspace, resolve: Self.resolve)
