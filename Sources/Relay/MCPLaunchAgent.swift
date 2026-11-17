@@ -70,10 +70,10 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
 
 /// The one shell command typed into the new pane.
 enum MCPLaunchAgentCommand {
-    /// The new shell exits with this when cd, reading the brief or exec fails,
-    /// so a Relay launch failure is never mistaken for a provider outcome.
+    /// The launch command returns this when cd, reading the brief or exec
+    /// fails, so a Relay launch failure is never mistaken for a provider outcome.
     static let launchFailureExitCode = 97
-    /// Exits that mean the launch, not the provider, failed when no binding
+    /// Statuses that mean the launch, not the provider, failed when no binding
     /// was seen: 97 from this command, 126/127 from env when the launcher
     /// cannot be executed.
     static let launchFailureExitCodes: Set<Int> = [97, 126, 127]
@@ -85,12 +85,19 @@ enum MCPLaunchAgentCommand {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    /// `cd` to cwd, read the brief, and exec the provider through Relay's exact
-    /// managed launcher with only the account's variable set (or, for the
-    /// default account, unset). The shell itself refuses an unreadable, empty
-    /// or option-like brief, so a brief changed after validation can never
-    /// become a CLI flag or launch an agent without it. The prompt is the last
-    /// argument. nil when any value does not qualify.
+    /// `cd` to cwd in the pane's shell, then in a subshell read the brief and
+    /// exec the provider through Relay's exact managed launcher with only the
+    /// account's variable set (or, for the default account, unset). The
+    /// provider is a child of the pane's interactive shell, never a
+    /// replacement for it: when the agent exits the shell prompt returns in
+    /// cwd, where an account move types its resume command. The brief lives
+    /// only in the subshell, so it is never a variable of the interactive
+    /// shell. The subshell refuses an unreadable, empty or option-like brief,
+    /// so a brief changed after validation can never become a CLI flag or
+    /// launch an agent without it. A cd, brief or exec failure returns 97
+    /// (126/127 when env cannot run the launcher); any other status is the
+    /// provider's own. The prompt is the last argument. nil when any value
+    /// does not qualify.
     static let permissionModes: Set<String> = ["account", "ask", "read_only", "yolo"]
 
     /// The provider's own flags for a permission mode; none for "account",
@@ -119,14 +126,17 @@ enum MCPLaunchAgentCommand {
         let environment = assignment.hasPrefix("env ") ? assignment : "env " + assignment
         let flag = account.provider == "codex" ? "-m" : "--model"
         let failure = String(launchFailureExitCode)
-        let command = "cd -- " + quote(cwd) +
+        // `exit` only inside the parentheses: it ends the subshell, never the
+        // pane's shell. Nothing follows the provider, so its status is the
+        // command's status.
+        let command = "{ cd -- " + quote(cwd) + " || (exit " + failure + "); }" +
             // Unquoted on purpose: an assignment does not split, and no double
             // quote surrounds the path, so `!` never meets history expansion.
-            " && relay_brief=$(cat -- " + quote(briefPath) + ")" +
+            " && (relay_brief=$(cat -- " + quote(briefPath) + ")" +
             " && case \"$relay_brief\" in ''|-*) exit " + failure + ";; esac" +
             " && exec " + environment + " " + RelayAgentAccount.managedShimCommand(account.provider) +
             " " + flag + " " + quote(model) + permission.map { " " + $0 }.joined() +
-            " \"$relay_brief\" || exit " + failure
+            " \"$relay_brief\" || exit " + failure + ")"
         return command.utf8.count <= commandLimit ? command : nil
     }
 
@@ -341,14 +351,63 @@ enum MCPLaunchAgentObservation {
                 "do you trust this directory"].contains { text.contains($0) }
     }
 
+    /// How the launch ended. The provider runs as a child of the pane's
+    /// shell, so the shell's own report of the launch command returning
+    /// (OSC 133;D, as relay_wait_for_command reads it) is the provider's
+    /// exit. The pane's process exiting is the fallback when the shell
+    /// reports no command status.
+    struct Ending: Equatable {
+        enum Source: Equatable { case command, pane }
+        var source: Source
+        /// nil when the command returned but its status cannot be attributed
+        /// to the launch command (none reported, or a later command returned too).
+        var code: Int?
+    }
+
+    /// The launch command's progress from the shell's command markers, given
+    /// the handle (`executions`) read just before it was typed.
+    enum CommandReport: Equatable {
+        case running
+        case returned(Int?)
+        /// The markers cannot tell: no shell integration, or the transport
+        /// was replaced so its generations are not comparable.
+        case unavailable(String)
+    }
+
+    static func commandReport(_ observation: TerminalSemanticPromptStateTracker.CommandObservation, after: UInt64,
+                              producerChanged: Bool) -> CommandReport {
+        if producerChanged {
+            return .unavailable("the pane's terminal transport reconnected after the launch, so its command status is not comparable")
+        }
+        guard observation.completedExecutions > after else {
+            return observation.integrationSeen ? .running : .unavailable("the pane reports no shell integration (OSC 133)")
+        }
+        // The launch command is the first command after the handle; a later
+        // one's status is never reported as the provider's.
+        return .returned(observation.completedExecutions == after + 1 ? observation.exitStatus : nil)
+    }
+
     /// The provider stage. `exitCode` is the pane's exit status once its
-    /// process ended (nil while it runs). Admission and refusal latch; a
-    /// refusal counts only before any admitted output.
+    /// process ended (nil while it runs).
     static func provider(_ previous: MCPLaunchAgentReceipt.Provider, evidence: TranscriptEvidence?,
                          exitCode: Int?, everBound: Bool, hasTranscriptPath: Bool, transcriptReadable: Bool,
                          screen: String?, paneClosed: Bool = false,
                          trustPrompt: Bool = false) -> MCPLaunchAgentReceipt.Provider {
+        provider(previous, evidence: evidence, ending: exitCode.map { Ending(source: .pane, code: $0) },
+                 everBound: everBound, hasTranscriptPath: hasTranscriptPath, transcriptReadable: transcriptReadable,
+                 screen: screen, paneClosed: paneClosed, trustPrompt: trustPrompt)
+    }
+
+    /// The provider stage from how the launch ended (nil while it runs).
+    /// Admission and refusal latch; a refusal counts only before any
+    /// admitted output. `exitUnobservable` says why an end could not be
+    /// seen even if it happened.
+    static func provider(_ previous: MCPLaunchAgentReceipt.Provider, evidence: TranscriptEvidence?,
+                         ending: Ending?, everBound: Bool, hasTranscriptPath: Bool, transcriptReadable: Bool,
+                         screen: String?, paneClosed: Bool = false, trustPrompt: Bool = false,
+                         exitUnobservable: String? = nil) -> MCPLaunchAgentReceipt.Provider {
         if previous.status == "refused" { return previous }
+        let exitCode = ending?.code
         var stage = previous
         if let model = evidence?.model { stage.observedModel = model }
         let admitted = previous.admitted == true || evidence?.admitted == true
@@ -363,19 +422,32 @@ enum MCPLaunchAgentObservation {
             stage.detail = "Codex reported an error event before any output; it may be a refusal or a transient failure."
             return stage
         }
-        if let code = exitCode {
-            stage.exitCode = code
+        if let ending {
+            let byCommand = ending.source == .command
+            stage.exitCode = exitCode
+            guard let code = exitCode else {
+                // The command returned; its status is not the launch's own.
+                stage.evidence = "exit"
+                stage.excerpt = admitted ? nil : screen.map { excerpt($0) }
+                stage.status = admitted ? "exited" : "unknown"
+                stage.detail = (admitted ? "The provider admitted the brief and later exited" : "The launch command returned before any assistant output") +
+                    "; its exit status is not known (none was reported, or a later command in the pane also returned)."
+                return stage
+            }
             if MCPLaunchAgentCommand.launchFailureExitCodes.contains(code) && !everBound && !admitted {
                 stage.status = "unknown"; stage.evidence = "none"
                 stage.excerpt = screen.map { excerpt($0) }
-                stage.detail = "The provider never started: the new pane exited \(code) (cd, brief, or Relay's launcher failed); see started."
+                stage.detail = byCommand
+                    ? "The provider never started: the launch command returned \(code) (cd, brief, or Relay's launcher failed); see started."
+                    : "The provider never started: the new pane exited \(code) (cd, brief, or Relay's launcher failed); see started."
                 return stage
             }
             stage.evidence = "exit"
             stage.excerpt = admitted ? nil : screen.map { excerpt($0) }
             if !everBound && !admitted && code != 0 {
                 stage.status = "unknown"
-                stage.detail = "The pane's process exited \(code) before a verified binding; it may be the provider or Relay's launcher. See excerpt."
+                stage.detail = (byCommand ? "The launch command returned \(code)" : "The pane's process exited \(code)") +
+                    " before a verified binding; it may be the provider or Relay's launcher. See excerpt."
                 return stage
             }
             if !admitted && code != 0 {
@@ -386,6 +458,7 @@ enum MCPLaunchAgentObservation {
                 stage.detail = admitted ? "The provider admitted the brief and later exited \(code)."
                     : "The provider exited \(code) before any assistant output."
             }
+            if byCommand { stage.detail? += " The pane's shell is back at its prompt." }
             return stage
         }
         if admitted {
@@ -408,9 +481,16 @@ enum MCPLaunchAgentObservation {
             stage.detail = "The verified binding names no transcript, so assistant output cannot be observed."
             return stage
         }
+        if everBound, let exitUnobservable {
+            stage.status = "unknown"; stage.evidence = "none"
+            stage.detail = (transcriptReadable ? "Bound; no assistant output yet." : "Bound; the transcript is not readable yet.") +
+                " The provider's exit cannot be observed: " + exitUnobservable + ". Repeat the call to re-observe."
+            return stage
+        }
         stage.status = "pending"; stage.evidence = "none"
         stage.detail = !everBound ? "Waiting for the agent's verified binding."
             : transcriptReadable ? "Bound; no assistant output yet." : "Bound; the transcript is not readable yet."
+        if !everBound, let exitUnobservable { stage.detail? += " A launch failure cannot be observed: " + exitUnobservable + "." }
         return stage
     }
 
@@ -418,6 +498,13 @@ enum MCPLaunchAgentObservation {
     /// it is not withdrawn when the agent later exits.
     static func bound(_ previous: MCPLaunchAgentReceipt.Bound, binding: [String: Any]?, unavailable: String?,
                       exitCode: Int?, paneClosed: Bool, target: RelayAgentAccount, home: String? = nil,
+                      label: (String) -> String?) -> MCPLaunchAgentReceipt.Bound {
+        bound(previous, binding: binding, unavailable: unavailable, ending: exitCode.map { Ending(source: .pane, code: $0) },
+              paneClosed: paneClosed, target: target, home: home, label: label)
+    }
+
+    static func bound(_ previous: MCPLaunchAgentReceipt.Bound, binding: [String: Any]?, unavailable: String?,
+                      ending: Ending?, paneClosed: Bool, target: RelayAgentAccount, home: String? = nil,
                       label: (String) -> String?) -> MCPLaunchAgentReceipt.Bound {
         if previous.status == "bound" { return previous }
         var stage = previous
@@ -445,8 +532,11 @@ enum MCPLaunchAgentObservation {
         }
         if paneClosed {
             stage.status = "failed"; stage.reason = "The pane was closed before a verified binding"
-        } else if let exitCode {
-            stage.status = "failed"; stage.reason = "The pane exited (\(exitCode)) before a verified binding"
+        } else if let ending {
+            let code = ending.code.map { " (\($0))" } ?? ""
+            stage.status = "failed"
+            stage.reason = ending.source == .command ? "The launch command returned\(code) before a verified binding"
+                : "The pane exited\(code) before a verified binding"
         } else {
             stage.status = "pending"
             stage.reason = unavailable.map { excerpt($0, limit: 300) }
@@ -505,13 +595,18 @@ enum MCPAgentBindingRead {
         var readFile: @MainActor (ConnectionProfile, String, Int) async throws -> Data
         /// A bounded prefix of a file (transcripts); nil when unreadable.
         var readPrefix: @MainActor (ConnectionProfile, String, Int) async -> Data?
-        /// Waits for the new pane's empty shell prompt, then types; nil once submitted.
-        var start: @MainActor (PaneModel, String, ContinuousClock.Instant, @escaping @MainActor () -> Bool) async -> String?
+        /// Waits for the new pane's empty shell prompt, calls the last
+        /// argument just before typing, then types; nil once submitted.
+        var start: @MainActor (PaneModel, String, ContinuousClock.Instant, @escaping @MainActor () -> Bool,
+                               @escaping @MainActor () -> Void) async -> String?
         var readBinding: @MainActor (PaneModel, UUID, WorkspaceModel) async -> MCPAgentBindingRead.Outcome
         var screen: @MainActor (PaneModel) async -> String?
         var accountLabel: @MainActor (ConnectionProfile, String, String) -> String?
         /// The host's $HOME and the physical form of cwd (`pwd -P`); nil when unknown.
         var hostPaths: @MainActor (ConnectionProfile, String) async -> (home: String?, cwd: String?) = { _, _ in (nil, nil) }
+        /// The shell's command markers, as relay_wait_for_command reads them.
+        var commandState: @MainActor (PaneModel) -> (producer: UUID,
+            observation: TerminalSemanticPromptStateTracker.CommandObservation)? = { $0.runtime.commandWaitContext }
         /// Whole first call (relay-mcp's HTTP client allows 60 s), the part of
         /// it the new shell may take to show an empty prompt, and one replay's
         /// observation. A stalled host RPC can still extend a call.
@@ -532,6 +627,11 @@ enum MCPAgentBindingRead {
         var pathsRead = false
         var home: String?
         var physicalCwd: String?
+        /// The transport and command count just before the launch command
+        /// was typed; the next command to return is the launch command.
+        var commandHandle: (producer: UUID, after: UInt64)?
+        /// The launch command's return, latched once seen.
+        var commandEnding: MCPLaunchAgentObservation.Ending?
     }
     private var entries: [UUID: Entry] = [:]
     let receiptLimit: Int
@@ -651,7 +751,12 @@ enum MCPAgentBindingRead {
         }
         // The shell gets part of the budget; the rest is for a first observation.
         let shellDeadline = min(deadline, ContinuousClock.now + environment.shellBudget)
-        if let reason = await environment.start(pane, command, shellDeadline, authorized) {
+        let willSend: @MainActor () -> Void = { [weak self] in
+            self?.update(proposal.requestID) {
+                $0.commandHandle = environment.commandState(pane).map { ($0.producer, $0.observation.executions) }
+            }
+        }
+        if let reason = await environment.start(pane, command, shellDeadline, authorized, willSend) {
             update(proposal.requestID) {
                 $0.receipt.started = .init(status: "failed", reason: reason)
                 $0.receipt.provider = .init(status: "unknown", evidence: "none", detail: "No agent was started.")
@@ -720,11 +825,33 @@ enum MCPAgentBindingRead {
             case .unavailable(let reason), .conflict(let reason): unavailable = reason
             }
         }
-        let exitCode = live()?.remoteExitCode
+        // The provider runs under the pane's shell, so its exit is the launch
+        // command returning. Without the shell's command status, only the
+        // pane's own exit (the previous behaviour) can be seen.
+        var ending = live()?.remoteExitCode.map { MCPLaunchAgentObservation.Ending(source: .pane, code: $0) }
+        var exitUnobservable: String?
+        if let latched = entries[requestID]?.commandEnding {
+            ending = latched
+        } else if let handle = entries[requestID]?.commandHandle {
+            if let current = live(), let state = environment.commandState(current) {
+                switch MCPLaunchAgentObservation.commandReport(state.observation, after: handle.after,
+                                                               producerChanged: state.producer != handle.producer) {
+                case .returned(let code):
+                    let returned = MCPLaunchAgentObservation.Ending(source: .command, code: code)
+                    entries[requestID]?.commandEnding = returned
+                    ending = returned
+                case .running: break
+                case .unavailable(let reason): if ending == nil { exitUnobservable = reason }
+                }
+            }
+        } else if ending == nil {
+            exitUnobservable = "the pane's command status was not readable when the launch command was typed"
+        }
+        let exitCode = ending?.code
         let paneClosed = live() == nil
         guard var receipt = entries[requestID]?.receipt else { return }
         receipt.bound = MCPLaunchAgentObservation.bound(receipt.bound, binding: binding, unavailable: unavailable,
-            exitCode: exitCode, paneClosed: paneClosed, target: account, home: home,
+            ending: ending, paneClosed: paneClosed, target: account, home: home,
             label: { environment.accountLabel(profile, account.provider, $0) })
         // Claude's binding may name no transcript; its path follows from the
         // config directory, the physical cwd and the session.
@@ -748,16 +875,18 @@ enum MCPAgentBindingRead {
         var screen: String?
         // Before a binding the screen also shows a provider waiting at its
         // workspace trust prompt; it is read, never answered.
-        if (exitCode != nil || receipt.bound.status != "bound"), let current = live() { screen = await environment.screen(current) }
-        let trust = exitCode == nil && receipt.provider.admitted != true && MCPLaunchAgentObservation.trustPrompt(screen)
+        if (ending != nil || receipt.bound.status != "bound"), let current = live() { screen = await environment.screen(current) }
+        let trust = ending == nil && receipt.provider.admitted != true && MCPLaunchAgentObservation.trustPrompt(screen)
         guard entries[requestID] != nil else { return }
-        receipt.provider = MCPLaunchAgentObservation.provider(receipt.provider, evidence: evidence, exitCode: exitCode,
+        receipt.provider = MCPLaunchAgentObservation.provider(receipt.provider, evidence: evidence, ending: ending,
             everBound: receipt.bound.status == "bound", hasTranscriptPath: receipt.bound.transcriptPath != nil,
-            transcriptReadable: readable, screen: exitCode != nil ? screen : nil, paneClosed: paneClosed, trustPrompt: trust)
+            transcriptReadable: readable, screen: ending != nil ? screen : nil, paneClosed: paneClosed, trustPrompt: trust,
+            exitUnobservable: exitUnobservable)
         if trust, receipt.bound.status == "pending" { receipt.bound.reason = "Waiting at the provider's workspace trust prompt" }
         if receipt.bound.status == "failed", let code = exitCode, MCPLaunchAgentCommand.launchFailureExitCodes.contains(code) {
             receipt.started = .init(status: "failed",
-                reason: "The new pane exited \(code) before a binding: cd to cwd, reading the brief, or executing Relay's launcher failed")
+                reason: (ending?.source == .command ? "The launch command returned \(code)" : "The new pane exited \(code)") +
+                    " before a binding: cd to cwd, reading the brief, or executing Relay's launcher failed")
             receipt.status = "launch_failed"
         }
         receipt.observedAt = ISO8601DateFormatter().string(from: Date())
@@ -805,9 +934,10 @@ enum MCPAgentBindingRead {
                                                      profile: profile)
                 (paneID, tabID) = (made.paneID, made.tabID)
             } else {
-                // No anchor: a new tab in the active session, filed like an MCP tab.
-                workspace.newTabInActiveSession(profile: profile, origin: .agent(sourcePane: nil))
-                (paneID, tabID) = (workspace.activePaneID, workspace.selectedTabID)
+                // No anchor: a new tab in the active session, filed like an
+                // MCP tab and created in the background.
+                let made = workspace.newTabInActiveSession(profile: profile, origin: .agent(sourcePane: nil))
+                (paneID, tabID) = (made?.paneID, made?.tabID)
             }
         } catch {
             let made = fresh()
@@ -871,18 +1001,23 @@ extension MCPLaunchAgentRequests.Environment {
                 if let last = data.lastIndex(of: UInt8(ascii: "\n")) { return data[...last] }
                 return Data()
             },
-            start: { pane, command, deadline, authorized in
+            start: { pane, command, deadline, authorized, willSend in
                 // As WorkspaceModel.openTab: connected, a shell, and an empty
-                // prompt owned by its shell before anything is typed.
+                // prompt owned by its shell before anything is typed. The
+                // pane was created in the background, so it may never have
+                // been shown: its runtime was started without a view
+                // (WorkspaceModel.startCreatedPaneInBackground) and its
+                // prompt is proven as a hidden pane's is.
                 while true {
                     guard authorized(), !Task.isCancelled else { return "The pane or a workspace capability changed before input. Nothing was typed." }
-                    if pane.connectionState == .connected, pane.kind == .shell, pane.runtime.assistantShellPromptIsEmpty() { break }
+                    if pane.connectionState == .connected, pane.kind == .shell, await pane.runtime.launchShellPromptIsEmpty() { break }
                     guard ContinuousClock.now < deadline else {
                         return "The new pane's shell prompt was not verified empty in time. Nothing was typed."
                     }
                     try? await Task.sleep(nanoseconds: 125_000_000)
                 }
-                guard await pane.runtime.sendAssistantShellCommand(command, authorization: authorized) else {
+                willSend()
+                guard await pane.runtime.sendLaunchShellCommand(command, authorization: authorized) else {
                     return "The new pane's shell refused the launch command (prompt not empty or not owned by its shell). Nothing was typed."
                 }
                 return nil

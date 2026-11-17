@@ -345,16 +345,15 @@ import Foundation
                 return .text("Anchored local tab unavailable: \(error.localizedDescription)", status: 409, reason: "Conflict")
             }
         } else {
-            // No source pane: an MCP-created tab goes to the Inbox.
-            if workspace.selectedTab != nil {
-                workspace.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: nil))
-            } else {
-                workspace.newTab(profile: .local, origin: .agent(sourcePane: nil))
-            }
-            guard let selected = workspace.selectedTabID, let active = workspace.activePaneID else {
+            // No source pane: an MCP-created tab goes to the Inbox. It is
+            // created in the background; the user's selection is unchanged.
+            let made = workspace.selectedTab != nil
+                ? workspace.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: nil))
+                : Optional(workspace.newTab(profile: .local, origin: .agent(sourcePane: nil)))
+            guard let made, workspace.tabID(containingPane: made.paneID) == made.tabID else {
                 return .text("Local tab creation failed", status: 409, reason: "Conflict")
             }
-            (tabID, paneID) = (selected, active)
+            (tabID, paneID) = (made.tabID, made.paneID)
         }
         var result = ["status": "created", "tabID": tabID.uuidString.lowercased(), "paneID": paneID.uuidString.lowercased()]
         if proposal.isAnchored, let owner = workspace.workspaceID(forTab: tabID) {

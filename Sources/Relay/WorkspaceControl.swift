@@ -414,10 +414,13 @@ extension WorkspaceModel {
                      profile: ConnectionProfile = .local) throws -> (tabID: UUID, paneID: UUID) {
         let anchor = try newTabAnchor(paneID: anchorPaneID, tabID: anchorTabID)
         let existing = Set(tabs.map(\.id))
-        withTabAdmission(.workspace(anchor.workspaceID)) {
+        // An agent tab is created in the background: selection, the active
+        // pane and focus are unchanged, so the result names what was made.
+        let made = withTabAdmission(.workspace(anchor.workspaceID)) {
             newTab(inSession: anchor.tab.sessionID, profile: profile, origin: .agent(sourcePane: anchor.sourcePane))
         }
-        guard let created = selectedTab, !existing.contains(created.id), let paneID = activePaneID,
+        let paneID = made?.paneID
+        guard let made, let paneID, let created = tabs.first(where: { $0.id == made.tabID }), !existing.contains(created.id),
               created.allPaneIDs == [paneID], created.sessionID == anchor.tab.sessionID else {
             throw PluginError.invalid("Local tab creation failed")
         }
@@ -568,6 +571,16 @@ extension WorkspaceModel {
         // that host or have been resolved there (MCP clients never send one).
         if let directory = proposal.directory,
            !admitsStartingDirectory(directory, profile: profile ?? expected.profile) { return nil }
+        if proposal.action == .newTab {
+            // An agent's new tab beside the source pane's session, created in
+            // the background: nothing is revealed, selected or focused.
+            // An approval route captures its scope at admission (outer wins).
+            guard let sourceTabID = tabID(containingPane: proposal.paneID),
+                  let source = tabs.first(where: { $0.id == sourceTabID }) else { return nil }
+            return newTab(inSession: source.sessionID, profile: profile ?? expected.profile, directory: proposal.directory,
+                          origin: .agent(sourcePane: proposal.paneID), sourcePaneID: proposal.paneID)
+                .map { ($0.tabID, $0.paneID) }
+        }
         revealPane(proposal.paneID, origin: .programmatic)
         guard let tab = selectedTab, tab.allPaneIDs.contains(proposal.paneID) else { return nil }
         switch proposal.action {
@@ -576,13 +589,7 @@ extension WorkspaceModel {
             showOriginalCLIConversation(pane: expected)
         case .terminal:
             expected.nativeConversationVisible = false
-        case .newTab:
-            // An approval route captures its scope at admission (outer wins).
-            newTabInActiveSession(profile: profile ?? expected.profile, directory: proposal.directory,
-                                  origin: .agent(sourcePane: proposal.paneID))
-            guard let newTab = selectedTab, let newPane = activePaneID,
-                  newTab.id != tab.id else { return nil }
-            return (newTab.id, newPane)
+        case .newTab: return nil // handled above, before any reveal
         case .splitRight: splitActive(axis: .horizontal, profile: profile ?? expected.profile, directory: proposal.directory)
         case .splitDown: splitActive(axis: .vertical, profile: profile ?? expected.profile, directory: proposal.directory)
         case .zoom:

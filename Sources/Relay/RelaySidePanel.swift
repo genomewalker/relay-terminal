@@ -1895,9 +1895,9 @@ final class RelaySidePanelServer: ObservableObject {
                 let proposal = try MCPDirectTabRequests.localPaneApprovalProposal(request.body)
                 return .json(try localPaneApprovals.propose(proposal, instance: agentInputRequests.instance) { [weak workspace] in
                     guard let workspace else { return nil }
-                    workspace.newTab(profile: .local, origin: .agent(sourcePane: nil))
-                    guard let tab = workspace.selectedTabID, let pane = workspace.activePaneID else { return nil }
-                    return (tab, pane)
+                    // Created in the background, like every agent tab.
+                    let made = workspace.newTab(profile: .local, origin: .agent(sourcePane: nil))
+                    return (made.tabID, made.paneID)
                 })
             } catch {
                 return .text("Local terminal approval unavailable", status: 409, reason: "Conflict")

@@ -516,16 +516,19 @@ func workspaceNewTabAdmission() throws {
     #expect(workspace.workspaceID(forTab: direct.0) == later)
 
     // An agent with no source pane (MCP local tab): the Inbox, not the visible workspace.
+    // Agent tabs are created in the background: the result names the tab.
     workspace.selectTab(tab2.id)
-    workspace.newTab(profile: .local, origin: .agent(sourcePane: nil))
-    #expect(workspace.workspaceID(forTab: workspace.selectedTabID!) == WorkspaceOwnershipSnapshot.inboxID)
+    let inboxTab = workspace.newTab(profile: .local, origin: .agent(sourcePane: nil)).tabID
+    #expect(workspace.workspaceID(forTab: inboxTab) == WorkspaceOwnershipSnapshot.inboxID)
+    #expect(workspace.selectedTabID == tab2.id)
     workspace.selectTab(tab2.id)
-    workspace.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: nil))
-    #expect(workspace.workspaceID(forTab: workspace.selectedTabID!) == WorkspaceOwnershipSnapshot.inboxID)
+    let inboxSessionTab = try #require(workspace.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: nil))).tabID
+    #expect(workspace.workspaceID(forTab: inboxSessionTab) == WorkspaceOwnershipSnapshot.inboxID)
+    #expect(workspace.selectedTabID == tab2.id)
     // An agent with a source pane: that pane's workspace, not the visible one.
     workspace.selectTab(tab2.id)
-    workspace.newTab(profile: .local, origin: .agent(sourcePane: sourcePane.id))
-    #expect(workspace.workspaceID(forTab: workspace.selectedTabID!) == later)
+    let sourcedTab = workspace.newTab(profile: .local, origin: .agent(sourcePane: sourcePane.id)).tabID
+    #expect(workspace.workspaceID(forTab: sourcedTab) == later)
     // A captured scope wins over the origin's default.
     workspace.withTabAdmission(.inbox) { workspace.newTab(profile: .local) }
     #expect(workspace.workspaceID(forTab: workspace.selectedTabID!) == WorkspaceOwnershipSnapshot.inboxID)
@@ -621,8 +624,8 @@ func workspaceMigrationLivePlanWithPaneMoves() throws {
     #expect(workspace.ownership.workspace(fixtureID("session:dandy-07")) == nil)
     #expect(workspace.workspaceID(forTab: switched) == fixtureID("group:PanBarley") && visible != fixtureID("group:PanBarley"))
     workspace.selectTab(tabID("331eea46"))
-    workspace.newTab(profile: .local, origin: .agent(sourcePane: paneID("4b3c6f80")))
-    #expect(workspace.workspaceID(forTab: workspace.selectedTabID!) == fixtureID("group:Rice"))
+    let agentTab = workspace.newTab(profile: .local, origin: .agent(sourcePane: paneID("4b3c6f80"))).tabID
+    #expect(workspace.workspaceID(forTab: agentTab) == fixtureID("group:Rice"))
     // A tab created after the migration survives its Undo.
     workspace.selectTab(tabID("331eea46"))
     workspace.newTab(profile: .local)
@@ -741,8 +744,7 @@ func workspaceAdoptsMergedPlacementOnEverySave() throws {
     let diskOwner = try #require(try store.restoreOwnership()?.owner(of: tab.id))
     let rendererOwner = try #require(model.workspaceID(forTab: tab.id))
     let admission = model.tabAdmission(forSourcePane: sourcePane)
-    model.newTab(profile: .local, origin: .agent(sourcePane: sourcePane))
-    let created = try #require(model.selectedTabID)
+    let created = model.newTab(profile: .local, origin: .agent(sourcePane: sourcePane)).tabID
     _ = try model.previewWorkspaceMigration()
     let newOwner = try #require(try store.restoreOwnership()?.owner(of: created))
     #expect(diskOwner == target) // positive control: the other writer's move survived
@@ -1365,8 +1367,8 @@ func navigatorSelectsEmptyWorkspace() throws {
     // An agent request keeps its captured scope, whatever is shown.
     let source = tabID("cd59ed8d"), sourcePane = try #require(model.tabs.first { $0.id == source }?.allPaneIDs.first)
     let scope = try #require(model.workspaceID(forTab: source))
-    model.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: sourcePane))
-    #expect(model.selectedTabID.flatMap { model.workspaceID(forTab: $0) } == scope && scope != target)
+    let agentTab = try #require(model.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: sourcePane))).tabID
+    #expect(model.workspaceID(forTab: agentTab) == scope && scope != target)
 }
 
 @MainActor
@@ -1457,15 +1459,15 @@ func navigatorCapturedAdmissionWithEmptyView() throws {
     try model.moveTab(source.id, toWorkspace: changed)
     let shown = model.createWorkspace(named: "Visible empty workspace")
     model.selectWorkspace(shown)
-    model.withTabAdmission(captured) {
+    let made = model.withTabAdmission(captured) {
         model.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: sourcePane))
     }
-    let created = try #require(model.selectedTabID)
+    let created = try #require(made).tabID
     let result = try #require(model.workspaceID(forTab: created))
     #expect(result == admittedWorkspace && result != changed && result != shown)
     model.selectWorkspace(shown)
-    model.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: nil))
-    #expect(model.selectedTabID.flatMap { model.workspaceID(forTab: $0) } == WorkspaceOwnershipSnapshot.inboxID)
+    let inboxTab = try #require(model.newTabInActiveSession(profile: .local, origin: .agent(sourcePane: nil))).tabID
+    #expect(model.workspaceID(forTab: inboxTab) == WorkspaceOwnershipSnapshot.inboxID)
 }
 
 @MainActor

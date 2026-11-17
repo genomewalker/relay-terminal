@@ -1295,7 +1295,12 @@ final class WorkspaceModel: ObservableObject {
         isFullScreen = fullScreen
     }
 
-    func newTab(profile: ConnectionProfile, origin: WorkspaceTabOrigin = .human) {
+    /// A human tab is selected and focused. An agent tab (MCP, assistant,
+    /// relay_launch_agent) is created in the background: the selected tab,
+    /// active pane, visible workspace and window focus stay as they were,
+    /// and its terminal starts without being shown.
+    @discardableResult
+    func newTab(profile: ConnectionProfile, origin: WorkspaceTabOrigin = .human) -> (tabID: UUID, paneID: UUID) {
         let pane = PaneModel(profile: profile)
         RelayCapacityManagementCoordinator.shared.didCreate(pane)
         storePane(pane)
@@ -1303,18 +1308,58 @@ final class WorkspaceModel: ObservableObject {
         tab.automaticName = tab.name
         pane.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         withTabAdmission(tabAdmission(for: origin)) { tabs.append(tab) }
+        if profile.kind == .ssh { profileStore.markUsed(profile) }
+        guard origin == .human else {
+            persistWorkspace()
+            startCreatedPaneInBackground(pane)
+            return (tab.id, pane.id)
+        }
         selectedTabID = tab.id
         activePaneID = pane.id
-        if profile.kind == .ssh { profileStore.markUsed(profile) }
         isHostLauncherPresented = false
         persistWorkspace()
+        focusCreatedPane(pane, tabID: tab.id)
+        return (tab.id, pane.id)
+    }
+
+    /// Focuses a pane a human just created once SwiftUI has mounted it.
+    private func focusCreatedPane(_ pane: PaneModel, tabID: UUID) {
         Task { @MainActor [weak self, weak pane] in
             await Task.yield()
-            guard let self, let pane, self.selectedTabID == tab.id,
+            guard let self, let pane, self.selectedTabID == tabID,
                   self.activePaneID == pane.id, self.panes[pane.id] === pane,
                   !self.networkVisible, !self.paneLinkSelection.active else { return }
             pane.focus()
         }
+    }
+
+    /// Tests replace this. The app starts the terminal the way a restored
+    /// hidden pane is attached in the background (RelayBackgroundAttach),
+    /// except that this new pane's worker is created rather than required.
+    var createdPaneBackgroundStart: @MainActor (PaneModel, RelayViewport) -> Void = { pane, viewport in
+        guard !RelayLaunchMode.isRunningTests else { return }
+        pane.runtime.startInBackground(viewport: viewport)
+    }
+
+    /// Starts a terminal pane that was created without being shown. A
+    /// SwiftUI terminal view mounts, and so starts its pane, only when its
+    /// tab is shown (or, in a stack, its member); an agent's new pane must
+    /// connect and show its shell prompt before then. The grid is the one
+    /// the pane would have if shown now; the first presentation corrects it.
+    func startCreatedPaneInBackground(_ pane: PaneModel) {
+        guard pane.contentKind == .terminal, pane.profile.backend == .relay, panes[pane.id] === pane else { return }
+        createdPaneBackgroundStart(pane, hiddenGrid(for: pane.id) ?? .default)
+    }
+
+    /// The grid a pane that is not laid out would have now: its slot's share
+    /// of the canvas in a hidden tab, or in the shown tab the laid-out grid
+    /// of the stack member it is hidden behind.
+    func hiddenGrid(for paneID: UUID) -> RelayViewport? {
+        if let grid = RelayHiddenPaneGrid.viewport(for: paneID, in: self) { return grid }
+        guard let tab = tabs.first(where: { $0.allPaneIDs.contains(paneID) }), tab === selectedTab,
+              let slot = RelayHiddenPaneGrid.slot(of: paneID, layout: tab.layout, stacks: tab.stacks),
+              slot != paneID else { return nil }
+        return panes[slot]?.runtime.laidOutGrid
     }
 
     func attachRemoteSession(profile: ConnectionProfile, remote: RemoteSessionRecord, inNewWindow: Bool = false) {
@@ -1710,14 +1755,17 @@ final class WorkspaceModel: ObservableObject {
 
     /// ⌘T and the rail +: a human tab goes to the shown workspace (even an
     /// empty one); an agent tab keeps its captured scope.
-    func newTabInActiveSession(profile: ConnectionProfile? = nil, directory: String? = nil, origin: WorkspaceTabOrigin = .human) {
+    /// The created tab and pane, or nil when nothing was created. An agent
+    /// origin creates it in the background (see newTab(profile:origin:)).
+    @discardableResult
+    func newTabInActiveSession(profile: ConnectionProfile? = nil, directory: String? = nil,
+                               origin: WorkspaceTabOrigin = .human) -> (tabID: UUID, paneID: UUID)? {
         // With an empty workspace shown, the remembered tab only supplies the
         // legacy session; the tab is still filed by the origin's scope.
         guard let source = selectedTab ?? rememberedTabID.flatMap({ id in tabs.first { $0.id == id } }) ?? tabs.first else {
-            withTabAdmission(tabAdmission(for: origin)) { newTab(profile: profile ?? .local, origin: origin) }
-            return
+            return withTabAdmission(tabAdmission(for: origin)) { newTab(profile: profile ?? .local, origin: origin) }
         }
-        withTabAdmission(tabAdmission(for: origin)) {
+        return withTabAdmission(tabAdmission(for: origin)) {
             newTab(inSession: source.sessionID, profile: profile, directory: directory, origin: origin)
         }
     }
@@ -1730,12 +1778,17 @@ final class WorkspaceModel: ObservableObject {
         newTab(inSession: sessionID, profile: sourcePane.profile)
     }
 
+    /// `sourcePaneID`, a pane of this session, is the pane the tab is opened
+    /// from; by default the active pane when the session is shown.
+    @discardableResult
     func newTab(inSession sessionID: UUID, profile: ConnectionProfile?, directory: String? = nil,
-                origin: WorkspaceTabOrigin = .human) {
+                origin: WorkspaceTabOrigin = .human, sourcePaneID requestedSource: UUID? = nil) -> (tabID: UUID, paneID: UUID)? {
         let sessionTabs = tabs.filter { $0.sessionID == sessionID }
         guard let sourceTab = sessionTabs.first,
-              let sourcePaneID = (selectedTab?.sessionID == sessionID ? activePaneID : sourceTab.allPaneIDs.first),
-              let sourcePane = panes[sourcePaneID] else { return }
+              let sourcePaneID = requestedSource
+                ?? (selectedTab?.sessionID == sessionID ? activePaneID : sourceTab.allPaneIDs.first),
+              sessionTabs.contains(where: { $0.allPaneIDs.contains(sourcePaneID) }),
+              let sourcePane = panes[sourcePaneID] else { return nil }
         let targetProfile = profile ?? sourcePane.profile
         let parentSessionID = targetProfile.kind == .ssh && targetProfile.backend == .relay &&
             sourcePane.profile.kind == .ssh && sourcePane.profile.connectionKey == targetProfile.connectionKey
@@ -1754,17 +1807,17 @@ final class WorkspaceModel: ObservableObject {
         // A human session switcher or "new tab in session" files the tab with
         // its source tab, even when that legacy session has no workspace.
         withTabAdmission(origin == .human ? tabAdmission(forSourcePane: sourcePaneID) : tabAdmission(for: origin)) { tabs.append(tab) }
+        if targetProfile.kind == .ssh { profileStore.markUsed(targetProfile) }
+        guard origin == .human else {
+            persistWorkspace()
+            startCreatedPaneInBackground(pane)
+            return (tab.id, pane.id)
+        }
         selectedTabID = tab.id
         activePaneID = pane.id
-        if targetProfile.kind == .ssh { profileStore.markUsed(targetProfile) }
         persistWorkspace()
-        Task { @MainActor [weak self, weak pane] in
-            await Task.yield()
-            guard let self, let pane, self.selectedTabID == tab.id,
-                  self.activePaneID == pane.id, self.panes[pane.id] === pane,
-                  !self.networkVisible, !self.paneLinkSelection.active else { return }
-            pane.focus()
-        }
+        focusCreatedPane(pane, tabID: tab.id)
+        return (tab.id, pane.id)
     }
 
     func connectDraft(saveProfile: Bool) {
@@ -3830,6 +3883,10 @@ final class WorkspaceModel: ObservableObject {
     /// Opens a new terminal pane directly as a member of the stack showing
     /// `targetID`, on `profile` (This Mac or an exact SSH host). Like a new
     /// tab, a Relay SSH pane on the target's host is born under the target.
+    /// Only agents call this (relay_new_stacked_pane, relay_launch_agent), so
+    /// the pane joins as a hidden member: the stack keeps showing what it
+    /// showed, and the selected tab, active pane and focus do not change.
+    /// Its terminal starts in the background.
     @discardableResult
     func newStackedPane(onto targetID: UUID, profile: ConnectionProfile) throws -> (paneID: UUID, stack: PaneStack, tabID: UUID) {
         let target = try stackTarget(targetID)
@@ -3841,10 +3898,25 @@ final class WorkspaceModel: ObservableObject {
         let pane = PaneModel(profile: profile, remoteParentSessionID: parentSessionID, startDirectory: nil)
         pane.assignRemoteHierarchy(workspaceSessionID: target.sessionID, tabID: target.id)
         storePane(pane)
-        let stack = joinStack(pane.id, onto: targetID, in: target)
+        let stack = joinStackHidden(pane.id, onto: targetID, in: target)
         if profile.kind == .ssh { profileStore.markUsed(profile) }
-        finishLayoutChange(in: [target], active: pane.id, select: target)
-        return (pane.id, stack, target.id)
+        target.reconcileStacks()
+        target.reconcileSplitRatios()
+        persistWorkspace()
+        startCreatedPaneInBackground(pane)
+        return (pane.id, target.stack(containing: pane.id) ?? stack, target.id)
+    }
+
+    /// Adds `paneID` to the stack showing `targetID` (or a new stack of the
+    /// two) without changing the layout or the shown member.
+    private func joinStackHidden(_ paneID: UUID, onto targetID: UUID, in target: TabModel) -> PaneStack {
+        if let index = target.stacks.firstIndex(where: { $0.members.contains(targetID) }) {
+            target.stacks[index].members.append(paneID)
+            return target.stacks[index]
+        }
+        let stack = PaneStack(id: UUID(), members: [targetID, paneID], selected: targetID)
+        target.stacks.append(stack)
+        return stack
     }
 
     /// Shows a stack member in its stack's slot. No-op for unstacked panes.

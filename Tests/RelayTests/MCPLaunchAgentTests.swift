@@ -24,6 +24,9 @@ struct MCPLaunchAgentTests {
     final class Probe {
         var starts: [(UUID, String)] = []
         var bindingReads = 0
+        /// The shell's command markers the handler reads; nil = unreadable.
+        var command: (producer: UUID, observation: TerminalSemanticPromptStateTracker.CommandObservation)? =
+            (UUID(), .init(executions: 0, completedExecutions: 0, exitStatus: nil, integrationSeen: false))
         var bindNow = false
         var transcript = Data()
     }
@@ -39,8 +42,9 @@ struct MCPLaunchAgentTests {
             isDirectory: { _, _ in directory },
             readFile: { _, _, _ in try brief.get() },
             readPrefix: { _, _, _ in probe.transcript },
-            start: { pane, command, _, authorized in
+            start: { pane, command, _, authorized, willSend in
                 guard authorized() else { return "not authorized" }
+                if startRefusal == nil { willSend() }
                 probe.starts.append((pane.id, command))
                 return startRefusal
             },
@@ -53,6 +57,7 @@ struct MCPLaunchAgentTests {
             },
             screen: { _ in "Error: model not found\n$ " },
             accountLabel: { _, _, directory in directory == "~/.claude-personal" ? "personal" : nil },
+            commandState: { _ in probe.command },
             launchBudget: .milliseconds(60), observeBudget: .milliseconds(30), pollInterval: .milliseconds(10))
     }
 
@@ -200,7 +205,7 @@ struct MCPLaunchAgentTests {
         for (name, environment, status) in refusals {
             let probe = Probe()
             var env = environment
-            env.start = { pane, command, _, _ in probe.starts.append((pane.id, command)); return nil }
+            env.start = { pane, command, _, _, _ in probe.starts.append((pane.id, command)); return nil }
             let response = await MCPLaunchAgentRequests().launch(Self.body(instance, request), instance: instance,
                 permits: F.all, workspace: f.workspace, environment: env)
             #expect(response.status == status, "\(name)")
@@ -463,5 +468,214 @@ struct MCPLaunchAgentTests {
         #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request))?.mode == "account")
         #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["permissionMode": "ask"]))?.mode == "ask")
         #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["permissionMode": "root"])) == nil)
+    }
+
+    // MARK: - No exec: the pane's shell outlives the provider
+
+    static func run(_ shell: String, _ command: String, environment: [String: String]) throws -> (status: Int32, out: String) {
+        let process = Process(), pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: shell)
+        process.arguments = shell.hasSuffix("zsh") ? ["-f", "-c", command] : ["-c", command]
+        process.environment = ["PATH": "/usr/bin:/bin"].merging(environment) { $1 }
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
+    /// The launch command runs the provider as a child: after a stub provider
+    /// exits 3 the same shell carries on, in cwd, with the provider's status
+    /// and no relay_brief variable. A bad brief or cwd returns 97 without
+    /// running the provider, and the shell carries on too.
+    @Test func launchCommandLeavesTheShellAliveAfterTheProviderExits() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("relay-noexec-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let shims = root.appendingPathComponent(".local/share/relay/shims")
+        try FileManager.default.createDirectory(at: shims, withIntermediateDirectories: true)
+        let ran = root.appendingPathComponent("ran")
+        let stub = shims.appendingPathComponent("claude")
+        try "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$RELAY_TEST_OUT\"\nexit 3\n".write(to: stub, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stub.path)
+        let cwd = root.appendingPathComponent("work dir 'q'")
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        let brief = root.appendingPathComponent("brief.md")
+        try "Review the parser and report.\n".write(to: brief, atomically: true, encoding: .utf8)
+        let bad = root.appendingPathComponent("bad.md")
+        try "--dangerously-skip-permissions".write(to: bad, atomically: true, encoding: .utf8)
+        let environment = ["HOME": root.path, "RELAY_TEST_OUT": ran.path]
+        // What the pane's shell shows next: the command's status, its cwd,
+        // whether relay_brief exists, and that it is still the same shell.
+        let after = "; printf 'status=%s\\n' \"$?\"; printf 'pwd=%s\\n' \"$(pwd -P)\"; " +
+            "printf 'brief=%s\\n' \"${relay_brief-unset}\"; printf 'shell=%s\\n' \"$$\""
+        // pwd -P names /private/var where Foundation's resolution says /var.
+        let physical = try #require(cwd.path.withCString { realpath($0, nil) }.map { pointer in
+            defer { free(pointer) }
+            return String(cString: pointer)
+        })
+        let start = FileManager.default.currentDirectoryPath
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] where FileManager.default.isExecutableFile(atPath: shell) {
+            try? FileManager.default.removeItem(at: ran)
+            let command = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus",
+                                                                   cwd: cwd.path, briefPath: brief.path))
+            #expect(!command.contains("exec env") || command.contains("&& (relay_brief="), "exec only inside the subshell")
+            let result = try Self.run(shell, command + after, environment: environment)
+            #expect(result.status == 0, "\(shell): the shell itself must not exit")
+            #expect(result.out.contains("status=3\n"), "\(shell): \(result.out)")
+            #expect(result.out.contains("pwd=" + physical + "\n"), "\(shell): \(result.out)")
+            #expect(result.out.contains("brief=unset\n"), "\(shell): relay_brief leaked into the shell")
+            let providerPID = try String(contentsOf: ran, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+            #expect(!result.out.contains("shell=" + providerPID + "\n"), "\(shell): the provider replaced the shell")
+
+            for (dir, briefPath) in [(cwd.path, bad.path), (cwd.path, root.path + "/missing.md"),
+                                     (root.appendingPathComponent("missing").path, brief.path)] {
+                try? FileManager.default.removeItem(at: ran)
+                let failing = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus",
+                                                                       cwd: dir, briefPath: briefPath))
+                let failed = try Self.run(shell, failing + after, environment: environment)
+                #expect(failed.status == 0, "\(shell): the shell itself must not exit")
+                #expect(failed.out.contains("status=\(MCPLaunchAgentCommand.launchFailureExitCode)\n"), "\(shell): \(failed.out)")
+                #expect(failed.out.contains("brief=unset\n"))
+                #expect(!FileManager.default.fileExists(atPath: ran.path), "\(shell): the provider ran")
+                if dir != cwd.path { #expect(!failed.out.contains("pwd=" + physical + "\n")) }
+            }
+        }
+        #expect(FileManager.default.currentDirectoryPath == start)
+    }
+
+    // MARK: - The provider's exit is the launch command's shell-reported status
+
+    @Test func commandReportMapsOnlyTheLaunchCommandsOwnStatus() {
+        typealias O = MCPLaunchAgentObservation
+        typealias C = TerminalSemanticPromptStateTracker.CommandObservation
+        #expect(O.commandReport(C(executions: 6, completedExecutions: 5, exitStatus: 0, integrationSeen: true),
+                                after: 5, producerChanged: false) == .running)
+        #expect(O.commandReport(C(executions: 6, completedExecutions: 6, exitStatus: 97, integrationSeen: true),
+                                after: 5, producerChanged: false) == .returned(97))
+        // A later command returned too: the status is not the launch command's.
+        #expect(O.commandReport(C(executions: 7, completedExecutions: 7, exitStatus: 0, integrationSeen: true),
+                                after: 5, producerChanged: false) == .returned(nil))
+        #expect(O.commandReport(C(executions: 6, completedExecutions: 6, exitStatus: nil, integrationSeen: true),
+                                after: 5, producerChanged: false) == .returned(nil))
+        if case .unavailable = O.commandReport(C(executions: 0, completedExecutions: 0, exitStatus: nil, integrationSeen: false),
+                                               after: 0, producerChanged: false) {} else { Issue.record("no integration") }
+        if case .unavailable = O.commandReport(C(executions: 6, completedExecutions: 6, exitStatus: 1, integrationSeen: true),
+                                               after: 5, producerChanged: true) {} else { Issue.record("reconnected") }
+
+        let command = { (code: Int?) in O.Ending(source: .command, code: code) }
+        func stage(_ ending: O.Ending?, bound: Bool, admitted: Bool = false, unobservable: String? = nil) -> MCPLaunchAgentReceipt.Provider {
+            var previous = MCPLaunchAgentReceipt.Provider()
+            if admitted { previous.admitted = true }
+            return O.provider(previous, evidence: nil, ending: ending, everBound: bound, hasTranscriptPath: true,
+                              transcriptReadable: true, screen: "$ ", exitUnobservable: unobservable)
+        }
+        // 97/126/127 before a binding: Relay's launch failed, not the provider.
+        for code in [97, 126, 127] {
+            #expect(stage(command(code), bound: false).status == "unknown")
+            #expect(stage(command(code), bound: false).detail?.contains("launch command returned \(code)") == true)
+        }
+        // Non-zero after a binding with no output: refused. After output: exited.
+        #expect(stage(command(1), bound: true).status == "refused" && stage(command(1), bound: true).exitCode == 1)
+        #expect(stage(command(1), bound: true).evidence == "exit")
+        #expect(stage(command(0), bound: true, admitted: true).status == "exited")
+        #expect(stage(command(1), bound: true, admitted: true).status == "exited")
+        #expect(stage(command(0), bound: true).status == "exited")
+        // Unattributable status: exited after output, otherwise unknown; never 0.
+        #expect(stage(command(nil), bound: true, admitted: true).status == "exited")
+        #expect(stage(command(nil), bound: true).status == "unknown" && stage(command(nil), bound: true).exitCode == nil)
+        // No shell integration: a bound agent's exit cannot be seen.
+        #expect(stage(nil, bound: true, unobservable: "no OSC 133").status == "unknown")
+        #expect(stage(nil, bound: true).status == "pending")
+        #expect(stage(nil, bound: false, unobservable: "no OSC 133").status == "pending")
+        let failed = O.bound(.init(), binding: nil, unavailable: nil, ending: command(97), paneClosed: false,
+                             target: Self.personal, label: { _ in nil })
+        #expect(failed.status == "failed" && failed.reason == "The launch command returned (97) before a verified binding")
+    }
+
+    /// Through the handler: the handle is read just before typing, and the
+    /// shell's report of the launch command returning decides the stages
+    /// while the pane itself never exits.
+    @Test func commandCompletionMapsToStagesWithoutAPaneExit() async throws {
+        let f = try F.fixture()
+        defer { f.workspace.shutdown() }
+        typealias C = TerminalSemanticPromptStateTracker.CommandObservation
+        let producer = UUID()
+        func launched(_ probe: Probe) async throws -> (UUID, MCPLaunchAgentRequests, Data) {
+            let instance = UUID(), request = UUID(), handler = MCPLaunchAgentRequests()
+            probe.command = (producer, C(executions: 4, completedExecutions: 4, exitStatus: 0, integrationSeen: true))
+            let body = Self.body(instance, request)
+            let first = try #require(Self.receipt(await handler.launch(body, instance: instance, permits: F.all,
+                workspace: f.workspace, environment: Self.environment(probe))))
+            #expect(first.started.status == "submitted" && first.provider.status == "pending")
+            return (instance, handler, body)
+        }
+        func observe(_ probe: Probe, _ launch: (UUID, MCPLaunchAgentRequests, Data)) async throws -> MCPLaunchAgentReceipt {
+            try #require(Self.receipt(await launch.1.launch(launch.2, instance: launch.0, permits: F.all,
+                workspace: f.workspace, environment: Self.environment(probe))))
+        }
+
+        // A bad brief: the command returned 97 before any binding.
+        let badBrief = Probe()
+        let one = try await launched(badBrief)
+        badBrief.command = (producer, C(executions: 5, completedExecutions: 5, exitStatus: 97, integrationSeen: true))
+        let failed = try await observe(badBrief, one)
+        #expect(failed.status == "launch_failed" && failed.started.status == "failed")
+        #expect(failed.started.reason?.contains("launch command returned 97") == true)
+        #expect(failed.bound.status == "failed" && failed.provider.status == "unknown")
+
+        // Bound, then the provider exited 1 with no assistant output: refused.
+        let refusing = Probe()
+        let two = try await launched(refusing)
+        refusing.bindNow = true
+        let running = try await observe(refusing, two)
+        #expect(running.bound.status == "bound" && running.provider.status == "pending")
+        refusing.command = (producer, C(executions: 5, completedExecutions: 5, exitStatus: 1, integrationSeen: true))
+        let refused = try await observe(refusing, two)
+        #expect(refused.status == "launched" && refused.provider.status == "refused")
+        #expect(refused.provider.exitCode == 1 && refused.provider.evidence == "exit")
+
+        // Admitted, then returned 0: exited, and later commands do not change it.
+        let exiting = Probe()
+        let three = try await launched(exiting)
+        exiting.bindNow = true
+        exiting.transcript = Data((#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":"Done."}}"# + "\n").utf8)
+        exiting.command = (producer, C(executions: 5, completedExecutions: 5, exitStatus: 0, integrationSeen: true))
+        let exited = try await observe(exiting, three)
+        #expect(exited.provider.status == "exited" && exited.provider.admitted == true && exited.provider.exitCode == 0)
+        exiting.command = (producer, C(executions: 6, completedExecutions: 6, exitStatus: 1, integrationSeen: true))
+        let later = try await observe(exiting, three)
+        #expect(later.provider.status == "exited" && later.provider.exitCode == 0)
+
+        // No shell integration: bound with no output is reported unknown.
+        let blind = Probe()
+        let four = try await launched(blind)
+        blind.command = (producer, C(executions: 0, completedExecutions: 0, exitStatus: nil, integrationSeen: false))
+        blind.bindNow = true
+        let unknown = try await observe(blind, four)
+        #expect(unknown.bound.status == "bound" && unknown.provider.status == "unknown")
+        #expect(unknown.provider.detail?.contains("cannot be observed") == true)
+    }
+
+    /// relay_launch_agent's default placement creates its tab in the background.
+    @Test func launchLeavesTheUsersSelectionAlone() async throws {
+        let f = try F.fixture()
+        defer { f.workspace.shutdown() }
+        var started: [UUID] = []
+        f.workspace.createdPaneBackgroundStart = { pane, _ in started.append(pane.id) }
+        f.workspace.selectTab(f.a1.id)
+        let before = (f.workspace.selectedTabID, f.workspace.activePaneID, f.workspace.selectedWorkspaceID)
+        let instance = UUID(), probe = Probe()
+        let stackTarget = try #require(f.b2.allPaneIDs.first)
+        let placements: [[String: String]] = [[:], ["anchorTabID": f.b1.id.uuidString], ["targetPaneID": stackTarget.uuidString]]
+        for extra in placements {
+            let receipt = try #require(Self.receipt(await MCPLaunchAgentRequests().launch(Self.body(instance, UUID(), extra: extra),
+                instance: instance, permits: F.all, workspace: f.workspace, environment: Self.environment(probe))))
+            #expect(receipt.created.status == "created", "\(extra)")
+            let paneID = try #require(receipt.created.paneID.flatMap(UUID.init(uuidString:)))
+            #expect(f.workspace.selectedTabID == before.0 && f.workspace.activePaneID == before.1, "\(extra)")
+            #expect(f.workspace.selectedWorkspaceID == before.2, "\(extra)")
+            #expect(started.last == paneID && probe.starts.last?.0 == paneID, "\(extra)")
+        }
     }
 }

@@ -2933,6 +2933,58 @@ final class TerminalRuntime: NSObject {
         return sendSidePanelPrompt(text, maximumBytes: 16 << 10)
     }
 
+    /// relay_launch_agent's start gate. A pane created for an agent is not
+    /// shown, so it may have no native surface and no live prompt mirror;
+    /// then the hidden-pane proof an account move's resume uses decides: the
+    /// OSC 133 input start with nothing echoed, or the prepared replay
+    /// screen. A pane with a surface uses the mirror, as before.
+    func launchShellPromptIsEmpty() async -> Bool {
+        guard let pane, pane.kind == .shell, pane.connectionState == .connected,
+              pane.profile.backend == .relay else { return false }
+        guard observeActiveScreen() == .noSurface else { return view.assistantShellPromptIsEmpty() }
+        await prepareAgentMaintenancePromptProof()
+        guard self.pane === pane, conversationInputLease == nil else { return false }
+        return hiddenShellPromptIsEmpty(observeActiveScreen())
+    }
+
+    /// A surfaceless shell's empty prompt from the byte stream alone. The
+    /// view's prompt mirror is not consulted: without a renderer it is not
+    /// fed, so it can still read empty after the shell echoed a draft.
+    private func hiddenShellPromptIsEmpty(_ observation: RelayActiveScreenCache.Observation) -> Bool {
+        guard observation == .noSurface, view.markedRange().location == NSNotFound,
+              !view.promptInspectionBlocksExternalInput else { return false }
+        return io.shellInputIsEmpty || currentPreparedPrompt(observation)?.shellEmpty == true
+    }
+
+    /// Types relay_launch_agent's command. With a native surface this is
+    /// sendAssistantShellCommand. Without one (a pane created in the
+    /// background) the same admission applies — authorization, a fresh shell
+    /// owner binding, an unchanged input revision and an empty prompt — and
+    /// the write carries the replay screen's token, so output that arrives
+    /// after admission refuses it at the transport (as resumeAgentAfterMaintenance).
+    func sendLaunchShellCommand(_ text: String, authorization: @MainActor () -> Bool = { true }) async -> Bool {
+        guard observeActiveScreen() == .noSurface else {
+            return await sendAssistantShellCommand(text, authorization: authorization)
+        }
+        guard !Task.isCancelled, authorization(), let pane, pane.kind == .shell, pane.connectionState == .connected,
+              pane.profile.backend == .relay, !text.isEmpty, text.utf8.count <= 16 << 10 else { return false }
+        let revision = pane.agentInputRevision
+        await prepareAgentMaintenancePromptProof()
+        guard hiddenShellPromptIsEmpty(observeActiveScreen()) else { return false }
+        let owner = await readPromptOwnerBinding()
+        await prepareAgentMaintenancePromptProof()
+        // The admitted observation is taken after the last suspension.
+        let observation = observeActiveScreen()
+        guard !Task.isCancelled, authorization(), self.pane === pane, pane.kind == .shell,
+              pane.connectionState == .connected, pane.agentInputRevision == revision,
+              RelayAssistantShellAdmission.allows(owner, paneID: pane.id, hostID: pane.profile.id),
+              conversationInputLease == nil, hiddenShellPromptIsEmpty(observation),
+              let fence = screenFence(observation) else { return false }
+        conversationInputLease = UUID()
+        defer { conversationInputLease = nil }
+        return sendPromptTransport(text, maximumBytes: 16 << 10, fence: fence)
+    }
+
 
     /// Explicit user recovery of an ended provider in its retained Bash pane.
     /// Recheck the worker, shell, and foreground owner before clearing the
