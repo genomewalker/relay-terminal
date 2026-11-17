@@ -169,19 +169,22 @@ struct MCPLaunchAgentReceipt: Codable, Equatable {
         var account: String?
         var accountMatches: Bool?
         var transcriptPath: String?
+        /// binding (named by the verified binding) or derived (Claude's
+        /// config_dir/projects/<cwd slug>/<session_id>.jsonl).
+        var transcriptSource: String?
         var reason: String?
         enum CodingKeys: String, CodingKey {
             case status, provider, pid, account, reason
             case sessionID = "session_id", configDir = "config_dir", accountMatches = "account_matches",
-                 transcriptPath = "transcript_path"
+                 transcriptPath = "transcript_path", transcriptSource = "transcript_source"
         }
     }
-    /// pending | admitted | refused | exited | unknown
+    /// pending | blocked | admitted | refused | exited | unknown
     struct Provider: Codable, Equatable {
         var status = "pending"
         /// Assistant output was observed at some point (latched).
         var admitted: Bool?
-        /// transcript | exit | none
+        /// transcript | exit | screen | none
         var evidence: String?
         var exitCode: Int?
         var excerpt: String?
@@ -266,12 +269,58 @@ enum MCPLaunchAgentObservation {
         return flat.count <= limit ? flat : String(flat.suffix(limit))
     }
 
+    /// An absolute directory below `home` in the "~/name" form account
+    /// directories use; anything else unchanged.
+    static func tildeForm(_ path: String, home: String?) -> String {
+        var path = path
+        while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+        guard var home, home.hasPrefix("/") else { return path }
+        while home.count > 1, home.hasSuffix("/") { home.removeLast() }
+        if path == home { return "~" }
+        if home != "/", path.hasPrefix(home + "/") { return "~/" + path.dropFirst(home.count + 1) }
+        return path
+    }
+
+    /// "~/name" or "~" against `home`; nil when it cannot be made absolute.
+    static func absolute(_ path: String, home: String?) -> String? {
+        if path.hasPrefix("/") { return path }
+        guard let home, home.hasPrefix("/") else { return nil }
+        if path == "~" { return home }
+        if path.hasPrefix("~/") { return (home.hasSuffix("/") ? String(home.dropLast()) : home) + "/" + path.dropFirst(2) }
+        return nil
+    }
+
+    /// Claude's transcript for a session: <config>/projects/<cwd with every
+    /// character outside A-Z a-z 0-9 replaced by "-">/<session>.jsonl, with
+    /// cwd the process's physical working directory. nil when an input does
+    /// not qualify or the slug is long enough for Claude to shorten it.
+    static func claudeTranscriptPath(configDir: String, cwd: String, sessionID: String) -> String? {
+        guard configDir.hasPrefix("/"), cwd.hasPrefix("/"),
+              sessionID.range(of: #"^[0-9a-fA-F-]{36}$"#, options: .regularExpression) != nil else { return nil }
+        let slug = String(cwd.unicodeScalars.map { scalar -> Character in
+            let v = scalar.value
+            return (48...57).contains(v) || (65...90).contains(v) || (97...122).contains(v) ? Character(scalar) : "-"
+        })
+        guard slug.count <= 200 else { return nil }
+        let base = configDir.count > 1 && configDir.hasSuffix("/") ? String(configDir.dropLast()) : configDir
+        return base + "/projects/" + slug + "/" + sessionID + ".jsonl"
+    }
+
+    /// The provider's first-run workspace trust question on screen.
+    static func trustPrompt(_ screen: String?) -> Bool {
+        guard let text = screen?.lowercased() else { return false }
+        return ["yes, i trust this folder", "trust this folder", "quick safety check",
+                "do you trust the contents of this directory", "trust the files in this folder",
+                "do you trust this directory"].contains { text.contains($0) }
+    }
+
     /// The provider stage. `exitCode` is the pane's exit status once its
     /// process ended (nil while it runs). Admission and refusal latch; a
     /// refusal counts only before any admitted output.
     static func provider(_ previous: MCPLaunchAgentReceipt.Provider, evidence: TranscriptEvidence?,
                          exitCode: Int?, everBound: Bool, hasTranscriptPath: Bool, transcriptReadable: Bool,
-                         screen: String?, paneClosed: Bool = false) -> MCPLaunchAgentReceipt.Provider {
+                         screen: String?, paneClosed: Bool = false,
+                         trustPrompt: Bool = false) -> MCPLaunchAgentReceipt.Provider {
         if previous.status == "refused" { return previous }
         var stage = previous
         if let model = evidence?.model { stage.observedModel = model }
@@ -321,6 +370,12 @@ enum MCPLaunchAgentObservation {
             stage.detail = "The pane was closed before any assistant output was observed."
             return stage
         }
+        if trustPrompt {
+            stage.status = "blocked"; stage.evidence = "screen"
+            stage.detail = "The provider is waiting at its workspace trust prompt for this cwd. Relay never answers it: " +
+                "use a cwd this account already trusts, or have the user answer it in the pane."
+            return stage
+        }
         if everBound && !hasTranscriptPath {
             stage.status = "unknown"; stage.evidence = "none"
             stage.detail = "The verified binding names no transcript, so assistant output cannot be observed."
@@ -335,7 +390,7 @@ enum MCPLaunchAgentObservation {
     /// The bound stage from one binding read. A binding seen once latches;
     /// it is not withdrawn when the agent later exits.
     static func bound(_ previous: MCPLaunchAgentReceipt.Bound, binding: [String: Any]?, unavailable: String?,
-                      exitCode: Int?, paneClosed: Bool, target: RelayAgentAccount,
+                      exitCode: Int?, paneClosed: Bool, target: RelayAgentAccount, home: String? = nil,
                       label: (String) -> String?) -> MCPLaunchAgentReceipt.Bound {
         if previous.status == "bound" { return previous }
         var stage = previous
@@ -345,10 +400,14 @@ enum MCPLaunchAgentObservation {
             stage.pid = producer["process_id"] as? Int
             stage.sessionID = binding["session_id"] as? String
             stage.transcriptPath = (binding["transcript_path"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            stage.transcriptSource = stage.transcriptPath == nil ? nil : "binding"
             if let directory = producer["config_dir"] as? String {
+                // The binding reports a resolved path; accounts are "~/name".
+                let observed = tildeForm(directory, home: home)
                 stage.configDir = directory
-                stage.account = label(directory)
-                stage.accountMatches = target.matches(observedDirectory: directory)
+                stage.account = label(observed)
+                stage.accountMatches = target.matches(observedDirectory: observed) ||
+                    target.explicitClaudeDefault(observedDirectory: observed)
             } else {
                 stage.configDir = nil
                 stage.account = label("")
@@ -424,6 +483,8 @@ enum MCPAgentBindingRead {
         var readBinding: @MainActor (PaneModel, UUID, WorkspaceModel) async -> MCPAgentBindingRead.Outcome
         var screen: @MainActor (PaneModel) async -> String?
         var accountLabel: @MainActor (ConnectionProfile, String, String) -> String?
+        /// The host's $HOME and the physical form of cwd (`pwd -P`); nil when unknown.
+        var hostPaths: @MainActor (ConnectionProfile, String) async -> (home: String?, cwd: String?) = { _, _ in (nil, nil) }
         /// Whole first call (relay-mcp's HTTP client allows 60 s), the part of
         /// it the new shell may take to show an empty prompt, and one replay's
         /// observation. A stalled host RPC can still extend a call.
@@ -441,6 +502,9 @@ enum MCPAgentBindingRead {
         var profile: ConnectionProfile?
         var running = true
         var observing = false
+        var pathsRead = false
+        var home: String?
+        var physicalCwd: String?
     }
     private var entries: [UUID: Entry] = [:]
     let receiptLimit: Int
@@ -579,7 +643,7 @@ enum MCPAgentBindingRead {
         while ContinuousClock.now < deadline {
             await observe(proposal.requestID, workspace: workspace, environment: environment)
             guard let receipt = entries[proposal.requestID]?.receipt else { break }
-            let settled = receipt.bound.status != "pending" && receipt.provider.status != "pending"
+            let settled = receipt.provider.status == "blocked" || (receipt.bound.status != "pending" && receipt.provider.status != "pending")
             if settled || ContinuousClock.now + environment.pollInterval >= deadline { break }
             try? await Task.sleep(for: environment.pollInterval)
         }
@@ -597,7 +661,7 @@ enum MCPAgentBindingRead {
             while true {
                 await observe(requestID, workspace: workspace, environment: environment)
                 guard let receipt = entries[requestID]?.receipt else { break }
-                let settled = receipt.bound.status != "pending" && receipt.provider.status != "pending"
+                let settled = receipt.provider.status == "blocked" || (receipt.bound.status != "pending" && receipt.provider.status != "pending")
                 if settled || ContinuousClock.now + environment.pollInterval >= deadline { break }
                 try? await Task.sleep(for: environment.pollInterval)
             }
@@ -612,6 +676,14 @@ enum MCPAgentBindingRead {
         // The entry holds the pane weakly; a closed pane may already be gone.
         let pane = entry.pane
         func live() -> PaneModel? { pane.flatMap { workspace.panes[$0.id] === $0 ? $0 : nil } }
+        if !entry.pathsRead {
+            let paths = await environment.hostPaths(profile, entry.proposal.cwd)
+            entries[requestID]?.pathsRead = true
+            entries[requestID]?.home = paths.home
+            entries[requestID]?.physicalCwd = paths.cwd
+        }
+        let home = entries[requestID]?.home
+        let physicalCwd = entries[requestID]?.physicalCwd ?? entry.proposal.cwd
         var binding: [String: Any]?, unavailable: String?
         if entry.receipt.bound.status != "bound", let current = live() {
             switch await environment.readBinding(current, current.id, workspace) {
@@ -623,8 +695,18 @@ enum MCPAgentBindingRead {
         let paneClosed = live() == nil
         guard var receipt = entries[requestID]?.receipt else { return }
         receipt.bound = MCPLaunchAgentObservation.bound(receipt.bound, binding: binding, unavailable: unavailable,
-            exitCode: exitCode, paneClosed: paneClosed, target: account,
+            exitCode: exitCode, paneClosed: paneClosed, target: account, home: home,
             label: { environment.accountLabel(profile, account.provider, $0) })
+        // Claude's binding may name no transcript; its path follows from the
+        // config directory, the physical cwd and the session.
+        if receipt.bound.status == "bound", receipt.bound.transcriptPath == nil, account.provider == "claude",
+           let session = receipt.bound.sessionID,
+           let config = receipt.bound.configDir.flatMap({ MCPLaunchAgentObservation.absolute($0, home: home) })
+                ?? MCPLaunchAgentObservation.absolute(account.dir.isEmpty ? "~/.claude" : account.dir, home: home),
+           let path = MCPLaunchAgentObservation.claudeTranscriptPath(configDir: config, cwd: physicalCwd, sessionID: session) {
+            receipt.bound.transcriptPath = path
+            receipt.bound.transcriptSource = "derived"
+        }
         var evidence: MCPLaunchAgentObservation.TranscriptEvidence?
         var readable = false
         if receipt.provider.status != "refused", receipt.provider.admitted != true,
@@ -635,11 +717,15 @@ enum MCPAgentBindingRead {
             }
         }
         var screen: String?
-        if exitCode != nil, let current = live() { screen = await environment.screen(current) }
+        // Before a binding the screen also shows a provider waiting at its
+        // workspace trust prompt; it is read, never answered.
+        if (exitCode != nil || receipt.bound.status != "bound"), let current = live() { screen = await environment.screen(current) }
+        let trust = exitCode == nil && receipt.provider.admitted != true && MCPLaunchAgentObservation.trustPrompt(screen)
         guard entries[requestID] != nil else { return }
         receipt.provider = MCPLaunchAgentObservation.provider(receipt.provider, evidence: evidence, exitCode: exitCode,
             everBound: receipt.bound.status == "bound", hasTranscriptPath: receipt.bound.transcriptPath != nil,
-            transcriptReadable: readable, screen: screen, paneClosed: paneClosed)
+            transcriptReadable: readable, screen: exitCode != nil ? screen : nil, paneClosed: paneClosed, trustPrompt: trust)
+        if trust, receipt.bound.status == "pending" { receipt.bound.reason = "Waiting at the provider's workspace trust prompt" }
         if receipt.bound.status == "failed", let code = exitCode, MCPLaunchAgentCommand.launchFailureExitCodes.contains(code) {
             receipt.started = .init(status: "failed",
                 reason: "The new pane exited \(code) before a binding: cd to cwd, reading the brief, or executing Relay's launcher failed")
@@ -776,6 +862,15 @@ extension MCPLaunchAgentRequests.Environment {
             screen: { pane in await pane.runtime.backgroundViewportText() },
             accountLabel: { profile, provider, directory in
                 RelayAgentAccountDirectory.shared.account(for: profile, provider: provider, observedDirectory: directory)?.label
+            },
+            hostPaths: { profile, cwd in
+                let command = "printf '%s\\n' \"$HOME\"; cd -- " + MCPLaunchAgentCommand.quote(cwd) + " && pwd -P"
+                guard let result = try? await RelayHostExecution.capture(profile: profile, command: command,
+                                                                         timeout: 10, maximumBytes: 16_384),
+                      result.exitCode == 0 else { return (nil, nil) }
+                let lines = String(decoding: result.stdout, as: UTF8.self).split(separator: "\n").map(String.init)
+                func path(_ index: Int) -> String? { lines.indices.contains(index) && lines[index].hasPrefix("/") ? lines[index] : nil }
+                return (path(0), path(1))
             })
     }
 }

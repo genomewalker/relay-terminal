@@ -389,4 +389,58 @@ struct MCPLaunchAgentTests {
         #expect(stage(codexError, exit: nil).status == "unknown" && stage(codexError, exit: nil).excerpt?.contains("not supported") == true)
         #expect(O.scan(Data("not json\n{}".utf8), provider: "claude") == O.TranscriptEvidence())
     }
+
+    // MARK: 0.5.108 gaps: home-relative accounts, derived Claude transcript, trust prompt
+
+    @Test func accountMatchesAResolvedHomePath() {
+        typealias O = MCPLaunchAgentObservation
+        #expect(O.tildeForm("/home/u/.claude-team", home: "/home/u") == "~/.claude-team")
+        #expect(O.tildeForm("/home/u/.claude-team/", home: "/home/u/") == "~/.claude-team")
+        #expect(O.tildeForm("/home/uu/.claude-team", home: "/home/u") == "/home/uu/.claude-team")
+        #expect(O.tildeForm("/opt/x", home: nil) == "/opt/x")
+        let team = RelayAgentAccount(provider: "claude", label: "business", dir: "~/.claude-team")
+        let binding: [String: Any] = ["session_id": "0088ed42-5a5b-49e5-b025-4fb565300b9c",
+            "producer": ["provider": "claude", "process_id": 7, "config_dir": "/home/u/.claude-team"]]
+        let bound = O.bound(.init(), binding: binding, unavailable: nil, exitCode: nil, paneClosed: false,
+                            target: team, home: "/home/u", label: { $0 == "~/.claude-team" ? "business" : nil })
+        #expect(bound.accountMatches == true)
+        #expect(bound.account == "business")
+        #expect(bound.configDir == "/home/u/.claude-team")
+        let other = O.bound(.init(), binding: binding, unavailable: nil, exitCode: nil, paneClosed: false,
+                            target: Self.personal, home: "/home/u", label: { _ in nil })
+        #expect(other.accountMatches == false)
+    }
+
+    @Test func claudeTranscriptPathFollowsConfigCwdAndSession() {
+        typealias O = MCPLaunchAgentObservation
+        let session = "0088ed42-5a5b-49e5-b025-4fb565300b9c"
+        #expect(O.claudeTranscriptPath(configDir: "/home/u/.claude-team",
+                                       cwd: "/maps/projects/caeg/people/kbd606/projects/faro-platform", sessionID: session)
+                == "/home/u/.claude-team/projects/-maps-projects-caeg-people-kbd606-projects-faro-platform/\(session).jsonl")
+        #expect(O.claudeTranscriptPath(configDir: "/c/", cwd: "/a b/c.d_e", sessionID: session) == "/c/projects/-a-b-c-d-e/\(session).jsonl")
+        #expect(O.claudeTranscriptPath(configDir: "~/.claude", cwd: "/a", sessionID: session) == nil)
+        #expect(O.claudeTranscriptPath(configDir: "/c", cwd: "/a", sessionID: "../x") == nil)
+        #expect(O.claudeTranscriptPath(configDir: "/c", cwd: "/" + String(repeating: "a", count: 240), sessionID: session) == nil)
+        #expect(O.absolute("~/.claude-team", home: "/home/u") == "/home/u/.claude-team")
+        #expect(O.absolute("~/.claude-team", home: nil) == nil)
+    }
+
+    @Test func trustPromptIsReportedAsBlockedNotPending() {
+        typealias O = MCPLaunchAgentObservation
+        let claude = " Accessing workspace:\n Quick safety check: Is this a project you created or one you trust?\n ❯ No, exit\n   Yes, I trust this folder"
+        #expect(O.trustPrompt(claude))
+        #expect(O.trustPrompt("Do you trust the contents of this directory? Working with untrusted contents"))
+        #expect(!O.trustPrompt("❯ launch smoke test OK"))
+        #expect(!O.trustPrompt(nil))
+        let blocked = O.provider(.init(), evidence: nil, exitCode: nil, everBound: false, hasTranscriptPath: false,
+                                 transcriptReadable: false, screen: nil, trustPrompt: true)
+        #expect(blocked.status == "blocked")
+        #expect(blocked.evidence == "screen")
+        // Admission, an exit or a closed pane decide over a stale trust screen.
+        var admitted = MCPLaunchAgentReceipt.Provider(); admitted.admitted = true
+        #expect(O.provider(admitted, evidence: nil, exitCode: nil, everBound: true, hasTranscriptPath: true,
+                           transcriptReadable: true, screen: nil, trustPrompt: true).status == "admitted")
+        #expect(O.provider(.init(), evidence: nil, exitCode: 1, everBound: false, hasTranscriptPath: false,
+                           transcriptReadable: false, screen: nil, trustPrompt: true).status != "blocked")
+    }
 }
