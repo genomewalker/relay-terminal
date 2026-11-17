@@ -171,6 +171,14 @@ enum RelayAgentMaintenancePrompt {
                 let centsCost = value.range(of: #"^[0-9]+(?:\.[0-9]+)?¢ "#, options: .regularExpression) != nil
                 // A finished slash command leaves a one-line result notice ("/rc failed").
                 let commandNotice = value.range(of: #"^/[a-z][a-z0-9-]* failed$"#, options: .regularExpression) != nil
+                // A usage-limit stop leaves two notice rows under an idle prompt
+                // (07fa914c, 2026-11-17): "⚠ Usage limit reached · limit resets 3:50pm ·
+                // clau.de/wrap-up" and "Continuing automatically at 3:50pm · Esc to cancel".
+                // The turn has ended; moving the pane to another account is the remedy.
+                let usageLimitNotice = value.range(of: #"^⚠ Usage limit reached(?: · .+)?$"#,
+                    options: .regularExpression) != nil ||
+                    value.range(of: #"^Continuing automatically at [^·]+ · Esc to cancel$"#,
+                        options: .regularExpression) != nil
                 // The status line names the model as "| [Name N.N]" ("[Fable 5.1]",
                 // "[Haiku 5.5>]"), so a new model family needs no code change.
                 let modelStatus = value.range(of: #"\| \[[A-Z][A-Za-z]* [0-9]+(?:\.[0-9]+)*[^\]|]*\]"#,
@@ -182,7 +190,8 @@ enum RelayAgentMaintenancePrompt {
                 let staleToolRow = (explainedAgents == waitingSessionsExplained || explainedAgents == allWorkExplained) &&
                     statusToolRow(value)
                 let known = value.hasPrefix("⏵") || value.hasPrefix("⏸") || value.hasPrefix("◈") ||
-                    value.hasPrefix("+ ") || value.hasPrefix("$") || centsCost || commandNotice || waitingStatus ||
+                    value.hasPrefix("+ ") || value.hasPrefix("$") || centsCost || commandNotice || usageLimitNotice ||
+                    waitingStatus ||
                     staleToolRow ||
                     modelStatus ||
                     (value.contains(" | [") && ["Opus", "Sonnet", "Haiku"].contains(where: value.contains))
