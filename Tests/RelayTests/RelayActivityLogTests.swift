@@ -95,8 +95,17 @@ struct RelayActivityLogTests {
         #expect(message?.summary == "Sent a message to 'worker'")
         #expect(message?.paneID == pane)
 
+        // A failed start that left a pane is listed; one without a pane is not.
+        let failed = RelayActivityDescriber.describe(method: "POST", path: "/api/workspace/launch-agent",
+            request: json(["provider": "codex", "host": "This Mac"]),
+            response: json(["status": "launch_failed", "created": ["status": "created", "pane_id": id(pane)]]))
+        #expect(failed?.summary == "Opened a pane but failed to launch Codex on This Mac")
         #expect(RelayActivityDescriber.describe(method: "POST", path: "/api/workspace/launch-agent",
             request: json([:]), response: json(["status": "launch_failed"])) == nil)
+        #expect(RelayActivityDescriber.describe(method: "POST", path: "/api/panes/\(id(pane))/message",
+            request: json(["messageID": "m2"]), response: json(["status": "rejected_untrusted"])) == nil)
+        #expect(RelayActivityDescriber.describe(method: "POST", path: "/api/panes/\(id(pane))/message",
+            request: json(["messageID": "m3"]), response: json(["status": "queued", "delivered": false])) == nil)
         #expect(RelayActivityDescriber.describe(method: "GET", path: "/api/panes/\(id(pane))/message",
             request: Data(), response: Data()) == nil)
         #expect(RelayActivityDescriber.describe(method: "POST", path: "/api/workspace/show",

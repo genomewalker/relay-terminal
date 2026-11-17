@@ -29,8 +29,10 @@ enum RelayActivityDescriber {
         guard method == "POST" else { return nil }
         let input = (try? JSONSerialization.jsonObject(with: request)) as? [String: Any] ?? [:]
         let output = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any] ?? [:]
-        if let status = output["status"] as? String,
-           ["failed", "unavailable", "launch_failed", "expired", "refused", "rejected"].contains(status) { return nil }
+        // A launch that created a pane but failed to start still left a pane behind.
+        let status = output["status"] as? String ?? ""
+        if ["failed", "unavailable", "expired", "refused"].contains(status) || status.hasPrefix("rejected") { return nil }
+        if output["delivered"] as? Bool == false { return nil }
         func string(_ object: [String: Any], _ keys: String...) -> String? {
             for key in keys { if let value = object[key] as? String, !value.isEmpty { return value } }
             return nil
@@ -71,7 +73,8 @@ enum RelayActivityDescriber {
             let pane = responsePane ?? uuid(input, "paneID")
             return entry("Stacked \(named(pane))", pane: pane, tab: responseTab)
         case "/api/workspace/browser":
-            return entry("Opened a browser pane", pane: responsePane, tab: responseTab)
+            let pane = responsePane ?? uuid(input, "paneID")
+            return entry("Used the browser in \(named(pane))", pane: pane, tab: responseTab)
         case "/api/workspace/rename-pane":
             let pane = uuid(input, "paneID")
             let name = string(input, "name").map { "'\(String($0.prefix(60)))'" } ?? "a new name"
@@ -84,12 +87,13 @@ enum RelayActivityDescriber {
             let created = output["created"] as? [String: Any] ?? [:]
             let provider = string(input, "provider").map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? "an agent"
             let host = string(input, "host") ?? "a host"
-            return entry("Launched \(provider) on \(host)", pane: uuid(created, "pane_id", "paneID"),
+            let verb = status == "launch_failed" ? "Opened a pane but failed to launch" : "Launched"
+            return entry("\(verb) \(provider) on \(host)", pane: uuid(created, "pane_id", "paneID"),
                          tab: uuid(created, "tab_id", "tabID"))
         case "/api/agent-accounts/move":
             let pane = uuid(input, "paneID") ?? responsePane
             let account = string(input, "account").map { " to account '\($0.prefix(60))'" } ?? ""
-            return entry("Moved \(named(pane))\(account)", pane: pane)
+            return entry("Moving \(named(pane))\(account)", pane: pane)
         case "/api/recovery/attach":
             return entry("Reattached a recovered pane", pane: responsePane ?? uuid(input, "paneID", "pane_id"), tab: responseTab)
         case "/api/recovery/terminate":

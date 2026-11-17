@@ -124,6 +124,8 @@ import UniformTypeIdentifiers
                     if query.isEmpty {
                         AttentionInboxSection(workspace: workspace, inbox: inbox, identifier: "relay.navigator.attention-inbox")
                             .padding(.horizontal, 8)
+                        RelayActivitySection(workspace: workspace)
+                            .padding(.horizontal, 8)
                     }
                     let pinned = lists.shown.filter { $0.favourite && !$0.isInbox }
                     if !pinned.isEmpty {
