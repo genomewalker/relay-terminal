@@ -1139,6 +1139,9 @@ final class RelaySidePanelServer: ObservableObject {
         }
         do { try callerControl.record(caller: identity, request: request, outcome: "admitted") }
         catch { return .text("Audit could not be persisted; operation not dispatched", status: 503, reason: "Service Unavailable") }
+        // Focus before the request runs: an action that touched another pane
+        // is listed in the activity inbox, even if it moved focus itself.
+        let focusedPane = workspace?.activePaneID, focusedTab = workspace?.selectedTabID
         // An account move is user-initiated only: the assistant's executor
         // enters here with its own identity and is refused before dispatch.
         let response = assistantIdentity && !assistantActionApproved && !Self.assistantMayRequest(request.path)
@@ -1146,6 +1149,13 @@ final class RelaySidePanelServer: ObservableObject {
             : await dispatch(request, caller: identity)
         do { try callerControl.record(caller: identity, request: request, outcome: "http-\(response.status)", responseData: response.body) }
         catch { return .text("Operation outcome unresolved: completion audit failed; do not replay", status: 503, reason: "Service Unavailable") }
+        if (200..<300).contains(response.status) {
+            let caller = identity == RelayCallerControl.assistantCaller ? "Relay assistant"
+                : identity == "legacy-unattributed" ? "An agent" : callerControl.label(for: identity)
+            RelayActivityLog.shared.observe(caller: caller, method: request.method, path: request.path,
+                                            request: request.body, response: response.body,
+                                            focusedPane: focusedPane, focusedTab: focusedTab, workspace: workspace)
+        }
         return response
     }
 

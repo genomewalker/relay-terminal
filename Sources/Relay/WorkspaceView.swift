@@ -309,6 +309,9 @@ struct WorkspaceView: View {
                 .accessibilityElement(children: .contain)
             }
         }
+        .overlay(alignment: .topTrailing) {
+            RelayActivityToast(workspace: workspace)
+        }
         .overlay(alignment: .top) {
             if recentPlaces.isVisible {
                 RelayRecentPlacesPanel(switcher: recentPlaces)
@@ -1806,6 +1809,7 @@ struct SessionManager: View {
                 if tabSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     LazyVStack(alignment: .leading, spacing: RelayTheme.spacing(2)) {
                         AttentionInboxSection(workspace: workspace)
+                        RelayActivitySection(workspace: workspace)
                         // Same status as the fleet board; one pass over the panes per revision.
                         let marks = RelayWorkOverviewIndex.tabStatuses(RelayWorkOverviewIndex.paneFacts(workspace),
                                                                        focusedTabID: workspace.selectedTabID)

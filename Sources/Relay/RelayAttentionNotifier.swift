@@ -127,6 +127,7 @@ final class RelayAttentionNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     private weak var workspace: WorkspaceModel?
     private var policy = RelayAttentionBannerPolicy()
+    private var activityPolicy = RelayAttentionBannerPolicy()
     private var authorized: Bool?
     private var summaryTask: Task<Void, Never>?
     private var activation: NSObjectProtocol?
@@ -149,6 +150,7 @@ final class RelayAttentionNotifier: NSObject, UNUserNotificationCenterDelegate {
         let store = AgentIntelligenceStore.shared
         store.onRecord = { [weak self] item in self?.recorded(item) ?? false }
         store.onPublish = { [weak self] in self?.updateDockBadge() }
+        RelayActivityLog.shared.onRecord = { [weak self] entry in self?.postActivity(entry) }
         guard !RelayLaunchMode.isRunningTests else { return }
         // Returning to Relay counts as looking at the pane already in front.
         activation = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
@@ -195,6 +197,22 @@ final class RelayAttentionNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.userInfo = ["pane_id": item.paneID.uuidString.lowercased()]
         if alert.playsSound { content.sound = .default }
         deliver(UNNotificationRequest(identifier: item.id, content: content, trigger: nil))
+    }
+
+    /// An agent action outside focus, while Relay is in the background: a
+    /// silent banner whose click shows the pane (frontmost Relay shows an
+    /// in-app toast instead). Its own policy, so activity never delays alerts.
+    private func postActivity(_ entry: RelayActivityEntry) {
+        guard let paneID = entry.paneID,
+              case .banner = activityPolicy.decide(paneID: paneID, alert: .done, occurredAt: entry.at, now: Date(),
+                                                   appActive: NSApp?.isActive ?? false) else { return }
+        let content = UNMutableNotificationContent()
+        content.title = entry.caller
+        content.body = entry.summary
+        content.threadIdentifier = "relay-activity"
+        content.userInfo = ["pane_id": paneID.uuidString.lowercased()]
+        deliver(UNNotificationRequest(identifier: "relay-activity-" + entry.id.uuidString.lowercased(),
+                                      content: content, trigger: nil))
     }
 
     private func scheduleSummary() {
