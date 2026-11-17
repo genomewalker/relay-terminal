@@ -611,6 +611,7 @@ final class RelaySidePanelServer: ObservableObject {
     private let mcpWorkspaceGrant = MCPWorkspaceGrant.shared
     private let workspaceApply = WorkspaceApplyAdmission()
     private let directTabRequests = MCPDirectTabRequests()
+    private let launchAgentRequests = MCPLaunchAgentRequests()
     private let directRecoveryReceipts = RelayPaneRecoveryReceipts()
     #if DEBUG
     var recoveryFixtureGrant: MCPWorkspaceGrant?
@@ -1816,6 +1817,11 @@ final class RelaySidePanelServer: ObservableObject {
                                                     permits: mcpWorkspaceGrant.permits, workspace: workspace,
                                                     resolve: { self.recoveryProfile(host: $0) })
         }
+        if request.method == "POST", request.path == "/api/workspace/launch-agent" {
+            return await launchAgentRequests.launch(request.body, instance: agentInputRequests.instance,
+                permits: { [mcpWorkspaceGrant] in mcpWorkspaceGrant.permits($0) }, workspace: workspace,
+                environment: .live(resolveHost: { [weak self] in self?.recoveryProfile(host: $0) }))
+        }
         if request.method == "GET", request.path == "/api/plugins" {
             do { return .json(try await RelayPluginManager.shared.controlInventory()) }
             catch { return .text("Plugin inventory unavailable", status: 503, reason: "Service Unavailable") }
@@ -2422,28 +2428,17 @@ final class RelaySidePanelServer: ObservableObject {
             guard let pane = workspace.panes[paneID], pane.contentKind == .terminal else {
                 return .text("Exact terminal pane required", status: 409, reason: "Conflict")
             }
-            let profile = pane.profile
             do {
-                let command = RelayHostExecution.daemonCommand(profile: profile,
-                    arguments: ["agent-binding", paneID.uuidString.lowercased()])
-                let result = try await RelayHostExecution.capture(profile: profile, command: command,
-                    timeout: 10, maximumBytes: 65_536)
-                guard workspace.panes[paneID] === pane, pane.profile == profile else {
-                    return .text("Pane or host changed during binding observation", status: 409, reason: "Conflict")
-                }
-                guard result.exitCode == 0 else {
-                    let reason = String(String(decoding: result.stderr, as: UTF8.self).prefix(2_048))
+                switch await MCPAgentBindingRead.read(pane, paneID: paneID, workspace: workspace) {
+                case .conflict(let reason):
+                    return .text(reason, status: 409, reason: "Conflict")
+                case .unavailable(let reason):
                     return try .jsonObject(["pane_id": paneID.uuidString.lowercased(),
                         "status": "unavailable", "reason": reason, "binding": NSNull()])
+                case .bound(let binding):
+                    return try .jsonObject(["pane_id": paneID.uuidString.lowercased(),
+                        "status": "bound", "binding": binding])
                 }
-                guard let binding = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any],
-                      binding["version"] as? Int == 1,
-                      let producer = binding["producer"] as? [String: Any],
-                      producer["pane_id"] as? String == paneID.uuidString.lowercased() else {
-                    return .text("Binding reader returned mismatched evidence", status: 409, reason: "Conflict")
-                }
-                return try .jsonObject(["pane_id": paneID.uuidString.lowercased(),
-                    "status": "bound", "binding": binding])
             } catch {
                 return .text("Binding observation unavailable: \(error.localizedDescription)", status: 409, reason: "Conflict")
             }

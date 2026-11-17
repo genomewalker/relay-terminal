@@ -26,6 +26,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 type request struct {
@@ -59,6 +60,7 @@ var peerIdentifier = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,109}$`)
 var peerStart = regexp.MustCompile(`^[0-9]{1,24}$`)
 var localPeerStart = regexp.MustCompile(`^[A-Za-z0-9 .:+_-]{1,128}$`)
 var accountLabel = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,23}$`)
+var launchModel = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 var migrationPlanName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$`)
 var migrationChecksum = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
@@ -84,6 +86,20 @@ func validStackHost(host string) bool {
 	return true
 }
 
+// validLaunchPath admits an absolute host path that is typed into a shell
+// only inside single quotes, so no control character (newline included).
+func validLaunchPath(path string) bool {
+	if !strings.HasPrefix(path, "/") || len(path) > 4096 || !utf8.ValidString(path) {
+		return false
+	}
+	for _, r := range path {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func tool(name, description string, properties map[string]any, required []string) map[string]any {
 	properties["caller_token"] = map[string]string{"type": "string", "description": "Optional registered client credential for persistent caller attribution and pause controls. Not an authenticated desktop thread identity."}
 	mutation := strings.HasPrefix(name, "relay_request_") || strings.HasPrefix(name, "relay_create_") || strings.HasPrefix(name, "relay_send_")
@@ -92,7 +108,7 @@ func tool(name, description string, properties map[string]any, required []string
 		mutation = true
 	case "relay_request_secret", "relay_miko_turn", "relay_miko_card", "relay_miko_set_instructions", "relay_miko_set_memory", "relay_miko_set_capabilities", "relay_miko_revert", "relay_ask_miko":
 		mutation = true
-	case "relay_apply_installed_update", "relay_codex_resume_pane", "relay_terminal_edit", "relay_rename_pane", "relay_show", "relay_browser", "relay_tab_action", "relay_stack_pane", "relay_new_stacked_pane", "relay_update_settings", "relay_check_host_installation", "relay_check_intelligence", "relay_register_caller", "relay_control_caller", "relay_render_content", "relay_publish_surface":
+	case "relay_apply_installed_update", "relay_codex_resume_pane", "relay_terminal_edit", "relay_rename_pane", "relay_show", "relay_browser", "relay_tab_action", "relay_stack_pane", "relay_new_stacked_pane", "relay_launch_agent", "relay_update_settings", "relay_check_host_installation", "relay_check_intelligence", "relay_register_caller", "relay_control_caller", "relay_render_content", "relay_publish_surface":
 		mutation = true
 	case "relay_exec", "relay_exec_cancel", "relay_host_request", "relay_upload_file", "relay_install_relayd", "relay_update_host_relayd", "relay_rollback_relayd", "relay_workspace_request", "relay_bind_workspace_context", "relay_workspace_migration_stage_plan", "relay_workspace_migration_apply", "relay_workspace_migration_undo":
 		mutation = true
@@ -237,6 +253,7 @@ func (s *server) handle(r request) (any, int, string) {
 			tool("relay_new_local_tab", "Create a local shell tab under the one-time terminal control grant. Without an anchor it opens in the active Relay session. With exactly one of anchor_pane_id or anchor_tab_id it opens immediately after that pane's tab (or that tab), in the anchor's Relay session and workspace. No command or environment override is accepted. Use the current instance and a fresh request UUID.", map[string]any{"instance": map[string]string{"type": "string"}, "request_id": map[string]string{"type": "string"}, "anchor_pane_id": map[string]string{"type": "string"}, "anchor_tab_id": map[string]string{"type": "string"}}, []string{"instance", "request_id"}),
 			tool("relay_stack_pane", "Stack one existing Relay pane (pane_id) into the pane stack of another pane (target_pane_id) under the one-time layout grant. The target may be in another tab or Relay session. The pane joins the target's stack as its shown member and is never placed as a split; its process, agent session, links and remote attachment are unchanged. A source tab left empty is removed. The result lists stackID and its members; any refusal changes nothing. Use a fresh request_id; repeated identical requests return the same result.", map[string]any{"instance": map[string]string{"type": "string"}, "request_id": map[string]string{"type": "string"}, "pane_id": map[string]string{"type": "string"}, "target_pane_id": map[string]string{"type": "string"}}, []string{"instance", "request_id", "pane_id", "target_pane_id"}),
 			tool("relay_new_stacked_pane", "Create a new shell pane directly in the pane stack of target_pane_id under the one-time terminal creation and layout grants. host is This Mac or an exact configured SSH host alias (see relay_connection_targets). No command or environment override is accepted. The result has the new paneID, stackID and members. Use a fresh request_id; repeated identical requests return the same result.", map[string]any{"instance": map[string]string{"type": "string"}, "request_id": map[string]string{"type": "string"}, "target_pane_id": map[string]string{"type": "string"}, "host": map[string]any{"type": "string", "maxLength": 256}}, []string{"instance", "request_id", "target_pane_id", "host"}),
+			tool("relay_launch_agent", "Start a genuine interactive Claude or Codex agent in a new shell pane that Relay creates, under the one-time terminal creation and input grants (plus layout with target_pane_id). host is This Mac or an exact configured SSH alias (see relay_connection_targets). cwd is an absolute directory and brief_path an absolute, readable regular file of 1 byte to 64 KiB on that host; the shell reads the brief as the agent's initial prompt, so it must be UTF-8 text of more than one word that does not start with \"-\". provider is claude or codex; model is a plain model name; account is a plain account label of that provider on that host, as in relay_list_panes' account field, never its accountDisplay text. Placement: target_pane_id stacks the new pane like relay_new_stacked_pane; anchor_tab_id or anchor_pane_id opens a new tab right after it like relay_new_local_tab; with none, a new tab opens in the active Relay session. Give at most one. Host, account, Relay's managed launcher, cwd and brief are checked first; a refusal creates nothing and leaves request_id unused. Relay then types one command only into the new pane's verified-empty shell prompt, never into an existing pane or agent: cd to cwd, then exec the provider through Relay's managed launcher with the account's CLAUDE_CONFIG_DIR or CODEX_HOME, the model and the brief (POSIX shell syntax: bash or zsh). If cd or reading the brief fails the new shell exits 97, and if the launcher cannot run it exits 126 or 127; before a binding these report started failed. The receipt reports four stages separately: created (pane_id, tab_id), started (submitted means typed, not running), bound (the verified native binding: provider, pid, session_id, config_dir, account) and provider (admitted after assistant output; refused on a provider refusal, API error, or a non-zero exit of the bound agent before output; exited; pending; or unknown, with an excerpt, when the evidence cannot tell). The call returns within about 30 seconds, often with bound or provider pending. request_id is single-use: repeating the identical call never creates or types again; it returns the receipt and re-observes bound and provider, so poll by repeating it. Different arguments under the same request_id return 409. Receipts live in Relay's memory and do not survive a Relay restart. Never retry, rephrase or relaunch around a provider refusal.", map[string]any{"instance": map[string]string{"type": "string", "pattern": paneID.String()}, "request_id": map[string]string{"type": "string", "pattern": paneID.String()}, "host": map[string]any{"type": "string", "maxLength": 256}, "cwd": map[string]any{"type": "string", "maxLength": 4096}, "provider": map[string]any{"type": "string", "enum": []string{"claude", "codex"}}, "model": map[string]any{"type": "string", "pattern": launchModel.String()}, "account": map[string]any{"type": "string", "pattern": accountLabel.String()}, "brief_path": map[string]any{"type": "string", "maxLength": 4096}, "target_pane_id": map[string]string{"type": "string", "pattern": paneID.String()}, "anchor_tab_id": map[string]string{"type": "string", "pattern": paneID.String()}, "anchor_pane_id": map[string]string{"type": "string", "pattern": paneID.String()}}, []string{"instance", "request_id", "host", "cwd", "provider", "model", "account", "brief_path"}),
 			tool("relay_connection_targets", "List This Mac and configured SSH aliases that Relay can use for panes and tabs.", map[string]any{}, []string{}),
 			tool("relay_host_registry", "Read configured host provenance, historical installation checks and observed daemon versions. Historical connected flags are not proof of current connectivity. Does not install or update helpers.", map[string]any{}, []string{}),
 			tool("relay_check_host_installation", "Check the installed helper and live daemon on one exact configured SSH host through Relay. Persists the native manager report. Requires workspace configuration grant and an unpaused caller. Never installs, updates or stops a daemon; refuses concurrent checks or installations.", map[string]any{"host": map[string]string{"type": "string"}}, []string{"host"}),
@@ -880,6 +897,47 @@ func (s *server) handle(r request) (any, int, string) {
 			}
 			path, method = "/api/workspace/new-stacked-pane", "POST"
 			body, _ = json.Marshal(map[string]string{"instance": instance, "requestID": id, "targetPaneID": target, "host": host})
+		case "relay_launch_agent":
+			var instance, id, host, cwd, provider, model, account, brief string
+			placement := ""
+			for key := range p.Arguments {
+				switch key {
+				case "instance", "request_id", "host", "cwd", "provider", "model", "account", "brief_path":
+				case "target_pane_id", "anchor_tab_id", "anchor_pane_id":
+					if placement != "" {
+						return nil, -32602, "Give at most one of target_pane_id, anchor_tab_id or anchor_pane_id"
+					}
+					placement = key
+				default:
+					return nil, -32602, "Unknown relay_launch_agent argument"
+				}
+			}
+			want := 8
+			if placement != "" {
+				want = 9
+			}
+			if len(p.Arguments) != want ||
+				json.Unmarshal(p.Arguments["instance"], &instance) != nil || !paneID.MatchString(instance) ||
+				json.Unmarshal(p.Arguments["request_id"], &id) != nil || !paneID.MatchString(id) ||
+				json.Unmarshal(p.Arguments["host"], &host) != nil || !validStackHost(host) ||
+				json.Unmarshal(p.Arguments["cwd"], &cwd) != nil || !validLaunchPath(cwd) ||
+				json.Unmarshal(p.Arguments["provider"], &provider) != nil || (provider != "claude" && provider != "codex") ||
+				json.Unmarshal(p.Arguments["model"], &model) != nil || !launchModel.MatchString(model) ||
+				json.Unmarshal(p.Arguments["account"], &account) != nil || !accountLabel.MatchString(account) ||
+				json.Unmarshal(p.Arguments["brief_path"], &brief) != nil || !validLaunchPath(brief) {
+				return nil, -32602, "Valid instance and request_id UUIDs, host (This Mac or an exact SSH alias), absolute cwd and brief_path without control characters, provider claude or codex, model and account label required"
+			}
+			payload := map[string]string{"instance": instance, "requestID": id, "host": host, "cwd": cwd, "provider": provider,
+				"model": model, "account": account, "briefPath": brief}
+			if placement != "" {
+				var anchor string
+				if json.Unmarshal(p.Arguments[placement], &anchor) != nil || !paneID.MatchString(anchor) {
+					return nil, -32602, "Placement must be an exact pane or tab UUID"
+				}
+				payload[map[string]string{"target_pane_id": "targetPaneID", "anchor_tab_id": "anchorTabID", "anchor_pane_id": "anchorPaneID"}[placement]] = anchor
+			}
+			path, method = "/api/workspace/launch-agent", "POST"
+			body, _ = json.Marshal(payload)
 		case "relay_link_panes":
 			var target, source, proposal string
 			for key, raw := range p.Arguments {

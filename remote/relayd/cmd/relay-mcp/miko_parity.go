@@ -26,7 +26,10 @@ func mikoExcluded(name string) bool {
 		// A blocking wait would hold Miko's turn; Miko reads the viewport instead.
 		"relay_wait_for_command",
 		// Miko does not broadcast yet; its catalog and card policy would need it first.
-		"relay_broadcast_message":
+		"relay_broadcast_message",
+		// Miko does not launch agents yet; the call blocks up to ~30 s and its
+		// card policy and catalog would need it first.
+		"relay_launch_agent":
 		return true
 	}
 	return false

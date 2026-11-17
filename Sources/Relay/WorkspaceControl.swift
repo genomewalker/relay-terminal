@@ -407,14 +407,15 @@ extension WorkspaceModel {
         return (tab, sourcePane, workspaceID)
     }
 
-    /// Opens a local shell tab immediately after the anchor tab, in the
-    /// anchor's legacy session and workspace. No existing tab, pane or
-    /// runtime is touched; only the new tab is placed.
-    func newLocalTab(anchorPaneID: UUID?, anchorTabID: UUID?) throws -> (tabID: UUID, paneID: UUID) {
+    /// Opens a shell tab (local unless `profile` names a host) immediately
+    /// after the anchor tab, in the anchor's legacy session and workspace.
+    /// No existing tab, pane or runtime is touched; only the new tab is placed.
+    func newLocalTab(anchorPaneID: UUID?, anchorTabID: UUID?,
+                     profile: ConnectionProfile = .local) throws -> (tabID: UUID, paneID: UUID) {
         let anchor = try newTabAnchor(paneID: anchorPaneID, tabID: anchorTabID)
         let existing = Set(tabs.map(\.id))
         withTabAdmission(.workspace(anchor.workspaceID)) {
-            newTab(inSession: anchor.tab.sessionID, profile: .local, origin: .agent(sourcePane: anchor.sourcePane))
+            newTab(inSession: anchor.tab.sessionID, profile: profile, origin: .agent(sourcePane: anchor.sourcePane))
         }
         guard let created = selectedTab, !existing.contains(created.id), let paneID = activePaneID,
               created.allPaneIDs == [paneID], created.sessionID == anchor.tab.sessionID else {
