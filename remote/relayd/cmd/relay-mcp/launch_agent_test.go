@@ -58,6 +58,8 @@ func TestLaunchAgentRefusesInvalidArgumentsBeforeRelay(t *testing.T) {
 		"model upper":         func(a map[string]any) { a["model"] = "Opus" },
 		"model too long":      func(a map[string]any) { a["model"] = strings.Repeat("a", 65) },
 		"model subst":         func(a map[string]any) { a["model"] = "$(id)" },
+		"unknown permission":  func(a map[string]any) { a["permission_mode"] = "bypassPermissions" },
+		"permission not str":  func(a map[string]any) { a["permission_mode"] = true },
 		"account display":     func(a map[string]any) { a["account"] = "personal (~/.claude-personal)" },
 		"host option":         func(a map[string]any) { a["host"] = "-oProxyCommand=x" },
 		"host injection":      func(a map[string]any) { a["host"] = "h; rm -rf ~" },
@@ -111,4 +113,21 @@ func TestLaunchAgentCatalogEntry(t *testing.T) {
 		return
 	}
 	t.Fatal("relay_launch_agent not in catalog")
+}
+
+func TestLaunchAgentForwardsPermissionMode(t *testing.T) {
+	s, _, bodies, done := stackServer(t)
+	defer done()
+	for _, mode := range []string{"account", "ask", "read_only", "yolo"} {
+		args := launchArgs()
+		args["permission_mode"] = mode
+		args["anchor_tab_id"] = "33333333-3333-4333-8333-333333333333"
+		if code := callTool(s, "relay_launch_agent", args); code != 0 {
+			t.Fatal(mode, code)
+		}
+		got := (*bodies)[len(*bodies)-1]
+		if got["permissionMode"] != mode || len(got) != 10 {
+			t.Fatalf("%s forwarded %v", mode, got)
+		}
+	}
 }

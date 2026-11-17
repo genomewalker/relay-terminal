@@ -443,4 +443,25 @@ struct MCPLaunchAgentTests {
         #expect(O.provider(.init(), evidence: nil, exitCode: 1, everBound: false, hasTranscriptPath: false,
                            transcriptReadable: false, screen: nil, trustPrompt: true).status != "blocked")
     }
+
+    @Test func permissionModeAddsOnlyTheProvidersOwnFlags() throws {
+        typealias C = MCPLaunchAgentCommand
+        #expect(C.permissionFlags(provider: "claude", mode: "account") == [])
+        #expect(C.permissionFlags(provider: "claude", mode: "ask") == ["--permission-mode", "manual"])
+        #expect(C.permissionFlags(provider: "claude", mode: "yolo") == ["--permission-mode", "bypassPermissions"])
+        #expect(C.permissionFlags(provider: "codex", mode: "ask") == ["-a", "on-request", "-s", "workspace-write"])
+        #expect(C.permissionFlags(provider: "codex", mode: "read_only") == ["-a", "on-request", "-s", "read-only"])
+        #expect(C.permissionFlags(provider: "codex", mode: "yolo") == ["--dangerously-bypass-approvals-and-sandbox"])
+        #expect(C.permissionFlags(provider: "claude", mode: "bypassPermissions") == nil)
+        let plain = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b"))
+        #expect(!plain.contains("--permission-mode"))
+        let ask = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", permissionMode: "ask"))
+        #expect(ask.contains(" --model 'opus' --permission-mode manual \"$relay_brief\""))
+        #expect(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", permissionMode: "nope") == nil)
+        // The wire field is optional and checked.
+        let instance = UUID(), request = UUID()
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request))?.mode == "account")
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["permissionMode": "ask"]))?.mode == "ask")
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["permissionMode": "root"])) == nil)
+    }
 }

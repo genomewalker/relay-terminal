@@ -25,9 +25,11 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
     var targetPaneID: UUID? = nil
     var anchorTabID: UUID? = nil
     var anchorPaneID: UUID? = nil
+    /// account (default: no flag, the account's own settings) | ask | read_only | yolo.
+    var permissionMode: String? = nil
 
     static let required: Set<String> = ["instance", "requestID", "host", "cwd", "provider", "model", "account", "briefPath"]
-    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID"])
+    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "permissionMode"])
     static let briefLimit = 64 << 10
 
     /// Exact keys, bounded body, and every field valid; nil otherwise.
@@ -42,8 +44,11 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
     var isValid: Bool {
         RelayAgentAccount.providers.contains(provider) && Self.validModel(model) && RelayAgentAccount.validLabel(account) &&
             Self.validPath(cwd) && Self.validPath(briefPath) && !host.isEmpty && host.utf8.count <= 256 &&
-            [targetPaneID, anchorTabID, anchorPaneID].compactMap { $0 }.count <= 1
+            [targetPaneID, anchorTabID, anchorPaneID].compactMap { $0 }.count <= 1 &&
+            MCPLaunchAgentCommand.permissionModes.contains(mode)
     }
+
+    var mode: String { permissionMode ?? "account" }
 
     static func validModel(_ model: String) -> Bool {
         model.range(of: #"^[a-z0-9][a-z0-9._-]{0,63}$"#, options: .regularExpression) != nil
@@ -86,7 +91,26 @@ enum MCPLaunchAgentCommand {
     /// or option-like brief, so a brief changed after validation can never
     /// become a CLI flag or launch an agent without it. The prompt is the last
     /// argument. nil when any value does not qualify.
-    static func build(account: RelayAgentAccount, model: String, cwd: String, briefPath: String) -> String? {
+    static let permissionModes: Set<String> = ["account", "ask", "read_only", "yolo"]
+
+    /// The provider's own flags for a permission mode; none for "account",
+    /// which leaves the account's configured mode in force.
+    static func permissionFlags(provider: String, mode: String) -> [String]? {
+        switch (provider, mode) {
+        case (_, "account"): []
+        case ("claude", "ask"): ["--permission-mode", "manual"]
+        case ("claude", "read_only"): ["--permission-mode", "plan"]
+        case ("claude", "yolo"): ["--permission-mode", "bypassPermissions"]
+        case ("codex", "ask"): ["-a", "on-request", "-s", "workspace-write"]
+        case ("codex", "read_only"): ["-a", "on-request", "-s", "read-only"]
+        case ("codex", "yolo"): ["--dangerously-bypass-approvals-and-sandbox"]
+        default: nil
+        }
+    }
+
+    static func build(account: RelayAgentAccount, model: String, cwd: String, briefPath: String,
+                      permissionMode: String = "account") -> String? {
+        guard let permission = permissionFlags(provider: account.provider, mode: permissionMode) else { return nil }
         guard account.isValid, MCPLaunchAgentProposal.validModel(model),
               MCPLaunchAgentProposal.validPath(cwd), MCPLaunchAgentProposal.validPath(briefPath) else { return nil }
         let assignment = account.launchAssignment
@@ -101,7 +125,8 @@ enum MCPLaunchAgentCommand {
             " && relay_brief=$(cat -- " + quote(briefPath) + ")" +
             " && case \"$relay_brief\" in ''|-*) exit " + failure + ";; esac" +
             " && exec " + environment + " " + RelayAgentAccount.managedShimCommand(account.provider) +
-            " " + flag + " " + quote(model) + " \"$relay_brief\" || exit " + failure
+            " " + flag + " " + quote(model) + permission.map { " " + $0 }.joined() +
+            " \"$relay_brief\" || exit " + failure
         return command.utf8.count <= commandLimit ? command : nil
     }
 
@@ -139,8 +164,10 @@ struct MCPLaunchAgentReceipt: Codable, Equatable {
         var briefBytes: Int
         var briefSHA256: String
         var placement: String
+        var permissionMode: String = "account"
         enum CodingKeys: String, CodingKey {
             case host, cwd, provider, model, account, placement
+            case permissionMode = "permission_mode"
             case configDir = "config_dir", configVariable = "config_variable", briefPath = "brief_path"
             case briefBytes = "brief_bytes", briefSHA256 = "brief_sha256"
         }
@@ -537,7 +564,8 @@ enum MCPAgentBindingRead {
         // Claimed before the first suspension: one owner per request ID.
         let request = MCPLaunchAgentReceipt.Request(host: proposal.host, cwd: proposal.cwd, provider: proposal.provider,
             model: proposal.model, account: proposal.account, configDir: "", configVariable: RelayAgentAccount.variable(proposal.provider),
-            briefPath: proposal.briefPath, briefBytes: 0, briefSHA256: "", placement: proposal.placement)
+            briefPath: proposal.briefPath, briefBytes: 0, briefSHA256: "", placement: proposal.placement,
+            permissionMode: proposal.mode)
         entries[proposal.requestID] = Entry(proposal: proposal,
             receipt: MCPLaunchAgentReceipt(requestID: proposal.requestID.uuidString.lowercased(), request: request))
         let deadline = ContinuousClock.now + environment.launchBudget
@@ -578,7 +606,8 @@ enum MCPAgentBindingRead {
         }
         if let refusal = MCPLaunchAgentCommand.briefRefusal(brief) { return refuse(refusal) }
         guard let command = MCPLaunchAgentCommand.build(account: account, model: proposal.model,
-                                                        cwd: proposal.cwd, briefPath: proposal.briefPath) else {
+                                                        cwd: proposal.cwd, briefPath: proposal.briefPath,
+                                                        permissionMode: proposal.mode) else {
             return refuse("The launch command could not be built from these values")
         }
         guard needed.allSatisfy(permits) else {
