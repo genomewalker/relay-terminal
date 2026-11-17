@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -561,6 +562,9 @@ func writeTerminalReplay(writer *protocol.Writer, frames []protocol.Frame) error
 	return writer.Write(caughtUp)
 }
 
+// agentObserverLog receives worker diagnostics; tests capture it.
+var agentObserverLog io.Writer = os.Stderr
+
 func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *Session, lastEventSequence uint64) {
 	observer, snapshot, eventReset := session.observeAgents(lastEventSequence)
 	defer session.detachAgentObserver(observer)
@@ -588,6 +592,11 @@ func serveAgentObserver(connection net.Conn, writer *protocol.Writer, session *S
 				return
 			}
 		case <-observer.lagged:
+			// The bounded queue overflowed while this observer was behind,
+			// often during a long snapshot replay. Closing the route lets the
+			// client reopen from its last delivered event.
+			fmt.Fprintf(agentObserverLog, "relay: agent observer for session %s fell behind (queue %d full, resumed from event %d); closing its route\n",
+				session.id, cap(observer.frames), lastEventSequence)
 			return
 		case <-closed:
 			return

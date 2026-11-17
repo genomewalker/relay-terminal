@@ -289,7 +289,43 @@ final class RelayHostAgentMonitor {
     }
 }
 
-private final class RelayHostAgentTransport: RelayHostAgentObserving, @unchecked Sendable {
+/// One per-pane observer route. The live route is a pooled node channel.
+protocol RelayAgentObserverRouteHandle: AnyObject, Sendable {
+    func close()
+}
+
+extension RelayNodeChannel: RelayAgentObserverRouteHandle {}
+
+/// Opens observer routes. Tests substitute a fake to drop and reopen them.
+struct RelayAgentObserverRoutes: Sendable {
+    /// `onReady` reports whether the node multiplexes routes and how to send
+    /// the hello; `onDisconnect` reports that the node connection failed.
+    typealias Attach = @Sendable (
+        _ profile: ConnectionProfile,
+        _ routeID: String,
+        _ onReady: @escaping @Sendable (_ multiplexed: Bool, _ sendHello: @escaping @Sendable (Data) -> Void) -> Void,
+        _ onFrame: @escaping @Sendable (RelayWireFrame) -> Void,
+        _ onDisconnect: @escaping @Sendable () -> Void
+    ) -> any RelayAgentObserverRouteHandle
+
+    let attach: Attach
+
+    static let live = RelayAgentObserverRoutes { profile, routeID, onReady, onFrame, onDisconnect in
+        RelayNodeTransportPool.shared.attach(
+            profile: profile,
+            sessionID: routeID,
+            onReady: { channel in
+                onReady(channel.supports("node_mux_v2")) { payload in
+                    channel.writeAsync(type: .hello, payload: payload)
+                }
+            },
+            onFrame: onFrame,
+            onDisconnect: { _ in onDisconnect() }
+        )
+    }
+}
+
+final class RelayHostAgentTransport: RelayHostAgentObserving, @unchecked Sendable {
     private final class EventCursor: @unchecked Sendable {
         private let lock = NSLock()
         private var sequence: UInt64
@@ -311,9 +347,31 @@ private final class RelayHostAgentTransport: RelayHostAgentObserving, @unchecked
         }
     }
 
+    private struct Route {
+        let id: String
+        let handle: any RelayAgentObserverRouteHandle
+    }
+
+    private let routes: RelayAgentObserverRoutes
+    private let reopenDelay: @Sendable (_ attempt: Int) -> TimeInterval
     private let lock = NSLock()
-    private var channels: [String: RelayNodeChannel] = [:]
+    private var channels: [String: Route] = [:]
+    /// Consecutive reopens without an attached status, per session.
+    private var reopenAttempts: [String: Int] = [:]
     private var legacyTransport: RelayLegacyHostAgentTransport?
+
+    /// A pane worker drops an observer that falls behind, and a node can fail.
+    /// Either way the route reopens from its last delivered event; backoff
+    /// stops a worker that keeps refusing from spinning the host.
+    static func defaultReopenDelay(_ attempt: Int) -> TimeInterval {
+        min(0.25 * pow(2, Double(min(attempt, 7))), 30)
+    }
+
+    init(routes: RelayAgentObserverRoutes = .live,
+         reopenDelay: @escaping @Sendable (_ attempt: Int) -> TimeInterval = RelayHostAgentTransport.defaultReopenDelay) {
+        self.routes = routes
+        self.reopenDelay = reopenDelay
+    }
     private var stopped = false
     private var profile: ConnectionProfile?
     private var sessions: [String: UInt64] = [:]
@@ -368,12 +426,12 @@ private final class RelayHostAgentTransport: RelayHostAgentObserving, @unchecked
     ) {
         let routeID = "observer_" + UUID().uuidString.lowercased()
         let eventCursor = EventCursor(cursor)
-        let created = RelayNodeTransportPool.shared.attach(
-            profile: profile,
-            sessionID: routeID,
-            onReady: { [weak self] channel in
+        let created = routes.attach(
+            profile,
+            routeID,
+            { [weak self] multiplexed, sendHello in
                 guard let self else { return }
-                guard channel.supports("node_mux_v2") else {
+                guard multiplexed else {
                     self.startLegacy(profile: profile, onEvent: onEvent, onAttached: onAttached)
                     return
                 }
@@ -384,39 +442,85 @@ private final class RelayHostAgentTransport: RelayHostAgentObserving, @unchecked
                     sessionID: sessionID, lastEventSequence: eventCursor.value
                 )
                 guard let payload = try? JSONSerialization.data(withJSONObject: hello) else { return }
-                channel.writeAsync(type: .hello, payload: payload)
+                sendHello(payload)
             },
-            onFrame: { frame in
+            { [weak self] frame in
                 switch frame.type {
                 case .agentEvent:
                     eventCursor.observe(frame.payload)
                     onEvent(sessionID, frame.payload)
                 case .status:
-                    if let status = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload),
-                       status.state == "attached" {
+                    guard let status = try? JSONDecoder().decode(StatusWirePayload.self, from: frame.payload) else { return }
+                    if status.state == "attached" {
+                        self?.routeAttached(sessionID: sessionID, routeID: routeID)
                         onAttached(sessionID)
+                    } else if status.state == "route_closed" {
+                        // The worker dropped this observer, usually because it
+                        // fell behind. Without a reopen the pane's agent state
+                        // freezes until the app restarts.
+                        self?.routeEnded(sessionID: sessionID, routeID: routeID, cursor: eventCursor.value)
                     }
                 default:
                     break
                 }
             },
-            onDisconnect: { _ in }
+            { [weak self] in
+                self?.routeEnded(sessionID: sessionID, routeID: routeID, cursor: eventCursor.value)
+            }
         )
         lock.lock()
-        if stopped || legacyTransport != nil {
+        if stopped || legacyTransport != nil || sessions[sessionID] == nil {
             lock.unlock()
             created.close()
         } else {
-            channels[sessionID] = created
+            let replaced = channels[sessionID]
+            channels[sessionID] = Route(id: routeID, handle: created)
             lock.unlock()
+            replaced?.handle.close()
+        }
+    }
+
+    private func routeAttached(sessionID: String, routeID: String) {
+        lock.lock()
+        if channels[sessionID]?.id == routeID { reopenAttempts[sessionID] = nil }
+        lock.unlock()
+    }
+
+    private func routeEnded(sessionID: String, routeID: String, cursor: UInt64) {
+        lock.lock()
+        // Only the current route reopens; a replaced or stopped one is done.
+        guard !stopped, legacyTransport == nil, channels[sessionID]?.id == routeID,
+              let profile, let onEvent, let onAttached else {
+            lock.unlock()
+            return
+        }
+        let ended = channels.removeValue(forKey: sessionID)
+        let attempt = reopenAttempts[sessionID] ?? 0
+        reopenAttempts[sessionID] = attempt + 1
+        // Keep the furthest delivered event so the reopened route resumes there.
+        sessions[sessionID] = max(sessions[sessionID] ?? 0, cursor)
+        lock.unlock()
+        ended?.handle.close()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + reopenDelay(attempt)) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            guard !self.stopped, self.legacyTransport == nil, self.channels[sessionID] == nil,
+                  let resume = self.sessions[sessionID] else {
+                self.lock.unlock()
+                return
+            }
+            self.lock.unlock()
+            self.startMultiplexedObserver(profile: profile, sessionID: sessionID, cursor: resume,
+                                          onEvent: onEvent, onAttached: onAttached)
         }
     }
 
     func stop() {
         lock.lock()
         stopped = true
-        let activeChannels = Array(channels.values)
+        let activeChannels = channels.values.map(\.handle)
         channels.removeAll()
+        reopenAttempts.removeAll()
         let legacyTransport = self.legacyTransport
         self.legacyTransport = nil
         lock.unlock()
@@ -432,7 +536,7 @@ private final class RelayHostAgentTransport: RelayHostAgentObserving, @unchecked
         lock.lock()
         guard !stopped, legacyTransport == nil else { lock.unlock(); return }
         let sessions = self.sessions
-        let activeChannels = Array(channels.values)
+        let activeChannels = channels.values.map(\.handle)
         channels.removeAll()
         let legacy = RelayLegacyHostAgentTransport()
         legacyTransport = legacy
