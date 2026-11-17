@@ -11,16 +11,39 @@ signing_identity="${RELAY_CODESIGN_IDENTITY:--}"
 bundle_name="${RELAY_BUNDLE_NAME:-Relay}"
 bundle_identifier="${RELAY_BUNDLE_IDENTIFIER:-dev.relay.terminal}"
 build_jobs="${RELAY_BUILD_JOBS:-2}"
+# One SwiftPM scratch folder serves every worktree, so a build does not write a
+# fresh ~13k-file .build tree per checkout (each write is malware-scanned).
+# Default: ~/dev/.relay-build/swift (RELAY_BUILD_SCRATCH). RELAY_BUILD_SCRATCH_PATH
+# still names an exact private scratch path, as build-candidate-app.sh uses.
+# Sharing is safe only when serialized: SwiftPM's own .lock covers a single
+# `swift build`, but this script reads products from the bin path afterwards, so
+# another worktree must not rebuild into it until packaging is done. Hence the
+# whole script runs under one lockf lock per scratch folder. SwiftPM keeps
+# release and debug products apart inside the folder; a different worktree path
+# only re-plans and recompiles what changed, it does not corrupt the state.
+if [[ -n "${RELAY_BUILD_SCRATCH_PATH:-}" ]]; then
+    build_scratch="$RELAY_BUILD_SCRATCH_PATH"
+else
+    relay_build_root="$HOME/dev/.relay-build"
+    build_scratch="${RELAY_BUILD_SCRATCH:-$relay_build_root/swift}"
+    mkdir -p "$relay_build_root"
+    # Keep Spotlight from indexing build products.
+    : > "$relay_build_root/.metadata_never_index"
+fi
+mkdir -p "$build_scratch"
+# Canonicalize /tmp to /private/tmp so Clang never sees two module-cache paths.
+build_scratch="$(cd "$build_scratch" && pwd -P)"
+build_lock="$build_scratch/.relay-build-app.lock"
+if [[ "${RELAY_BUILD_LOCK_HELD:-}" != "$build_lock" ]]; then
+    echo "Waiting for shared build lock $build_lock" >&2
+    RELAY_BUILD_LOCK_HELD="$build_lock" exec /usr/bin/lockf -k "$build_lock" \
+        "$project_root/scripts/$(basename "$0")" "$@"
+fi
 cd "$project_root"
 source "$project_root/scripts/build-app-steps.sh"
 check_rotation_resources "$project_root"
 check_native_library "$project_root/Vendor/libghostty-spm"
 swift_build_args=(-c "$configuration" --jobs "$build_jobs" --force-resolved-versions)
-# Keep compiler caches outside File Provider and use SwiftPM's supported default.
-# Canonicalize /tmp to /private/tmp so Clang never sees two module-cache paths.
-build_scratch="${RELAY_BUILD_SCRATCH_PATH:-/private/tmp/relay-swiftpm-build}"
-mkdir -p "$build_scratch"
-build_scratch="$(cd "$build_scratch" && pwd -P)"
 swift_build_args+=(--scratch-path "$build_scratch")
 swift build "${swift_build_args[@]}"
 binary_path="$(swift build "${swift_build_args[@]}" --show-bin-path)"
@@ -140,39 +163,74 @@ fi
 # the signed app rather than downloading an executable at connection time.
 check_daemon_communication_assets "$project_root"
 native_helper_names="$(relay_build_helper helper-names)"
-for relay_architecture in amd64 arm64; do
-    (
-        cd "$project_root/remote/relayd"
-        CGO_ENABLED=0 GOOS=linux GOARCH="$relay_architecture" \
-            go build -trimpath -ldflags="-s -w -X main.relaydVersion=$relayd_version" \
-            -o "$app_path/Contents/Resources/relayd-linux-$relay_architecture" ./cmd/relayd
-    )
-    chmod 0555 "$app_path/Contents/Resources/relayd-linux-$relay_architecture"
-    (
-        cd "$project_root/remote/relayd"
-        CGO_ENABLED=0 GOOS=linux GOARCH="$relay_architecture" \
-            go build -trimpath -ldflags="-s -w" \
-            -o "$app_path/Contents/Resources/relay-peer-link-linux-$relay_architecture" ./cmd/relay-peer-link
-    )
-    chmod 0555 "$app_path/Contents/Resources/relay-peer-link-linux-$relay_architecture"
-    (
-        cd "$project_root/remote/relayd"
-        CGO_ENABLED=0 GOOS=linux GOARCH="$relay_architecture" \
-            go build -trimpath -ldflags="-s -w" \
-            -o "$app_path/Contents/Resources/relay-mcp-linux-$relay_architecture" ./cmd/relay-mcp
-    )
-    chmod 0555 "$app_path/Contents/Resources/relay-mcp-linux-$relay_architecture"
-    while IFS= read -r relay_helper; do
-        [[ -n "$relay_helper" ]] || continue
-        (
-            cd "$project_root/remote/relayd"
-            CGO_ENABLED=0 GOOS=linux GOARCH="$relay_architecture" \
-                go build -trimpath -ldflags="-s -w" \
-                -o "$app_path/Contents/Resources/$relay_helper-linux-$relay_architecture" "./cmd/$relay_helper"
-        )
-        chmod 0555 "$app_path/Contents/Resources/$relay_helper-linux-$relay_architecture"
-    done <<< "$native_helper_names"
-done
+darwin_architecture="$(go env GOARCH)"
+# Every pure-Go payload, one per line: <GOOS> <GOARCH> <bundle path> <package> <ldflags>.
+# The darwin relayd is not listed: it needs cgo (supervisor_spawn_darwin.go)
+# and is always built on this Mac below.
+go_payload_specs() {
+    local arch helper
+    for arch in amd64 arm64; do
+        printf 'linux %s Contents/Resources/relayd-linux-%s ./cmd/relayd -s -w -X main.relaydVersion=%s\n' \
+            "$arch" "$arch" "$relayd_version"
+        for helper in relay-peer-link relay-mcp $native_helper_names; do
+            printf 'linux %s Contents/Resources/%s-linux-%s ./cmd/%s -s -w\n' "$arch" "$helper" "$arch" "$helper"
+        done
+    done
+    # relay-work-mcp: Work threads start this frontend from the installed
+    # bundle, and relayd's Work origin proof names its path.
+    for helper in relay-mcp relay-work-mcp relay-peer-link relay-connection relay-workspace \
+        $native_helper_names relay-restart relay-preserving-update; do
+        printf 'darwin %s Contents/MacOS/%s ./cmd/%s -s -w\n' "$darwin_architecture" "$helper" "$helper"
+    done
+}
+# helper-names overlaps the fixed lists; build each output once.
+go_payload_specs | /usr/bin/awk '!seen[$3]++' > "$stage_root/go-payloads.txt"
+if [[ -n "${RELAY_GO_REMOTE:-}" ]]; then
+    # Opt-in: cross-compile the pure-Go payloads on a remote Linux host so the
+    # Go build's intermediate files are not written (and scanned) on this Mac.
+    # None of these packages use cgo (`go list -deps` shows no CgoFiles), so
+    # CGO_ENABLED=0 cross-compilation is exact. Signing stays on the Mac.
+    # There is no fallback: an unreachable host fails the build.
+    go_remote="$RELAY_GO_REMOTE"
+    go_remote_dir="${RELAY_GO_REMOTE_DIR:-/maps/projects/caeg/scratch/kbd606/tmp/relay-go-build/$(basename "$project_root")}"
+    go_remote_ssh=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$go_remote")
+    if ! "${go_remote_ssh[@]}" "mkdir -p '$go_remote_dir/src' && rm -rf '$go_remote_dir/out'"; then
+        echo "RELAY_GO_REMOTE: cannot reach $go_remote or create $go_remote_dir" >&2
+        exit 1
+    fi
+    rsync -a --delete --exclude .git --exclude .build -e "ssh -o BatchMode=yes" \
+        "$project_root/remote/relayd/" "$go_remote:$go_remote_dir/src/"
+    rsync -a -e "ssh -o BatchMode=yes" "$stage_root/go-payloads.txt" "$go_remote:$go_remote_dir/go-payloads.txt"
+    "${go_remote_ssh[@]}" "set -eu
+        export PATH=\"\${RELAY_GO_REMOTE_GOROOT:-\$HOME/.local/go}/bin:/usr/local/go/bin:\$PATH\"
+        export GOCACHE='$go_remote_dir/../gocache' GOTOOLCHAIN=local
+        cd '$go_remote_dir/src'
+        go version
+        while read -r goos goarch output package ldflags; do
+            mkdir -p \"\$(dirname \"../out/\$output\")\"
+            CGO_ENABLED=0 GOOS=\"\$goos\" GOARCH=\"\$goarch\" \
+                go build -trimpath -ldflags=\"\$ldflags\" -o \"../out/\$output\" \"\$package\"
+        done < ../go-payloads.txt"
+    rsync -a -e "ssh -o BatchMode=yes" "$go_remote:$go_remote_dir/out/" "$app_path/"
+    while read -r goos goarch output package ldflags; do
+        if [[ ! -f "$app_path/$output" ]]; then
+            echo "RELAY_GO_REMOTE: $output was not built on $go_remote" >&2
+            exit 1
+        fi
+    done < "$stage_root/go-payloads.txt"
+fi
+while read -r goos goarch output package ldflags; do
+    if [[ "$goos" == "linux" ]]; then
+        if [[ -z "${RELAY_GO_REMOTE:-}" ]]; then
+            (
+                cd "$project_root/remote/relayd"
+                CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
+                    go build -trimpath -ldflags="$ldflags" -o "$app_path/$output" "$package"
+            )
+        fi
+        chmod 0555 "$app_path/$output"
+    fi
+done < "$stage_root/go-payloads.txt"
 
 # The Linux payloads cannot run on the build Mac. Build the same source for the
 # host once and verify the embedded helper version before signing the bundle.
@@ -194,27 +252,16 @@ if [[ "$($relayd_version_check --version)" != "relayd $relayd_version" ]]; then
     exit 1
 fi
 cp "$relayd_version_check" "$app_path/Contents/MacOS/relayd"
-(
-    cd "$project_root/remote/relayd"
-    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-mcp" ./cmd/relay-mcp
-    # Work threads start this frontend from the installed bundle, and relayd's
-    # Work origin proof names its path, so the bundle must always carry it.
-    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-work-mcp" ./cmd/relay-work-mcp
-    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-peer-link" ./cmd/relay-peer-link
-    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-connection" ./cmd/relay-connection
-    go build -trimpath -ldflags="-s -w" -o "$app_path/Contents/MacOS/relay-workspace" ./cmd/relay-workspace
-)
+if [[ -z "${RELAY_GO_REMOTE:-}" ]]; then
+    while read -r goos goarch output package ldflags; do
+        [[ "$goos" == "darwin" ]] || continue
+        (cd "$project_root/remote/relayd" && go build -trimpath -ldflags="$ldflags" -o "$app_path/$output" "$package")
+    done < "$stage_root/go-payloads.txt"
+fi
 if [[ ! -f "$app_path/Contents/MacOS/relay-work-mcp" || ! -x "$app_path/Contents/MacOS/relay-work-mcp" ]]; then
     echo "relay-work-mcp was not built into the bundle" >&2
     exit 1
 fi
-while IFS= read -r relay_helper; do
-    [[ -n "$relay_helper" ]] || continue
-    (cd "$project_root/remote/relayd" && go build -trimpath -ldflags="-s -w" \
-        -o "$app_path/Contents/MacOS/$relay_helper" "./cmd/$relay_helper")
-done <<< "$native_helper_names
-relay-restart
-relay-preserving-update"
 # Reject stale SwiftPM resources in the completed bundle before signing.
 relay_build_helper assets-check "$app_path/Contents/Resources"
 write_release_manifest "$app_path" "$app_version" "$relayd_version" "$build_number"
