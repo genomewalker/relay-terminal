@@ -11,16 +11,16 @@ signing_identity="${RELAY_CODESIGN_IDENTITY:--}"
 bundle_name="${RELAY_BUNDLE_NAME:-Relay}"
 bundle_identifier="${RELAY_BUNDLE_IDENTIFIER:-dev.relay.terminal}"
 build_jobs="${RELAY_BUILD_JOBS:-2}"
-# One SwiftPM scratch folder serves every worktree, so a build does not write a
-# fresh ~13k-file .build tree per checkout (each write is malware-scanned).
+# One SwiftPM scratch folder serves every worktree, outside any checkout, so
+# release builds never fill a per-worktree .build (each write is malware-scanned).
 # Default: ~/dev/.relay-build/swift (RELAY_BUILD_SCRATCH). RELAY_BUILD_SCRATCH_PATH
 # still names an exact private scratch path, as build-candidate-app.sh uses.
 # Sharing is safe only when serialized: SwiftPM's own .lock covers a single
 # `swift build`, but this script reads products from the bin path afterwards, so
 # another worktree must not rebuild into it until packaging is done. Hence the
 # whole script runs under one lockf lock per scratch folder. SwiftPM keeps
-# release and debug products apart inside the folder; a different worktree path
-# only re-plans and recompiles what changed, it does not corrupt the state.
+# release and debug products apart inside the folder, and the previous default
+# (/private/tmp/relay-swiftpm-build) was already shared by all worktrees.
 if [[ -n "${RELAY_BUILD_SCRATCH_PATH:-}" ]]; then
     build_scratch="$RELAY_BUILD_SCRATCH_PATH"
 else
@@ -43,6 +43,17 @@ cd "$project_root"
 source "$project_root/scripts/build-app-steps.sh"
 check_rotation_resources "$project_root"
 check_native_library "$project_root/Vendor/libghostty-spm"
+if [[ -n "${RELAY_GO_REMOTE:-}" ]]; then
+    # Opt-in remote Go build (see below). Fail before the long Swift build.
+    go_remote="$RELAY_GO_REMOTE"
+    go_remote_dir="${RELAY_GO_REMOTE_DIR:-/maps/projects/caeg/scratch/kbd606/tmp/relay-go-build/$(basename "$project_root")}"
+    go_remote_goroot="${RELAY_GO_REMOTE_GOROOT:-\$HOME/.local/go}"
+    go_remote_ssh=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$go_remote")
+    if ! "${go_remote_ssh[@]}" "mkdir -p '$go_remote_dir/src' && rm -rf '$go_remote_dir/out'"; then
+        echo "RELAY_GO_REMOTE: cannot reach $go_remote or create $go_remote_dir" >&2
+        exit 1
+    fi
+fi
 swift_build_args=(-c "$configuration" --jobs "$build_jobs" --force-resolved-versions)
 swift_build_args+=(--scratch-path "$build_scratch")
 swift build "${swift_build_args[@]}"
@@ -191,18 +202,11 @@ if [[ -n "${RELAY_GO_REMOTE:-}" ]]; then
     # None of these packages use cgo (`go list -deps` shows no CgoFiles), so
     # CGO_ENABLED=0 cross-compilation is exact. Signing stays on the Mac.
     # There is no fallback: an unreachable host fails the build.
-    go_remote="$RELAY_GO_REMOTE"
-    go_remote_dir="${RELAY_GO_REMOTE_DIR:-/maps/projects/caeg/scratch/kbd606/tmp/relay-go-build/$(basename "$project_root")}"
-    go_remote_ssh=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$go_remote")
-    if ! "${go_remote_ssh[@]}" "mkdir -p '$go_remote_dir/src' && rm -rf '$go_remote_dir/out'"; then
-        echo "RELAY_GO_REMOTE: cannot reach $go_remote or create $go_remote_dir" >&2
-        exit 1
-    fi
     rsync -a --delete --exclude .git --exclude .build -e "ssh -o BatchMode=yes" \
         "$project_root/remote/relayd/" "$go_remote:$go_remote_dir/src/"
     rsync -a -e "ssh -o BatchMode=yes" "$stage_root/go-payloads.txt" "$go_remote:$go_remote_dir/go-payloads.txt"
     "${go_remote_ssh[@]}" "set -eu
-        export PATH=\"\${RELAY_GO_REMOTE_GOROOT:-\$HOME/.local/go}/bin:/usr/local/go/bin:\$PATH\"
+        export PATH=\"$go_remote_goroot/bin:/usr/local/go/bin:\$PATH\"
         export GOCACHE='$go_remote_dir/../gocache' GOTOOLCHAIN=local
         cd '$go_remote_dir/src'
         go version
