@@ -135,6 +135,7 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
             ("already uses that account", .targetAccountUnavailable),
             ("is not ready for this conversation", .targetAccountUnavailable),
             (RelayAgentMaintenancePrompt.goalBlockerPrefix, .goalActive),
+            ("folder-trust", .trustPrompt), ("folder trust", .trustPrompt), ("is not trusted", .trustPrompt),
             ("terminal input grant", .notAuthorized), ("user-initiated only", .notAuthorized),
             ("Only the user can", .notAuthorized), ("No durable quota failover intent", .notAuthorized),
             ("Maintenance or another move", .operationInProgress), ("another input operation", .operationInProgress),

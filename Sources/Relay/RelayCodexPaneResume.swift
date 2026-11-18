@@ -208,6 +208,10 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             try save("verifying", "Resume submitted once; checking the resulting native session")
             let verifyUntil = Date().addingTimeInterval(90)
             while current(), Date() < verifyUntil {
+                if agent == "codex", RelayAgentMaintenancePrompt.isCodexFolderTrustDialog(pane.runtime.sidePanelViewportText()) {
+                    try save("held", "Resume launched once; Codex stopped at its folder-trust dialog for " + plan.directory +
+                             ". Relay did not answer it.", .trustPrompt); return
+                }
                 if let owner = await pane.runtime.agentResumeOwner(), Self.verified(plan.owner, after: owner, target: request.targetSession) {
                     let verifyCommand = RelayHostExecution.daemonCommand(profile: profile, arguments: Self.planArguments(pane: pane.id, provider: agent, expected: plan.sessionId, target: plan.sessionId))
                     let account = try await RelayHostExecution.capture(profile: profile, command: verifyCommand, timeout: 15, maximumBytes: 16_384)

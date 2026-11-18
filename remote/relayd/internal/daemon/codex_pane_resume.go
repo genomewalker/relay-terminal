@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"github.com/relay-terminal/relayd/internal/agentaccounts"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +76,12 @@ func ReadCodexPaneResumePlan(pane, expected, target string) (CodexPaneResumePlan
 	live, err := processWorkingDirectory(owner.ProcessID)
 	if err != nil || verifyNativeDirectoryEvidence(cwd, nil, live) != nil {
 		return empty, newPaneRefusal(PaneRefusalOutsideProject, "saved session is outside this pane's project")
+	}
+	// Pre-exit: a relaunch that would stop at Codex's folder-trust dialog is
+	// refused while the original agent still runs (case 10, 7b68ee70).
+	if trust := agentaccounts.CodexProjectTrust(config, cwd); trust.Status == agentaccounts.CodexTrustParentOnly ||
+		trust.Status == agentaccounts.CodexTrustUntrusted {
+		return empty, newPaneRefusal(PaneRefusalTrustPrompt, "Codex folder trust required for "+cwd+" ("+trust.Status+")")
 	}
 	shim := filepath.Join(home, ".local", "share", "relay", "shims", "codex")
 	info, err := os.Stat(shim)

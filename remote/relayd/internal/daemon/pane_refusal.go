@@ -21,6 +21,7 @@ const (
 	PaneRefusalOutsideProject      = "outside_project"
 	PaneRefusalLauncherUnavailable = "launcher_unavailable"
 	PaneRefusalInvalidRequest      = "invalid_request"
+	PaneRefusalTrustPrompt         = "trust_prompt"
 	PaneRefusalUnclassified        = "unclassified"
 )
 
@@ -45,6 +46,7 @@ var paneRefusalClearing = map[string]string{
 	PaneRefusalOutsideProject:      "Run the resume from a pane whose agent works in the saved conversation's project.",
 	PaneRefusalLauncherUnavailable: "Repair Relay's agent launchers on that host (relayd agent-launchers --repair), then retry.",
 	PaneRefusalInvalidRequest:      "Pass the exact pane and session UUIDs.",
+	PaneRefusalTrustPrompt:         "Trust the folder in the Codex account's config.toml (or enable Relay's matching-parent trust setting), then retry; Relay never answers the trust dialog.",
 	PaneRefusalUnclassified:        "Read the blocker text; it names what held the operation.",
 }
 

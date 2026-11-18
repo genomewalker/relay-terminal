@@ -93,6 +93,7 @@ enum RelaySettingsPolicy {
         .init(key: "automatic_agent_maintenance", type: "boolean"),
         .init(key: "agent_update_restarts_paused", type: "boolean"),
         .init(key: "agent_maintenance_protected_panes", type: "object"),
+        .init(key: "codex_trust_mirror_parent", type: "boolean"),
         .init(key: "haiku_pane_health", type: "boolean"),
         .init(key: "key_bindings", type: "object"),
         .init(key: "agent_account_rules", type: "object"),
@@ -117,7 +118,8 @@ enum RelaySettingsPolicy {
         // Miko never lifts the operator's restart freeze or pane protection.
         !assistantIdentity || !changes.keys.contains {
             $0.hasPrefix("miko_") || $0 == "claude_quota_failover" ||
-                $0 == "agent_update_restarts_paused" || $0 == "agent_maintenance_protected_panes"
+                $0 == "agent_update_restarts_paused" || $0 == "agent_maintenance_protected_panes" ||
+                $0 == "codex_trust_mirror_parent"
         }
     }
 
@@ -250,6 +252,7 @@ final class RelaySettingsControl {
             "intelligence_enabled": .bool(p.intelligenceEnabled),
             "automatic_agent_maintenance": .bool(p.automaticAgentMaintenance),
             "agent_update_restarts_paused": .bool(p.agentUpdateRestartsPaused),
+            "codex_trust_mirror_parent": .bool(p.codexTrustMirrorParent),
             "agent_maintenance_protected_panes": .json(.object(["panes": .array(p.maintenanceProtectedPanes.map { .string($0) })])),
             "haiku_pane_health": .bool(p.haikuPaneHealth),
             "decision_model_path": .string(p.decisionModelPath),
@@ -323,6 +326,7 @@ final class RelaySettingsControl {
             case ("relayd_auto_update", .bool(let v)): p.automaticallyUpdateRelayd = v
             case ("automatic_agent_maintenance", .bool(let v)): p.automaticAgentMaintenance = v
             case ("agent_update_restarts_paused", .bool(let v)): p.agentUpdateRestartsPaused = v
+            case ("codex_trust_mirror_parent", .bool(let v)): p.codexTrustMirrorParent = v
             case ("agent_maintenance_protected_panes", .json(let v)):
                 p.maintenanceProtectedPanes = try RelayAgentMaintenancePolicy.protectedPanes(RelayPaneHealthJSON.data(v))
             case ("haiku_pane_health", .bool(let v)): p.haikuPaneHealth = v

@@ -298,6 +298,16 @@ enum RelayAgentMaintenancePrompt {
         return stalled ? RelayPaneOperationRefusal.Code.goalStalled.rawValue : nil
     }
 
+    /// Codex's folder-trust dialog ("Trust this folder?" with "Trust and
+    /// continue"), which a relaunch in an untrusted folder stops at. Relay
+    /// never answers it.
+    static func isCodexFolderTrustDialog(_ text: String?) -> Bool {
+        guard let text else { return false }
+        return text.contains("Trust this folder?") && text.contains("Trust and continue")
+    }
+
+    static let folderTrustBlocker = "Codex is showing its folder-trust dialog (Trust this folder?)"
+
     /// The prompt blocker for a pane whose Codex footer shows an active goal.
     static func codexGoalBlocker(_ vt: String?) -> String? {
         guard let vt, let prompt = prompt(vt, provider: "codex") else { return nil }

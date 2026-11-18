@@ -35,7 +35,7 @@ struct RelayPaneOperationRefusalTests {
     @Test func everyRelaydCodeIsKnown() {
         for code in ["identity_unavailable", "pane_changed", "resume_unavailable", "manual_restart_required", "login_mismatch",
                      "target_account_unavailable", "relaunch_unavailable", "outside_project", "launcher_unavailable",
-                     "invalid_request", "unclassified"] {
+                     "invalid_request", "trust_prompt", "unclassified"] {
             #expect(Refusal.Code(rawValue: code) != nil, "\(code)")
         }
     }
@@ -72,6 +72,7 @@ struct RelayPaneOperationRefusalTests {
         #expect(reason(background)?.code == .backgroundWork)
         #expect(reason(proof, empty: false)?.code == .promptUnverified)
         #expect(reason(proof, empty: false, blocker: RelayAgentMaintenancePrompt.goalBlockerPrefix + " (Pursuing goal (3m))")?.code == .goalActive)
+        #expect(reason(proof, empty: false, blocker: RelayAgentMaintenancePrompt.folderTrustBlocker)?.code == .trustPrompt)
         var settling = proof; settling.lifecycle = "settling"
         #expect(reason(settling)?.code == .transcriptSettling)
         settling.lifecycle = "active"

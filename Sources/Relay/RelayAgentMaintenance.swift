@@ -48,6 +48,9 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
     var moveErrorCode: String? = nil
     /// Codex: the ChatGPT login in the running agent's folder and its pin.
     var login: RelayAgentLoginObservation? = nil
+    /// Codex: how the pane's account config.toml trusts the conversation's
+    /// directory for a relaunch (relayd's codex_trust).
+    var codexTrust: RelayCodexTrustObservation? = nil
     var unavailable: String? = nil
     var worker: RelayPaneWorkerObservation? = nil
     var context: RelayPaneContextObservation? = nil
@@ -61,7 +64,7 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
         case version, provider, bound, lifecycle, revision, owner, unavailable
         case paneID = "paneId", processID = "processId", processStart, sessionID = "sessionId"
         case installedUpdate, installedImageCurrent, runningVersion, installedVersion, outdatedOtherInstall
-        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, resumeErrorCode, worker, context, configDir, accountMatches, moveCommand, moveError, moveErrorCode, login
+        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, resumeErrorCode, worker, context, configDir, accountMatches, moveCommand, moveError, moveErrorCode, login, codexTrust
     }
 
     /// Native image versions on the pane's host; nil when either is unverified.
@@ -238,6 +241,32 @@ enum RelayAgentMaintenancePolicy {
         return proof.lifecycle != "quiet"
     }
 
+    /// Whether a Codex at `version` ("0.170.0") is at least `minimum`.
+    static func codexVersion(_ version: String?, atLeast minimum: [Int]) -> Bool {
+        guard let version else { return false }
+        let parts = version.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+        for (index, wanted) in minimum.enumerated() {
+            let have = index < parts.count ? parts[index] : 0
+            if have != wanted { return have > wanted }
+        }
+        return true
+    }
+
+    /// Case 10 (7b68ee70): a Codex relaunch that would stop at its
+    /// folder-trust dialog is held before any input, so the old process keeps
+    /// running. 0.170.0 stopped for a non-git folder trusted only through its
+    /// parent; an untrusted folder stops on any version. Nil when it will not
+    /// stop or relayd did not say.
+    static func codexTrustHold(_ proof: RelayAgentMaintenanceProbe, reason: Reason) -> RelayPaneOperationRefusal? {
+        guard proof.provider == "codex", let trust = proof.codexTrust else { return nil }
+        let target = proof.installedVersion ?? proof.runningVersion
+        let stops = trust.status == "untrusted" ||
+            trust.status == "parent_only" && codexVersion(target, atLeast: [0, 170, 0])
+        guard stops else { return nil }
+        let what = reason == .update ? "Update " + (proof.versionTransition ?? "installed") + " available" : "Restart needed"
+        return .init(.trustPrompt, what + ", held: Codex folder trust required for " + trust.cwd)
+    }
+
     /// Lowercase, unique, sorted pane UUIDs, at most 256; nil when any is invalid.
     static func validProtectedPanes(_ ids: [String]) -> [String]? {
         guard ids.count <= 256 else { return nil }
@@ -318,7 +347,8 @@ enum RelayAgentMaintenancePolicy {
         guard preservingDraft || emptyPrompt else {
             let blocker = "Waiting for the original prompt to be confirmed empty" + (promptBlocker.map { ": " + $0 } ?? "")
             let goal = promptBlocker.map(RelayAgentMaintenancePrompt.isGoalBlocker) ?? false
-            return Refusal(goal ? .goalActive : .promptUnverified, blocker)
+            let trust = promptBlocker == RelayAgentMaintenancePrompt.folderTrustBlocker
+            return Refusal(goal ? .goalActive : trust ? .trustPrompt : .promptUnverified, blocker)
         }
         // A current, process-start-matched Claude harness observation can
         // supersede a transcript's cached active phase (for example after
@@ -1070,6 +1100,31 @@ enum RelayAgentMaintenanceRestartAdmission {
             completeHaikuTool(pane, state: "held", message: hold.blocker, proof: proof)
             return
         }
+        if let trust = RelayAgentMaintenancePolicy.codexTrustHold(proof, reason: reason) {
+            // Opt-in only: mirror the parent's existing trust for this exact
+            // folder, then restart on a later check. Never answers the dialog.
+            if RelayPreferences.shared.codexTrustMirrorParent, proof.codexTrust?.status == "parent_only",
+               let cwd = proof.codexTrust?.cwd, let parent = proof.codexTrust?.parent {
+                let command = RelayHostExecution.daemonCommand(profile: profile,
+                    arguments: ["codex-trust-like-parent", proof.configDir.flatMap { $0.isEmpty ? nil : $0 } ?? "-", cwd])
+                let result = try await RelayHostExecution.capture(profile: profile, command: command, timeout: 15, maximumBytes: 4096)
+                let note = result.exitCode == 0
+                    ? "Relay trusted " + cwd + " in the pane's Codex config.toml, mirroring the trusted parent " + parent +
+                        " (setting codex_trust_mirror_parent); the update restart follows on the next check"
+                    : "Relay could not write the trust entry for " + cwd + ": " +
+                        RelayPaneOperationRefusal.hostBlocker(stderr: result.stderr)
+                try? audit("trust:" + cwd, pane: pane.id, reason: reason, result.exitCode == 0 ? "trust_written" : "trust_write_failed", note)
+                let held = RelayPaneOperationRefusal(.trustPrompt, trust.blocker + ". " + note)
+                statuses[pane.id] = held.blocker
+                holds[pane.id] = held
+                completeHaikuTool(pane, state: "held", message: held.blocker, proof: proof)
+                return
+            }
+            statuses[pane.id] = trust.blocker
+            holds[pane.id] = trust
+            completeHaikuTool(pane, state: "held", message: trust.blocker, proof: proof)
+            return
+        }
         holds.removeValue(forKey: pane.id)
         if await RelayCapacityManagementCoordinator.shared.shouldUseCombined(pane) {
             statuses[pane.id] = "Installed-image adoption shares the combined native lane; retirement/preservation capability unavailable. No additional maintenance restart is submitted."
@@ -1197,6 +1252,20 @@ enum RelayAgentMaintenanceRestartAdmission {
 
     private func advance(_ pane: PaneModel, workspace: WorkspaceModel, action: Pending) async throws {
         guard pane.profile == action.profile, workspace.panes[pane.id] === pane else { return }
+        // A relaunched Codex stopped at its folder-trust dialog: held with its
+        // reason, not left as verification_required. Relay never answers it.
+        if action.stage == .verify, action.proof.provider == "codex",
+           RelayAgentMaintenancePrompt.isCodexFolderTrustDialog(pane.runtime.sidePanelViewportText()) {
+            try journal.mark(action.id, "held_trust_prompt")
+            let cwd = action.proof.codexTrust?.cwd ?? "the conversation's folder"
+            let held = RelayPaneOperationRefusal(.trustPrompt, "Restart held: Codex folder trust required for " + cwd)
+            try? audit(action.id, pane: pane.id, reason: action.reason, "held_trust_prompt", cwd)
+            statuses[pane.id] = held.blocker
+            holds[pane.id] = held
+            pending.removeValue(forKey: pane.id); requested.remove(pane.id)
+            completeHaikuTool(pane, state: "held", message: held.blocker + ". " + held.howToClear)
+            return
+        }
         guard Date() < action.deadline, action.attempts < Self.pendingVerifyAttempts else {
             try journal.mark(action.id, "verification_required")
             try? audit(action.id, pane: pane.id, reason: action.reason, "verification_required")
@@ -1346,6 +1415,10 @@ struct RelayAgentMaintenanceSettingsView: View {
             Toggle("Pause automatic update restarts", isOn: $preferences.agentUpdateRestartsPaused)
                 .accessibilityIdentifier("relay.settings.agent-maintenance.update-restarts-paused")
             Text("Freezes restarts onto a newly installed agent version (for a release freeze); health checks and link repairs continue. Held panes report \"update available, held\".")
+                .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+            Toggle("Trust a Codex folder like its trusted parent before restarting", isOn: $preferences.codexTrustMirrorParent)
+                .accessibilityIdentifier("relay.settings.agent-maintenance.codex-trust-mirror-parent")
+            Text("Off: a Codex restart that would stop at the folder-trust dialog is held and reported. On: Relay first adds that exact folder to the account's config.toml, mirroring its trusted parent, and says so.")
                 .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
             Toggle("Use Haiku to monitor panes and take safe actions", isOn: $preferences.haikuPaneHealth)
                 .accessibilityIdentifier("relay.settings.haiku-pane-health.enabled")

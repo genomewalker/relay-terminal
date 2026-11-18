@@ -219,6 +219,14 @@ struct RelayPaneAgentAccountState: Codable, Equatable, Sendable {
 /// the 8-character account id prefix and plan only, the folder label's pinned
 /// prefix, and status "match", "mismatch", "unpinned", "unknown" or
 /// "unregistered".
+/// relayd's codex_trust: trusted, parent_only, untrusted or unknown, for
+/// the conversation's directory under the pane's CODEX_HOME.
+struct RelayCodexTrustObservation: Codable, Equatable, Sendable {
+    var status: String
+    var cwd: String
+    var parent: String? = nil
+}
+
 struct RelayAgentLoginObservation: Codable, Equatable, Sendable {
     var status: String
     var label: String? = nil
