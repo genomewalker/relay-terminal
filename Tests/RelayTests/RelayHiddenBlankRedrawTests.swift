@@ -17,6 +17,9 @@ import Testing
 ///   REAL, an idle Codex 0.170 started in a scratch pty at 120x40: a reset
 ///   plus its answer to a same-grid redraw signal, and the same followed by a
 ///   one-row bounce (39 rows, then 40).
+/// - f52d610f-after-bounce.bin: REAL, the pane's saved screen after 0.5.114's
+///   bounce, at its 90x42 grid. The first 0.5.114 proof ran before Codex's
+///   final repaint arrived and was refused; the settled screen is admitted.
 @Suite("A hidden pane's blank fresh redraw is bounced, never proven")
 struct RelayHiddenBlankRedrawTests {
     static let owner = RelayPromptOwnerBinding(version: 1, paneId: "f52d610f-8231-45de-b196-307188d47f06", nodeBootId: "b",
@@ -60,6 +63,22 @@ struct RelayHiddenBlankRedrawTests {
         #expect(steps.last == Self.viewport)
         #expect(TerminalRuntime.hiddenRowBounce(RelayViewport(columns: 120, rows: 5)) == nil)
         #expect(TerminalRuntime.hiddenRowBounce(RelayViewport(columns: 19, rows: 40)) == nil)
+    }
+
+    @Test func theSettledF52dScreenAfterTheBounceIsAdmitted() async throws {
+        let data = try fixture("f52d610f-after-bounce.bin")
+        let vt = await RelayAgentMaintenanceScreen.read(data, viewport: RelayViewport(columns: 90, rows: 42))
+        #expect(!TerminalRuntime.screenIsBlank(vt))
+        #expect(TerminalRuntime.agentResumePromptBlocker(expected: Self.owner, vt: vt,
+            pendingApprovals: 0, composerBusy: false) == nil)
+    }
+
+    @Test func aBouncedScreenIsProvenOnlyAfterItsOutputIsQuiet() {
+        #expect(!TerminalRuntime.hiddenBounceSettled(sequenceAvailable: true, quietFor: 0.3))
+        #expect(!TerminalRuntime.hiddenBounceSettled(sequenceAvailable: false, quietFor: 5))
+        #expect(TerminalRuntime.hiddenBounceSettled(sequenceAvailable: true, quietFor: TerminalRuntime.hiddenBounceQuiet))
+        // The settle bound outlasts the 4 s f52d610f took to repaint.
+        #expect(TerminalRuntime.hiddenBounceSettleLimit >= 4 + TerminalRuntime.hiddenBounceQuiet)
     }
 
     @Test func noScreenAndWhitespaceAreBlankButTextIsNot() {

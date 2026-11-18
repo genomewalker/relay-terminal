@@ -3459,18 +3459,36 @@ final class TerminalRuntime: NSObject {
             }
             try? await Task.sleep(for: .milliseconds(400))
         }
-        for _ in 0..<20 {
-            try? await Task.sleep(for: .milliseconds(250))
+        // The intermediate grid's frame is already non-blank, and the agent
+        // can repaint the final grid seconds later (f52d610f on 0.5.114: the
+        // proof ran at 17:01:23.96, the final repaint arrived at 17:01:24).
+        // Prove only a non-blank screen whose output has been quiet.
+        var lastSequence: UInt64?
+        var quietSince = Date()
+        let deadline = Date().addingTimeInterval(Self.hiddenBounceSettleLimit)
+        while Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(100))
             guard self.pane === pane else { return false }
-            if io.maintenanceScreenSnapshot() != nil, !(await hiddenScreenIsBlank()) {
-                // Let the repaint finish before the screen is proven.
-                try? await Task.sleep(for: .milliseconds(300))
+            let sequence = io.maintenanceScreenSnapshot()?.token.sequence
+            if sequence != lastSequence { lastSequence = sequence; quietSince = Date(); continue }
+            if Self.hiddenBounceSettled(sequenceAvailable: sequence != nil,
+                                        quietFor: Date().timeIntervalSince(quietSince)),
+               !(await hiddenScreenIsBlank()) {
                 hiddenScreenRefreshNote = nil
                 return true
             }
         }
-        hiddenScreenRefreshNote = blankNote + ", and a one-row bounce gave no screen within 5 s"
+        hiddenScreenRefreshNote = blankNote + ", and a one-row bounce gave no settled screen within " +
+            "\(Int(Self.hiddenBounceSettleLimit)) s"
         return false
+    }
+
+    /// How long a bounced hidden pane's output must stay unchanged before
+    /// its screen is proven, and the bound on waiting for that.
+    nonisolated static let hiddenBounceQuiet: TimeInterval = 1
+    nonisolated static let hiddenBounceSettleLimit: TimeInterval = 8
+    nonisolated static func hiddenBounceSettled(sequenceAvailable: Bool, quietFor: TimeInterval) -> Bool {
+        sequenceAvailable && quietFor >= hiddenBounceQuiet
     }
 
     func prepareAgentMaintenancePromptProof() async {
