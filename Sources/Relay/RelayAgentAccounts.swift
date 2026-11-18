@@ -154,6 +154,10 @@ struct RelayPaneAgentAccountState: Codable, Equatable, Sendable {
     /// relayd's resolved real-path comparison with the recorded account, when
     /// the host reports one; it decides over the textual comparison.
     var observedMatches: Bool?
+    /// The ChatGPT login the running Codex's folder holds, compared by relayd
+    /// with the account its label is pinned to. Nil from a host that does not
+    /// report it: never shown as a mismatch.
+    var observedLogin: RelayAgentLoginObservation?
 
     var label: String? { recorded?.label ?? observedLabel }
 
@@ -174,6 +178,12 @@ struct RelayPaneAgentAccountState: Codable, Equatable, Sendable {
     /// recorded business"): panes 57c1dd5b and bc08e46f showed "business"
     /// while they spent the personal quota. Display only; no decision reads it.
     var displayLabel: String? {
+        guard let label = folderDisplayLabel else { return nil }
+        // A wrong login is named next to the folder label it contradicts.
+        return loginMismatch ? label + " · login " + (observedLogin?.accountText ?? "other") : label
+    }
+
+    private var folderDisplayLabel: String? {
         if let recorded {
             guard mismatch, let directory = observedDirectory else { return recorded.label }
             let place = directory.isEmpty ? "default (~/.\(observedProvider ?? "claude"))" : directory
@@ -183,6 +193,10 @@ struct RelayPaneAgentAccountState: Codable, Equatable, Sendable {
         let place = directory.isEmpty ? "default (~/.\(observedProvider ?? "claude"))" : directory
         return observedLabel.map { "\($0) · \(place)" } ?? place
     }
+
+    /// The folder's auth.json is logged in to another ChatGPT account than
+    /// the one its label is pinned to.
+    var loginMismatch: Bool { observedLogin?.status == "mismatch" }
 
     var mismatch: Bool {
         guard let recorded, let observedDirectory, observedProvider == recorded.provider else { return false }
@@ -197,6 +211,47 @@ struct RelayPaneAgentAccountState: Codable, Equatable, Sendable {
             ? " (explicit ~/.claude uses a different .claude.json)" : ""
         return "This pane's \(recorded.provider == "codex" ? "Codex" : "Claude") account is \(recorded.label) " +
             "(\(recorded.displayDirectory)) but the running agent uses \(observed)\(reason). Relay will not restart or switch it."
+    }
+}
+
+/// relayd's report of the ChatGPT login in a running Codex pane's folder:
+/// the 8-character account id prefix and plan only, the folder label's pinned
+/// prefix, and status "match", "mismatch", "unpinned", "unknown" or
+/// "unregistered".
+struct RelayAgentLoginObservation: Codable, Equatable, Sendable {
+    var status: String
+    var label: String? = nil
+    var expected: String? = nil
+    var state: String? = nil
+    var account: String? = nil
+    var plan: String? = nil
+    /// The process started before auth.json last changed.
+    var startedBeforeLoginChange: Bool? = nil
+
+    var accountText: String {
+        guard let account else { return state == "api_key" ? "API key" : "unknown" }
+        return account + "…" + (plan.map { " (\($0))" } ?? "")
+    }
+
+    /// The badge tooltip for a mismatch; nil otherwise.
+    var mismatchDescription: String? {
+        guard status == "mismatch" else { return nil }
+        let name = label ?? "this"
+        return "Wrong Codex login: the \(name) account is pinned to ChatGPT account \(expected ?? "?")… but its folder " +
+            "is logged in to \(accountText). Codex bills that login. Moves and restarts into this folder are refused " +
+            "until it is logged in again or the label is re-pinned in Settings." +
+            (startedBeforeLoginChange == true
+                ? " This pane started before the login file last changed; it keeps the login it loaded until it is restarted." : "")
+    }
+
+    /// Unpinned folders are labelled by folder only: Relay cannot tell whose login is there.
+    var note: String? {
+        switch status {
+        case "unpinned": return "Codex login \(accountText); this label is not pinned to an account."
+        case "unknown": return "Codex login could not be read (credential store or no login); not verified."
+        case "match": return "Codex login \(accountText) matches the pinned account."
+        default: return nil
+        }
     }
 }
 
@@ -695,6 +750,11 @@ struct RelayAgentAccountStatus: Decodable, Equatable, Sendable, Identifiable {
     var expectWorkspace: String? = nil
     var expectPlan: String? = nil
     var expectKey: String? = nil
+    /// Codex: the ChatGPT account prefix the label is pinned to, the login
+    /// its auth.json names now (prefix and plan only) and relayd's comparison.
+    var expectAccount: String? = nil
+    var login: Login? = nil
+    var loginStatus: String? = nil
     /// The model and effort new agents of this account start with.
     var model: String? = nil
     var effort: String? = nil
@@ -717,6 +777,23 @@ struct RelayAgentAccountStatus: Decodable, Equatable, Sendable, Identifiable {
         let backup: String?
     }
 
+    struct Login: Decodable, Equatable, Sendable {
+        var state: String
+        var account: String? = nil
+        var plan: String? = nil
+    }
+
+    /// "02bb1caa… (pro)", "API key", "not logged in" or "unknown".
+    var loginText: String? {
+        guard let login else { return nil }
+        switch login.state {
+        case "chatgpt": return (login.account ?? "?") + "…" + (login.plan.map { " (\($0))" } ?? "")
+        case "api_key": return "API key"
+        case "missing": return "not logged in"
+        default: return "unknown"
+        }
+    }
+
     var id: String { provider + ":" + label }
     var account: RelayAgentAccount { .init(provider: provider, label: label, dir: isDefault ? "" : dir) }
 
@@ -725,6 +802,7 @@ struct RelayAgentAccountStatus: Decodable, Equatable, Sendable, Identifiable {
         case isDefault = "default", loggedIn = "logged_in", shareHistory = "share_history", mcpExclude = "mcp_exclude"
         case identityKey = "identity_key", probeReason = "probe_reason", workspaceKey = "workspace_key"
         case expectWorkspace = "expect_workspace", expectPlan = "expect_plan", expectKey = "expect_key"
+        case expectAccount = "expect_account", login, loginStatus = "login_status"
         case defaultsError = "defaults_error"
     }
 
@@ -1229,6 +1307,12 @@ struct RelayAgentAccountSyncResult: Decodable, Equatable, Sendable {
         guard expected.isValid else { throw Failure.refused("An expected workspace is at most 64 characters and a plan at most 32, without line breaks.") }
         try await send(profile, ["action": "set_expectation", "provider": account.provider, "label": account.label,
                                  "expect_workspace": expected.workspace, "expect_plan": expected.plan, "expect_key": expected.key])
+    }
+
+    /// Pins a Codex label to the ChatGPT account its folder is logged in to
+    /// now (pin true), or removes the pin. An explicit user action only.
+    func pinLogin(_ profile: ConnectionProfile, account: RelayAgentAccount, pin: Bool) async throws {
+        try await send(profile, ["action": pin ? "pin_login" : "unpin_login", "provider": account.provider, "label": account.label])
     }
 
     /// The model and effort new agents of the account start with; empty

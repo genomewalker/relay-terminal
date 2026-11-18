@@ -67,6 +67,11 @@ struct RelaySidePanelState: Encodable, Sendable {
         /// ("personal · default (~/.claude)"), or the directory alone while the
         /// label is unknown. Not an account label; moves reject it.
         var accountDisplay: String? = nil
+        /// Codex: the ChatGPT login observed in the agent's folder ("02bb1caa… (pro)"),
+        /// its comparison with the label's pinned account, and true on a mismatch.
+        var accountLogin: String? = nil
+        var accountLoginStatus: String? = nil
+        var accountLoginMismatch: Bool? = nil
     }
 
     struct Activity: Encodable, Sendable {

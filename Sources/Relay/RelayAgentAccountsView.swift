@@ -322,26 +322,42 @@ struct RelayAgentPicker: View {
 }
 
 /// The account label on an agent pane's header; coral when the running agent
-/// reports a different account than the one the pane was started in.
+/// reports a different account than the one the pane was started in, red when
+/// its Codex folder is logged in to another ChatGPT account than the pinned one.
 struct RelayAgentAccountBadge: View {
     @ObservedObject var pane: PaneModel
     @ObservedObject private var moves = RelayAgentAccountMove.shared
 
     var body: some View {
         if pane.kind == .claude || pane.kind == .codex, let state = pane.agentAccount, let label = state.displayLabel {
+            let tint = Self.tint(state)
             Text(label)
                 .font(RelayTheme.font(size: 9.5, weight: .medium))
                 .padding(.horizontal, RelayTheme.spacing(5))
                 .padding(.vertical, RelayTheme.spacing(1))
-                .foregroundStyle(state.mismatch ? RelayTheme.coral : RelayTheme.textMuted)
-                .overlay(Capsule().stroke(state.mismatch ? RelayTheme.coral : RelayTheme.textFaint.opacity(0.5), lineWidth: 0.5))
+                .foregroundStyle(tint ?? RelayTheme.textMuted)
+                .overlay(Capsule().stroke(tint ?? RelayTheme.textFaint.opacity(0.5), lineWidth: 0.5))
                 .lineLimit(1)
                 .fixedSize()
-                .help((state.mismatchDescription ?? "Agent account: \(label)" +
-                      (state.recorded.map { " (\($0.displayDirectory))" } ?? "")) +
-                      (moves.statuses[pane.id].map { "\n" + $0 } ?? ""))
-                .accessibilityLabel(state.mismatch ? "Agent account mismatch" : "Agent account \(label)")
+                .help(Self.help(state, label: label) + (moves.statuses[pane.id].map { "\n" + $0 } ?? ""))
+                .accessibilityLabel(state.loginMismatch ? "Wrong Codex login" :
+                    state.mismatch ? "Agent account mismatch" : "Agent account \(label)")
         }
+    }
+}
+
+extension RelayAgentAccountBadge {
+    /// Red for a login that contradicts the label's pinned account, coral for
+    /// a folder other than the recorded one, else the neutral style.
+    static func tint(_ state: RelayPaneAgentAccountState) -> Color? {
+        state.loginMismatch ? RelayTheme.red : state.mismatch ? RelayTheme.coral : nil
+    }
+
+    static func help(_ state: RelayPaneAgentAccountState, label: String) -> String {
+        let folder = state.mismatchDescription ?? "Agent account: \(label)" +
+            (state.recorded.map { " (\($0.displayDirectory))" } ?? "")
+        guard let login = state.observedLogin else { return folder }
+        return (login.mismatchDescription.map { $0 + "\n" } ?? "") + folder + (login.note.map { "\n" + $0 } ?? "")
     }
 }
 
@@ -670,6 +686,9 @@ struct RelayAgentAccountsSettingsView: View {
                     .foregroundStyle(RelayTheme.textFaint)
                     .textSelection(.enabled)
                 usageLine(status: status, usage: usage)
+                if account.provider == "codex", let status, let login = status.loginText {
+                    codexLoginLine(account, status: status, login: login)
+                }
                 if let reason = unavailableReason(status) {
                     Text("Status unavailable: " + reason)
                         .font(RelayTheme.font(size: 10.5)).foregroundStyle(RelayTheme.coral)
@@ -789,6 +808,45 @@ struct RelayAgentAccountsSettingsView: View {
             ForEach(labels, id: \.self) { Text($0).tag($0) }
         }
         .frame(maxWidth: 220)
+    }
+
+    /// The ChatGPT login in a Codex folder against the label's pin: red when
+    /// it is another account, amber while the label is unpinned.
+    @ViewBuilder private func codexLoginLine(_ account: RelayAgentAccount, status: RelayAgentAccountStatus,
+                                             login: String) -> some View {
+        let pinned = status.expectAccount.flatMap { $0.isEmpty ? nil : $0 }
+        let mismatch = status.loginStatus == "mismatch"
+        HStack(spacing: 8) {
+            Text("ChatGPT login " + login + (pinned.map { " · pinned to " + $0 + "…" } ?? " · not pinned"))
+                .font(RelayTheme.font(size: 10.5, weight: mismatch ? .semibold : .regular))
+                .foregroundStyle(mismatch ? RelayTheme.red : pinned == nil ? RelayTheme.warning : RelayTheme.textFaint)
+                .help(mismatch
+                      ? "This folder is logged in to another ChatGPT account than the one this label is pinned to. Codex launches, moves and restarts into it are refused until it is logged in again or re-pinned."
+                      : "Relay compares this folder's login with the pinned account before every Codex launch, account move and restart.")
+            if status.login?.state == "chatgpt", status.loginStatus != "match" {
+                Button("Pin to this login") {
+                    let profile = host
+                    run(scope) {
+                        try await directory.pinLogin(profile, account: account, pin: true)
+                        try await directory.refresh(profile)
+                        return "Pinned \(account.label) to ChatGPT account \(status.login?.account ?? "?")…."
+                    }
+                }
+                .disabled(actionsDisabled || dirty)
+                .help("Pins this label to the ChatGPT account logged in here now. Only do this after checking it is the right account.")
+            }
+            if pinned != nil {
+                Button("Unpin") {
+                    let profile = host
+                    run(scope) {
+                        try await directory.pinLogin(profile, account: account, pin: false)
+                        try await directory.refresh(profile)
+                        return "Removed the login pin of \(account.label)."
+                    }
+                }
+                .disabled(actionsDisabled || dirty)
+            }
+        }
     }
 
     /// "AEGIS-micro · Team" when the provider reports the workspace, else

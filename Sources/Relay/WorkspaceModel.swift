@@ -1033,7 +1033,10 @@ final class WorkspaceModel: ObservableObject {
                 (pane.profile.backend == .relay ? "detach_persistent_session" : "stop_nonpersistent_process"),
             account: pane.agentAccountLabel,
             accountMismatch: pane.agentAccount?.mismatch == true ? true : nil,
-            accountDisplay: pane.agentAccountDisplay
+            accountDisplay: pane.agentAccountDisplay,
+            accountLogin: pane.agentAccount?.observedLogin?.accountText,
+            accountLoginStatus: pane.agentAccount?.observedLogin?.status,
+            accountLoginMismatch: pane.agentAccount?.loginMismatch == true ? true : nil
         )
     }
 

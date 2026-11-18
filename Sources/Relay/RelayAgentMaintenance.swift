@@ -43,6 +43,8 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
     /// or why the target cannot resume this conversation.
     var moveCommand: String? = nil
     var moveError: String? = nil
+    /// Codex: the ChatGPT login in the running agent's folder and its pin.
+    var login: RelayAgentLoginObservation? = nil
     var unavailable: String? = nil
     var worker: RelayPaneWorkerObservation? = nil
     var context: RelayPaneContextObservation? = nil
@@ -56,7 +58,7 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
         case version, provider, bound, lifecycle, revision, owner, unavailable
         case paneID = "paneId", processID = "processId", processStart, sessionID = "sessionId"
         case installedUpdate, installedImageCurrent, runningVersion, installedVersion, outdatedOtherInstall
-        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, worker, context, configDir, accountMatches, moveCommand, moveError
+        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, worker, context, configDir, accountMatches, moveCommand, moveError, login
     }
 
     /// Native image versions on the pane's host; nil when either is unverified.
@@ -335,6 +337,7 @@ enum RelayAgentMaintenancePolicy {
             pane.observeAgentAccount(provider: provider, directory: directory,
                 label: matches == true ? pane.agentAccount?.recorded?.label : configured?.label,
                 matches: matches, configured: configured)
+            if provider == "codex" { pane.observeAgentLogin(proof.login) }
         }
         return proof
     }
