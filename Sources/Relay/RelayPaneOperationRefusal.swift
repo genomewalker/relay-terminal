@@ -57,6 +57,12 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
         /// A Codex attached directly to Codex's own app-server daemon, not
         /// through Relay's proxy (0173baf5); Relay does not exit or relaunch it.
         case nativeOutsideProxy = "native_outside_proxy"
+        /// Submitted input is still in Relay's backlog (transport detached).
+        case inputQueued = "input_queued"
+        /// Delivery to the pane's terminal is not acknowledged or not echoed.
+        case inputUnconfirmed = "input_unconfirmed"
+        /// The worker took the input but the pane's screen has not updated.
+        case rendererStale = "renderer_stale"
         case unclassified
 
         /// What the operator or an MCP client does to clear this refusal.
@@ -121,6 +127,12 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
                 return "Nothing was sent. Select the pane's tab once, or wait for its worker to deliver a fresh screen, then retry."
             case .closeRefused: return "Read the blocker; end or detach what keeps the pane open, then close it again."
             case .coolingDown: return "Wait for the cooling interval to end; maintenance retries this pane by itself."
+            case .inputQueued:
+                return "Do not resend. Reconnect the pane (relay_recover_pane); Relay sends the held input once the transport reattaches, then read the pane."
+            case .inputUnconfirmed:
+                return "Do not resend. Read the pane after a few seconds (relay_read_viewport, check stale_seconds); if nothing changed, reconnect it (relay_recover_pane) before deciding."
+            case .rendererStale:
+                return "Do not resend. The screen Relay holds is old; reconnect the pane (relay_recover_pane) and read it again to see whether the input took effect."
             case .nativeOutsideProxy:
                 return "Exit this Codex yourself (or close its task in Codex desktop), then relaunch the conversation from Relay's launch form (relay_launch_agent), which runs it through Relay's proxy."
             case .unclassified: return "Read the blocker text; it names what held the operation."
