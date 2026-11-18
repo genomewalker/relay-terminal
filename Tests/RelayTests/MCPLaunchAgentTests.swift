@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import Relay
@@ -6,6 +7,10 @@ import Testing
 /// replay, and the mapping of observations onto the four receipt stages.
 @MainActor @Suite("MCP launch agent")
 struct MCPLaunchAgentTests {
+    private static func digest(_ bytes: Data) -> String {
+        SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    }
+
     typealias F = MCPTabMoveTests
 
     static let personal = RelayAgentAccount(provider: "claude", label: "personal", dir: "~/.claude-personal")
@@ -115,38 +120,44 @@ struct MCPLaunchAgentTests {
         let environment = ["HOME": root.path, "RELAY_TEST_OUT": out.path, "CODEX_HOME": "/should/be/unset"]
 
         let claude = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "claude-opus-4.1",
-                                                              cwd: cwd.path, briefPath: briefURL.path))
+                                                              cwd: cwd.path, briefPath: briefURL.path, briefSHA256: Self.digest(Data((content + "\n\n").utf8))))
         // No path sits inside double quotes, where interactive history expansion acts on `!`.
-        #expect(claude.contains("relay_brief=$(cat -- '") && !claude.contains("\"$(cat"))
+        #expect(claude.contains("relay_brief=$(head -c 65537 -- '") && !claude.contains("\"$(cat"))
         var result = try Self.sh(claude, environment: environment)
         #expect(result.status == 0)
         var lines = try String(contentsOf: out, encoding: .utf8)
         let resolvedCwd = cwd.resolvingSymlinksInPath().path
         #expect(lines.hasPrefix(resolvedCwd + "\n") || lines.hasPrefix(cwd.path + "\n"))
         #expect(lines.contains("\n" + root.path + "/.claude-personal\n"))
-        #expect(lines.hasSuffix("<--model>\n<claude-opus-4.1>\n<" + content + ">\n"))
+        #expect(lines.hasSuffix("<--model>\n<claude-opus-4.1>\n<" + content + "\n\n>\n"))
 
         // Codex default account: CODEX_HOME is unset, never inherited.
         let codex = RelayAgentAccount(provider: "codex", label: "work", dir: "")
         let codexCommand = try #require(MCPLaunchAgentCommand.build(account: codex, model: "gpt-5.1-codex",
-                                                                    cwd: cwd.path, briefPath: briefURL.path))
+                                                                    cwd: cwd.path, briefPath: briefURL.path, briefSHA256: Self.digest(Data((content + "\n\n").utf8))))
         #expect(codexCommand.contains("exec env -u CODEX_HOME \"$HOME\"/.local/share/relay/shims/codex -m 'gpt-5.1-codex' \"$relay_brief\""))
         result = try Self.sh(codexCommand, environment: environment)
         #expect(result.status == 0)
         lines = try String(contentsOf: out, encoding: .utf8)
-        #expect(lines.contains("\nunset\n<-m>\n<gpt-5.1-codex>\n<" + content + ">\n"))
+        #expect(lines.contains("\nunset\n<-m>\n<gpt-5.1-codex>\n<" + content + "\n\n>\n"))
+
+        // A valid but different brief replaced after validation must not reach the shim.
+        try FileManager.default.removeItem(at: out)
+        try "Replacement brief".write(to: briefURL, atomically: true, encoding: .utf8)
+        #expect(try Self.sh(claude, environment: environment).status == Int32(MCPLaunchAgentCommand.launchFailureExitCode))
+        #expect(!FileManager.default.fileExists(atPath: out.path))
 
         // A brief changed into an option, emptied, or unreadable never launches.
         for (name, bytes) in [("dash", "--dangerously-skip-permissions"), ("empty", "")] {
             try? FileManager.default.removeItem(at: out)
             let bad = root.appendingPathComponent(name)
             try bytes.write(to: bad, atomically: true, encoding: .utf8)
-            let command = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus", cwd: cwd.path, briefPath: bad.path))
+            let command = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus", cwd: cwd.path, briefPath: bad.path, briefSHA256: Self.digest(Data(bytes.utf8))))
             #expect(try Self.sh(command, environment: environment).status == Int32(MCPLaunchAgentCommand.launchFailureExitCode))
             #expect(!FileManager.default.fileExists(atPath: out.path), "\(name) brief launched the provider")
         }
         for (dir, brief) in [(root.appendingPathComponent("missing").path, briefURL.path), (cwd.path, root.path + "/missing.md")] {
-            let command = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus", cwd: dir, briefPath: brief))
+            let command = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus", cwd: dir, briefPath: brief, briefSHA256: Self.digest(Self.brief)))
             #expect(try Self.sh(command, environment: environment).status == Int32(MCPLaunchAgentCommand.launchFailureExitCode))
             #expect(!FileManager.default.fileExists(atPath: out.path))
         }
@@ -155,10 +166,10 @@ struct MCPLaunchAgentTests {
     @Test func commandBuilderRefusesUnsafeValues() {
         for (model, cwd, brief) in [("op us", "/p", "/b"), ("$(id)", "/p", "/b"), ("opus", "p", "/b"), ("opus", "/p\nx", "/b"),
                                     ("opus", "/p", "/b\r"), ("Opus", "/p", "/b")] {
-            #expect(MCPLaunchAgentCommand.build(account: Self.personal, model: model, cwd: cwd, briefPath: brief) == nil)
+            #expect(MCPLaunchAgentCommand.build(account: Self.personal, model: model, cwd: cwd, briefPath: brief, briefSHA256: Self.digest(Self.brief)) == nil)
         }
         #expect(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus", cwd: "/" + String(repeating: "a", count: 4000),
-                                            briefPath: "/" + String(repeating: "b", count: 4000)) != nil)
+                                            briefPath: "/" + String(repeating: "b", count: 4000), briefSHA256: Self.digest(Self.brief)) != nil)
         #expect(MCPLaunchAgentCommand.briefRefusal(Data("-p do it".utf8)) != nil)
         #expect(MCPLaunchAgentCommand.briefRefusal(Data("  \n".utf8)) != nil)
         #expect(MCPLaunchAgentCommand.briefRefusal(Data("resume\n".utf8)) != nil)
@@ -458,11 +469,11 @@ struct MCPLaunchAgentTests {
         #expect(C.permissionFlags(provider: "codex", mode: "read_only") == ["-a", "on-request", "-s", "read-only"])
         #expect(C.permissionFlags(provider: "codex", mode: "yolo") == ["--dangerously-bypass-approvals-and-sandbox"])
         #expect(C.permissionFlags(provider: "claude", mode: "bypassPermissions") == nil)
-        let plain = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b"))
+        let plain = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: Self.digest(Self.brief)))
         #expect(!plain.contains("--permission-mode"))
-        let ask = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", permissionMode: "ask"))
+        let ask = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: Self.digest(Self.brief), permissionMode: "ask"))
         #expect(ask.contains(" --model 'opus' --permission-mode manual \"$relay_brief\""))
-        #expect(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", permissionMode: "nope") == nil)
+        #expect(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: Self.digest(Self.brief), permissionMode: "nope") == nil)
         // The wire field is optional and checked.
         let instance = UUID(), request = UUID()
         #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request))?.mode == "account")
@@ -518,7 +529,7 @@ struct MCPLaunchAgentTests {
         for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] where FileManager.default.isExecutableFile(atPath: shell) {
             try? FileManager.default.removeItem(at: ran)
             let command = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus",
-                                                                   cwd: cwd.path, briefPath: brief.path))
+                                                                   cwd: cwd.path, briefPath: brief.path, briefSHA256: Self.digest(try Data(contentsOf: brief))))
             #expect(!command.contains("exec env") || command.contains("&& (relay_brief="), "exec only inside the subshell")
             let result = try Self.run(shell, command + after, environment: environment)
             #expect(result.status == 0, "\(shell): the shell itself must not exit")
@@ -532,7 +543,7 @@ struct MCPLaunchAgentTests {
                                      (root.appendingPathComponent("missing").path, brief.path)] {
                 try? FileManager.default.removeItem(at: ran)
                 let failing = try #require(MCPLaunchAgentCommand.build(account: Self.personal, model: "opus",
-                                                                       cwd: dir, briefPath: briefPath))
+                                                                       cwd: dir, briefPath: briefPath, briefSHA256: Self.digest(try Data(contentsOf: brief))))
                 let failed = try Self.run(shell, failing + after, environment: environment)
                 #expect(failed.status == 0, "\(shell): the shell itself must not exit")
                 #expect(failed.out.contains("status=\(MCPLaunchAgentCommand.launchFailureExitCode)\n"), "\(shell): \(failed.out)")

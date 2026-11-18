@@ -6,6 +6,21 @@ import Testing
 struct RelayActivityLogTests {
     private func json(_ object: [String: Any]) -> Data { try! JSONSerialization.data(withJSONObject: object) }
 
+    @Test func resumeSummaryUsesTheRequestedProviderAndReceiptState() {
+        let pane = UUID()
+        let path = "/api/panes/\(pane)/codex-resume"
+        func summary(_ state: String, provider: String? = nil) -> String? {
+            RelayActivityDescriber.describe(method: "POST", path: path,
+                                      request: json(provider.map { ["provider": $0] } ?? [:]),
+                                      response: json(["state": state]), paneName: { _ in "Review" })?.summary
+        }
+        #expect(summary("checking", provider: "claude") == "Resume requested for Claude in 'Review'")
+        #expect(summary("checking") == "Resume requested for Codex in 'Review'")
+        #expect(summary("verified", provider: "claude") == "Resumed Claude in 'Review'")
+        #expect(summary("outcome_unknown") == "Codex resume unconfirmed in 'Review'")
+        #expect(summary("refused") == nil)
+    }
+
     @Test("Entries are newest first, by time even when they arrive out of order")
     func ordering() {
         let log = RelayActivityLog()

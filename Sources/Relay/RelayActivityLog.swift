@@ -59,7 +59,21 @@ enum RelayActivityDescriber {
             case "message": return entry("Sent a message to \(named(pane))", pane: pane)
             case "input-direct": return entry("Sent a command to \(named(pane))", pane: pane)
             case "input-recover-shell": return entry("Recovered the shell in \(named(pane))", pane: pane)
-            case "codex-resume": return entry("Resumed Codex in \(named(pane))", pane: pane)
+            case "codex-resume":
+                let provider = string(input, "provider") ?? "codex"
+                guard ["claude", "codex"].contains(provider) else { return nil }
+                let name = provider == "claude" ? "Claude" : "Codex"
+                let target = named(pane)
+                switch output["state"] as? String {
+                case "checking", "exiting", "launching", "verifying":
+                    return entry("Resume requested for \(name) in \(target)", pane: pane)
+                case "verified":
+                    return entry("Resumed \(name) in \(target)", pane: pane)
+                case "held", "outcome_unknown", "interrupted_outcome_unknown":
+                    return entry("\(name) resume unconfirmed in \(target)", pane: pane)
+                default:
+                    return nil
+                }
             default: return nil
             }
         }

@@ -116,10 +116,12 @@ enum MCPLaunchAgentCommand {
     }
 
     static func build(account: RelayAgentAccount, model: String, cwd: String, briefPath: String,
+                      briefSHA256: String,
                       permissionMode: String = "account") -> String? {
         guard let permission = permissionFlags(provider: account.provider, mode: permissionMode) else { return nil }
         guard account.isValid, MCPLaunchAgentProposal.validModel(model),
-              MCPLaunchAgentProposal.validPath(cwd), MCPLaunchAgentProposal.validPath(briefPath) else { return nil }
+              MCPLaunchAgentProposal.validPath(cwd), MCPLaunchAgentProposal.validPath(briefPath),
+              briefSHA256.utf8.count == 64, briefSHA256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
         let assignment = account.launchAssignment
         guard !assignment.isEmpty else { return nil }
         // `exec VAR=x prog` would try to run "VAR=x"; env takes both forms.
@@ -130,11 +132,13 @@ enum MCPLaunchAgentCommand {
         // pane's shell. Nothing follows the provider, so its status is the
         // command's status.
         let command = "{ cd -- " + quote(cwd) + " || (exit " + failure + "); }" +
-            // Unquoted on purpose: an assignment does not split, and no double
-            // quote surrounds the path, so `!` never meets history expansion.
-            " && (relay_brief=$(cat -- " + quote(briefPath) + ")" +
-            " && case \"$relay_brief\" in ''|-*) exit " + failure + ";; esac" +
-            " && exec " + environment + " " + RelayAgentAccount.managedShimCommand(account.provider) +
+            // Keep trailing newlines with a sentinel and verify the same value passed to exec.
+            " && (relay_brief=$(head -c 65537 -- " + quote(briefPath) + " && printf '.')"
+            + " && relay_brief=${relay_brief%.}"
+            + " && case \"$relay_brief\" in ''|-*) exit " + failure + ";; esac"
+            + " && relay_digest=$(printf '%s' \"$relay_brief\" | (if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi))"
+            + " && [ \"${relay_digest%% *}\" = " + quote(briefSHA256) + " ]"
+            + " && exec " + environment + " " + RelayAgentAccount.managedShimCommand(account.provider) +
             " " + flag + " " + quote(model) + permission.map { " " + $0 }.joined() +
             " \"$relay_brief\" || exit " + failure + ")"
         return command.utf8.count <= commandLimit ? command : nil
@@ -705,9 +709,10 @@ enum MCPAgentBindingRead {
             return refuse("brief_path is not a readable regular file of at most 64 KiB on \(proposal.host): \(error.localizedDescription)")
         }
         if let refusal = MCPLaunchAgentCommand.briefRefusal(brief) { return refuse(refusal) }
+        let briefSHA256 = SHA256.hash(data: brief).map { String(format: "%02x", $0) }.joined()
         guard let command = MCPLaunchAgentCommand.build(account: account, model: proposal.model,
                                                         cwd: proposal.cwd, briefPath: proposal.briefPath,
-                                                        permissionMode: proposal.mode) else {
+                                                        briefSHA256: briefSHA256, permissionMode: proposal.mode) else {
             return refuse("The launch command could not be built from these values")
         }
         guard needed.allSatisfy(permits) else {
@@ -715,7 +720,7 @@ enum MCPAgentBindingRead {
         }
         entries[proposal.requestID]?.receipt.request.configDir = account.dir
         entries[proposal.requestID]?.receipt.request.briefBytes = brief.count
-        entries[proposal.requestID]?.receipt.request.briefSHA256 = SHA256.hash(data: brief).map { String(format: "%02x", $0) }.joined()
+        entries[proposal.requestID]?.receipt.request.briefSHA256 = briefSHA256
         entries[proposal.requestID]?.account = account
         entries[proposal.requestID]?.profile = profile
 

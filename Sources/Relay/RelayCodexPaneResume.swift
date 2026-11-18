@@ -79,9 +79,17 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
         let initial = Receipt(paneID: pane.id, request: request, state: "checking", detail: "Checking exact native owner and saved session", updatedAt: Date())
         try write(initial)
         active[request.requestID] = Task { [weak self, weak pane, weak workspace] in
-            guard let self, let pane, let workspace else { return }
+            guard let self else { return }
+            defer { self.active[request.requestID] = nil }
+            guard let pane, let workspace, workspace.panes[pane.id] === pane else {
+                var result = initial
+                result.state = "refused"
+                result.detail = "Refused before any input: the pane or workspace closed before the resume started"
+                result.updatedAt = Date()
+                try? self.write(result)
+                return
+            }
             await self.run(initial, pane: pane, workspace: workspace, authorized: authorized)
-            self.active[request.requestID] = nil
         }
         return initial
     }

@@ -27,6 +27,41 @@ struct RelayCodexPaneResumeTests {
         #expect(!RelayCodexPaneResume.verified(before, after: owner(session: target.uuidString.lowercased(), process: 21, boot: "other"), target: target))
         #expect(!RelayCodexPaneResume.verified(before, after: owner(session: target.uuidString.lowercased()), target: target))
     }
+    @Test @MainActor func lostPaneFinishesReceiptAndReleasesResumeAdmission() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = RelayCodexPaneResume(directory: directory)
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        var original: PaneModel? = PaneModel(profile: .sshConfigHost("resume-fixture.invalid"), contentKind: .terminal)
+        let first = RelayCodexPaneResumeRequest(instance: UUID(), requestID: UUID(), expectedSession: UUID(), targetSession: UUID())
+        let firstID: UUID
+        do {
+            let pane = try #require(original)
+            firstID = pane.id
+            pane.connectionState = .connected
+            #expect(try store.start(first, pane: pane, workspace: workspace, authorized: { true }).state == "checking")
+        }
+        original = nil
+
+        // The pane is no longer part of the workspace when the queued task starts.
+        let deadline = ContinuousClock.now + .seconds(2)
+        while store.receipt(first.requestID, paneID: firstID)?.state == "checking", ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        let refused = try #require(store.receipt(first.requestID, paneID: firstID))
+        #expect(refused.state == "refused")
+        #expect(refused.detail.contains("before any input"))
+
+        let nextPane = PaneModel(profile: .sshConfigHost("resume-fixture.invalid"), contentKind: .terminal)
+        nextPane.connectionState = .connected
+        let next = RelayCodexPaneResumeRequest(instance: first.instance, requestID: UUID(), expectedSession: UUID(), targetSession: UUID())
+        #expect(try store.start(next, pane: nextPane, workspace: workspace, authorized: { true }).state == "checking")
+        while store.receipt(next.requestID, paneID: nextPane.id)?.state == "checking", ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        #expect(store.receipt(next.requestID, paneID: nextPane.id)?.state == "refused")
+    }
+
     @Test @MainActor func codexPaneResumeInterruptedReceiptDoesNotBecomePermissionToReplay() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
