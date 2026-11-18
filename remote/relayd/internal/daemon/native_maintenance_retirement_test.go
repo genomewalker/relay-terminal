@@ -513,6 +513,7 @@ func TestNativeAccountOriginalInspectionAssertions(t *testing.T) {
 		f := mrAccountFixture(t, true)
 		proof := f.inspect(nil, mrString("~/.claude-personal"))
 		mrEq(t, proof.Get("move_error"), nil)
+		mrEq(t, proof.Get("move_error_code"), nil)
 		moved := phShlexSplit(pyMustString(proof.Get("move_command")))
 		original := phShlexSplit(pyMustString(proof.Get("resume_command")))
 		mrEq(t, moved[0], "CLAUDE_CONFIG_DIR="+f.home+"/.claude-personal")
@@ -534,6 +535,7 @@ func TestNativeAccountOriginalInspectionAssertions(t *testing.T) {
 		proof := f.inspect(nil, mrString("~/.claude-personal"))
 		mrEq(t, proof.Get("move_command"), nil)
 		mrEq(t, strings.Contains(pyMustString(proof.Get("move_error")), "could not bind this conversation"), true)
+		mrEq(t, proof.Get("move_error_code"), PaneRefusalTargetAccount)
 		mrEq(t, proof.Get("resume_command") != nil, true)
 	})
 	t.Run("A64_history_not_visible", func(t *testing.T) {
@@ -541,6 +543,7 @@ func TestNativeAccountOriginalInspectionAssertions(t *testing.T) {
 		proof := f.inspect(nil, mrString("~/.claude-personal"))
 		mrEq(t, proof.Get("move_command"), nil)
 		mrEq(t, strings.Contains(pyMustString(proof.Get("move_error")), "not visible from the target account"), true)
+		mrEq(t, proof.Get("move_error_code"), PaneRefusalTargetAccount)
 	})
 	t.Run("A65_same_account_and_bad_selectors", func(t *testing.T) {
 		f := mrAccountFixture(t, true)

@@ -50,22 +50,36 @@ enum RelayAgentAccountMovePolicy {
     static func refusal(_ proof: RelayAgentMaintenanceProbe, paneID: UUID, target: RelayAgentAccount,
                         emptyPrompt: Bool, hasDraft: Bool, typedDraft: Bool = false, pendingApprovals: Int,
                         inputAge: TimeInterval, promptBlocker: String? = nil) -> String? {
-        guard proof.valid(for: paneID) else { return proof.unavailable ?? "The agent's native identity could not be verified." }
-        guard target.isValid, target.provider == proof.provider else {
-            return "This pane runs \(proof.provider ?? "another agent"); choose one of its \(proof.provider ?? "") accounts."
+        refusalReason(proof, paneID: paneID, target: target, emptyPrompt: emptyPrompt, hasDraft: hasDraft, typedDraft: typedDraft,
+                      pendingApprovals: pendingApprovals, inputAge: inputAge, promptBlocker: promptBlocker)?.blocker
+    }
+
+    /// `refusal` with its reason code and how to clear it.
+    static func refusalReason(_ proof: RelayAgentMaintenanceProbe, paneID: UUID, target: RelayAgentAccount,
+                              emptyPrompt: Bool, hasDraft: Bool, typedDraft: Bool = false, pendingApprovals: Int,
+                              inputAge: TimeInterval, promptBlocker: String? = nil) -> RelayPaneOperationRefusal? {
+        typealias Refusal = RelayPaneOperationRefusal
+        guard proof.valid(for: paneID) else {
+            return Refusal(.identityUnavailable, proof.unavailable ?? "The agent's native identity could not be verified.")
         }
-        guard !hasDraft else { return "Send or clear the unsent prompt first; a move needs an empty prompt." }
-        if typedDraft, let refused = draftCaptureRefusal(provider: proof.provider) { return refused }
+        guard target.isValid, target.provider == proof.provider else {
+            return Refusal(.targetAccountUnavailable,
+                           "This pane runs \(proof.provider ?? "another agent"); choose one of its \(proof.provider ?? "") accounts.")
+        }
+        guard !hasDraft else { return Refusal(.draftPresent, "Send or clear the unsent prompt first; a move needs an empty prompt.") }
+        if typedDraft, let refused = draftCaptureRefusal(provider: proof.provider) { return Refusal(.draftPresent, refused) }
         // A move resumes with its own moveCommand. relayd withholds the
         // same-pane resume of a folder holding the wrong Codex login, and a
         // move is exactly how such a pane leaves that folder.
-        if let held = RelayAgentMaintenancePolicy.deferral(proof, paneID: paneID, emptyPrompt: emptyPrompt || typedDraft,
+        if let held = RelayAgentMaintenancePolicy.deferralReason(proof, paneID: paneID, emptyPrompt: emptyPrompt || typedDraft,
             hasDraft: hasDraft, pendingApprovals: pendingApprovals, inputAge: inputAge, promptBlocker: promptBlocker,
             requiresResume: proof.login?.status != "mismatch") {
             return held
         }
         guard proof.moveCommand != nil else {
-            return proof.moveError ?? "This relayd cannot prepare an account move; update Relay on that host."
+            let code = proof.moveErrorCode.flatMap(Refusal.Code.init(rawValue:)) ??
+                (proof.moveError.map(Refusal.classify) ?? .resumeUnavailable)
+            return Refusal(code, proof.moveError ?? "This relayd cannot prepare an account move; update Relay on that host.")
         }
         return nil
     }
@@ -168,6 +182,14 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
         /// refused, verified, held or unknown
         let state: String
         let message: String
+        /// Why a refused, held or deferred move stopped, and how to clear it.
+        var refusal: RelayPaneOperationRefusal? = nil
+        /// The message with how to clear its refusal, for the UI.
+        var displayMessage: String { refusal.map { message + " To clear: " + $0.howToClear } ?? message }
+        /// Receipt fields: status, message, and the refusal's flat fields.
+        var fields: [String: String] {
+            (refusal?.fields ?? [:]).merging(["status": state, "message": message]) { $1 }
+        }
     }
     /// The agent's terminal prompt as the move's admission reads it.
     struct PromptState: Equatable, Sendable {
@@ -228,7 +250,9 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                 provider: proof?.provider ?? target.provider, sessionID: proof?.sessionID, from: from, to: target,
                 state: state, detail: detail.map { String($0.prefix(300)) }))
         }
-        func finish(_ state: String, _ message: String, _ proof: RelayAgentMaintenanceProbe? = nil) -> Outcome {
+        func finish(_ state: String, _ message: String, _ proof: RelayAgentMaintenanceProbe? = nil,
+                    _ code: RelayPaneOperationRefusal.Code? = nil) -> Outcome {
+            let blocker = message
             var message = message
             if interrupted && state != "verified" {
                 message += " Relay had interrupted the agent's turn with Esc for the forced move."
@@ -238,8 +262,13 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                 message += " Your unsent prompt was saved and not restored; it is kept at " + draftPath + "."
             }
             record(state, proof, message)
-            statuses[pane.id] = message
-            return Outcome(state: state, message: message)
+            // A held, refused or deferred move names its code; an unknown
+            // outcome is not a refusal and must be inspected, not cleared.
+            let refusal = ["refused", "held", "deferred"].contains(state)
+                ? RelayPaneOperationRefusal(code ?? RelayPaneOperationRefusal.classify(blocker), blocker) : nil
+            let outcome = Outcome(state: state, message: message, refusal: refusal)
+            statuses[pane.id] = outcome.displayMessage
+            return outcome
         }
         if let refused = RelayAgentAccountMovePolicy.originRefusal(origin, inputGranted: inputGranted) {
             return finish("refused", refused)
@@ -258,7 +287,7 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
             RelayClaudeQuotaScheduler.shared.userClaimed(pane)
         }
         guard workspace.panes[pane.id] === pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
-              target.isValid else { return finish("refused", "The pane cannot be moved.") }
+              target.isValid else { return finish("refused", "The pane cannot be moved.", nil, .unsupportedPane) }
         guard RelayAgentMaintenance.shared.hold(pane.id) else {
             return finish(origin == .quotaFailover ? "deferred" : "refused", "Maintenance or another move is acting on this pane; try again when it finishes.")
         }
@@ -402,7 +431,8 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                 record("force_background", proof, commands.isEmpty ? "none" : commands.map(\.command).joined(separator: " | "))
             }
             if let refused = await admission(pane, proof: proof, target: target).refusal {
-                return finish(origin == .quotaFailover && proof.moveCommand != nil && proof.resumeCommand != nil ? "deferred" : "refused", refused, proof)
+                return finish(origin == .quotaFailover && proof.moveCommand != nil && proof.resumeCommand != nil ? "deferred" : "refused",
+                              refused.blocker, proof, refused.code)
             }
             // A second native read fences a turn, a draft or a session switch
             // that started during the first one.
@@ -413,7 +443,8 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
             }
             let admitted = await admission(pane, proof: fresh, target: target)
             if let refused = admitted.refusal {
-                return finish(origin == .quotaFailover && fresh.moveCommand != nil && fresh.resumeCommand != nil ? "deferred" : "refused", refused, fresh)
+                return finish(origin == .quotaFailover && fresh.moveCommand != nil && fresh.resumeCommand != nil ? "deferred" : "refused",
+                              refused.blocker, fresh, refused.code)
             }
             if origin == .quotaFailover && !admitted.prompt.empty {
                 return finish("deferred", "A draft appeared during the automatic move; nothing was sent.", fresh)
@@ -730,10 +761,12 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
     }
 
     private func admission(_ pane: PaneModel, proof: RelayAgentMaintenanceProbe,
-                           target: RelayAgentAccount) async -> (refusal: String?, prompt: PromptState) {
+                           target: RelayAgentAccount) async -> (refusal: RelayPaneOperationRefusal?, prompt: PromptState) {
         let prompt = await readPrompt(pane, proof)
-        if prompt.delivering { return ("Waiting for the current prompt delivery to finish; nothing was sent.", prompt) }
-        return (RelayAgentAccountMovePolicy.refusal(proof, paneID: pane.id, target: target,
+        if prompt.delivering {
+            return (.init(.operationInProgress, "Waiting for the current prompt delivery to finish; nothing was sent."), prompt)
+        }
+        return (RelayAgentAccountMovePolicy.refusalReason(proof, paneID: pane.id, target: target,
             emptyPrompt: prompt.empty, hasDraft: false, typedDraft: !prompt.empty && prompt.typed,
             pendingApprovals: pane.pendingAgentApprovals, inputAge: Date().timeIntervalSince(pane.agentLastInputAt),
             promptBlocker: prompt.empty ? nil : prompt.blocker), prompt)

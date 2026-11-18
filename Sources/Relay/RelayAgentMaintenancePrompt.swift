@@ -125,11 +125,16 @@ enum RelayAgentMaintenancePrompt {
                 // The entire prompt and the recognized footer remain required.
             }
         }
-        let footer = prompt.rows.dropFirst(prompt.footer).map {
+        var footer = prompt.rows.dropFirst(prompt.footer).map {
             String(String.UnicodeScalarView($0.map(\.character))).trimmingCharacters(in: .whitespaces)
         }.filter { !$0.isEmpty && !(provider == "codex" && explainedAgents == allWorkExplained && codexBackgroundRow($0)) }
         if provider == "claude", footer.contains(where: { busy($0, explainedAgents: explainedAgents) }) { return false }
         if provider == "codex" {
+            // An active /goal continues the thread on its own, so a goal still
+            // being pursued is never an idle prompt; a settled goal's status
+            // row is history and does not hold the composer.
+            if footer.contains(where: codexGoalPursuing) { return false }
+            footer.removeAll(where: codexGoalSettledRow)
             // The status line's items are user-configured: it opens with the
             // model and may omit the context segment ("GPT-6.1 Terra high ·
             // ~/cwd · thread title"). At most two status-line rows may name the context.
@@ -267,6 +272,56 @@ enum RelayAgentMaintenancePrompt {
             clean[2] == "3. Switch to usage credits"
     }
 
+    /// Codex 0.170's /goal status ("Pursuing goal (12m)"): the thread has an
+    /// active goal, which Codex continues without new input.
+    static func codexGoalPursuing(_ value: String) -> Bool {
+        value.range(of: #"(?:^|· |  )Pursuing goal \("#, options: .regularExpression) != nil
+    }
+
+    /// A /goal state that does not continue the thread by itself: stalled
+    /// (captured, 9cc78978) or achieved/unmet (from the 0.170.0 binary).
+    private static let codexSettledGoal = #"Goal (?:stalled \(/goal resume\)|(?:achieved|unmet) \([^)]*\))"#
+
+    /// A whole footer row reporting a settled /goal ("Goal achieved (1h 2m)",
+    /// "Goal unmet (40m)"), optionally followed by " · " segments.
+    static func codexGoalSettledRow(_ value: String) -> Bool {
+        value.range(of: "^" + codexSettledGoal + #"(?: · .+)?$"#, options: .regularExpression) != nil
+    }
+
+    /// Informational /goal state of an idle Codex footer: "goal_stalled" when
+    /// the goal waits for /goal resume (a restart keeps it stalled), else nil.
+    static func codexGoalNote(_ vt: String?) -> String? {
+        guard let vt, let prompt = prompt(vt, provider: "codex") else { return nil }
+        let stalled = prompt.rows.dropFirst(prompt.footer).contains {
+            String(String.UnicodeScalarView($0.map(\.character))).contains("Goal stalled (/goal resume)")
+        }
+        return stalled ? RelayPaneOperationRefusal.Code.goalStalled.rawValue : nil
+    }
+
+    /// Codex's folder-trust dialog ("Trust this folder?" with "Trust and
+    /// continue"), which a relaunch in an untrusted folder stops at. Relay
+    /// never answers it.
+    static func isCodexFolderTrustDialog(_ text: String?) -> Bool {
+        guard let text else { return false }
+        return text.contains("Trust this folder?") && text.contains("Trust and continue")
+    }
+
+    static let folderTrustBlocker = "Codex is showing its folder-trust dialog (Trust this folder?)"
+
+    /// The prompt blocker for a pane whose Codex footer shows an active goal.
+    static func codexGoalBlocker(_ vt: String?) -> String? {
+        guard let vt, let prompt = prompt(vt, provider: "codex") else { return nil }
+        let row = prompt.rows.dropFirst(prompt.footer).map {
+            String(String.UnicodeScalarView($0.map(\.character))).trimmingCharacters(in: .whitespaces)
+        }.first(where: codexGoalPursuing)
+        return row.map { goalBlockerPrefix + " (" + String($0.prefix(80)) + "); it continues the thread without new input" }
+    }
+
+    static let goalBlockerPrefix = "a Codex /goal is still being pursued"
+
+    /// Whether a prompt blocker is the active-goal one.
+    static func isGoalBlocker(_ blocker: String) -> Bool { blocker.hasPrefix(goalBlockerPrefix) }
+
     /// The idle composer's hint row. After one Esc on an empty composer,
     /// Codex offers to edit the previous message; the composer is still empty
     /// and nothing runs. Any other hint ("ctrl + c again to quit", queueing)
@@ -281,8 +336,13 @@ enum RelayAgentMaintenancePrompt {
         let segments = value.components(separatedBy: "  ")
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         guard (1...2).contains(segments.count), segments[0] == "← for agents · ? for shortcuts" else { return false }
+        // Codex 0.170 puts a settled /goal state before the warnings on the
+        // same right-aligned segment: "Goal stalled (/goal resume) · ⚠ 2
+        // warnings · f2 to view" (9cc78978, 2026-11-18). A stalled goal waits
+        // for /goal resume, so the composer is idle.
         return segments.dropFirst().allSatisfy {
-            $0.range(of: #"^⚠ [0-9]+ warnings? · f2 to view$"#, options: .regularExpression) != nil
+            $0.range(of: #"^(?:"# + codexSettledGoal + #"(?: · |$))?(?:⚠ [0-9]+ warnings? · f2 to view)?$"#,
+                     options: .regularExpression) != nil && !$0.isEmpty
         }
     }
 

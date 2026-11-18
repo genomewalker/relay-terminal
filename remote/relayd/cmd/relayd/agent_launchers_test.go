@@ -15,9 +15,26 @@ import (
 func runMainHelper(t *testing.T, test string, arguments []string, environment ...string) ([]byte, error) {
 	t.Helper()
 	command := exec.Command(os.Args[0], "-test.run=^"+test+"$")
-	command.Env = append(os.Environ(), environment...)
+	command.Env = append(hermeticEnvironment(), environment...)
 	command.Env = append(command.Env, "RELAY_MAIN_TEST_HELPER=1", "RELAY_MAIN_TEST_ARGS="+strings.Join(arguments, "\x1f"))
 	return command.CombinedOutput()
+}
+
+// hermeticEnvironment is the test process's environment without the agent
+// account selectors a developer's shell may export (for example
+// CLAUDE_CONFIG_DIR=~/.claude-max), so a helper never inherits a real account.
+// A test that needs one passes it explicitly.
+func hermeticEnvironment() []string {
+	var kept []string
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		switch name {
+		case "CLAUDE_CONFIG_DIR", "CODEX_HOME":
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept
 }
 
 func mainHelper() bool {

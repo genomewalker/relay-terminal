@@ -255,6 +255,11 @@ import Combine
                 guard proof.valid(for: candidate.id), proof.provider == "claude", let dir = proof.configDir,
                       let label = directory.label(for: candidate.profile, provider: "claude", observedDirectory: dir),
                       let session = proof.sessionID else { try audit(candidate.id, "deferred_native_identity"); continue }
+                // A protected pane is never exited automatically, by quota
+                // failover either; it is reported and left running.
+                if Self.protected(candidate.id, list: RelayPreferences.shared.maintenanceProtectedPanes) {
+                    try audit(candidate.id, "deferred_protected"); continue
+                }
                 let mover = RelayAgentAccountMove.shared
                 if RelayAgentMaintenancePolicy.idleEvidence(proof, emptyPrompt: true, hasDraft: false),
                    !(await Self.ensureReadable(candidate, in: workspace, mover: mover)) {
@@ -294,6 +299,9 @@ import Combine
                 // checked again. There is never a task per pane.
             }
         }
+    }
+    nonisolated static func protected(_ pane: UUID, list: [String]) -> Bool {
+        list.contains(pane.uuidString.lowercased())
     }
     /// Observation only. An unopened pane must first produce a complete
     /// native screen; no prompt input is sent and a user's new selection wins.

@@ -43,7 +43,7 @@ extension WorkspaceModel {
         case .move:
             Task {
                 let outcome = await RelayAgentAccountMove.shared.move(pane, in: self, to: account, origin: .user, inputGranted: true)
-                if outcome.state != "verified" { operationError = outcome.message }
+                if outcome.state != "verified" { operationError = outcome.displayMessage }
             }
         case .forceReview:
             // The view handler presents a user-owned review sheet. There is

@@ -519,6 +519,12 @@ struct RelaySidePanelHTTPResponse: Sendable {
         return Self(status: status, reason: reason, contentType: "application/json; charset=utf-8", body: data)
     }
 
+    /// A refused pane operation: {status: refused, reason_code, blocker,
+    /// how_to_clear}. The MCP bridge passes this body into the tool result.
+    static func refusal(_ refusal: RelayPaneOperationRefusal, status: Int = 409) -> Self {
+        json(refusal.fields.merging(["status": "refused"]) { $1 }, status: status, reason: reasonPhrase(for: status))
+    }
+
     static func desktopDiscoveryFailure(_ error: Error) -> Self {
         .text(DesktopPeerRoute.discoveryMessage(error), status: 503, reason: "Service Unavailable")
     }
@@ -1621,40 +1627,40 @@ final class RelaySidePanelServer: ObservableObject {
         }
         if request.method == "POST", request.path == "/api/agent-accounts/move" {
             guard mcpWorkspaceGrant.permits(.input) else {
-                return .text("Moving a pane to another account requires the terminal input grant", status: 403, reason: "Forbidden")
+                return .refusal(.init(.notAuthorized, "Moving a pane to another account requires the terminal input grant"), status: 403)
             }
             guard let input = try? JSONDecoder().decode(MCPMovePaneAccountRequest.self, from: request.body),
                   input.instance == agentInputRequests.instance, RelayAgentAccount.validLabel(input.account) else {
-                return .text("Invalid or stale account move request", status: 400, reason: "Bad Request")
+                return .refusal(.init(.invalidRequest, "Invalid or stale account move request"), status: 400)
             }
             switch accountMoveReceipts.lookup(input) {
             case .replay(let result): return .json(result)
-            case .conflict: return .text("Conflicting account move request ID", status: 409, reason: "Conflict")
+            case .conflict: return .refusal(.init(.invalidRequest, "Conflicting account move request ID"))
             case .expired: return .json(["status": "expired", "message": RelayAccountMoveReceipts.expiredMessage])
             case .new: break
             }
             guard let pane = workspace.panes[input.paneID],
                   let provider = RelayAgentAccountMovePolicy.movableProvider(pane.kind) else {
-                return .text("The pane does not run a Claude or Codex agent", status: 409, reason: "Conflict")
+                return .refusal(.init(.unsupportedPane, "The pane does not run a Claude or Codex agent"))
             }
             guard let target = RelayAgentAccountDirectory.shared.account(for: pane.profile, provider: provider, label: input.account) else {
-                return .text("There is no \(provider) account named \(input.account) on the pane's host", status: 409, reason: "Conflict")
+                return .refusal(.init(.targetAccountUnavailable, "There is no \(provider) account named \(input.account) on the pane's host",
+                                      howToClear: "Use an account label from relay_list_panes for this provider and host, or add the account in Settings > Accounts."))
             }
             let requestID = input.requestID
             let base = ["paneID": input.paneID.uuidString.lowercased(), "account": target.label]
             guard accountMoveReceipts.begin(input, result: base.merging(["status": "moving"]) { $1 }, now: Date()) else {
                 if accountMoveReceipts.usedCeilingReached {
-                    return .text(RelayAccountMoveReceipts.usedCeilingMessage, status: 409, reason: "Conflict")
+                    return .refusal(.init(.operationInProgress, RelayAccountMoveReceipts.usedCeilingMessage))
                 }
-                return .text("Account move receipt limit reached: \(accountMoveReceipts.inProgress) moves are still in progress",
-                             status: 409, reason: "Conflict")
+                return .refusal(.init(.operationInProgress,
+                                      "Account move receipt limit reached: \(accountMoveReceipts.inProgress) moves are still in progress"))
             }
             let targetWorkspace = workspace
             Task { @MainActor [weak self] in
                 let outcome = await RelayAgentAccountMove.shared.move(pane, in: targetWorkspace, to: target, origin: .mcp,
                     inputGranted: self?.mcpWorkspaceGrant.permits(.input) == true, force: input.force == true)
-                self?.accountMoveReceipts.finish(requestID, result: base.merging(["status": outcome.state, "message": outcome.message]) { $1 },
-                                                 now: Date())
+                self?.accountMoveReceipts.finish(requestID, result: base.merging(outcome.fields) { $1 }, now: Date())
             }
             // The MCP client waits up to a minute; a longer move is reported
             // as still moving and read back with the same request_id.
@@ -1665,7 +1671,7 @@ final class RelaySidePanelServer: ObservableObject {
         }
         if request.method == "POST", request.path == "/api/recovery/attach" {
             guard recoveryGrant().permits(.create) else {
-                return .text("MCP pane recovery requires the create capability", status: 403, reason: "Forbidden")
+                return .refusal(.init(.notAuthorized, "MCP pane recovery requires the create capability"), status: 403)
             }
             guard let input = try? JSONDecoder().decode(MCPRecoverPaneRequest.self, from: request.body),
                   input.instance == agentInputRequests.instance else {
@@ -1677,9 +1683,9 @@ final class RelaySidePanelServer: ObservableObject {
             case .pending:
                 return .json(["status": "pending", "paneID": input.paneID.uuidString.lowercased()])
             case .conflict:
-                return .text("Conflicting recovery request ID", status: 409, reason: "Conflict")
+                return .refusal(.init(.invalidRequest, "Conflicting recovery request ID"))
             case .full:
-                return .text("Recovery receipt limit reached", status: 409, reason: "Conflict")
+                return .refusal(.init(.operationInProgress, "Recovery receipt limit reached"))
             case .started:
                 break
             }
@@ -1690,7 +1696,8 @@ final class RelaySidePanelServer: ObservableObject {
             let profile: ConnectionProfile
             if let capturedProfile {
                 guard let pinned = RelayPaneRecoveryProfile.captured(capturedProfile, requestedHost: input.host) else {
-                    return .text("The saved pane's host or backend does not match", status: 409, reason: "Conflict")
+                    return .refusal(.init(.invalidRequest, "The saved pane's host or backend does not match",
+                        howToClear: "Pass the host the pane runs on, as relay_list_panes or relay_list_managed_panes names it."))
                 }
                 profile = pinned
             } else {
@@ -1705,12 +1712,12 @@ final class RelaySidePanelServer: ObservableObject {
                         grant: recoveryGrant(), callers: callerControl, caller: caller) },
                     load: { try await recoveryLoad(profile) }) { catalog in
                     guard let pane = catalog.panes.first(where: { $0.paneID.lowercased() == input.paneID.uuidString.lowercased() && $0.recoverable }) else {
-                        return .text("Pane is no longer recoverable on this host", status: 409, reason: "Conflict")
+                        return .refusal(.init(.notRecoverable, "Pane is no longer recoverable on this host"))
                     }
                     let session = catalog.sessions.first(where: { $0.panes.contains(where: { $0.paneID == pane.paneID }) })
                     guard recoveryAttach(workspace, profile: profile,
                         pane: pane, label: session?.label ?? profile.name) else {
-                        return .text("Pane recovery target does not match its existing host", status: 409, reason: "Conflict")
+                        return .refusal(.init(.paneChanged, "Pane recovery target does not match its existing host"))
                     }
                     let result = ["status": "attached", "host": input.host,
                         "paneID": input.paneID.uuidString.lowercased(),
@@ -1725,16 +1732,16 @@ final class RelaySidePanelServer: ObservableObject {
                     return .json(result)
                 }
             } catch is RelayPaneRecoveryCapture.Changed {
-                return .text("The pane changed during recovery", status: 409, reason: "Conflict")
+                return .refusal(.init(.paneChanged, "The pane changed during recovery"))
             } catch is RelayPaneRecoveryCapture.Revoked {
-                return .text("MCP pane recovery permission or caller access was revoked", status: 403, reason: "Forbidden")
+                return .refusal(.init(.notAuthorized, "MCP pane recovery permission or caller access was revoked"), status: 403)
             } catch {
                 return .text("Could not recover pane: \(error.localizedDescription)", status: 502, reason: "Bad Gateway")
             }
         }
         if request.method == "POST", request.path == "/api/recovery/terminate" {
             guard mcpWorkspaceGrant.permits(.terminate) else {
-                return .text("MCP process termination is not granted", status: 403, reason: "Forbidden")
+                return .refusal(.init(.notAuthorized, "MCP process termination is not granted"), status: 403)
             }
             guard let input = try? JSONDecoder().decode(MCPTerminatePaneRequest.self, from: request.body),
                   input.instance == agentInputRequests.instance,
@@ -1743,12 +1750,12 @@ final class RelaySidePanelServer: ObservableObject {
             }
             if let prior = directTerminationRequests[input.requestID] {
                 guard prior == input, let result = directTerminationResults[input.requestID] else {
-                    return .text("Conflicting termination request ID", status: 409, reason: "Conflict")
+                    return .refusal(.init(.invalidRequest, "Conflicting termination request ID"))
                 }
                 return .json(result)
             }
             guard directTerminationRequests.count < 256 else {
-                return .text("Termination receipt limit reached", status: 409, reason: "Conflict")
+                return .refusal(.init(.operationInProgress, "Termination receipt limit reached"))
             }
             do {
                 let catalog = try await RemoteCatalogService.load(profile: profile)
@@ -1756,7 +1763,7 @@ final class RelaySidePanelServer: ObservableObject {
                     $0.paneID.lowercased() == input.paneID.uuidString.lowercased() &&
                     $0.recoverable && $0.state == "running" && $0.contentKind == "terminal"
                 }) else {
-                    return .text("Pane is no longer a running Relay terminal on this host", status: 409, reason: "Conflict")
+                    return .refusal(.init(.notRecoverable, "Pane is no longer a running Relay terminal on this host"))
                 }
                 let attached = workspace.panes[input.paneID] != nil
                 try await RemotePaneControlService.terminate(profile: profile, paneID: input.paneID)
@@ -2155,7 +2162,7 @@ final class RelaySidePanelServer: ObservableObject {
                 }
                 input = nested
                 if ["process_signal", "account_force_commit"].contains(input["operation"] as? String ?? ""), !mcpWorkspaceGrant.permits(.terminate) {
-                    return .text("MCP process termination is not granted", status: 403, reason: "Forbidden")
+                    return .refusal(.init(.notAuthorized, "MCP process termination is not granted"), status: 403)
                 }
                 // Capture an unambiguous workspace owner before execution, even
                 // if the response is lost. Host-only jobs have no pane attribution.
@@ -2232,7 +2239,7 @@ final class RelaySidePanelServer: ObservableObject {
                 return .text("Exact configured host and valid operation required", status: 400, reason: "Bad Request")
             }
             if ["process_signal", "account_force_commit"].contains(operation), !mcpWorkspaceGrant.permits(.terminate) {
-                return .text("MCP process termination is not granted", status: 403, reason: "Forbidden")
+                return .refusal(.init(.notAuthorized, "MCP process termination is not granted"), status: 403)
             }
             guard operation == "status" || mcpWorkspaceGrant.permits(.input) else {
                 return .text("MCP terminal input is not granted", status: 403, reason: "Forbidden")
@@ -2642,11 +2649,15 @@ final class RelaySidePanelServer: ObservableObject {
             shellRecoveryResults[input.requestID] = result
             return .json(result)
         case ("POST", "codex-resume"):
-            guard mcpWorkspaceGrant.permits(.input), let caller,
-                  let input = try? JSONDecoder().decode(RelayCodexPaneResumeRequest.self, from: request.body),
-                  input.instance == agentInputRequests.instance,
-                  let pane = workspace.panes[paneID] else {
-                return .text("Invalid resume target, instance or input grant", status: 409, reason: "Conflict")
+            guard mcpWorkspaceGrant.permits(.input), caller != nil else {
+                return .refusal(.init(.notAuthorized, "Same-pane resume requires the terminal input grant and a registered caller"))
+            }
+            guard let caller, let input = try? JSONDecoder().decode(RelayCodexPaneResumeRequest.self, from: request.body),
+                  input.instance == agentInputRequests.instance else {
+                return .refusal(.init(.invalidRequest, "Invalid resume request or stale instance"))
+            }
+            guard let pane = workspace.panes[paneID] else {
+                return .refusal(.init(.notRecoverable, "The pane is not open in this Relay window"))
             }
             do {
                 let receipt = try RelayCodexPaneResume.shared.start(input, pane: pane, workspace: workspace) { [weak self, weak workspace, weak pane] in
@@ -2654,6 +2665,8 @@ final class RelaySidePanelServer: ObservableObject {
                     return self.mcpWorkspaceGrant.permits(.input) && self.callerControl.permitted(caller) && workspace.panes[paneID] === pane
                 }
                 return try .jsonObject(receipt.object())
+            } catch let refusal as RelayPaneOperationRefusal {
+                return .refusal(refusal)
             } catch { return .text(error.localizedDescription, status: 409, reason: "Conflict") }
         case ("POST", "codex-resume-receipt"):
             guard let body = try? JSONSerialization.jsonObject(with: request.body) as? [String: String],
@@ -2813,7 +2826,8 @@ final class RelaySidePanelServer: ObservableObject {
                     }
                     let facts = RelayPaneHealthFacts.read(pane, proof: proof)
                     if proof.valid(for: paneID), RelayAgentMaintenancePolicy.installedImageVerified(proof) {
-                        result = .object(["state": .string("already_current"), "pane": facts.value])
+                        result = .object(["state": .string("already_current"), "pane": facts.value]
+                            .merging(RelayAgentMaintenancePolicy.updateVersionFields(before: proof, after: proof)) { $1 })
                     } else if !facts.allowedActions.contains("apply_update") || RelayPreferences.shared.shepherd.enabled {
                         result = .object(["state": .string("held"), "message": .string("Fresh native evidence or the active coordinator holds this update."), "pane": facts.value])
                     } else {
@@ -2826,11 +2840,16 @@ final class RelaySidePanelServer: ObservableObject {
                             if workspace.panes[paneID] === pane, pane.profile == profile,
                                RelayInstalledUpdatePostcondition.verified(before: proof, after: after, pane: paneID) {
                                 result = .object(["state": .string("verified"),
-                                    "pane": RelayPaneHealthFacts.read(pane, proof: after).value])
+                                    "pane": RelayPaneHealthFacts.read(pane, proof: after).value]
+                                    .merging(RelayAgentMaintenancePolicy.updateVersionFields(before: proof, after: after)) { $1 })
                             } else {
                                 result = .object(["state": .string("verification_unknown"),
                                     "message": .string("The original conversation and current installed image could not both be verified; no retry was submitted.")])
                             }
+                        } else if case .object(var fields) = native, let hold = RelayAgentMaintenance.shared.holds[paneID] {
+                            // A held update names its reason code and how to clear it.
+                            for (key, value) in hold.fields { fields[key] = .string(value) }
+                            result = .object(fields)
                         } else { result = native }
                     }
                 } catch {

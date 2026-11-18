@@ -33,6 +33,8 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
     var backgroundAgentJobs: Int? = nil
     var resumeCommand: String? = nil
     var resumeError: String? = nil
+    /// relayd's reason code for resumeError (absent from an older relayd).
+    var resumeErrorCode: String? = nil
     /// The running agent's provider account directory: "" for the provider
     /// default, "~/name" below the host home, else absolute.
     var configDir: String? = nil
@@ -43,8 +45,12 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
     /// or why the target cannot resume this conversation.
     var moveCommand: String? = nil
     var moveError: String? = nil
+    var moveErrorCode: String? = nil
     /// Codex: the ChatGPT login in the running agent's folder and its pin.
     var login: RelayAgentLoginObservation? = nil
+    /// Codex: how the pane's account config.toml trusts the conversation's
+    /// directory for a relaunch (relayd's codex_trust).
+    var codexTrust: RelayCodexTrustObservation? = nil
     var unavailable: String? = nil
     var worker: RelayPaneWorkerObservation? = nil
     var context: RelayPaneContextObservation? = nil
@@ -58,7 +64,7 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
         case version, provider, bound, lifecycle, revision, owner, unavailable
         case paneID = "paneId", processID = "processId", processStart, sessionID = "sessionId"
         case installedUpdate, installedImageCurrent, runningVersion, installedVersion, outdatedOtherInstall
-        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, worker, context, configDir, accountMatches, moveCommand, moveError, login
+        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, resumeErrorCode, worker, context, configDir, accountMatches, moveCommand, moveError, moveErrorCode, login, codexTrust
     }
 
     /// Native image versions on the pane's host; nil when either is unverified.
@@ -235,11 +241,95 @@ enum RelayAgentMaintenancePolicy {
         return proof.lifecycle != "quiet"
     }
 
+    /// An update result's old → new versions, from the native probes before
+    /// and after the restart (never the assumed installed version).
+    static func updateVersionFields(before: RelayAgentMaintenanceProbe, after: RelayAgentMaintenanceProbe)
+        -> [String: RelayPaneHealthJSON] {
+        let old = before.runningVersion ?? "unknown", new = after.runningVersion ?? "unknown"
+        return ["from_version": .string(old), "to_version": .string(new), "version_transition": .string(old + " → " + new)]
+    }
+
+    /// Whether a Codex at `version` ("0.170.0") is at least `minimum`.
+    static func codexVersion(_ version: String?, atLeast minimum: [Int]) -> Bool {
+        guard let version else { return false }
+        let parts = version.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+        for (index, wanted) in minimum.enumerated() {
+            let have = index < parts.count ? parts[index] : 0
+            if have != wanted { return have > wanted }
+        }
+        return true
+    }
+
+    /// Case 10 (7b68ee70): a Codex relaunch that would stop at its
+    /// folder-trust dialog is held before any input, so the old process keeps
+    /// running. 0.170.0 stopped for a non-git folder trusted only through its
+    /// parent (inferred from one case, not confirmed in Codex's source). Nil
+    /// otherwise; a dialog that still appears is caught after the launch.
+    static func codexTrustHold(_ proof: RelayAgentMaintenanceProbe, reason: Reason) -> RelayPaneOperationRefusal? {
+        guard proof.provider == "codex", let trust = proof.codexTrust else { return nil }
+        let target = proof.installedVersion ?? proof.runningVersion
+        // Only the observed case is held before exit; other states are left
+        // to the post-launch dialog check rather than held on a guess.
+        let stops = trust.status == "parent_only" && codexVersion(target, atLeast: [0, 170, 0])
+        guard stops else { return nil }
+        let what = reason == .update ? "Update " + (proof.versionTransition ?? "installed") + " available" : "Restart needed"
+        return .init(.trustPrompt, what + ", held: Codex folder trust required for " + trust.cwd)
+    }
+
+    /// Lowercase, unique, sorted pane UUIDs, at most 256; nil when any is invalid.
+    static func validProtectedPanes(_ ids: [String]) -> [String]? {
+        guard ids.count <= 256 else { return nil }
+        var result = Set<String>()
+        for id in ids {
+            guard let uuid = UUID(uuidString: id) else { return nil }
+            result.insert(uuid.uuidString.lowercased())
+        }
+        return result.sorted()
+    }
+
+    /// The agent_maintenance_protected_panes setting: exactly {"panes": [UUID]}.
+    static func protectedPanes(_ data: Data) throws -> [String] {
+        struct Value: Decodable { let panes: [String] }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], object.keys.sorted() == ["panes"],
+              let value = try? JSONDecoder().decode(Value.self, from: data),
+              let panes = validProtectedPanes(value.panes) else {
+            throw RelaySettingsPolicy.ControlError.invalid("agent_maintenance_protected_panes needs {\"panes\": [pane UUIDs]}, at most 256")
+        }
+        return panes
+    }
+
+    /// Why maintenance holds an automatic restart before any input: a
+    /// protected pane is never restarted on its own, and paused update
+    /// restarts hold updates only (binding repairs and health checks go on).
+    static func automaticRestartHold(reason: Reason, paneID: UUID, paused: Bool, protected: [String],
+                                     transition: String?) -> RelayPaneOperationRefusal? {
+        let what = reason == .update ? "Update " + (transition ?? "installed") + " available" : "Binding repair needed"
+        if protected.contains(paneID.uuidString.lowercased()) {
+            return .init(.protectedPane, what + ", held: protected")
+        }
+        if reason == .update, paused { return .init(.updatesPaused, what + ", held: update restarts are paused") }
+        return nil
+    }
+
     static func deferral(_ proof: RelayAgentMaintenanceProbe, paneID: UUID,
         emptyPrompt: Bool, hasDraft: Bool, pendingApprovals: Int, inputAge: TimeInterval,
         preservingDraft: Bool = false, recordedAccount: RelayAgentAccount? = nil,
         promptBlocker: String? = nil, requiresResume: Bool = true) -> String? {
-        guard proof.valid(for: paneID) else { return proof.unavailable ?? "Native identity is unavailable" }
+        deferralReason(proof, paneID: paneID, emptyPrompt: emptyPrompt, hasDraft: hasDraft, pendingApprovals: pendingApprovals,
+            inputAge: inputAge, preservingDraft: preservingDraft, recordedAccount: recordedAccount,
+            promptBlocker: promptBlocker, requiresResume: requiresResume)?.blocker
+    }
+
+    /// `deferral` with its reason code and how to clear it; the blocker is
+    /// exactly the text `deferral` returns.
+    static func deferralReason(_ proof: RelayAgentMaintenanceProbe, paneID: UUID,
+        emptyPrompt: Bool, hasDraft: Bool, pendingApprovals: Int, inputAge: TimeInterval,
+        preservingDraft: Bool = false, recordedAccount: RelayAgentAccount? = nil,
+        promptBlocker: String? = nil, requiresResume: Bool = true) -> RelayPaneOperationRefusal? {
+        typealias Refusal = RelayPaneOperationRefusal
+        guard proof.valid(for: paneID) else {
+            return Refusal(.identityUnavailable, proof.unavailable ?? "Native identity is unavailable")
+        }
         // The account is part of the agent's identity. A restart would resume
         // in the running agent's own account, so a difference from the
         // account the pane was started in is reported and never acted on.
@@ -247,37 +337,42 @@ enum RelayAgentMaintenancePolicy {
            !(proof.accountMatches ?? recordedAccount.matches(observedDirectory: observed)) {
             let reason = recordedAccount.explicitClaudeDefault(observedDirectory: observed)
                 ? " (explicit ~/.claude uses a different .claude.json)" : ""
-            return "Held: the running agent uses a different \(recordedAccount.provider) account than this pane's " +
-                "\(recordedAccount.label) account\(reason); Relay will not restart or switch it"
+            return Refusal(.accountMismatch, "Held: the running agent uses a different \(recordedAccount.provider) account than this pane's " +
+                "\(recordedAccount.label) account\(reason); Relay will not restart or switch it")
         }
-        guard pendingApprovals == 0 else { return "Waiting for the pending approval" }
-        guard preservingDraft || !hasDraft else { return "Waiting for the unsent prompt to be cleared or sent" }
+        guard pendingApprovals == 0 else { return Refusal(.approvalPending, "Waiting for the pending approval") }
+        guard preservingDraft || !hasDraft else { return Refusal(.draftPresent, "Waiting for the unsent prompt to be cleared or sent") }
         if !proof.forcedByUser && proof.backgroundWork == true {
-            return "Waiting for the agent's background shells or agent processes to finish"
+            return Refusal(.backgroundWork, "Waiting for the agent's background shells or agent processes to finish")
         }
         if !proof.forcedByUser && proof.provider == "claude" && proof.backgroundWork == nil {
-            return "Waiting for background work to be verified absent: the native process check is unavailable"
+            return Refusal(.backgroundWork, "Waiting for background work to be verified absent: the native process check is unavailable")
         }
         // Lifecycle evidence of a running subagent holds on its own, whatever
         // the screen shows: a footer can be stale, clipped or absent.
         if !proof.forcedByUser && proof.provider == "claude" && proof.subagentWork == true {
-            return "Waiting for the session's subagents to finish: Claude's lifecycle records show one still running"
+            return Refusal(.subagentWork, "Waiting for the session's subagents to finish: Claude's lifecycle records show one still running")
         }
         guard preservingDraft || emptyPrompt else {
-            return "Waiting for the original prompt to be confirmed empty" + (promptBlocker.map { ": " + $0 } ?? "")
+            let blocker = "Waiting for the original prompt to be confirmed empty" + (promptBlocker.map { ": " + $0 } ?? "")
+            let goal = promptBlocker.map(RelayAgentMaintenancePrompt.isGoalBlocker) ?? false
+            let trust = promptBlocker == RelayAgentMaintenancePrompt.folderTrustBlocker
+            return Refusal(goal ? .goalActive : trust ? .trustPrompt : .promptUnverified, blocker)
         }
         // A current, process-start-matched Claude harness observation can
         // supersede a transcript's cached active phase (for example after
         // "Claude session ended"). CPU usage and summary text are not proof.
         // An explicitly busy harness overrides even a quiet transcript.
         guard idleEvidence(proof, emptyPrompt: emptyPrompt, hasDraft: hasDraft) else {
-            if proof.forcedByUser { return "The agent's turn did not stop after Relay's interrupt" }
-            return proof.lifecycle == "settling" ? "Waiting for the conversation transcript to stop changing"
-                : "Waiting for the current turn to finish"
+            if proof.forcedByUser { return Refusal(.turnActive, "The agent's turn did not stop after Relay's interrupt") }
+            return proof.lifecycle == "settling" ? Refusal(.transcriptSettling, "Waiting for the conversation transcript to stop changing")
+                : Refusal(.turnActive, "Waiting for the current turn to finish")
         }
-        guard inputAge >= 15 else { return "Waiting until you finish typing" }
+        guard inputAge >= 15 else { return Refusal(.userTyping, "Waiting until you finish typing") }
         if requiresResume, proof.resumeCommand == nil {
-            return proof.resumeError ?? "The exact agent resume command is unavailable"
+            let code = proof.resumeErrorCode.flatMap(Refusal.Code.init(rawValue:)) ??
+                (proof.resumeError.map(Refusal.classify) ?? .resumeUnavailable)
+            return Refusal(code, proof.resumeError ?? "The exact agent resume command is unavailable")
         }
         return nil
     }
@@ -733,6 +828,9 @@ enum RelayAgentMaintenanceRestartAdmission {
 @MainActor final class RelayAgentMaintenance: ObservableObject {
     static let shared = RelayAgentMaintenance()
     @Published private(set) var statuses: [UUID: String] = [:]
+    /// Panes whose automatic restart is held by the operator (protected or
+    /// paused update restarts), with the reason code.
+    @Published private(set) var holds: [UUID: RelayPaneOperationRefusal] = [:]
     private let journal = RelayAgentMaintenanceJournal()
     private let drafts = RelayAgentMaintenanceDraftStore()
     private var lastChecked: [UUID: Date] = [:]
@@ -791,14 +889,59 @@ enum RelayAgentMaintenanceRestartAdmission {
         let recentActions: [RelayAgentMaintenanceJournal.Entry]
         let haiku: RelayPaneHealthCoordinator.Snapshot
         var agents: [String: AgentVersion] = [:]
+        var updateRestartsPaused = false
+        var protectedPanes: [String] = []
+        /// Held automatic restarts by pane: reason_code, blocker, how_to_clear.
+        var holds: [String: [String: String]] = [:]
+        /// Journal entries left out of recentActions; the journal keeps them.
+        var omittedActions = 0
+    }
+
+    /// The caller-audit record of one automatic restart step (caller
+    /// "agent-maintenance"); the request ID is the journal action ID.
+    static func auditRecord(action: String, paneID: UUID, reason: RelayAgentMaintenancePolicy.Reason, outcome: String,
+                            detail: String?, at: Date = Date()) -> RelayCallerControl.Audit {
+        var record = RelayCallerControl.Audit(id: UUID(), at: at, caller: RelayCallerControl.maintenanceCaller,
+            path: "in-process/agent-maintenance", operation: "agent_maintenance." + reason.rawValue + "_restart",
+            requestID: String(action.prefix(128)), tabID: nil, paneID: paneID.uuidString.lowercased(), jobID: nil,
+            outcome: String(outcome.prefix(64)))
+        record.preview = detail.map { String($0.prefix(240)) }
+        return record
+    }
+
+    /// Audits one step; `required` fails the step when the audit cannot be written.
+    private func audit(_ action: String, pane: UUID, reason: RelayAgentMaintenancePolicy.Reason, _ outcome: String, _ detail: String? = nil,
+                       required: Bool = false) throws {
+        let record = Self.auditRecord(action: action, paneID: pane, reason: reason, outcome: outcome, detail: detail)
+        do { try auditSink(record) } catch { if required { throw error } }
+    }
+    var auditSink: @MainActor (RelayCallerControl.Audit) throws -> Void = { try RelayCallerControl.shared.recordMaintenanceAction($0) }
+
+    /// Every action of the last 24 hours and every unsettled one, newest
+    /// first, up to `limit`; the count left out is reported, never dropped
+    /// silently (af242052 fell off a fixed 16-entry list).
+    static func recentActions(_ entries: [RelayAgentMaintenanceJournal.Entry], now: Date = Date(), limit: Int = 128)
+        -> (entries: [RelayAgentMaintenanceJournal.Entry], omitted: Int) {
+        let sorted = entries.sorted { $0.createdAt > $1.createdAt }
+        let recent = sorted.enumerated().filter { index, entry in
+            index < 16 || now.timeIntervalSince(entry.createdAt) < 86_400 ||
+                !RelayAgentMaintenanceJournal.settledStates.contains(entry.state)
+        }.map(\.element)
+        let kept = Array(recent.prefix(limit))
+        return (kept, sorted.count - kept.count)
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(enabled: RelayPreferences.shared.automaticAgentMaintenance,
+        let recent = Self.recentActions(Array(journal.entries.values))
+        return Snapshot(enabled: RelayPreferences.shared.automaticAgentMaintenance,
             statuses: Dictionary(uniqueKeysWithValues: statuses.map { ($0.key.uuidString.lowercased(), $0.value) }),
-            recentActions: Array(journal.entries.values.sorted { $0.createdAt > $1.createdAt }.prefix(16)),
+            recentActions: recent.entries,
             haiku: RelayPaneHealthCoordinator.shared.snapshot(),
-            agents: RelayPaneHealthCoordinator.shared.agentVersions())
+            agents: RelayPaneHealthCoordinator.shared.agentVersions(),
+            updateRestartsPaused: RelayPreferences.shared.agentUpdateRestartsPaused,
+            protectedPanes: RelayPreferences.shared.maintenanceProtectedPanes,
+            holds: Dictionary(uniqueKeysWithValues: holds.map { ($0.key.uuidString.lowercased(), $0.value.fields) }),
+            omittedActions: recent.omitted)
     }
 
     func performHaikuTool(_ action: String, pane: PaneModel, workspace: WorkspaceModel,
@@ -958,6 +1101,40 @@ enum RelayAgentMaintenanceRestartAdmission {
             completeHaikuTool(pane, state: "already_healthy", message: "Native evidence does not require a restart.", proof: proof)
             return
         }
+        if let hold = RelayAgentMaintenancePolicy.automaticRestartHold(reason: reason, paneID: pane.id,
+            paused: RelayPreferences.shared.agentUpdateRestartsPaused,
+            protected: RelayPreferences.shared.maintenanceProtectedPanes, transition: proof.versionTransition) {
+            statuses[pane.id] = hold.blocker
+            holds[pane.id] = hold
+            completeHaikuTool(pane, state: "held", message: hold.blocker, proof: proof)
+            return
+        }
+        if let trust = RelayAgentMaintenancePolicy.codexTrustHold(proof, reason: reason) {
+            // Opt-in only: mirror the parent's existing trust for this exact
+            // folder, then restart on a later check. Never answers the dialog.
+            if RelayPreferences.shared.codexTrustMirrorParent, proof.codexTrust?.status == "parent_only",
+               let cwd = proof.codexTrust?.cwd, let parent = proof.codexTrust?.parent {
+                let command = RelayHostExecution.daemonCommand(profile: profile,
+                    arguments: ["codex-trust-like-parent", proof.configDir.flatMap { $0.isEmpty ? nil : $0 } ?? "-", cwd])
+                let result = try await RelayHostExecution.capture(profile: profile, command: command, timeout: 15, maximumBytes: 4096)
+                let note = result.exitCode == 0
+                    ? "Relay trusted " + cwd + " in the pane's Codex config.toml, mirroring the trusted parent " + parent +
+                        " (setting codex_trust_mirror_parent); the update restart follows on the next check"
+                    : "Relay could not write the trust entry for " + cwd + ": " +
+                        RelayPaneOperationRefusal.hostBlocker(stderr: result.stderr)
+                try? audit("trust:" + cwd, pane: pane.id, reason: reason, result.exitCode == 0 ? "trust_written" : "trust_write_failed", note)
+                let held = RelayPaneOperationRefusal(.trustPrompt, trust.blocker + ". " + note)
+                statuses[pane.id] = held.blocker
+                holds[pane.id] = held
+                completeHaikuTool(pane, state: "held", message: held.blocker, proof: proof)
+                return
+            }
+            statuses[pane.id] = trust.blocker
+            holds[pane.id] = trust
+            completeHaikuTool(pane, state: "held", message: trust.blocker, proof: proof)
+            return
+        }
+        holds.removeValue(forKey: pane.id)
         if await RelayCapacityManagementCoordinator.shared.shouldUseCombined(pane) {
             statuses[pane.id] = "Installed-image adoption shares the combined native lane; retirement/preservation capability unavailable. No additional maintenance restart is submitted."
             completeHaikuTool(pane, state: "held", message: statuses[pane.id]!, proof: proof)
@@ -969,11 +1146,13 @@ enum RelayAgentMaintenanceRestartAdmission {
             return
         }
         await pane.runtime.prepareAgentMaintenancePromptProof()
-        if let held = RelayAgentMaintenancePolicy.deferral(proof, paneID: pane.id,
+        if let refusal = RelayAgentMaintenancePolicy.deferralReason(proof, paneID: pane.id,
             emptyPrompt: pane.runtime.agentMaintenanceTerminalPromptIsEmpty(
                 explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents)), hasDraft: draft,
             pendingApprovals: pane.pendingAgentApprovals, inputAge: Date().timeIntervalSince(pane.agentLastInputAt),
             preservingDraft: true, recordedAccount: pane.agentAccount?.recorded) {
+            let held = refusal.blocker
+            holds[pane.id] = refusal
             statuses[pane.id] = reason == .update ? "Update " + (proof.versionTransition ?? "installed") + ": " + held : held
             completeHaikuTool(pane, state: "held", message: held, proof: proof)
             return
@@ -1033,8 +1212,13 @@ enum RelayAgentMaintenanceRestartAdmission {
             },
             preparePrompt: { await pane.runtime.prepareAgentMaintenancePromptProof() },
             claim: {
-                try self.journal.claim(pane: pane.id, host: profile.connectionKey, proof: fresh, reason: reason,
+                let id = try self.journal.claim(pane: pane.id, host: profile.connectionKey, proof: fresh, reason: reason,
                     modelOperationID: grant?.operationID, modelToolID: grant?.toolID)
+                // Durable in the caller audit before any restart input.
+                if let id {
+                    try self.audit(id, pane: pane.id, reason: reason, "admitted", fresh.versionTransition, required: true)
+                }
+                return id
             },
             saveDraft: { id, text in
                 try RelayAgentMaintenanceRestartAdmission.saveCapturedDraft(actionID: id, text: text,
@@ -1079,8 +1263,23 @@ enum RelayAgentMaintenanceRestartAdmission {
 
     private func advance(_ pane: PaneModel, workspace: WorkspaceModel, action: Pending) async throws {
         guard pane.profile == action.profile, workspace.panes[pane.id] === pane else { return }
+        // A relaunched Codex stopped at its folder-trust dialog: held with its
+        // reason, not left as verification_required. Relay never answers it.
+        if action.stage == .verify, action.proof.provider == "codex",
+           RelayAgentMaintenancePrompt.isCodexFolderTrustDialog(pane.runtime.sidePanelViewportText()) {
+            try journal.mark(action.id, "held_trust_prompt")
+            let cwd = action.proof.codexTrust?.cwd ?? "the conversation's folder"
+            let held = RelayPaneOperationRefusal(.trustPrompt, "Restart held: Codex folder trust required for " + cwd)
+            try? audit(action.id, pane: pane.id, reason: action.reason, "held_trust_prompt", cwd)
+            statuses[pane.id] = held.blocker
+            holds[pane.id] = held
+            pending.removeValue(forKey: pane.id); requested.remove(pane.id)
+            completeHaikuTool(pane, state: "held", message: held.blocker + ". " + held.howToClear)
+            return
+        }
         guard Date() < action.deadline, action.attempts < Self.pendingVerifyAttempts else {
             try journal.mark(action.id, "verification_required")
+            try? audit(action.id, pane: pane.id, reason: action.reason, "verification_required")
             statuses[pane.id] = "Restart needs attention; no automatic retry"
             pending.removeValue(forKey: pane.id); requested.remove(pane.id)
             completeHaikuTool(pane, state: "verification_unknown", message: "The native restart needs review; no retry was submitted.")
@@ -1089,6 +1288,7 @@ enum RelayAgentMaintenanceRestartAdmission {
         if action.stage == .shell {
             guard pane.agentInputRevision == action.inputRevision else {
                 try journal.mark(action.id, "user_input_after_exit")
+                try? audit(action.id, pane: pane.id, reason: action.reason, "user_input_after_exit")
                 statuses[pane.id] = "Restart paused because you entered input"
                 pending.removeValue(forKey: pane.id); requested.remove(pane.id)
                 completeHaikuTool(pane, state: "held", message: "Input arrived after the agent exited; the resume was held.")
@@ -1104,6 +1304,7 @@ enum RelayAgentMaintenanceRestartAdmission {
             guard sent else {
                 if attempted {
                     try journal.mark(action.id, "resume_outcome_unknown")
+                    try? audit(action.id, pane: pane.id, reason: action.reason, "resume_outcome_unknown")
                     statuses[pane.id] = "Resume needs attention; no automatic retry"
                     pending.removeValue(forKey: pane.id); requested.remove(pane.id)
                     completeHaikuTool(pane, state: "verification_unknown", message: "The resume outcome is unknown; no retry was submitted.")
@@ -1111,6 +1312,7 @@ enum RelayAgentMaintenanceRestartAdmission {
                 return
             }
             try journal.mark(action.id, "resume_submitted")
+            try? audit(action.id, pane: pane.id, reason: action.reason, "resume_submitted")
             var next = action; next.stage = .verify; next.inputRevision = pane.agentInputRevision
             pending[pane.id] = next
             statuses[pane.id] = "Resume submitted; verifying the exact conversation"
@@ -1139,8 +1341,10 @@ enum RelayAgentMaintenanceRestartAdmission {
             return
         }
         try journal.mark(action.id, "verified")
+        let transition = (action.proof.runningVersion ?? "unknown") + " → " + (proof.runningVersion ?? "unknown")
+        try? audit(action.id, pane: pane.id, reason: action.reason, "verified", action.reason == .update ? transition : nil)
         statuses[pane.id] = action.reason == .binding ? "Conversation binding recovered" :
-            "Installed update " + (proof.runningVersion.map { $0 + " " } ?? "") + "applied; conversation preserved"
+            "Installed update " + (proof.runningVersion.map { $0 + " " } ?? "") + "applied (" + transition + "); conversation preserved"
         pending.removeValue(forKey: pane.id); requested.remove(pane.id)
         completeHaikuTool(pane, state: "verified", message: statuses[pane.id] ?? "The original conversation was verified.", proof: proof)
         RelayRecoveryStore.shared.record(kind: "agent_maintenance_verified", paneID: pane.id, profile: pane.profile)
@@ -1191,6 +1395,15 @@ struct RelayAgentMaintenanceSettingsView: View {
     private var mikoHosts: [ConnectionProfile] {
         [ConnectionProfile.local] + profiles.connectableHosts.filter { $0.backend == .relay }
     }
+    private func protection(_ id: UUID) -> Binding<Bool> {
+        let key = id.uuidString.lowercased()
+        return Binding(get: { preferences.maintenanceProtectedPanes.contains(key) }, set: { on in
+            var panes = Set(preferences.maintenanceProtectedPanes)
+            if on { panes.insert(key) } else { panes.remove(key) }
+            preferences.maintenanceProtectedPanes = RelayAgentMaintenancePolicy.validProtectedPanes(Array(panes))
+                ?? preferences.maintenanceProtectedPanes
+        })
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Automatic maintenance").font(RelayTheme.font(size: 14, weight: .semibold))
@@ -1210,6 +1423,14 @@ struct RelayAgentMaintenanceSettingsView: View {
                 .accessibilityIdentifier("relay.settings.agent-maintenance.enabled")
             Text("Waits for an idle agent and an empty prompt, preserves the conversation, and verifies the new binding. An uncertain restart is held for review.")
                 .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+            Toggle("Pause automatic update restarts", isOn: $preferences.agentUpdateRestartsPaused)
+                .accessibilityIdentifier("relay.settings.agent-maintenance.update-restarts-paused")
+            Text("Freezes restarts onto a newly installed agent version (for a release freeze); health checks and link repairs continue. Held panes report \"update available, held\".")
+                .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+            Toggle("Trust a Codex folder like its trusted parent before restarting", isOn: $preferences.codexTrustMirrorParent)
+                .accessibilityIdentifier("relay.settings.agent-maintenance.codex-trust-mirror-parent")
+            Text("Off: a Codex restart that would stop at the folder-trust dialog is held and reported. On: Relay first adds that exact folder to the account's config.toml, mirroring its trusted parent, and says so.")
+                .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
             Toggle("Use Haiku to monitor panes and take safe actions", isOn: $preferences.haikuPaneHealth)
                 .accessibilityIdentifier("relay.settings.haiku-pane-health.enabled")
             Text("Uses the saved API account and spending limits on each host. Haiku can inspect panes, reconnect retained terminals, repair idle agents and verify recovery. Uses low effort with thinking off.")
@@ -1219,8 +1440,24 @@ struct RelayAgentMaintenanceSettingsView: View {
                     .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
             }
             ForEach(maintenance.statuses.keys.sorted(by: { $0.uuidString < $1.uuidString }), id: \.self) { id in
-                Text("\(id.uuidString.prefix(8)): \(maintenance.statuses[id] ?? "")")
-                    .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+                HStack {
+                    Text("\(id.uuidString.prefix(8)): \(maintenance.statuses[id] ?? "")")
+                        .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+                    Spacer()
+                    Toggle("Protected", isOn: protection(id)).toggleStyle(.checkbox)
+                        .help("Never restart this pane automatically")
+                }
+            }
+            ForEach(preferences.maintenanceProtectedPanes.filter { id in
+                !maintenance.statuses.keys.contains { $0.uuidString.lowercased() == id } }, id: \.self) { id in
+                HStack {
+                    Text("\(id.prefix(8)): protected from automatic restarts")
+                        .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+                    Spacer()
+                    if let uuid = UUID(uuidString: id) {
+                        Toggle("Protected", isOn: protection(uuid)).toggleStyle(.checkbox)
+                    }
+                }
             }
         }
         .padding(16)

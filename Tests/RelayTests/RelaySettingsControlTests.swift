@@ -20,7 +20,7 @@ import Testing
         "intelligence_enabled": .bool(true), "automatic_agent_maintenance": .bool(true), "haiku_pane_health": .bool(true), "font_size": .number(13.5),
         "font_family": .string("Menlo"), "terminal_padding": .number(9),
         "key_bindings": .bindings([:])])
-    #expect(RelaySettingsPolicy.definitions.count == 32)
+    #expect(RelaySettingsPolicy.definitions.count == 35)
 }
 
 @Test func settingsRejectReservedAndDuplicateShortcuts() {
