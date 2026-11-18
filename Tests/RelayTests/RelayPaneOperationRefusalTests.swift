@@ -140,7 +140,8 @@ struct RelayPaneOperationRefusalTests {
         #expect(code() == nil)
         #expect(code(claude) == .invalidRequest)
         #expect(code(busy: true) == .operationInProgress)
-        #expect(code(authorized: false) == .notAuthorized)
+        // 0.5.113: a missing or expired grant is its own code (was not_authorized).
+        #expect(code(authorized: false) == .authorizationGrant)
         #expect(code(backend: .direct) == .unsupportedPane)
         #expect(code(connection: .disconnected("gone")) == .paneNotConnected)
         #expect(code(content: .editor) == .unsupportedPane)

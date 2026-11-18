@@ -10,6 +10,8 @@ import Testing
     /// Screen checks after the pane is shown before its screen is complete.
     var checksUntilReadable = 2
     var presented = 0
+    /// The hidden pane's worker gives a fresh screen when asked (f52d610f).
+    var workerScreen = false
     var failRestore = false
     /// Claude's settings overlay covers the prompt until one Esc.
     var overlay = false
@@ -57,6 +59,11 @@ struct RelayAgentAccountMoveDraftTests {
         mover.presentPane = { pane, workspace in
             agent.presented += 1; agent.events.append("present")
             workspace.revealPane(pane.id, origin: .programmatic)
+        }
+        mover.refreshWorkerScreen = { _ in
+            agent.events.append("refresh")
+            if agent.workerScreen { agent.readable = true }
+            return agent.workerScreen
         }
         mover.screenRefusal = { _ in
             agent.events.append("screen")
@@ -260,6 +267,22 @@ struct RelayAgentAccountMoveDraftTests {
         #expect(!mover.audit.memory.contains { $0.state.hasPrefix("draft") })
     }
 
+    @Test("A hidden pane whose worker gives a fresh screen is moved without being shown (f52d610f)")
+    func hiddenPaneIsReadFromItsWorker() async throws {
+        let agent = MovedAgent()
+        agent.workerScreen = true
+        let (mover, workspace, pane, other) = try harness(agent)
+        defer { workspace.shutdown() }
+        let outcome = await mover.move(pane, in: workspace, to: personal, origin: .user, inputGranted: true)
+        #expect(outcome.state == "verified", "\(outcome.message)")
+        #expect(agent.presented == 0 && !agent.events.contains("present"))
+        let refresh = try #require(agent.events.firstIndex(of: "refresh"))
+        let inspect = try #require(agent.events.firstIndex(of: "inspect"))
+        #expect(refresh < inspect)
+        #expect(workspace.activePaneID == other.id)
+        #expect(agent.activeAtInput.allSatisfy { $0 == other.id })
+    }
+
     @Test("A screen that never becomes readable is refused after the bound, before any native read")
     func unreadableScreenIsRefusedAfterTheBound() async throws {
         let agent = MovedAgent()
@@ -271,6 +294,8 @@ struct RelayAgentAccountMoveDraftTests {
         let outcome = await mover.move(pane, in: workspace, to: personal, origin: .user, inputGranted: true)
         #expect(outcome.state == "refused")
         #expect(outcome.message.contains("could not read its screen within"))
+        #expect(outcome.refusal?.code == .noRendererForIdleProof)
+        #expect(agent.events.contains("refresh"))
         #expect(!outcome.message.contains("Waiting for the original prompt"))
         #expect(Date().timeIntervalSince(started) < 5)
         #expect(agent.presented == 1)

@@ -99,3 +99,62 @@ struct RelayCodexGoalFooterTests {
         #expect(RelayAgentMaintenancePrompt.codexGoalBlocker(nil) == nil)
     }
 }
+
+/// REAL capture: pane d415f009 (Codex 0.170.0, GPT-6.2-Sol, idle, stalled
+/// goal), relay_read_viewport read-only, 2026-11-18. Bottom rows verbatim; the
+/// viewport carries no SGR, so the placeholder gets the faint style.
+private enum CapturedStalledGoalD415 {
+    static let screen = [
+        "• Hook failed",
+        "  └ hook timed out after 30s",
+        " ",
+        "  Worked for 59s • 09:10" + String(repeating: " ", count: 88),
+        " ", " ",
+        "› \u{1b}[2mAsk Codex to do anything\u{1b}[22m",
+        " ",
+        "  GPT-6.2-Sol medium · ~/dev/term/work · Complete the task",
+        "  ← for agents · ? for shortcuts" + String(repeating: " ", count: 24) +
+            "Goal stalled (/goal resume) · ⚠ 3 warnings · f2 to view",
+    ].joined(separator: "\r\n")
+}
+
+/// 0.5.113 item 2: 9cc78978 and d415f009 were refused on 0.5.112 with "no
+/// verified idle empty Codex prompt (busy, draft, approval, ...)". The resume
+/// admission uses the same goal classification, and each cause that still
+/// holds is named by its own code.
+@Suite("Resume idle proof names each blocker")
+struct RelayResumePromptBlockerTests {
+    static let owner = RelayPromptOwnerBinding(version: 1, paneId: "9cc78978-7791-4d31-8a98-ac29a95d7423", nodeBootId: "b",
+        workerPid: 1, workerStart: 2, shellPid: 3, shellStart: 4, provider: "codex", processId: 5, processStart: 6,
+        sessionId: "01a1d43d-606c-7f91-8288-edf53495c685", transcriptIdentity: "1:2")
+    private func blocker(_ vt: String?, approvals: Int = 0, composerBusy: Bool = false) -> RelayPaneOperationRefusal.Code? {
+        TerminalRuntime.agentResumePromptBlocker(expected: Self.owner, vt: vt, pendingApprovals: approvals, composerBusy: composerBusy)?.code
+    }
+
+    @Test func bothCapturedStalledGoalPanesAreAdmitted() {
+        for screen in [CapturedStalledGoal.screen, CapturedStalledGoalD415.screen] {
+            #expect(TerminalRuntime.agentResumePromptAdmits(expected: Self.owner, vt: screen, pendingApprovals: 0, composerBusy: false))
+            #expect(blocker(screen) == nil)
+            #expect(RelayAgentMaintenancePrompt.codexGoalNote(screen) == "goal_stalled")
+        }
+    }
+
+    @Test func eachRemainingCauseHasItsOwnCode() {
+        let idle = CapturedStalledGoalD415.screen
+        #expect(blocker(idle, approvals: 1) == .approvalPending)
+        #expect(blocker(idle, composerBusy: true) == .draftPresent)
+        #expect(blocker(nil) == .noRendererForIdleProof)
+        #expect(blocker(idle.replacingOccurrences(of: "\u{1b}[2mAsk Codex to do anything\u{1b}[22m", with: "continue")) == .draftPresent)
+        #expect(blocker(idle.replacingOccurrences(of: "Goal stalled (/goal resume)", with: "Pursuing goal (12m)")) == .goalActive)
+        let running = idle.replacingOccurrences(of: "  Worked for 59s • 09:10", with: "• Working (3s • esc to interrupt)")
+        #expect(blocker(running) == .turnActive)
+    }
+
+    @Test func aSessionMismatchIsTargetSession() {
+        let session = UUID(uuidString: Self.owner.sessionId!)!
+        let plan = RelayCodexPaneResume.Plan(owner: Self.owner, sessionId: Self.owner.sessionId!, directory: "/w", command: "x", configDir: "/c")
+        #expect(RelayCodexPaneResume.sessionRefusal(.init(instance: UUID(), requestID: UUID(), expectedSession: session, targetSession: session), plan: plan) == nil)
+        #expect(RelayCodexPaneResume.sessionRefusal(.init(instance: UUID(), requestID: UUID(), expectedSession: UUID(), targetSession: session), plan: plan)?.code == .targetSession)
+        #expect(RelayCodexPaneResume.sessionRefusal(.init(instance: UUID(), requestID: UUID(), expectedSession: session, targetSession: UUID()), plan: plan)?.code == .targetSession)
+    }
+}

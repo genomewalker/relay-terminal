@@ -1232,20 +1232,24 @@ enum RelayAgentMaintenanceRestartAdmission {
         switch decision {
         case .promptUnconfirmed(let blocker):
             let held = "Waiting for the prompt to be confirmed empty or to show a typed draft: " + blocker
+            holds[pane.id] = .init(.promptUnverified, held)
             statuses[pane.id] = held
             completeHaikuTool(pane, state: "held", message: held, proof: fresh)
         case .noDraftContract:
             statuses[pane.id] = "Waiting for an exact draft capture contract for this agent"
         case .cooling:
             statuses[pane.id] = "A recent restart is recorded; automatic retry is held"
+            holds[pane.id] = .init(.coolingDown, "The previous native maintenance action is held or cooling down")
             completeHaikuTool(pane, state: "held", message: "The previous native maintenance action is held or cooling down.", proof: fresh)
             requested.remove(pane.id)
         case .held(_, let why):
             let message = "Restart held: " + why + "; nothing was typed"
+            holds[pane.id] = .init(RelayPaneOperationRefusal.classify(why), message)
             statuses[pane.id] = message
             completeHaikuTool(pane, state: "held", message: message + ".", proof: fresh)
         case .busy:
             statuses[pane.id] = "Restart held: the pane was still resizing or reconnecting; nothing was typed"
+            holds[pane.id] = .init(.paneNotConnected, "The pane was still resizing or reconnecting after about 30 s; nothing was typed")
             completeHaikuTool(pane, state: "held",
                 message: "The pane was still resizing or reconnecting after about 30 s; nothing was typed.", proof: fresh)
         case .unknown:

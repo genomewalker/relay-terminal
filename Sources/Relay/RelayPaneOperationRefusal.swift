@@ -42,6 +42,18 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
         case goalStalled = "goal_stalled"
         case notRecoverable = "not_recoverable"
         case unsavedChanges = "unsaved_changes"
+        /// The request's expected or target session is not the pane's bound session.
+        case targetSession = "target_session"
+        /// The terminal input grant is missing or expired.
+        case authorizationGrant = "authorization_grant"
+        /// Neither a native renderer nor the pane's worker could give a
+        /// complete screen, so idleness could not be proven.
+        case noRendererForIdleProof = "no_renderer_for_idle_proof"
+        /// A close was refused by the pane itself (still running, or a
+        /// published surface without a close capability).
+        case closeRefused = "close_refused"
+        /// Automatic maintenance waits between attempts on this pane.
+        case coolingDown = "cooling_down"
         case unclassified
 
         /// What the operator or an MCP client does to clear this refusal.
@@ -98,6 +110,14 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
                 return "Informational: the Codex /goal is stalled and waits for /goal resume; the pane is idle and a restart keeps the goal stalled."
             case .notRecoverable: return "List the host's managed panes again; the pane is gone or no longer running."
             case .unsavedChanges: return "Save or discard the pane's unsaved editor changes, then close it."
+            case .targetSession:
+                return "Read the pane's current binding (relay_agent_binding) and retry with its bound session as expected_session and a fresh request ID."
+            case .authorizationGrant:
+                return "Grant terminal input to MCP clients in Relay (the grant expires), then retry with a fresh request ID."
+            case .noRendererForIdleProof:
+                return "Nothing was sent. Select the pane's tab once, or wait for its worker to deliver a fresh screen, then retry."
+            case .closeRefused: return "Read the blocker; end or detach what keeps the pane open, then close it again."
+            case .coolingDown: return "Wait for the cooling interval to end; maintenance retries this pane by itself."
             case .unclassified: return "Read the blocker text; it names what held the operation."
             }
         }

@@ -1746,7 +1746,7 @@ final class RelaySidePanelServer: ObservableObject {
             guard let input = try? JSONDecoder().decode(MCPTerminatePaneRequest.self, from: request.body),
                   input.instance == agentInputRequests.instance,
                   let profile = recoveryProfile(host: input.host) else {
-                return .text("Invalid or stale termination request", status: 400, reason: "Bad Request")
+                return .refusal(.init(.invalidRequest, "Invalid or stale termination request"), status: 400)
             }
             if let prior = directTerminationRequests[input.requestID] {
                 guard prior == input, let result = directTerminationResults[input.requestID] else {
@@ -1777,7 +1777,7 @@ final class RelaySidePanelServer: ObservableObject {
                 directTerminationResults[input.requestID] = result
                 return .json(result)
             } catch {
-                return .text("Could not terminate pane: \(error.localizedDescription)", status: 502, reason: "Bad Gateway")
+                return .refusal(.init(.closeRefused, "Could not terminate pane: \(error.localizedDescription)"), status: 502)
             }
         }
         if request.method == "POST", request.path == "/api/workspace/grant" {
@@ -2649,8 +2649,11 @@ final class RelaySidePanelServer: ObservableObject {
             shellRecoveryResults[input.requestID] = result
             return .json(result)
         case ("POST", "codex-resume"):
-            guard mcpWorkspaceGrant.permits(.input), caller != nil else {
-                return .refusal(.init(.notAuthorized, "Same-pane resume requires the terminal input grant and a registered caller"))
+            guard mcpWorkspaceGrant.permits(.input) else {
+                return .refusal(.init(.authorizationGrant, "Same-pane resume requires the terminal input grant, which is missing or expired"))
+            }
+            guard caller != nil else {
+                return .refusal(.init(.notAuthorized, "Same-pane resume requires a registered caller"))
             }
             guard let caller, let input = try? JSONDecoder().decode(RelayCodexPaneResumeRequest.self, from: request.body),
                   input.instance == agentInputRequests.instance else {
@@ -2790,18 +2793,25 @@ final class RelaySidePanelServer: ObservableObject {
             return .json(result)
         case ("POST", "installed-update"):
             guard mcpWorkspaceGrant.permits(.input) else {
-                return .text("MCP terminal input is not granted", status: 403, reason: "Forbidden")
+                return .refusal(.init(.authorizationGrant, "MCP terminal input is not granted"), status: 403)
             }
             guard let input = try? RelayInstalledUpdateRequest.decode(request.body),
-                  input.instance == agentInputRequests.instance,
-                  let pane = workspace.panes[paneID], pane.contentKind == .terminal,
-                  pane.profile.backend == .relay, pane.connectionState == .connected else {
-                return .text("Invalid or unavailable installed update target", status: 409, reason: "Conflict")
+                  input.instance == agentInputRequests.instance else {
+                return .refusal(.init(.invalidRequest, "Invalid installed update request or stale instance"))
+            }
+            guard let pane = workspace.panes[paneID] else {
+                return .refusal(.init(.notRecoverable, "The pane is not open in this Relay window"))
+            }
+            guard pane.contentKind == .terminal, pane.profile.backend == .relay else {
+                return .refusal(.init(.unsupportedPane, "The pane is not a terminal on a Relay-managed backend"))
+            }
+            guard pane.connectionState == .connected else {
+                return .refusal(.init(.paneNotConnected, "The pane is not connected"))
             }
             switch installedUpdateReceipts.begin(pane: paneID, request: input,
                 instance: agentInputRequests.instance, granted: mcpWorkspaceGrant.permits(.input)) {
             case .existing(let result): return .json(result)
-            case .refused: return .text("Conflicting request or receipt limit", status: 409, reason: "Conflict")
+            case .refused: return .refusal(.init(.operationInProgress, "Conflicting request or receipt limit"))
             case .admitted: break
             }
             Task { @MainActor [weak self, weak pane, weak workspace] in
@@ -2829,7 +2839,10 @@ final class RelaySidePanelServer: ObservableObject {
                         result = .object(["state": .string("already_current"), "pane": facts.value]
                             .merging(RelayAgentMaintenancePolicy.updateVersionFields(before: proof, after: proof)) { $1 })
                     } else if !facts.allowedActions.contains("apply_update") || RelayPreferences.shared.shepherd.enabled {
-                        result = .object(["state": .string("held"), "message": .string("Fresh native evidence or the active coordinator holds this update."), "pane": facts.value])
+                        let hold = RelayPaneOperationRefusal(RelayPreferences.shared.shepherd.enabled ? .operationInProgress : .promptUnverified,
+                            "Fresh native evidence or the active coordinator holds this update.")
+                        result = .object(["state": .string("held"), "message": .string(hold.blocker), "pane": facts.value]
+                            .merging(hold.fields.mapValues { .string($0) }) { $1 })
                     } else {
                         actionSubmitted = true
                         let native = await RelayAgentMaintenance.shared.performHaikuTool("apply_installed_update",
@@ -2846,17 +2859,19 @@ final class RelaySidePanelServer: ObservableObject {
                                 result = .object(["state": .string("verification_unknown"),
                                     "message": .string("The original conversation and current installed image could not both be verified; no retry was submitted.")])
                             }
-                        } else if case .object(var fields) = native, let hold = RelayAgentMaintenance.shared.holds[paneID] {
+                        } else if case .object(var fields) = native, fields["state"]?.string == "held",
+                                  let hold = RelayAgentMaintenance.shared.holds[paneID] {
                             // A held update names its reason code and how to clear it.
                             for (key, value) in hold.fields { fields[key] = .string(value) }
                             result = .object(fields)
                         } else { result = native }
                     }
                 } catch {
+                    let hold = actionSubmitted
+                        ? RelayPaneOperationRefusal(.exitNotVerified, "The native result could not be verified; do not replay the update.")
+                        : RelayPaneOperationRefusal(.identityUnavailable, "Native identity inspection is unavailable; no update was submitted.")
                     result = .object(["state": .string(actionSubmitted ? "verification_unknown" : "held"),
-                        "message": .string(actionSubmitted ?
-                            "The native result could not be verified; do not replay the update." :
-                            "Native identity inspection is unavailable; no update was submitted.")])
+                        "message": .string(hold.blocker)].merging(hold.fields.mapValues { .string($0) }) { $1 })
                 }
                 self.installedUpdateReceipts.finish(input.requestID, result: result)
             }
@@ -2917,9 +2932,13 @@ final class RelaySidePanelServer: ObservableObject {
             }
             return .json(pane.promptProvenance.snapshot(paneID: paneID))
         case ("GET", "viewport"):
-            guard let pane = workspace.panes[paneID], let text = await pane.runtime.backgroundViewportText(),
-                  workspace.panes[paneID] === pane else {
-                return .text("Viewport unavailable", status: 409, reason: "Conflict")
+            guard let pane = workspace.panes[paneID] else {
+                return .refusal(.init(.notRecoverable, "The pane is not open in this Relay window"))
+            }
+            guard let text = await pane.runtime.backgroundViewportText(), workspace.panes[paneID] === pane else {
+                // Not an idle proof either way: resume and move read worker state.
+                return .refusal(.init(.noRendererForIdleProof,
+                    "Viewport unavailable: the pane has no native renderer and no complete worker screen yet"))
             }
             return .json(["pane_id": paneID.uuidString.lowercased(), "text": text, "scope": "visible_viewport_only"])
         case ("GET", "command-wait"):

@@ -226,14 +226,14 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             }
             guard let admitted = Self.decodePlan(captured.stdout) else { try refuse("the host's resume plan could not be read", .hostUnreachable); return }
             plan = admitted
-            guard request.isAdmissible, plan.owner.provider == agent, plan.owner.paneId == pane.id.uuidString.lowercased(),
-                  plan.owner.sessionId == request.expectedSession.uuidString.lowercased(),
-                  plan.sessionId == request.targetSession.uuidString.lowercased() else {
-                try refuse("the host's plan names a different provider, pane or session", .paneChanged); return
+            guard request.isAdmissible, plan.owner.provider == agent, plan.owner.paneId == pane.id.uuidString.lowercased() else {
+                try refuse("the host's plan names a different provider or pane", .paneChanged); return
             }
-            guard let proof = await pane.runtime.agentResumePromptProof(expected: plan.owner) else {
-                try refuse("no verified idle empty \(name) prompt (busy, draft, approval, background work, or the screen or owner changed)",
-                           .promptUnverified); return
+            if let mismatch = Self.sessionRefusal(request, plan: plan) { try refuse(mismatch.blocker, mismatch.code); return }
+            let checked = await pane.runtime.agentResumePromptCheck(expected: plan.owner)
+            guard let proof = checked.token else {
+                let why = checked.refusal ?? .init(.promptUnverified, "the screen or owner changed")
+                try refuse("no verified idle empty \(name) prompt: " + why.blocker, why.code); return
             }
             guard current() else { try refuse("the pane, its connection or the authorization changed", .paneChanged); return }
             result.plan = admitted
@@ -330,10 +330,22 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             return .init(.invalidRequest, "A Claude resume restarts the pane's own session; target_session must equal expected_session")
         }
         if busy { return .init(.operationInProgress, "Another same-pane resume is running") }
-        if !authorized { return .init(.notAuthorized, "The terminal input grant or this caller's access is not current") }
+        if !authorized { return .init(.authorizationGrant, "The terminal input grant or this caller's access is not current") }
         if backend != .relay { return .init(.unsupportedPane, "The pane is not on a Relay-managed backend") }
         if connection != .connected { return .init(.paneNotConnected, "The pane is not connected") }
         if content != .terminal { return .init(.unsupportedPane, "The pane is not a terminal") }
+        return nil
+    }
+    /// The request's sessions against the host plan: the pane is bound to
+    /// another session than expected_session, or the plan resumes another.
+    nonisolated static func sessionRefusal(_ request: RelayCodexPaneResumeRequest, plan: Plan) -> RelayPaneOperationRefusal? {
+        let expected = request.expectedSession.uuidString.lowercased(), target = request.targetSession.uuidString.lowercased()
+        if plan.owner.sessionId != expected {
+            return .init(.targetSession, "the pane is bound to session " + (plan.owner.sessionId ?? "none") + ", not expected_session " + expected)
+        }
+        if plan.sessionId != target {
+            return .init(.targetSession, "the host plans session " + plan.sessionId + ", not target_session " + target)
+        }
         return nil
     }
     /// The next line-clearing control key for a retained shell whose recognized
