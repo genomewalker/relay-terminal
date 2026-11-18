@@ -125,11 +125,16 @@ enum RelayAgentMaintenancePrompt {
                 // The entire prompt and the recognized footer remain required.
             }
         }
-        let footer = prompt.rows.dropFirst(prompt.footer).map {
+        var footer = prompt.rows.dropFirst(prompt.footer).map {
             String(String.UnicodeScalarView($0.map(\.character))).trimmingCharacters(in: .whitespaces)
         }.filter { !$0.isEmpty && !(provider == "codex" && explainedAgents == allWorkExplained && codexBackgroundRow($0)) }
         if provider == "claude", footer.contains(where: { busy($0, explainedAgents: explainedAgents) }) { return false }
         if provider == "codex" {
+            // An active /goal continues the thread on its own, so a goal still
+            // being pursued is never an idle prompt; a settled goal's status
+            // row is history and does not hold the composer.
+            if footer.contains(where: codexGoalPursuing) { return false }
+            footer.removeAll(where: codexGoalSettledRow)
             // The status line's items are user-configured: it opens with the
             // model and may omit the context segment ("GPT-6.1 Terra high ·
             // ~/cwd · thread title"). At most two status-line rows may name the context.
@@ -266,6 +271,32 @@ enum RelayAgentMaintenancePrompt {
             clean[1].count > "2. Wait here, then continue automatically at ".count &&
             clean[2] == "3. Switch to usage credits"
     }
+
+    /// Codex 0.170's /goal status ("Pursuing goal (12m)"): the thread has an
+    /// active goal, which Codex continues without new input.
+    static func codexGoalPursuing(_ value: String) -> Bool {
+        value.range(of: #"(?:^|· )Pursuing goal \("#, options: .regularExpression) != nil
+    }
+
+    /// A whole footer row reporting a finished /goal ("Goal achieved (1h 2m)",
+    /// "Goal unmet (40m)"), optionally followed by " · " segments.
+    static func codexGoalSettledRow(_ value: String) -> Bool {
+        value.range(of: #"^Goal (?:achieved|unmet) \([^)]*\)(?: · .+)?$"#, options: .regularExpression) != nil
+    }
+
+    /// The prompt blocker for a pane whose Codex footer shows an active goal.
+    static func codexGoalBlocker(_ vt: String?) -> String? {
+        guard let vt, let prompt = prompt(vt, provider: "codex") else { return nil }
+        let row = prompt.rows.dropFirst(prompt.footer).map {
+            String(String.UnicodeScalarView($0.map(\.character))).trimmingCharacters(in: .whitespaces)
+        }.first(where: codexGoalPursuing)
+        return row.map { goalBlockerPrefix + " (" + String($0.prefix(80)) + "); it continues the thread without new input" }
+    }
+
+    static let goalBlockerPrefix = "a Codex /goal is still being pursued"
+
+    /// Whether a prompt blocker is the active-goal one.
+    static func isGoalBlocker(_ blocker: String) -> Bool { blocker.hasPrefix(goalBlockerPrefix) }
 
     /// The idle composer's hint row. After one Esc on an empty composer,
     /// Codex offers to edit the previous message; the composer is still empty

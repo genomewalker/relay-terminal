@@ -3173,6 +3173,7 @@ final class TerminalRuntime: NSObject {
                 }
                 return "the footer shows background work still running (\(String(work.suffix(60))))"
             }
+            if provider == "codex", let goal = RelayAgentMaintenancePrompt.codexGoalBlocker(screen) { return goal }
             return "the screen's prompt or footer was not recognised"
         }
         guard preparedMaintenancePrompt != nil else {
