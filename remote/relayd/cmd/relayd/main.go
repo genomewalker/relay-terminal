@@ -352,7 +352,7 @@ func main() {
 		}
 		plan, err := daemon.ReadCodexPaneResumePlan(os.Args[2], os.Args[3], os.Args[4])
 		if err != nil {
-			fatal(err.Error())
+			fatalRefusal(err)
 		}
 		if err := daemon.EncodeJSON(os.Stdout, plan); err != nil {
 			fatal(err.Error())
@@ -363,7 +363,7 @@ func main() {
 		}
 		plan, err := daemon.ReadClaudePaneResumePlan(os.Args[2], os.Args[3])
 		if err != nil {
-			fatal(err.Error())
+			fatalRefusal(err)
 		}
 		if err := daemon.EncodeJSON(os.Stdout, plan); err != nil {
 			fatal(err.Error())
@@ -2124,6 +2124,16 @@ func existingOwnedRelaydRuntimeSocket(directory string, uid int) string {
 
 func legacySocket() string {
 	return filepath.Join("/tmp", "relayd-"+strconv.Itoa(os.Getuid())+".sock")
+}
+
+// fatalRefusal reports a refused pane operation: the blocker on the usual
+// "relayd:" line, then its structured reason code and how to clear it.
+func fatalRefusal(err error) {
+	fmt.Fprintln(os.Stderr, "relayd:", err.Error())
+	if line := daemon.PaneRefusalLine(err); line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
+	os.Exit(1)
 }
 
 func fatal(message string) {

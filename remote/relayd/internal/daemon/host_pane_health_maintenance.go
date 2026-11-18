@@ -2160,9 +2160,9 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 		"running_version", versions.running, "installed_version", versions.installed,
 		"outdated_other_install", outdated && versions.sameInstall != true,
 		"background_work", backgroundWork, "subagent_work", subagents,
-		"harness_status", harness, "background_agent_jobs", hostJobs, "resume_command", command, "resume_error", commandError,
+		"harness_status", harness, "background_agent_jobs", hostJobs, "resume_command", command, "resume_error", commandError, "resume_error_code", paneRefusalCodeOrNil(commandError),
 		"config_dir", phAccountLabelDir(account, provider),
-		"account_matches", accountMatches, "move_command", moved, "move_error", moveError, "login", login)
+		"account_matches", accountMatches, "move_command", moved, "move_error", moveError, "move_error_code", paneRefusalCodeOrNil(moveError), "login", login)
 }
 
 // installedRelayImage is installed_relay_image(binary): the reviewed

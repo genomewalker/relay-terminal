@@ -22,15 +22,15 @@ type CodexPaneResumePlan struct {
 func ReadCodexPaneResumePlan(pane, expected, target string) (CodexPaneResumePlan, error) {
 	var empty CodexPaneResumePlan
 	if !validSessionID.MatchString(pane) || !validSessionID.MatchString(expected) || !validSessionID.MatchString(target) {
-		return empty, errors.New("exact pane and session UUIDs required")
+		return empty, newPaneRefusal(PaneRefusalInvalidRequest, "exact pane and session UUIDs required")
 	}
 	owner, err := ReadVerifiedPromptOwnerBinding(pane)
 	if err != nil || owner.Provider != "codex" || owner.SessionID != expected || owner.InputOnly {
-		return empty, errors.New("original Codex prompt owner changed or unavailable")
+		return empty, newPaneRefusal(PaneRefusalIdentityUnavailable, "original Codex prompt owner changed or unavailable")
 	}
 	config, err := agentConfigRoot(owner.ProcessID, "codex")
 	if err != nil {
-		return empty, errors.New("original Codex account unavailable")
+		return empty, newPaneRefusal(PaneRefusalIdentityUnavailable, "original Codex account unavailable")
 	}
 	config, err = filepath.EvalSymlinks(config)
 	if err != nil {
@@ -41,7 +41,7 @@ func ReadCodexPaneResumePlan(pane, expected, target string) (CodexPaneResumePlan
 		return empty, err
 	}
 	if refusal := codexLoginRefusal(home, config); refusal != "" {
-		return empty, errors.New(refusal)
+		return empty, newPaneRefusal(PaneRefusalLoginMismatch, refusal)
 	}
 	path, err := exactCodexResumeTranscript(config, target)
 	if err != nil {
@@ -55,12 +55,12 @@ func ReadCodexPaneResumePlan(pane, expected, target string) (CodexPaneResumePlan
 	before, err := file.Stat()
 	current, lerr := os.Lstat(path)
 	if err != nil || lerr != nil || !before.Mode().IsRegular() || !os.SameFile(before, current) || current.Mode()&os.ModeSymlink != 0 {
-		return empty, errors.New("saved session source changed")
+		return empty, newPaneRefusal(PaneRefusalPaneChanged, "saved session source changed")
 	}
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	if !scanner.Scan() {
-		return empty, errors.New("saved session metadata unavailable")
+		return empty, newPaneRefusal(PaneRefusalResumeUnavailable, "saved session metadata unavailable")
 	}
 	session, _, kind, err := nativeCodexOpenTranscriptMetadata(scanner.Bytes())
 	var metadata struct {
@@ -69,21 +69,21 @@ func ReadCodexPaneResumePlan(pane, expected, target string) (CodexPaneResumePlan
 		} `json:"payload"`
 	}
 	if err != nil || session != target || kind != "root" || json.Unmarshal(scanner.Bytes(), &metadata) != nil || !filepath.IsAbs(metadata.Payload.CWD) {
-		return empty, errors.New("saved session identity mismatch")
+		return empty, newPaneRefusal(PaneRefusalResumeUnavailable, "saved session identity mismatch")
 	}
 	cwd := metadata.Payload.CWD
 	live, err := processWorkingDirectory(owner.ProcessID)
 	if err != nil || verifyNativeDirectoryEvidence(cwd, nil, live) != nil {
-		return empty, errors.New("saved session is outside this pane's project")
+		return empty, newPaneRefusal(PaneRefusalOutsideProject, "saved session is outside this pane's project")
 	}
 	shim := filepath.Join(home, ".local", "share", "relay", "shims", "codex")
 	info, err := os.Stat(shim)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
-		return empty, errors.New("managed Codex launcher unavailable")
+		return empty, newPaneRefusal(PaneRefusalLauncherUnavailable, "managed Codex launcher unavailable")
 	}
 	after, err := ReadVerifiedPromptOwnerBinding(pane)
 	if err != nil || after != owner {
-		return empty, errors.New("original Codex owner changed during admission")
+		return empty, newPaneRefusal(PaneRefusalPaneChanged, "original Codex owner changed during admission")
 	}
 	return CodexPaneResumePlan{Owner: owner, Session: target, Directory: cwd, ConfigDir: config,
 		Command: "cd -- " + shellQuote(cwd) + " && CODEX_HOME=" + shellQuote(config) + " " + shellQuote(shim) + " resume " + shellQuote(target)}, nil

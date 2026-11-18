@@ -20,15 +20,15 @@ import (
 func ReadClaudePaneResumePlan(pane, expected string) (CodexPaneResumePlan, error) {
 	var empty CodexPaneResumePlan
 	if !validSessionID.MatchString(pane) || !nativeClaudeSessionID.MatchString(expected) {
-		return empty, errors.New("exact pane and session UUIDs required")
+		return empty, newPaneRefusal(PaneRefusalInvalidRequest, "exact pane and session UUIDs required")
 	}
 	owner, err := ReadVerifiedPromptOwnerBinding(pane)
 	if err != nil || owner.Provider != "claude" || owner.SessionID != expected || owner.InputOnly {
-		return empty, errors.New("original Claude prompt owner changed or unavailable")
+		return empty, newPaneRefusal(PaneRefusalIdentityUnavailable, "original Claude prompt owner changed or unavailable")
 	}
 	override, err := agentConfigOverride(owner.ProcessID, "claude")
 	if err != nil {
-		return empty, errors.New("original Claude account unavailable")
+		return empty, newPaneRefusal(PaneRefusalIdentityUnavailable, "original Claude account unavailable")
 	}
 	root := override
 	if root == "" {
@@ -38,7 +38,7 @@ func ReadClaudePaneResumePlan(pane, expected string) (CodexPaneResumePlan, error
 	}
 	path, err := nativeClaudeTranscript(root, expected)
 	if err != nil || path == "" {
-		return empty, errors.New("saved session is missing or ambiguous in the original account")
+		return empty, newPaneRefusal(PaneRefusalResumeUnavailable, "saved session is missing or ambiguous in the original account")
 	}
 	file, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
@@ -48,11 +48,11 @@ func ReadClaudePaneResumePlan(pane, expected string) (CodexPaneResumePlan, error
 	before, err := file.Stat()
 	current, lerr := os.Lstat(path)
 	if err != nil || lerr != nil || !before.Mode().IsRegular() || !os.SameFile(before, current) || current.Mode()&os.ModeSymlink != 0 {
-		return empty, errors.New("saved session source changed")
+		return empty, newPaneRefusal(PaneRefusalPaneChanged, "saved session source changed")
 	}
 	// The located transcript must be the one the live owner is bound to.
 	if stat, ok := before.Sys().(*syscall.Stat_t); !ok || fmt.Sprintf("%d:%d", stat.Dev, stat.Ino) != owner.TranscriptIdentity {
-		return empty, errors.New("saved session is not the pane's bound transcript")
+		return empty, newPaneRefusal(PaneRefusalResumeUnavailable, "saved session is not the pane's bound transcript")
 	}
 	cwd, err := claudeTranscriptDirectory(file, expected)
 	if err != nil {
@@ -60,7 +60,7 @@ func ReadClaudePaneResumePlan(pane, expected string) (CodexPaneResumePlan, error
 	}
 	live, err := processWorkingDirectory(owner.ProcessID)
 	if err != nil || verifyNativeDirectoryEvidence(cwd, nil, live) != nil {
-		return empty, errors.New("saved session is outside this pane's project")
+		return empty, newPaneRefusal(PaneRefusalOutsideProject, "saved session is outside this pane's project")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -69,7 +69,7 @@ func ReadClaudePaneResumePlan(pane, expected string) (CodexPaneResumePlan, error
 	shim := filepath.Join(home, ".local", "share", "relay", "shims", "claude")
 	info, err := os.Stat(shim)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
-		return empty, errors.New("managed Claude launcher unavailable")
+		return empty, newPaneRefusal(PaneRefusalLauncherUnavailable, "managed Claude launcher unavailable")
 	}
 	command, err := claudePaneResumeCommand(cwd, override, shim, expected)
 	if err != nil {
@@ -77,7 +77,7 @@ func ReadClaudePaneResumePlan(pane, expected string) (CodexPaneResumePlan, error
 	}
 	after, err := ReadVerifiedPromptOwnerBinding(pane)
 	if err != nil || after != owner {
-		return empty, errors.New("original Claude owner changed during admission")
+		return empty, newPaneRefusal(PaneRefusalPaneChanged, "original Claude owner changed during admission")
 	}
 	return CodexPaneResumePlan{Owner: owner, Session: expected, Directory: cwd, ConfigDir: override, Command: command}, nil
 }
