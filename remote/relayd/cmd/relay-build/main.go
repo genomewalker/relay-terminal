@@ -169,7 +169,7 @@ func running(target string, input io.Reader) (bool, error) {
 }
 
 var rotationReferences = map[string]string{
-	"Sources/Relay/Resources/Rotation/miko_tool_catalog.json":                        "ea677bac827c4ccf1c6559fb6d3ba9600b11c36bb1946c999bbbb2484bcc4743",
+	"Sources/Relay/Resources/Rotation/miko_tool_catalog.json":                        "b25f522ad72ecb8ab09f5b26e9d61c4e3e88d997260013b1a63490af62345359",
 	"remote/relayd/internal/daemon/testdata/host_rotation_policy/golden.json":        "4d61896b546f9d82fa3d8cc5ca32054560c6d6e7454d29f1b01b381a4d21d7b2",
 	"remote/relayd/internal/daemon/testdata/host_pane_health_controller/golden.json": "137a51a9ae015fb7f5e7d54a19dfa711d9b7d99dddb7c30242dc1328401c0ec8",
 }
