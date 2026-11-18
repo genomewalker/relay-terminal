@@ -55,6 +55,9 @@ func TestServiceFakeProcess(t *testing.T) {
 		if os.Getenv("RELAY_SERVICE_FAKE_IGNORE_TERM") == "1" {
 			continue
 		}
+		if after, _ := strconv.Atoi(os.Getenv("RELAY_SERVICE_FAKE_EXIT_AFTER_MS")); after > 0 {
+			time.Sleep(time.Duration(after) * time.Millisecond)
+		}
 		record("stop " + name)
 		os.Exit(0)
 	}
@@ -182,6 +185,7 @@ type fakeService struct {
 	depends   []string
 	accept    []int
 	ignore    bool
+	exitAfter int
 	delayMS   int
 	graceSecs int
 }
@@ -198,6 +202,9 @@ func (f *serviceFixture) spec(service fakeService, port int) ServiceSpec {
 	}
 	if service.ignore {
 		env["RELAY_SERVICE_FAKE_IGNORE_TERM"] = "1"
+	}
+	if service.exitAfter > 0 {
+		env["RELAY_SERVICE_FAKE_EXIT_AFTER_MS"] = strconv.Itoa(service.exitAfter)
 	}
 	if service.delayMS > 0 {
 		env["RELAY_SERVICE_FAKE_DELAY_MS"] = strconv.Itoa(service.delayMS)
@@ -468,6 +475,12 @@ func TestServiceUpgradeResumesAfterCrashBetweenStopAndRelaunch(t *testing.T) {
 				t.Fatal(err)
 			}
 			first = nil // the client is gone
+			if _, err := store.Declare(ServiceSpec{Name: "late", Command: "serve", Cwd: f.work}, ""); err == nil {
+				t.Fatal("declared a service under an unfinished journal")
+			}
+			if err := store.Undeclare("web"); err == nil {
+				t.Fatal("undeclared a service under an unfinished journal")
+			}
 
 			// The next upgrade-supervisor run adopts the journal rather than planning anew.
 			second := f.upgrade(f.old)
@@ -636,6 +649,34 @@ func TestServiceUpgradeStopFailureRestoresStoppedServices(t *testing.T) {
 	}
 	if bound["api"] != "api-r0562" || bound["web"] != serviceJobID("web", 1) {
 		t.Fatalf("bindings = %v", bound)
+	}
+}
+
+// A service that exits only after its stop timeout is still relaunched by the
+// restore, under its journaled generation, rather than reported as kept.
+func TestServiceUpgradeSlowStopIsRelaunchedOnceItExits(t *testing.T) {
+	previous := serviceStopTimeout
+	serviceStopTimeout = time.Second
+	t.Cleanup(func() { serviceStopTimeout = previous })
+	f := newServiceFixture(t)
+	store := f.store()
+	f.startOld(store, fakeService{name: "api", exitAfter: 1500})
+	f.startOld(store, fakeService{name: "web", depends: []string{"api"}})
+	upgrade := f.upgrade(f.old)
+	plan, _ := upgrade.Plan()
+	if err := upgrade.Begin(plan); err == nil || !strings.Contains(err.Error(), "did not exit") {
+		t.Fatalf("begin = %v", err)
+	}
+	if err := upgrade.Relaunch(ServiceResumeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"api", "web"} {
+		if !jobState(t, f.old, serviceJobID(name, 1)).live() {
+			t.Fatalf("%s generation 1 is not running", name)
+		}
+	}
+	if got := f.events("start"); !equalServiceStrings(got, []string{"api", "web", "api", "web"}) {
+		t.Fatalf("starts = %v", got)
 	}
 }
 

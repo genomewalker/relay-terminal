@@ -76,9 +76,17 @@ func runUpgradeSupervisor(arguments []string) {
 		fmt.Printf("preserved %d completed jobs in the archive; %d records remain for the upgrade guard\n", archived.Archived, archived.Retained)
 	}
 
-	if services != nil {
+	// With no supervisor serving there is nothing to stop through; a journal
+	// left behind is finished once the new supervisor answers.
+	if services != nil && currentErr == nil {
 		if err := services.Acquire(); err != nil {
 			fatal(err.Error())
+		}
+		// A journal already past its stops is finished first; its relaunched
+		// jobs are then part of this upgrade's plan instead of deferring it.
+		if err := services.FinishRelaunch(); err != nil {
+			services.Summary(os.Stdout)
+			fatal("cannot finish the previous service relaunch: " + err.Error())
 		}
 		plan, err := services.Plan()
 		if err != nil {

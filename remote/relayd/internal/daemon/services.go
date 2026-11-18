@@ -89,12 +89,15 @@ type ServiceStore struct {
 	host string
 }
 
-// LocalHostName is the key for this host's declarations.
+// LocalHostName is the key for this host's declarations: the first label of
+// the host name, lowercased, as the ledger's node comparison treats it. A Mac
+// whose domain changes with its network ("mac.lan", "mac.local") keeps one key.
 func LocalHostName() (string, error) {
 	host, err := os.Hostname()
 	if err != nil {
 		return "", err
 	}
+	host, _, _ = strings.Cut(strings.ToLower(host), ".")
 	if !validServiceHost.MatchString(host) {
 		return "", fmt.Errorf("host name %q cannot key service declarations", host)
 	}
@@ -190,6 +193,9 @@ func (s *ServiceStore) Declare(spec ServiceSpec, jobID string) (ServiceDeclarati
 	if jobID != "" && !validSessionID.MatchString(jobID) {
 		return ServiceDeclaration{}, errors.New("invalid job ID")
 	}
+	if err := s.refuseDuringUpgrade(); err != nil {
+		return ServiceDeclaration{}, err
+	}
 	file, err := s.load()
 	if err != nil {
 		return ServiceDeclaration{}, err
@@ -222,6 +228,9 @@ func (s *ServiceStore) Declare(spec ServiceSpec, jobID string) (ServiceDeclarati
 // Undeclare removes a declaration; its job keeps running, but is no longer
 // stopped by an upgrade. Allocated generations are kept. The caller holds Lock.
 func (s *ServiceStore) Undeclare(name string) error {
+	if err := s.refuseDuringUpgrade(); err != nil {
+		return err
+	}
 	file, err := s.load()
 	if err != nil {
 		return err
@@ -245,6 +254,19 @@ func (s *ServiceStore) Undeclare(name string) error {
 	}
 	file.Services = kept
 	return s.save(file)
+}
+
+// An unfinished journal acts on the declarations it recorded; changing them
+// underneath it could stop a job that is no longer declared.
+func (s *ServiceStore) refuseDuringUpgrade() error {
+	journal, err := s.loadJournal()
+	if err != nil {
+		return err
+	}
+	if journal != nil && !journal.finished() {
+		return errors.New("an unfinished supervisor upgrade journal exists; finish it with `relayd service resume` first")
+	}
+	return nil
 }
 
 // HasWork reports whether an upgrade on this host has declarations or an

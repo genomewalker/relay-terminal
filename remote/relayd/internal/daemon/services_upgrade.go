@@ -57,12 +57,15 @@ type serviceJournalEntry struct {
 	OldPID       int         `json:"old_pid,omitempty"`
 	HealthBefore string      `json:"health_before"`
 	Stopped      bool        `json:"stopped"`
-	Generation   int         `json:"generation"`
-	JobID        string      `json:"job_id"`
-	Launch       string      `json:"launch,omitempty"`
-	PID          int         `json:"pid,omitempty"`
-	HealthAfter  string      `json:"health_after,omitempty"`
-	Error        string      `json:"error,omitempty"`
+	// StopRequested is set durably before the cancel. A job that outlives its
+	// stop timeout may still exit later; Relaunch then launches it.
+	StopRequested bool   `json:"stop_requested,omitempty"`
+	Generation    int    `json:"generation"`
+	JobID         string `json:"job_id"`
+	Launch        string `json:"launch,omitempty"`
+	PID           int    `json:"pid,omitempty"`
+	HealthAfter   string `json:"health_after,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 type serviceJournal struct {
@@ -280,6 +283,11 @@ func (p ServicePlan) Print(w io.Writer) {
 func (u *ServiceUpgrade) Begin(plan ServicePlan) error {
 	if plan.Resume {
 		u.journal = plan.journal
+		if u.journal.Phase == serviceJournalStopping {
+			if err := plan.BlockerError(); err != nil {
+				return err
+			}
+		}
 	} else {
 		if err := plan.BlockerError(); err != nil {
 			return err
@@ -296,9 +304,21 @@ func (u *ServiceUpgrade) Begin(plan ServicePlan) error {
 	if u.journal.Phase != serviceJournalStopping {
 		return nil
 	}
+	file, err := u.Store.load()
+	if err != nil {
+		return err
+	}
+	declared := map[string]bool{}
+	for _, service := range file.Services {
+		declared[service.Name+"\x00"+service.JobID] = true
+	}
 	for i := len(u.journal.Entries) - 1; i >= 0; i-- {
 		entry := u.journal.Entries[i]
 		if entry.Stopped {
+			continue
+		}
+		// Only a job still declared under the same binding is ever stopped.
+		if !declared[entry.Spec.Name+"\x00"+entry.OldJobID] {
 			continue
 		}
 		if err := u.stop(entry); err != nil {
@@ -368,11 +388,20 @@ func (u *ServiceUpgrade) stop(entry *serviceJournalEntry) error {
 	if err != nil {
 		return err
 	}
+	if !status.known {
+		// The plan found it live in the ledger; an unreadable record is no
+		// evidence that it stopped.
+		return fmt.Errorf("the supervisor cannot report job %s; it was not stopped", entry.OldJobID)
+	}
 	if !status.live() {
 		return nil
 	}
 	if status.record.State != "running" {
 		return fmt.Errorf("job %s is %s and not controlled by this supervisor; stop it by hand", entry.OldJobID, status.record.State)
+	}
+	entry.StopRequested = true
+	if err := u.Store.saveJournal(u.journal); err != nil {
+		return err
 	}
 	if _, err := u.jobs.call(hostRequest{RequestID: serviceRequestID(), Operation: "cancel", JobID: entry.OldJobID}); err != nil {
 		return err
@@ -429,6 +458,9 @@ func (u *ServiceUpgrade) Relaunch(options ServiceResumeOptions) error {
 			if entry.Level != level {
 				continue
 			}
+			if !entry.Stopped && entry.StopRequested && u.awaitOldJobGone(entry) {
+				entry.Stopped = true
+			}
 			if !entry.Stopped {
 				u.keep(entry)
 				continue
@@ -476,12 +508,39 @@ func (u *ServiceUpgrade) Relaunch(options ServiceResumeOptions) error {
 	return u.Store.saveJournal(journal)
 }
 
+// keep leaves a service on its old job. entry.JobID stays the journaled
+// generation, so a later resume that finds the old job gone launches it.
 func (u *ServiceUpgrade) keep(entry *serviceJournalEntry) {
-	if entry.Launch == serviceLaunchKept {
-		return
-	}
-	entry.Launch, entry.JobID, entry.PID = serviceLaunchKept, entry.OldJobID, entry.OldPID
+	entry.Launch = serviceLaunchKept
 	entry.HealthAfter = serviceHealthWord(entry.Spec.Health)
+}
+
+// awaitOldJobGone gives a job already sent SIGTERM one more stop timeout to
+// exit. It is true only when the supervisor reports the job finished.
+func (u *ServiceUpgrade) awaitOldJobGone(entry *serviceJournalEntry) bool {
+	deadline := time.Now().Add(serviceStopTimeout)
+	for {
+		status, err := serviceStatus(u.jobs, entry.OldJobID)
+		if err == nil && status.known && !status.live() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(serviceStatusPollDelay)
+	}
+}
+
+// FinishRelaunch completes a journal already past its stops, so that a new
+// plan can include the services it relaunched. Other journals are left for
+// Begin to continue.
+func (u *ServiceUpgrade) FinishRelaunch() error {
+	journal, err := u.Store.loadJournal()
+	if err != nil || journal == nil || journal.Phase != serviceJournalRelaunching {
+		return err
+	}
+	u.journal = journal
+	return u.Relaunch(ServiceResumeOptions{})
 }
 
 // launch starts entry.JobID at most once. It always asks the supervisor about
@@ -649,6 +708,9 @@ func (u *ServiceUpgrade) Summary(w io.Writer) {
 		switch entry.Launch {
 		case serviceLaunchKept:
 			newJob = "kept " + entry.OldJobID
+			if entry.StopRequested {
+				newJob += " (SIGTERM sent; did not exit)"
+			}
 		case "":
 		default:
 			newJob = fmt.Sprintf("%s (%d)", entry.JobID, entry.PID)
