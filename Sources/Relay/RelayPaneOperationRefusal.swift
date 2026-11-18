@@ -35,6 +35,8 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
         case exitNotVerified = "exit_not_verified"
         case otherInstall = "other_install"
         case goalActive = "goal_active"
+        /// Informational, not a blocker: the pane is idle with a stalled /goal.
+        case goalStalled = "goal_stalled"
         case notRecoverable = "not_recoverable"
         case unsavedChanges = "unsaved_changes"
         case unclassified
@@ -83,6 +85,8 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
                 return "The newer agent is a different install; restart the pane by hand onto that install."
             case .goalActive:
                 return "The Codex /goal is still pursuing its objective; wait for it, or pause or clear it with /goal, then retry."
+            case .goalStalled:
+                return "Informational: the Codex /goal is stalled and waits for /goal resume; the pane is idle and a restart keeps the goal stalled."
             case .notRecoverable: return "List the host's managed panes again; the pane is gone or no longer running."
             case .unsavedChanges: return "Save or discard the pane's unsaved editor changes, then close it."
             case .unclassified: return "Read the blocker text; it names what held the operation."

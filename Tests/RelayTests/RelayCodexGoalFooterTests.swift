@@ -19,6 +19,25 @@ private enum GoalScreens {
     }
 }
 
+/// REAL capture: pane 9cc78978 (Codex on GPT-6.2-Astra, idle, stalled goal),
+/// relay_read_viewport by the team lead, 2026-11-18 ~06:30Z. Lines verbatim
+/// apart from the elided recap text; the viewport carries no SGR, so the
+/// native placeholder gets the faint style the screen export carries.
+private enum CapturedStalledGoal {
+    static let screen = [
+        "  Worked for 33s • 05:58" + String(repeating: " ", count: 107),
+        " ",
+        "  ↳ Recap: The Relay 0.5.111 review found three issues. ...",
+        "           Next: d415f009 will hand the fixes to 57c1dd5b for integration into candidate-05111." + String(repeating: " ", count: 36),
+        " ", " ", " ",
+        "› \u{1b}[2mAsk Codex to do anything\u{1b}[22m",
+        " ",
+        "  GPT-6.2-Astra high · ~ · Introduce yourself to collaborator",
+        "  ← for agents · ? for shortcuts" + String(repeating: " ", count: 43) +
+            "Goal stalled (/goal resume) · ⚠ 2 warnings · f2 to view",
+    ].joined(separator: "\r\n")
+}
+
 @Suite("Codex 0.170 /goal footer")
 struct RelayCodexGoalFooterTests {
     private func empty(_ screen: String) -> Bool { RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex") }
@@ -53,6 +72,27 @@ struct RelayCodexGoalFooterTests {
         let running = (["• Working (3s • esc to interrupt)", " ", "› " + GoalScreens.placeholder, " "] + footer)
             .joined(separator: "\r\n")
         #expect(!empty(running))
+    }
+
+    @Test func theCapturedStalledGoalScreenIsIdleWithAnInformationalNote() {
+        #expect(empty(CapturedStalledGoal.screen))
+        #expect(RelayAgentMaintenancePrompt.codexGoalBlocker(CapturedStalledGoal.screen) == nil)
+        #expect(RelayAgentMaintenancePrompt.codexGoalNote(CapturedStalledGoal.screen) == "goal_stalled")
+        #expect(RelayAgentMaintenancePrompt.codexGoalNote(GoalScreens.screen(footer: [GoalScreens.contextLine, GoalScreens.hintLine])) == nil)
+    }
+
+    @Test func theGoalSegmentShareTheHintRowWithOrWithoutWarnings() {
+        let hint = "  ← for agents · ? for shortcuts" + String(repeating: " ", count: 30)
+        #expect(empty(GoalScreens.screen(footer: [GoalScreens.contextLine, hint + "Goal stalled (/goal resume)"])))
+        #expect(empty(GoalScreens.screen(footer: [GoalScreens.contextLine, hint + "Goal stalled (/goal resume) · ⚠ 1 warning · f2 to view"])))
+        // Synthesized from the binary's strings, in the captured position.
+        #expect(empty(GoalScreens.screen(footer: [GoalScreens.contextLine, hint + "Goal achieved (1h 2m) · ⚠ 2 warnings · f2 to view"])))
+        let pursuing = GoalScreens.screen(footer: [GoalScreens.contextLine, hint + "Pursuing goal (4m) · ⚠ 2 warnings · f2 to view"])
+        #expect(!empty(pursuing))
+        #expect(RelayAgentMaintenancePrompt.codexGoalBlocker(pursuing) != nil)
+        // Anything else in that segment stays unrecognized.
+        #expect(!empty(GoalScreens.screen(footer: [GoalScreens.contextLine, hint + "Goal stalled (/goal resume) · foo"])))
+        #expect(!empty(GoalScreens.screen(footer: [GoalScreens.contextLine, hint + "Goal paused · ⚠ 2 warnings · f2 to view"])))
     }
 
     @Test func claudeScreensAreUnaffected() {

@@ -275,13 +275,27 @@ enum RelayAgentMaintenancePrompt {
     /// Codex 0.170's /goal status ("Pursuing goal (12m)"): the thread has an
     /// active goal, which Codex continues without new input.
     static func codexGoalPursuing(_ value: String) -> Bool {
-        value.range(of: #"(?:^|· )Pursuing goal \("#, options: .regularExpression) != nil
+        value.range(of: #"(?:^|· |  )Pursuing goal \("#, options: .regularExpression) != nil
     }
 
-    /// A whole footer row reporting a finished /goal ("Goal achieved (1h 2m)",
+    /// A /goal state that does not continue the thread by itself: stalled
+    /// (captured, 9cc78978) or achieved/unmet (from the 0.170.0 binary).
+    private static let codexSettledGoal = #"Goal (?:stalled \(/goal resume\)|(?:achieved|unmet) \([^)]*\))"#
+
+    /// A whole footer row reporting a settled /goal ("Goal achieved (1h 2m)",
     /// "Goal unmet (40m)"), optionally followed by " · " segments.
     static func codexGoalSettledRow(_ value: String) -> Bool {
-        value.range(of: #"^Goal (?:achieved|unmet) \([^)]*\)(?: · .+)?$"#, options: .regularExpression) != nil
+        value.range(of: "^" + codexSettledGoal + #"(?: · .+)?$"#, options: .regularExpression) != nil
+    }
+
+    /// Informational /goal state of an idle Codex footer: "goal_stalled" when
+    /// the goal waits for /goal resume (a restart keeps it stalled), else nil.
+    static func codexGoalNote(_ vt: String?) -> String? {
+        guard let vt, let prompt = prompt(vt, provider: "codex") else { return nil }
+        let stalled = prompt.rows.dropFirst(prompt.footer).contains {
+            String(String.UnicodeScalarView($0.map(\.character))).contains("Goal stalled (/goal resume)")
+        }
+        return stalled ? RelayPaneOperationRefusal.Code.goalStalled.rawValue : nil
     }
 
     /// The prompt blocker for a pane whose Codex footer shows an active goal.
@@ -312,8 +326,13 @@ enum RelayAgentMaintenancePrompt {
         let segments = value.components(separatedBy: "  ")
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         guard (1...2).contains(segments.count), segments[0] == "← for agents · ? for shortcuts" else { return false }
+        // Codex 0.170 puts a settled /goal state before the warnings on the
+        // same right-aligned segment: "Goal stalled (/goal resume) · ⚠ 2
+        // warnings · f2 to view" (9cc78978, 2026-11-18). A stalled goal waits
+        // for /goal resume, so the composer is idle.
         return segments.dropFirst().allSatisfy {
-            $0.range(of: #"^⚠ [0-9]+ warnings? · f2 to view$"#, options: .regularExpression) != nil
+            $0.range(of: #"^(?:"# + codexSettledGoal + #"(?: · |$))?(?:⚠ [0-9]+ warnings? · f2 to view)?$"#,
+                     options: .regularExpression) != nil && !$0.isEmpty
         }
     }
 
