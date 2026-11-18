@@ -342,6 +342,33 @@ func main() {
 		runAgent(os.Args[2:])
 	case "agent-launchers":
 		runAgentLaunchers(os.Args[2:])
+	case "codex-trust-like-parent":
+		// Opt-in (Relay setting codex_trust_mirror_parent, default off):
+		// trust exactly DIR in ACCOUNT's config.toml, mirroring the trust the
+		// user already gave its parent. Never answers Codex's dialog.
+		if len(os.Args) != 4 || !filepath.IsAbs(os.Args[3]) {
+			fatal("usage: relayd codex-trust-like-parent ACCOUNT_DIR|- ABSOLUTE_DIR")
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fatal(err.Error())
+		}
+		account := os.Args[2]
+		switch {
+		case account == "-":
+			account = filepath.Join(home, ".codex")
+		case strings.HasPrefix(account, "~/"):
+			account = filepath.Join(home, account[2:])
+		case !filepath.IsAbs(account):
+			fatal("the account directory must be ~/name, absolute, or - for the default")
+		}
+		parent, err := agentaccounts.TrustCodexDirectoryLikeParent(filepath.Clean(account), filepath.Clean(os.Args[3]))
+		if err != nil {
+			fatal(err.Error())
+		}
+		if err := daemon.EncodeJSON(os.Stdout, map[string]string{"status": "trusted", "cwd": filepath.Clean(os.Args[3]), "mirrored_parent": parent}); err != nil {
+			fatal(err.Error())
+		}
 	case "codex-login":
 		runCodexLogin(os.Args[2:])
 	case "codex-relay-profile":

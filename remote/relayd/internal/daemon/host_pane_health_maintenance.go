@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/relay-terminal/relayd/internal/agentaccounts"
 	"io"
 	"math/big"
 	"net"
@@ -2118,7 +2119,7 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 			command, commandError = nil, exception.msg
 		}
 	}
-	var login any
+	var login, codexTrust any
 	if provider == "codex" {
 		// Same-pane restart: refused when the pane's own pinned folder is
 		// logged in to another ChatGPT account. base stays, so the pane can
@@ -2129,6 +2130,14 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 		started := float64(-1)
 		phCatchAll(func() { started = r.processEpoch(pid) })
 		login = codexLoginObservation(phHome(), account, started)
+		// Whether a Codex relaunched in the conversation's directory would
+		// stop at its folder-trust dialog under this account's config.toml.
+		if directory, ok := phGet(context, "cwd", nil).(string); ok && strings.HasPrefix(directory, "/") {
+			phCatchAll(func() {
+				trust := agentaccounts.CodexProjectTrust(phMaintenanceAccountRoot(provider, account), directory)
+				codexTrust = pyObj("status", trust.Status, "cwd", trust.Dir, "parent", trust.Parent)
+			})
+		}
 	}
 	var moved, moveError, accountMatches any
 	if target != nil {
@@ -2162,7 +2171,7 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 		"background_work", backgroundWork, "subagent_work", subagents,
 		"harness_status", harness, "background_agent_jobs", hostJobs, "resume_command", command, "resume_error", commandError, "resume_error_code", paneRefusalCodeOrNil(commandError),
 		"config_dir", phAccountLabelDir(account, provider),
-		"account_matches", accountMatches, "move_command", moved, "move_error", moveError, "move_error_code", paneRefusalCodeOrNil(moveError), "login", login)
+		"account_matches", accountMatches, "move_command", moved, "move_error", moveError, "move_error_code", paneRefusalCodeOrNil(moveError), "login", login, "codex_trust", codexTrust)
 }
 
 // installedRelayImage is installed_relay_image(binary): the reviewed
