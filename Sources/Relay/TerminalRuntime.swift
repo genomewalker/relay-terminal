@@ -3380,30 +3380,96 @@ final class TerminalRuntime: NSObject {
     /// unchanged grid; nothing is typed. Refused unless the pane has no
     /// surface, is connected with no other viewer and the copy is cut short;
     /// the caller also requires relayd's idle proof, no draft and no approval.
+    ///
+    /// 0.5.114 (case f52d610f): Codex redraws only what changed, so at an
+    /// unchanged grid it answers the redraw signal with no visible character
+    /// and the fresh screen is blank. A blank screen is never a complete one:
+    /// the hidden pane's grid is then bounced one row and back, a real size
+    /// change that makes the agent repaint in full, ending on the same grid.
+    /// A blank saved copy left by an earlier attempt takes the bounce directly.
     func refreshHiddenScreenBaseForInstalledUpdate() async -> Bool {
         guard let pane, pane.profile.backend == .relay, pane.connectionState == .connected, started,
-              observeActiveScreen() == .noSurface, (pane.remoteClientCount ?? 1) <= 1,
-              io.maintenanceScreenAvailability().reason == TerminalIOBridge.savedCopyCutShort else { return false }
-        guard io.requestFreshRedraw() else {
-            hiddenScreenRefreshNote = "the pane's worker cannot give a fresh screen (needs relayd 0.5.38 in this worker)"
-            recordInputDiagnostic("hidden-screen-fresh-redraw-unsupported")
-            return false
-        }
-        recordInputDiagnostic("hidden-screen-fresh-redraw")
-        for _ in 0..<60 {
-            try? await Task.sleep(for: .milliseconds(250))
-            guard self.pane === pane else { return false }
-            if case .available = io.maintenanceScreenAvailability() {
+              observeActiveScreen() == .noSurface, (pane.remoteClientCount ?? 1) <= 1 else { return false }
+        let availability = io.maintenanceScreenAvailability()
+        var blank = false
+        if case .available = availability { blank = await hiddenScreenIsBlank() }
+        guard blank || availability.reason == TerminalIOBridge.savedCopyCutShort else { return false }
+        if !blank {
+            guard io.requestFreshRedraw() else {
+                hiddenScreenRefreshNote = "the pane's worker cannot give a fresh screen (needs relayd 0.5.38 in this worker)"
+                recordInputDiagnostic("hidden-screen-fresh-redraw-unsupported")
+                return false
+            }
+            recordInputDiagnostic("hidden-screen-fresh-redraw")
+            var arrived = false
+            for _ in 0..<60 {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard self.pane === pane else { return false }
+                if case .available = io.maintenanceScreenAvailability() { arrived = true; break }
+                if let outcome = io.freshRedrawOutcome, outcome.hasPrefix("refused") {
+                    hiddenScreenRefreshNote = "the worker " + outcome
+                    return false
+                }
+            }
+            guard arrived else {
+                hiddenScreenRefreshNote = "a fresh screen was requested but did not arrive within 15 s" +
+                    (io.freshRedrawOutcome.map { " (" + $0 + ")" } ?? "")
+                return false
+            }
+            guard await hiddenScreenIsBlank() else {
                 hiddenScreenRefreshNote = nil
                 return true
             }
-            if let outcome = io.freshRedrawOutcome, outcome.hasPrefix("refused") {
-                hiddenScreenRefreshNote = "the worker " + outcome
+        }
+        return await bounceHiddenScreenRows(pane)
+    }
+
+    /// The hidden pane's saved screen has no visible character.
+    func hiddenScreenIsBlank() async -> Bool {
+        guard let snapshot = io.maintenanceScreenSnapshot() else { return false }
+        let vt = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport)
+        return Self.screenIsBlank(vt)
+    }
+
+    /// A screen with no visible character, or none at all.
+    nonisolated static func screenIsBlank(_ vt: String?) -> Bool {
+        vt?.allSatisfy(\.isWhitespace) ?? true
+    }
+
+    /// The grids a hidden pane passes through to repaint an agent that drew
+    /// nothing at its unchanged grid: one row fewer, then the grid itself.
+    nonisolated static func hiddenRowBounce(_ viewport: RelayViewport) -> [RelayViewport]? {
+        guard viewport.rows > 5, viewport.columns >= 20 else { return nil }
+        return [RelayViewport(columns: Int(viewport.columns), rows: Int(viewport.rows) - 1), viewport]
+    }
+
+    private func bounceHiddenScreenRows(_ pane: PaneModel) async -> Bool {
+        let blankNote = "the agent redrew nothing at its unchanged grid"
+        guard let steps = Self.hiddenRowBounce(io.currentViewport) else {
+            hiddenScreenRefreshNote = blankNote + ", and the grid is too small to bounce"
+            return false
+        }
+        recordInputDiagnostic("hidden-screen-row-bounce")
+        for step in steps {
+            // Only a pane with no renderer: a surface would own its grid.
+            guard self.pane === pane, observeActiveScreen() == .noSurface,
+                  io.sendHiddenRowBounceStep(step) else {
+                hiddenScreenRefreshNote = blankNote + "; the one-row bounce could not be sent"
                 return false
             }
+            try? await Task.sleep(for: .milliseconds(400))
         }
-        hiddenScreenRefreshNote = "a fresh screen was requested but did not arrive within 15 s" +
-            (io.freshRedrawOutcome.map { " (" + $0 + ")" } ?? "")
+        for _ in 0..<20 {
+            try? await Task.sleep(for: .milliseconds(250))
+            guard self.pane === pane else { return false }
+            if io.maintenanceScreenSnapshot() != nil, !(await hiddenScreenIsBlank()) {
+                // Let the repaint finish before the screen is proven.
+                try? await Task.sleep(for: .milliseconds(300))
+                hiddenScreenRefreshNote = nil
+                return true
+            }
+        }
+        hiddenScreenRefreshNote = blankNote + ", and a one-row bounce gave no screen within 5 s"
         return false
     }
 
@@ -3924,10 +3990,17 @@ final class TerminalRuntime: NSObject {
     /// depends on the pane being shown.
     func agentResumePromptCheck(expected: RelayPromptOwnerBinding) async -> (token: UUID?, refusal: RelayPaneOperationRefusal?) {
         if let token = await agentResumePromptProof(expected: expected) { return (token, nil) }
-        if observeActiveScreen() == .noSurface, io.maintenanceScreenSnapshot() == nil {
+        var hiddenScreenMissing = false
+        if observeActiveScreen() == .noSurface {
+            hiddenScreenMissing = io.maintenanceScreenSnapshot() == nil
+            if !hiddenScreenMissing { hiddenScreenMissing = await hiddenScreenIsBlank() }
+        }
+        if hiddenScreenMissing {
             if await refreshHiddenScreenBaseForInstalledUpdate(),
                let token = await agentResumePromptProof(expected: expected) { return (token, nil) }
-            if io.maintenanceScreenSnapshot() == nil {
+            var stillMissing = io.maintenanceScreenSnapshot() == nil
+            if !stillMissing { stillMissing = await hiddenScreenIsBlank() }
+            if stillMissing {
                 return (nil, .init(.noRendererForIdleProof, "the pane has no native renderer and its worker gave no complete screen" +
                     (hiddenScreenRefreshNote.map { " (" + $0 + ")" } ?? "")))
             }
@@ -3955,6 +4028,10 @@ final class TerminalRuntime: NSObject {
         if expected.inputOnly == true { return .init(.unsupportedPane, "the pane's agent is an input-only frontend") }
         guard let vt else {
             return .init(.noRendererForIdleProof, "the pane has no native renderer and no complete worker screen")
+        }
+        // A blank screen is a redraw that drew nothing, not a prompt (f52d610f).
+        if screenIsBlank(vt) {
+            return .init(.noRendererForIdleProof, "the pane's screen is blank: the agent redrew nothing")
         }
         let provider = expected.provider
         guard provider == "codex" || provider == "claude" else {
@@ -4989,6 +5066,16 @@ final class TerminalIOBridge: @unchecked Sendable {
         receiveLock.lock()
         snapshotBufferTruncated = true
         receiveLock.unlock()
+    }
+
+    /// One grid step of a hidden pane's row bounce; the committed viewport
+    /// (latestViewport, lastSentViewport) is unchanged, since the bounce ends
+    /// on it.
+    func sendHiddenRowBounceStep(_ viewport: RelayViewport) -> Bool {
+        resizeLock.lock()
+        let currentTransport = transport
+        resizeLock.unlock()
+        return currentTransport?.sendHiddenRowBounceStep(columns: viewport.columns, rows: viewport.rows) == true
     }
 
     /// Asks the worker for one screen from a reset and the agent's redraw.

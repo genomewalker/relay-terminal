@@ -41,6 +41,7 @@ let package = Package(
             name: "RelayTests",
             dependencies: ["Relay"],
             path: "Tests/RelayTests",
+            exclude: ["HiddenRedrawFixtures"],
             resources: [.copy("ShepherdSeeds")]
         )
     ]

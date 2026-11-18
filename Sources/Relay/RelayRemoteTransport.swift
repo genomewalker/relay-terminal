@@ -1683,6 +1683,23 @@ final class RelayRemoteTransport: @unchecked Sendable {
         writer?.writeAsync(type: .resize, payload: payload)
     }
 
+    /// 0.5.114 (case f52d610f): one step of a hidden pane's row bounce, sent
+    /// only when the pane has no renderer, so no Ghostty grid can disagree
+    /// with it. The same input-control conditions as a fresh redraw apply.
+    func sendHiddenRowBounceStep(columns: UInt16, rows: UInt16) -> Bool {
+        lock.lock()
+        guard attached, !detached, !sessionEnded, let writer,
+              let context = connectionContext, !context.observeAgentsOnly,
+              promptEditorControlGranted || !attachedWithInputLease else {
+            lock.unlock()
+            return false
+        }
+        latestResize = (columns, rows)
+        lock.unlock()
+        writeResize(columns: columns, rows: rows, using: writer)
+        return true
+    }
+
     /// Asks the attached worker for one screen built from a reset and the
     /// agent's redraw, with no retained output (fresh_redraw_v1). Refused for
     /// an older worker, an observer, or a route without input control. The
