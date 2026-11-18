@@ -384,6 +384,17 @@ func main() {
 		if err := daemon.EncodeJSON(os.Stdout, plan); err != nil {
 			fatal(err.Error())
 		}
+	case "codex-pane-relaunch-plan":
+		if len(os.Args) != 5 {
+			fatal("usage: relayd codex-pane-relaunch-plan PANE TARGET_SESSION ACCOUNT_DIR")
+		}
+		plan, err := daemon.ReadCodexPaneRelaunchPlan(os.Args[2], os.Args[3], os.Args[4])
+		if err != nil {
+			fatalRefusal(err)
+		}
+		if err := daemon.EncodeJSON(os.Stdout, plan); err != nil {
+			fatal(err.Error())
+		}
 	case "claude-pane-resume-plan":
 		if len(os.Args) != 4 {
 			fatal("usage: relayd claude-pane-resume-plan PANE EXPECTED_SESSION")
