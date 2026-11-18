@@ -22,6 +22,7 @@ const (
 	PaneRefusalLauncherUnavailable = "launcher_unavailable"
 	PaneRefusalInvalidRequest      = "invalid_request"
 	PaneRefusalTrustPrompt         = "trust_prompt"
+	PaneRefusalOutsideProxy        = "native_outside_proxy"
 	PaneRefusalUnclassified        = "unclassified"
 )
 
@@ -47,6 +48,7 @@ var paneRefusalClearing = map[string]string{
 	PaneRefusalLauncherUnavailable: "Repair Relay's agent launchers on that host (relayd agent-launchers --repair), then retry.",
 	PaneRefusalInvalidRequest:      "Pass the exact pane and session UUIDs.",
 	PaneRefusalTrustPrompt:         "Trust the folder in the Codex account's config.toml (or enable Relay's matching-parent trust setting), then retry; Relay never answers the trust dialog.",
+	PaneRefusalOutsideProxy:        "Exit this Codex yourself (or close its task in Codex desktop), then relaunch the conversation from Relay's launch form (relay_launch_agent), which runs it through Relay's proxy.",
 	PaneRefusalUnclassified:        "Read the blocker text; it names what held the operation.",
 }
 
@@ -73,6 +75,7 @@ var paneRefusalPatterns = []struct{ fragment, code string }{
 	{"changed its selected session", PaneRefusalPaneChanged},
 	{"launcher unavailable", PaneRefusalLauncherUnavailable},
 	{"managed frontend route is unavailable", PaneRefusalRelaunchUnavailable},
+	{"outside Relay's proxy", PaneRefusalOutsideProxy},
 	{"outside this pane's project", PaneRefusalOutsideProject},
 	{"resume command is unavailable", PaneRefusalResumeUnavailable},
 	{"missing or ambiguous", PaneRefusalResumeUnavailable},

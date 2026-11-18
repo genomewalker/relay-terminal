@@ -3372,7 +3372,8 @@ final class TerminalRuntime: NSObject {
     /// Outcome of the last fresh-base request, named in held receipts.
     private(set) var hiddenScreenRefreshNote: String?
 
-    /// 0.5.62, for a user-requested installed update only: a hidden pane
+    /// 0.5.62, for an installed update; 0.5.113 also for an account move and a
+    /// same-pane resume, instead of showing the pane (case f52d610f). A hidden pane
     /// whose saved copy was cut short at restore asks its worker for one
     /// screen made of a reset and the agent's own redraw, with no old output.
     /// The worker sends the redraw signal that showing the pane causes, at the
@@ -3864,6 +3865,62 @@ final class TerminalRuntime: NSObject {
     }
 
     func agentResumeOwner() async -> RelayPromptOwnerBinding? { await readPromptOwnerBinding()?.binding }
+
+    /// The resume prompt proof, or the named reason it is missing. A hidden
+    /// pane with neither a renderer nor a complete worker screen first asks
+    /// its worker for one fresh screen (nothing typed), so the proof never
+    /// depends on the pane being shown.
+    func agentResumePromptCheck(expected: RelayPromptOwnerBinding) async -> (token: UUID?, refusal: RelayPaneOperationRefusal?) {
+        if let token = await agentResumePromptProof(expected: expected) { return (token, nil) }
+        if observeActiveScreen() == .noSurface, io.maintenanceScreenSnapshot() == nil {
+            if await refreshHiddenScreenBaseForInstalledUpdate(),
+               let token = await agentResumePromptProof(expected: expected) { return (token, nil) }
+            if io.maintenanceScreenSnapshot() == nil {
+                return (nil, .init(.noRendererForIdleProof, "the pane has no native renderer and its worker gave no complete screen" +
+                    (hiddenScreenRefreshNote.map { " (" + $0 + ")" } ?? "")))
+            }
+        }
+        guard let owner = await readPromptOwnerBinding()?.binding, owner == expected else {
+            return (nil, .init(.paneChanged, "the pane's agent process or session changed"))
+        }
+        var vt: String?
+        if let snapshot = io.maintenanceScreenSnapshot() {
+            vt = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport)
+        } else if case .screen(let screen, _) = observeActiveScreen() { vt = screen }
+        guard let pane else { return (nil, .init(.paneChanged, "the pane closed")) }
+        let busy = pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true
+        return (nil, Self.agentResumePromptBlocker(expected: expected, vt: vt, pendingApprovals: pane.pendingAgentApprovals,
+            composerBusy: busy) ?? .init(.promptUnverified, "the screen changed while it was proven"))
+    }
+
+    /// Why `agentResumePromptAdmits` refuses, each cause by its own code; nil
+    /// when it admits. A stalled /goal is idle (informational goal_stalled).
+    nonisolated static func agentResumePromptBlocker(expected: RelayPromptOwnerBinding, vt: String?,
+                                                    pendingApprovals: Int, composerBusy: Bool) -> RelayPaneOperationRefusal? {
+        if agentResumePromptAdmits(expected: expected, vt: vt, pendingApprovals: pendingApprovals, composerBusy: composerBusy) { return nil }
+        if pendingApprovals > 0 { return .init(.approvalPending, "the agent is waiting for a permission answer") }
+        if composerBusy { return .init(.draftPresent, "Relay's composer holds an unsent or delivering prompt") }
+        if expected.inputOnly == true { return .init(.unsupportedPane, "the pane's agent is an input-only frontend") }
+        guard let vt else {
+            return .init(.noRendererForIdleProof, "the pane has no native renderer and no complete worker screen")
+        }
+        let provider = expected.provider
+        guard provider == "codex" || provider == "claude" else {
+            return .init(.promptUnverified, "the retained shell's prompt is not recognized as empty")
+        }
+        if provider == "codex", RelayAgentMaintenancePrompt.isCodexFolderTrustDialog(vt) {
+            return .init(.trustPrompt, RelayAgentMaintenancePrompt.folderTrustBlocker)
+        }
+        if provider == "codex", let goal = RelayAgentMaintenancePrompt.codexGoalBlocker(vt) { return .init(.goalActive, goal) }
+        if RelayAgentMaintenancePrompt.hasTypedText(vt, provider: provider) {
+            return .init(.draftPresent, "the agent's prompt holds typed text")
+        }
+        if vt.localizedCaseInsensitiveContains("esc to interrupt") {
+            return .init(.turnActive, "the agent's turn is running")
+        }
+        if let work = RelayAgentMaintenancePrompt.backgroundWork(vt, provider: provider) { return .init(.backgroundWork, work) }
+        return .init(.promptUnverified, "the agent's prompt is not recognized as idle and empty")
+    }
 
     /// Budget notices may observe the native prompt but never authorize input.
     func budgetPromptEmpty() -> Bool? {

@@ -314,6 +314,12 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
             }
         }
         defer { restoreSelection() }
+        // Worker state first: a hidden pane asks its worker for one fresh
+        // screen (nothing typed, no focus change). Only when that gives none
+        // is the pane shown, as before.
+        if screenRefusal(pane) != nil, await refreshWorkerScreen(pane), screenRefusal(pane) == nil {
+            statuses[pane.id] = "Read the hidden pane's screen from its worker"
+        }
         if screenRefusal(pane) != nil {
             if workspace.activePaneID != pane.id {
                 shownByMove = true
@@ -328,14 +334,14 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                 }
                 guard Date() < screenDeadline else {
                     return finish("refused", "Relay showed this pane but could not read its screen within " +
-                        "\(Int(screenTimeout)) s (\(unreadable)); nothing was sent.")
+                        "\(Int(screenTimeout)) s (\(unreadable)); nothing was sent.", nil, .noRendererForIdleProof)
                 }
                 try? await Task.sleep(nanoseconds: UInt64(screenInterval * 1e9))
             }
             restoreSelection()
             if let unreadable = screenRefusal(pane) {
                 return finish("refused", "Relay read this pane's screen while it was shown, but not after the earlier " +
-                    "selection was restored (\(unreadable)); nothing was sent.")
+                    "selection was restored (\(unreadable)); nothing was sent.", nil, .noRendererForIdleProof)
             }
         }
         // Input never goes to a pane that is key only because the move showed it.
@@ -662,6 +668,10 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
     /// Shows the pane, as selecting it in the workspace does.
     var presentPane: @MainActor (PaneModel, WorkspaceModel) -> Void = { pane, workspace in
         _ = try? workspace.selectWorkspacePane(pane.id)
+    }
+    /// Asks a hidden pane's worker for one fresh screen; true once it arrived.
+    var refreshWorkerScreen: @MainActor (PaneModel) async -> Bool = { pane in
+        await pane.runtime.refreshHiddenScreenBaseForInstalledUpdate()
     }
     /// Why the pane's screen cannot be read yet, or nil once it can.
     var screenRefusal: @MainActor (PaneModel) -> String? = { $0.runtime.accountMoveScreenRefusal() }

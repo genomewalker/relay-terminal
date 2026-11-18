@@ -2120,12 +2120,17 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 		}
 	}
 	var login, codexTrust any
+	outsideProxy := false
 	if provider == "codex" {
 		// Same-pane restart: refused when the pane's own pinned folder is
 		// logged in to another ChatGPT account. base stays, so the pane can
 		// still be moved out of that folder.
 		if refusal := codexLoginRefusal(phHome(), account); refusal != "" && command != nil {
 			command, commandError = nil, refusal
+		}
+		// A Codex outside Relay's proxy is neither restarted nor moved.
+		if codexOutsideProxy(pane) {
+			command, commandError, outsideProxy = nil, codexOutsideProxyMessage, true
 		}
 		started := float64(-1)
 		phCatchAll(func() { started = r.processEpoch(pid) })
@@ -2140,7 +2145,9 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 		}
 	}
 	var moved, moveError, accountMatches any
-	if target != nil {
+	if target != nil && outsideProxy {
+		moveError = codexOutsideProxyMessage
+	} else if target != nil {
 		if exception := phCatch(func() {
 			moved = r.accountMoveCommand(provider, sessionText, path, base, account, *target, binary)
 		}, phOSError, phValueError); exception != nil {
@@ -2171,7 +2178,7 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 		"background_work", backgroundWork, "subagent_work", subagents,
 		"harness_status", harness, "background_agent_jobs", hostJobs, "resume_command", command, "resume_error", commandError, "resume_error_code", paneRefusalCodeOrNil(commandError),
 		"config_dir", phAccountLabelDir(account, provider),
-		"account_matches", accountMatches, "move_command", moved, "move_error", moveError, "move_error_code", paneRefusalCodeOrNil(moveError), "login", login, "codex_trust", codexTrust)
+		"account_matches", accountMatches, "move_command", moved, "move_error", moveError, "move_error_code", paneRefusalCodeOrNil(moveError), "login", login, "codex_trust", codexTrust, "codex_outside_proxy", outsideProxy)
 }
 
 // installedRelayImage is installed_relay_image(binary): the reviewed

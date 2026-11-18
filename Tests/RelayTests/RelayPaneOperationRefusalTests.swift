@@ -140,7 +140,8 @@ struct RelayPaneOperationRefusalTests {
         #expect(code() == nil)
         #expect(code(claude) == .invalidRequest)
         #expect(code(busy: true) == .operationInProgress)
-        #expect(code(authorized: false) == .notAuthorized)
+        // 0.5.113: a missing or expired grant is its own code (was not_authorized).
+        #expect(code(authorized: false) == .authorizationGrant)
         #expect(code(backend: .direct) == .unsupportedPane)
         #expect(code(connection: .disconnected("gone")) == .paneNotConnected)
         #expect(code(content: .editor) == .unsupportedPane)
@@ -171,4 +172,13 @@ struct RelayPaneOperationRefusalTests {
         // The MCP bridge keeps the first 1024 bytes of a refusal body.
         #expect(response.body.count < 1024)
     }
+}
+
+/// Item 4 (0173baf5): relayd's outside-proxy refusal keeps its code in Swift,
+/// from a coded refusal line and from the plain resume_error text alike.
+@Test func aCodexOutsideRelaysProxyIsNamed() {
+    let message = "This Codex runs outside Relay's proxy, attached directly to Codex's own app-server daemon (shared with Codex desktop); Relay does not exit or relaunch it."
+    #expect(RelayPaneOperationRefusal.classify(message) == .nativeOutsideProxy)
+    let line = #"refusal: {"reason_code":"native_outside_proxy","blocker":"x","how_to_clear":"y"}"#
+    #expect(RelayPaneOperationRefusal.hostRefusal(stderr: Data(("relayd: x\n" + line + "\n").utf8))?.code == .nativeOutsideProxy)
 }

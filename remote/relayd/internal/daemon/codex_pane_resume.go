@@ -115,7 +115,34 @@ func codexRelaunchCommand(home, config, target string) (string, string, error) {
 // Codex backend (case 7db531e6): its proxy descriptor must name this pane and
 // an absolute frontend socket, the same precondition maintenance's restart
 // has, or the pane is not exited because it could not be relaunched the same way.
+// codexOutsideProxyMessage is the refusal for a Codex frontend attached
+// directly to Codex's own app-server daemon (the one Codex desktop shares),
+// not through Relay's per-pane proxy (case 0173baf5: 0.167.0 frontend,
+// managed daemon 0.170.0, holding a desktop task). Relaunching it through
+// Relay would move the conversation off that daemon while it still holds it.
+const codexOutsideProxyMessage = "This Codex runs outside Relay's proxy, attached directly to Codex's own app-server daemon (shared with Codex desktop); Relay does not exit or relaunch it."
+
+// codexOutsideProxy reports whether the pane's Codex is bound through the
+// native daemon endpoint without a Relay proxy. Replaceable in tests.
+var codexOutsideProxy = func(pane string) bool {
+	if _, err := readStockCodexProxyBinding(pane); !errors.Is(err, errNoStockCodexProxy) {
+		return false
+	}
+	binding, err := ReadNativeCodexBinding(pane)
+	return err == nil && binding.Source == "native_runtime_mcp_origin" && binding.NativeEndpoint != nil
+}
+
+func codexOutsideProxyRefusal(pane string) *PaneRefusal {
+	if codexOutsideProxy(pane) {
+		return newPaneRefusal(PaneRefusalOutsideProxy, codexOutsideProxyMessage)
+	}
+	return nil
+}
+
 func codexManagedRouteRefusal(pane string) *PaneRefusal {
+	if refusal := codexOutsideProxyRefusal(pane); refusal != nil {
+		return refusal
+	}
 	path := filepath.Join(phWorkerStateDirectory(), "relay/workers/codex-proxies", pane, "descriptor.json")
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
