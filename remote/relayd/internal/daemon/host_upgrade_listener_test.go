@@ -939,14 +939,25 @@ func TestHostUpgradeListenerUntouchedWhileAnotherJobBlocks(t *testing.T) {
 }
 
 func TestHostUpgradeUndrainedListenerDefersAndDrainedOnesResumeHere(t *testing.T) {
-	previous := hostUpgradeListenerDrain
-	hostUpgradeListenerDrain = 300 * time.Millisecond
-	t.Cleanup(func() { hostUpgradeListenerDrain = previous })
+	// The drained listener (first in job order) keeps the default 10-second
+	// budget, so a slow exit under load is not misreported as undrained. Only
+	// the stubborn one, which ignores TERM, gets a short wait of its own.
+	previous := hostListenerDrainWait
+	hostListenerDrainWait = func(job *hostJob, deadline time.Time) bool {
+		job.mu.Lock()
+		id := job.record.JobID
+		job.mu.Unlock()
+		if id == "job-stubborn" {
+			deadline = time.Now().Add(300 * time.Millisecond)
+		}
+		return waitHostJobExited(job, deadline)
+	}
+	t.Cleanup(func() { hostListenerDrainWait = previous })
 	f := newListenerFixture(t)
 	s := f.server()
 	_, stubborn := f.launch(s, "job-stubborn", "route-a", stubbornListener)
 	_, drained := f.launch(s, "job-drained", "route-b", drainingListener)
-	if err := s.prepareHostUpgrade(); err == nil || !strings.Contains(err.Error(), "did not drain") {
+	if err := s.prepareHostUpgrade(); err == nil || !strings.Contains(err.Error(), "peer listener job-stubborn did not drain in time") {
 		t.Fatalf("undrained listener did not defer: %v", err)
 	}
 	if !s.hostUpgradeUntil.IsZero() {
@@ -967,15 +978,20 @@ func TestHostUpgradeUndrainedListenerDefersAndDrainedOnesResumeHere(t *testing.T
 }
 
 func TestHostUpgradeFailedDrainDefersAndLeavesLaterListenersUntouched(t *testing.T) {
-	previous := hostUpgradeListenerDrain
-	hostUpgradeListenerDrain = 500 * time.Millisecond
-	t.Cleanup(func() { hostUpgradeListenerDrain = previous })
 	for _, test := range []struct{ name, script, reason string }{
 		{"nonzero exit", failingListener, "did not drain cleanly: exited with status 3"},
 		{"killed by signal", crashingListener, "did not drain cleanly: exited with status -1 (signal: killed)"},
 		{"timeout", stubbornListener, "did not drain in time"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			// Only the timeout case needs a short budget. The others keep the
+			// default, so a listener slow to exit under load is not misreported
+			// as undrained. The failing listener is first, so the budget is its own.
+			if test.script == stubbornListener {
+				previous := hostUpgradeListenerDrain
+				hostUpgradeListenerDrain = 500 * time.Millisecond
+				t.Cleanup(func() { hostUpgradeListenerDrain = previous })
+			}
 			f := newListenerFixture(t)
 			s := f.server()
 			// Drains run in job order, so the failing listener goes first.

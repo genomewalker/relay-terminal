@@ -21,6 +21,10 @@ const hostJobKindPeerListener = "peer_listener_v1"
 // Bounded so the whole preparation stays within the 30-second upgrade probe.
 var hostUpgradeListenerDrain = 10 * time.Second
 
+// Waits for a signaled listener to exit by the drain deadline. Tests replace
+// it to give one listener its own deadline.
+var hostListenerDrainWait = waitHostJobExited
+
 // The handoff barrier. A supervisor still serving when it lapses was not
 // replaced, so it resumes the listeners it drained.
 var hostUpgradeHandoff = 30 * time.Second
@@ -202,7 +206,7 @@ func (s *Server) drainHostListener(job *hostJob, deadline time.Time) (bool, erro
 		return false, fmt.Errorf("peer listener %s could not be drained: %v", id, err)
 	}
 	job.mu.Unlock()
-	if !waitHostJobExited(job, deadline) {
+	if !hostListenerDrainWait(job, deadline) {
 		// Still running: it keeps its active registration. If it exits later it
 		// deregisters, and its client relaunches it.
 		job.mu.Lock()
