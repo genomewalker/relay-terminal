@@ -173,3 +173,12 @@ struct RelayPaneOperationRefusalTests {
         #expect(response.body.count < 1024)
     }
 }
+
+/// Item 4 (0173baf5): relayd's outside-proxy refusal keeps its code in Swift,
+/// from a coded refusal line and from the plain resume_error text alike.
+@Test func aCodexOutsideRelaysProxyIsNamed() {
+    let message = "This Codex runs outside Relay's proxy, attached directly to Codex's own app-server daemon (shared with Codex desktop); Relay does not exit or relaunch it."
+    #expect(RelayPaneOperationRefusal.classify(message) == .nativeOutsideProxy)
+    let line = #"refusal: {"reason_code":"native_outside_proxy","blocker":"x","how_to_clear":"y"}"#
+    #expect(RelayPaneOperationRefusal.hostRefusal(stderr: Data(("relayd: x\n" + line + "\n").utf8))?.code == .nativeOutsideProxy)
+}

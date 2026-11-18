@@ -54,6 +54,9 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
         case closeRefused = "close_refused"
         /// Automatic maintenance waits between attempts on this pane.
         case coolingDown = "cooling_down"
+        /// A Codex attached directly to Codex's own app-server daemon, not
+        /// through Relay's proxy (0173baf5); Relay does not exit or relaunch it.
+        case nativeOutsideProxy = "native_outside_proxy"
         case unclassified
 
         /// What the operator or an MCP client does to clear this refusal.
@@ -118,6 +121,8 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
                 return "Nothing was sent. Select the pane's tab once, or wait for its worker to deliver a fresh screen, then retry."
             case .closeRefused: return "Read the blocker; end or detach what keeps the pane open, then close it again."
             case .coolingDown: return "Wait for the cooling interval to end; maintenance retries this pane by itself."
+            case .nativeOutsideProxy:
+                return "Exit this Codex yourself (or close its task in Codex desktop), then relaunch the conversation from Relay's launch form (relay_launch_agent), which runs it through Relay's proxy."
             case .unclassified: return "Read the blocker text; it names what held the operation."
             }
         }
@@ -155,6 +160,7 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
             ("already uses that account", .targetAccountUnavailable),
             ("is not ready for this conversation", .targetAccountUnavailable),
             (RelayAgentMaintenancePrompt.goalBlockerPrefix, .goalActive),
+            ("outside Relay's proxy", .nativeOutsideProxy),
             ("folder-trust", .trustPrompt), ("folder trust", .trustPrompt), ("is not trusted", .trustPrompt),
             ("terminal input grant", .notAuthorized), ("user-initiated only", .notAuthorized),
             ("Only the user can", .notAuthorized), ("No durable quota failover intent", .notAuthorized),

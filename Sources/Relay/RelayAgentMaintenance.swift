@@ -46,6 +46,8 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
     var moveCommand: String? = nil
     var moveError: String? = nil
     var moveErrorCode: String? = nil
+    /// The Codex is bound to Codex's own daemon, not through Relay's proxy.
+    var codexOutsideProxy: Bool? = nil
     /// Codex: the ChatGPT login in the running agent's folder and its pin.
     var login: RelayAgentLoginObservation? = nil
     /// Codex: how the pane's account config.toml trusts the conversation's
@@ -64,7 +66,7 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
         case version, provider, bound, lifecycle, revision, owner, unavailable
         case paneID = "paneId", processID = "processId", processStart, sessionID = "sessionId"
         case installedUpdate, installedImageCurrent, runningVersion, installedVersion, outdatedOtherInstall
-        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, resumeErrorCode, worker, context, configDir, accountMatches, moveCommand, moveError, moveErrorCode, login, codexTrust
+        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, resumeErrorCode, worker, context, configDir, accountMatches, moveCommand, moveError, moveErrorCode, login, codexTrust, codexOutsideProxy
     }
 
     /// Native image versions on the pane's host; nil when either is unverified.
