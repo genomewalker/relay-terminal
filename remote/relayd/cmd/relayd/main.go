@@ -52,7 +52,7 @@ func main() {
 		return
 	}
 	if len(os.Args) < 2 {
-		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|agent-launchers|artifact|files|terminfo|live-status|upgrade-supervisor|upgrade-workers|communication|peer-serve>")
+		fatal("usage: relayd <daemon|node|attach|observe|observe-many|sessions|terminate|forget|gc|event|agent|agent-launchers|artifact|files|terminfo|live-status|upgrade-supervisor|upgrade-workers|service|communication|peer-serve>")
 	}
 	switch os.Args[1] {
 	case "desktop-route":
@@ -488,6 +488,8 @@ func main() {
 		runUsageSummary(os.Args[2:])
 	case "upgrade-supervisor":
 		runUpgradeSupervisor(os.Args[2:])
+	case "service":
+		runService(os.Args[2:])
 	case "--version", "version":
 		fmt.Println("relayd " + relaydVersion)
 	default:

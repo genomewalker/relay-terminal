@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,11 +47,24 @@ func runUpgradeSupervisor(arguments []string) {
 	stateDir := flags.String("state-dir", "", "worker state directory for completed job archival")
 	ledgerWait := flags.Duration("ledger-wait", upgradeLedgerWait, "how long to wait for the host job ledger lock while archiving")
 	prepareTimeout := flags.Duration("prepare-timeout", upgradePrepareTimeout, "how long an old supervisor may take to prepare the upgrade")
+	planOnly := flags.Bool("plan", false, "print which declared services the upgrade would stop and relaunch, and change nothing")
 	_ = flags.Parse(arguments)
+
+	// Declared services: without declarations or an unfinished journal on
+	// this host, the upgrade is exactly as before.
+	services := upgradeServices(*stateDir, *socket)
+	if *planOnly {
+		printUpgradePlan(*socket, services)
+		return
+	}
 
 	current, currentErr := inspectSupervisor(*socket)
 	if !*force && currentErr == nil && current.Status.Version == relaydVersion &&
 		current.Status.ProtocolVersion == supervisorProtocolVersion {
+		if services != nil {
+			// A journal left by an interrupted upgrade is finished here.
+			finishServiceRelaunch(services, "")
+		}
 		fmt.Printf("relayd supervisor %s is current\n", relaydVersion)
 		return
 	}
@@ -62,6 +76,20 @@ func runUpgradeSupervisor(arguments []string) {
 		fmt.Printf("preserved %d completed jobs in the archive; %d records remain for the upgrade guard\n", archived.Archived, archived.Retained)
 	}
 
+	if services != nil {
+		if err := services.Acquire(); err != nil {
+			fatal(err.Error())
+		}
+		plan, err := services.Plan()
+		if err != nil {
+			fatal("cannot plan declared services: " + err.Error())
+		}
+		if err := services.Begin(plan); err != nil {
+			upgradeFailed(services, *stateDir, err.Error())
+		}
+	}
+	fail := func(message string) { upgradeFailed(services, *stateDir, message) }
+
 	// Prepare every affected supervisor before stopping any of them. A legacy
 	// refusal must not leave the current supervisor needlessly disconnected.
 	var old *liveSupervisor
@@ -69,7 +97,7 @@ func runUpgradeSupervisor(arguments []string) {
 		if live, err := inspectSupervisor(*legacy); err == nil {
 			prepared, err := inspectSupervisorForUpgrade(*legacy, *prepareTimeout)
 			if err != nil || !prepared.Status.UpgradePrepared {
-				fatal("legacy supervisor cannot guarantee host-job-safe upgrade; upgrade deferred")
+				fail("legacy supervisor cannot guarantee host-job-safe upgrade; upgrade deferred")
 			}
 			live = prepared
 			old = &live
@@ -78,27 +106,27 @@ func runUpgradeSupervisor(arguments []string) {
 	if currentErr == nil {
 		prepared, err := inspectSupervisorForUpgrade(*socket, *prepareTimeout)
 		if err != nil {
-			fatal("cannot prepare supervisor upgrade: " + err.Error())
+			fail("cannot prepare supervisor upgrade: " + err.Error())
 		}
 		if !prepared.Status.UpgradePrepared {
-			fatal("existing supervisor does not support safe host-job upgrade handoff; upgrade deferred")
+			fail("existing supervisor does not support safe host-job upgrade handoff; upgrade deferred")
 		}
 		current = prepared
 	}
 	if old != nil {
 		if err := stopValidatedSupervisor(*legacy, *old); err != nil {
-			fatal("cannot retire legacy supervisor: " + err.Error())
+			fail("cannot retire legacy supervisor: " + err.Error())
 		}
 	}
 	if currentErr == nil {
 		if err := stopValidatedSupervisor(*socket, current); err != nil {
-			fatal("cannot replace existing supervisor: " + err.Error())
+			fail("cannot replace existing supervisor: " + err.Error())
 		}
 	}
 
 	connection, err := connectOrStart(*socket)
 	if err != nil {
-		fatal("cannot start upgraded supervisor: " + err.Error())
+		fail("cannot start upgraded supervisor: " + err.Error())
 	}
 	_ = connection.Close()
 
@@ -114,14 +142,99 @@ func runUpgradeSupervisor(arguments []string) {
 		}
 		if time.Now().After(verificationDeadline) {
 			if err != nil {
-				fatal("upgraded supervisor did not answer: " + err.Error())
+				fail("upgraded supervisor did not answer: " + err.Error())
 			}
-			fatal(fmt.Sprintf("supervisor verification failed: got %s protocol %d, want %s protocol %d",
+			fail(fmt.Sprintf("supervisor verification failed: got %s protocol %d, want %s protocol %d",
 				live.Status.Version, live.Status.ProtocolVersion, relaydVersion, supervisorProtocolVersion))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	fmt.Printf("relayd supervisor upgraded to %s; pane workers were preserved\n", relaydVersion)
+	if services != nil {
+		finishServiceRelaunch(services, "")
+	}
+}
+
+// upgradeServices returns the host's service orchestration, or nil when the
+// host has nothing declared. A store that cannot be read leaves the upgrade
+// as it was before declarations existed: any live job still defers it.
+func upgradeServices(stateDir, socket string) *daemon.ServiceUpgrade {
+	services, err := daemon.NewServiceUpgrade(stateDir, socket)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "relayd: declared services unavailable: "+err.Error())
+		return nil
+	}
+	active, err := services.Active()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "relayd: declared services unavailable: "+err.Error())
+		return nil
+	}
+	if !active {
+		return nil
+	}
+	return services
+}
+
+func printUpgradePlan(socket string, services *daemon.ServiceUpgrade) {
+	if current, err := inspectSupervisor(socket); err == nil {
+		fmt.Printf("supervisor %s protocol %d; this relayd is %s protocol %d\n", current.Status.Version,
+			current.Status.ProtocolVersion, relaydVersion, supervisorProtocolVersion)
+	} else {
+		fmt.Printf("no supervisor answers; this relayd is %s\n", relaydVersion)
+	}
+	if services == nil {
+		fmt.Println("no declared services on this host; the upgrade stops and relaunches nothing")
+		return
+	}
+	plan, err := services.Plan()
+	if err != nil {
+		fatal("cannot plan declared services: " + err.Error())
+	}
+	plan.Print(os.Stdout)
+	if err := plan.BlockerError(); err != nil && !plan.Resume {
+		fmt.Println(err.Error())
+	}
+	fmt.Println("plan only: nothing was stopped or started")
+}
+
+// finishServiceRelaunch relaunches from the journal against the supervisor
+// serving now and prints the summary. failure is the upgrade error that
+// prompted a restore, if any; either way a failure exits non-zero.
+func finishServiceRelaunch(services *daemon.ServiceUpgrade, failure string) {
+	if err := services.Acquire(); err != nil && failure == "" {
+		fatal(err.Error())
+	}
+	err := services.Relaunch(daemon.ServiceResumeOptions{})
+	services.Summary(os.Stdout)
+	if err != nil {
+		if failure != "" {
+			failure += "; "
+		}
+		failure += "declared services: " + err.Error()
+	}
+	if failure != "" {
+		fatal(failure)
+	}
+}
+
+// upgradeFailed restores any declared services this upgrade stopped, on
+// whichever supervisor serves now, then exits. Without declarations it names
+// the live jobs behind a deferral after the unchanged refusal line.
+func upgradeFailed(services *daemon.ServiceUpgrade, stateDir, message string) {
+	if services != nil && services.Started() {
+		fmt.Fprintln(os.Stderr, "relayd: "+message)
+		fmt.Fprintln(os.Stderr, "relayd: relaunching the declared services this upgrade stopped")
+		finishServiceRelaunch(services, message)
+		os.Exit(1)
+	}
+	if services == nil && strings.Contains(message, "upgrade deferred") {
+		fmt.Fprintln(os.Stderr, "relayd: "+message)
+		if names, err := daemon.DescribeLiveHostJobs(stateDir); err == nil && names != "" {
+			fmt.Fprintln(os.Stderr, "relayd: live host jobs: "+names)
+		}
+		os.Exit(1)
+	}
+	fatal(message)
 }
 
 // An old supervisor prepares an upgrade by inspecting its host job ledger, which
