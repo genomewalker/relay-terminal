@@ -190,3 +190,51 @@ func TestPinLoginNeedsAChatGPTLogin(t *testing.T) {
 		t.Fatal("pinned a Claude account")
 	}
 }
+
+func TestReadCodexLoginModesAndStores(t *testing.T) {
+	root := t.TempDir()
+	both := chatgptAuth(t, personalID, "pro")
+	both["OPENAI_API_KEY"] = "sk-test"
+	writeAuth(t, root, both)
+	// Without auth_mode a ChatGPT login is what Codex uses.
+	if login := ReadCodexLogin(root); login.State != "chatgpt" || login.AccountID != personalID {
+		t.Fatalf("tokens and key = %+v", login)
+	}
+	both["auth_mode"] = "apikey"
+	writeAuth(t, root, both)
+	if login := ReadCodexLogin(root); login.State != "api_key" {
+		t.Fatalf("auth_mode apikey = %+v", login)
+	}
+	writeAuth(t, root, chatgptAuth(t, personalID, "pro"))
+	config := filepath.Join(root, "config.toml")
+	for _, c := range []struct{ text, want string }{
+		{"cli_auth_credentials_store = \"auto\"\n", "unknown"},
+		// The strict reader refuses multi-line strings; the key is still found.
+		{"cli_auth_credentials_store = 'keyring' # os store\nnotes = \"\"\"\nx\n\"\"\"\n", "unknown"},
+		{"notes = \"\"\"\nx\n\"\"\"\ncli_auth_credentials_store = \"file\"\n", "chatgpt"},
+		{"notes = \"\"\"\nx\n\"\"\"\n[profiles.a]\ncli_auth_credentials_store = \"keyring\"\n", "chatgpt"},
+	} {
+		if err := os.WriteFile(config, []byte(c.text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if login := ReadCodexLogin(root); login.State != c.want {
+			t.Errorf("config %q: login = %+v, want %s", c.text, login, c.want)
+		}
+	}
+}
+
+// Only pin_login sets a pin: a configure cannot write one, not even a
+// display prefix copied from a status row.
+func TestConfigureCannotSetAPin(t *testing.T) {
+	current := DefaultRegistry()
+	incoming := DefaultRegistry()
+	incoming.Accounts[3].ExpectAccount = "4fea6400"
+	if kept := KeepExpectations(current, incoming); kept.Accounts[3].ExpectAccount != "" {
+		t.Fatalf("configure set a pin: %+v", kept.Accounts[3])
+	}
+	current.Accounts[3].ExpectAccount = personalID
+	incoming.Accounts[3].ExpectAccount = businessID
+	if kept := KeepExpectations(current, incoming); kept.Accounts[3].ExpectAccount != personalID {
+		t.Fatalf("configure replaced a pin: %+v", kept.Accounts[3])
+	}
+}

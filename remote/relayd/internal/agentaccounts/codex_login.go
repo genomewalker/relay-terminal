@@ -57,14 +57,9 @@ func AccountPrefix(id string) string {
 // every problem is a state.
 func ReadCodexLogin(root string) CodexLogin {
 	if store := codexCredentialStore(root); store != "" && store != "file" {
-		// keyring (or auto with a keyring entry): an auth.json there may be
-		// stale, so it decides nothing.
-		if store != "auto" {
-			return CodexLogin{State: "unknown", Reason: "Codex keeps this login in the OS credential store"}
-		}
-		if _, err := os.Lstat(filepath.Join(root, "auth.json")); err != nil {
-			return CodexLogin{State: "unknown", Reason: "Codex keeps this login in the OS credential store"}
-		}
+		// keyring or auto: the login may be in the OS credential store and
+		// an auth.json there may be stale, so it decides nothing.
+		return CodexLogin{State: "unknown", Reason: "Codex may keep this login in the OS credential store"}
 	}
 	data, modified, err := readAuthFile(filepath.Join(root, "auth.json"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -91,10 +86,16 @@ func parseCodexAuth(data []byte) CodexLogin {
 	if json.Unmarshal(data, &auth) != nil {
 		return CodexLogin{State: "unknown", Reason: "auth.json is not valid JSON"}
 	}
-	if auth.Tokens == nil || auth.Tokens.IDToken == "" {
-		if auth.APIKey != nil && *auth.APIKey != "" {
+	hasKey := auth.APIKey != nil && *auth.APIKey != ""
+	// Codex's auth_mode decides when both are present; without it a ChatGPT
+	// login is what Codex uses.
+	if auth.Mode == "apikey" || auth.Mode == "api_key" || (hasKey && (auth.Tokens == nil || auth.Tokens.IDToken == "")) {
+		if hasKey {
 			return CodexLogin{State: "api_key"}
 		}
+		return CodexLogin{State: "unknown", Reason: "auth.json selects an API key it does not hold"}
+	}
+	if auth.Tokens == nil || auth.Tokens.IDToken == "" {
 		return CodexLogin{State: "unknown", Reason: "auth.json holds no ChatGPT login"}
 	}
 	claims, ok := idTokenClaims(auth.Tokens.IDToken)
@@ -176,7 +177,9 @@ func codexCredentialStore(root string) string {
 	}
 	document, err := parseTOML(string(data))
 	if err != nil {
-		return "unknown"
+		// The strict reader refuses some valid TOML; the one top-level key
+		// is then read from its own line, so a login is not left unchecked.
+		return credentialStoreLine(string(data))
 	}
 	value, present := document.root.values["cli_auth_credentials_store"]
 	if !present {
@@ -187,6 +190,32 @@ func codexCredentialStore(root string) string {
 		return "unknown"
 	}
 	return store
+}
+
+// credentialStoreLine finds `cli_auth_credentials_store = "value"` before
+// the first table header ("" when absent, "unknown" when not a plain string).
+func credentialStoreLine(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			return ""
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found || strings.Trim(strings.TrimSpace(key), `"'`) != "cli_auth_credentials_store" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if comment := strings.Index(value, "#"); comment >= 0 {
+			value = strings.TrimSpace(value[:comment])
+		}
+		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
+			if store := value[1 : len(value)-1]; store != "" && !strings.ContainsAny(store, `"'\`) {
+				return store
+			}
+		}
+		return "unknown"
+	}
+	return ""
 }
 
 // LoginCheck compares a folder's login with the account its label is pinned

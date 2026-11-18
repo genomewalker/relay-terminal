@@ -344,9 +344,11 @@ func SetExpectation(home string, registry Registry, provider, label, workspace, 
 // client that does not send expectations.
 func KeepExpectations(current, incoming Registry) Registry {
 	for index, account := range incoming.Accounts {
-		// A login pin is kept on its own: clients that send the other
-		// expectations do not know it. Only unpin_login removes it.
-		if previous, ok := current.Find(account.Provider, account.Label); ok && account.ExpectAccount == "" {
+		// A login pin is never set by a configure: it is kept from the
+		// current slot (or absent for a new one). Only pin_login, which reads
+		// the folder's own login, sets it; only unpin_login removes it.
+		incoming.Accounts[index].ExpectAccount = ""
+		if previous, ok := current.Find(account.Provider, account.Label); ok {
 			incoming.Accounts[index].ExpectAccount = previous.ExpectAccount
 		}
 		if account.ExpectWorkspace != "" || account.ExpectPlan != "" || account.ExpectKey != "" {
