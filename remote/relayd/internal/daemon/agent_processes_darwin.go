@@ -28,22 +28,6 @@ func descendantAgentProcesses(rootPID int) map[int]string {
 		byPID[int(info.Proc.P_pid)] = info
 	}
 	for pid, info := range byPID {
-		command := darwinAgentCommand(info.Proc.P_comm[:])
-		agent := classifyAgentProcess(command, "")
-		// Native Claude installs a version-named binary behind ~/.local/bin/claude.
-		if agent == "" && len(command) > 0 && command[0] >= '0' && command[0] <= '9' {
-			executable, err := darwinKernelExecutable(pid)
-			if err != nil {
-				// proc_pidpath cannot name a deleted image; the exec path saved
-				// in the process arguments still does.
-				executable, err = darwinExecPath(pid)
-			}
-			home, homeErr := os.UserHomeDir()
-			if err == nil && homeErr == nil {
-				agent = classifyDarwinAgentExecutable(command, executable, home)
-			}
-
-		}
 		current := pid
 		seen := map[int]bool{}
 		chain := []int{}
@@ -66,6 +50,21 @@ func descendantAgentProcesses(rootPID int) map[int]string {
 		}
 		if !belongs {
 			continue
+		}
+		command := darwinAgentCommand(info.Proc.P_comm[:])
+		agent := classifyAgentProcess(command, "")
+		// Native Claude installs a version-named binary behind ~/.local/bin/claude.
+		if agent == "" && len(command) > 0 && command[0] >= '0' && command[0] <= '9' {
+			executable, err := darwinKernelExecutable(pid)
+			if err != nil {
+				// proc_pidpath cannot name a deleted image; the exec path saved
+				// in the process arguments still does.
+				executable, err = darwinExecPath(pid)
+			}
+			home, homeErr := os.UserHomeDir()
+			if err == nil && homeErr == nil {
+				agent = classifyDarwinAgentExecutable(command, executable, home)
+			}
 		}
 		if agent == "" && harnessInterpreter(command) {
 			if arguments, err := darwinHarnessArguments(pid); err == nil {
