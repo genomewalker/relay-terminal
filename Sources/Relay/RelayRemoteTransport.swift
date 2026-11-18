@@ -1457,6 +1457,21 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
     }
 
+    /// Where submitted input stands: still held in Relay's backlog (the
+    /// transport is not attached), sent but not acknowledged by the worker,
+    /// or acknowledged (the worker wrote it to the terminal).
+    struct InputDeliveryState: Equatable, Sendable {
+        let attached: Bool
+        let acknowledgements: Bool
+        let backlogBytes: Int
+        let unacknowledgedBytes: Int
+    }
+    func inputDeliveryState() -> InputDeliveryState {
+        lock.lock(); defer { lock.unlock() }
+        return .init(attached: attached && writer != nil, acknowledgements: supportsInputAcknowledgements,
+                     backlogBytes: inputBacklog.count, unacknowledgedBytes: pendingInputBytes)
+    }
+
     @discardableResult
     func sendInput(_ data: Data, expectedControlLease: RelayPromptEditorControlLease? = nil) -> Bool {
         if let lease = expectedControlLease {

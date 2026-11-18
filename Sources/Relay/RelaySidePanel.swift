@@ -2760,7 +2760,12 @@ final class RelaySidePanelServer: ObservableObject {
                                                           "commandGeneration": commandGeneration]
                 return .json(directInputResults[proposal.requestID]!)
             }
+            let submittedAt = Date()
             if pane.runtime.sendSidePanelPrompt(proposal.text) {
+                // Still submitted_outcome_unknown; the fields say what could
+                // not be confirmed (input_queued, input_unconfirmed, renderer_stale).
+                let delivery = await pane.runtime.inputDeliveryReport(submittedAt: submittedAt)
+                directInputResults[proposal.requestID]?.merge(delivery) { $1 }
                 return .json(directInputResults[proposal.requestID]!)
             }
             directInputResults[proposal.requestID] = ["status": "unavailable", "paneID": paneID.uuidString.lowercased()]
@@ -2940,7 +2945,8 @@ final class RelaySidePanelServer: ObservableObject {
                 return .refusal(.init(.noRendererForIdleProof,
                     "Viewport unavailable: the pane has no native renderer and no complete worker screen yet"))
             }
-            return .json(["pane_id": paneID.uuidString.lowercased(), "text": text, "scope": "visible_viewport_only"])
+            return .json(["pane_id": paneID.uuidString.lowercased(), "text": text, "scope": "visible_viewport_only"]
+                .merging(pane.runtime.screenFreshness()) { $1 })
         case ("GET", "command-wait"):
             // Read-only, like the viewport: observes the shell's OSC 133
             // markers and never writes to the pane.

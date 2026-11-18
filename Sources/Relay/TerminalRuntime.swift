@@ -3866,6 +3866,58 @@ final class TerminalRuntime: NSObject {
 
     func agentResumeOwner() async -> RelayPromptOwnerBinding? { await readPromptOwnerBinding()?.binding }
 
+    /// The age of the pane's last live screen output, for viewport reads.
+    func screenFreshness(now: Date = Date()) -> [String: String] {
+        guard let at = io.lastLiveOutputAt else { return ["last_output_at": "", "stale_seconds": ""] }
+        return ["last_output_at": ISO8601DateFormatter().string(from: at), "stale_seconds": String(Int(now.timeIntervalSince(at)))]
+    }
+
+    /// After a submit at `submittedAt`, waits up to `wait` seconds for the
+    /// worker's acknowledgement and for new screen output, then names what
+    /// could not be confirmed. Read-only; never resends.
+    func inputDeliveryReport(submittedAt: Date, wait: TimeInterval = 3) async -> [String: String] {
+        let deadline = Date().addingTimeInterval(wait)
+        var state = io.inputDeliveryState()
+        while Date() < deadline {
+            state = io.inputDeliveryState()
+            let echoed = io.lastLiveOutputAt.map { $0 >= submittedAt } ?? false
+            if echoed, state?.backlogBytes == 0, state?.unacknowledgedBytes == 0 { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return Self.inputDeliveryFields(state, lastOutput: io.lastLiveOutputAt, submittedAt: submittedAt, now: Date())
+    }
+
+    nonisolated static func inputDeliveryFields(_ state: RelayRemoteTransport.InputDeliveryState?, lastOutput: Date?,
+                                                submittedAt: Date, now: Date) -> [String: String] {
+        var fields: [String: String] = [:]
+        if let lastOutput {
+            fields["last_output_at"] = ISO8601DateFormatter().string(from: lastOutput)
+            fields["stale_seconds"] = String(Int(now.timeIntervalSince(lastOutput)))
+        }
+        let echoed = lastOutput.map { $0 >= submittedAt } ?? false
+        let refusal: RelayPaneOperationRefusal?
+        if let state, state.backlogBytes > 0 || !state.attached {
+            fields["delivery"] = "queued_in_relay"
+            refusal = .init(.inputQueued, "Relay holds the input until the pane's transport reattaches; the worker has not received it")
+        } else if let state, state.acknowledgements, state.unacknowledgedBytes > 0 {
+            fields["delivery"] = "sent_unacknowledged"
+            refusal = .init(.inputUnconfirmed, "the pane's worker has not acknowledged writing the input to the terminal")
+        } else {
+            fields["delivery"] = state?.acknowledgements == true ? "written_to_terminal" : "sent_unconfirmed"
+            if echoed {
+                refusal = nil
+            } else if state?.acknowledgements == true {
+                refusal = .init(.rendererStale, "the worker wrote the input to the terminal, but no screen output has arrived since" +
+                    (lastOutput.map { "; the last output is \(Int(now.timeIntervalSince($0))) s old" } ?? ""))
+            } else {
+                refusal = .init(.inputUnconfirmed, "the input was sent, but neither an acknowledgement nor new screen output confirms it")
+            }
+        }
+        fields["screen_changed"] = String(echoed)
+        if let refusal { fields.merge(refusal.fields) { $1 } }
+        return fields
+    }
+
     /// The resume prompt proof, or the named reason it is missing. A hidden
     /// pane with neither a renderer nor a complete worker screen first asks
     /// its worker for one fresh screen (nothing typed), so the proof never
@@ -4632,6 +4684,19 @@ final class TerminalIOBridge: @unchecked Sendable {
     }
 
     private var transport: RelayRemoteTransport?
+    private let liveOutputClock = NSLock()
+    private var lastLiveOutput: Date?
+    /// When live (not replayed) output last arrived from the pane's worker.
+    var lastLiveOutputAt: Date? {
+        liveOutputClock.lock(); defer { liveOutputClock.unlock() }
+        return lastLiveOutput
+    }
+    func inputDeliveryState() -> RelayRemoteTransport.InputDeliveryState? {
+        resizeLock.lock()
+        let transport = self.transport
+        resizeLock.unlock()
+        return transport?.inputDeliveryState()
+    }
     var onReplayFinished: (@Sendable (Bool) -> Void)?
     var onReplayWritesResumed: (@Sendable () -> Void)?
     var onObservedRepaintFrame: (@Sendable (UUID) -> Void)?
@@ -5399,6 +5464,9 @@ final class TerminalIOBridge: @unchecked Sendable {
         // must not report an old command result as a new one.
         let liveOutput = !replaying || (remoteSequence > 0 && remoteSequence > replayKnownSequence)
         replayLock.unlock()
+        if liveOutput, !data.isEmpty {
+            liveOutputClock.lock(); lastLiveOutput = Date(); liveOutputClock.unlock()
+        }
         let semanticState = semanticPromptTracker.observe(data, recordsCompletion: liveOutput)
         let executionChanged = semanticPromptTracker.executionGeneration != priorExecution
         replayLock.lock()
