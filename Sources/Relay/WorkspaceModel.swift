@@ -3875,8 +3875,11 @@ final class WorkspaceModel: ObservableObject {
         let pane = activePaneID.flatMap {
             BrowserPaneSave.savedFocus($0, stacks: tabs.flatMap(\.stacks), browsers: browsers, anchors: browserAnchors)
         }.flatMap { panes[$0] != nil ? $0 : nil }
+        // No selection means an empty workspace is shown; restore relies on
+        // that nil to show it again, so it is saved as is, never replaced.
+        guard let selectedTabID else { return (nil, pane) }
         let savedTabs = tabs.filter { !Set($0.allPaneIDs).subtracting(browsers).isEmpty }
-        if let selectedTabID, savedTabs.contains(where: { $0.id == selectedTabID }),
+        if savedTabs.contains(where: { $0.id == selectedTabID }),
            pane.map({ id in savedTabs.first { $0.id == selectedTabID }!.allPaneIDs.contains(id) }) ?? true {
             return (selectedTabID, pane)
         }
