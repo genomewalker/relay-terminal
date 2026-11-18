@@ -108,6 +108,11 @@ final class RelayPreferences: ObservableObject {
     @Published var semanticAgentSearch: Bool { didSet { save() } }
     @Published var automaticallyUpdateRelayd: Bool { didSet { save() } }
     @Published var automaticAgentMaintenance: Bool { didSet { save() } }
+    /// Freezes agent maintenance's automatic update restarts only; health
+    /// checks and binding repairs keep running. Off (unpaused) by default.
+    @Published var agentUpdateRestartsPaused: Bool { didSet { save() } }
+    /// Lowercase pane UUIDs that agent maintenance never restarts on its own.
+    @Published var maintenanceProtectedPanes: [String] { didSet { save() } }
     /// Relay clears an agent's context at its measured budget and restores the
     /// agent's own capsule (stock CLIs, guarded /clear). Off by default.
     @Published var automaticContextRotation: Bool { didSet { save() } }
@@ -186,6 +191,9 @@ final class RelayPreferences: ObservableObject {
         )
         automaticallyUpdateRelayd = defaults.object(forKey: "relay.settings.relayd-auto-update") as? Bool ?? false
         automaticAgentMaintenance = defaults.object(forKey: "relay.settings.agent-maintenance") as? Bool ?? false
+        agentUpdateRestartsPaused = defaults.object(forKey: "relay.settings.agent-maintenance.update-restarts-paused") as? Bool ?? false
+        maintenanceProtectedPanes = RelayAgentMaintenancePolicy.validProtectedPanes(
+            defaults.stringArray(forKey: "relay.settings.agent-maintenance.protected-panes") ?? []) ?? []
         automaticContextRotation = defaults.object(forKey: "relay.settings.context-rotation") as? Bool ?? false
         contextRotationBudget = min(max(defaults.object(forKey: "relay.settings.context-rotation-budget") as? Int
             ?? RelayStockRotationPolicy.defaultBudget, 20_000), 2_000_000)
@@ -374,6 +382,8 @@ final class RelayPreferences: ObservableObject {
         defaults.set(semanticAgentSearch, forKey: "relay.settings.intelligence-search")
         defaults.set(automaticallyUpdateRelayd, forKey: "relay.settings.relayd-auto-update")
         defaults.set(automaticAgentMaintenance, forKey: "relay.settings.agent-maintenance")
+        defaults.set(agentUpdateRestartsPaused, forKey: "relay.settings.agent-maintenance.update-restarts-paused")
+        defaults.set(maintenanceProtectedPanes, forKey: "relay.settings.agent-maintenance.protected-panes")
         defaults.set(automaticContextRotation, forKey: "relay.settings.context-rotation")
         defaults.set(contextRotationBudget, forKey: "relay.settings.context-rotation-budget")
         if let enrollment = contextRotationEnrollment, let data = try? JSONEncoder().encode(enrollment) {

@@ -35,6 +35,9 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
         case exitNotVerified = "exit_not_verified"
         case otherInstall = "other_install"
         case goalActive = "goal_active"
+        case protectedPane = "protected"
+        case updatesPaused = "updates_paused"
+        case trustPrompt = "trust_prompt"
         /// Informational, not a blocker: the pane is idle with a stalled /goal.
         case goalStalled = "goal_stalled"
         case notRecoverable = "not_recoverable"
@@ -85,6 +88,12 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
                 return "The newer agent is a different install; restart the pane by hand onto that install."
             case .goalActive:
                 return "The Codex /goal is still pursuing its objective; wait for it, or pause or clear it with /goal, then retry."
+            case .protectedPane:
+                return "The pane is protected from automatic restarts; restart it yourself, or remove it from agent_maintenance_protected_panes in Settings."
+            case .updatesPaused:
+                return "Automatic update restarts are paused; set agent_update_restarts_paused to false (Settings > Automatic maintenance) when the freeze ends."
+            case .trustPrompt:
+                return "Trust the folder in the Codex account's config.toml (or enable Relay's matching-parent trust setting), then restart; Relay never answers the trust dialog."
             case .goalStalled:
                 return "Informational: the Codex /goal is stalled and waits for /goal resume; the pane is idle and a restart keeps the goal stalled."
             case .notRecoverable: return "List the host's managed panes again; the pane is gone or no longer running."

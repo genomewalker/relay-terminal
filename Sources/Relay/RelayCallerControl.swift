@@ -40,6 +40,8 @@ final class RelayCallerControl: ObservableObject {
         var preview: String? = nil
     }
     static let assistantCaller = "relay-assistant"
+    /// Relay's own automatic agent maintenance (update and binding restarts).
+    static let maintenanceCaller = "agent-maintenance"
     /// A reserved, app-owned publisher namespace. No caller token maps to it;
     /// only the in-process assistant route may select it. It grants nothing.
     static let assistantPublisher = "a5515700-0000-4000-8000-00000000face"
@@ -293,6 +295,14 @@ final class RelayCallerControl: ObservableObject {
         record.actionID = actionID?.uuidString.lowercased()
         record.argumentsDigest = argumentsDigest.map { String($0.prefix(64)) }
         record.preview = preview.map { RelayAssistantSnapshot.clean($0, limit: 240) }
+        try auditLog.append(record)
+        auditRecords.append(record)
+        if auditRecords.count > Self.auditLimit { auditRecords.removeFirst(auditRecords.count - Self.auditLimit) }
+    }
+    /// An automatic agent-maintenance restart step, durable before the
+    /// restart's input is sent: the journal action, its pane and reason.
+    func recordMaintenanceAction(_ record: Audit) throws {
+        guard storageReady, record.caller == Self.maintenanceCaller else { throw RelayHostRPCError.invalidRequest }
         try auditLog.append(record)
         auditRecords.append(record)
         if auditRecords.count > Self.auditLimit { auditRecords.removeFirst(auditRecords.count - Self.auditLimit) }

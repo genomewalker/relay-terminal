@@ -238,6 +238,41 @@ enum RelayAgentMaintenancePolicy {
         return proof.lifecycle != "quiet"
     }
 
+    /// Lowercase, unique, sorted pane UUIDs, at most 256; nil when any is invalid.
+    static func validProtectedPanes(_ ids: [String]) -> [String]? {
+        guard ids.count <= 256 else { return nil }
+        var result = Set<String>()
+        for id in ids {
+            guard let uuid = UUID(uuidString: id) else { return nil }
+            result.insert(uuid.uuidString.lowercased())
+        }
+        return result.sorted()
+    }
+
+    /// The agent_maintenance_protected_panes setting: exactly {"panes": [UUID]}.
+    static func protectedPanes(_ data: Data) throws -> [String] {
+        struct Value: Decodable { let panes: [String] }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], object.keys.sorted() == ["panes"],
+              let value = try? JSONDecoder().decode(Value.self, from: data),
+              let panes = validProtectedPanes(value.panes) else {
+            throw RelaySettingsPolicy.ControlError.invalid("agent_maintenance_protected_panes needs {\"panes\": [pane UUIDs]}, at most 256")
+        }
+        return panes
+    }
+
+    /// Why maintenance holds an automatic restart before any input: a
+    /// protected pane is never restarted on its own, and paused update
+    /// restarts hold updates only (binding repairs and health checks go on).
+    static func automaticRestartHold(reason: Reason, paneID: UUID, paused: Bool, protected: [String],
+                                     transition: String?) -> RelayPaneOperationRefusal? {
+        let what = reason == .update ? "Update " + (transition ?? "installed") + " available" : "Binding repair needed"
+        if protected.contains(paneID.uuidString.lowercased()) {
+            return .init(.protectedPane, what + ", held: protected")
+        }
+        if reason == .update, paused { return .init(.updatesPaused, what + ", held: update restarts are paused") }
+        return nil
+    }
+
     static func deferral(_ proof: RelayAgentMaintenanceProbe, paneID: UUID,
         emptyPrompt: Bool, hasDraft: Bool, pendingApprovals: Int, inputAge: TimeInterval,
         preservingDraft: Bool = false, recordedAccount: RelayAgentAccount? = nil,
@@ -754,6 +789,9 @@ enum RelayAgentMaintenanceRestartAdmission {
 @MainActor final class RelayAgentMaintenance: ObservableObject {
     static let shared = RelayAgentMaintenance()
     @Published private(set) var statuses: [UUID: String] = [:]
+    /// Panes whose automatic restart is held by the operator (protected or
+    /// paused update restarts), with the reason code.
+    @Published private(set) var holds: [UUID: RelayPaneOperationRefusal] = [:]
     private let journal = RelayAgentMaintenanceJournal()
     private let drafts = RelayAgentMaintenanceDraftStore()
     private var lastChecked: [UUID: Date] = [:]
@@ -812,14 +850,59 @@ enum RelayAgentMaintenanceRestartAdmission {
         let recentActions: [RelayAgentMaintenanceJournal.Entry]
         let haiku: RelayPaneHealthCoordinator.Snapshot
         var agents: [String: AgentVersion] = [:]
+        var updateRestartsPaused = false
+        var protectedPanes: [String] = []
+        /// Held automatic restarts by pane: reason_code, blocker, how_to_clear.
+        var holds: [String: [String: String]] = [:]
+        /// Journal entries left out of recentActions; the journal keeps them.
+        var omittedActions = 0
+    }
+
+    /// The caller-audit record of one automatic restart step (caller
+    /// "agent-maintenance"); the request ID is the journal action ID.
+    static func auditRecord(action: String, paneID: UUID, reason: RelayAgentMaintenancePolicy.Reason, outcome: String,
+                            detail: String?, at: Date = Date()) -> RelayCallerControl.Audit {
+        var record = RelayCallerControl.Audit(id: UUID(), at: at, caller: RelayCallerControl.maintenanceCaller,
+            path: "in-process/agent-maintenance", operation: "agent_maintenance." + reason.rawValue + "_restart",
+            requestID: String(action.prefix(128)), tabID: nil, paneID: paneID.uuidString.lowercased(), jobID: nil,
+            outcome: String(outcome.prefix(64)))
+        record.preview = detail.map { String($0.prefix(240)) }
+        return record
+    }
+
+    /// Audits one step; `required` fails the step when the audit cannot be written.
+    private func audit(_ action: String, pane: UUID, reason: RelayAgentMaintenancePolicy.Reason, _ outcome: String, _ detail: String? = nil,
+                       required: Bool = false) throws {
+        let record = Self.auditRecord(action: action, paneID: pane, reason: reason, outcome: outcome, detail: detail)
+        do { try auditSink(record) } catch { if required { throw error } }
+    }
+    var auditSink: @MainActor (RelayCallerControl.Audit) throws -> Void = { try RelayCallerControl.shared.recordMaintenanceAction($0) }
+
+    /// Every action of the last 24 hours and every unsettled one, newest
+    /// first, up to `limit`; the count left out is reported, never dropped
+    /// silently (af242052 fell off a fixed 16-entry list).
+    static func recentActions(_ entries: [RelayAgentMaintenanceJournal.Entry], now: Date = Date(), limit: Int = 128)
+        -> (entries: [RelayAgentMaintenanceJournal.Entry], omitted: Int) {
+        let sorted = entries.sorted { $0.createdAt > $1.createdAt }
+        let recent = sorted.enumerated().filter { index, entry in
+            index < 16 || now.timeIntervalSince(entry.createdAt) < 86_400 ||
+                !RelayAgentMaintenanceJournal.settledStates.contains(entry.state)
+        }.map(\.element)
+        let kept = Array(recent.prefix(limit))
+        return (kept, sorted.count - kept.count)
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(enabled: RelayPreferences.shared.automaticAgentMaintenance,
+        let recent = Self.recentActions(Array(journal.entries.values))
+        return Snapshot(enabled: RelayPreferences.shared.automaticAgentMaintenance,
             statuses: Dictionary(uniqueKeysWithValues: statuses.map { ($0.key.uuidString.lowercased(), $0.value) }),
-            recentActions: Array(journal.entries.values.sorted { $0.createdAt > $1.createdAt }.prefix(16)),
+            recentActions: recent.entries,
             haiku: RelayPaneHealthCoordinator.shared.snapshot(),
-            agents: RelayPaneHealthCoordinator.shared.agentVersions())
+            agents: RelayPaneHealthCoordinator.shared.agentVersions(),
+            updateRestartsPaused: RelayPreferences.shared.agentUpdateRestartsPaused,
+            protectedPanes: RelayPreferences.shared.maintenanceProtectedPanes,
+            holds: Dictionary(uniqueKeysWithValues: holds.map { ($0.key.uuidString.lowercased(), $0.value.fields) }),
+            omittedActions: recent.omitted)
     }
 
     func performHaikuTool(_ action: String, pane: PaneModel, workspace: WorkspaceModel,
@@ -979,6 +1062,15 @@ enum RelayAgentMaintenanceRestartAdmission {
             completeHaikuTool(pane, state: "already_healthy", message: "Native evidence does not require a restart.", proof: proof)
             return
         }
+        if let hold = RelayAgentMaintenancePolicy.automaticRestartHold(reason: reason, paneID: pane.id,
+            paused: RelayPreferences.shared.agentUpdateRestartsPaused,
+            protected: RelayPreferences.shared.maintenanceProtectedPanes, transition: proof.versionTransition) {
+            statuses[pane.id] = hold.blocker
+            holds[pane.id] = hold
+            completeHaikuTool(pane, state: "held", message: hold.blocker, proof: proof)
+            return
+        }
+        holds.removeValue(forKey: pane.id)
         if await RelayCapacityManagementCoordinator.shared.shouldUseCombined(pane) {
             statuses[pane.id] = "Installed-image adoption shares the combined native lane; retirement/preservation capability unavailable. No additional maintenance restart is submitted."
             completeHaikuTool(pane, state: "held", message: statuses[pane.id]!, proof: proof)
@@ -1054,8 +1146,13 @@ enum RelayAgentMaintenanceRestartAdmission {
             },
             preparePrompt: { await pane.runtime.prepareAgentMaintenancePromptProof() },
             claim: {
-                try self.journal.claim(pane: pane.id, host: profile.connectionKey, proof: fresh, reason: reason,
+                let id = try self.journal.claim(pane: pane.id, host: profile.connectionKey, proof: fresh, reason: reason,
                     modelOperationID: grant?.operationID, modelToolID: grant?.toolID)
+                // Durable in the caller audit before any restart input.
+                if let id {
+                    try self.audit(id, pane: pane.id, reason: reason, "admitted", fresh.versionTransition, required: true)
+                }
+                return id
             },
             saveDraft: { id, text in
                 try RelayAgentMaintenanceRestartAdmission.saveCapturedDraft(actionID: id, text: text,
@@ -1102,6 +1199,7 @@ enum RelayAgentMaintenanceRestartAdmission {
         guard pane.profile == action.profile, workspace.panes[pane.id] === pane else { return }
         guard Date() < action.deadline, action.attempts < Self.pendingVerifyAttempts else {
             try journal.mark(action.id, "verification_required")
+            try? audit(action.id, pane: pane.id, reason: action.reason, "verification_required")
             statuses[pane.id] = "Restart needs attention; no automatic retry"
             pending.removeValue(forKey: pane.id); requested.remove(pane.id)
             completeHaikuTool(pane, state: "verification_unknown", message: "The native restart needs review; no retry was submitted.")
@@ -1110,6 +1208,7 @@ enum RelayAgentMaintenanceRestartAdmission {
         if action.stage == .shell {
             guard pane.agentInputRevision == action.inputRevision else {
                 try journal.mark(action.id, "user_input_after_exit")
+                try? audit(action.id, pane: pane.id, reason: action.reason, "user_input_after_exit")
                 statuses[pane.id] = "Restart paused because you entered input"
                 pending.removeValue(forKey: pane.id); requested.remove(pane.id)
                 completeHaikuTool(pane, state: "held", message: "Input arrived after the agent exited; the resume was held.")
@@ -1125,6 +1224,7 @@ enum RelayAgentMaintenanceRestartAdmission {
             guard sent else {
                 if attempted {
                     try journal.mark(action.id, "resume_outcome_unknown")
+                    try? audit(action.id, pane: pane.id, reason: action.reason, "resume_outcome_unknown")
                     statuses[pane.id] = "Resume needs attention; no automatic retry"
                     pending.removeValue(forKey: pane.id); requested.remove(pane.id)
                     completeHaikuTool(pane, state: "verification_unknown", message: "The resume outcome is unknown; no retry was submitted.")
@@ -1132,6 +1232,7 @@ enum RelayAgentMaintenanceRestartAdmission {
                 return
             }
             try journal.mark(action.id, "resume_submitted")
+            try? audit(action.id, pane: pane.id, reason: action.reason, "resume_submitted")
             var next = action; next.stage = .verify; next.inputRevision = pane.agentInputRevision
             pending[pane.id] = next
             statuses[pane.id] = "Resume submitted; verifying the exact conversation"
@@ -1160,8 +1261,10 @@ enum RelayAgentMaintenanceRestartAdmission {
             return
         }
         try journal.mark(action.id, "verified")
+        let transition = (action.proof.runningVersion ?? "unknown") + " → " + (proof.runningVersion ?? "unknown")
+        try? audit(action.id, pane: pane.id, reason: action.reason, "verified", action.reason == .update ? transition : nil)
         statuses[pane.id] = action.reason == .binding ? "Conversation binding recovered" :
-            "Installed update " + (proof.runningVersion.map { $0 + " " } ?? "") + "applied; conversation preserved"
+            "Installed update " + (proof.runningVersion.map { $0 + " " } ?? "") + "applied (" + transition + "); conversation preserved"
         pending.removeValue(forKey: pane.id); requested.remove(pane.id)
         completeHaikuTool(pane, state: "verified", message: statuses[pane.id] ?? "The original conversation was verified.", proof: proof)
         RelayRecoveryStore.shared.record(kind: "agent_maintenance_verified", paneID: pane.id, profile: pane.profile)
@@ -1212,6 +1315,15 @@ struct RelayAgentMaintenanceSettingsView: View {
     private var mikoHosts: [ConnectionProfile] {
         [ConnectionProfile.local] + profiles.connectableHosts.filter { $0.backend == .relay }
     }
+    private func protection(_ id: UUID) -> Binding<Bool> {
+        let key = id.uuidString.lowercased()
+        return Binding(get: { preferences.maintenanceProtectedPanes.contains(key) }, set: { on in
+            var panes = Set(preferences.maintenanceProtectedPanes)
+            if on { panes.insert(key) } else { panes.remove(key) }
+            preferences.maintenanceProtectedPanes = RelayAgentMaintenancePolicy.validProtectedPanes(Array(panes))
+                ?? preferences.maintenanceProtectedPanes
+        })
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Automatic maintenance").font(RelayTheme.font(size: 14, weight: .semibold))
@@ -1231,6 +1343,10 @@ struct RelayAgentMaintenanceSettingsView: View {
                 .accessibilityIdentifier("relay.settings.agent-maintenance.enabled")
             Text("Waits for an idle agent and an empty prompt, preserves the conversation, and verifies the new binding. An uncertain restart is held for review.")
                 .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+            Toggle("Pause automatic update restarts", isOn: $preferences.agentUpdateRestartsPaused)
+                .accessibilityIdentifier("relay.settings.agent-maintenance.update-restarts-paused")
+            Text("Freezes restarts onto a newly installed agent version (for a release freeze); health checks and link repairs continue. Held panes report \"update available, held\".")
+                .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
             Toggle("Use Haiku to monitor panes and take safe actions", isOn: $preferences.haikuPaneHealth)
                 .accessibilityIdentifier("relay.settings.haiku-pane-health.enabled")
             Text("Uses the saved API account and spending limits on each host. Haiku can inspect panes, reconnect retained terminals, repair idle agents and verify recovery. Uses low effort with thinking off.")
@@ -1240,8 +1356,24 @@ struct RelayAgentMaintenanceSettingsView: View {
                     .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
             }
             ForEach(maintenance.statuses.keys.sorted(by: { $0.uuidString < $1.uuidString }), id: \.self) { id in
-                Text("\(id.uuidString.prefix(8)): \(maintenance.statuses[id] ?? "")")
-                    .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+                HStack {
+                    Text("\(id.uuidString.prefix(8)): \(maintenance.statuses[id] ?? "")")
+                        .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+                    Spacer()
+                    Toggle("Protected", isOn: protection(id)).toggleStyle(.checkbox)
+                        .help("Never restart this pane automatically")
+                }
+            }
+            ForEach(preferences.maintenanceProtectedPanes.filter { id in
+                !maintenance.statuses.keys.contains { $0.uuidString.lowercased() == id } }, id: \.self) { id in
+                HStack {
+                    Text("\(id.prefix(8)): protected from automatic restarts")
+                        .font(RelayTheme.font(size: 12)).foregroundStyle(RelayTheme.textMuted)
+                    Spacer()
+                    if let uuid = UUID(uuidString: id) {
+                        Toggle("Protected", isOn: protection(uuid)).toggleStyle(.checkbox)
+                    }
+                }
             }
         }
         .padding(16)

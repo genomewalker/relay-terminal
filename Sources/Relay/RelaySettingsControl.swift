@@ -91,6 +91,8 @@ enum RelaySettingsPolicy {
         .init(key: "intelligence_search", type: "boolean"),
         .init(key: "relayd_auto_update", type: "boolean"),
         .init(key: "automatic_agent_maintenance", type: "boolean"),
+        .init(key: "agent_update_restarts_paused", type: "boolean"),
+        .init(key: "agent_maintenance_protected_panes", type: "object"),
         .init(key: "haiku_pane_health", type: "boolean"),
         .init(key: "key_bindings", type: "object"),
         .init(key: "agent_account_rules", type: "object"),
@@ -112,8 +114,10 @@ enum RelaySettingsPolicy {
     // CLI configuration is a user capability, not authority for Miko to alter
     // its own autonomy, monitoring, spending/loop policy or pause state.
     static func allows(changes: [String: RelaySettingValue], assistantIdentity: Bool) -> Bool {
+        // Miko never lifts the operator's restart freeze or pane protection.
         !assistantIdentity || !changes.keys.contains {
-            $0.hasPrefix("miko_") || $0 == "claude_quota_failover"
+            $0.hasPrefix("miko_") || $0 == "claude_quota_failover" ||
+                $0 == "agent_update_restarts_paused" || $0 == "agent_maintenance_protected_panes"
         }
     }
 
@@ -127,6 +131,7 @@ enum RelaySettingsPolicy {
         switch key {
         case "miko_shepherd": _ = try RelayShepherdSettings.decode(data)
         case "claude_quota_failover": _ = try RelayClaudeQuotaSettings.decode(data)
+        case "agent_maintenance_protected_panes": _ = try RelayAgentMaintenancePolicy.protectedPanes(data)
         case "assistant_hotkey":
             try RelayShepherdWire.keys(data, allowed: ["keyCode", "control", "option", "command", "shift"], limit: 8192)
             guard try JSONDecoder().decode(RelayAssistantHotkey.self, from: data).valid else {
@@ -244,6 +249,8 @@ final class RelaySettingsControl {
             "artifact_presentation": .string(p.artifactPresentation.rawValue),
             "intelligence_enabled": .bool(p.intelligenceEnabled),
             "automatic_agent_maintenance": .bool(p.automaticAgentMaintenance),
+            "agent_update_restarts_paused": .bool(p.agentUpdateRestartsPaused),
+            "agent_maintenance_protected_panes": .json(.object(["panes": .array(p.maintenanceProtectedPanes.map { .string($0) })])),
             "haiku_pane_health": .bool(p.haikuPaneHealth),
             "decision_model_path": .string(p.decisionModelPath),
             "decision_model_sha256": .string(p.decisionModelSHA256),
@@ -315,6 +322,9 @@ final class RelaySettingsControl {
             case ("intelligence_search", .bool(let v)): p.semanticAgentSearch = v
             case ("relayd_auto_update", .bool(let v)): p.automaticallyUpdateRelayd = v
             case ("automatic_agent_maintenance", .bool(let v)): p.automaticAgentMaintenance = v
+            case ("agent_update_restarts_paused", .bool(let v)): p.agentUpdateRestartsPaused = v
+            case ("agent_maintenance_protected_panes", .json(let v)):
+                p.maintenanceProtectedPanes = try RelayAgentMaintenancePolicy.protectedPanes(RelayPaneHealthJSON.data(v))
             case ("haiku_pane_health", .bool(let v)): p.haikuPaneHealth = v
             case ("miko_host_key", .string(let v)): p.mikoHostKey = v
             case ("miko_autonomy", .string(let v)): p.mikoAutonomy = RelayMikoPolicySettings.Autonomy(rawValue: v)!
