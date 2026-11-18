@@ -342,6 +342,8 @@ func main() {
 		runAgent(os.Args[2:])
 	case "agent-launchers":
 		runAgentLaunchers(os.Args[2:])
+	case "codex-login":
+		runCodexLogin(os.Args[2:])
 	case "codex-relay-profile":
 		runCodexRelayProfile(os.Args[2:])
 	case "codex-pane-resume-plan":
@@ -991,6 +993,9 @@ func runCodex(arguments []string) {
 		fatal(err.Error())
 	}
 	admitAccount(home, "codex", false)
+	if !codexManagesAuth(arguments) {
+		admitCodexLogin(home)
+	}
 	prepareAccount(home, "codex")
 	executable, err := resolveStockCodexExecutable()
 	if err != nil {
@@ -1027,6 +1032,34 @@ func admitAccount(home, provider string, held bool) {
 	if err := admit(home, provider, os.Getenv(name)); err != nil {
 		fatal(err.Error())
 	}
+}
+
+// admitCodexLogin refuses to start Codex when CODEX_HOME's folder is pinned
+// to one ChatGPT account and its auth.json is logged in to another.
+func admitCodexLogin(home string) {
+	if err := agentaccounts.AdmitCodexLogin(home, os.Getenv("CODEX_HOME")); err != nil {
+		fatal(err.Error())
+	}
+}
+
+// codexManagesAuth: a login, logout, help or version command must run in a
+// mismatched folder, or the wrong login could not be replaced from a pane.
+func codexManagesAuth(arguments []string) bool {
+	if len(arguments) > 0 {
+		switch arguments[0] {
+		case "login", "logout", "help", "completion":
+			return true
+		}
+	}
+	for _, argument := range arguments {
+		switch argument {
+		case "--":
+			return false
+		case "--help", "-h", "--version", "-V":
+			return true
+		}
+	}
+	return false
 }
 
 // prepareAccount copies the main account's first-run and trust answers into

@@ -31,6 +31,9 @@ func runNativeChat(arguments []string) {
 		fatal(err.Error())
 	}
 	admitAccount(home, provider, false)
+	if provider == "codex" {
+		admitCodexLogin(home)
+	}
 	prepareAccount(home, provider)
 	stateRoot := filepath.Join(home, ".local", "share", "relay")
 	accountRoot := codexHome(os.Environ())

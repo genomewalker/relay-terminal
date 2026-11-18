@@ -77,6 +77,7 @@ func runCodexRotationExec(arguments []string) {
 		fatal("private home unavailable")
 	}
 	admitAccount(home, "codex", true)
+	admitCodexLogin(home)
 	newSnapshot, err := agentlaunch.Save(filepath.Join(home, ".local", "share", "relay", "agent-launches"),
 		"codex", snapshot.Executable, snapshot.CWD, *pane, agentlaunch.ProcessStart(), args, args)
 	if err != nil {

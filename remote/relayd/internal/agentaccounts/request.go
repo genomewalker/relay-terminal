@@ -23,6 +23,8 @@ import (
 //   - rename: change a slot's label (folder and login stay)
 //   - set_expectation: the workspace and plan a slot is meant for
 //   - set_defaults: the model and effort new agents of the account use
+//   - pin_login: pin a Codex label to the ChatGPT account its folder is
+//     logged in to now; unpin_login removes the pin (see PinLogin)
 type Request struct {
 	Action   string    `json:"action"`
 	Provider string    `json:"provider,omitempty"`
@@ -151,6 +153,14 @@ func Handle(request Request, probe Prober) (Response, error) {
 	case "set_expectation":
 		if registry, err = SetExpectation(home, registry, request.Provider, request.Label,
 			request.ExpectWorkspace, request.ExpectPlan, request.ExpectKey); err != nil {
+			return Response{}, err
+		}
+	case "pin_login":
+		if registry, err = PinLogin(home, registry, request.Provider, request.Label); err != nil {
+			return Response{}, err
+		}
+	case "unpin_login":
+		if registry, err = UnpinLogin(home, registry, request.Provider, request.Label); err != nil {
 			return Response{}, err
 		}
 	case "set_defaults":

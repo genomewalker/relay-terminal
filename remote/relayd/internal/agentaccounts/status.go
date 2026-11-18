@@ -16,7 +16,9 @@ import (
 
 // Status describes one account without reading credential material. Logged-in
 // state comes from the existence of the provider's credential file or from
-// the provider's own status command, never from a token's contents.
+// the provider's own status command, never from a token's contents. A Codex
+// account's ChatGPT account id and plan come from auth.json's unverified
+// id_token claims (ReadCodexLogin); no token is returned or kept.
 type Status struct {
 	Provider string `json:"provider"`
 	Label    string `json:"label"`
@@ -53,6 +55,12 @@ type Status struct {
 	ExpectWorkspace string `json:"expect_workspace,omitempty"`
 	ExpectPlan      string `json:"expect_plan,omitempty"`
 	ExpectKey       string `json:"expect_key,omitempty"`
+	// ExpectAccount is the display prefix of the ChatGPT account a Codex
+	// label is pinned to; Login is the account its auth.json names now and
+	// LoginStatus the comparison (see DecideLogin). Codex only.
+	ExpectAccount string      `json:"expect_account,omitempty"`
+	Login         *CodexLogin `json:"login,omitempty"`
+	LoginStatus   string      `json:"login_status,omitempty"`
 	// Model and Effort are the account's launch defaults; DefaultsError
 	// says why its defaults file could not be used.
 	Model         string `json:"model,omitempty"`
@@ -95,6 +103,13 @@ func AccountStatus(home string, account Account, probe Prober) Status {
 		status.LoggedIn = "no"
 		return status
 	}
+	if account.Provider == "codex" {
+		// The one place Settings reads auth.json: its identity claims only
+		// (ReadCodexLogin), never a token.
+		login := ReadCodexLogin(root)
+		status.Login, status.ExpectAccount = &login, AccountPrefix(account.ExpectAccount)
+		status.LoginStatus = DecideLogin(account.ExpectAccount, login)
+	}
 	if defaults, err := ReadModelDefaults(account.Provider, root); err != nil {
 		status.DefaultsError = printable(err.Error(), 120)
 	} else {
@@ -113,7 +128,8 @@ func AccountStatus(home string, account Account, probe Prober) Status {
 				State: linkState(filepath.Join(defaultRoot(home, account.Provider), name), filepath.Join(root, name))})
 		}
 	}
-	// Existence only: the credential file is never opened.
+	// Logged-in state is the credential file's existence. (A Codex login's
+	// account is read above from auth.json's identity claims only.)
 	credential := ".credentials.json"
 	if account.Provider == "codex" {
 		credential = "auth.json"

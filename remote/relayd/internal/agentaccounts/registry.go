@@ -1,7 +1,8 @@
 // Package agentaccounts keeps a host's provider accounts: which Claude or
 // Codex config directory each account label uses. An account is selected only
-// by its directory (CLAUDE_CONFIG_DIR or CODEX_HOME); Relay never reads,
-// copies or moves provider credentials. Login runs the provider's own flow.
+// by its directory (CLAUDE_CONFIG_DIR or CODEX_HOME); Relay never copies or
+// moves provider credentials and reads only the account identity claims of a
+// Codex auth.json (ReadCodexLogin). Login runs the provider's own flow.
 package agentaccounts
 
 import (
@@ -37,6 +38,10 @@ type Account struct {
 	ExpectWorkspace string `json:"expect_workspace,omitempty"`
 	ExpectPlan      string `json:"expect_plan,omitempty"`
 	ExpectKey       string `json:"expect_key,omitempty"`
+	// ExpectAccount pins a Codex label to one ChatGPT account id (see
+	// PinLogin). Launches, moves and restarts into the folder are refused
+	// while its auth.json is logged in to another account.
+	ExpectAccount string `json:"expect_account,omitempty"`
 }
 
 type Registry struct {
@@ -118,6 +123,9 @@ func Normalize(registry Registry, home string) (Registry, error) {
 		if !displayText(account.ExpectWorkspace, 64) || !displayText(account.ExpectPlan, 32) ||
 			(account.ExpectKey != "" && !keyPattern.MatchString(account.ExpectKey)) {
 			return Registry{}, errors.New("an expected workspace or plan is at most 64 printable characters")
+		}
+		if account.ExpectAccount != "" && (account.Provider != "codex" || !codexAccountPattern.MatchString(account.ExpectAccount)) {
+			return Registry{}, errors.New("only a Codex account can be pinned to a ChatGPT account id")
 		}
 		exclude, err := normalizeServerNames(account.MCPExclude)
 		if err != nil {

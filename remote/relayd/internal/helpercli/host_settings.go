@@ -226,7 +226,7 @@ func runNativeSettingsRequest(ctx context.Context, host, domain string, args []s
 			}
 		} else {
 			switch action {
-			case "list", "configure", "usage", "launchers", "repair_launchers", "mcp_preview", "prepare", "set_expectation", "set_defaults":
+			case "list", "configure", "usage", "launchers", "repair_launchers", "mcp_preview", "prepare", "set_expectation", "set_defaults", "pin_login", "unpin_login":
 				allowed = true
 			}
 		}
