@@ -71,3 +71,15 @@ struct RelayCodexPaneRecoveryTests {
         #expect(resume.recoverablePlan(pane: Self.pane, request: claude) == nil)
     }
 }
+
+/// Recovery is chosen by the pane's current owner, so a held receipt never
+/// blocks an ordinary resume once Codex runs in the pane again.
+@Test func recoveryAppliesOnlyWhileTheHeldShellOwnsThePrompt() {
+    let held = RelayCodexPaneRecoveryTests.plan(RelayCodexPaneRecoveryTests.owner("codex", process: 42))
+    let shell = RelayCodexPaneRecoveryTests.owner("shell", process: 12)
+    #expect(RelayCodexPaneResume.recoveryApplies(held: held, currentOwner: shell)?.configDir == held.configDir)
+    #expect(RelayCodexPaneResume.recoveryApplies(held: held, currentOwner: RelayCodexPaneRecoveryTests.owner("codex", process: 77)) == nil)
+    #expect(RelayCodexPaneResume.recoveryApplies(held: held, currentOwner: RelayCodexPaneRecoveryTests.owner("shell", process: 55, shell: 55)) == nil)
+    #expect(RelayCodexPaneResume.recoveryApplies(held: held, currentOwner: nil) == nil)
+    #expect(RelayCodexPaneResume.recoveryApplies(held: nil, currentOwner: shell) == nil)
+}

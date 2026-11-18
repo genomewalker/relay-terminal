@@ -100,3 +100,11 @@ struct RelayMaintenanceUpdateHoldTests {
     after.runningVersion = nil
     #expect(RelayAgentMaintenancePolicy.updateVersionFields(before: before, after: after)["to_version"] == .string("unknown"))
 }
+
+/// Item 9: quota failover also exits and resumes panes automatically, so it
+/// honours the same protected list.
+@Test func quotaFailoverSkipsAProtectedPane() {
+    let pane = UUID()
+    #expect(RelayClaudeQuotaScheduler.protected(pane, list: [pane.uuidString.lowercased()]))
+    #expect(!RelayClaudeQuotaScheduler.protected(pane, list: [UUID().uuidString.lowercased()]))
+}

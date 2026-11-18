@@ -50,8 +50,9 @@ struct RelayCodexTrustHoldTests {
         #expect(RelayAgentMaintenancePolicy.codexTrustHold(Self.proof(status: "parent_only", installed: "0.169.0"), reason: .update) == nil)
         #expect(RelayAgentMaintenancePolicy.codexTrustHold(Self.proof(status: "trusted"), reason: .update) == nil)
         #expect(RelayAgentMaintenancePolicy.codexTrustHold(Self.proof(status: "unknown"), reason: .update) == nil)
-        #expect(RelayAgentMaintenancePolicy.codexTrustHold(Self.proof(status: "untrusted", installed: "0.160.0"), reason: .binding)?.code == .trustPrompt)
-        var claude = Self.proof(status: "untrusted"); claude.provider = "claude"
+        // Not observed to stop before exit: left to the post-launch check.
+        #expect(RelayAgentMaintenancePolicy.codexTrustHold(Self.proof(status: "untrusted"), reason: .update) == nil)
+        var claude = Self.proof(status: "parent_only"); claude.provider = "claude"
         #expect(RelayAgentMaintenancePolicy.codexTrustHold(claude, reason: .update) == nil)
     }
 

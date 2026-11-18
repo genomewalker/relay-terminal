@@ -43,6 +43,14 @@ func TestCodexTrustNonGitSubfolderOfTrustedParentNeedsTrust(t *testing.T) {
 	if got := CodexProjectTrust(home, sub); got.Status != CodexTrustTrusted {
 		t.Fatalf("repository subfolder: %+v", got)
 	}
+	// A repository below the trusted parent, with its own root untrusted, is
+	// not claimed as parent-only.
+	if err := os.Mkdir(filepath.Join(sub, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got := CodexProjectTrust(home, sub); got.Status != CodexTrustUntrusted {
+		t.Fatalf("nested repository: %+v", got)
+	}
 }
 
 func TestCodexTrustOtherStates(t *testing.T) {

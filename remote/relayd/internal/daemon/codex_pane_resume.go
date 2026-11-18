@@ -97,8 +97,10 @@ func codexRelaunchCommand(home, config, target string) (string, string, error) {
 	cwd := metadata.Payload.CWD
 	// A relaunch that would stop at Codex's folder-trust dialog is refused
 	// while the original agent still runs (case 10, 7b68ee70).
-	if trust := agentaccounts.CodexProjectTrust(config, cwd); trust.Status == agentaccounts.CodexTrustParentOnly ||
-		trust.Status == agentaccounts.CodexTrustUntrusted {
+	// Only the observed case is refused before exit: a non-git folder
+	// trusted through its parent alone. Other states are left to the
+	// post-launch dialog check rather than held on a guess.
+	if trust := agentaccounts.CodexProjectTrust(config, cwd); trust.Status == agentaccounts.CodexTrustParentOnly {
 		return "", "", newPaneRefusal(PaneRefusalTrustPrompt, "Codex folder trust required for "+cwd+" ("+trust.Status+")")
 	}
 	shim := filepath.Join(home, ".local", "share", "relay", "shims", "codex")

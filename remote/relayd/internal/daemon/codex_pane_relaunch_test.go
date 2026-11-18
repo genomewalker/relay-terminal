@@ -53,7 +53,7 @@ func TestCodexRelaunchCommandIsProvenBeforeExit(t *testing.T) {
 	if _, _, err := codexRelaunchCommand(home, config, "01a18b32-f284-7220-91a2-6a81cde6db15"); refusalCode(err) != PaneRefusalResumeUnavailable {
 		t.Fatalf("missing session: %v", err)
 	}
-	// Case 10: a folder that would stop at the trust dialog is refused.
+	// Case 10: a non-git folder trusted only through its parent is refused.
 	if err := os.RemoveAll(filepath.Join(cwd, ".git")); err != nil {
 		t.Fatal(err)
 	}

@@ -79,10 +79,10 @@ func CodexProjectTrust(home, dir string) CodexTrust {
 		return result
 	}
 	if root := gitRoot(dir); root != "" {
-		if levels[root] == "trusted" {
-			result.Status = CodexTrustTrusted
-			return result
-		}
+		// Inside a repository Codex keys trust by its root; parent-only is
+		// the observed non-git case alone, so anything else is not claimed.
+		result.Status = map[bool]string{true: CodexTrustTrusted, false: CodexTrustUntrusted}[levels[root] == "trusted"]
+		return result
 	}
 	for parent := filepath.Dir(dir); ; parent = filepath.Dir(parent) {
 		if level, ok := levels[parent]; ok {

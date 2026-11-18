@@ -263,13 +263,14 @@ enum RelayAgentMaintenancePolicy {
     /// Case 10 (7b68ee70): a Codex relaunch that would stop at its
     /// folder-trust dialog is held before any input, so the old process keeps
     /// running. 0.170.0 stopped for a non-git folder trusted only through its
-    /// parent; an untrusted folder stops on any version. Nil when it will not
-    /// stop or relayd did not say.
+    /// parent (inferred from one case, not confirmed in Codex's source). Nil
+    /// otherwise; a dialog that still appears is caught after the launch.
     static func codexTrustHold(_ proof: RelayAgentMaintenanceProbe, reason: Reason) -> RelayPaneOperationRefusal? {
         guard proof.provider == "codex", let trust = proof.codexTrust else { return nil }
         let target = proof.installedVersion ?? proof.runningVersion
-        let stops = trust.status == "untrusted" ||
-            trust.status == "parent_only" && codexVersion(target, atLeast: [0, 170, 0])
+        // Only the observed case is held before exit; other states are left
+        // to the post-launch dialog check rather than held on a guess.
+        let stops = trust.status == "parent_only" && codexVersion(target, atLeast: [0, 170, 0])
         guard stops else { return nil }
         let what = reason == .update ? "Update " + (proof.versionTransition ?? "installed") + " available" : "Restart needed"
         return .init(.trustPrompt, what + ", held: Codex folder trust required for " + trust.cwd)
@@ -1145,11 +1146,13 @@ enum RelayAgentMaintenanceRestartAdmission {
             return
         }
         await pane.runtime.prepareAgentMaintenancePromptProof()
-        if let held = RelayAgentMaintenancePolicy.deferral(proof, paneID: pane.id,
+        if let refusal = RelayAgentMaintenancePolicy.deferralReason(proof, paneID: pane.id,
             emptyPrompt: pane.runtime.agentMaintenanceTerminalPromptIsEmpty(
                 explainedAgents: RelayAgentMaintenancePolicy.explainedFooterAgents(proof, subagents: pane.subagents)), hasDraft: draft,
             pendingApprovals: pane.pendingAgentApprovals, inputAge: Date().timeIntervalSince(pane.agentLastInputAt),
             preservingDraft: true, recordedAccount: pane.agentAccount?.recorded) {
+            let held = refusal.blocker
+            holds[pane.id] = refusal
             statuses[pane.id] = reason == .update ? "Update " + (proof.versionTransition ?? "installed") + ": " + held : held
             completeHaikuTool(pane, state: "held", message: held, proof: proof)
             return

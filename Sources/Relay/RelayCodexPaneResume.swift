@@ -108,10 +108,8 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                                            connection: pane.connectionState, content: pane.contentKind) {
             throw refusal
         }
-        let recovering = recoverablePlan(pane: pane.id, request: request)
-        let initial = Receipt(paneID: pane.id, request: request, state: "checking",
-            detail: recovering == nil ? "Checking exact native owner and saved session"
-                : "Recovering a pane held after its exit: checking its retained shell and saved session", updatedAt: Date())
+        let candidate = recoverablePlan(pane: pane.id, request: request)
+        let initial = Receipt(paneID: pane.id, request: request, state: "checking", detail: "Checking exact native owner and saved session", updatedAt: Date())
         try write(initial)
         active[request.requestID] = Task { [weak self, weak pane, weak workspace] in
             guard let self else { return }
@@ -125,6 +123,10 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                 try? self.write(result)
                 return
             }
+            // Recovery only while the held plan's retained shell owns the
+            // prompt; once an agent runs there again, the ordinary resume.
+            let recovering = candidate == nil ? nil
+                : Self.recoveryApplies(held: candidate, currentOwner: await pane.runtime.agentResumeOwner())
             await self.run(initial, pane: pane, workspace: workspace, authorized: authorized, recovering: recovering)
         }
         return initial
@@ -142,6 +144,13 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             return value
         }.filter { Self.recoverable($0, pane: pane, target: target) }
         return held.max { $0.updatedAt < $1.updatedAt }?.plan
+    }
+    /// The held plan to relaunch, only when the pane's current owner is that
+    /// plan's own retained shell; nil means an ordinary resume.
+    nonisolated static func recoveryApplies(held: Plan?, currentOwner: RelayPromptOwnerBinding?) -> Plan? {
+        guard let held, let currentOwner, currentOwner.provider == "shell",
+              sameRetainedShellValues(held.owner, currentOwner) else { return nil }
+        return held
     }
     nonisolated static func recoverable(_ receipt: Receipt, pane: UUID, target: String) -> Bool {
         receipt.paneID == pane && receipt.request.agent == "codex" && receipt.state == "held" &&
@@ -286,6 +295,7 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             guard launchReceipt.status == "input_submitted", let launchRevision = launchReceipt.inputRevision else {
                 try save("held", "The retained shell changed before the launch text was submitted", .exitNotVerified); return
             }
+            inputSent = true
             protectedInputRevision = launchRevision
             try save("verifying", "Resume submitted once; checking the resulting native session")
             let verifyUntil = Date().addingTimeInterval(90)
