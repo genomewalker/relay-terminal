@@ -241,6 +241,14 @@ enum RelayAgentMaintenancePolicy {
         return proof.lifecycle != "quiet"
     }
 
+    /// An update result's old → new versions, from the native probes before
+    /// and after the restart (never the assumed installed version).
+    static func updateVersionFields(before: RelayAgentMaintenanceProbe, after: RelayAgentMaintenanceProbe)
+        -> [String: RelayPaneHealthJSON] {
+        let old = before.runningVersion ?? "unknown", new = after.runningVersion ?? "unknown"
+        return ["from_version": .string(old), "to_version": .string(new), "version_transition": .string(old + " → " + new)]
+    }
+
     /// Whether a Codex at `version` ("0.170.0") is at least `minimum`.
     static func codexVersion(_ version: String?, atLeast minimum: [Int]) -> Bool {
         guard let version else { return false }

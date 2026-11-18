@@ -2826,7 +2826,8 @@ final class RelaySidePanelServer: ObservableObject {
                     }
                     let facts = RelayPaneHealthFacts.read(pane, proof: proof)
                     if proof.valid(for: paneID), RelayAgentMaintenancePolicy.installedImageVerified(proof) {
-                        result = .object(["state": .string("already_current"), "pane": facts.value])
+                        result = .object(["state": .string("already_current"), "pane": facts.value]
+                            .merging(RelayAgentMaintenancePolicy.updateVersionFields(before: proof, after: proof)) { $1 })
                     } else if !facts.allowedActions.contains("apply_update") || RelayPreferences.shared.shepherd.enabled {
                         result = .object(["state": .string("held"), "message": .string("Fresh native evidence or the active coordinator holds this update."), "pane": facts.value])
                     } else {
@@ -2839,11 +2840,16 @@ final class RelaySidePanelServer: ObservableObject {
                             if workspace.panes[paneID] === pane, pane.profile == profile,
                                RelayInstalledUpdatePostcondition.verified(before: proof, after: after, pane: paneID) {
                                 result = .object(["state": .string("verified"),
-                                    "pane": RelayPaneHealthFacts.read(pane, proof: after).value])
+                                    "pane": RelayPaneHealthFacts.read(pane, proof: after).value]
+                                    .merging(RelayAgentMaintenancePolicy.updateVersionFields(before: proof, after: after)) { $1 })
                             } else {
                                 result = .object(["state": .string("verification_unknown"),
                                     "message": .string("The original conversation and current installed image could not both be verified; no retry was submitted.")])
                             }
+                        } else if case .object(var fields) = native, let hold = RelayAgentMaintenance.shared.holds[paneID] {
+                            // A held update names its reason code and how to clear it.
+                            for (key, value) in hold.fields { fields[key] = .string(value) }
+                            result = .object(fields)
                         } else { result = native }
                     }
                 } catch {

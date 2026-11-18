@@ -89,3 +89,14 @@ struct RelayMaintenanceUpdateHoldTests {
         #expect(capped.entries.count == 10 && capped.omitted == 7)
     }
 }
+
+/// Case 5: an update result reports old → new from the native probes.
+@Test func anUpdateResultReportsTheObservedVersionTransition() {
+    var before = RelayAgentMaintenanceProbe(version: 1); before.runningVersion = "0.169.0"; before.installedVersion = "0.170.0"
+    var after = RelayAgentMaintenanceProbe(version: 1); after.runningVersion = "0.170.0"
+    #expect(RelayAgentMaintenancePolicy.updateVersionFields(before: before, after: after) ==
+        ["from_version": .string("0.169.0"), "to_version": .string("0.170.0"), "version_transition": .string("0.169.0 → 0.170.0")])
+    // A probe without a running version says unknown, not the installed one.
+    after.runningVersion = nil
+    #expect(RelayAgentMaintenancePolicy.updateVersionFields(before: before, after: after)["to_version"] == .string("unknown"))
+}
