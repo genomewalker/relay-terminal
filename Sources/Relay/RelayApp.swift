@@ -390,6 +390,7 @@ final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
         RelayAssistantEntryPoints.shared.stop()
         workspace?.shutdown()
         responsivenessMonitor.stop()
+        RelayHostRegistry.shared.flush()
         presentationSuspensionTask?.cancel()
         presentationSuspensionTask = nil
         quitConfirmationTimer?.invalidate()

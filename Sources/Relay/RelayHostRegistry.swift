@@ -28,9 +28,22 @@ final class RelayHostRegistry: ObservableObject {
     static let shared = RelayHostRegistry()
     @Published private(set) var records: [String: RelayHostRecord] = [:]
     @Published private(set) var persistenceError: String?
-    private let url = RelayStateProfile.applicationSupportRoot.appendingPathComponent("host-registry-v1.json")
+    private let url: URL
+    private let now: () -> Date
+    /// Timestamp-only observations are written at most this often. The
+    /// observation time is history (a launch never trusts it as current
+    /// connectivity), so a checkpoint loses nothing that matters, while a
+    /// rewrite per transport event caused an atomic-rename storm (~11/s).
+    static let observationCheckpointInterval: TimeInterval = 60
+    private var lastPersistedAt: Date?
+    private var timestampOnlyPending = false
+    /// Number of completed file writes, for tests and diagnostics.
+    private(set) var persistCount = 0
 
-    private init() {
+    init(url: URL = RelayStateProfile.applicationSupportRoot.appendingPathComponent("host-registry-v1.json"),
+         now: @escaping () -> Date = Date.init) {
+        self.url = url
+        self.now = now
         if let data = try? Data(contentsOf: url),
            let saved = try? JSONDecoder().decode([String: RelayHostRecord].self, from: data) {
             records = saved.mapValues { record in
@@ -68,6 +81,7 @@ final class RelayHostRegistry: ObservableObject {
         record.protocolVersion = report.protocolVersion
         record.checkedAt = report.checkedAt
         record.message = report.message.map { String(RelayDiagnostics.redact($0).prefix(1000)) }
+        guard records[record.id] != record else { return }
         records[record.id] = record
         persist()
     }
@@ -80,6 +94,7 @@ final class RelayHostRegistry: ObservableObject {
         record.installation = report.state.rawValue
         record.checkedAt = report.checkedAt
         record.message = report.message.map { String(RelayDiagnostics.redact($0).prefix(1000)) }
+        guard records[record.id] != record else { return }
         records[record.id] = record
         persist()
     }
@@ -87,9 +102,9 @@ final class RelayHostRegistry: ObservableObject {
     func connection(_ profile: ConnectionProfile, ready: Bool, capabilities: [String] = [],
                     version: String? = nil, protocolVersion: Int? = nil, supervisorPID: Int? = nil) {
         register(profile, origin: "Relay node transport")
-        guard var record = records[profile.connectionKey] else { return }
+        guard let previous = records[profile.connectionKey] else { return }
+        var record = previous
         record.connected = ready
-        record.connectionObservedAt = Date()
         if ready {
             record.capabilities = capabilities.sorted()
             // These fields come from the current daemon handshake, independently
@@ -98,7 +113,25 @@ final class RelayHostRegistry: ObservableObject {
             record.protocolVersion = protocolVersion
             record.supervisorPID = supervisorPID
         }
+        let meaningful = record != previous
+        let observedAt = now()
+        record.connectionObservedAt = observedAt
         records[record.id] = record
+        if meaningful {
+            // A connect, disconnect or handshake change is written at once.
+            persist()
+        } else if let last = lastPersistedAt,
+                  observedAt.timeIntervalSince(last) < Self.observationCheckpointInterval {
+            // Same state again: keep the fresher time in memory only.
+            timestampOnlyPending = true
+        } else {
+            persist()
+        }
+    }
+
+    /// Writes a pending timestamp-only observation, e.g. when the app quits.
+    func flush() {
+        guard timestampOnlyPending else { return }
         persist()
     }
 
@@ -110,6 +143,9 @@ final class RelayHostRegistry: ObservableObject {
             try data.write(to: url, options: [.atomic])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             persistenceError = nil
+            lastPersistedAt = now()
+            timestampOnlyPending = false
+            persistCount += 1
         } catch { persistenceError = "Host registry could not be saved: \(error.localizedDescription)" }
     }
 }
