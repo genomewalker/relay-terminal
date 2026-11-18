@@ -33,6 +33,8 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
     var backgroundAgentJobs: Int? = nil
     var resumeCommand: String? = nil
     var resumeError: String? = nil
+    /// relayd's reason code for resumeError (absent from an older relayd).
+    var resumeErrorCode: String? = nil
     /// The running agent's provider account directory: "" for the provider
     /// default, "~/name" below the host home, else absolute.
     var configDir: String? = nil
@@ -43,6 +45,7 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
     /// or why the target cannot resume this conversation.
     var moveCommand: String? = nil
     var moveError: String? = nil
+    var moveErrorCode: String? = nil
     /// Codex: the ChatGPT login in the running agent's folder and its pin.
     var login: RelayAgentLoginObservation? = nil
     var unavailable: String? = nil
@@ -58,7 +61,7 @@ struct RelayAgentMaintenanceProbe: Decodable, Equatable, Sendable {
         case version, provider, bound, lifecycle, revision, owner, unavailable
         case paneID = "paneId", processID = "processId", processStart, sessionID = "sessionId"
         case installedUpdate, installedImageCurrent, runningVersion, installedVersion, outdatedOtherInstall
-        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, worker, context, configDir, accountMatches, moveCommand, moveError, login
+        case backgroundWork, subagentWork, harnessStatus, backgroundAgentJobs, resumeCommand, resumeError, resumeErrorCode, worker, context, configDir, accountMatches, moveCommand, moveError, moveErrorCode, login
     }
 
     /// Native image versions on the pane's host; nil when either is unverified.
@@ -239,7 +242,21 @@ enum RelayAgentMaintenancePolicy {
         emptyPrompt: Bool, hasDraft: Bool, pendingApprovals: Int, inputAge: TimeInterval,
         preservingDraft: Bool = false, recordedAccount: RelayAgentAccount? = nil,
         promptBlocker: String? = nil, requiresResume: Bool = true) -> String? {
-        guard proof.valid(for: paneID) else { return proof.unavailable ?? "Native identity is unavailable" }
+        deferralReason(proof, paneID: paneID, emptyPrompt: emptyPrompt, hasDraft: hasDraft, pendingApprovals: pendingApprovals,
+            inputAge: inputAge, preservingDraft: preservingDraft, recordedAccount: recordedAccount,
+            promptBlocker: promptBlocker, requiresResume: requiresResume)?.blocker
+    }
+
+    /// `deferral` with its reason code and how to clear it; the blocker is
+    /// exactly the text `deferral` returns.
+    static func deferralReason(_ proof: RelayAgentMaintenanceProbe, paneID: UUID,
+        emptyPrompt: Bool, hasDraft: Bool, pendingApprovals: Int, inputAge: TimeInterval,
+        preservingDraft: Bool = false, recordedAccount: RelayAgentAccount? = nil,
+        promptBlocker: String? = nil, requiresResume: Bool = true) -> RelayPaneOperationRefusal? {
+        typealias Refusal = RelayPaneOperationRefusal
+        guard proof.valid(for: paneID) else {
+            return Refusal(.identityUnavailable, proof.unavailable ?? "Native identity is unavailable")
+        }
         // The account is part of the agent's identity. A restart would resume
         // in the running agent's own account, so a difference from the
         // account the pane was started in is reported and never acted on.
@@ -247,37 +264,41 @@ enum RelayAgentMaintenancePolicy {
            !(proof.accountMatches ?? recordedAccount.matches(observedDirectory: observed)) {
             let reason = recordedAccount.explicitClaudeDefault(observedDirectory: observed)
                 ? " (explicit ~/.claude uses a different .claude.json)" : ""
-            return "Held: the running agent uses a different \(recordedAccount.provider) account than this pane's " +
-                "\(recordedAccount.label) account\(reason); Relay will not restart or switch it"
+            return Refusal(.accountMismatch, "Held: the running agent uses a different \(recordedAccount.provider) account than this pane's " +
+                "\(recordedAccount.label) account\(reason); Relay will not restart or switch it")
         }
-        guard pendingApprovals == 0 else { return "Waiting for the pending approval" }
-        guard preservingDraft || !hasDraft else { return "Waiting for the unsent prompt to be cleared or sent" }
+        guard pendingApprovals == 0 else { return Refusal(.approvalPending, "Waiting for the pending approval") }
+        guard preservingDraft || !hasDraft else { return Refusal(.draftPresent, "Waiting for the unsent prompt to be cleared or sent") }
         if !proof.forcedByUser && proof.backgroundWork == true {
-            return "Waiting for the agent's background shells or agent processes to finish"
+            return Refusal(.backgroundWork, "Waiting for the agent's background shells or agent processes to finish")
         }
         if !proof.forcedByUser && proof.provider == "claude" && proof.backgroundWork == nil {
-            return "Waiting for background work to be verified absent: the native process check is unavailable"
+            return Refusal(.backgroundWork, "Waiting for background work to be verified absent: the native process check is unavailable")
         }
         // Lifecycle evidence of a running subagent holds on its own, whatever
         // the screen shows: a footer can be stale, clipped or absent.
         if !proof.forcedByUser && proof.provider == "claude" && proof.subagentWork == true {
-            return "Waiting for the session's subagents to finish: Claude's lifecycle records show one still running"
+            return Refusal(.subagentWork, "Waiting for the session's subagents to finish: Claude's lifecycle records show one still running")
         }
         guard preservingDraft || emptyPrompt else {
-            return "Waiting for the original prompt to be confirmed empty" + (promptBlocker.map { ": " + $0 } ?? "")
+            let blocker = "Waiting for the original prompt to be confirmed empty" + (promptBlocker.map { ": " + $0 } ?? "")
+            let goal = promptBlocker.map(RelayAgentMaintenancePrompt.isGoalBlocker) ?? false
+            return Refusal(goal ? .goalActive : .promptUnverified, blocker)
         }
         // A current, process-start-matched Claude harness observation can
         // supersede a transcript's cached active phase (for example after
         // "Claude session ended"). CPU usage and summary text are not proof.
         // An explicitly busy harness overrides even a quiet transcript.
         guard idleEvidence(proof, emptyPrompt: emptyPrompt, hasDraft: hasDraft) else {
-            if proof.forcedByUser { return "The agent's turn did not stop after Relay's interrupt" }
-            return proof.lifecycle == "settling" ? "Waiting for the conversation transcript to stop changing"
-                : "Waiting for the current turn to finish"
+            if proof.forcedByUser { return Refusal(.turnActive, "The agent's turn did not stop after Relay's interrupt") }
+            return proof.lifecycle == "settling" ? Refusal(.transcriptSettling, "Waiting for the conversation transcript to stop changing")
+                : Refusal(.turnActive, "Waiting for the current turn to finish")
         }
-        guard inputAge >= 15 else { return "Waiting until you finish typing" }
+        guard inputAge >= 15 else { return Refusal(.userTyping, "Waiting until you finish typing") }
         if requiresResume, proof.resumeCommand == nil {
-            return proof.resumeError ?? "The exact agent resume command is unavailable"
+            let code = proof.resumeErrorCode.flatMap(Refusal.Code.init(rawValue:)) ??
+                (proof.resumeError.map(Refusal.classify) ?? .resumeUnavailable)
+            return Refusal(code, proof.resumeError ?? "The exact agent resume command is unavailable")
         }
         return nil
     }

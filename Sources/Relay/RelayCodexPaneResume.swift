@@ -40,6 +40,17 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
         var state: String
         var detail: String
         var updatedAt: Date
+        /// Set for a refused or held outcome: why, and what clears it.
+        var reasonCode: String? = nil
+        var blocker: String? = nil
+        var howToClear: String? = nil
+        enum CodingKeys: String, CodingKey {
+            case paneID, request, state, detail, updatedAt
+            case reasonCode = "reason_code", blocker, howToClear = "how_to_clear"
+        }
+        mutating func set(_ refusal: RelayPaneOperationRefusal?) {
+            reasonCode = refusal?.code.rawValue; blocker = refusal?.blocker; howToClear = refusal?.howToClear
+        }
         func object() throws -> [String: Any] {
             try JSONSerialization.jsonObject(with: JSONEncoder().encode(self)) as! [String: Any]
         }
@@ -55,6 +66,7 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
         if active[id] == nil && ["checking", "exiting", "launching", "verifying"].contains(value.state) {
             value.state = "interrupted_outcome_unknown"
             value.detail = "The original operation is no longer running. Inspect this pane; do not replay it."
+            value.set(.init(.exitNotVerified, value.detail))
         }
         return value
     }
@@ -68,13 +80,13 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                authorized: @escaping @MainActor () -> Bool) throws -> Receipt {
         if FileManager.default.fileExists(atPath: url(request.requestID).path) {
             guard let prior = receipt(request.requestID, paneID: pane.id), prior.request == request else {
-                throw NSError(domain: "RelayCodexResume", code: 409, userInfo: [NSLocalizedDescriptionKey: "Conflicting or unreadable resume request ID"])
+                throw RelayPaneOperationRefusal(.invalidRequest, "Conflicting or unreadable resume request ID")
             }
             return prior
         }
-        guard request.isAdmissible, active.isEmpty, authorized(), pane.profile.backend == .relay, pane.connectionState == .connected,
-              pane.contentKind == .terminal else {
-            throw NSError(domain: "RelayCodexResume", code: 409, userInfo: [NSLocalizedDescriptionKey: "Resume target or authorization unavailable"])
+        if let refusal = Self.startRefusal(request, busy: !active.isEmpty, authorized: authorized(), backend: pane.profile.backend,
+                                           connection: pane.connectionState, content: pane.contentKind) {
+            throw refusal
         }
         let initial = Receipt(paneID: pane.id, request: request, state: "checking", detail: "Checking exact native owner and saved session", updatedAt: Date())
         try write(initial)
@@ -85,6 +97,7 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                 var result = initial
                 result.state = "refused"
                 result.detail = "Refused before any input: the pane or workspace closed before the resume started"
+                result.set(.init(.paneChanged, result.detail))
                 result.updatedAt = Date()
                 try? self.write(result)
                 return
@@ -102,8 +115,11 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
         func current() -> Bool { authorized() && workspace.panes[pane.id] === pane && pane.profile == profile && pane.connectionState == .connected && pane.agentInputRevision == protectedInputRevision }
         // Every receipt after a line clear says so: that input reached the shell.
         var clearNote = ""
-        func save(_ state: String, _ detail: String) throws {
-            result.state = state; result.detail = detail + clearNote; result.updatedAt = Date(); try write(result)
+        func save(_ state: String, _ detail: String, _ code: RelayPaneOperationRefusal.Code? = nil,
+                  host: RelayPaneOperationRefusal? = nil) throws {
+            result.state = state; result.detail = detail + clearNote; result.updatedAt = Date()
+            result.set(host.map { .init($0.code, result.detail, howToClear: $0.howToClear) } ?? code.map { .init($0, result.detail) })
+            try write(result)
         }
         do {
             let request = result.request, agent = request.agent, name = agent == "claude" ? "Claude" : "Codex"
@@ -112,26 +128,30 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             let captured = try await RelayHostExecution.capture(profile: profile, command: command, timeout: 15, maximumBytes: 16_384)
             // Each refusal names the fence that held, so an operator or Miko
             // can decide without re-deriving it; none of them sends input.
-            func refuse(_ reason: String) throws { try save("refused", "Refused before any input: " + reason) }
-            guard current() else { try refuse("the pane, its connection or the authorization changed"); return }
-            guard captured.exitCode == 0 else {
-                try refuse("the host's \(name) resume plan was refused: " + String(decoding: captured.stderr.prefix(500), as: UTF8.self)); return
+            func refuse(_ reason: String, _ code: RelayPaneOperationRefusal.Code, host: RelayPaneOperationRefusal? = nil) throws {
+                try save("refused", "Refused before any input: " + reason, code, host: host)
             }
-            guard let plan = Self.decodePlan(captured.stdout) else { try refuse("the host's resume plan could not be read"); return }
+            guard current() else { try refuse("the pane, its connection or the authorization changed", .paneChanged); return }
+            guard captured.exitCode == 0 else {
+                try refuse("the host's \(name) resume plan was refused: " + String(decoding: captured.stderr.prefix(500), as: UTF8.self),
+                           .unclassified, host: RelayPaneOperationRefusal.hostRefusal(stderr: captured.stderr)); return
+            }
+            guard let plan = Self.decodePlan(captured.stdout) else { try refuse("the host's resume plan could not be read", .hostUnreachable); return }
             guard request.isAdmissible, plan.owner.provider == agent, plan.owner.paneId == pane.id.uuidString.lowercased(),
                   plan.owner.sessionId == request.expectedSession.uuidString.lowercased(),
                   plan.sessionId == request.targetSession.uuidString.lowercased() else {
-                try refuse("the host's plan names a different provider, pane or session"); return
+                try refuse("the host's plan names a different provider, pane or session", .paneChanged); return
             }
             guard let proof = await pane.runtime.agentResumePromptProof(expected: plan.owner) else {
-                try refuse("no verified idle empty \(name) prompt (busy, draft, approval, background work, or the screen or owner changed)"); return
+                try refuse("no verified idle empty \(name) prompt (busy, draft, approval, background work, or the screen or owner changed)",
+                           .promptUnverified); return
             }
-            guard current() else { try refuse("the pane, its connection or the authorization changed"); return }
+            guard current() else { try refuse("the pane, its connection or the authorization changed", .paneChanged); return }
             try save("exiting", "Graceful \(name) exit requested for the verified original session")
             let (exit, submit) = Self.exitEdit(provider: agent, instance: request.instance, requestID: request.requestID, token: proof)
             let exitReceipt = await pane.runtime.sendTerminalEditReceipt(exit, appendShellReturn: submit, authorization: current)
             guard exitReceipt.status == "input_submitted", let exitRevision = exitReceipt.inputRevision else {
-                try save("not_sent", "The original owner or screen changed; no exit input was submitted"); return
+                try save("not_sent", "The original owner or screen changed; no exit input was submitted", .paneChanged); return
             }
             inputSent = true
             protectedInputRevision = exitRevision
@@ -176,13 +196,13 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             }
             if !current() { reason = "the pane, its connection, authorization or input revision changed" }
             guard current(), let shell, let token else {
-                try save("held", "Exit submitted; the same retained empty shell was not verified (\(reason)). No resume was sent."); return
+                try save("held", "Exit submitted; the same retained empty shell was not verified (\(reason)). No resume was sent.", .exitNotVerified); return
             }
             try save("launching", "Launching the exact saved session in its original account and project")
             let launch = RelayTerminalEditRequest(instance: request.instance, requestID: UUID(), token: token, action: "insert_text", text: plan.command, key: nil, modifiers: nil)
             let launchReceipt = await pane.runtime.sendTerminalEditReceipt(launch, appendShellReturn: true, authorization: current)
             guard launchReceipt.status == "input_submitted", let launchRevision = launchReceipt.inputRevision else {
-                try save("held", "The retained shell changed before the launch text was submitted"); return
+                try save("held", "The retained shell changed before the launch text was submitted", .exitNotVerified); return
             }
             protectedInputRevision = launchRevision
             try save("verifying", "Resume submitted once; checking the resulting native session")
@@ -202,8 +222,23 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
             }
             try save("outcome_unknown", "Resume was submitted once; the expected native binding was not confirmed. Inspect; do not replay.")
         } catch {
-            try? save(inputSent ? "outcome_unknown" : "refused", error.localizedDescription)
+            try? save(inputSent ? "outcome_unknown" : "refused", error.localizedDescription, inputSent ? nil : .hostUnreachable)
         }
+    }
+    /// Why a resume request cannot start, before any receipt is written: each
+    /// condition has its own code instead of one opaque refusal.
+    nonisolated static func startRefusal(_ request: RelayCodexPaneResumeRequest, busy: Bool, authorized: Bool,
+                                         backend: RemoteSessionBackend, connection: PaneConnectionState,
+                                         content: PaneContentKind) -> RelayPaneOperationRefusal? {
+        if !request.isAdmissible {
+            return .init(.invalidRequest, "A Claude resume restarts the pane's own session; target_session must equal expected_session")
+        }
+        if busy { return .init(.operationInProgress, "Another same-pane resume is running") }
+        if !authorized { return .init(.notAuthorized, "The terminal input grant or this caller's access is not current") }
+        if backend != .relay { return .init(.unsupportedPane, "The pane is not on a Relay-managed backend") }
+        if connection != .connected { return .init(.paneNotConnected, "The pane is not connected") }
+        if content != .terminal { return .init(.unsupportedPane, "The pane is not a terminal") }
+        return nil
     }
     /// The next line-clearing control key for a retained shell whose recognized
     /// prompt has shown typed text on two consecutive fenced polls: Ctrl-U kills
