@@ -101,7 +101,20 @@ func TestUpgradeSupervisorRelaunchesDeclaredService(t *testing.T) {
 	}
 	temporary := t.TempDir()
 	oldBinary, newBinary := filepath.Join(temporary, "relayd-old"), filepath.Join(temporary, "relayd-new")
-	buildTestRelayd(t, oldBinary, "0.5.1")
+	// RELAY_E2E_OLD_RELAYD runs a shipped relayd (e.g. the installed 0.5.62)
+	// as the old supervisor. It is copied first and only ever given this
+	// test's temp socket, runtime and state directories.
+	if shipped := os.Getenv("RELAY_E2E_OLD_RELAYD"); shipped != "" {
+		data, err := os.ReadFile(shipped)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(oldBinary, data, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		buildTestRelayd(t, oldBinary, "0.5.1")
+	}
 	buildTestRelayd(t, newBinary, "0.5.2")
 	runtimeDir := newTestRuntime(t, "relay-svc-", temporary)
 	stateHome := filepath.Join(temporary, "state")
@@ -116,6 +129,11 @@ func TestUpgradeSupervisorRelaunchesDeclaredService(t *testing.T) {
 	socket := filepath.Join(runtimeDir, "relayd.sock")
 	serviceLog := filepath.Join(temporary, "service.log")
 	oldSupervisor, oldLog := startTestSupervisor(t, oldBinary, socket, environment)
+	if before, err := inspectSupervisorAt(t, oldBinary, socket, environment); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Logf("old supervisor %s protocol %d on a temp socket", before.Status.Version, before.Status.ProtocolVersion)
+	}
 	var newSupervisor int
 	t.Cleanup(func() {
 		if file, err := os.Open(serviceLog); err == nil {
@@ -193,13 +211,38 @@ func TestUpgradeSupervisorRelaunchesDeclaredService(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	// The old supervisor defers only after the service was stopped: a live
+	// ledger record the client leaves to the supervisor (a peer listener)
+	// blocks its prepare. The client then relaunches the service on the old
+	// supervisor, which first answers "unknown job" for the new ID.
+	blockingListener := filepath.Join(stateHome, "relay", "workers", "host-jobs", "listener-e2e")
+	if err := os.MkdirAll(blockingListener, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record, _ := json.Marshal(map[string]any{"job_id": "listener-e2e", "fingerprint": "e2e", "kind": "peer_listener_v1",
+		"state": "running", "pid": os.Getpid(), "created_at": time.Now().UTC().Format(time.RFC3339Nano)})
+	if err := os.WriteFile(filepath.Join(blockingListener, "record.json"), record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err = relayd("upgrade-supervisor", "--socket", socket, "--legacy-socket", "")
+	t.Logf("restore output:\n%s", output)
+	if err == nil || !strings.Contains(output, "relaunching the declared services") || !strings.Contains(output, "svc-api-g1") {
+		t.Fatalf("deferred prepare did not restore: %v\n%s", err, output)
+	}
+	if e2eJobState(t, socket, "api-r1") == "running" || e2eJobState(t, socket, "svc-api-g1") != "running" || !e2eHealthy(port) {
+		t.Fatalf("service not restored on the old supervisor; supervisor log: %s", oldLog.String())
+	}
+	if err := os.RemoveAll(blockingListener); err != nil {
+		t.Fatal(err)
+	}
+
 	output, err = relayd("upgrade-supervisor", "--socket", socket, "--legacy-socket", "")
 	if err != nil {
 		t.Fatalf("upgrade: %v\n%s\nold supervisor log: %s", err, output, oldLog.String())
 	}
 	_, _ = oldSupervisor.Process.Wait()
 	t.Logf("upgrade output:\n%s", output)
-	if !strings.Contains(output, "upgraded to 0.5.2") || !strings.Contains(output, "svc-api-g1") || !strings.Contains(output, "healthy") ||
+	if !strings.Contains(output, "upgraded to 0.5.2") || !strings.Contains(output, "svc-api-g2") || !strings.Contains(output, "healthy") ||
 		strings.Contains(output, "s3cr3t") || strings.Contains(output, "test.run") {
 		t.Fatalf("upgrade output:\n%s", output)
 	}
@@ -211,15 +254,15 @@ func TestUpgradeSupervisorRelaunchesDeclaredService(t *testing.T) {
 	if live.Status.Version != "0.5.2" || newSupervisor == oldSupervisor.Process.Pid {
 		t.Fatalf("supervisor = %+v", live.Status)
 	}
-	if e2eJobState(t, socket, "svc-api-g1") != "running" || !e2eHealthy(port) {
+	if e2eJobState(t, socket, "svc-api-g2") != "running" || !e2eHealthy(port) {
 		t.Fatal("relaunched service is not running and healthy")
 	}
 	list, err := relayd("service", "list")
-	if err != nil || !strings.Contains(list, "svc-api-g1") || !strings.Contains(list, "running") {
+	if err != nil || !strings.Contains(list, "svc-api-g2") || !strings.Contains(list, "running") {
 		t.Fatalf("list: %v\n%s", err, list)
 	}
 	logData, _ := os.ReadFile(serviceLog)
-	if starts := strings.Count(string(logData), "start "); starts != 2 {
+	if starts := strings.Count(string(logData), "start "); starts != 3 {
 		t.Fatalf("service started %d times:\n%s", starts, logData)
 	}
 }
