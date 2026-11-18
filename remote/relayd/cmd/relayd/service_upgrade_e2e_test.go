@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/relay-terminal/relayd/internal/daemon"
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
@@ -129,10 +130,17 @@ func TestUpgradeSupervisorRelaunchesDeclaredService(t *testing.T) {
 	socket := filepath.Join(runtimeDir, "relayd.sock")
 	serviceLog := filepath.Join(temporary, "service.log")
 	oldSupervisor, oldLog := startTestSupervisor(t, oldBinary, socket, environment)
-	if before, err := inspectSupervisorAt(t, oldBinary, socket, environment); err != nil {
-		t.Fatal(err)
-	} else {
-		t.Logf("old supervisor %s protocol %d on a temp socket", before.Status.Version, before.Status.ProtocolVersion)
+	// startTestSupervisor accepts any status frame; wait until it is ready.
+	for ready := time.Now().Add(15 * time.Second); ; {
+		before, err := inspectSupervisorAt(t, oldBinary, socket, environment)
+		if err == nil {
+			t.Logf("old supervisor %s protocol %d on a temp socket", before.Status.Version, before.Status.ProtocolVersion)
+			break
+		}
+		if time.Now().After(ready) {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	var newSupervisor int
 	t.Cleanup(func() {
@@ -264,5 +272,36 @@ func TestUpgradeSupervisorRelaunchesDeclaredService(t *testing.T) {
 	logData, _ := os.ReadFile(serviceLog)
 	if starts := strings.Count(string(logData), "start "); starts != 3 {
 		t.Fatalf("service started %d times:\n%s", starts, logData)
+	}
+
+	// The caller's session drops: its output pipe is closed before the
+	// upgrade writes anything. The upgrade must still relaunch the service
+	// and leave its result on the host.
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.Close()
+	hungUp := exec.Command(newBinary, "upgrade-supervisor", "--force", "--socket", socket, "--legacy-socket", "")
+	hungUp.Env, hungUp.Stdout, hungUp.Stderr = environment, writer, writer
+	if err := hungUp.Start(); err != nil {
+		t.Fatal(err)
+	}
+	writer.Close()
+	runErr := hungUp.Wait()
+	if e2eJobState(t, socket, "svc-api-g3") != "running" || !e2eHealthy(port) {
+		t.Fatalf("upgrade with a closed output did not relaunch the service: %v", runErr)
+	}
+	if forced, err := inspectSupervisorAt(t, newBinary, socket, environment); err == nil {
+		newSupervisor = forced.PeerPID
+	}
+	host, err := daemon.LocalHostName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := os.ReadFile(filepath.Join(stateHome, "relay", "workers", "services", host, "last-upgrade.txt"))
+	if err != nil || !strings.Contains(string(result), "svc-api-g3") || !strings.Contains(string(result), "result: ok") ||
+		strings.Contains(string(result), "s3cr3t") {
+		t.Fatalf("saved result: %v\n%s", err, result)
 	}
 }

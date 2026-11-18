@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -693,6 +694,25 @@ func (u *ServiceUpgrade) bindRelaunched() error {
 		}
 	}
 	return u.Store.save(file)
+}
+
+// SaveResult records the summary and outcome in the host's service directory
+// as last-upgrade.txt, for a caller whose session ended before the output
+// reached it. Like Summary it holds no commands or environment values.
+// Nothing is written when no journal was involved.
+func (u *ServiceUpgrade) SaveResult(version, failure string) error {
+	if u.journal == nil {
+		return nil
+	}
+	var text strings.Builder
+	fmt.Fprintf(&text, "relayd %s, %s\n", version, time.Now().UTC().Format(time.RFC3339))
+	u.Summary(&text)
+	if failure == "" {
+		text.WriteString("result: ok\n")
+	} else {
+		text.WriteString("result: failed: " + failure + "\n")
+	}
+	return writeServiceText(filepath.Join(u.Store.dir, "last-upgrade.txt"), text.String())
 }
 
 // Summary prints one row per journaled service. It never prints commands or

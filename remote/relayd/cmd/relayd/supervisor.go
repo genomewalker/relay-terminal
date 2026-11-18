@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
 	"time"
@@ -56,6 +57,14 @@ func runUpgradeSupervisor(arguments []string) {
 	if *planOnly {
 		printUpgradePlan(*socket, services)
 		return
+	}
+	if services != nil {
+		// From the first stop until the last relaunch the services depend on
+		// this process. A remote update runs it over SSH; if that session
+		// times out or drops, a SIGHUP or a write to the closed output must not
+		// end it between stop and relaunch. Output is then lost; the result is
+		// kept in the service directory's last-upgrade.txt.
+		signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 	}
 
 	current, currentErr := inspectSupervisor(*socket)
@@ -219,6 +228,9 @@ func finishServiceRelaunch(services *daemon.ServiceUpgrade, failure string) {
 			failure += "; "
 		}
 		failure += "declared services: " + err.Error()
+	}
+	if saveErr := services.SaveResult(relaydVersion, failure); saveErr != nil {
+		fmt.Fprintln(os.Stderr, "relayd: cannot record the service result: "+saveErr.Error())
 	}
 	if failure != "" {
 		fatal(failure)

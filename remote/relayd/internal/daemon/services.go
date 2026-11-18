@@ -410,6 +410,10 @@ func readServiceJSON(path string, value any) error {
 	return nil
 }
 
+func writeServiceText(path, text string) error {
+	return writeServiceBytes(path, []byte(text))
+}
+
 // writeServiceJSON is durable before it returns: the data is synced, renamed
 // over the old file and the directory is synced.
 func writeServiceJSON(path string, value any) error {
@@ -417,6 +421,10 @@ func writeServiceJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
+	return writeServiceBytes(path, append(data, '\n'))
+}
+
+func writeServiceBytes(path string, data []byte) error {
 	if len(data) > maximumServiceDeclaredBytes {
 		return errors.New("service record exceeds its size limit")
 	}
@@ -430,7 +438,7 @@ func writeServiceJSON(path string, value any) error {
 	name := file.Name()
 	defer os.Remove(name)
 	if err = file.Chmod(0o600); err == nil {
-		_, err = file.Write(append(data, '\n'))
+		_, err = file.Write(data)
 	}
 	if err == nil {
 		err = file.Sync()
