@@ -2118,6 +2118,18 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 			command, commandError = nil, exception.msg
 		}
 	}
+	var login any
+	if provider == "codex" {
+		// Same-pane restart: refused when the pane's own pinned folder is
+		// logged in to another ChatGPT account. base stays, so the pane can
+		// still be moved out of that folder.
+		if refusal := codexLoginRefusal(phHome(), account); refusal != "" && command != nil {
+			command, commandError = nil, refusal
+		}
+		started := float64(-1)
+		phCatchAll(func() { started = r.processEpoch(pid) })
+		login = codexLoginObservation(phHome(), account, started)
+	}
 	var moved, moveError, accountMatches any
 	if target != nil {
 		if exception := phCatch(func() {
@@ -2150,7 +2162,7 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 		"background_work", backgroundWork, "subagent_work", subagents,
 		"harness_status", harness, "background_agent_jobs", hostJobs, "resume_command", command, "resume_error", commandError,
 		"config_dir", phAccountLabelDir(account, provider),
-		"account_matches", accountMatches, "move_command", moved, "move_error", moveError)
+		"account_matches", accountMatches, "move_command", moved, "move_error", moveError, "login", login)
 }
 
 // installedRelayImage is installed_relay_image(binary): the reviewed

@@ -51,6 +51,11 @@ func (r *phReader) accountMoveCommand(provider, session, path, base, account, ta
 	if base == "" {
 		phRaise(phValueError, "The exact agent resume command is unavailable.")
 	}
+	if provider == "codex" {
+		if refusal := codexLoginRefusal(phHome(), override); refusal != "" {
+			phRaise(phValueError, refusal)
+		}
+	}
 	seen := ""
 	phCatch(func() {
 		root := phMaintenanceAccountRoot(provider, override)

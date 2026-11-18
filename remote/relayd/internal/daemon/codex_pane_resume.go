@@ -36,6 +36,13 @@ func ReadCodexPaneResumePlan(pane, expected, target string) (CodexPaneResumePlan
 	if err != nil {
 		return empty, err
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return empty, err
+	}
+	if refusal := codexLoginRefusal(home, config); refusal != "" {
+		return empty, errors.New(refusal)
+	}
 	path, err := exactCodexResumeTranscript(config, target)
 	if err != nil {
 		return empty, err
@@ -68,10 +75,6 @@ func ReadCodexPaneResumePlan(pane, expected, target string) (CodexPaneResumePlan
 	live, err := processWorkingDirectory(owner.ProcessID)
 	if err != nil || verifyNativeDirectoryEvidence(cwd, nil, live) != nil {
 		return empty, errors.New("saved session is outside this pane's project")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return empty, err
 	}
 	shim := filepath.Join(home, ".local", "share", "relay", "shims", "codex")
 	info, err := os.Stat(shim)
