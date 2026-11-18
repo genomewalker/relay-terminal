@@ -336,7 +336,7 @@ struct RelayAgentAccountBadge: View {
                 .padding(.horizontal, RelayTheme.spacing(5))
                 .padding(.vertical, RelayTheme.spacing(1))
                 .foregroundStyle(tint ?? RelayTheme.textMuted)
-                .overlay(Capsule().stroke(tint ?? RelayTheme.textFaint.opacity(0.5), lineWidth: 0.5))
+                .overlay(Capsule().stroke(tint ?? Self.unverifiedStroke(state) ?? RelayTheme.textFaint.opacity(0.5), lineWidth: 0.5))
                 .lineLimit(1)
                 .fixedSize()
                 .help(Self.help(state, label: label) + (moves.statuses[pane.id].map { "\n" + $0 } ?? ""))
@@ -351,6 +351,12 @@ extension RelayAgentAccountBadge {
     /// a folder other than the recorded one, else the neutral style.
     static func tint(_ state: RelayPaneAgentAccountState) -> Color? {
         state.loginMismatch ? RelayTheme.red : state.mismatch ? RelayTheme.coral : nil
+    }
+
+    /// An amber outline only: the Codex login is unpinned or could not be
+    /// read, so the folder label is unverified. Nil from older hosts.
+    static func unverifiedStroke(_ state: RelayPaneAgentAccountState) -> Color? {
+        ["unpinned", "unknown"].contains(state.observedLogin?.status ?? "") ? RelayTheme.warning : nil
     }
 
     static func help(_ state: RelayPaneAgentAccountState, label: String) -> String {

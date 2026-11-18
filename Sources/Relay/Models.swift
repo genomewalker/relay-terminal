@@ -2150,13 +2150,22 @@ extension PaneModel {
     /// Records the Codex login relayd observed in the running agent's folder.
     /// A new mismatch is reported once per host, label and observed account
     /// in the activity list; nothing is restarted or switched.
-    func observeAgentLogin(_ login: RelayAgentLoginObservation?, activity: RelayActivityLog = .shared) {
-        guard var state = agentAccount, state.observedLogin != login else { return }
+    func observeAgentLogin(_ observed: RelayAgentLoginObservation?, activity: RelayActivityLog = .shared) {
+        guard var state = agentAccount else { return }
+        var login = observed
+        // Fixing the folder does not fix a running process: one seen on the
+        // wrong login, started before auth.json changed, keeps that login.
+        if var current = login, current.status != "mismatch", current.startedBeforeLoginChange == true,
+           state.loginMismatch {
+            current.loadedWrongLogin = true
+            login = current
+        }
+        guard state.observedLogin != login else { return }
         let wasMismatch = state.loginMismatch
         state.observedLogin = login
         agentAccount = state
         RelayPaneAccountStore.shared.save(state, paneID: id)
-        guard state.loginMismatch, !wasMismatch, let login else { return }
+        guard state.loginMismatch, !wasMismatch, let login, login.status == "mismatch" else { return }
         activity.record(caller: "Relay", summary: "Wrong Codex login in \(displayName.prefix(40)): \(login.label ?? "folder") " +
             "is pinned to \(login.expected ?? "?")… but logged in to \(login.accountText)", paneID: id, tabID: nil,
             dedupeKey: "codex-login:\(profile.connectionKey):\(login.label ?? ""):\(login.account ?? login.state ?? "")",

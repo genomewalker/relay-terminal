@@ -56,8 +56,12 @@ enum RelayAgentAccountMovePolicy {
         }
         guard !hasDraft else { return "Send or clear the unsent prompt first; a move needs an empty prompt." }
         if typedDraft, let refused = draftCaptureRefusal(provider: proof.provider) { return refused }
+        // A move resumes with its own moveCommand. relayd withholds the
+        // same-pane resume of a folder holding the wrong Codex login, and a
+        // move is exactly how such a pane leaves that folder.
         if let held = RelayAgentMaintenancePolicy.deferral(proof, paneID: paneID, emptyPrompt: emptyPrompt || typedDraft,
-            hasDraft: hasDraft, pendingApprovals: pendingApprovals, inputAge: inputAge, promptBlocker: promptBlocker) {
+            hasDraft: hasDraft, pendingApprovals: pendingApprovals, inputAge: inputAge, promptBlocker: promptBlocker,
+            requiresResume: proof.login?.status != "mismatch") {
             return held
         }
         guard proof.moveCommand != nil else {

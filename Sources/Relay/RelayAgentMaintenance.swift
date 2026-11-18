@@ -238,7 +238,7 @@ enum RelayAgentMaintenancePolicy {
     static func deferral(_ proof: RelayAgentMaintenanceProbe, paneID: UUID,
         emptyPrompt: Bool, hasDraft: Bool, pendingApprovals: Int, inputAge: TimeInterval,
         preservingDraft: Bool = false, recordedAccount: RelayAgentAccount? = nil,
-        promptBlocker: String? = nil) -> String? {
+        promptBlocker: String? = nil, requiresResume: Bool = true) -> String? {
         guard proof.valid(for: paneID) else { return proof.unavailable ?? "Native identity is unavailable" }
         // The account is part of the agent's identity. A restart would resume
         // in the running agent's own account, so a difference from the
@@ -276,7 +276,7 @@ enum RelayAgentMaintenancePolicy {
                 : "Waiting for the current turn to finish"
         }
         guard inputAge >= 15 else { return "Waiting until you finish typing" }
-        if proof.resumeCommand == nil {
+        if requiresResume, proof.resumeCommand == nil {
             return proof.resumeError ?? "The exact agent resume command is unavailable"
         }
         return nil
@@ -866,6 +866,7 @@ enum RelayAgentMaintenanceRestartAdmission {
     func tick(_ workspace: WorkspaceModel, now: Date = Date()) {
         RelayPaneHealthCoordinator.shared.heartbeat(workspace, now: now)
         RelayMikoShepherdCoordinator.shared.heartbeat(workspace, now: now)
+        RelayCodexLoginWatch.shared.tick(workspace, now: now)
         guard !RelayPreferences.shared.shepherd.enabled,
               (RelayPreferences.shared.automaticAgentMaintenance || RelayPreferences.shared.haikuPaneHealth),
               !RelayLaunchMode.isRunningTests else { return }

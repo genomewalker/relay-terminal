@@ -180,7 +180,8 @@ struct RelayPaneAgentAccountState: Codable, Equatable, Sendable {
     var displayLabel: String? {
         guard let label = folderDisplayLabel else { return nil }
         // A wrong login is named next to the folder label it contradicts.
-        return loginMismatch ? label + " · login " + (observedLogin?.accountText ?? "other") : label
+        guard loginMismatch, let login = observedLogin else { return label }
+        return label + (login.status == "mismatch" ? " · login " + login.accountText : " · restart for login")
     }
 
     private var folderDisplayLabel: String? {
@@ -196,7 +197,7 @@ struct RelayPaneAgentAccountState: Codable, Equatable, Sendable {
 
     /// The folder's auth.json is logged in to another ChatGPT account than
     /// the one its label is pinned to.
-    var loginMismatch: Bool { observedLogin?.status == "mismatch" }
+    var loginMismatch: Bool { observedLogin?.wrong == true }
 
     var mismatch: Bool {
         guard let recorded, let observedDirectory, observedProvider == recorded.provider else { return false }
@@ -227,6 +228,12 @@ struct RelayAgentLoginObservation: Codable, Equatable, Sendable {
     var plan: String? = nil
     /// The process started before auth.json last changed.
     var startedBeforeLoginChange: Bool? = nil
+    /// Set by Relay, never by the host: this process was seen in the folder
+    /// while it held the wrong login, and the folder was fixed after it
+    /// started, so it still runs on the login it loaded.
+    var loadedWrongLogin: Bool? = nil
+
+    var wrong: Bool { status == "mismatch" || loadedWrongLogin == true }
 
     var accountText: String {
         guard let account else { return state == "api_key" ? "API key" : "unknown" }
@@ -235,6 +242,11 @@ struct RelayAgentLoginObservation: Codable, Equatable, Sendable {
 
     /// The badge tooltip for a mismatch; nil otherwise.
     var mismatchDescription: String? {
+        if status != "mismatch", loadedWrongLogin == true {
+            return "Restart needed: this Codex pane ran while its folder was logged in to another ChatGPT account. " +
+                "The folder now holds the pinned account \(accountText), but a running Codex keeps the login it " +
+                "loaded until it is restarted."
+        }
         guard status == "mismatch" else { return nil }
         let name = label ?? "this"
         return "Wrong Codex login: the \(name) account is pinned to ChatGPT account \(expected ?? "?")… but its folder " +
@@ -1461,5 +1473,48 @@ extension WorkspaceModel {
         else { return promptRefusal }
         pane.recordAgentAccount(account)
         return nil
+    }
+}
+
+/// Notices a pinned Codex folder whose auth.json changes account, without
+/// waiting for a pane inspection: every few minutes per host with connected
+/// Codex panes it reads the host's account list (local file reads on the
+/// host, no provider command) and updates those panes' login observation.
+/// A pane already seen on a wrong login keeps that until its own inspection,
+/// which knows whether the process started before the folder was fixed.
+@MainActor final class RelayCodexLoginWatch {
+    static let shared = RelayCodexLoginWatch()
+    static let interval: TimeInterval = 300
+    private var lastRead: [String: Date] = [:]
+    private var reading: Set<String> = []
+
+    func tick(_ workspace: WorkspaceModel, now: Date = Date()) {
+        guard !RelayLaunchMode.isRunningTests else { return }
+        let panes = workspace.panes.values.filter {
+            $0.kind == .codex && $0.profile.backend == .relay && $0.connectionState == .connected && $0.agentAccount != nil
+        }
+        for (key, group) in Dictionary(grouping: panes, by: { RelayAgentAccountDirectory.hostKey($0.profile) }) {
+            guard !reading.contains(key), now.timeIntervalSince(lastRead[key] ?? .distantPast) >= Self.interval,
+                  let profile = group.first?.profile else { continue }
+            lastRead[key] = now
+            reading.insert(key)
+            Task { @MainActor [weak self] in
+                defer { self?.reading.remove(key) }
+                guard let statuses = try? await RelayAgentAccountDirectory.shared.refresh(profile) else { return }
+                for pane in group where pane.profile == profile { Self.apply(statuses, to: pane) }
+            }
+        }
+    }
+
+    static func apply(_ statuses: [RelayAgentAccountStatus], to pane: PaneModel) {
+        guard let state = pane.agentAccount, let label = state.observedLabel ?? state.recorded?.label,
+              let status = statuses.first(where: { $0.provider == "codex" && $0.label == label }),
+              let loginStatus = status.loginStatus, let login = status.login else { return }
+        let current = state.observedLogin
+        guard current?.status != loginStatus || current?.account != login.account,
+              !(current?.wrong == true && loginStatus != "mismatch") else { return }
+        pane.observeAgentLogin(.init(status: loginStatus, label: label,
+            expected: status.expectAccount.flatMap { $0.isEmpty ? nil : $0 },
+            state: login.state, account: login.account, plan: login.plan))
     }
 }
