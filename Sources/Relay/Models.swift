@@ -1962,6 +1962,40 @@ final class TabModel: ObservableObject, Identifiable {
         return true
     }
 
+    /// Puts `replacement` exactly where `paneID` was: its floating
+    /// placement, its layout leaf, or its place in a stack (showing or
+    /// hidden). The stack table changes together with the layout, so a
+    /// later `reconcileStacks` never sees the retired ID and re-tiles it.
+    /// Returns false if the pane is not in this tab.
+    @discardableResult
+    func replacePane(_ paneID: UUID, with replacement: UUID) -> Bool {
+        if let index = floatingPanes.firstIndex(where: { $0.paneID == paneID }) {
+            let placement = floatingPanes[index]
+            floatingPanes[index] = FloatingPanePlacement(
+                paneID: replacement,
+                originX: placement.originX, originY: placement.originY,
+                width: placement.width, height: placement.height,
+                minimized: placement.minimized
+            )
+            return true
+        }
+        let tiled = layout.paneIDs.contains(paneID)
+        let stackIndex = stacks.firstIndex(where: { $0.members.contains(paneID) })
+        guard tiled || stackIndex != nil else { return false }
+        if let stackIndex {
+            var updated = stacks
+            var stack = updated[stackIndex]
+            stack.members = stack.members.map { $0 == paneID ? replacement : $0 }
+            if stack.selected == paneID { stack.selected = replacement }
+            updated[stackIndex] = stack
+            if tiled { layout = layout.swapping(paneID, replacement) }
+            stacks = updated
+        } else {
+            layout = layout.swapping(paneID, replacement)
+        }
+        return true
+    }
+
     /// Keeps the stack table consistent after any direct `layout` assignment:
     /// a stack whose showing member left the layout promotes another member
     /// that is still there, or else re-tiles its hidden members so no pane is

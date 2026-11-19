@@ -2297,17 +2297,7 @@ final class WorkspaceModel: ObservableObject {
         replacement.assignRemoteHierarchy(workspaceSessionID: tab.sessionID, tabID: tab.id)
         rememberClosedPane(paneID, in: tab)
         storePane(replacement)
-        if let index = tab.floatingPanes.firstIndex(where: { $0.paneID == paneID }) {
-            let placement = tab.floatingPanes[index]
-            tab.floatingPanes[index] = FloatingPanePlacement(
-                paneID: replacement.id,
-                originX: placement.originX, originY: placement.originY,
-                width: placement.width, height: placement.height,
-                minimized: placement.minimized
-            )
-        } else {
-            tab.layout = tab.layout.swapping(paneID, replacement.id)
-        }
+        tab.replacePane(paneID, with: replacement.id)
         if zoomedPaneID == paneID { zoomedPaneID = replacement.id }
         if agentInspector?.paneID == paneID { agentInspector = nil }
         retirePluginPresentation(for: paneID)

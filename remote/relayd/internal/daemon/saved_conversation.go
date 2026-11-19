@@ -119,3 +119,48 @@ func readSavedConversationPlan(server *Server, pane string) (SavedConversationPl
 	plan.ConfigDir = binding.Producer.ConfigDir
 	return plan, nil
 }
+
+// SavedConversationOpenElsewhere names another pane whose live provider
+// process is bound to this conversation. Resuming it again would run one
+// conversation in two panes: 2026-10-30, two Resumes of pane cc583d26 both
+// started f5c58da2 (panes 07fa914c and 4ca4ff69), and both wrote to it.
+func SavedConversationOpenElsewhere(sessionID, exceptPane string) (string, error) {
+	return savedConversationOpenElsewhere(NewServer(), sessionID, exceptPane)
+}
+
+func savedConversationOpenElsewhere(server *Server, sessionID, exceptPane string) (string, error) {
+	if !validSessionID.MatchString(sessionID) {
+		return "", errors.New("invalid conversation identity")
+	}
+	directory := filepath.Join(server.stateDir, "agent-bindings")
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || filepath.Ext(name) != ".json" {
+			continue
+		}
+		pane := name[:len(name)-len(".json")]
+		if pane == exceptPane || !validSessionID.MatchString(pane) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(directory, name))
+		if err != nil || len(data) > 65536 {
+			continue
+		}
+		var binding AgentBindingRecord
+		if json.Unmarshal(data, &binding) != nil || binding.SessionID != sessionID ||
+			binding.Producer.PaneID != pane || binding.Producer.ProcessID <= 1 {
+			continue
+		}
+		if start, err := processStartTime(binding.Producer.ProcessID); err == nil && start == binding.Producer.ProcessStart {
+			return pane, nil
+		}
+	}
+	return "", nil
+}

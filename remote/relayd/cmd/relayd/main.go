@@ -854,6 +854,11 @@ func runResumeSaved(arguments []string) {
 	if err != nil || plan.SessionID != arguments[1] || plan.BindingSHA != arguments[2] {
 		fatal("saved conversation changed or is unavailable; no agent was started")
 	}
+	if other, err := daemon.SavedConversationOpenElsewhere(plan.SessionID, arguments[0]); err != nil {
+		fatal("could not check where this conversation is open; no agent was started")
+	} else if other != "" {
+		fatal("this conversation is already running in pane " + other + "; no agent was started")
+	}
 	if err := os.Chdir(plan.Directory); err != nil {
 		fatal("saved working directory is unavailable")
 	}
