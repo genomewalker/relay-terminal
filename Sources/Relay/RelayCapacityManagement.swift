@@ -154,7 +154,9 @@ enum RelayCapacityManagement {
             throw RelayHostRotationRPC.Failure.invalidResponse
         }
         if let error = root["error"] as? String {
-            guard root["result"] == nil, error.utf8.count <= 8192 else { throw RelayHostRotationRPC.Failure.invalidResponse }
+            // relayd's node sends `"result": null` beside an error it raised itself
+            // (request slots full, handler failure); a real result beside an error is ambiguous.
+            guard root["result"] == nil || root["result"] is NSNull, error.utf8.count <= 8192 else { throw RelayHostRotationRPC.Failure.invalidResponse }
             throw RelayHostRotationRPC.Failure.refused(error)
         }
         guard let result = root["result"] as? [String: Any],
