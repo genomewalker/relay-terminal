@@ -65,6 +65,12 @@ final class RelayDiagnostics: @unchecked Sendable {
             RelayStateProfile.applicationSupportRoot.appendingPathComponent("Relay/connection-diagnostics.jsonl"))
     }
 
+    static let recoveryGeometryKeys: Set<String> = ["row", "column", "columns", "cursor", "prefix",
+        "draft_characters", "row_characters", "linefeeds", "carriage_returns",
+        "shell_prefix_-1", "shell_prefix_0", "shell_prefix_1",
+        "agent_prefix_-1", "agent_prefix_0", "agent_prefix_1", "lead_-1", "lead_0", "lead_1",
+        "point_y", "cell_height", "grid_origin_y", "bounds_height"]
+
     private static func inputDetails(_ details: [String: String]) -> [String: String] {
         let allowed: Set<String> = ["pane_id", "kind", "remote", "reason", "phase", "queued_actions",
             "first_responder", "surface_visible", "focus_claimed", "window_key", "eligible",
@@ -76,6 +82,17 @@ final class RelayDiagnostics: @unchecked Sendable {
             "near_prompt", "mirror_reliable", "reliable", "redo", "history"]
         return details.filter {
                 if flags.contains($0.key) { return $0.value == "true" || $0.value == "false" }
+                // Prompt-mirror recovery geometry: small signed cell counts.
+                if Self.recoveryGeometryKeys.contains($0.key) {
+                    return Int($0.value).map { $0 >= -1 && $0 <= 100_000 } == true
+                }
+                // A row's first glyph: a symbol's code point, or "text"/"blank";
+                // never a letter or digit of the prompt.
+                if $0.key.hasPrefix("glyph_"), ["glyph_-1", "glyph_0", "glyph_1"].contains($0.key) {
+                    return $0.value == "text" || $0.value == "blank" ||
+                        ($0.value.hasPrefix("U+") && $0.value.count <= 8 &&
+                         $0.value.dropFirst(2).allSatisfy(\.isHexDigit))
+                }
                 if $0.key == "movement" {
                     return $0.value == "unresolved" || Int($0.value).map { abs($0) <= 1_000_000 } == true
                 }

@@ -28,6 +28,16 @@ final class RelayClipboardRequest {
 
 enum TerminalPromptSelectionEdit {
     /// Recognize only Relay's known input-line prefixes, never arbitrary output.
+    /// The redacted shape of a rendered row for diagnostics: its leading
+    /// spaces and its first other glyph, named only when it is a symbol.
+    static func rowShape(_ line: String) -> (leadingSpaces: Int, glyph: String) {
+        let leading = line.prefix(while: { $0 == " " }).count
+        guard let first = line.dropFirst(leading).first, first != "\n", first != "\r",
+              let scalar = first.unicodeScalars.first else { return (leading, "blank") }
+        if scalar.properties.isAlphabetic || scalar.properties.numericType != nil { return (leading, "text") }
+        return (leading, "U+" + String(scalar.value, radix: 16, uppercase: true))
+    }
+
     static func inputPrefixLength(_ line: String, shell: Bool) -> Int? {
         let leading = line.prefix(while: { $0 == " " }).count
         var remainder = String(line.dropFirst(leading))
@@ -8853,6 +8863,10 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         diagnostic["row"] = String(row)
         diagnostic["column"] = String(column)
         diagnostic["columns"] = String(geometry.columns)
+        diagnostic["point_y"] = String(Int(geometry.point.y.rounded()))
+        diagnostic["cell_height"] = String(Int((geometry.cellSize.height * 10).rounded()))
+        diagnostic["grid_origin_y"] = String(Int(geometry.gridOrigin.y.rounded()))
+        diagnostic["bounds_height"] = String(Int(bounds.height.rounded()))
         if recoverWrappedPrompt(row: row, column: column, columns: geometry.columns) {
             diagnostic["reason"] = "recovered_wrapped"
             return
@@ -8863,6 +8877,9 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
                     TerminalPromptSelectionEdit.inputPrefixLength(nearby, shell: true) ?? -1)
                 diagnostic["agent_prefix_\(offset)"] = String(
                     TerminalPromptSelectionEdit.inputPrefixLength(nearby, shell: false) ?? -1)
+                let shape = TerminalPromptSelectionEdit.rowShape(nearby)
+                diagnostic["lead_\(offset)"] = String(shape.leadingSpaces)
+                diagnostic["glyph_\(offset)"] = shape.glyph
             }
         }
         diagnostic["reason"] = "row"
