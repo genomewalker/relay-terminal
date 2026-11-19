@@ -381,6 +381,8 @@ func (b *Bridge) route(r *http.Request, caller string) (int, []byte, error) {
 		}
 	case method == "POST" && path == "/api/workspace/apply":
 		return b.workspaceApply(r, caller, allowed, tabs, paneTab)
+	case method == "POST" && path == "/api/workspace/launch-agent":
+		return b.launchAgent(r, caller, allowed, tabs, paneTab)
 	case method == "POST" && (path == "/api/workspace/stack-pane" || path == "/api/workspace/new-stacked-pane"):
 		return b.workspaceStack(r, caller, path, allowed)
 	case method == "POST" && path == "/api/workspace/show":

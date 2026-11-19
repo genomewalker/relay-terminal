@@ -729,4 +729,51 @@ struct MCPLaunchAgentTests {
         #expect(unknown.created.status == "created", "a caller pane Relay does not show still gets an agent")
         #expect(unknown.request.placement == "active_session_tab")
     }
+
+    /// 0.5.125: dandy-07 agents launch through the remote bridge, which adds
+    /// bridgeScope. Relay re-checks it against live state before creating:
+    /// the launch host is the bridge host, the calling pane is on that host in
+    /// a tab wholly on it, any placement stays in the caller's session, and a
+    /// bridged launch never falls back to the active session.
+    @Test func aBridgedLaunchIsFencedToTheCallersHostAndSession() async throws {
+        let f = try F.fixture()
+        defer { f.workspace.shutdown() }
+        f.workspace.createdPaneBackgroundStart = { _, _ in }
+        f.workspace.selectTab(f.a1.id)
+        let bHost = "mcp-tab-move-b.invalid"
+        let caller = try #require(f.b1.allPaneIDs.first)
+        let macSide = try #require(f.a1.allPaneIDs.first)
+        let instance = UUID(), probe = Probe()
+        func launch(_ extra: [String: String], scope: String = bHost, host: String = bHost) async -> MCPLaunchAgentReceipt? {
+            var object = ["instance": instance.uuidString, "requestID": UUID().uuidString, "host": host,
+                          "cwd": "/tmp/project", "provider": "claude", "model": "claude-opus-4.1", "account": "personal",
+                          "briefPath": "/tmp/brief.md"]
+            object.merge(extra) { $1 }
+            var json = String(decoding: F.body(object), as: UTF8.self)
+            json.removeLast()
+            json += ",\"bridgeScope\":{\"host\":\"\(scope)\"}}"
+            return Self.receipt(await MCPLaunchAgentRequests().launch(Data(json.utf8), instance: instance, permits: F.all,
+                workspace: f.workspace, environment: Self.environment(probe, host: .sshConfigHost(host))))
+        }
+        let before = Set(f.workspace.panes.keys)
+        let ok = try #require(await launch(["callerPaneID": caller.uuidString]))
+        #expect(ok.created.status == "created")
+        let tab = try #require(ok.created.tabID.flatMap(UUID.init(uuidString:)))
+        #expect(f.workspace.tabs.first { $0.id == tab }?.sessionID == f.b1.sessionID)
+        #expect(Set(f.workspace.panes.keys).subtracting(before).count == 1)
+
+        let refusals: [(String, [String: String], String, String)] = [
+            ("no caller", [:], bHost, bHost),
+            ("caller on another host", ["callerPaneID": macSide.uuidString], bHost, bHost),
+            ("anchor in another session", ["callerPaneID": caller.uuidString, "anchorTabID": f.a1.id.uuidString], bHost, bHost),
+            ("launch host is not the bridge host", ["callerPaneID": caller.uuidString], bHost, "mcp-tab-move-a.invalid"),
+            ("bridge names the Mac", ["callerPaneID": caller.uuidString], "This Mac", bHost),
+        ]
+        for (name, extra, scope, host) in refusals {
+            let count = f.workspace.panes.count
+            let receipt = await launch(extra, scope: scope, host: host)
+            #expect(receipt?.created.status != "created", "\(name)")
+            #expect(f.workspace.panes.count == count, "\(name): nothing was created")
+        }
+    }
 }

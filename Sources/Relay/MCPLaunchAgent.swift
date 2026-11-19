@@ -30,11 +30,14 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
     /// new tab opens right after this pane's tab, in its workspace, when
     /// Relay shows that pane; otherwise in the active session.
     var callerPaneID: UUID? = nil
+    /// Set only by the remote MCP bridge (dandy-07 agents). Relay re-checks
+    /// it against live state immediately before creating anything.
+    var bridgeScope: PaneStackBridgeScope? = nil
     /// account (default: no flag, the account's own settings) | ask | read_only | yolo.
     var permissionMode: String? = nil
 
     static let required: Set<String> = ["instance", "requestID", "host", "cwd", "provider", "model", "account", "briefPath"]
-    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "callerPaneID", "permissionMode"])
+    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "callerPaneID", "bridgeScope", "permissionMode"])
     static let briefLimit = 64 << 10
 
     /// Exact keys, bounded body, and every field valid; nil otherwise.
@@ -42,6 +45,7 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
         guard body.count <= 16384, (try? RelayCapacityJSON.validate(body)) != nil,
               let fields = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               Set(fields.keys).isSubset(of: keys), required.isSubset(of: Set(fields.keys)),
+              !(fields["bridgeScope"] is NSNull),
               let proposal = try? JSONDecoder().decode(Self.self, from: body), proposal.isValid else { return nil }
         return proposal
     }
@@ -73,6 +77,33 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
         if anchorTabID != nil || anchorPaneID != nil { return "anchored_tab" }
         if callerPaneID != nil && callerShown { return "caller_tab" }
         return "active_session_tab"
+    }
+
+    /// A bridged launch stays on the bridge host and in the calling pane's
+    /// session: nil when allowed, otherwise the refusal. Synchronous on the
+    /// main actor, so the checked state is the one changed.
+    @MainActor func bridgeRefusal(profile: ConnectionProfile, workspace: WorkspaceModel) -> String? {
+        guard let scope = bridgeScope else { return nil }
+        guard let callerPaneID else { return "A bridged launch needs its calling pane" }
+        let placedPanes = [targetPaneID, anchorPaneID].compactMap { $0 }
+        var fenced = [callerPaneID] + placedPanes
+        if let anchorTabID {
+            let panes = workspace.paneIDs(inTab: anchorTabID)
+            guard !panes.isEmpty else { return "Anchor tab is not in this workspace" }
+            fenced += panes
+        }
+        if let reason = MCPDirectTabRequests.bridgeFence(scope: scope, paneIDs: fenced, requestedHost: host,
+                                                          profile: profile, workspace: workspace) {
+            return reason
+        }
+        func session(ofTab id: UUID?) -> UUID? { id.flatMap { tab in workspace.tabs.first { $0.id == tab }?.sessionID } }
+        let callerSession = session(ofTab: workspace.tabID(containingPane: callerPaneID))
+        let placedSessions = placedPanes.map { session(ofTab: workspace.tabID(containingPane: $0)) } +
+            (anchorTabID.map { [session(ofTab: $0)] } ?? [])
+        guard callerSession != nil, placedSessions.allSatisfy({ $0 == callerSession }) else {
+            return "Placement must stay in the calling pane's session on the bridge host"
+        }
+        return nil
     }
 
     /// The caller's pane when it decides placement: no explicit placement and
@@ -946,6 +977,7 @@ enum MCPAgentBindingRead {
                        before: Set<UUID>) -> Creation {
         func fresh() -> [UUID] { workspace.panes.keys.filter { !before.contains($0) } }
         var paneID: UUID?, tabID: UUID?
+        if let refusal = proposal.bridgeRefusal(profile: profile, workspace: workspace) { return .refused(refusal) }
         do {
             if let target = proposal.targetPaneID {
                 guard workspace.panes[target] != nil else { return .refused("target_pane_id is not a pane") }

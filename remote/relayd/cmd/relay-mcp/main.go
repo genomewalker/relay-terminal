@@ -1779,7 +1779,7 @@ func main() {
 	// Remote discovery and durable workspace operations can take longer than a
 	// loopback read. Allow their bounded completion instead of reporting a timeout
 	// after a successful write. Receipts remain authoritative after uncertainty.
-	s := server{surfacePane: surfacePane, callerPane: callerPaneFrom(os.Getenv("RELAY_SESSION")), callerToken: callerToken, token: token, endpoint: fmt.Sprintf("http://127.0.0.1:%d", port), client: &http.Client{Timeout: 60 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	s := server{surfacePane: surfacePane, callerPane: callerPane(), callerToken: callerToken, token: token, endpoint: fmt.Sprintf("http://127.0.0.1:%d", port), client: &http.Client{Timeout: 60 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	if os.Getenv("RELAY_MCP_BACKEND") == "daemon" {
 		s.daemonHelper = os.Getenv("RELAY_MCP_DAEMON")
 		if s.daemonHelper == "" {
