@@ -48,3 +48,39 @@ func TestClaudeQuotaWindowsAllowlistAndMissingData(t *testing.T) {
 		}
 	}
 }
+
+// Two Claude accounts on one host: each pane's status names its own account,
+// from CLAUDE_CONFIG_DIR when set, else the home default.
+func TestClaudeStatusCaptureNamesThePanesOwnAccount(t *testing.T) {
+	const pane = "12345678-1234-4234-8234-123456789abc"
+	t.Setenv("RELAY_SESSION", pane)
+	home := t.TempDir()
+	business := filepath.Join(home, ".claude-business")
+	write := func(dir, account string) {
+		_ = os.MkdirAll(dir, 0o700)
+		data := `{"oauthAccount":{"accountUuid":"` + account + `","organizationUuid":"org-` + account + `"}}`
+		if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(home, "personal")
+	write(business, "business")
+	input := []byte(`{"session_id":"aaaaaaaa-1234-4234-8234-123456789abc","model":{"id":"claude-opus-5"},"cwd":"/work","workspace":{"project_dir":"/work"}}`)
+	scope := func() string {
+		if err := captureClaudeStatus(pane, input, home); err != nil {
+			t.Fatal(err)
+		}
+		var got claudeLiveStatus
+		data, _ := os.ReadFile(filepath.Join(home, ".local", "share", "relay", "claude-status", pane+".json"))
+		if json.Unmarshal(data, &got) != nil || len(got.AccountScope) != 64 {
+			t.Fatalf("no account scope recorded: %s", data)
+		}
+		return got.AccountScope
+	}
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	personal := scope()
+	t.Setenv("CLAUDE_CONFIG_DIR", business)
+	if scope() == personal {
+		t.Fatal("a business pane was recorded under the personal account")
+	}
+}

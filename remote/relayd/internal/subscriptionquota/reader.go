@@ -380,3 +380,12 @@ func decodeCommand(encoded string) (string, error) {
 	}
 	return string(data), nil
 }
+
+// ClaudeAccountScope is the account digest the per-pane status capture
+// records: Claude in this process's environment (CLAUDE_CONFIG_DIR or the
+// home default), or "" when its account file is missing or not private.
+func ClaudeAccountScope(home string) string {
+	r := &Reader{home: home, uid: uint32(os.Getuid()), env: os.LookupEnv}
+	scope, _ := r.accountScope("claude").(string)
+	return scope
+}

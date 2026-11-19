@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/relay-terminal/relayd/internal/subscriptionquota"
 )
 
 // Claude sends current model and effort to a status-line command even while
@@ -54,6 +56,9 @@ type claudeLiveStatus struct {
 	Project    string                       `json:"project_dir"`
 	Captured   time.Time                    `json:"captured_at"`
 	RateLimits map[string]claudeQuotaWindow `json:"rate_limits,omitempty"`
+	// The pane's own account, so the desktop shows this pane that account's
+	// usage when one host runs several Claude accounts (dandy-07, 2026-11-19).
+	AccountScope string `json:"account_scope,omitempty"`
 }
 
 func captureClaudeStatus(pane string, raw []byte, home string) error {
@@ -89,7 +94,7 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 	}
 	status := claudeLiveStatus{SessionID: input.SessionID, PaneID: pane, Model: input.Model.ID,
 		Effort: input.Effort.Level, CWD: input.CWD, Project: input.Workspace.Project, Captured: time.Now().UTC(),
-		RateLimits: claudeQuotaWindows(input.RateLimits)}
+		RateLimits: claudeQuotaWindows(input.RateLimits), AccountScope: subscriptionquota.ClaudeAccountScope(home)}
 	data, err := json.Marshal(status)
 	if err != nil {
 		return err
