@@ -80,3 +80,30 @@ struct RelayResumeStackReplacementTests {
         #expect(tab.allPaneIDs.allSatisfy { workspace.panes[$0] != nil })
     }
 }
+
+/// Tab bf85207f (2026-11-19): a dead Resume leaf stayed in the layout with no
+/// pane behind it. Restore then refused the whole tab; now only the slot goes.
+@MainActor @Suite("A slot whose pane is gone is dropped, not the tab")
+struct RelayDeadSlotTests {
+    @Test func theDeadSlotGoesAndEveryLivePaneAndStackStays() throws {
+        let (a, b, c, d, dead, hidden) = (UUID(), UUID(), UUID(), UUID(), UUID(), UUID())
+        let tab = TabModel(id: UUID(), sessionID: UUID(), name: "Kapk", firstPane: a, floatingPanes: [])
+        tab.layout = .split(id: UUID(), axis: .vertical,
+            first: .split(id: UUID(), axis: .horizontal, first: .pane(a), second: .pane(b)),
+            second: .split(id: UUID(), axis: .horizontal, first: .pane(c),
+                second: .split(id: UUID(), axis: .horizontal, first: .pane(d), second: .pane(dead))))
+        tab.stacks = [PaneStack(id: UUID(), members: [b, hidden], selected: b)]
+        let live: Set<UUID> = [a, b, c, d, hidden]
+
+        #expect(tab.dropMissingPanes { live.contains($0) })
+        #expect(Set(tab.layout.paneIDs) == [a, b, c, d])
+        #expect(Set(tab.allPaneIDs) == live)
+        #expect(tab.stack(containing: hidden)?.selected == b)
+    }
+
+    @Test func aTabWithNothingLiveIsNotKept() {
+        let gone = UUID()
+        let tab = TabModel(id: UUID(), sessionID: UUID(), name: "x", firstPane: gone, floatingPanes: [])
+        #expect(!tab.dropMissingPanes { _ in false })
+    }
+}

@@ -2841,15 +2841,19 @@ final class WorkspaceModel: ObservableObject {
         let restoredTabs = snapshot.tabs.compactMap { saved -> TabModel? in
             let floatingPanes = saved.floatingPanes ?? []
             let allPaneIDs = saved.layout.paneIDs + floatingPanes.map(\.paneID)
-            guard allPaneIDs.allSatisfy({ panes[$0] != nil }) else { return nil }
+            // A slot whose pane is gone is dropped, never the whole tab.
+            guard let firstLive = saved.layout.paneIDs.first(where: { panes[$0] != nil }) else { return nil }
             let tab = TabModel(
                 id: saved.id,
                 sessionID: saved.sessionID ?? saved.id,
                 name: saved.name,
-                firstPane: saved.layout.paneIDs[0],
+                firstPane: firstLive,
                 floatingPanes: floatingPanes
             )
             tab.restoreLayout(legacy: saved.layout, visible: saved.visibleLayout, stacks: saved.stacks)
+            if !allPaneIDs.allSatisfy({ panes[$0] != nil }) {
+                guard tab.dropMissingPanes({ panes[$0] != nil }) else { return nil }
+            }
             tab.splitRatios = saved.splitRatios ?? [:]
             restoreRLayout(saved, in: tab)
             tab.automaticName = saved.automaticName

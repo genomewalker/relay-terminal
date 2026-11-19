@@ -1962,6 +1962,21 @@ final class TabModel: ObservableObject, Identifiable {
         return true
     }
 
+    /// Removes slots whose pane no longer exists, keeping every live pane,
+    /// stack and split where it is (tab bf85207f, 2026-11-19: a dead Resume
+    /// leaf 90a0f5b3 left an empty slot). Returns false when nothing live
+    /// remains.
+    @discardableResult
+    func dropMissingPanes(_ exists: (UUID) -> Bool) -> Bool {
+        for paneID in allPaneIDs where !exists(paneID) {
+            floatingPanes.removeAll { $0.paneID == paneID }
+            if !detachTiledPane(paneID), layout.paneIDs.contains(paneID) { return false }
+        }
+        guard layout.paneIDs.allSatisfy(exists) else { return false }
+        reconcileStacks()
+        return !layout.paneIDs.isEmpty
+    }
+
     /// Puts `replacement` exactly where `paneID` was: its floating
     /// placement, its layout leaf, or its place in a stack (showing or
     /// hidden). The stack table changes together with the layout, so a
