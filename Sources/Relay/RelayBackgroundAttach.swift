@@ -125,12 +125,6 @@ struct RelayBackgroundAttachPolicy {
     private var heldSince: [String: UInt64] = [:]
     private var lastWaitingReport: [String: UInt64] = [:]
 
-    /// Whether restored hidden panes attach in the background. Off: an app
-    /// restart attaches only the panes on screen (through their layout), and a
-    /// hidden pane attaches when it is opened, so a restart does not resend
-    /// every hidden screen over the shared link.
-    var attachesHiddenPanes = false
-
     /// Tests replace the remembered workspaces with their own panes.
     var panes: (@MainActor () -> [PaneModel])?
     var nodes: () -> [NetworkTransportSnapshot] = { RelayNodeTransportPool.shared.networkSnapshots() }
@@ -163,7 +157,6 @@ struct RelayBackgroundAttachPolicy {
     /// One pass. Returns whether a pane is still waiting or attaching.
     @discardableResult
     func step() -> Bool {
-        guard attachesHiddenPanes else { return false }
         let now = uptime()
         let current: [PaneModel]
         if let panes {

@@ -128,7 +128,6 @@ struct RelayBackgroundAttachSchedulerTests {
     @Test("Starts each eligible pane at its saved grid, staggered, and stops when none is left")
     func startsAtSavedGrid() {
         let scheduler = RelayBackgroundAttachScheduler()
-        scheduler.attachesHiddenPanes = true
         let saved = pane("dandy.invalid"), other = pane("dandy.invalid"), unsaved = pane("dandy.invalid"),
             fresh = pane("dandy.invalid", existing: false)
         let grids: [UUID: RelayViewport] = [saved.id: .init(columns: 211, rows: 57), other.id: .init(columns: 90, rows: 30),
@@ -162,7 +161,6 @@ struct RelayBackgroundAttachSchedulerTests {
     @Test("Panes keep attaching after the host's node stops")
     func attachesAfterTheNodeStops() {
         let scheduler = RelayBackgroundAttachScheduler()
-        scheduler.attachesHiddenPanes = true
         let panes = (0..<5).map { _ in pane("dandy.invalid") }
         var now: UInt64 = 0
         var started: [UUID] = []
@@ -189,7 +187,6 @@ struct RelayBackgroundAttachSchedulerTests {
     @Test("A host held with waiting panes is recorded after 30 s, then at most once a minute")
     func recordsAHeldHost() {
         let scheduler = RelayBackgroundAttachScheduler()
-        scheduler.attachesHiddenPanes = true
         let waiting = [pane("dandy.invalid"), pane("dandy.invalid")]
         var now: UInt64 = 0
         var records: [(String, [String: String])] = []
@@ -322,26 +319,5 @@ struct RelayBackgroundAttachHeaderFuzzTests {
         guard valid else { #expect(parsed == nil); return }
         let columns = UInt16(b[8]) << 8 | UInt16(b[9]), rows = UInt16(b[10]) << 8 | UInt16(b[11])
         #expect(parsed == (columns > 0 && rows > 0 ? RelayViewport(columns: columns, rows: rows) : nil))
-    }
-}
-
-/// 2026-11-19 13:28Z: each app restart reattached all 177 panes, hidden ones
-/// included, and resent their screens: 200 MB over the shared dandy-07 link in
-/// five minutes, 35 s blocked, 3.9 s round trips. Hidden panes now wait until
-/// they are opened.
-@MainActor @Suite("An app restart leaves hidden panes until they are opened")
-struct RelayRestartLeavesHiddenPanesTests {
-    @Test func aRestartStartsNoHiddenPane() {
-        let scheduler = RelayBackgroundAttachScheduler()
-        let hidden = (0..<3).map { _ in PaneModel(profile: .sshConfigHost("dandy.invalid"), requiresExistingWorker: true) }
-        var started: [UUID] = []
-        scheduler.panes = { hidden }
-        scheduler.nodes = { [] }
-        scheduler.uptime = { 0 }
-        scheduler.savedViewport = { _ in .init(columns: 120, rows: 40) }
-        scheduler.start = { pane, _ in started.append(pane.id); pane.connectionState = .connected }
-        #expect(!scheduler.step(), "nothing is left to schedule")
-        #expect(started.isEmpty, "no hidden pane screen is resent at launch")
-        #expect(hidden.allSatisfy { $0.connectionState == .connecting }, "they attach when opened")
     }
 }
