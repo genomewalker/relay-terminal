@@ -1644,6 +1644,7 @@ final class TerminalRuntime: NSObject {
 
     /// The pane the user is looking at: its node sends its output first.
     func setTransportFocused(_ focused: Bool) { io.setTransportFocused(focused) }
+    func setTransportShown(_ shown: Bool) { io.setTransportShown(shown) }
 
     func setKeyboardFocusEligible(_ eligible: Bool) {
         guard keyboardFocusEligible != eligible else { return }
@@ -4990,6 +4991,15 @@ final class TerminalIOBridge: @unchecked Sendable {
     }
 
     private var transportFocused = false
+    private var transportShown = false
+
+    func setTransportShown(_ shown: Bool) {
+        resizeLock.lock()
+        transportShown = shown
+        let transport = self.transport
+        resizeLock.unlock()
+        transport?.setShown(shown)
+    }
 
     func setTransportFocused(_ focused: Bool) {
         resizeLock.lock()
@@ -5008,10 +5018,12 @@ final class TerminalIOBridge: @unchecked Sendable {
         let viewport = latestViewport
         lastSentViewport = nil
         let focused = transportFocused
+        let shown = transportShown
         resizeLock.unlock()
         outputOrderingLock.unlock()
         transport.setInitialViewport(viewport)
         if focused { transport.setFocused(true) }
+        if shown { transport.setShown(true) }
         transport.setViewportCommitHandler { [weak self, weak transport] generation, deliveryEpoch in
             guard let self, let transport else { return }
             _ = self.performForTransport(transport) {

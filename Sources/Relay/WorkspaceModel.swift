@@ -3057,8 +3057,12 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func updateTerminalFocusOwnership() {
+        // Panes laid out in the selected tab are on screen; their node resumes
+        // them before hidden panes after a reconnect.
+        let shown = Set((selectedTab?.layout.paneIDs ?? []) + (selectedTab?.floatingPanes.map(\.paneID) ?? []))
         for (id, pane) in panes {
             pane.runtime.setTransportFocused(id == activePaneID)
+            pane.runtime.setTransportShown(shown.contains(id) || id == activePaneID)
             pane.runtime.setKeyboardFocusEligible(id == activePaneID && !paneLinkSelection.active && !networkVisible && !isQuickNavigatePresented && !isFleetBoardPresented)
         }
         if paneLinkSelection.active { NSApp?.keyWindow?.makeFirstResponder(nil) }

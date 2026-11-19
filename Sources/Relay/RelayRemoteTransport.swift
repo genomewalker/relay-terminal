@@ -242,6 +242,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var nodeChannel: RelayNodeChannel?
     /// The user is looking at this pane; its node sends its output first.
     private var focused = false
+    /// The pane is on screen; its node resumes it first after a reconnect.
+    private var shown = false
     private var detached = false
     private var deliveryEpoch = UUID() {
         didSet {
@@ -519,9 +521,11 @@ final class RelayRemoteTransport: @unchecked Sendable {
         nodeChannel = channel
         writer = channel
         let focusChannel = focused ? channel : nil
+        let shownChannel = shown ? channel : nil
         lock.unlock()
         replaced?.close()
         focusChannel?.setFocused(true)
+        shownChannel?.setShown(true)
         scheduleNodeRecoveryCheck(context)
     }
 
@@ -534,6 +538,17 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let channel = nodeChannel
         lock.unlock()
         channel?.setFocused(value)
+    }
+
+    /// Marks this pane as on screen, so a reconnected node resumes it before
+    /// hidden panes. Kept across channel changes.
+    func setShown(_ value: Bool) {
+        lock.lock()
+        guard shown != value else { lock.unlock(); return }
+        shown = value
+        let channel = nodeChannel
+        lock.unlock()
+        channel?.setShown(value)
     }
 
     /// The shared-node channel this pane currently uses (tests).
@@ -623,9 +638,11 @@ final class RelayRemoteTransport: @unchecked Sendable {
             channel.supports("viewport_commit_compat_v2")
         supportsExactSupervisorViewportCommits = channel.supports("viewport_commit_compat_v2")
         let isFocused = focused
+        let isShown = shown
         helloAnswered = false
         lock.unlock()
         if isFocused { channel.setFocused(true) }
+        if isShown { channel.setShown(true) }
         let hello = multiplexedHello(context, viewport: viewport,
             resumeSequence: resumeSequence, resumeEventSequence: resumeEventSequence)
         let payload = (try? JSONSerialization.data(withJSONObject: hello.compactMapValues { $0 })) ?? Data()
