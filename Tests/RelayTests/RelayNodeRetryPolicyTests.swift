@@ -17,6 +17,12 @@ struct RelayNodeRetryPolicyTests {
         #expect(RelayNodeRetryPolicy.delayMilliseconds(attempt: 900, failure: Self.route) == 30_000)
     }
 
+    @Test func aNameLookupFailureKeepsRetryingFast() {
+        let dns = SSHConnectionFailure(kind: .networkRoute, detail: "ssh: Could not resolve hostname dandy-07: nodename nor servname provided")
+        #expect(dns.isNameLookup)
+        #expect(RelayNodeRetryPolicy.delayMilliseconds(attempt: 40, failure: dns) == 3_000)
+    }
+
     @Test func permanentFailuresKeepTheirSlowRetry() {
         let auth = SSHConnectionFailure(kind: .authentication, detail: "Permission denied")
         #expect(RelayNodeRetryPolicy.delayMilliseconds(attempt: 1, failure: auth) == 30_000)

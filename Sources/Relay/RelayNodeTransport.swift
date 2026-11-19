@@ -1218,6 +1218,8 @@ enum RelayNodeRetryPolicy {
     static func delayMilliseconds(attempt: Int, failure: SSHConnectionFailure) -> Int {
         let step = 150 * (1 << min(max(attempt, 1) - 1, 8))
         guard failure.shouldRetry else { return 30_000 }
-        return failure.kind == .networkRoute ? min(30_000, step) : min(3_000, step)
+        // A name lookup can recover with no path change to wake the node
+        // (dandy-07, 08:00-08:04 UTC), so it keeps the fast cap.
+        return failure.kind == .networkRoute && !failure.isNameLookup ? min(30_000, step) : min(3_000, step)
     }
 }
