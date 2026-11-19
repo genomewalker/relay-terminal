@@ -447,8 +447,10 @@ func serveWorkerConnection(connection net.Conn, config WorkerConfig, session *Se
 		for {
 			select {
 			case frame := <-viewer.frames:
-				if err := writer.Write(frame); err != nil {
-					return
+				for _, merged := range coalesceQueuedOutput(frame, viewer.frames) {
+					if err := writer.Write(merged); err != nil {
+						return
+					}
 				}
 			case <-viewer.lagged:
 				_ = connection.Close()
