@@ -5292,6 +5292,10 @@ struct ConnectionPath: View {
             if pane.contentKind == .terminal || toggleFloating != nil || toggleZoom != nil || close != nil {
                 HStack(spacing: RelayTheme.spacing(0)) {
                     if pane.contentKind == .terminal {
+                        // Claude and Codex panes show their own account's usage.
+                        if pane.kind.quotaProvider != nil {
+                            RelayPaneQuotaRing(paneID: pane.id)
+                        }
                         // A pane with saved or pending links keeps its link control,
                         // which carries that state and the saved-links popover.
                         if linkControlVisible {

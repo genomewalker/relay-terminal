@@ -219,12 +219,18 @@ func (r *Reader) Read(ctx context.Context, panes []string) ([]byte, error) {
 	if len(snapshots) > 16 {
 		snapshots = snapshots[:16]
 	}
-	appendCache := func(value map[string]any) {
-		result = append(result, map[string]any{"provider": "claude", "account_scope": value["account_scope"], "observation": projection(value, "session_id", "rate_limits", "captured_at")})
+	appendCache := func(value map[string]any, pane string) {
+		row := map[string]any{"provider": "claude", "account_scope": value["account_scope"], "observation": projection(value, "session_id", "rate_limits", "captured_at")}
+		// A pane's own cache names the account its Claude runs under, so the
+		// desktop can show that pane the right account's allowance.
+		if pane != "" {
+			row["pane_id"] = strings.ToLower(pane)
+		}
+		result = append(result, row)
 	}
 	for _, item := range snapshots {
 		if value, err := privateFile(item.path, Limit, r.uid); err == nil {
-			appendCache(value)
+			appendCache(value, "")
 		}
 	}
 	if len(panes) > 128 {
@@ -235,7 +241,7 @@ func (r *Reader) Read(ctx context.Context, panes []string) ([]byte, error) {
 			continue
 		}
 		if value, err := privateFile(filepath.Join(dir, pane+".json"), Limit, r.uid); err == nil && strings.EqualFold(text(value["pane_id"]), pane) {
-			appendCache(value)
+			appendCache(value, pane)
 		}
 	}
 	codexRead := false

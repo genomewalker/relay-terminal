@@ -262,6 +262,10 @@ func TestReadCombinesBoundedCachesWithCurrentIdentity(t *testing.T) {
 	if object(rows[0]["observation"])["session_id"] != "session-19" || object(rows[15]["observation"])["session_id"] != "session-4" || object(rows[16]["observation"])["session_id"] != "pane-report" {
 		t.Fatal("newest-first/session/pane behavior changed")
 	}
+	// Only a pane's own cache names its pane, so the desktop can attribute that account.
+	if rows[16]["pane_id"] != "abc-123" || rows[0]["pane_id"] != nil {
+		t.Fatalf("pane attribution changed: pane=%v session=%v", rows[16]["pane_id"], rows[0]["pane_id"])
+	}
 	if bytes.Contains(data, []byte("discard-me")) || bytes.Contains(data, []byte("never-export")) || bytes.Contains(data, []byte("wrong-pane")) {
 		t.Fatal("cache projection leaked extra or wrong-pane fields")
 	}

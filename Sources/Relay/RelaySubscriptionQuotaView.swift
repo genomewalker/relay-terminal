@@ -1,6 +1,10 @@
 import SwiftUI
 
 @MainActor final class RelaySubscriptionQuotaStore: ObservableObject {
+    /// One store for the toolbar button and every pane's ring, so both show
+    /// the same reads and the hosts are asked once per refresh.
+    static let shared = RelaySubscriptionQuotaStore()
+
     struct Entry: Identifiable {
         let id: String
         let hosts: [String]
@@ -48,12 +52,16 @@ import SwiftUI
             }
         }
 
+        /// The grouped entry this host row belongs to: one per signed-in account.
+        var groupKey: String {
+            // A failed host read cannot verify that its previous account is still signed in.
+            refreshFailed ? "unverified:" + id : (accountScope.map { provider.rawValue + ":" + $0 } ?? id)
+        }
+
         static func grouped(_ entries: [Entry]) -> [Entry] {
             var groups: [String: Entry] = [:]
             for entry in entries {
-                // A failed host read cannot verify that its previous account is still signed in.
-                let key = entry.refreshFailed ? "unverified:" + entry.id :
-                    (entry.accountScope.map { entry.provider.rawValue + ":" + $0 } ?? entry.id)
+                let key = entry.groupKey
                 guard let previous = groups[key] else {
                     groups[key] = Entry(id: key, hosts: entry.hosts, provider: entry.provider,
                                         accountScope: entry.accountScope, quota: entry.quota,
@@ -83,6 +91,8 @@ import SwiftUI
         }
     }
     @Published private(set) var entries: [Entry] = []
+    /// Lowercased pane ID → the grouped entry for the account its agent uses.
+    @Published private(set) var paneAccounts: [String: String] = [:]
     @Published private(set) var refreshing = false
     private(set) var lastRefreshFinishedAt: Date?
     private var lastSuccessfulEntriesByHost: [String: [Entry]] = [:]
@@ -115,6 +125,7 @@ import SwiftUI
         if profiles.isEmpty { profiles["local"] = (.local, []) }
         var observations: [Entry] = []
         var history: [String: [Entry]] = [:]
+        var accounts: [String: String] = [:]
         for key in profiles.keys.sorted() {
             guard !Task.isCancelled, let (profile, panes) = profiles[key] else { break }
             let host = profile.kind == .local ? "This Mac" : profile.host
@@ -128,16 +139,23 @@ import SwiftUI
                 let rows = try Self.entries(from: snapshot, key: key, host: host)
                 history[key] = rows
                 observations.append(contentsOf: rows)
+                let reported = (try? Self.paneScopes(from: snapshot)) ?? [:]
+                accounts.merge(Self.paneAccounts(panes: panes, rows: rows, reported: reported,
+                    provider: { workspace.panes[UUID(uuidString: $0) ?? UUID()]?.kind.quotaProvider })) { $1 }
             } catch {
                 guard !Task.isCancelled else { break }
                 let previous = lastSuccessfulEntriesByHost[key] ?? []
                 history[key] = previous
-                observations.append(contentsOf: Entry.afterFailure(previous, key: key, host: host))
+                let failed = Entry.afterFailure(previous, key: key, host: host)
+                observations.append(contentsOf: failed)
+                accounts.merge(Self.paneAccounts(panes: panes, rows: failed, reported: [:],
+                    provider: { workspace.panes[UUID(uuidString: $0) ?? UUID()]?.kind.quotaProvider })) { $1 }
             }
         }
         if !Task.isCancelled {
             lastSuccessfulEntriesByHost = history
             entries = Entry.grouped(observations)
+            paneAccounts = accounts
         }
     }
 
@@ -179,6 +197,44 @@ import SwiftUI
                          accountLabel: label, configuredPlan: plan)
             }
         }
+    }
+
+    /// Claude panes whose own status cache names their account (relayd 0.5.115+).
+    static func paneScopes(from snapshot: RelaySubscriptionQuotaReader.Snapshot) throws -> [String: String] {
+        guard let rows = try JSONSerialization.jsonObject(with: snapshot.data) as? [[String: Any]] else {
+            throw RelaySubscriptionQuota.ParseError.invalidPayload
+        }
+        var scopes: [String: String] = [:]
+        for row in rows where row["provider"] as? String == "claude" {
+            guard let pane = (row["pane_id"] as? String)?.lowercased(), UUID(uuidString: pane) != nil,
+                  let scope = row["account_scope"] as? String,
+                  scope.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil else { continue }
+            scopes[pane] = scope
+        }
+        return scopes
+    }
+
+    /// Each agent pane's account on one host. A pane its host attributed goes
+    /// to that account; otherwise only a host with one account of the pane's
+    /// provider can be attributed, never a guess between two accounts.
+    static func paneAccounts(panes: [String], rows: [Entry], reported: [String: String],
+                             provider: (String) -> RelaySubscriptionQuota.Provider?) -> [String: String] {
+        var result: [String: String] = [:]
+        for pane in panes {
+            guard let kind = provider(pane) else { continue }
+            let candidates = rows.filter { $0.provider == kind }
+            if let scope = reported[pane], let row = candidates.first(where: { $0.accountScope == scope }) {
+                result[pane] = row.groupKey
+            } else if candidates.count == 1, let only = candidates.first {
+                result[pane] = only.groupKey
+            }
+        }
+        return result
+    }
+
+    func entry(forPane paneID: UUID) -> Entry? {
+        guard let key = paneAccounts[paneID.uuidString.lowercased()] else { return nil }
+        return entries.first { $0.id == key }
     }
 
     private static func displayMetadata(_ value: Any?, limit: Int) -> String? {
@@ -352,7 +408,7 @@ private struct RelaySubscriptionQuotaContentHeight: PreferenceKey {
 
 struct RelaySubscriptionQuotaButton: View {
     @ObservedObject var workspace: WorkspaceModel
-    @StateObject private var store = RelaySubscriptionQuotaStore()
+    @ObservedObject private var store = RelaySubscriptionQuotaStore.shared
     @State private var presenting = false
     @State private var observedNow = Date()
     @State private var contentHeight: CGFloat = 180
