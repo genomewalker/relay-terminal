@@ -176,6 +176,11 @@ enum RelayPaneAttachPolicy {
     /// "worker is still alive but unavailable"). A missing worker answers the
     /// same way every time, so this is bounded.
     static let answeredRetryLimit = 1
+    /// A pane that fell back to a dedicated SSH checks this often whether its
+    /// host's shared node is healthy again, then rejoins it.
+    static let sharedReturnCheckMilliseconds = 30_000
+    /// Upper bound on that wait after repeated failed returns.
+    static let sharedReturnMaximumMilliseconds = 600_000
 
     static func retryDelayMilliseconds(attempt: Int, waitingForInputLease: Bool) -> Int {
         if waitingForInputLease {
@@ -301,6 +306,12 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// The host's relayd has no node mux; only dedicated routes work.
     private var nodeUnsupported = false
     private var nodeRecoveryScheduled = false
+    /// A dedicated-route pane's pending check for returning to the shared node.
+    private var sharedReturnScheduled = false
+    /// The pane left its dedicated route to rejoin the shared node.
+    private var returningToShared = false
+    /// Returns that stalled back onto a dedicated route since the last shared attach.
+    private var sharedReturnFailures = 0
     /// The current attempt to join a shared node. Replaced by every attempt
     /// and cancelled by detach, so a superseded attempt cannot register.
     private var nodeAdmission: RelayNodeAdmission?
@@ -308,6 +319,11 @@ final class RelayRemoteTransport: @unchecked Sendable {
     var nodePool = RelayNodeTransportPool.shared
     var nodeRecoveryCheckMilliseconds = RelayPaneAttachPolicy.nodeRecoveryCheckMilliseconds
     var handshakeTimeoutMilliseconds = RelayPaneAttachPolicy.handshakeTimeoutMilliseconds
+    /// How long a pane stays on a dedicated SSH before checking whether its
+    /// host's shared node is healthy again (doubles after a failed return).
+    var sharedReturnCheckMilliseconds = RelayPaneAttachPolicy.sharedReturnCheckMilliseconds
+    /// Tests replace the dedicated route's process (executable, arguments).
+    var dedicatedCommandOverride: (URL, [String])?
     private var diagnosticSessionID = "unknown"
     private var inputDiagnosticCount = 0
     private var connectionContext: RelayConnectionContext?
@@ -957,6 +973,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
             ssh.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/relayd")
             ssh.arguments = Array(arguments.dropFirst(helperIndex + 1))
         }
+        if let (executable, override) = dedicatedCommandOverride {
+            ssh.executableURL = executable
+            ssh.arguments = override
+        }
         ssh.standardInput = input
         ssh.standardOutput = output
         ssh.standardError = errors
@@ -1280,6 +1300,16 @@ final class RelayRemoteTransport: @unchecked Sendable {
 
     private func didAttach(context: RelayConnectionContext, capabilities: [String], controlGranted: Bool?) {
         lock.lock()
+        // A dedicated route is a fallback: once attached there, keep checking
+        // whether the shared node can take this pane back.
+        let onDedicatedRoute = process != nil && nodeChannel == nil && !nodeUnsupported
+        if onDedicatedRoute {
+            if returningToShared { sharedReturnFailures += 1 }
+        } else if nodeChannel != nil {
+            sharedReturnFailures = 0
+        }
+        returningToShared = false
+        defer { if onDedicatedRoute { scheduleSharedReturn(context) } }
         reconnectAttempt = 0
         reconnectScheduled = false
         attached = true
@@ -1389,6 +1419,51 @@ final class RelayRemoteTransport: @unchecked Sendable {
             self.reconnectScheduled = false
             self.lock.unlock()
             self.reconnectRoute(context)
+        }
+    }
+
+    /// While attached on a dedicated SSH, periodically check whether the host's
+    /// shared node is healthy and, if so, move this pane back onto it through
+    /// the normal retained-worker reopen. A return that stalls again lands back
+    /// on a dedicated route and doubles the wait, so a node that is still
+    /// overloaded does not make the pane flap.
+    private func scheduleSharedReturn(_ context: RelayConnectionContext) {
+        lock.lock()
+        guard !detached, !sessionEnded, !sharedReturnScheduled, !nodeUnsupported else {
+            lock.unlock()
+            return
+        }
+        sharedReturnScheduled = true
+        let delay = min(RelayPaneAttachPolicy.sharedReturnMaximumMilliseconds,
+            sharedReturnCheckMilliseconds << min(sharedReturnFailures, 8))
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.sharedReturnScheduled = false
+            guard !self.detached, !self.sessionEnded, self.attached, self.process != nil,
+                  self.nodeChannel == nil, !self.nodeUnsupported, !self.reconnectScheduled else {
+                self.lock.unlock()
+                return
+            }
+            let pool = self.nodePool
+            self.lock.unlock()
+            guard pool.acceptsReturningPane(profile: context.profile) else {
+                self.scheduleSharedReturn(context)
+                return
+            }
+            self.lock.lock()
+            self.returningToShared = true
+            self.lock.unlock()
+            RelayDiagnostics.shared.record(category: "connection", name: "pane-returning-to-shared-node", details: [
+                "pane_id": context.sessionID,
+            ])
+            if !self.reconnectExistingPaneRoute() {
+                self.lock.lock()
+                self.returningToShared = false
+                self.lock.unlock()
+                self.scheduleSharedReturn(context)
+            }
         }
     }
 

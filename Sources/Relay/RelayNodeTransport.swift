@@ -398,6 +398,15 @@ final class RelayNodeTransportPool: @unchecked Sendable {
         return !pooled
     }
 
+    /// Whether a pane on a dedicated SSH should rejoin its host's shared node:
+    /// that node is healthy, or there is none (the attempt creates it).
+    func acceptsReturningPane(profile: ConnectionProfile) -> Bool {
+        lock.lock()
+        let node = nodes[profile.connectionKey]
+        lock.unlock()
+        return node?.acceptsReturningPanes ?? true
+    }
+
     /// The current transport incarnation for a host, without creating or
     /// reconnecting it: changes whenever the node is replaced or reconnects.
     func incarnation(profile: ConnectionProfile) -> String? {
@@ -619,6 +628,18 @@ final class RelayNodeConnection: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return "\(incarnationSerial.uuidString)/\(generation)"
+    }
+
+    /// Whether a pane that fell back to its own SSH can rejoin this node now:
+    /// it is ready, its supervisor sent something recently, and no heartbeat
+    /// is missed or has waited longer than two seconds (a backed-up stream).
+    var acceptsReturningPanes: Bool {
+        let now = uptime()
+        lock.lock()
+        defer { lock.unlock() }
+        guard ready, !stopped, consecutiveHeartbeatMisses == 0, let inbound = lastInboundUptime,
+              now >= inbound, now - inbound <= RelayHeartbeatPolicy.timeoutNanoseconds else { return false }
+        return pendingHeartbeats.values.allSatisfy { now < $0 || now - $0 <= 2_000_000_000 }
     }
 
     func networkSnapshot() -> NetworkTransportSnapshot {

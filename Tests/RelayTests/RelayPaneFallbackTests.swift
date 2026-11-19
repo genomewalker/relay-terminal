@@ -174,4 +174,75 @@ private final class FallbackNodes: @unchecked Sendable {
         #expect(node.writer.hellos == 2)
         #expect(!statuses.messages.contains { $0.contains("dedicated") })
     }
+
+    /// A dedicated route whose process emits one attached status and stays up.
+    private func fakeDedicatedRoute() throws -> (URL, [String]) {
+        let payload = Data(#"{"state":"attached","capabilities":[]}"#.utf8)
+        var frame = Data([RelayWireType.status.rawValue])
+        frame.append(contentsOf: withUnsafeBytes(of: UInt32(payload.count).bigEndian, Array.init))
+        frame.append(payload)
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("dedicated-\(UUID().uuidString).frames")
+        try frame.write(to: file)
+        return (URL(fileURLWithPath: "/bin/sh"), ["-c", "cat \"$0\"; exec sleep 30", file.path])
+    }
+
+    private func startStalling(_ pool: RelayNodeTransportPool, session: String, statuses: FallbackFrames) throws -> RelayRemoteTransport {
+        let transport = RelayRemoteTransport()
+        transport.nodePool = pool
+        transport.handshakeTimeoutMilliseconds = 300
+        transport.sharedReturnCheckMilliseconds = 300
+        transport.dedicatedCommandOverride = try fakeDedicatedRoute()
+        transport.start(profile: profile, sessionID: session, parentSessionID: nil,
+            workspaceSessionID: nil, tabID: nil, paneTitle: session, contentKind: "terminal",
+            onOutput: { _, _, _ in },
+            onStatus: { status, _ in
+                statuses.writeAsync(type: .status, payload: Data("\(status.state) \(status.message ?? "")".utf8))
+            },
+            onAgentEvent: { _, _ in }, onArtifact: { _, _ in }, onDisconnect: { _, _ in })
+        return transport
+    }
+
+    /// 2026-11-19: after an app restart 8 dandy-07 panes stalled once on the
+    /// busy shared node, moved to their own SSH, and stayed there for good.
+    @Test("A pane on a dedicated SSH returns to the shared node once it is healthy")
+    func dedicatedRouteReturnsToHealthySharedNode() throws {
+        let nodes = FallbackNodes()
+        let statuses = FallbackFrames()
+        let pool = nodes.pool()
+        let other = neighbour(pool)
+        defer { other.close() }
+        let transport = try startStalling(pool, session: "stalled", statuses: statuses)
+        defer { transport.detach() }
+        let node = try #require(nodes.first)
+        waitUntil { node.writer.hellos == 1 }
+        // No answer: the pane falls back to its own route and attaches there.
+        waitUntil { statuses.messages.filter { $0.hasPrefix("attached") }.count == 1 }
+        #expect(statuses.messages.contains { $0.contains("dedicated") })
+        // The shared node is healthy again: traffic arrives for its other pane.
+        let deadline = Date().addingTimeInterval(3)
+        while node.writer.hellos < 2, Date() < deadline {
+            try send(node.node, session: "neighbour", #"{"state":"clients","client_count":1}"#)
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        #expect(node.writer.hellos == 2, "the pane never rejoined the shared node")
+        try send(node.node, session: "stalled", #"{"state":"attached","capabilities":[]}"#)
+        waitUntil { transport.currentNodeChannel != nil }
+        #expect(transport.currentNodeChannel != nil)
+    }
+
+    @Test("A pane stays on its dedicated SSH while the shared node is silent")
+    func dedicatedRouteStaysWhileSharedNodeIsSilent() throws {
+        let nodes = FallbackNodes()
+        let statuses = FallbackFrames()
+        let pool = nodes.pool()
+        let other = neighbour(pool)
+        defer { other.close() }
+        let transport = try startStalling(pool, session: "silent", statuses: statuses)
+        defer { transport.detach() }
+        let node = try #require(nodes.first)
+        waitUntil { statuses.messages.filter { $0.hasPrefix("attached") }.count == 1 }
+        Thread.sleep(forTimeInterval: 1.2)
+        #expect(node.writer.hellos == 1)
+        #expect(transport.currentNodeChannel == nil)
+    }
 }
