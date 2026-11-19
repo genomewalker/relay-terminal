@@ -59,6 +59,7 @@ struct RelayHiddenPaneGridTests {
     @Test("The scheduler starts a hidden pane at its layout grid when one is known")
     func schedulerPrefersTheLayoutGrid() {
         let scheduler = RelayBackgroundAttachScheduler()
+        scheduler.attachesHiddenPanes = true
         let known = PaneModel(profile: .sshConfigHost("dandy.invalid"), requiresExistingWorker: true)
         let unknown = PaneModel(profile: .sshConfigHost("dandy.invalid"), requiresExistingWorker: true)
         let saved = RelayViewport(columns: 58, rows: 40), layout = RelayViewport(columns: 131, rows: 64)
