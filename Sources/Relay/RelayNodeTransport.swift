@@ -1162,6 +1162,7 @@ final class RelayNodeConnection: @unchecked Sendable {
                 RelayDiagnostics.shared.heartbeatAcknowledged(
                     connection: diagnosticConnectionID, rttMilliseconds: milliseconds
                 )
+                RelayPaneDelayStore.shared.link(host: profile.connectionKey, milliseconds: milliseconds)
             }
             return
         }

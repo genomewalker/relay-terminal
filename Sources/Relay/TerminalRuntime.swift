@@ -4830,6 +4830,8 @@ final class TerminalIOBridge: @unchecked Sendable {
     private var pendingObservedRepaintFrame: UUID?
     private let displayQueue = DispatchQueue(label: "relay.terminal-display", qos: .userInteractive)
     private var displayBuffer = Data()
+    /// When the oldest byte now in displayBuffer arrived (pane delay: Mac draw).
+    private var displayBufferArrivedAt: UInt64?
     private var displayDrainScheduled = false
     /// Display bytes accepted from receive() and not yet handed to the native
     /// session: buffered or taken by a drain still delivering. Guarded by
@@ -6452,6 +6454,7 @@ final class TerminalIOBridge: @unchecked Sendable {
     /// first newly arriving live frame.
     private func enqueueDisplayWhilePresentationLocked(_ data: Data, immediate: Bool) {
         displayLock.lock()
+        if displayBuffer.isEmpty { displayBufferArrivedAt = DispatchTime.now().uptimeNanoseconds }
         displayBuffer.append(data)
         displayBytesInTransit += data.count
         if observedRepaint != nil {
@@ -6485,6 +6488,8 @@ final class TerminalIOBridge: @unchecked Sendable {
         presentationLock.lock()
         displayLock.lock()
         let batch = displayBuffer
+        let arrivedAt = displayBufferArrivedAt
+        displayBufferArrivedAt = nil
         let observedFrameID = pendingObservedRepaintFrame
         pendingObservedRepaintFrame = nil
         displayBuffer = Data()
@@ -6498,6 +6503,12 @@ final class TerminalIOBridge: @unchecked Sendable {
         presentationLock.unlock()
         guard !batch.isEmpty else { return }
         deliverDisplayBatch(batch, observedFrameID: observedFrameID)
+        if let arrivedAt {
+            receiveLock.lock()
+            let paneID = snapshotPaneID
+            receiveLock.unlock()
+            if let paneID { RelayPaneDelayStore.shared.drawn(pane: paneID.uuidString.lowercased(), arrivedAt: arrivedAt) }
+        }
         displayLock.lock()
         displayBytesInTransit -= batch.count
         displayLock.unlock()

@@ -820,6 +820,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 automationInputSequences.remove(acknowledgement.sequence)
                 signalPromptEditorLeaseChangedLocked()
                 lock.unlock()
+                RelayPaneDelayStore.shared.inputAcknowledged(pane: context.sessionID, sequence: acknowledgement.sequence)
             }
         case .viewportAck:
             receiveViewportAck(frame.payload)
@@ -1205,6 +1206,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
                     self.automationInputSequences.remove(acknowledgement.sequence)
                     self.signalPromptEditorLeaseChangedLocked()
                     self.lock.unlock()
+                    RelayPaneDelayStore.shared.inputAcknowledged(pane: context.sessionID, sequence: acknowledgement.sequence)
                 }
             case .viewportAck:
                 self.receiveViewportAck(frame.payload)
@@ -1580,6 +1582,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let shouldRecordDiagnostic = inputDiagnosticCount < 8
         if shouldRecordDiagnostic { inputDiagnosticCount += 1 }
         let diagnosticSessionID = self.diagnosticSessionID
+        let delayRoute = connectionContext.map { ($0.sessionID, $0.profile.connectionKey) }
         var inputSequence: UInt64?
         var processToRestart: Process?
         var multiplexedRetryContext: RelayConnectionContext?
@@ -1616,6 +1619,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
             }
         }
         lock.unlock()
+        if let inputSequence, let delayRoute {
+            RelayPaneDelayStore.shared.inputSent(pane: delayRoute.0, host: delayRoute.1, sequence: inputSequence)
+        }
         wakeChannel?.requestResume()
         if shouldRecordDiagnostic {
             RelayDiagnostics.shared.record(
@@ -1732,6 +1738,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
 
     private func receiveOutput(_ payload: Data, context: RelayConnectionContext) {
         guard payload.count >= 8 else { return }
+        RelayPaneDelayStore.shared.outputArrived(pane: context.sessionID)
         let sequence = payload.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
         lock.lock()
         guard !detached, RelayOutputSequencePolicy.accepts(sequence, after: lastSequence) else {
