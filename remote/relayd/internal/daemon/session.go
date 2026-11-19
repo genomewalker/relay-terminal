@@ -824,7 +824,7 @@ func (session *Session) publish(data []byte) {
 		// Delivery is all-or-nothing for a replay record. In particular, never
 		// deliver the output sequence while dropping a following artifact: the
 		// client's resume cursor would otherwise skip that artifact forever.
-		if cap(viewer.frames)-len(viewer.frames) < 1+len(artifactFrames) {
+		if !viewer.makeRoom(1 + len(artifactFrames)) {
 			viewer.markLagged()
 			delete(session.clients, viewer)
 			continue
@@ -857,7 +857,7 @@ func (session *Session) wait() {
 	session.exited = true
 	session.exitCode = exitCode
 	for viewer := range session.clients {
-		if cap(viewer.frames)-len(viewer.frames) < 1 {
+		if !viewer.makeRoom(1) {
 			viewer.markLagged()
 			delete(session.clients, viewer)
 			continue
@@ -1575,7 +1575,7 @@ func (session *Session) agentEvent(payload []byte) {
 		if frame.Type == protocol.AgentEvent && !viewer.includeAgentEvents {
 			continue
 		}
-		if cap(viewer.frames)-len(viewer.frames) < 1 {
+		if !viewer.makeRoom(1) {
 			viewer.markLagged()
 			delete(session.clients, viewer)
 			continue
@@ -1806,12 +1806,12 @@ func (session *Session) broadcastProgramStatusLocked() {
 		if !viewer.includeProgramStatus {
 			continue
 		}
-		select {
-		case viewer.frames <- frame:
-		default:
+		if !viewer.makeRoom(1) {
 			viewer.markLagged()
 			delete(session.clients, viewer)
+			continue
 		}
+		viewer.frames <- frame
 	}
 }
 
@@ -1863,10 +1863,10 @@ func (session *Session) setProgramStatusObservation(viewer *client, enabled bool
 	if !enabled {
 		return
 	}
-	select {
-	case viewer.frames <- session.programStatusFrameLocked(true):
-	default:
+	if !viewer.makeRoom(1) {
 		viewer.markLagged()
 		delete(session.clients, viewer)
+		return
 	}
+	viewer.frames <- session.programStatusFrameLocked(true)
 }

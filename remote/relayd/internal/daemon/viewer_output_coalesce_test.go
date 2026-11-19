@@ -69,3 +69,59 @@ func TestCoalesceQueuedOutputBoundsOneFrame(t *testing.T) {
 	}
 	_ = total
 }
+
+// dandy-07, 2026-11-19: the shared SSH link stalled after a restart, d62c62eb's
+// 512-frame queue filled and the view was cut ("Reconnecting"), every replay
+// adding more traffic. A full queue now merges its waiting output instead.
+func TestFullViewerQueueMergesOutputInsteadOfCuttingTheView(t *testing.T) {
+	session := &Session{
+		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		activeSubagents: make(map[string][]byte), eventHashes: make(map[[32]byte]struct{}),
+	}
+	viewer := newClient(512)
+	session.clients[viewer] = struct{}{}
+	var want bytes.Buffer
+	for i := 0; i < 2000; i++ { // nothing drains: the link is stalled
+		chunk := []byte{byte(i), byte(i >> 8), '\x1b', '[', 'K'}
+		want.Write(chunk)
+		session.publish(chunk)
+	}
+	select {
+	case <-viewer.lagged:
+		t.Fatal("a full queue of output cut the view")
+	default:
+	}
+	if _, kept := session.clients[viewer]; !kept {
+		t.Fatal("viewer was removed")
+	}
+	var got bytes.Buffer
+	last := uint64(0)
+	for len(viewer.frames) > 0 {
+		sequence, data, err := protocol.ParseOutput(<-viewer.frames)
+		if err != nil || sequence <= last {
+			t.Fatalf("frame out of order: sequence=%d after %d err=%v", sequence, last, err)
+		}
+		last = sequence
+		got.Write(data)
+	}
+	if last != 2000 || !bytes.Equal(got.Bytes(), want.Bytes()) {
+		t.Fatalf("delivered %d bytes up to sequence %d; want %d bytes to 2000", got.Len(), last, want.Len())
+	}
+}
+
+// Frames that are not output keep their place; with nothing to merge the view
+// is still cut, and a merge never mutates a frame shared with other viewers.
+func TestCompactQueuedOutputKeepsOrderAndCopiesSharedPayloads(t *testing.T) {
+	shared := protocol.OutputFrame(1, []byte("a"))
+	status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{State: "clients"})
+	frames, total := compactQueuedOutput([]protocol.Frame{shared, protocol.OutputFrame(2, []byte("b")), status, protocol.OutputFrame(3, []byte("c"))})
+	if len(frames) != 3 || frames[1].Type != protocol.Status || total != 8*3+3+len(status.Payload) {
+		t.Fatalf("got %d frames, total %d", len(frames), total)
+	}
+	if sequence, data, _ := protocol.ParseOutput(frames[0]); sequence != 2 || string(data) != "ab" {
+		t.Fatalf("merged run: %d %q", sequence, data)
+	}
+	if sequence, data, _ := protocol.ParseOutput(shared); sequence != 1 || string(data) != "a" {
+		t.Fatal("merging changed a frame another viewer shares")
+	}
+}
