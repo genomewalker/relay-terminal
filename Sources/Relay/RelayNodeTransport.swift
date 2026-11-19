@@ -83,6 +83,17 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
         openConnection?.setFocus(sessionID: sessionID, focused: focused, channel: self)
     }
 
+    /// A pane's terminal route: after a reconnect it is resumed only when shown
+    /// or when it has input to send, so hidden screens are not resent.
+    func setWaitUntilShown(_ wait: Bool) {
+        openConnection?.setWaitUntilShown(sessionID: sessionID, wait: wait, channel: self)
+    }
+
+    /// Resume this route now if a reconnect left it waiting (input is pending).
+    func requestResume() {
+        openConnection?.requestResume(sessionID: sessionID, channel: self)
+    }
+
     /// Tells the node whether this pane is on screen (resumed first on reconnect).
     func setShown(_ shown: Bool) {
         openConnection?.setShown(sessionID: sessionID, shown: shown, channel: self)
@@ -520,6 +531,20 @@ final class RelayNodeConnection: @unchecked Sendable {
         return true
     }
 
+    func setWaitUntilShown(sessionID: String, wait: Bool, channel: RelayNodeChannel) {
+        lock.lock()
+        if subscriptions[sessionID]?.channel === channel {
+            if wait { waitUntilShownRoutes.insert(sessionID) } else { waitUntilShownRoutes.remove(sessionID) }
+        }
+        lock.unlock()
+    }
+
+    func requestResume(sessionID: String, channel: RelayNodeChannel) {
+        lock.lock()
+        if subscriptions[sessionID]?.channel === channel { resumeLocked(sessionID, generation: generation, pendingOnly: true) }
+        lock.unlock()
+    }
+
     func setShown(sessionID: String, shown: Bool, channel: RelayNodeChannel) {
         lock.lock()
         guard let subscription = subscriptions[sessionID], subscription.channel === channel else { lock.unlock(); return }
@@ -600,6 +625,8 @@ final class RelayNodeConnection: @unchecked Sendable {
     private var shownRoutes: Set<String> = []
     /// Hidden panes of this generation still waiting for their staggered resume.
     private var pendingResume: Set<String> = []
+    /// Pane terminal routes that, when hidden, wait to be shown after a reconnect.
+    private var waitUntilShownRoutes: Set<String> = []
     /// Serializes Focus sends so the node always ends on the newest set.
     private let focusSendLock = NSLock()
     private var systemSleeping = false
@@ -788,6 +815,7 @@ final class RelayNodeConnection: @unchecked Sendable {
         let focusChanged = focusedRoutes.remove(sessionID) != nil
         shownRoutes.remove(sessionID)
         pendingResume.remove(sessionID)
+        waitUntilShownRoutes.remove(sessionID)
         let activeWriter = ready ? writer : nil
         if subscriptions.isEmpty && !retainsHostConnection {
             stopped = true
@@ -1078,9 +1106,12 @@ final class RelayNodeConnection: @unchecked Sendable {
             )
             // Panes on screen (or focused) resume first; hidden panes follow
             // in staggered groups so their replays do not delay them.
+            let shownNow = shownRoutes.union(focusedRoutes)
             let waves = RelayNodeReattachOrder.waves(sessionIDs: Array(subscriptions.keys),
-                shown: shownRoutes.union(focusedRoutes))
-            pendingResume = Set(waves.filter { $0.delayMilliseconds > 0 }.flatMap(\.sessionIDs))
+                shown: shownNow, waitUntilShown: waitUntilShownRoutes)
+            // Everything not resumed at once waits: staggered routes until their
+            // group, hidden pane screens until shown or sent input.
+            pendingResume = Set(subscriptions.keys).subtracting(waves.first { $0.delayMilliseconds == 0 }?.sessionIDs ?? [])
             for wave in waves where wave.delayMilliseconds == 0 {
                 for id in wave.sessionIDs { resumeLocked(id, generation: currentGeneration, pendingOnly: false) }
             }
@@ -1295,10 +1326,12 @@ enum RelayNodeReattachOrder {
     /// Panes on screen resume at once; hidden panes follow in small groups
     /// after a pause, so their replays do not queue ahead of what the user is
     /// looking at. With nothing shown, the first hidden group starts at once.
-    static func waves(sessionIDs: [String], shown: Set<String>) -> [Wave] {
+    static func waves(sessionIDs: [String], shown: Set<String>, waitUntilShown: Set<String> = []) -> [Wave] {
         let sorted = sessionIDs.sorted()
         let first = sorted.filter(shown.contains)
-        let rest = sorted.filter { !shown.contains($0) }
+        // A hidden pane's terminal route waits until it is opened (or sent
+        // input); routes that did not ask to wait resume in staggered groups.
+        let rest = sorted.filter { !shown.contains($0) && !waitUntilShown.contains($0) }
         var waves: [Wave] = first.isEmpty ? [] : [Wave(delayMilliseconds: 0, sessionIDs: first)]
         let start = first.isEmpty ? 0 : hiddenFirstDelayMilliseconds
         for (index, offset) in stride(from: 0, to: rest.count, by: hiddenGroupSize).enumerated() {

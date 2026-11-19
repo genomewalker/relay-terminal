@@ -524,6 +524,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let shownChannel = shown ? channel : nil
         lock.unlock()
         replaced?.close()
+        // A hidden pane's screen is not resent after a node reconnect until the
+        // pane is shown or has input; agent observers are separate routes.
+        channel.setWaitUntilShown(!context.observeAgentsOnly)
         focusChannel?.setFocused(true)
         shownChannel?.setShown(true)
         scheduleNodeRecoveryCheck(context)
@@ -1580,6 +1583,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         var inputSequence: UInt64?
         var processToRestart: Process?
         var multiplexedRetryContext: RelayConnectionContext?
+        var wakeChannel: RelayNodeChannel?
         var admitted = canSend
         if canSend && acknowledged && pendingInputBytes + data.count <= 64 << 10 {
             let sequence = RelayInputSequenceAllocator.shared.next()
@@ -1601,6 +1605,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
             // pane's input would stall until an unrelated disconnect.
             if processToRestart == nil { multiplexedRetryContext = connectionContext }
         } else if !canSend {
+            // Input for a hidden pane still waiting after a reconnect wakes it.
+            if !attached { wakeChannel = nodeChannel }
             if inputBacklog.count + data.count <= 64 << 10 {
                 inputBacklog.append(data)
                 admitted = true
@@ -1610,6 +1616,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             }
         }
         lock.unlock()
+        wakeChannel?.requestResume()
         if shouldRecordDiagnostic {
             RelayDiagnostics.shared.record(
                 category: "terminal-input",

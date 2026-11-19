@@ -29,4 +29,16 @@ struct RelayNodeReattachOrderTests {
         #expect(waves.flatMap(\.sessionIDs).sorted() == hidden)
         #expect(waves.first?.delayMilliseconds == 0, "the first group starts at once")
     }
+
+    /// A hidden pane's screen is not resent until the user opens it; routes
+    /// that did not ask to wait (agent observers, workspace sync) still resume.
+    @Test func hiddenPaneScreensWaitUntilShownButObserversResume() {
+        let panes = Set(hidden.prefix(15))
+        let waves = RelayNodeReattachOrder.waves(sessionIDs: hidden + ["active"], shown: shown,
+            waitUntilShown: panes.union(["active"]))
+        let resumed = waves.flatMap(\.sessionIDs)
+        #expect(resumed.first == "active", "a shown pane resumes even though it may wait")
+        #expect(resumed.filter(panes.contains).isEmpty, "no hidden pane screen is resent")
+        #expect(Array(resumed.dropFirst()) == Array(hidden.dropFirst(15)), "observer routes still resume")
+    }
 }
