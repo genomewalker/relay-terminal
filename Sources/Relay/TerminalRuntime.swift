@@ -5904,6 +5904,7 @@ final class TerminalIOBridge: @unchecked Sendable {
         }
         if !replaying { TerminalBufferRetentionPolicy.clear(&replayBuffer) }
         replaying = true
+        if let pane = meteredPaneID() { RelayPaneDelayStore.shared.replayBegan(pane: pane) }
         reconnectReplayExtendsRestoredScreen = false
         replayCommitGeneration = nil
         suppressingTerminalWrites = true
@@ -5990,7 +5991,9 @@ final class TerminalIOBridge: @unchecked Sendable {
         TerminalReplayTrace.log("endReplay pane=\(snapshotPaneID?.uuidString ?? "unknown") incoming=\(buffered.count) retain=\(retainGrid)")
         legacyReplayHardDeadline = .distantFuture
         legacyReplayTimer.schedule(deadline: .distantFuture)
+        let meteredPane = meteredPaneID()
         replayLock.unlock()
+        if let meteredPane { RelayPaneDelayStore.shared.replayCaughtUp(pane: meteredPane, bytes: bufferedCount) }
         RelayDiagnostics.shared.record(category: "snapshot", name: "worker-replay-base", details: [
             "pane_id": snapshotPaneID?.uuidString.lowercased() ?? "unknown",
             "bytes": String(bufferedCount),
@@ -6063,10 +6066,14 @@ final class TerminalIOBridge: @unchecked Sendable {
 
             // Publish as soon as the parser barrier completes. Device-query
             // suppression is a separate guard and must not delay first paint.
+            let committedBytes = commit.count
             self.displayQueue.async { [weak self] in
                 guard let self else { return }
                 self.drainDisplay()
                 self.session.waitForPendingOutput()
+                if let meteredPane {
+                    RelayPaneDelayStore.shared.replayDrawn(pane: meteredPane, committedBytes: committedBytes)
+                }
                 self.replayLock.lock()
                 let finished = !self.replaying && self.replayGeneration == generation
                 self.replayLock.unlock()
@@ -6482,6 +6489,14 @@ final class TerminalIOBridge: @unchecked Sendable {
         displayQueue.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
             self?.drainDisplay()
         }
+    }
+
+    /// The pane this bridge saves, for the reconnect meter. Callers may hold
+    /// replayLock; receiveLock is always taken after it.
+    private func meteredPaneID() -> String? {
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        return snapshotPaneID?.uuidString.lowercased()
     }
 
     private func drainDisplay() {

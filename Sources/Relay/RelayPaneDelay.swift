@@ -121,8 +121,38 @@ final class RelayPaneDelayStore: @unchecked Sendable {
         }
     }
 
+    private var replays: [String: RelayReplayMeter] = [:]
+
+    func replayBegan(pane: String) {
+        let at = now()
+        update { $0.replays[pane, default: RelayReplayMeter()].began(at: at) }
+    }
+
+    func replayCaughtUp(pane: String, bytes: Int) {
+        let at = now()
+        update { $0.replays[pane]?.caughtUp(bytes: bytes, at: at) }
+    }
+
+    /// Records the reconnect and logs one line per reconnect.
+    func replayDrawn(pane: String, committedBytes: Int) {
+        let at = now()
+        lock.lock()
+        let sample = replays[pane]?.drawn(at: at)
+        if sample != nil { dirty = true }
+        lock.unlock()
+        guard let sample else { return }
+        RelayDiagnostics.shared.record(category: "pane-delay", name: "reconnect-replay", details: [
+            "pane_id": pane, "replayed_bytes": String(sample.bytes), "committed_bytes": String(committedBytes),
+            "caught_up_ms": String(format: "%.1f", sample.waitMs), "drawn_ms": String(format: "%.1f", sample.drawMs),
+        ])
+    }
+
     struct Report: Codable, Equatable {
-        struct Pane: Codable, Equatable { let host: String; let delay: RelayPaneDelayMeter.Summary }
+        struct Pane: Codable, Equatable {
+            let host: String
+            let delay: RelayPaneDelayMeter.Summary
+            var reconnects: RelayReplayMeter.Summary? = nil
+        }
         let hosts: [String: RelayPaneDelayMeter.Stat]
         let panes: [String: Pane]
     }
@@ -133,7 +163,12 @@ final class RelayPaneDelayStore: @unchecked Sendable {
         for (key, meter) in links { if let stat = meter.linkStat() { hosts[key] = stat } }
         var result: [String: Report.Pane] = [:]
         for (id, entry) in panes {
-            result[id] = .init(host: entry.host, delay: entry.meter.summary(link: hosts[entry.host]))
+            result[id] = .init(host: entry.host, delay: entry.meter.summary(link: hosts[entry.host]),
+                               reconnects: replays[id]?.summary())
+        }
+        for (id, meter) in replays where result[id] == nil {
+            guard let summary = meter.summary() else { continue }
+            result[id] = .init(host: "", delay: RelayPaneDelayMeter().summary(), reconnects: summary)
         }
         return Report(hosts: hosts, panes: result)
     }
@@ -167,5 +202,52 @@ final class RelayPaneDelayStore: @unchecked Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(report()) else { return }
         try? data.write(to: url, options: .atomic)
+    }
+}
+
+/// One pane's reconnect replays: bytes relayd replayed, the wait until it
+/// said caught up, and the time until the rebuilt screen was parsed.
+struct RelayReplayMeter {
+    struct Sample: Codable, Equatable { let bytes: Int; let waitMs: Double; let drawMs: Double }
+    struct Summary: Codable, Equatable {
+        let count: Int
+        let bytesMedian: Int; let bytesMax: Int
+        let drawMsMedian: Double; let drawMsP95: Double; let drawMsMax: Double
+        let last: Sample
+    }
+    private var started: UInt64?
+    private var caught: (bytes: Int, at: UInt64)?
+    private var samples: [Sample] = []
+
+    /// A reconnect that begins again before it finished keeps its first start.
+    mutating func began(at: UInt64) {
+        if started == nil { started = at }
+        caught = nil
+    }
+
+    mutating func caughtUp(bytes: Int, at: UInt64) {
+        guard started != nil else { return }
+        caught = (bytes, at)
+    }
+
+    /// The rebuilt screen has been parsed; one sample per reconnect.
+    mutating func drawn(at: UInt64) -> Sample? {
+        guard let start = started, let caught, at >= start, caught.at >= start else { return nil }
+        started = nil
+        self.caught = nil
+        let sample = Sample(bytes: caught.bytes, waitMs: Double(caught.at - start) / 1_000_000,
+                            drawMs: Double(at - start) / 1_000_000)
+        samples.append(sample)
+        if samples.count > RelayPaneDelayMeter.capacity { samples.removeFirst(samples.count - RelayPaneDelayMeter.capacity) }
+        return sample
+    }
+
+    func summary() -> Summary? {
+        guard let last = samples.last else { return nil }
+        let bytes = samples.map(\.bytes).sorted()
+        let draw = RelayPaneDelayMeter.stat(samples.map(\.drawMs))
+        return Summary(count: samples.count, bytesMedian: bytes[bytes.count / 2], bytesMax: bytes.last ?? 0,
+                       drawMsMedian: draw?.medianMs ?? 0, drawMsP95: draw?.p95Ms ?? 0,
+                       drawMsMax: samples.map(\.drawMs).max() ?? 0, last: last)
     }
 }

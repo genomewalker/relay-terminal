@@ -50,3 +50,58 @@ struct RelayPaneDelayTests {
         #expect(meter.summary().host?.samples == 1, "the oldest pending inputs were dropped, the newest kept")
     }
 }
+
+/// Step 2 of the reconnect work: before changing how a pane is restored,
+/// record per reconnect how much was replayed and how long until it showed.
+@Suite("Each reconnect's replay size and time to draw are recorded")
+struct RelayReplayMeterTests {
+    static func ms(_ value: Double) -> UInt64 { UInt64(value * 1_000_000) }
+
+    @Test func oneReconnectRecordsBytesWaitAndDraw() throws {
+        var meter = RelayReplayMeter()
+        meter.began(at: Self.ms(1000))
+        meter.caughtUp(bytes: 4_000_000, at: Self.ms(1300))
+        let drawn = meter.drawn(at: Self.ms(1450))
+        let sample = try #require(drawn)
+        #expect(sample == .init(bytes: 4_000_000, waitMs: 300, drawMs: 450))
+        let summary = try #require(meter.summary())
+        #expect(summary.count == 1 && summary.bytesMax == 4_000_000 && summary.last == sample)
+    }
+
+    @Test func aDrawWithoutAReplayOrASecondDrawRecordsNothing() {
+        var meter = RelayReplayMeter()
+        let early = meter.drawn(at: Self.ms(5))
+        #expect(early == nil, "no replay began")
+        meter.began(at: Self.ms(10))
+        let beforeCaughtUp = meter.drawn(at: Self.ms(20))
+        #expect(beforeCaughtUp == nil, "relayd has not caught up yet")
+        meter.caughtUp(bytes: 10, at: Self.ms(30))
+        let first = meter.drawn(at: Self.ms(40))
+        #expect(first != nil)
+        let second = meter.drawn(at: Self.ms(50))
+        #expect(second == nil, "one sample per reconnect")
+        #expect(meter.summary()?.count == 1)
+    }
+
+    @Test func aReplayThatRestartsIsTimedFromItsFirstStart() throws {
+        var meter = RelayReplayMeter()
+        meter.began(at: Self.ms(0))
+        meter.began(at: Self.ms(500)) // reconnect again before caught up
+        meter.caughtUp(bytes: 7, at: Self.ms(900))
+        let drawn = meter.drawn(at: Self.ms(1000))
+        #expect(drawn?.drawMs == 1000)
+    }
+
+    @Test func summariesKeepTheRecentWindow() throws {
+        var meter = RelayReplayMeter()
+        for i in 0..<100 {
+            let start = Self.ms(Double(i) * 10_000)
+            meter.began(at: start)
+            meter.caughtUp(bytes: i, at: start)
+            _ = meter.drawn(at: start + Self.ms(Double(i)))
+        }
+        let summary = try #require(meter.summary())
+        #expect(summary.count == RelayPaneDelayMeter.capacity)
+        #expect(summary.bytesMax == 99 && summary.last.bytes == 99 && summary.drawMsMax == 99)
+    }
+}
