@@ -25,11 +25,16 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
     var targetPaneID: UUID? = nil
     var anchorTabID: UUID? = nil
     var anchorPaneID: UUID? = nil
+    /// The pane whose agent called (relay-mcp's RELAY_SESSION). A placement
+    /// hint only, never an authorization: without an explicit placement the
+    /// new tab opens right after this pane's tab, in its workspace, when
+    /// Relay shows that pane; otherwise in the active session.
+    var callerPaneID: UUID? = nil
     /// account (default: no flag, the account's own settings) | ask | read_only | yolo.
     var permissionMode: String? = nil
 
     static let required: Set<String> = ["instance", "requestID", "host", "cwd", "provider", "model", "account", "briefPath"]
-    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "permissionMode"])
+    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "callerPaneID", "permissionMode"])
     static let briefLimit = 64 << 10
 
     /// Exact keys, bounded body, and every field valid; nil otherwise.
@@ -61,10 +66,21 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
             !path.unicodeScalars.contains { $0.value < 32 || $0.value == 127 }
     }
 
-    var placement: String {
+    var placement: String { placement(callerShown: false) }
+
+    func placement(callerShown: Bool) -> String {
         if targetPaneID != nil { return "stack" }
         if anchorTabID != nil || anchorPaneID != nil { return "anchored_tab" }
+        if callerPaneID != nil && callerShown { return "caller_tab" }
         return "active_session_tab"
+    }
+
+    /// The caller's pane when it decides placement: no explicit placement and
+    /// Relay shows that pane.
+    @MainActor func callerAnchor(in workspace: WorkspaceModel) -> UUID? {
+        guard targetPaneID == nil, anchorTabID == nil, anchorPaneID == nil, let callerPaneID,
+              workspace.panes[callerPaneID] != nil, workspace.tabID(containingPane: callerPaneID) != nil else { return nil }
+        return callerPaneID
     }
 }
 
@@ -668,7 +684,8 @@ enum MCPAgentBindingRead {
         // Claimed before the first suspension: one owner per request ID.
         let request = MCPLaunchAgentReceipt.Request(host: proposal.host, cwd: proposal.cwd, provider: proposal.provider,
             model: proposal.model, account: proposal.account, configDir: "", configVariable: RelayAgentAccount.variable(proposal.provider),
-            briefPath: proposal.briefPath, briefBytes: 0, briefSHA256: "", placement: proposal.placement,
+            briefPath: proposal.briefPath, briefBytes: 0, briefSHA256: "",
+            placement: proposal.placement(callerShown: proposal.callerAnchor(in: workspace) != nil),
             permissionMode: proposal.mode)
         entries[proposal.requestID] = Entry(proposal: proposal,
             receipt: MCPLaunchAgentReceipt(requestID: proposal.requestID.uuidString.lowercased(), request: request))
@@ -937,6 +954,10 @@ enum MCPAgentBindingRead {
             } else if proposal.anchorTabID != nil || proposal.anchorPaneID != nil {
                 let made = try workspace.newLocalTab(anchorPaneID: proposal.anchorPaneID, anchorTabID: proposal.anchorTabID,
                                                      profile: profile)
+                (paneID, tabID) = (made.paneID, made.tabID)
+            } else if let caller = proposal.callerAnchor(in: workspace) {
+                // Beside the calling agent's pane, in its session and workspace.
+                let made = try workspace.newLocalTab(anchorPaneID: caller, anchorTabID: nil, profile: profile)
                 (paneID, tabID) = (made.paneID, made.tabID)
             } else {
                 // No anchor: a new tab in the active session, filed like an

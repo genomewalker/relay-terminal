@@ -689,4 +689,44 @@ struct MCPLaunchAgentTests {
             #expect(started.last == paneID && probe.starts.last?.0 == paneID, "\(extra)")
         }
     }
+
+    /// 2026-11-19: agents started from pane bc08e46f (workspace Work) opened
+    /// in whichever workspace the user was looking at. Without a placement,
+    /// the calling pane is the anchor: right after its tab, in its workspace.
+    @Test func withoutAPlacementTheAgentOpensBesideTheCallingPane() async throws {
+        let f = try F.fixture()
+        defer { f.workspace.shutdown() }
+        f.workspace.createdPaneBackgroundStart = { _, _ in }
+        f.workspace.selectTab(f.a1.id) // W1 shown; the caller is in W2
+        let caller = try #require(f.b1.allPaneIDs.first)
+        let instance = UUID(), probe = Probe()
+        let receipt = try #require(Self.receipt(await MCPLaunchAgentRequests().launch(
+            Self.body(instance, UUID(), extra: ["callerPaneID": caller.uuidString]),
+            instance: instance, permits: F.all, workspace: f.workspace, environment: Self.environment(probe))))
+        #expect(receipt.created.status == "created")
+        let tabID = try #require(receipt.created.tabID.flatMap(UUID.init(uuidString:)))
+        #expect(f.workspace.workspaceID(forTab: tabID) == f.w2, "the caller's workspace, not the shown one")
+        #expect(f.workspace.tabs.first { $0.id == tabID }?.sessionID == f.b1.sessionID)
+        #expect(receipt.request.placement == "caller_tab")
+        #expect(f.workspace.selectedTabID == f.a1.id)
+    }
+
+    @Test func anExplicitPlacementWinsAndAnUnknownCallerFallsBackToTheActiveSession() async throws {
+        let f = try F.fixture()
+        defer { f.workspace.shutdown() }
+        f.workspace.createdPaneBackgroundStart = { _, _ in }
+        f.workspace.selectTab(f.a1.id)
+        let caller = try #require(f.b1.allPaneIDs.first)
+        let instance = UUID(), probe = Probe()
+        let explicit = try #require(Self.receipt(await MCPLaunchAgentRequests().launch(
+            Self.body(instance, UUID(), extra: ["callerPaneID": caller.uuidString, "anchorTabID": f.a1.id.uuidString]),
+            instance: instance, permits: F.all, workspace: f.workspace, environment: Self.environment(probe))))
+        let explicitTab = try #require(explicit.created.tabID.flatMap(UUID.init(uuidString:)))
+        #expect(f.workspace.workspaceID(forTab: explicitTab) == f.w1 && explicit.request.placement == "anchored_tab")
+        let unknown = try #require(Self.receipt(await MCPLaunchAgentRequests().launch(
+            Self.body(instance, UUID(), extra: ["callerPaneID": UUID().uuidString]),
+            instance: instance, permits: F.all, workspace: f.workspace, environment: Self.environment(probe))))
+        #expect(unknown.created.status == "created", "a caller pane Relay does not show still gets an agent")
+        #expect(unknown.request.placement == "active_session_tab")
+    }
 }

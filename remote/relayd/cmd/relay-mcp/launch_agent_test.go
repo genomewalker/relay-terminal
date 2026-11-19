@@ -131,3 +131,35 @@ func TestLaunchAgentForwardsPermissionMode(t *testing.T) {
 		}
 	}
 }
+
+// 2026-11-19: agents started from a pane in one workspace opened in whichever
+// workspace was shown. relay-mcp names its own pane so Relay can place the
+// tab beside it; an explicit placement is forwarded unchanged instead.
+func TestLaunchAgentNamesTheCallingPaneOnlyWithoutAPlacement(t *testing.T) {
+	s, _, bodies, done := stackServer(t)
+	defer done()
+	s.callerPane = "44444444-4444-4444-8444-444444444444"
+	if code := callTool(s, "relay_launch_agent", launchArgs()); code != 0 {
+		t.Fatal(code)
+	}
+	if got := (*bodies)[len(*bodies)-1]; got["callerPaneID"] != s.callerPane || len(got) != 9 {
+		t.Fatalf("no placement forwarded %v", got)
+	}
+	args := launchArgs()
+	args["anchor_tab_id"] = "33333333-3333-4333-8333-333333333333"
+	if code := callTool(s, "relay_launch_agent", args); code != 0 {
+		t.Fatal(code)
+	}
+	if got := (*bodies)[len(*bodies)-1]; got["callerPaneID"] != "" || got["anchorTabID"] == "" {
+		t.Fatalf("explicit placement forwarded %v", got)
+	}
+}
+
+func TestCallerPaneIsOnlyAValidPaneID(t *testing.T) {
+	for value, want := range map[string]string{"": "", "not-a-uuid": "", "44444444-4444-4444-8444-444444444444": "44444444-4444-4444-8444-444444444444",
+		"44444444-4444-4444-8444-444444444444\nx": ""} {
+		if got := callerPaneFrom(value); got != want {
+			t.Fatalf("%q -> %q", value, got)
+		}
+	}
+}
