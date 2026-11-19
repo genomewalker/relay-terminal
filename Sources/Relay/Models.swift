@@ -662,12 +662,23 @@ final class PaneModel: ObservableObject, Identifiable {
         didSet {
             // The overview fact reads only the detector's phase and kind.
             if detector.phase != oldValue.phase || detector.kind != oldValue.kind { overviewInputChanged() }
+            if detector.phase != oldValue.phase {
+                (phaseChangedAt, runStartedAt) = RelayPaneStatusLabel.nextTimer(
+                    old: oldValue.phase, new: detector.phase, lastChange: phaseChangedAt, runStart: runStartedAt, now: Date())
+            }
             // A wait seen in terminal output; agent events name theirs in raiseWait.
             guard agentEventInProgress == nil, detector.phase == .needsInput, oldValue.phase != .needsInput else { return }
             terminalWaits &+= 1
             waitIdentity = "terminal:\(terminalWaits)"
         }
     }
+    /// When the agent entered its current phase: the start of the Refreshed
+    /// header's live timer ("Running · 3m 12s"). Restored panes start counting
+    /// when Relay restores them; no earlier start is known.
+    private(set) var phaseChangedAt = Date()
+    /// Start of the current run of work; survives pauses shorter than
+    /// `RelayPaneStatusLabel.pauseGrace`.
+    private var runStartedAt: Date?
     /// The latest wait, so a dismissed wait is told from a later one: the
     /// agent event that asked for the user, which a snapshot replaying that
     /// same event leaves unchanged, or a count of waits seen in terminal output.

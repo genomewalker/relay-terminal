@@ -5151,6 +5151,8 @@ struct ConnectionPath: View {
     let terminate: (() -> Void)?
     let close: (() -> Void)?
     @ObservedObject private var preferences = RelayPreferences.shared
+    @Environment(\.relayInterfaceStyle) private var interfaceStyleOverride
+    @Environment(\.relayInboxStore) private var inbox
 
     var body: some View {
         HStack(spacing: RelayTheme.spacing(8)) {
@@ -5260,7 +5262,11 @@ struct ConnectionPath: View {
                 }
                 .layoutPriority(-1)
             }
-            if let status = headerStatus {
+            if (interfaceStyleOverride ?? preferences.interfaceStyle) == .refreshed, pane.kind != .shell {
+                RelayRefreshedPaneStatus(pane: pane, inbox: inbox)
+                    .fixedSize()
+                    .layoutPriority(2)
+            } else if let status = headerStatus {
                 RelayBadge(status.text, role: status.role)
                     .fixedSize()
                     .layoutPriority(2)

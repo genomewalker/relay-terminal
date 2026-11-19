@@ -65,6 +65,16 @@ enum RelayTerminalPalette: String, CaseIterable, Identifiable {
     var selectionForeground: String { "FFFFFF" }
 }
 
+/// Relay's look. Classic is the interface as it was before the restyle and
+/// stays the default; Refreshed turns on the restyle's changes one by one.
+enum RelayInterfaceStyle: String, CaseIterable, Identifiable, Sendable {
+    case classic
+    case refreshed
+
+    var id: String { rawValue }
+    var label: String { self == .classic ? "Classic" : "Refreshed" }
+}
+
 enum RelayArtifactPresentation: String, CaseIterable, Identifiable, Sendable {
     case inline
     case preview
@@ -101,6 +111,7 @@ final class RelayPreferences: ObservableObject {
     @Published var hideSidebarInFullScreen: Bool { didSet { save() } }
     @Published var showArtifactPreviews: Bool { didSet { save() } }
     @Published var artifactPresentation: RelayArtifactPresentation { didSet { save() } }
+    @Published var interfaceStyle: RelayInterfaceStyle { didSet { save() } }
     @Published var intelligenceEnabled: Bool { didSet { save() } }
     @Published var decisionModelPath: String { didSet { save() } }
     @Published var decisionModelSHA256: String { didSet { save() } }
@@ -174,6 +185,8 @@ final class RelayPreferences: ObservableObject {
         compactInterface = defaults.object(forKey: "relay.settings.compact-interface") as? Bool ?? true
         hideSidebarInFullScreen = defaults.object(forKey: "relay.settings.hide-sidebar-fullscreen") as? Bool ?? true
         showArtifactPreviews = defaults.object(forKey: "relay.settings.artifact-previews") as? Bool ?? true
+        interfaceStyle = RelayInterfaceStyle(
+            rawValue: defaults.string(forKey: "relay.settings.interface-style") ?? "") ?? .classic
         artifactPresentation = RelayArtifactPresentation(
             rawValue: defaults.string(forKey: "relay.settings.artifact-presentation") ?? ""
         ) ?? .preview
@@ -379,6 +392,7 @@ final class RelayPreferences: ObservableObject {
         defaults.set(hideSidebarInFullScreen, forKey: "relay.settings.hide-sidebar-fullscreen")
         defaults.set(showArtifactPreviews, forKey: "relay.settings.artifact-previews")
         defaults.set(artifactPresentation.rawValue, forKey: "relay.settings.artifact-presentation")
+        defaults.set(interfaceStyle.rawValue, forKey: "relay.settings.interface-style")
         defaults.set(intelligenceEnabled, forKey: "relay.settings.intelligence-enabled")
         defaults.set(decisionModelPath, forKey: "relay.settings.decision-model-path")
         defaults.set(decisionModelSHA256, forKey: "relay.settings.decision-model-sha256")

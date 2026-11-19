@@ -824,6 +824,11 @@ struct RelayApp: App {
                     workspace.toggleIntelligencePanel()
                 }
                 .keyboardShortcut(shortcut(.agentActivity).keyEquivalent, modifiers: shortcut(.agentActivity).eventModifiers)
+                Picker("Interface", selection: $preferences.interfaceStyle) {
+                    ForEach(RelayInterfaceStyle.allCases) { style in
+                        Text(style.label).tag(style)
+                    }
+                }
             }
             CommandMenu("Remote") {
                 Button("Manage relayd…") {

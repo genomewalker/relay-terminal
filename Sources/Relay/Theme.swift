@@ -21,6 +21,9 @@ enum RelayPalette {
     static let warning = dynamic(dark: 0xDDA398, light: .systemOrange)
     static let danger = dynamic(dark: 0xDE827B, light: .systemRed)
     static let info = dynamic(dark: 0x8DB7EB, light: 0x1F63D1)
+    /// Refreshed interface only: the running-agent colour (mockup 2026-11-18).
+    /// The light value keeps WCAG AA contrast for its text on near-white.
+    static let lime = dynamic(dark: 0xC5EB4A, light: 0x4F7A00)
 
     static func dynamic(dark: UInt32, light: NSColor) -> NSColor {
         let dark = hex(dark)
@@ -66,6 +69,7 @@ enum RelayTheme {
     static let coral = Color(nsColor: RelayPalette.coral)
     static let red = Color(nsColor: RelayPalette.red)
     static let success = Color(nsColor: RelayPalette.success)
+    static let lime = Color(nsColor: RelayPalette.lime)
     static let warning = Color(nsColor: RelayPalette.warning)
     static let danger = Color(nsColor: RelayPalette.danger)
     static let info = Color(nsColor: RelayPalette.info)

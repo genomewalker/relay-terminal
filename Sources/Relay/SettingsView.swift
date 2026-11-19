@@ -159,6 +159,13 @@ settingSection("Workspace") {
                         .font(RelayTheme.font(size: 11))
                         .foregroundStyle(RelayTheme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
+                    Picker("Interface", selection: $preferences.interfaceStyle) {
+                        ForEach(RelayInterfaceStyle.allCases) { style in
+                            Text(style.label).tag(style)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .help("Refreshed shows status labels with live timers. Classic is Relay as before.")
                     Toggle("Compact interface", isOn: $preferences.compactInterface)
                     Toggle("Hide navigator in full screen", isOn: $preferences.hideSidebarInFullScreen)
                 }
