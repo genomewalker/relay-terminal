@@ -1118,7 +1118,7 @@ final class RelayNodeConnection: @unchecked Sendable {
         // stream closed before the handshake) can still clear outside Relay,
         // e.g. after a network drop or an ssh-agent unlock. Keep retrying
         // slowly; never leave the node parked with no process until restart.
-        let delay = failure.shouldRetry ? min(3_000, 150 * (1 << min(attempt - 1, 4))) : 30_000
+        let delay = RelayNodeRetryPolicy.delayMilliseconds(attempt: attempt, failure: failure)
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
             guard let self else { return }
             self.lock.lock()
@@ -1205,5 +1205,19 @@ final class RelayNodeConnection: @unchecked Sendable {
         case .unsupported: return "Host daemon needs the host_rpc_v1 capability"
         case .outcomeUnknown: return "Host request outcome unknown; query the same job ID, never replay with a new job ID"
         }
+    }
+}
+
+/// How long a disconnected node waits before its next SSH attempt.
+enum RelayNodeRetryPolicy {
+    /// A host whose network route is gone (VPN down, 2026-11-19 denbi-h-micro:
+    /// 942 SSH attempts in 40 minutes) backs off to 30 s; a network or VPN
+    /// change and opening one of its panes still restart it at once
+    /// (`resumeAfterNetworkChange`, demand restart). Other retryable drops keep
+    /// the fast 3 s cap; permanent failures retry slowly.
+    static func delayMilliseconds(attempt: Int, failure: SSHConnectionFailure) -> Int {
+        let step = 150 * (1 << min(max(attempt, 1) - 1, 8))
+        guard failure.shouldRetry else { return 30_000 }
+        return failure.kind == .networkRoute ? min(30_000, step) : min(3_000, step)
     }
 }
