@@ -124,6 +124,21 @@ struct RelayStatusPillTests {
         #expect(pane.phaseChangedAt == start, "the run continues across the reconnect")
     }
 
+    /// Release A follow-up (2026-11-20): the grey activity text ("Thinking",
+    /// "Using Bash") contradicted the label beside it. Refreshed headers
+    /// leave it out; the label's hover and agent details still show it.
+    @Test func refreshedHeadersLeaveOutTheActivityText() {
+        #expect(ConnectionPath.usesRefreshedLabel(style: .refreshed, kind: .claude, programReport: false))
+        #expect(ConnectionPath.usesRefreshedLabel(style: .refreshed, kind: .shell, programReport: true))
+        #expect(!ConnectionPath.usesRefreshedLabel(style: .refreshed, kind: .shell, programReport: false))
+        #expect(!ConnectionPath.usesRefreshedLabel(style: .classic, kind: .codex, programReport: true))
+        #expect(RelayRefreshedPaneStatus.help(activity: "Using Bash", programReport: false)
+                == "Latest activity: Using Bash · Show agent details")
+        #expect(RelayRefreshedPaneStatus.help(activity: nil, programReport: false) == "Show agent details")
+        #expect(RelayRefreshedPaneStatus.help(activity: "Thinking", programReport: true)
+                == "Latest activity: Thinking · Show program tasks")
+    }
+
     static func records(_ json: String) throws -> [RelayProgramStatusRecord] {
         try JSONDecoder().decode([RelayProgramStatusRecord].self, from: Data(json.utf8))
     }

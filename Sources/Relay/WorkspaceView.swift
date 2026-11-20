@@ -5246,7 +5246,10 @@ struct ConnectionPath: View {
                 }
             }
             Spacer(minLength: 8)
-            if let detail = pane.headerActivityDetail {
+            let refreshedLabel = Self.usesRefreshedLabel(style: interfaceStyleOverride ?? preferences.interfaceStyle,
+                                                         kind: pane.kind, programReport: !pane.programStatus.records.isEmpty)
+            // Refreshed: the activity text moves to the label's hover and agent details.
+            if !refreshedLabel, let detail = pane.headerActivityDetail {
                 droppable {
                     Button(action: inspectAgent) {
                         Text(detail)
@@ -5262,11 +5265,9 @@ struct ConnectionPath: View {
                 }
                 .layoutPriority(-1)
             }
-            let refreshedLabel = (interfaceStyleOverride ?? preferences.interfaceStyle) == .refreshed
-                && (pane.kind != .shell || !pane.programStatus.records.isEmpty)
             if refreshedLabel {
                 // One label: it follows the program's report and opens its task list.
-                RelayRefreshedPaneStatus(pane: pane, inbox: inbox)
+                RelayRefreshedPaneStatus(pane: pane, inbox: inbox, showDetails: inspectAgent)
                     .fixedSize()
                     .layoutPriority(2)
             } else if let status = headerStatus {
@@ -5407,6 +5408,12 @@ struct ConnectionPath: View {
     private var connectionNormal: Bool { pane.connectionIsNormal }
 
     private var headerStatus: (text: String, role: RelayTheme.StatusRole)? { pane.headerStatus }
+
+    /// Refreshed draws one status label for agents, and for shells whose
+    /// program reports; everything else keeps the Classic header.
+    static func usesRefreshedLabel(style: RelayInterfaceStyle, kind: AgentKind, programReport: Bool) -> Bool {
+        style == .refreshed && (kind != .shell || programReport)
+    }
 
     /// Secondary pane actions in one keyboard-reachable menu so the name keeps its width.
     private var overflowMenu: some View {

@@ -149,18 +149,31 @@ struct RelayStatusPill: View {
 struct RelayRefreshedPaneStatus: View {
     @ObservedObject var pane: PaneModel
     @ObservedObject var inbox: AgentIntelligenceStore
+    /// Opens agent details when no program reports a task list.
+    var showDetails: () -> Void = {}
+
+    nonisolated static func help(activity: String?, programReport: Bool) -> String {
+        let action = programReport ? "Show program tasks" : "Show agent details"
+        return activity.map { "Latest activity: \($0) · " + action } ?? action
+    }
 
     var body: some View {
         if let label = RelayPaneStatusLabel.make(kind: pane.kind, phase: pane.phase, connection: pane.connectionState,
                                                  pendingApprovals: pane.pendingAgentApprovals,
                                                  finishedUnseen: inbox.marker(for: pane.id) == .done,
                                                  phaseSince: pane.phaseChangedAt, program: pane.programStatusPrimary) {
-            if pane.programStatus.records.isEmpty {
-                RelayStatusPill(label: label)
-            } else {
-                // The program's task list opens from the one label.
-                RelayProgramStatusBadge(pane: pane, label: label)
+            let reports = !pane.programStatus.records.isEmpty
+            Group {
+                if reports {
+                    // The program's task list opens from the one label.
+                    RelayProgramStatusBadge(pane: pane, label: label)
+                } else {
+                    Button(action: showDetails) { RelayStatusPill(label: label).contentShape(Rectangle()) }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Shows agent details")
+                }
             }
+            .help(Self.help(activity: pane.headerActivityDetail, programReport: reports))
         }
     }
 }

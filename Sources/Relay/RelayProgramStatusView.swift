@@ -62,7 +62,7 @@ struct RelayProgramStatusBadge: View {
                     }
                 }
             }
-            .help("Program-reported status from this pane. Open to inspect all tasks.")
+            .help(label == nil ? "Program-reported status from this pane. Open to inspect all tasks." : "")
             .accessibilityLabel("Program reported " + (current ? stateLabel(primary.state) : "stale status"))
             .popover(isPresented: $showingDetails, arrowEdge: .leading) {
                 VStack(alignment: .leading, spacing: 12) {
