@@ -51,6 +51,15 @@ func processStartTime(pid int) (uint64, error) {
 	return sec*1000000 + uint64(info.Proc.P_starttime.Usec), nil
 }
 
+// processStartWallTime converts the kernel process incarnation already verified
+// by the binding reader to a wall-clock instant.
+func processStartWallTime(start uint64) time.Time {
+	if start == 0 {
+		return time.Time{}
+	}
+	return time.UnixMicro(int64(start)).UTC()
+}
+
 // Keep the existing peer discovery wire format. Worker incarnation validation
 // uses the full microsecond kernel identity through processStartTime.
 func processStartIdentity(pid int) (string, error) {

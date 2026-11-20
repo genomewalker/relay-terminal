@@ -377,3 +377,50 @@ func FuzzNativeReaderCLI(f *testing.F) {
 func bufioNewConversationReader(data []byte) *bufio.Reader {
 	return bufio.NewReaderSize(bytes.NewReader(data), 65536)
 }
+
+func TestConversationClaudeControlKeepsVerifiedHookTime(t *testing.T) {
+	r, path := conversationFixture(t, "claude", "session", "")
+	r.binding = r.authenticatedBinding
+	binding := pyObj("version", int64(1), "session_id", "session", "transcript_path", path, "revision", "live-revision",
+		"source", "native_registration_kernel_owner",
+		"lifecycle", "stop_observed", "observed_at", "2026-11-20T15:00:00Z",
+		"producer", pyObj("pane_id", "pane", "process_id", int64(22), "process_start", int64(7), "provider", "claude"))
+	changeBetweenReads := false
+	calls := 0
+	r.run = func(args []string, _ float64) string {
+		if args[1] != "agent-binding" {
+			t.Fatalf("unexpected command %v", args)
+		}
+		calls++
+		current := binding.Copy()
+		if changeBetweenReads && calls > 1 {
+			current.Set("observed_at", "2026-11-20T15:00:01Z")
+		}
+		return string(pyEncode(current, conversationCompactJSON))
+	}
+	control := r.conversationSnapshot("pane", 11, "reader", nil, "", "").Get("control").(*pyObject)
+	if control.Get("lifecycle") != "stop_observed" || control.Get("revision") != "live-revision" ||
+		control.Get("observed_at") != "2026-11-20T15:00:00.000000000Z" {
+		t.Fatalf("wrong authenticated control: %v", control)
+	}
+
+	calls = 0
+	changeBetweenReads = true
+	requireConversationRefusal(t, "binding changed", func() {
+		r.conversationSnapshot("pane", 11, "reader", nil, "", "")
+	})
+
+	changeBetweenReads = false
+	binding.Set("observed_at", "invalid")
+	control = r.conversationSnapshot("pane", 11, "reader", nil, "", "").Get("control").(*pyObject)
+	if control.Get("lifecycle") != "unknown" || control.Get("observed_at") != "" {
+		t.Fatalf("invalid timestamp supplied a known control: %v", control)
+	}
+
+	binding.Delete("source")
+	binding.Set("observed_at", "2026-11-20T15:00:00Z")
+	control = r.conversationSnapshot("pane", 11, "reader", nil, "", "").Get("control").(*pyObject)
+	if control.Get("observed_at") != "" {
+		t.Fatalf("hook-only fallback supplied actionable control: %v", control)
+	}
+}

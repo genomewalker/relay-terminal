@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 import Testing
 @testable import Relay
 
@@ -41,5 +42,16 @@ import Testing
         before.windowDidChangeFullScreen(true)
         let relaunched = RelayWorkspaceFullScreenMemory(defaults: defaults)
         #expect(!relaunched.shouldRestore(windowIsFullScreen: true))
+    }
+}
+
+@Suite struct RelayQuickLookTypeTests {
+    /// The bar shows macOS's own icon for the item's type, local or remote.
+    @Test func macOSDecidesTheTypeFromTheNameForLocalAndRemoteFiles() {
+        let remote = ConnectionProfile(name: "dandy", kind: .ssh, backend: .direct)
+        #expect(RelayQuickLookItem(source: .localFile("/tmp/a.PNG"), openLink: "").contentType == .png)
+        #expect(RelayQuickLookItem(source: .remoteFile(remote, path: "~/paper.pdf", cwd: nil), openLink: "").contentType == .pdf)
+        #expect(RelayQuickLookItem(source: .localFile("/tmp/blob"), openLink: "").contentType == .data)
+        #expect(RelayQuickLookItem(source: .web(URL(string: "https://example.org")!), openLink: "").contentType == nil)
     }
 }

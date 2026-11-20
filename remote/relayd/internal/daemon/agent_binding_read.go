@@ -181,13 +181,47 @@ func privateBindingObject(path string, directory bool) error {
 	return nil
 }
 
-// ReadVerifiedAgentBinding re-observes Codex runtime selection on every read.
+// withVerifiedClaudeLifecycle overlays hook telemetry on the independently verified
+// live association. Only the lifecycle and its original observation time transfer.
+func withVerifiedClaudeLifecycle(live, stored AgentBindingRecord, startedAt time.Time) AgentBindingRecord {
+	// The private hook writer leaves Source unset. Other binding sources are explicit.
+	if live.Version != 1 || stored.Version != 1 ||
+		!nativeClaudeLifecycleSource(live.Source) ||
+		stored.Source != "" || stored.Producer.SenderPID <= 1 || stored.Revision == "" ||
+		live.Producer.Provider != "claude" || stored.Producer.Provider != "claude" ||
+		live.Producer.PaneID != stored.Producer.PaneID ||
+		live.Producer.ProcessID != stored.Producer.ProcessID || live.Producer.ProcessStart != stored.Producer.ProcessStart ||
+		live.Producer.ConfigDir != stored.Producer.ConfigDir || live.SessionID != stored.SessionID ||
+		live.TranscriptPath != stored.TranscriptPath ||
+		!knownAgentLifecycle(stored.Lifecycle) || startedAt.IsZero() ||
+		stored.ObservedAt.Before(startedAt) || stored.ObservedAt.After(live.ObservedAt) {
+		return live
+	}
+	live.Lifecycle = stored.Lifecycle
+	live.ObservedAt = stored.ObservedAt
+	return live
+}
+
+func nativeClaudeLifecycleSource(source string) bool {
+	return source == "native_registration_kernel_owner" || source == "native_parked_job_kernel_owner"
+}
+
+func knownAgentLifecycle(lifecycle string) bool {
+	switch lifecycle {
+	case "stop_observed", "quiet", "needs_input", "active", "exited":
+		return true
+	default:
+		return false
+	}
+}
+
+// ReadVerifiedAgentBinding re-observes native runtime selection on every read.
 func ReadVerifiedAgentBinding(pane string) (AgentBindingRecord, error) {
 	stored, err := readStoredVerifiedAgentBinding(pane)
 	if err == nil && stored.Producer.Provider == "claude" {
 		live, liveErr := ReadNativeClaudeBinding(pane)
 		if liveErr == nil {
-			return live, nil
+			return withVerifiedClaudeLifecycle(live, stored, processStartWallTime(live.Producer.ProcessStart)), nil
 		}
 		if errors.Is(liveErr, errNativeClaudeParkedUnavailable) {
 			return AgentBindingRecord{}, liveErr

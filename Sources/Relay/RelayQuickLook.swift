@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import Quartz
 import SwiftUI
 import WebKit
@@ -175,6 +176,17 @@ struct RelayQuickLookItem: Equatable, Sendable {
         case .localFile(let path), .remoteFile(_, let path, _):
             let name = (path as NSString).lastPathComponent
             return name.isEmpty ? path : name
+        }
+    }
+
+    /// The item's type as macOS knows it from its name, for local and
+    /// remote files alike; nil for a web page.
+    var contentType: UTType? {
+        switch source {
+        case .web: return nil
+        case .localFile(let path), .remoteFile(_, let path, _):
+            let ext = (path as NSString).pathExtension
+            return ext.isEmpty ? .data : (UTType(filenameExtension: ext) ?? .data)
         }
     }
 
@@ -569,7 +581,9 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
         panel.minSize = NSSize(width: 360, height: 240)
         panel.delegate = self
         RelayTheme.configureAppearance(panel)
-        panel.contentView = NSHostingView(rootView: RelayQuickLookView(controller: self))
+        // The title bar is hidden and transparent; start the bar at the top
+        // edge, as a pane header does, instead of below an empty title area.
+        panel.contentView = NSHostingView(rootView: RelayQuickLookView(controller: self).ignoresSafeArea(.container, edges: .top))
         return panel
     }
 }
@@ -627,9 +641,27 @@ struct RelayQuickLookView: View {
     }
 
     private var header: some View {
-        RelayViewerBar(symbol: "eye", title: controller.browser?.current.title ?? "Quick Look",
-                       detail: controller.browser?.current.subtitle, detailMonospaced: false,
-                       close: { controller.close() }, closeLabel: "Close (Esc)") {
+        let item = controller.browser?.current
+        return RelayViewerBarFrame(close: { controller.close() }, closeLabel: "Close (Esc)") {
+            // macOS's own icon for the type, as Finder and Quick Look show it.
+            Group {
+                if let type = item?.contentType {
+                    Image(nsImage: NSWorkspace.shared.icon(for: type)).resizable().interpolation(.high)
+                } else {
+                    Image(systemName: "globe").font(RelayViewerMetrics.icon).foregroundStyle(RelayTheme.textFaint)
+                }
+            }
+            .frame(width: 16, height: 16)
+            .accessibilityHidden(true)
+            Text(item?.title ?? "Quick Look")
+                .font(RelayViewerMetrics.title).foregroundStyle(RelayTheme.text)
+                .lineLimit(1).truncationMode(.middle).layoutPriority(2)
+            if let subtitle = item?.subtitle {
+                Text(subtitle).font(RelayViewerMetrics.meta).foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Spacer(minLength: RelayViewerMetrics.barSpacing)
+        } trailing: {
             if let position = controller.browser?.position, !position.isEmpty {
                 Text(position).font(RelayViewerMetrics.identifier).foregroundStyle(RelayTheme.textFaint)
                 RelayViewerIconButton(title: "Previous", symbol: "chevron.left") { controller.previous() }
