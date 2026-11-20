@@ -80,6 +80,8 @@ struct RelayAgentConversationItem: Equatable, Codable, Identifiable, Sendable {
         case artifact(id: String, kind: String)
         case providerImage(reference: String)
         case tool(name: String, status: String, summary: String)
+        /// Structured detail for the `.tool` block before it; rendered in its place.
+        case toolCard(RelayToolCard)
     }
     let id: String
     let turnID: String?
@@ -104,6 +106,9 @@ struct RelayAgentConversationItem: Equatable, Codable, Identifiable, Sendable {
             case .tool(let name, let status, let summary):
                 guard name.utf8.count <= 256, status.utf8.count <= 128 else { return false }
                 total += summary.utf8.count
+            case .toolCard(let card):
+                guard card.isValid else { return false }
+                total += card.byteCount
             }
             if total > 1_048_576 { return false }
         }

@@ -22,6 +22,9 @@ private struct RelayConversationSnapshot: Decodable {
         let toolName: String?
         let toolStatus: String?
         let revision: UInt64
+        /// Optional structured edit or shell detail; older hosts omit it.
+        let card: RelayToolCard.Lenient?
+        let callId: String?
     }
     struct Control: Decodable { let lifecycle: String; let revision: String; let observedAt: String }
     struct History: Decodable { let before: UInt64?; let historical: Bool }
@@ -133,11 +136,14 @@ private struct RelayConversationSnapshot: Decodable {
             historical = snapshot.history?.historical ?? false
             // Every response is a bounded resynchronization. Provider transcripts are the durable source.
             var next = RelayAgentConversation(); next.bind(binding)
-            for item in items {
+            let cards = items.map { item in item.card?.value.flatMap { $0.isValid ? $0 : nil } }
+            let folded = RelayToolCard.foldedCalls(zip(items, cards).map { ($0.callId, $1 != nil, $0.toolStatus) })
+            for (index, item) in items.enumerated() where !folded.contains(index) {
                 guard let role = RelayAgentConversationItem.Role(rawValue: item.role) else { continue }
                 var blocks: [RelayAgentConversationItem.Block]
                 if let tool = item.toolName {
                     blocks = [.tool(name: tool, status: item.toolStatus ?? "unknown", summary: item.text)]
+                    if let card = cards[index] { blocks.append(.toolCard(card)) }
                 } else { blocks = [.markdown(item.text)] }
                 for image in (item.images ?? []).prefix(16) { blocks.append(.providerImage(reference: image.reference)) }
                 _ = next.receive(.init(id: item.id, turnID: nil, role: role, blocks: blocks,
