@@ -15,7 +15,7 @@ private func contextFixture(pane: UUID, usage: [String: Int]?) throws -> Data {
 @Test func providerContextMatchesExactSessionAndPreservesZero() throws {
     let pane = UUID()
     let data = try contextFixture(pane: pane, usage: ["used_tokens": 0, "limit_tokens": 272_000])
-    let context = try #require(RelayProviderContext.decode(data, hostID: "host", paneID: pane, provider: .codex))
+    let context = try #require(try RelayProviderContext.decode(data, hostID: "host", paneID: pane, provider: .codex))
     #expect(context.usedTokens == 0)
     #expect(context.limitTokens == 272_000)
     #expect(context.matches(context.binding))
@@ -30,7 +30,7 @@ private func contextFixture(pane: UUID, usage: [String: Int]?) throws -> Data {
     let pane = UUID()
     for usage in [nil, ["used_tokens": 24], ["used_tokens": -1, "limit_tokens": 400], ["used_tokens": 42, "limit_tokens": 0]] {
         let data = try contextFixture(pane: pane, usage: usage)
-        let context = try #require(RelayProviderContext.decode(data, hostID: "host", paneID: pane, provider: .codex))
+        let context = try #require(try RelayProviderContext.decode(data, hostID: "host", paneID: pane, provider: .codex))
         #expect(context.label == RelayProviderContext.unknown)
     }
 }
