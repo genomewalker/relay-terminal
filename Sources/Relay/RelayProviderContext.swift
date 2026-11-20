@@ -1,4 +1,5 @@
-import Foundation
+import AppKit
+import SwiftUI
 
 struct RelayProviderContext: Equatable, Sendable {
     let binding: RelayAgentConversationBinding
@@ -54,4 +55,123 @@ struct RelayProviderContext: Equatable, Sendable {
     }
 
     static let unknown = "Context unknown"
+}
+
+/// One read loop per pane. A replacement waits for the old read to unwind
+/// even when its window closes while another presentation is taking over.
+struct RelayProviderContextDemand<Key: Equatable> {
+    enum Change: Equatable {
+        case none, start(Key), cancel
+    }
+
+    private var consumers: [UUID: Key] = [:]
+    private var running: Key?
+    private var cancelling = false
+
+    mutating func set(_ consumer: UUID, key: Key?) { consumers[consumer] = key }
+
+    func includes(_ key: Key?) -> Bool {
+        guard let key else { return false }
+        return consumers.values.contains(key)
+    }
+
+    mutating func reconcile(_ key: Key?) -> Change {
+        guard !cancelling else { return .none }
+        let wanted = includes(key) ? key : nil
+        guard running != wanted else { return .none }
+        if running != nil {
+            cancelling = true
+            return .cancel
+        }
+        guard let wanted else { return .none }
+        running = wanted
+        return .start(wanted)
+    }
+
+    mutating func didStop() {
+        running = nil
+        cancelling = false
+    }
+}
+
+private struct RelayProviderContextPresentedKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    var providerContextPresented: Bool {
+        get { self[RelayProviderContextPresentedKey.self] }
+        set { self[RelayProviderContextPresentedKey.self] = newValue }
+    }
+}
+
+struct RelayProviderContextWindowReader: NSViewRepresentable {
+    let pane: PaneModel
+    let key: PaneModel.ProviderContextKey
+
+    static func presentsContent(size: CGSize, presented: Bool, covered: Bool) -> Bool {
+        presented && !covered && size.width > 0 && size.height > 0
+    }
+
+    @MainActor final class Coordinator {
+        private let consumer = UUID()
+        private weak var pane: PaneModel?
+        private weak var registeredPane: PaneModel?
+        private var key: PaneModel.ProviderContextKey?
+        private var showing = false
+
+        func configure(_ pane: PaneModel, key: PaneModel.ProviderContextKey) {
+            guard self.pane !== pane || self.key != key else { return }
+            self.pane = pane
+            self.key = key
+            reconcileAfterViewUpdate()
+        }
+
+        func watch(_ view: RelayWindowVisibilityView) {
+            view.onChange = { [weak self] showing in self?.windowChanged(showing) }
+        }
+
+        private func windowChanged(_ showing: Bool) {
+            self.showing = showing
+            reconcileAfterViewUpdate()
+        }
+
+        func detach() {
+            pane = nil
+            key = nil
+            showing = false
+            reconcileAfterViewUpdate()
+        }
+
+        private func reconcileAfterViewUpdate() {
+            // AppKit can report a transition inside SwiftUI's representable update.
+            DispatchQueue.main.async { [self] in
+                let current = self.showing ? self.pane : nil
+                if self.registeredPane !== current {
+                    self.registeredPane?.setProviderContextConsumer(self.consumer, key: nil)
+                }
+                self.registeredPane = current
+                current?.setProviderContextConsumer(self.consumer, key: self.key)
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> RelayWindowVisibilityView {
+        let view = RelayWindowVisibilityView()
+        context.coordinator.watch(view)
+        context.coordinator.configure(pane, key: key)
+        return view
+    }
+
+    func updateNSView(_ view: RelayWindowVisibilityView, context: Context) {
+        context.coordinator.configure(pane, key: key)
+        view.evaluate()
+    }
+
+    static func dismantleNSView(_ view: RelayWindowVisibilityView, coordinator: Coordinator) {
+        view.detach()
+        coordinator.detach()
+    }
 }

@@ -3902,6 +3902,7 @@ private struct PaneView: View {
     @ObservedObject private var toolWindows = RelayToolWindowCoordinator.shared
     @EnvironmentObject private var linkSelection: PaneLinkSelection
     @Environment(\.networkCoverActive) private var networkCoverActive
+    @Environment(\.providerContextPresented) private var providerContextPresented
     @ObservedObject var pane: PaneModel
     @ObservedObject private var preferences = RelayPreferences.shared
     let isActive: Bool
@@ -3923,7 +3924,9 @@ private struct PaneView: View {
     @StateObject private var dropPreview = PaneDropPreviewModel()
 
     var body: some View {
-        let contextKey = networkCoverActive ? nil : pane.providerContextKey
+        let contextKey = pane.providerContextKey
+        let observesContext = RelayProviderContextWindowReader.presentsContent(size: paneSize,
+            presented: providerContextPresented, covered: networkCoverActive)
         return VStack(spacing: RelayTheme.spacing(0)) {
             paneHeader
             ZStack {
@@ -4064,9 +4067,10 @@ private struct PaneView: View {
                     .accessibilityIdentifier("relay.pane.context-usage")
             }
         }
-        .task(id: contextKey) {
-            if let contextKey, !RelayLaunchMode.isRunningTests {
-                await pane.observeProviderContext(contextKey)
+        .background {
+            if observesContext, let contextKey, !RelayLaunchMode.isRunningTests {
+                RelayProviderContextWindowReader(pane: pane, key: contextKey)
+                    .allowsHitTesting(false).accessibilityHidden(true)
             }
         }
         .onChange(of: pane.richContentRequested) { _, requested in
@@ -5995,6 +5999,7 @@ private struct RBoundedWorkspaceHost: View {
                           placementChanged: { windows.rPanelPlacements[key] = $0; workspace.persistRPresentation() }) {
                 item.content
             }.id(key)
+                .transformEnvironment(\.providerContextPresented) { $0 = $0 && !windows.minimizedRWorkspaces.contains(key) }
                 .opacity(windows.minimizedRWorkspaces.contains(key) ? 0 : 1)
                 .allowsHitTesting(!windows.minimizedRWorkspaces.contains(key))
                 .accessibilityHidden(windows.minimizedRWorkspaces.contains(key))
@@ -6241,7 +6246,8 @@ private struct RStandaloneWorkspace: View {
                     } else {
                         RLayoutResultsDock(runtime: editor.editorRuntime)
                     }
-                }.frame(width: 0, height: 0).hidden()
+                }.environment(\.providerContextPresented, false)
+                    .frame(width: 0, height: 0).hidden()
             }
         }
         }.background(RelayTheme.canvas)
@@ -6257,6 +6263,7 @@ private struct RStandaloneWorkspace: View {
                                   placementChanged: { windows.rPanelPlacements[key] = $0; workspace.persistRPresentation() }) {
                         panel.content
                     }.id(key)
+                        .transformEnvironment(\.providerContextPresented) { $0 = $0 && !windows.minimizedRPanels.contains(key) }
                         .opacity(windows.minimizedRPanels.contains(key) ? 0 : 1)
                         .allowsHitTesting(!windows.minimizedRPanels.contains(key))
                         .accessibilityHidden(windows.minimizedRPanels.contains(key))

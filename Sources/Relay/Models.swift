@@ -649,7 +649,11 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published private var observedProviderContext: RelayProviderContext?
     @Published private var providerContextEpoch = UUID()
     private var observedProviderContextKey: ProviderContextKey?
-    private var providerContextObserver: UUID?
+    private var providerContextDemand = RelayProviderContextDemand<ProviderContextKey>()
+    private var providerContextTask: Task<Void, Never>?
+    var providerContextCapture: @MainActor (ConnectionProfile, String) async -> RelayHostExecution.Output? = { profile, command in
+        try? await RelayHostExecution.capture(profile: profile, command: command, timeout: 10, maximumBytes: 8192)
+    }
 
     var providerContext: RelayProviderContext? {
         observedProviderContextKey == providerContextKey ? observedProviderContext : nil
@@ -676,37 +680,63 @@ final class PaneModel: ObservableObject, Identifiable {
         if observedProviderContext != nil { observedProviderContext = nil }
     }
 
-    func observeProviderContext(_ key: ProviderContextKey) async {
-        guard !Task.isCancelled, providerContextKey == key else { return }
-        let observation = UUID()
-        providerContextObserver = observation
-        defer {
-            if providerContextObserver == observation {
-                providerContextObserver = nil
+    func setProviderContextConsumer(_ consumer: UUID, key: ProviderContextKey?) {
+        providerContextDemand.set(consumer, key: key)
+        reconcileProviderContext()
+    }
+
+    private func reconcileProviderContext() {
+        let key = providerContextKey
+        switch providerContextDemand.reconcile(key) {
+        case .start(let key):
+            let paneID = id
+            let profile = self.profile
+            let command = RelayHostExecution.daemonCommand(profile: profile, arguments: [
+                "agent-conversation", "--context-only", "--pane", paneID.uuidString.lowercased(),
+                "--root-pid", String(key.rootPID)
+            ])
+            let capture = providerContextCapture
+            providerContextTask = Task { [weak self] in
+                defer {
+                    if let self {
+                        self.providerContextTask = nil
+                        self.providerContextDemand.didStop()
+                        self.reconcileProviderContext()
+                    }
+                }
+                while !Task.isCancelled, self?.acceptsProviderContext(key) == true {
+                    let output = await capture(profile, command)
+                    guard !Task.isCancelled, self?.acceptsProviderContext(key) == true else { return }
+                    self?.recordProviderContext(output, key: key)
+                    do { try await Task.sleep(for: .seconds(20)) } catch { return }
+                }
+            }
+        case .cancel:
+            providerContextTask?.cancel()
+            fallthrough
+        case .none:
+            if !providerContextDemand.includes(key) {
                 observedProviderContextKey = nil
                 if observedProviderContext != nil { observedProviderContext = nil }
             }
         }
-        let paneID = id.uuidString.lowercased()
-        let command = RelayHostExecution.daemonCommand(profile: profile, arguments: [
-            "agent-conversation", "--context-only", "--pane", paneID, "--root-pid", String(key.rootPID)
-        ])
-        while !Task.isCancelled, providerContextObserver == observation, providerContextKey == key {
-            let output = try? await RelayHostExecution.capture(profile: profile, command: command,
-                timeout: 10, maximumBytes: 8192)
-            guard !Task.isCancelled, providerContextObserver == observation, providerContextKey == key else { return }
-            let next: RelayProviderContext?
-            if let output, output.exitCode == 0 {
-                next = try? RelayProviderContext.decode(output.stdout, hostID: profile.id.uuidString,
-                    paneID: id, provider: key.provider)
-            } else {
-                next = nil
-            }
-            let changed = observedProviderContext != next || observedProviderContextKey != key
-            observedProviderContextKey = key
-            if changed { observedProviderContext = next }
-            do { try await Task.sleep(for: .seconds(20)) } catch { return }
+    }
+
+    private func recordProviderContext(_ output: RelayHostExecution.Output?, key: ProviderContextKey) {
+        let next: RelayProviderContext?
+        if let output, output.exitCode == 0 {
+            next = try? RelayProviderContext.decode(output.stdout, hostID: profile.id.uuidString,
+                paneID: id, provider: key.provider)
+        } else {
+            next = nil
         }
+        let changed = observedProviderContext != next || observedProviderContextKey != key
+        observedProviderContextKey = key
+        if changed { observedProviderContext = next }
+    }
+
+    private func acceptsProviderContext(_ key: ProviderContextKey) -> Bool {
+        providerContextKey == key && providerContextDemand.includes(key)
     }
     /// A tool call the conversation view scrolls to when it next shows it;
     /// set by Agent details, cleared once resolved.
