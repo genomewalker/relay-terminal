@@ -43,3 +43,14 @@ import Testing
         #expect(!relaunched.shouldRestore(windowIsFullScreen: true))
     }
 }
+
+@Suite struct RelayQuickLookSymbolTests {
+    @Test func theBarIconSaysWhatKindOfItemIsShown() {
+        func symbol(_ path: String) -> String { RelayQuickLookItem(source: .localFile(path), openLink: path).symbol }
+        #expect(symbol("/tmp/a.PNG") == "photo")
+        #expect(symbol("/tmp/paper.pdf") == "doc.richtext")
+        #expect(symbol("/tmp/change.diff") == "doc.text")
+        #expect(symbol("/tmp/blob") == "doc")
+        #expect(RelayQuickLookItem(source: .web(URL(string: "https://example.org")!), openLink: "").symbol == "globe")
+    }
+}

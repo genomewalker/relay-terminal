@@ -178,6 +178,25 @@ struct RelayQuickLookItem: Equatable, Sendable {
         }
     }
 
+    /// The bar's symbol: what kind of thing is shown, like a pane header's
+    /// agent badge says what runs in it.
+    var symbol: String {
+        let path: String
+        switch source {
+        case .web: return "globe"
+        case .localFile(let p), .remoteFile(_, let p, _): path = p
+        }
+        switch (path as NSString).pathExtension.lowercased() {
+        case "png", "jpg", "jpeg", "gif", "heic", "tif", "tiff", "webp", "bmp", "svg": return "photo"
+        case "pdf": return "doc.richtext"
+        case "mov", "mp4", "m4v": return "film"
+        case "csv", "tsv", "xlsx": return "tablecells"
+        case "md", "txt", "log", "diff", "patch", "json", "yaml", "yml", "toml", "swift", "go", "py", "r", "sh", "c", "h", "cpp", "rs", "js", "ts", "html", "css":
+            return "doc.text"
+        default: return "doc"
+        }
+    }
+
     var subtitle: String {
         switch source {
         case .web(let url): url.absoluteString
@@ -569,7 +588,9 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
         panel.minSize = NSSize(width: 360, height: 240)
         panel.delegate = self
         RelayTheme.configureAppearance(panel)
-        panel.contentView = NSHostingView(rootView: RelayQuickLookView(controller: self))
+        // The title bar is hidden and transparent; start the bar at the top
+        // edge, as a pane header does, instead of below an empty title area.
+        panel.contentView = NSHostingView(rootView: RelayQuickLookView(controller: self).ignoresSafeArea(.container, edges: .top))
         return panel
     }
 }
@@ -627,7 +648,7 @@ struct RelayQuickLookView: View {
     }
 
     private var header: some View {
-        RelayViewerBar(symbol: "eye", title: controller.browser?.current.title ?? "Quick Look",
+        RelayViewerBar(symbol: controller.browser?.current.symbol ?? "doc", title: controller.browser?.current.title ?? "Quick Look",
                        detail: controller.browser?.current.subtitle, detailMonospaced: false,
                        close: { controller.close() }, closeLabel: "Close (Esc)") {
             if let position = controller.browser?.position, !position.isEmpty {
