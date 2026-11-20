@@ -20,6 +20,19 @@ enum PaneHeaderName {
         let shown = base.joined(separator: " ")
         return shown.isEmpty ? (name, nil) : (shown, String(id))
     }
+
+    /// The pane's own short id: the first 6 characters of its UUID.
+    static func shortID(_ paneID: UUID) -> String {
+        String(paneID.uuidString.lowercased().prefix(6))
+    }
+
+    /// What the header shows: the name, with a trailing "<agent> <6-hex>" moved
+    /// out of it, and always the pane's own short id. On 2026-11-20, 94 of 180
+    /// panes showed no id (names without that suffix, such as "dandy-07") and
+    /// two showed another pane's id copied into their name.
+    static func header(name: String, paneID: UUID) -> (name: String, id: String) {
+        (parts(name).name, shortID(paneID))
+    }
 }
 
 extension PaneModel {

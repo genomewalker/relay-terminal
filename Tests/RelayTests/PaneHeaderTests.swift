@@ -86,3 +86,27 @@ import Testing
         #expect(rendered == 20)
     }
 }
+
+/// 2026-11-20: 94 of 180 pane headers showed no id and two showed another
+/// pane's id copied into their name. Every header shows its own.
+@Suite("Pane header short id") struct PaneHeaderShortIDTests {
+    let id = UUID(uuidString: "CEF66912-3456-7890-ABCD-EF0123456789")!
+
+    @Test func aPlainNameStillShowsThePanesOwnID() {
+        let header = PaneHeaderName.header(name: "dandy-07", paneID: id)
+        #expect(header.name == "dandy-07")
+        #expect(header.id == "cef669")
+    }
+
+    @Test func anIDCopiedIntoTheNameIsReplacedByThePanesOwn() {
+        let header = PaneHeaderName.header(name: "Chitta - evidence stream - claude 27e685", paneID: id)
+        #expect(header.name == "Chitta - evidence stream")
+        #expect(header.id == "cef669")
+    }
+
+    @Test func aMatchingSuffixIsShownOnce() {
+        let header = PaneHeaderName.header(name: "KapK review - codex cef669", paneID: id)
+        #expect(header.name == "KapK review")
+        #expect(header.id == "cef669")
+    }
+}

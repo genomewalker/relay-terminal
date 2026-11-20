@@ -5165,20 +5165,18 @@ struct ConnectionPath: View {
                     .foregroundStyle(.orange).lineLimit(1)
                     .help(inputMessage).accessibilityLabel("Typing paused. " + inputMessage)
             }
-            let nameParts = PaneHeaderName.parts(pane.displayName)
+            let nameParts = PaneHeaderName.header(name: pane.displayName, paneID: pane.id)
             HStack(spacing: RelayTheme.spacing(5)) {
                 Text(nameParts.name)
                     .font(RelayTheme.font(size: 11.5, weight: .medium))
                     .lineLimit(1)
                     .layoutPriority(1)
-                if let id = nameParts.id {
-                    Text(id)
-                        .font(RelayTheme.font(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(RelayTheme.textFaint)
-                        .lineLimit(1)
-                        .fixedSize()
-                        .layoutPriority(2)
-                }
+                Text(nameParts.id)
+                    .font(RelayTheme.font(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .layoutPriority(2)
             }
             .layoutPriority(3)
             .help(pane.displayName + " · " + pane.id.uuidString.lowercased())
