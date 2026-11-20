@@ -15,6 +15,15 @@ struct RelayAgentConversationControl: Equatable, Sendable {
     static func readyForInput(lifecycle: String, provider: String) -> Bool {
         lifecycle == "quiet" || (lifecycle == "stop_observed" && provider == "claude")
     }
+    /// The observation time of an authenticated lifecycle. relayd sends a time
+    /// only with a hook observation; a verified agent that has reported no hook
+    /// since it started is "unknown" with none. That is still a verified binding
+    /// that permits nothing, not a host without lifecycle support.
+    static func observedAt(_ raw: String, lifecycle: String) -> Date? {
+        let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = parser.date(from: raw) { return date }
+        return raw.isEmpty && lifecycle == "unknown" ? .distantPast : nil
+    }
     var permitsSend: Bool {
         readyForInput && binding.processStart.hasPrefix("kernel:") &&
         !revision.isEmpty && revision.utf8.count <= 128 && Date().timeIntervalSince(checkedAt) < 5

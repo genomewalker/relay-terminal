@@ -424,3 +424,42 @@ func TestConversationClaudeControlKeepsVerifiedHookTime(t *testing.T) {
 		t.Fatalf("hook-only fallback supplied actionable control: %v", control)
 	}
 }
+
+// A verified Claude agent that has reported no hook since it started is
+// "unknown" without an observation time. The control is still present, so the
+// timeline can show a verified but unconfirmed state; the live identity time,
+// new on every read, must neither leak into it nor fail the double read.
+func TestConversationClaudeControlWithoutHookIsUnconfirmed(t *testing.T) {
+	r, path := conversationFixture(t, "claude", "session", "")
+	r.binding = r.authenticatedBinding
+	for _, c := range []struct{ lifecycle, observed string }{
+		{"unknown", ""},
+		{"quiet", ""}, // a known state without its hook time is not trusted
+		{"quiet", "not-a-time"},
+	} {
+		calls := 0
+		r.run = func(args []string, _ float64) string {
+			calls++
+			binding := pyObj("version", int64(1), "session_id", "session", "transcript_path", path, "revision", "live-revision",
+				"source", "native_registration_kernel_owner", "lifecycle", c.lifecycle,
+				"producer", pyObj("pane_id", "pane", "process_id", int64(22), "process_start", int64(7), "provider", "claude"))
+			if c.observed != "" {
+				binding.Set("observed_at", c.observed)
+			} else {
+				binding.Set("observed_at", fmt.Sprintf("2026-11-20T15:00:%02d.%09dZ", calls, calls))
+				if c.lifecycle == "quiet" {
+					binding.Delete("observed_at")
+				}
+			}
+			return string(pyEncode(binding, conversationCompactJSON))
+		}
+		control, ok := r.conversationSnapshot("pane", 11, "reader", nil, "", "").Get("control").(*pyObject)
+		if !ok || calls < 2 {
+			t.Fatalf("%v: control missing or binding read once: %v", c, control)
+		}
+		if control.Get("lifecycle") != "unknown" || control.Get("revision") != "live-revision" ||
+			control.Get("observed_at") != "" {
+			t.Fatalf("%v: wrong unconfirmed control: %v", c, control)
+		}
+	}
+}

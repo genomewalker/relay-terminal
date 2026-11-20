@@ -143,8 +143,9 @@ private struct RelayConversationSnapshot: Decodable {
                 _ = next.receive(.init(id: item.id, turnID: nil, role: role, blocks: blocks,
                                       revision: item.revision, complete: true), binding: binding)
             }
-            let dateParser = ISO8601DateFormatter(); dateParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let proof = snapshot.control, let observedAt = dateParser.date(from: proof.observedAt), proof.revision.utf8.count <= 128, !proof.revision.isEmpty,
+            if let proof = snapshot.control,
+               let observedAt = RelayAgentConversationControl.observedAt(proof.observedAt, lifecycle: proof.lifecycle),
+               proof.revision.utf8.count <= 128, !proof.revision.isEmpty,
                pane.agentInputRevision == inputRevision {
                 let baseline = control?.binding == binding && control?.revision == proof.revision &&
                     pane.agentLastInputAt >= observedAt
@@ -769,6 +770,9 @@ struct RelayAgentTimelineView: View {
         if store.conversation.binding == nil { return "Sending needs an exact conversation binding." }
         if pane.pendingAgentApprovals > 0 { return "Answer the pending approval in the original terminal first." }
         if store.control == nil { return "Authenticated lifecycle is unavailable on this host. Use the original terminal." }
+        if store.control?.lifecycle == "unknown" {
+            return "Agent state is not confirmed yet. It updates when the agent next starts or finishes a turn."
+        }
         if let control = store.control, control.lifecycle == "stop_observed", !control.readyForInput {
             return "Waiting for the agent to confirm it is idle."
         }
