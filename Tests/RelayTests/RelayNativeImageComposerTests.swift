@@ -111,6 +111,24 @@ private func attachmentRasterFixture(_ type: UTType, orientation: Int = 1) throw
     #expect(!FileManager.default.fileExists(atPath: pending.sourceURL.path))
 }
 
+@Test func screenPromptIsEmptyOnlyWhenTheInputRowHasNoText() {
+    let rule = String(repeating: "─", count: 30)
+    // The idle Claude screen seen in the composer smoke test: the earlier
+    // prompt echo is above, the empty input row sits between rules.
+    let claude = ["❯ Composer smoke test. Reply with READY.", "", "⏺ READY", "", rule, "❯ ", rule,
+                  "  term:local/main | [Sonnet 5.5]", "  ⏸ plan mode on (shift+tab to cycle)"]
+    #expect(RelayNativeImageComposer.promptIsEmpty(provider: "claude", rows: claude))
+    #expect(!RelayNativeImageComposer.promptIsEmpty(provider: "claude", rows: ["❯ draft text", rule]))
+    // Suggestion text cannot be told apart from typed text in plain rows.
+    #expect(!RelayNativeImageComposer.promptIsEmpty(provider: "claude", rows: ["❯ Gray prediction", rule]))
+    #expect(!RelayNativeImageComposer.promptIsEmpty(provider: "claude", rows: ["❯ ", "wrapped tail", rule]))
+    #expect(RelayNativeImageComposer.promptIsEmpty(provider: "codex",
+        rows: ["› ", "", "GPT-6.1-Sol low · directory"]))
+    #expect(!RelayNativeImageComposer.promptIsEmpty(provider: "codex", rows: ["› hello", ""]))
+    #expect(!RelayNativeImageComposer.promptIsEmpty(provider: "claude", rows: ["no prompt here"]))
+    #expect(!RelayNativeImageComposer.promptIsEmpty(provider: "shell", rows: ["❯ ", rule]))
+}
+
 @Test func nativeImagesAreAcknowledgedOnlyInTheCurrentComposer() {
     let rule = String(repeating: "─", count: 30)
     #expect(RelayNativeImageComposer.acknowledges(1, provider: "claude",

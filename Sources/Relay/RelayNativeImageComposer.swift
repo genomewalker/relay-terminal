@@ -34,6 +34,24 @@ enum RelayNativeImageComposer {
         return content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// True only when the provider's input row on screen holds no text at all.
+    /// Placeholder or suggestion text counts as content, so it refuses.
+    static func promptIsEmpty(provider: String, rows: [String]) -> Bool {
+        guard ["claude", "codex"].contains(provider) else { return false }
+        let marker: Character = provider == "claude" ? "❯" : "›"
+        guard let start = rows.lastIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces).first == marker
+        }) else { return false }
+        var content = String(rows[start].trimmingCharacters(in: .whitespaces).dropFirst())
+        for row in rows.dropFirst(start + 1) {
+            let trimmed = row.trimmingCharacters(in: .whitespaces)
+            if provider == "codex" && trimmed.isEmpty { break }
+            if !trimmed.isEmpty && trimmed.allSatisfy({ "─━".contains($0) }) { break }
+            content += trimmed
+        }
+        return content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     static func quotedPath(_ path: String) -> String? {
         guard path.hasPrefix("/"), path.utf8.count <= 4096,
               !path.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),

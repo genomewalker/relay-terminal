@@ -99,6 +99,10 @@ final class RelayDiagnostics: @unchecked Sendable {
                     return $0.value == "nil" || Int($0.value).map { $0 >= 0 && $0 <= 100_000 } == true
                 }
                 if $0.key == "source" { return ["row", "renderer", "worker"].contains($0.value) }
+                if $0.key == "reason", ["none", "pane", "profile", "app_inactive", "focus", "lifecycle", "binding",
+                    "input_revision", "stale_control", "approval_pending", "disconnected", "bracketed_paste",
+                    "prompt_not_empty", "send_in_progress", "foreground_process", "supervisor",
+                    "control_characters"].contains($0.value) { return true }
                 if $0.key == "target" { return ["none", "hovered_link", "cell"].contains($0.value) }
                 if $0.key == "movement" {
                     return $0.value == "unresolved" || Int($0.value).map { abs($0) <= 1_000_000 } == true

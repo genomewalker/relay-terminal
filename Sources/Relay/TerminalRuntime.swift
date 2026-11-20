@@ -2698,22 +2698,36 @@ final class TerminalRuntime: NSObject {
     /// The key conversation window excludes terminal keyboard/browser writers;
     /// companion prompt writers must also respect this lease.
     private func admitsConversationPrompt(_ text: String, paneID: UUID, rootPID: Int, control: RelayAgentConversationControl) -> Bool {
-        guard let pane, pane.id == paneID,
-              (pane.profile.kind == .local || pane.profile.backend == .relay), NSApp.isActive,
-              (NSApp.keyWindow?.identifier?.rawValue == "relay.agent." + paneID.uuidString ||
-               (conversationComposerOwnsFocus && NSApp.keyWindow === view.window)),
-              control.permitsSend, control.binding.paneID == paneID,
-              control.binding.hostID == pane.profile.id.uuidString,
-              control.inputRevision == pane.agentInputRevision,
-              control.observedAt > pane.agentLastInputAt, pane.pendingAgentApprovals == 0,
-              pane.connectionState == .connected, io.isBracketedPasteActive,
-              view.conversationPromptIsEmpty,
-              conversationInputLease == nil,
-              (pane.profile.kind != .local || Int(networkForegroundPID ?? 0) == rootPID),
-              (pane.profile.backend != .relay || io.canSendSupervisorInterrupt),
-              !text.utf8.contains(where: { $0 < 32 && $0 != 10 && $0 != 9 }),
-              !text.utf8.contains(127) else { return false }
-        return true
+        let refusal = conversationPromptRefusal(text, paneID: paneID, rootPID: rootPID, control: control)
+        recordInputDiagnostic(refusal == nil ? "composer-send-admitted" : "composer-send-refused",
+                              details: ["reason": refusal ?? "none"])
+        return refusal == nil
+    }
+
+    /// The first condition that blocks a composer send, or nil when it may send.
+    private func conversationPromptRefusal(_ text: String, paneID: UUID, rootPID: Int,
+                                           control: RelayAgentConversationControl) -> String? {
+        guard let pane, pane.id == paneID else { return "pane" }
+        guard pane.profile.kind == .local || pane.profile.backend == .relay else { return "profile" }
+        guard NSApp.isActive else { return "app_inactive" }
+        guard NSApp.keyWindow?.identifier?.rawValue == "relay.agent." + paneID.uuidString ||
+              (conversationComposerOwnsFocus && NSApp.keyWindow === view.window) else { return "focus" }
+        guard control.permitsSend else { return "lifecycle" }
+        guard control.binding.paneID == paneID,
+              control.binding.hostID == pane.profile.id.uuidString else { return "binding" }
+        guard control.inputRevision == pane.agentInputRevision else { return "input_revision" }
+        guard control.observedAt > pane.agentLastInputAt else { return "stale_control" }
+        guard pane.pendingAgentApprovals == 0 else { return "approval_pending" }
+        guard pane.connectionState == .connected else { return "disconnected" }
+        guard io.isBracketedPasteActive else { return "bracketed_paste" }
+        guard view.conversationPromptIsEmpty(provider: control.binding.provider,
+                                             screenRows: session.readViewportRows()) else { return "prompt_not_empty" }
+        guard conversationInputLease == nil else { return "send_in_progress" }
+        guard pane.profile.kind != .local || Int(networkForegroundPID ?? 0) == rootPID else { return "foreground_process" }
+        guard pane.profile.backend != .relay || io.canSendSupervisorInterrupt else { return "supervisor" }
+        guard !text.utf8.contains(where: { $0 < 32 && $0 != 10 && $0 != 9 }),
+              !text.utf8.contains(127) else { return "control_characters" }
+        return nil
     }
 
     func sendConversationPrompt(_ text: String, paneID: UUID, rootPID: Int, control: RelayAgentConversationControl) -> Bool {
@@ -2739,7 +2753,9 @@ final class TerminalRuntime: NSObject {
               control.binding.paneID == paneID, control.binding.hostID == pane.profile.id.uuidString,
               control.inputRevision == pane.agentInputRevision, control.observedAt > pane.agentLastInputAt,
               pane.pendingAgentApprovals == 0, pane.connectionState == .connected,
-              io.isBracketedPasteActive, view.conversationPromptIsEmpty, promptEditingViewportIsLive,
+              io.isBracketedPasteActive,
+              view.conversationPromptIsEmpty(provider: control.binding.provider, screenRows: session.readViewportRows()),
+              promptEditingViewportIsLive,
               text.utf8.count <= 65536,
               !text.utf8.contains(where: { $0 < 32 && $0 != 10 && $0 != 9 }), !text.utf8.contains(127),
               RelayNativeImageComposer.acknowledges(0, provider: control.binding.provider,
@@ -10795,6 +10811,18 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         // refuse native composition until the original terminal resynchronizes.
         promptBuffer.isReliable && promptBuffer.snapshot?.characters.isEmpty == true &&
             !hasLocalInputSincePromptBoundary && !promptInspectionPreservesInput && markedRange().location == NSNotFound
+    }
+
+    /// The local mirror stays unreliable in a pane nobody has typed into
+    /// (an agent launched with its brief, or one used only through the
+    /// conversation view). With no local input pending, the provider's own
+    /// input row on the worker screen decides whether the prompt is empty.
+    fileprivate func conversationPromptIsEmpty(provider: String, screenRows: [String]?) -> Bool {
+        if conversationPromptIsEmpty { return true }
+        guard !promptBuffer.isReliable, !hasLocalInputSincePromptBoundary,
+              !promptInspectionPreservesInput, markedRange().location == NSNotFound,
+              let screenRows else { return false }
+        return RelayNativeImageComposer.promptIsEmpty(provider: provider, rows: screenRows)
     }
 
     private var promptEditingIsSemanticallyActive: Bool {
