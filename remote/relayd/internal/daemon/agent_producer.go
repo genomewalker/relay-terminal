@@ -23,8 +23,6 @@ type agentProducer struct {
 	ConfigDir string `json:"config_dir,omitempty"`
 }
 
-// Infer the provider root from the sender's kernel ancestry. Claimed PIDs,
-// working directories and transcript timestamps cannot identify a producer.
 // claudeHookLifecycle maps one Claude hook event to the binding lifecycle.
 // Stop means the turn ended and the prompt accepts input again; the
 // conversation composer may send then. Every other notification, such as a
@@ -48,6 +46,8 @@ func claudeHookLifecycle(name, notification string) string {
 	return "unknown"
 }
 
+// Infer the provider root from the sender's kernel ancestry. Claimed PIDs,
+// working directories and transcript timestamps cannot identify a producer.
 func verifiedAgentProducer(connection net.Conn, manifest workerManifest, provider string) (agentProducer, error) {
 	uid, sender, err := PeerCredentials(connection)
 	if err != nil || uid != os.Getuid() || sender <= 1 {
