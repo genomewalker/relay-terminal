@@ -41,6 +41,42 @@ import Combine
                                      model: { _ in (model, "h-test") }, audit: audit, taskJournal: journal)
     }
 
+    @Test("Pane-derived questions survive yes and pane-ID replies, including model rotation")
+    func callerQuestionContinuity() async throws {
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let journal = try RelayMikoTaskJournal.temporary()
+        let question = "Should I search pane text for DIANA and fastst?"
+        let model = ContinuationModel { _, count in
+            switch count {
+            case 1: return self.tool(count)
+            case 2: return self.answer("Label search found nothing. " + question)
+            default: return self.answer("Finished searching.")
+            }
+        }
+        let assistant = try harness(workspace, model: model, journal: journal)
+        let result = await assistant.run("Find the DIANA and fastst comparison", origin: .user)
+        let turn = try #require(result)
+        #expect(turn.followUpQuestion == question)
+        #expect(journal.rows.first(where: { $0.id == turn.durableTaskID })?.status == "askedUser")
+        _ = await assistant.run("yes", origin: .user)
+        let messages = try #require(model.requests.last?.messages)
+        #expect(messages.contains { $0["role"]?.string == "assistant" && $0["content"]?.string?.contains(question) == true })
+        #expect(messages.last?["content"]?.string?.hasSuffix("yes") == true)
+
+        let pane = "07fa914c-6df8-45db-9757-3078bd97d2d2"
+        var prior = RelayAssistantExchange(request: "switch to personal", origin: .user)
+        prior.paneDerived = true
+        prior.followUpQuestion = "Which pane should move?"
+        var current = RelayAssistantExchange(request: pane, origin: .user)
+        var checkpoint = state()
+        checkpoint.callerContext = RelayAssistantHarness.modelHistory([prior], exchange: &current)
+        checkpoint.rotate(userTurn: pane)
+        let rotated = checkpoint.messages.compactMap { $0["content"]?.string }.joined(separator: "\n")
+        #expect(current.paneDerived && rotated.contains("switch to personal") && rotated.contains(pane))
+        #expect(rotated.contains("Which pane should move?"))
+    }
+
     @Test("Checkpoint retains exact targets and usable schema fields, permits safe refresh")
     func checkpointRetainsOperatorEvidence() throws {
         var saved = state()
