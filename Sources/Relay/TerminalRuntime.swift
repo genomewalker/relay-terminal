@@ -669,6 +669,27 @@ enum TerminalResizePolicy {
     static let revealAfterCommitMilliseconds = 50
 }
 
+/// The agent width repaint withholds drawing while Claude or Codex redraws
+/// at a one-column-wider grid and back. On dandy-07 (2026-11-20) one long
+/// Claude pane never returned that frame: every zoom, unzoom and tab switch
+/// hid it for the full 8 s wait, 29 times in a row. Panes that answer do so
+/// within about a second.
+enum TerminalWidthRepaintPolicy {
+    /// Longest time a pane stays hidden waiting for the provider's frames.
+    static let revealDeadline: Duration = .milliseconds(1_500)
+
+    /// Whether an unfinished attempt is owed again at the pane's next
+    /// presentation. A pane that was hidden or resized mid-attempt never got
+    /// its chance; one that timed out did, and retrying would hide it again
+    /// on every later zoom or tab switch.
+    static func retriesAfter(outcome: String) -> Bool {
+        switch outcome {
+        case "timeout", "timeout-restoring": false
+        default: true
+        }
+    }
+}
+
 enum TerminalViewportOwnershipPolicy {
     /// The native surface only needs to take the PTY back when another client
     /// committed a different grid (or no grid has been committed yet).
@@ -1449,7 +1470,7 @@ final class TerminalRuntime: NSObject {
                 }
             }
             let deadline = Task { @MainActor in
-                do { try await Task.sleep(for: .seconds(8)) } catch { return }
+                do { try await Task.sleep(for: TerminalWidthRepaintPolicy.revealDeadline) } catch { return }
                 continuation.yield(.timeout)
             }
             var restoring = false
@@ -1469,6 +1490,12 @@ final class TerminalRuntime: NSObject {
                 self.initialWidthRepaintTask = nil
                 if succeeded {
                     self.initialWidthRepaintFailureEpoch = nil
+                } else if !TerminalWidthRepaintPolicy.retriesAfter(outcome: outcome) {
+                    // The provider had its chance and did not answer. Later
+                    // geometry changes are plain resizes: Ghostty reflows the
+                    // text at once and the agent redraws on its own SIGWINCH.
+                    self.initialWidthRepaintFailureEpoch = nil
+                    self.initialWidthRepaintCompleted = true
                 } else {
                     // Hiding a tab while its frame is in flight must not spend
                     // the repaint permanently. Its next presentation owes it.

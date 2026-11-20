@@ -114,3 +114,22 @@ struct RelayAttachRepaintPolicyTests {
         #expect(transport.acceptsViewportRepaint)
     }
 }
+
+/// dandy-07, 2026-11-20: a long Claude pane never returned the width-repaint
+/// frame, so each zoom, unzoom and tab switch hid it for the full 8 s wait.
+@Suite struct TerminalWidthRepaintPolicyTests {
+    @Test func aPaneIsHiddenForAtMostASecondAndAHalfWaitingForTheProvider() {
+        #expect(TerminalWidthRepaintPolicy.revealDeadline <= .milliseconds(1_500))
+    }
+
+    @Test func aTimedOutRepaintIsNotRetriedAtTheNextZoomOrTabSwitch() {
+        #expect(!TerminalWidthRepaintPolicy.retriesAfter(outcome: "timeout"))
+        #expect(!TerminalWidthRepaintPolicy.retriesAfter(outcome: "timeout-restoring"))
+    }
+
+    @Test func anInterruptedRepaintIsOwedAgainAtTheNextPresentation() {
+        for outcome in ["hidden", "bounds-changed", "cancelled"] {
+            #expect(TerminalWidthRepaintPolicy.retriesAfter(outcome: outcome))
+        }
+    }
+}
