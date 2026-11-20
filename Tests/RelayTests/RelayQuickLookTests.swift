@@ -5,6 +5,15 @@ import Testing
 @Suite struct RelayQuickLookTests {
     private let remote = ConnectionProfile(name: "quicklook", kind: .ssh, host: "quicklook.invalid", backend: .relay)
 
+    @Test func onlyAPlainCommandSingleClickOpensALink() {
+        #expect(RelayQuickLookLinks.isCommandLinkClick(clickCount: 1, modifiers: [.command]))
+        #expect(RelayQuickLookLinks.isCommandLinkClick(clickCount: 1, modifiers: [.command, .capsLock]))
+        #expect(!RelayQuickLookLinks.isCommandLinkClick(clickCount: 1, modifiers: [.command, .shift]))
+        #expect(!RelayQuickLookLinks.isCommandLinkClick(clickCount: 2, modifiers: [.command]))
+        #expect(!RelayQuickLookLinks.isCommandLinkClick(clickCount: 1, modifiers: []))
+        #expect(!RelayQuickLookLinks.isCommandLinkClick(clickCount: 1, modifiers: [.command, .option]))
+    }
+
     @Test func extractsURLsAndPathsInReadingOrder() {
         let screen = """
         Wrote /home/kbd606/project/out/report.pdf and ~/notes/todo.md.

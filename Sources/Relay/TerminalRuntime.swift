@@ -4396,12 +4396,21 @@ final class TerminalRuntime: NSObject {
     /// Shift-Command-click: the link Ghostty reports under the pointer, else
     /// the word in the clicked cell. The other items on screen follow it.
     fileprivate func quickLook(row: Int?, column: Int?) -> Bool {
-        let text = sidePanelViewportText() ?? ""
+        // The clicked cell is a position in the grid Ghostty drew, so read that
+        // grid. A Relay-backed pane's worker text can have different rows.
+        let rendered = view.readViewportText()
+        let text = rendered ?? sidePanelViewportText() ?? ""
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         var clicked = hoveredLink.flatMap(RelayQuickLookLinks.target(fromLink:))
-        if clicked == nil, let row, let column {
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-            if lines.indices.contains(row) { clicked = RelayQuickLookLinks.target(in: String(lines[row]), column: column) }
+        let fromHover = clicked != nil
+        if clicked == nil, let row, let column, lines.indices.contains(row) {
+            clicked = RelayQuickLookLinks.target(in: String(lines[row]), column: column)
         }
+        recordInputDiagnostic("quicklook-click", details: [
+            "row": row.map(String.init) ?? "nil", "column": column.map(String.init) ?? "nil",
+            "lines": String(lines.count), "source": rendered == nil ? "worker" : "renderer",
+            "target": clicked == nil ? "none" : (fromHover ? "hovered_link" : "cell"),
+        ])
         guard let clicked else { return false }
         var targets = RelayQuickLookLinks.extract(text: text)
         if !targets.contains(clicked) { targets.insert(clicked, at: 0) }
@@ -8223,6 +8232,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         let pendingLocalDown = pendingLocalSelectionMouseDown
         let completedLocalDrag = localSelectionDidDrag
         var handledLocalSelectionClick = false
+        var handledCommandLinkClick = false
         // Shift-Command-click previews the link instead of selecting text or
         // reaching the remote program.
         // When nothing there can be previewed, the click keeps its old meaning.
@@ -8241,6 +8251,19 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         } else if forcedLocalSelection {
             if completedLocalDrag {
                 super.mouseUp(with: localSelectionEvent(from: event, clickCount: 1) ?? event)
+            } else if let pendingLocalDown,
+                      RelayQuickLookLinks.isCommandLinkClick(clickCount: pendingLocalDown.clickCount,
+                                                             modifiers: pendingLocalDown.modifierFlags),
+                      pointerStart.map({ hypot(end.x - $0.x, end.y - $0.y) < 4 }) == true {
+                // Command-click opens a link. The selection replay below adds
+                // Shift, which Ghostty treats as selecting, so it never opened
+                // the link. Open the hovered link, else replay it unshifted.
+                if owner?.openHoveredLink() != true,
+                   let down = localSelectionEvent(from: pendingLocalDown, addingShift: false) {
+                    super.mouseDown(with: down)
+                    super.mouseUp(with: localSelectionEvent(from: event, addingShift: false) ?? event)
+                }
+                handledCommandLinkClick = true
             } else if let pendingLocalDown,
                       pendingLocalDown.clickCount > 1 ||
                         !pendingLocalDown.modifierFlags
@@ -8262,7 +8285,7 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
         forcingLocalSelectionGesture = false
         pendingLocalSelectionMouseDown = nil
         localSelectionDidDrag = false
-        if quickLookClick { return }
+        if quickLookClick || handledCommandLinkClick { return }
         if handledLocalSelectionClick {
             // Read Ghostty's selection directly, without touching the clipboard.
             // Only a range proven against the live logical input may be edited.
@@ -10961,12 +10984,13 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
 
     private func localSelectionEvent(
         from event: NSEvent,
-        clickCount: Int? = nil
+        clickCount: Int? = nil,
+        addingShift: Bool = true
     ) -> NSEvent? {
         NSEvent.mouseEvent(
             with: event.type,
             location: selectionAdjustedWindowLocation(event.locationInWindow),
-            modifierFlags: event.modifierFlags.union(.shift),
+            modifierFlags: addingShift ? event.modifierFlags.union(.shift) : event.modifierFlags,
             timestamp: event.timestamp,
             windowNumber: event.windowNumber,
             context: nil,
@@ -10978,13 +11002,14 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
 
     private func localSelectionEvent(
         from pending: PendingLocalSelectionMouseDown,
-        clickCount: Int? = nil
+        clickCount: Int? = nil,
+        addingShift: Bool = true
     ) -> NSEvent? {
         guard let window else { return nil }
         return NSEvent.mouseEvent(
             with: .leftMouseDown,
             location: windowLocation(forTerminalPoint: pending.terminalPoint),
-            modifierFlags: pending.modifierFlags.union(.shift),
+            modifierFlags: addingShift ? pending.modifierFlags.union(.shift) : pending.modifierFlags,
             timestamp: pending.timestamp,
             windowNumber: window.windowNumber,
             context: nil,

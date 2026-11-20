@@ -31,6 +31,11 @@ enum RelayQuickLookLinks {
     }
 
     /// The viewport cell under a point measured from the top-left corner.
+    /// A single Command-click (no other modifier) is a request to open a link.
+    static func isCommandLinkClick(clickCount: Int, modifiers: NSEvent.ModifierFlags) -> Bool {
+        clickCount == 1 && modifiers.intersection([.command, .option, .control, .shift]) == [.command]
+    }
+
     static func cell(at point: CGPoint, origin: CGPoint, cellSize: CGSize) -> (row: Int, column: Int)? {
         guard cellSize.width > 0, cellSize.height > 0, point.x.isFinite, point.y.isFinite,
               point.x >= origin.x, point.y >= origin.y else { return nil }
