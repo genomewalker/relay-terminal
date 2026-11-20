@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func nodeBootID() (string, error) {
@@ -33,6 +34,28 @@ func processStartTime(pid int) (uint64, error) {
 		return 0, fmt.Errorf("short /proc/%d/stat", pid)
 	}
 	return strconv.ParseUint(fields[19], 10, 64)
+}
+
+// processStartWallTime combines the kernel process start ticks with the boot
+// epoch in /proc/stat. Both quantities are rounded down by the kernel.
+func processStartWallTime(start uint64) time.Time {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil || start == 0 {
+		return time.Time{}
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		raw, ok := strings.CutPrefix(line, "btime ")
+		if !ok {
+			continue
+		}
+		boot, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || boot <= 0 {
+			break
+		}
+		// Linux userspace exposes process start in USER_HZ (100 ticks/second).
+		return time.Unix(boot+int64(start/100), int64(start%100)*int64(10*time.Millisecond)).UTC()
+	}
+	return time.Time{}
 }
 
 func processStartIdentity(pid int) (string, error) {

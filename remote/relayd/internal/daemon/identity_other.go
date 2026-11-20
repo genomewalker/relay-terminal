@@ -30,6 +30,10 @@ func processStartTime(pid int) (uint64, error) {
 	return uint64(pid), nil
 }
 
+func processStartWallTime(_ uint64) time.Time {
+	return time.Time{}
+}
+
 // processStartIdentity uses the same stable textual identity as native peer
 // discovery on non-Linux hosts. A PID alone is not enough to bind an observed
 // agent process to a registered messaging peer after PID reuse.

@@ -783,7 +783,21 @@ func (r *phReader) authenticatedBinding(binary, pane string, pid int64, kind str
 			phRaise(phUnbound, "Invalid authenticated session binding.")
 		}
 		object := value.(*pyObject)
+		// Live identity observations have a new timestamp on every read. A
+		// known lifecycle carries its stable hook observation time instead.
+		raw, _ := object.GetOr("observed_at", "").(string)
 		object.Delete("observed_at")
+		lifecycle, _ := object.GetOr("lifecycle", "unknown").(string)
+		source, _ := object.GetOr("source", "").(string)
+		if kind == "claude" && nativeClaudeLifecycleSource(source) && knownAgentLifecycle(lifecycle) {
+			observed, err := time.Parse(time.RFC3339Nano, raw)
+			if err == nil && !observed.IsZero() {
+				// The timeline's ISO 8601 parser requires fractional seconds.
+				object.Set("observed_at", observed.UTC().Format("2006-01-02T15:04:05.000000000Z"))
+			} else {
+				object.Set("lifecycle", "unknown")
+			}
+		}
 		result = object
 	}, phOSError, phValueError, phTimeout)
 	return result
