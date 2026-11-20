@@ -4627,8 +4627,11 @@ final class TerminalRuntime: NSObject {
     }
 
     private func showArtifact(path: String) {
-        // An explicit open always rereads the file: cached bytes may be stale.
-        pane?.openFilePreview(path: path, kind: RelayFilePreviewKind.from(path: path))
+        // A clicked file opens in Quick Look, which rereads it and resolves a
+        // relative path against this pane's folder. The in-pane preview is only
+        // the fallback when Quick Look cannot resolve the path here.
+        if presentFileInQuickLook(path: path, takeFocus: true) { return }
+        pane?.openFilePreview(path: path)
     }
 
     @discardableResult

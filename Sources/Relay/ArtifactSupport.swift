@@ -782,8 +782,17 @@ enum RemoteArtifactLoader {
 /// Loads exactly the requested file for an in-place pane preview. Failures become an
 /// error card for that same path; another file is never substituted.
 enum RelayFilePreviewLoader {
+    /// A file of unknown type (a script, source, config) is shown as text, so it
+    /// never fails as a "broken image". Only an extensionless Claude image fetch
+    /// under /tmp/claude- is still treated as an image.
+    static func defaultKind(path: String) -> RelayFilePreviewKind {
+        if let kind = RelayFilePreviewKind.from(path: path) { return kind }
+        let claudeImageFetch = path.hasPrefix("/tmp/claude-") && TerminalPathSyntax.pathExtension(path).isEmpty
+        return claudeImageFetch ? .image : .log
+    }
+
     static func load(path: String, profile: ConnectionProfile, kind: RelayFilePreviewKind? = nil) async -> PaneArtifact {
-        let kind = kind ?? RelayFilePreviewKind.from(path: path) ?? .image
+        let kind = kind ?? defaultKind(path: path)
         return await artifact(path: path, kind: kind) {
             if kind == .log {
                 return .log(profile.kind == .local

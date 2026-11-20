@@ -18,6 +18,15 @@ final class RelayFilePreviewTests: XCTestCase {
         XCTAssertEqual(RelayFilePreviewKind.log.symbol, "doc.plaintext")
     }
 
+    func testUnknownTypesPreviewAsTextNotImages() {
+        for path in ["/tmp/claude-501/x/scratchpad/run.py", "main.swift", "/bin/tool", "notes"] {
+            XCTAssertEqual(RelayFilePreviewLoader.defaultKind(path: path), .log, path)
+        }
+        XCTAssertEqual(RelayFilePreviewLoader.defaultKind(path: "/tmp/claude-123/project/scratchp"), .image)
+        XCTAssertEqual(RelayFilePreviewLoader.defaultKind(path: "/r/plot.png"), .image)
+        XCTAssertEqual(RelayFilePreviewLoader.defaultKind(path: "/r/paper.pdf"), .pdf)
+    }
+
     func testSmallLogIsReadWhole() throws {
         let url = try temporaryFile(Data("first\nsecond\n".utf8))
         let tail = try RelayLogTail.readLocal(path: url.path)
