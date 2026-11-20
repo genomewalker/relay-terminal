@@ -206,6 +206,21 @@ enum RelayAgentMaintenancePrompt {
         return true
     }
 
+    /// The conversation composer's question: does the provider's input row
+    /// hold no typed text? Faint native cells (Codex's placeholder, a Claude
+    /// suggestion) are not typed text. A bare Codex marker may hold typed
+    /// spaces, since Codex hides its placeholder once anything is typed.
+    /// nil when no prompt is recognized. Unlike `isEmpty` it does not judge
+    /// the footer: the lifecycle proof decides whether the turn has ended.
+    static func inputIsEmpty(_ vt: String?, provider: String) -> Bool? {
+        guard let prompt = prompt(vt, provider: provider) else { return nil }
+        if prompt.cells.count > prompt.first,
+           prompt.cells.prefix(prompt.first).allSatisfy({ CharacterSet.whitespaces.contains($0.character) }) { return false }
+        let input = typed(prompt.cells)
+        if provider == "codex", input.isEmpty { return false }
+        return input.allSatisfy(\.faint)
+    }
+
     /// True only when the provider's prompt line is found and shows typed text
     /// that is not the faint native placeholder or prediction. An unreadable or
     /// unrecognized screen is not evidence of a draft; callers hold instead of

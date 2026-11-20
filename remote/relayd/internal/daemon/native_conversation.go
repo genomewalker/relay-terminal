@@ -361,6 +361,11 @@ func (r *phReader) conversationSnapshot(pane string, root int64, binary string, 
 	if !conversationBound(verified) {
 		nativeStart = r.nativeProcessStart(binary, pane, pid, kind)
 	}
+	// A verified Codex binding carries no turn state of its own: every Codex
+	// binding source reports "unknown". Its own transcript does, as for an
+	// unbound Codex pane.
+	codexTurns := kind == "codex" && (nativeStart != nil ||
+		conversationBound(verified) && pyEqual(verified.GetOr("lifecycle", "unknown"), "unknown"))
 	path, session := r.conversationPath(pid, kind, verified)
 	file, info := conversationFile(path, r.uid)
 	defer file.Close()
@@ -414,7 +419,7 @@ func (r *phReader) conversationSnapshot(pane string, root int64, binary string, 
 		if !ok {
 			continue
 		}
-		if nativeStart != nil {
+		if codexTurns {
 			if state := r.codexLifecycle(row); state != nil {
 				nativeState = state
 				nativeOffset = lineOffset
@@ -447,7 +452,14 @@ func (r *phReader) conversationSnapshot(pane string, root int64, binary string, 
 			phRaise(phUnbound, "Authenticated binding changed during the read; refresh.")
 		}
 		start = "kernel:" + pyStr(phGet(phIndex(verified, "producer"), "process_start", nil))
-		control = pyObj("lifecycle", verified.GetOr("lifecycle", "unknown"), "revision", verified.GetOr("revision", ""), "observed_at", verified.GetOr("observed_at", ""))
+		proof := pyObj("lifecycle", verified.GetOr("lifecycle", "unknown"), "revision", verified.GetOr("revision", ""), "observed_at", verified.GetOr("observed_at", ""))
+		if codexTurns && nativeState != nil {
+			// The transcript is the binding's own, rechecked above. Only the
+			// turn state and its time transfer; the binding revision stays.
+			proof.Set("lifecycle", nativeState.items[0])
+			proof.Set("observed_at", nativeState.items[1])
+		}
+		control = proof
 	} else if nativeStart != nil {
 		if !pyEqual(r.nativeProcessStart(binary, pane, pid, kind), nativeStart) {
 			phRaise(phUnbound, "Original CLI process changed during the read.")

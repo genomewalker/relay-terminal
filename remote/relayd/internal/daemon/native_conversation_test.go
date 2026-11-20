@@ -463,3 +463,46 @@ func TestConversationClaudeControlWithoutHookIsUnconfirmed(t *testing.T) {
 		}
 	}
 }
+
+// A bound Codex pane's binding never carries turn state ("unknown"); the
+// composer must still see the turn end recorded in its own transcript.
+func TestConversationBoundCodexControlReadsTurnStateFromItsTranscript(t *testing.T) {
+	event := func(kind, at string) string {
+		return conversationJSONLine(map[string]any{"type": "event_msg", "timestamp": at, "payload": map[string]any{"type": kind}})
+	}
+	for _, c := range []struct {
+		name, text, lifecycle, observed string
+	}{
+		{"complete", event("task_started", "2026-11-20T19:20:14.822Z") + conversationJSONLine(conversationTextRow("1", "AGAIN")) +
+			event("task_complete", "2026-11-20T19:20:37.814Z"), "quiet", "2026-11-20T19:20:37.814Z"},
+		{"running", event("task_complete", "2026-11-20T19:20:37.814Z") + event("task_started", "2026-11-20T19:21:00.000Z"),
+			"active", "2026-11-20T19:21:00.000Z"},
+		{"aborted", event("turn_aborted", "2026-11-20T19:22:00.000Z"), "stop_observed", "2026-11-20T19:22:00.000Z"},
+		{"no turn yet", conversationJSONLine(conversationTextRow("1", "hi")), "unknown", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r, path := conversationFixture(t, "codex", "session", c.text)
+			binding := conversationStockBinding()
+			binding.Set("session_id", "session")
+			binding.Set("transcript_path", path)
+			binding.Set("lifecycle", "unknown")
+			r.binding = func(string, string, int64, string) *pyObject { return binding }
+			control := r.conversationSnapshot("pane", 11, "reader", nil, "", "").Get("control").(*pyObject)
+			if control.Get("lifecycle") != c.lifecycle || control.Get("observed_at") != c.observed ||
+				control.Get("revision") != strings.Repeat("a", 64) {
+				t.Fatalf("wrong bound Codex control: %v", control)
+			}
+		})
+	}
+	// A Claude binding keeps its own (hook) lifecycle; Codex events in its
+	// transcript are not read.
+	r, path := conversationFixture(t, "claude", "session", event("task_complete", "2026-11-20T19:20:37.814Z"))
+	r.binding = func(string, string, int64, string) *pyObject {
+		return pyObj("version", int64(1), "session_id", "session", "transcript_path", path, "revision", "live-revision",
+			"source", "native_registration_kernel_owner", "lifecycle", "unknown",
+			"producer", pyObj("pane_id", "pane", "process_id", int64(22), "process_start", int64(7), "provider", "claude"))
+	}
+	if control := r.conversationSnapshot("pane", 11, "reader", nil, "", "").Get("control").(*pyObject); control.Get("lifecycle") != "unknown" {
+		t.Fatalf("Claude control took a transcript state: %v", control)
+	}
+}

@@ -2704,6 +2704,18 @@ final class TerminalRuntime: NSObject {
         return refusal == nil
     }
 
+    /// The provider's input row decides when the local mirror is unreliable.
+    /// The serialized screen keeps the faint style of Codex's placeholder and
+    /// Claude's suggestions; without it, plain rows count them as typed text.
+    private func conversationScreenPromptIsEmpty(provider: String) -> Bool {
+        if case .screen(let vt, _) = observeActiveScreen(),
+           let empty = RelayAgentMaintenancePrompt.inputIsEmpty(vt, provider: provider) {
+            return view.conversationPromptIsEmpty(screenInputIsEmpty: empty)
+        }
+        return view.conversationPromptIsEmpty(screenInputIsEmpty:
+            session.readViewportRows().map { RelayNativeImageComposer.promptIsEmpty(provider: provider, rows: $0) } ?? false)
+    }
+
     /// The first condition that blocks a composer send, or nil when it may send.
     private func conversationPromptRefusal(_ text: String, paneID: UUID, rootPID: Int,
                                            control: RelayAgentConversationControl) -> String? {
@@ -2720,8 +2732,7 @@ final class TerminalRuntime: NSObject {
         guard pane.pendingAgentApprovals == 0 else { return "approval_pending" }
         guard pane.connectionState == .connected else { return "disconnected" }
         guard io.isBracketedPasteActive else { return "bracketed_paste" }
-        guard view.conversationPromptIsEmpty(provider: control.binding.provider,
-                                             screenRows: session.readViewportRows()) else { return "prompt_not_empty" }
+        guard conversationScreenPromptIsEmpty(provider: control.binding.provider) else { return "prompt_not_empty" }
         guard conversationInputLease == nil else { return "send_in_progress" }
         guard pane.profile.kind != .local || Int(networkForegroundPID ?? 0) == rootPID else { return "foreground_process" }
         guard pane.profile.backend != .relay || io.canSendSupervisorInterrupt else { return "supervisor" }
@@ -2754,7 +2765,7 @@ final class TerminalRuntime: NSObject {
               control.inputRevision == pane.agentInputRevision, control.observedAt > pane.agentLastInputAt,
               pane.pendingAgentApprovals == 0, pane.connectionState == .connected,
               io.isBracketedPasteActive,
-              view.conversationPromptIsEmpty(provider: control.binding.provider, screenRows: session.readViewportRows()),
+              conversationScreenPromptIsEmpty(provider: control.binding.provider),
               promptEditingViewportIsLive,
               text.utf8.count <= 65536,
               !text.utf8.contains(where: { $0 < 32 && $0 != 10 && $0 != 9 }), !text.utf8.contains(127),
@@ -10817,12 +10828,11 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     /// (an agent launched with its brief, or one used only through the
     /// conversation view). With no local input pending, the provider's own
     /// input row on the worker screen decides whether the prompt is empty.
-    fileprivate func conversationPromptIsEmpty(provider: String, screenRows: [String]?) -> Bool {
+    fileprivate func conversationPromptIsEmpty(screenInputIsEmpty: @autoclosure () -> Bool) -> Bool {
         if conversationPromptIsEmpty { return true }
         guard !promptBuffer.isReliable, !hasLocalInputSincePromptBoundary,
-              !promptInspectionPreservesInput, markedRange().location == NSNotFound,
-              let screenRows else { return false }
-        return RelayNativeImageComposer.promptIsEmpty(provider: provider, rows: screenRows)
+              !promptInspectionPreservesInput, markedRange().location == NSNotFound else { return false }
+        return screenInputIsEmpty()
     }
 
     private var promptEditingIsSemanticallyActive: Bool {

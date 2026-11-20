@@ -11,6 +11,23 @@ final class RelayAgentMaintenancePromptTests: XCTestCase {
         XCTAssertFalse(RelayAgentMaintenancePrompt.isEmpty("› Ask \u{1b}[90mCodex to do anything\u{1b}[39m" + codexFooter, provider: "codex"))
     }
 
+    func testComposerInputIgnoresFaintPlaceholderAndSuggestionButNotTypedText() {
+        // The composer only asks whether the input row holds typed text.
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("› \u{1b}[2mAsk Codex to do anything\u{1b}[22m" + codexFooter, provider: "codex"), true)
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("› \u{1b}[90mSummarize recent commits\u{1b}[39m" + codexFooter, provider: "codex"), true)
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("› Ask Codex to do anything" + codexFooter, provider: "codex"), false)
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("› " + codexFooter, provider: "codex"), false)
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("› \n  a real multiline draft" + codexFooter, provider: "codex"), false)
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("❯ " + claudeFooter, provider: "claude"), true)
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("❯ \u{1b}[2mTry fixing the tests\u{1b}[22m" + claudeFooter, provider: "claude"), true)
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("❯ ?" + claudeFooter, provider: "claude"), false)
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("❯ draft \u{1b}[2msuggested\u{1b}[22m" + claudeFooter, provider: "claude"), false)
+        // A busy footer does not decide it; the lifecycle proof does.
+        XCTAssertEqual(RelayAgentMaintenancePrompt.inputIsEmpty("❯ \n────────────────\n2 shells\n", provider: "claude"), true)
+        XCTAssertNil(RelayAgentMaintenancePrompt.inputIsEmpty("no prompt here", provider: "claude"))
+        XCTAssertNil(RelayAgentMaintenancePrompt.inputIsEmpty("❯ " + claudeFooter, provider: "codex"))
+    }
+
     func testBlankPromptAndRGBFaintPlaceholder() {
         // Codex hides the placeholder once anything is typed, so a bare
         // marker may hold typed spaces: never empty (review M1, 0517c).
