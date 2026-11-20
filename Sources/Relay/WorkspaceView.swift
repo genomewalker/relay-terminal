@@ -5262,7 +5262,10 @@ struct ConnectionPath: View {
                 }
                 .layoutPriority(-1)
             }
-            if (interfaceStyleOverride ?? preferences.interfaceStyle) == .refreshed, pane.kind != .shell {
+            let refreshedLabel = (interfaceStyleOverride ?? preferences.interfaceStyle) == .refreshed
+                && (pane.kind != .shell || !pane.programStatus.records.isEmpty)
+            if refreshedLabel {
+                // One label: it follows the program's report and opens its task list.
                 RelayRefreshedPaneStatus(pane: pane, inbox: inbox)
                     .fixedSize()
                     .layoutPriority(2)
@@ -5272,7 +5275,7 @@ struct ConnectionPath: View {
                     .layoutPriority(2)
                     .help(status.text + (pane.lastCommandExitCode.map { $0 == 0 ? "" : " · last command exited with status \($0)" } ?? ""))
             }
-            if connectionNormal { RelayProgramStatusBadge(pane: pane).layoutPriority(2) }
+            if connectionNormal, !refreshedLabel { RelayProgramStatusBadge(pane: pane).layoutPriority(2) }
             if let progress = pane.terminalProgressPercent {
                 ProgressView(value: Double(progress), total: 100)
                     .progressViewStyle(.linear)

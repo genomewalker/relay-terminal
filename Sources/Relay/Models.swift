@@ -651,7 +651,21 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var conversationFocus: RelayConversationFocus?
     @Published var lastCommandExitCode: Int?
     @Published var lastCommandDurationNanos: UInt64?
-    @Published var programStatus = RelayProgramStatusSnapshot() { didSet { overviewInputChanged() } }
+    @Published var programStatus = RelayProgramStatusSnapshot() {
+        didSet {
+            overviewInputChanged()
+            let state = RelayWorkOverviewIndex.mostUrgentProgramState(programStatus.records.map(\.state))
+            if state != programPrimary?.state { programPrimary = state.map { .init(state: $0, since: Date()) } }
+        }
+    }
+    /// The most urgent program-reported state and when it began; restored
+    /// panes start counting when the report arrives.
+    private var programPrimary: RelayPaneStatusLabel.ProgramReport?
+    /// The program report the Refreshed label follows: nil without a report,
+    /// or when the connection is down and the report is no longer current.
+    var programStatusPrimary: RelayPaneStatusLabel.ProgramReport? {
+        connectionState == .connected && programStatus.revision != nil ? programPrimary : nil
+    }
     private var programStatusAttention = RelayProgramStatusAttention()
     private var programStatusFlush: Task<Void, Never>?
     @Published var terminalProgressPercent: Int?

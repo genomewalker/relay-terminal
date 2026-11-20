@@ -21,9 +21,6 @@ enum RelayPalette {
     static let warning = dynamic(dark: 0xDDA398, light: .systemOrange)
     static let danger = dynamic(dark: 0xDE827B, light: .systemRed)
     static let info = dynamic(dark: 0x8DB7EB, light: 0x1F63D1)
-    /// Refreshed interface only: the running-agent colour (mockup 2026-11-18).
-    /// The light value keeps WCAG AA contrast for its text on near-white.
-    static let lime = dynamic(dark: 0xC5EB4A, light: 0x4F7A00)
 
     static func dynamic(dark: UInt32, light: NSColor) -> NSColor {
         let dark = hex(dark)
@@ -38,6 +35,37 @@ enum RelayPalette {
         NSColor(srgbRed: CGFloat((value >> 16) & 0xff) / 255, green: CGFloat((value >> 8) & 0xff) / 255,
                 blue: CGFloat(value & 0xff) / 255, alpha: 1)
     }
+}
+
+/// Refreshed interface tokens (design canvas 2026-11-19, Audit board): warm
+/// neutrals, and one colour per meaning. Lime means working and nothing else;
+/// amber needs the user; green is ready; red is failed or disconnected.
+/// Classic never reads these.
+enum RelayRefreshedPalette {
+    static let paper = RelayPalette.dynamic(dark: 0x0F0F0E, light: 0xFAFAF8)
+    static let card = RelayPalette.dynamic(dark: 0x171716, light: 0xF3F3EF)
+    static let raised = RelayPalette.dynamic(dark: 0x1E1E1D, light: 0xFFFFFF)
+    static let ink = RelayPalette.dynamic(dark: 0xFAFAF8, light: 0x20211F)
+    static let muted = RelayPalette.dynamic(dark: 0xB4B6AE, light: 0x5F615B)
+    static let faint = RelayPalette.dynamic(dark: 0x9A9D94, light: 0x6F726A)
+    /// Lime fill; `working` is its readable form on paper.
+    static let accent = RelayPalette.dynamic(dark: 0xCDEA5C, light: 0xCDEA5C)
+    static let working = RelayPalette.dynamic(dark: 0xB9DC4F, light: 0x4C6610)
+    static let ok = RelayPalette.dynamic(dark: 0xA4D4AA, light: 0x367740)
+    static let warn = RelayPalette.dynamic(dark: 0xE7C47B, light: 0x885C12)
+    static let bad = RelayPalette.dynamic(dark: 0xF1A298, light: 0xB83329)
+    static let info = RelayPalette.dynamic(dark: 0x9CC0EE, light: 0x2C5D9E)
+}
+
+enum RelayRefreshedTheme {
+    static let paper = Color(nsColor: RelayRefreshedPalette.paper)
+    static let ink = Color(nsColor: RelayRefreshedPalette.ink)
+    static let muted = Color(nsColor: RelayRefreshedPalette.muted)
+    static let faint = Color(nsColor: RelayRefreshedPalette.faint)
+    static let working = Color(nsColor: RelayRefreshedPalette.working)
+    static let ok = Color(nsColor: RelayRefreshedPalette.ok)
+    static let warn = Color(nsColor: RelayRefreshedPalette.warn)
+    static let bad = Color(nsColor: RelayRefreshedPalette.bad)
 }
 
 enum RelayTheme {
@@ -69,7 +97,6 @@ enum RelayTheme {
     static let coral = Color(nsColor: RelayPalette.coral)
     static let red = Color(nsColor: RelayPalette.red)
     static let success = Color(nsColor: RelayPalette.success)
-    static let lime = Color(nsColor: RelayPalette.lime)
     static let warning = Color(nsColor: RelayPalette.warning)
     static let danger = Color(nsColor: RelayPalette.danger)
     static let info = Color(nsColor: RelayPalette.info)

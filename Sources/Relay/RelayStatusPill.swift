@@ -1,11 +1,13 @@
 import SwiftUI
 
-/// The Refreshed interface's one status label per agent pane, with a live
-/// timer while the agent works or waits on the user. Classic keeps
-/// `RelayBadge` with `PaneModel.headerStatus`.
+/// The Refreshed interface's one status label per agent pane: a dot, a word
+/// and, while the agent works or waits on the user, a live timer. A current
+/// program report decides it; terminal output only fills in without one.
+/// Classic keeps `RelayBadge` with `PaneModel.headerStatus` and the separate
+/// `RelayProgramStatusBadge`.
 struct RelayPaneStatusLabel: Equatable {
     enum State: CaseIterable, Equatable {
-        case running, needsYou, ready, idle, exited, connecting, reconnecting, disconnected
+        case running, needsYou, ready, idle, failed, exited, connecting, reconnecting, disconnected
 
         var text: String {
             switch self {
@@ -13,6 +15,7 @@ struct RelayPaneStatusLabel: Equatable {
             case .needsYou: "Needs you"
             case .ready: "Ready"
             case .idle: "Idle"
+            case .failed: "Failed"
             case .exited: "Exited"
             case .connecting: "Connecting"
             case .reconnecting: "Reconnecting"
@@ -20,39 +23,35 @@ struct RelayPaneStatusLabel: Equatable {
             }
         }
 
-        /// Colour is never the only signal: each state also has its own symbol.
-        var symbol: String {
-            switch self {
-            case .running: "circle.fill"
-            case .needsYou: "hand.raised.fill"
-            case .ready: "checkmark.circle.fill"
-            case .idle: "moon.zzz"
-            case .exited: "stop.circle"
-            case .connecting: "ellipsis.circle"
-            case .reconnecting: "arrow.triangle.2.circlepath"
-            case .disconnected: "wifi.slash"
-            }
-        }
-
+        /// One colour per meaning; the word always says it as well.
         var color: Color {
             switch self {
-            case .running: RelayTheme.lime
-            case .needsYou: RelayTheme.coral
-            case .ready: RelayTheme.success
-            case .idle, .exited, .connecting, .reconnecting, .disconnected: RelayTheme.textMuted
+            case .running: RelayRefreshedTheme.working
+            case .needsYou: RelayRefreshedTheme.warn
+            case .ready: RelayRefreshedTheme.ok
+            case .failed, .disconnected: RelayRefreshedTheme.bad
+            case .idle, .exited, .connecting, .reconnecting: RelayRefreshedTheme.faint
             }
         }
+    }
+
+    /// A program's current self-report: its most urgent state and when that
+    /// state began.
+    struct ProgramReport: Equatable {
+        let state: String
+        let since: Date
     }
 
     let state: State
     /// Start of the live timer; nil when the state shows no timer.
     let timerSince: Date?
 
-    /// A shell gets no label. A connection problem comes first, then a
-    /// question or approval waiting on the user, then the agent's phase.
+    /// Order: connection problem, exit, a Relay approval, the program's own
+    /// report, then what terminal output suggests. A shell gets a label only
+    /// when a program in it reports.
     static func make(kind: AgentKind, phase: AgentPhase, connection: PaneConnectionState, pendingApprovals: Int,
-                     finishedUnseen: Bool, phaseSince: Date) -> RelayPaneStatusLabel? {
-        guard kind != .shell else { return nil }
+                     finishedUnseen: Bool, phaseSince: Date, program: ProgramReport?) -> RelayPaneStatusLabel? {
+        guard kind != .shell || program != nil else { return nil }
         switch connection {
         case .reconnecting, .waitingForNetwork: return .init(state: .reconnecting, timerSince: nil)
         case .disconnected: return .init(state: .disconnected, timerSince: nil)
@@ -60,12 +59,22 @@ struct RelayPaneStatusLabel: Equatable {
         case .connected: break
         }
         if phase == .exited { return .init(state: .exited, timerSince: nil) }
-        if phase == .needsInput || pendingApprovals > 0 { return .init(state: .needsYou, timerSince: phaseSince) }
+        if pendingApprovals > 0 { return .init(state: .needsYou, timerSince: phaseSince) }
+        if let program {
+            switch program.state {
+            case "working": return .init(state: .running, timerSince: program.since)
+            case "blocked": return .init(state: .needsYou, timerSince: program.since)
+            case "error": return .init(state: .failed, timerSince: nil)
+            case "done": return .init(state: .ready, timerSince: nil)
+            default: return .init(state: finishedUnseen ? .ready : .idle, timerSince: nil)
+            }
+        }
         switch phase {
+        case .needsInput: return .init(state: .needsYou, timerSince: phaseSince)
         case .active: return .init(state: .running, timerSince: phaseSince)
         case .connecting: return .init(state: .connecting, timerSince: nil)
         case .quiet: return .init(state: finishedUnseen ? .ready : .idle, timerSince: nil)
-        case .needsInput, .exited: return nil
+        case .exited: return nil
         }
     }
 
@@ -97,48 +106,46 @@ struct RelayPaneStatusLabel: Equatable {
     }
 }
 
-/// A capsule with the state's symbol, its name and, while live, the elapsed
-/// time, redrawn once a second only while a timer shows.
+/// Dot, word and, while live, the elapsed time; no capsule. Redrawn once a
+/// second only while a timer shows.
 struct RelayStatusPill: View {
     let label: RelayPaneStatusLabel
 
     var body: some View {
         if let since = label.timerSince {
             TimelineView(.periodic(from: since, by: 1)) { context in
-                pill(timer: RelayPaneStatusLabel.elapsed(context.date.timeIntervalSince(since)))
+                content(timer: RelayPaneStatusLabel.elapsed(context.date.timeIntervalSince(since)))
             }
         } else {
-            pill(timer: nil)
+            content(timer: nil)
         }
     }
 
-    private func pill(timer: String?) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: label.state.symbol)
-                .font(.system(size: 7, weight: .bold))
-                .foregroundStyle(label.state.color)
+    private func content(timer: String?) -> some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(label.state.color)
+                .frame(width: 6, height: 6)
             Text(label.state.text)
-                .fontWeight(.medium)
+                .font(RelayTheme.font(size: 11, weight: .medium))
+                .foregroundStyle(RelayRefreshedTheme.ink)
             if let timer {
                 Text(timer)
+                    .font(.system(size: 10.5, design: .monospaced))
                     .monospacedDigit()
-                    .foregroundStyle(RelayTheme.textMuted)
+                    .foregroundStyle(RelayRefreshedTheme.muted)
             }
         }
-        .font(RelayTheme.font(size: 11))
-        .foregroundStyle(RelayTheme.text)
         .lineLimit(1)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 2)
-        .background(Capsule().fill(label.state.color.opacity(0.14)))
-        .overlay(Capsule().strokeBorder(label.state.color.opacity(0.45), lineWidth: 1))
+        .fixedSize()
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label.state.text + (timer.map { ", for " + $0 } ?? ""))
     }
 }
 
 /// The pane header's Refreshed label; observes the inbox so Ready appears
-/// and clears with the finished-not-seen marker.
+/// and clears with the finished-not-seen marker. Replaces both the Classic
+/// status badge and the program-status badge.
 struct RelayRefreshedPaneStatus: View {
     @ObservedObject var pane: PaneModel
     @ObservedObject var inbox: AgentIntelligenceStore
@@ -147,8 +154,13 @@ struct RelayRefreshedPaneStatus: View {
         if let label = RelayPaneStatusLabel.make(kind: pane.kind, phase: pane.phase, connection: pane.connectionState,
                                                  pendingApprovals: pane.pendingAgentApprovals,
                                                  finishedUnseen: inbox.marker(for: pane.id) == .done,
-                                                 phaseSince: pane.phaseChangedAt) {
-            RelayStatusPill(label: label)
+                                                 phaseSince: pane.phaseChangedAt, program: pane.programStatusPrimary) {
+            if pane.programStatus.records.isEmpty {
+                RelayStatusPill(label: label)
+            } else {
+                // The program's task list opens from the one label.
+                RelayProgramStatusBadge(pane: pane, label: label)
+            }
         }
     }
 }

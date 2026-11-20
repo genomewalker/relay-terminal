@@ -2,6 +2,9 @@ import SwiftUI
 
 struct RelayProgramStatusBadge: View {
     @ObservedObject var pane: PaneModel
+    /// Refreshed: the pane's one status label opens the task list instead
+    /// of a second, program-only label.
+    var label: RelayPaneStatusLabel? = nil
     @State private var showingDetails = false
     @FocusState private var detailsFocused: Bool
 
@@ -11,7 +14,7 @@ struct RelayProgramStatusBadge: View {
     private func priority(_ state: String) -> Int {
         ["blocked": 0, "error": 1, "working": 2, "done": 3, "idle": 4][state] ?? 5
     }
-    private func label(_ state: String) -> String { Self.label(for: state) }
+    private func stateLabel(_ state: String) -> String { Self.label(for: state) }
     /// A program's self-reported state in the shared pane vocabulary.
     nonisolated static func label(for state: String) -> String {
         switch state {
@@ -39,10 +42,14 @@ struct RelayProgramStatusBadge: View {
     var body: some View {
         if let primary {
             Button { showingDetails.toggle() } label: {
-                Label(current ? label(primary.state) : "Status stale", systemImage: symbol(primary.state))
-                    .font(RelayTheme.font(size: 9.5, weight: .medium))
-                    .foregroundStyle(color(primary.state))
-                    .lineLimit(1)
+                if let label {
+                    RelayStatusPill(label: label)
+                } else {
+                    Label(current ? stateLabel(primary.state) : "Status stale", systemImage: symbol(primary.state))
+                        .font(RelayTheme.font(size: 9.5, weight: .medium))
+                        .foregroundStyle(color(primary.state))
+                        .lineLimit(1)
+                }
             }
             .buttonStyle(.plain)
             .onChange(of: showingDetails) { _, presented in
@@ -56,7 +63,7 @@ struct RelayProgramStatusBadge: View {
                 }
             }
             .help("Program-reported status from this pane. Open to inspect all tasks.")
-            .accessibilityLabel("Program reported " + (current ? label(primary.state) : "stale status"))
+            .accessibilityLabel("Program reported " + (current ? stateLabel(primary.state) : "stale status"))
             .popover(isPresented: $showingDetails, arrowEdge: .leading) {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
@@ -80,7 +87,7 @@ struct RelayProgramStatusBadge: View {
                             ForEach(records, id: \.id) { record in
                                 VStack(alignment: .leading, spacing: 4) {
                                     HStack {
-                                        Label(label(record.state), systemImage: symbol(record.state))
+                                        Label(stateLabel(record.state), systemImage: symbol(record.state))
                                             .foregroundStyle(color(record.state))
                                         Spacer()
                                         if let progress = record.progress {
