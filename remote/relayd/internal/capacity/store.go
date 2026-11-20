@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 	"unicode/utf8"
 )
 
@@ -169,6 +170,32 @@ func private(info os.FileInfo, dir bool) bool {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	return ok && int(st.Uid) == os.Getuid() && info.Mode().Perm()&0077 == 0 && ((dir && info.IsDir()) || (!dir && info.Mode().IsRegular()))
 }
+// The journal's lock calls; tests replace them.
+var journalFlock = syscall.Flock
+var journalLockPause = time.Sleep
+
+// journalLockAttempts bounds the exclusive flock calls for one journal lock,
+// as communicationLockExclusive does in the daemon. On NFSv3 (dandy-07's home)
+// the kernel emulates flock through NLM, which can answer ENOLCK while lockd
+// is briefly unavailable. ENOLCK grants no lock and the journal is opened only
+// after the lock is held, so only the flock call itself is retried.
+const journalLockAttempts = 3
+
+// journalLockExclusive takes the exclusive journal lock on f. Only ENOLCK is
+// retried, after a pause of 100 ms times the attempt number; after the last
+// attempt the ENOLCK error is returned unchanged. Every other error returns at
+// once.
+func journalLockExclusive(f *os.File) error {
+	fd := int(f.Fd())
+	for attempt := 1; ; attempt++ {
+		err := journalFlock(fd, syscall.LOCK_EX)
+		if err == nil || !errors.Is(err, syscall.ENOLCK) || attempt == journalLockAttempts {
+			return err
+		}
+		journalLockPause(time.Duration(attempt) * 100 * time.Millisecond)
+	}
+}
+
 func (j Journal) locked(fn func(*os.File) error) error {
 	if err := os.MkdirAll(j.Root, 0700); err != nil {
 		return err
@@ -195,10 +222,10 @@ func (j Journal) locked(fn func(*os.File) error) error {
 		return err
 	}
 	defer lock.Close()
-	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err = journalLockExclusive(lock); err != nil {
 		return err
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer journalFlock(int(lock.Fd()), syscall.LOCK_UN)
 	file, err := open("policy.jsonl", syscall.O_CREAT|syscall.O_APPEND|syscall.O_RDWR)
 	if err != nil {
 		return err
