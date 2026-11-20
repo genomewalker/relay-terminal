@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 import Testing
 @testable import Relay
 
@@ -44,13 +45,13 @@ import Testing
     }
 }
 
-@Suite struct RelayQuickLookSymbolTests {
-    @Test func theBarIconSaysWhatKindOfItemIsShown() {
-        func symbol(_ path: String) -> String { RelayQuickLookItem(source: .localFile(path), openLink: path).symbol }
-        #expect(symbol("/tmp/a.PNG") == "photo")
-        #expect(symbol("/tmp/paper.pdf") == "doc.richtext")
-        #expect(symbol("/tmp/change.diff") == "doc.text")
-        #expect(symbol("/tmp/blob") == "doc")
-        #expect(RelayQuickLookItem(source: .web(URL(string: "https://example.org")!), openLink: "").symbol == "globe")
+@Suite struct RelayQuickLookTypeTests {
+    /// The bar shows macOS's own icon for the item's type, local or remote.
+    @Test func macOSDecidesTheTypeFromTheNameForLocalAndRemoteFiles() {
+        let remote = ConnectionProfile(name: "dandy", kind: .ssh, backend: .direct)
+        #expect(RelayQuickLookItem(source: .localFile("/tmp/a.PNG"), openLink: "").contentType == .png)
+        #expect(RelayQuickLookItem(source: .remoteFile(remote, path: "~/paper.pdf", cwd: nil), openLink: "").contentType == .pdf)
+        #expect(RelayQuickLookItem(source: .localFile("/tmp/blob"), openLink: "").contentType == .data)
+        #expect(RelayQuickLookItem(source: .web(URL(string: "https://example.org")!), openLink: "").contentType == nil)
     }
 }

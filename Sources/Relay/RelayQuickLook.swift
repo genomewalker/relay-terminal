@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import Quartz
 import SwiftUI
 import WebKit
@@ -178,22 +179,14 @@ struct RelayQuickLookItem: Equatable, Sendable {
         }
     }
 
-    /// The bar's symbol: what kind of thing is shown, like a pane header's
-    /// agent badge says what runs in it.
-    var symbol: String {
-        let path: String
+    /// The item's type as macOS knows it from its name, for local and
+    /// remote files alike; nil for a web page.
+    var contentType: UTType? {
         switch source {
-        case .web: return "globe"
-        case .localFile(let p), .remoteFile(_, let p, _): path = p
-        }
-        switch (path as NSString).pathExtension.lowercased() {
-        case "png", "jpg", "jpeg", "gif", "heic", "tif", "tiff", "webp", "bmp", "svg": return "photo"
-        case "pdf": return "doc.richtext"
-        case "mov", "mp4", "m4v": return "film"
-        case "csv", "tsv", "xlsx": return "tablecells"
-        case "md", "txt", "log", "diff", "patch", "json", "yaml", "yml", "toml", "swift", "go", "py", "r", "sh", "c", "h", "cpp", "rs", "js", "ts", "html", "css":
-            return "doc.text"
-        default: return "doc"
+        case .web: return nil
+        case .localFile(let path), .remoteFile(_, let path, _):
+            let ext = (path as NSString).pathExtension
+            return ext.isEmpty ? .data : (UTType(filenameExtension: ext) ?? .data)
         }
     }
 
@@ -648,9 +641,27 @@ struct RelayQuickLookView: View {
     }
 
     private var header: some View {
-        RelayViewerBar(symbol: controller.browser?.current.symbol ?? "doc", title: controller.browser?.current.title ?? "Quick Look",
-                       detail: controller.browser?.current.subtitle, detailMonospaced: false,
-                       close: { controller.close() }, closeLabel: "Close (Esc)") {
+        let item = controller.browser?.current
+        return RelayViewerBarFrame(close: { controller.close() }, closeLabel: "Close (Esc)") {
+            // macOS's own icon for the type, as Finder and Quick Look show it.
+            Group {
+                if let type = item?.contentType {
+                    Image(nsImage: NSWorkspace.shared.icon(for: type)).resizable().interpolation(.high)
+                } else {
+                    Image(systemName: "globe").font(RelayViewerMetrics.icon).foregroundStyle(RelayTheme.textFaint)
+                }
+            }
+            .frame(width: 16, height: 16)
+            .accessibilityHidden(true)
+            Text(item?.title ?? "Quick Look")
+                .font(RelayViewerMetrics.title).foregroundStyle(RelayTheme.text)
+                .lineLimit(1).truncationMode(.middle).layoutPriority(2)
+            if let subtitle = item?.subtitle {
+                Text(subtitle).font(RelayViewerMetrics.meta).foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Spacer(minLength: RelayViewerMetrics.barSpacing)
+        } trailing: {
             if let position = controller.browser?.position, !position.isEmpty {
                 Text(position).font(RelayViewerMetrics.identifier).foregroundStyle(RelayTheme.textFaint)
                 RelayViewerIconButton(title: "Previous", symbol: "chevron.left") { controller.previous() }
