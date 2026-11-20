@@ -4403,12 +4403,21 @@ final class TerminalRuntime: NSObject {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         var clicked = hoveredLink.flatMap(RelayQuickLookLinks.target(fromLink:))
         let fromHover = clicked != nil
-        if clicked == nil, let row, let column, lines.indices.contains(row) {
-            clicked = RelayQuickLookLinks.target(in: String(lines[row]), column: column)
+        // Viewport text joins soft-wrapped rows into one line, so its line
+        // index drifts below any wrapped line. Read the clicked grid row itself.
+        var source = rendered == nil ? "worker" : "renderer"
+        if clicked == nil, let row, let column {
+            let columns = Int(view.currentGridMetrics()?.columns ?? 0)
+            if columns > 0, let line = view.readViewportRow(row, columns: columns) {
+                source = "row"
+                clicked = RelayQuickLookLinks.target(in: line, column: column)
+            } else if lines.indices.contains(row) {
+                clicked = RelayQuickLookLinks.target(in: String(lines[row]), column: column)
+            }
         }
         recordInputDiagnostic("quicklook-click", details: [
             "row": row.map(String.init) ?? "nil", "column": column.map(String.init) ?? "nil",
-            "lines": String(lines.count), "source": rendered == nil ? "worker" : "renderer",
+            "lines": String(lines.count), "source": source,
             "target": clicked == nil ? "none" : (fromHover ? "hovered_link" : "cell"),
         ])
         guard let clicked else { return false }
