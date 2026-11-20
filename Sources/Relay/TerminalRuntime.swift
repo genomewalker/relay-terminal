@@ -4643,20 +4643,10 @@ final class TerminalRuntime: NSObject {
             guard let pane else { return false }
             RelayBrowserController.shared.open(url, profile: pane.profile, directory: pane.directory, near: view.window,
                                                anchor: pane.id)
-        case .image(let path):
+        case .image(let path), .file(let path):
+            // Every clicked file opens in Quick Look, which picks the viewer
+            // from the file itself (a script shows as text).
             showArtifact(path: resolvedRemotePath(path))
-        case .file(let path) where RelayFilePreviewKind.from(path: path) != nil:
-            showArtifact(path: resolvedRemotePath(path))
-        case .file(let path):
-            guard let pane else { return false }
-            NotificationCenter.default.post(
-                name: .relayOpenRemoteFile,
-                object: RemoteFileOpenRequest(
-                    profile: pane.profile,
-                    parentSessionID: pane.id.uuidString.lowercased(),
-                    request: EditorOpenRequest(paths: [resolvedRemotePath(path)], diff: false)
-                )
-            )
         }
         return true
     }

@@ -27,6 +27,17 @@ final class RelayFilePreviewTests: XCTestCase {
         XCTAssertEqual(RelayFilePreviewLoader.defaultKind(path: "/r/paper.pdf"), .pdf)
     }
 
+    func testScriptsUnderClaudeTempAreFilesNotAutoFetchedImages() {
+        let script = "/tmp/claude-501/x/scratchpad/hello.py"
+        XCTAssertEqual(TerminalLinkResolver.target(from: script), .file(script))
+        var detector = ImagePathDetector()
+        XCTAssertEqual(detector.ingest("wrote \(script)\n"), [])
+        let fetch = "/tmp/claude-123/project/scratchp"
+        XCTAssertEqual(TerminalLinkResolver.target(from: fetch), .image(fetch))
+        let png = "/tmp/claude-123/out/plot.png"
+        XCTAssertEqual(detector.ingest("saved \(png)\n"), [png])
+    }
+
     func testSmallLogIsReadWhole() throws {
         let url = try temporaryFile(Data("first\nsecond\n".utf8))
         let tail = try RelayLogTail.readLocal(path: url.path)

@@ -375,8 +375,10 @@ enum TerminalLinkResolver {
     }
 
     static func isImagePath(_ path: String) -> Bool {
-        imageExtensions.contains(TerminalPathSyntax.pathExtension(path))
-            || path.hasPrefix("/tmp/claude-")
+        // Claude's image fetches under /tmp/claude- carry no extension. A file
+        // there with its own extension (a .py script) is an ordinary file.
+        let ext = TerminalPathSyntax.pathExtension(path)
+        return imageExtensions.contains(ext) || (path.hasPrefix("/tmp/claude-") && ext.isEmpty)
     }
 
     private static func target(forRemotePath path: String) -> TerminalLinkTarget {
