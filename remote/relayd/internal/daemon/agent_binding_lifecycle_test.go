@@ -32,22 +32,25 @@ func TestVerifiedClaudeLifecycleKeepsNativeIdentityAndHookObservation(t *testing
 	}
 	stored.Lifecycle = "quiet"
 	for name, change := range map[string]func(*AgentBindingRecord){
-		"missing record":       func(r *AgentBindingRecord) { *r = AgentBindingRecord{} },
-		"version":              func(r *AgentBindingRecord) { r.Version = 2 },
-		"source":               func(r *AgentBindingRecord) { r.Source = "native_registration_kernel_owner" },
-		"missing sender":       func(r *AgentBindingRecord) { r.Producer.SenderPID = 0 },
-		"missing revision":     func(r *AgentBindingRecord) { r.Revision = "" },
-		"provider":             func(r *AgentBindingRecord) { r.Producer.Provider = "codex" },
-		"pane":                 func(r *AgentBindingRecord) { r.Producer.PaneID = "other-pane" },
-		"pid":                  func(r *AgentBindingRecord) { r.Producer.ProcessID++ },
-		"reused pid":           func(r *AgentBindingRecord) { r.Producer.ProcessStart++ },
-		"account":              func(r *AgentBindingRecord) { r.Producer.ConfigDir = "" },
-		"session":              func(r *AgentBindingRecord) { r.SessionID = "other-session" },
-		"transcript":           func(r *AgentBindingRecord) { r.TranscriptPath = "/other/path.jsonl" },
-		"missing timestamp":    func(r *AgentBindingRecord) { r.ObservedAt = time.Time{} },
-		"prior incarnation":    func(r *AgentBindingRecord) { r.ObservedAt = started.Add(-time.Nanosecond) },
-		"future timestamp":     func(r *AgentBindingRecord) { r.ObservedAt = live.ObservedAt.Add(time.Nanosecond) },
-		"unknown lifecycle":    func(r *AgentBindingRecord) { r.Lifecycle = "unknown" },
+		"missing record":    func(r *AgentBindingRecord) { *r = AgentBindingRecord{} },
+		"version":           func(r *AgentBindingRecord) { r.Version = 2 },
+		"source":            func(r *AgentBindingRecord) { r.Source = "native_registration_kernel_owner" },
+		"missing sender":    func(r *AgentBindingRecord) { r.Producer.SenderPID = 0 },
+		"missing revision":  func(r *AgentBindingRecord) { r.Revision = "" },
+		"provider":          func(r *AgentBindingRecord) { r.Producer.Provider = "codex" },
+		"pane":              func(r *AgentBindingRecord) { r.Producer.PaneID = "other-pane" },
+		"pid":               func(r *AgentBindingRecord) { r.Producer.ProcessID++ },
+		"reused pid":        func(r *AgentBindingRecord) { r.Producer.ProcessStart++ },
+		"account":           func(r *AgentBindingRecord) { r.Producer.ConfigDir = "" },
+		"session":           func(r *AgentBindingRecord) { r.SessionID = "other-session" },
+		"transcript":        func(r *AgentBindingRecord) { r.TranscriptPath = "/other/path.jsonl" },
+		"missing timestamp": func(r *AgentBindingRecord) { r.ObservedAt = time.Time{} },
+		"prior incarnation": func(r *AgentBindingRecord) { r.ObservedAt = started.Add(-time.Nanosecond) },
+		"future timestamp":  func(r *AgentBindingRecord) { r.ObservedAt = live.ObservedAt.Add(time.Nanosecond) },
+		"unknown lifecycle": func(r *AgentBindingRecord) {
+			r.Lifecycle = "unknown"
+			r.ObservedAt = started.Add(claudeLaunchHookWindow)
+		},
 		"unexpected lifecycle": func(r *AgentBindingRecord) { r.Lifecycle = "idle" },
 	} {
 		t.Run(name, func(t *testing.T) {
