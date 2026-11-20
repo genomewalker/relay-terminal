@@ -669,13 +669,17 @@ enum TerminalResizePolicy {
     static let revealAfterCommitMilliseconds = 50
 }
 
-/// The agent width repaint withholds drawing while Claude or Codex redraws
-/// at a one-column-wider grid and back. On dandy-07 (2026-11-20) one long
-/// Claude pane never returned that frame: every zoom, unzoom and tab switch
-/// hid it for the full 8 s wait, 29 times in a row. Panes that answer do so
-/// within about a second.
+/// The agent width repaint makes Claude or Codex redraw at a one-column-wider
+/// grid and back. On dandy-07 (2026-11-20) one long Claude pane never
+/// returned that frame: while drawing was withheld, every zoom, unzoom and
+/// tab switch hid it for the full 8 s wait, 29 times in a row. Panes that
+/// answer do so within about a second.
 enum TerminalWidthRepaintPolicy {
-    /// Longest time a pane stays hidden waiting for the provider's frames.
+    /// The pane keeps drawing during the repaint; nothing is hidden.
+    static let keepsDrawing = true
+
+    /// Longest time the grid stays one column wider waiting for the
+    /// provider's frames.
     static let revealDeadline: Duration = .milliseconds(1_500)
 
     /// Whether an unfinished attempt is owed again at the pane's next
@@ -1440,7 +1444,8 @@ final class TerminalRuntime: NSObject {
 
     /// Claude and Codex keep a diff buffer across SIGWINCH. A one-column change makes
     /// it redraw while Ghostty parses each frame on that same actual grid.
-    /// The existing inspection surface withholds the temporary frame.
+    /// The pane keeps drawing throughout: for a moment it shows the provider's
+    /// one-column-wider frame, never a stale one.
     private func beginInitialWidthRepaint() -> Bool {
         let original = io.currentViewport
         guard original.columns > 0, original.columns < 4_098 else { return false }
@@ -1452,7 +1457,8 @@ final class TerminalRuntime: NSObject {
             bufferingPolicy: .bufferingNewest(16)
         )
         io.beginObservedViewportResize()
-        guard view.beginViewportInspection(columns: Int(wide.columns)) else {
+        guard view.beginViewportInspection(columns: Int(wide.columns),
+                                           keepsDrawing: TerminalWidthRepaintPolicy.keepsDrawing) else {
             io.resumeAutomaticViewportResizes()
             continuation.finish()
             return false

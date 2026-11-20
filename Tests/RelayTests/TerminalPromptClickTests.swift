@@ -2427,3 +2427,39 @@ func promptBufferDeletionPlanValidatesBeforeDispatch() {
     buffer.invalidate()
     #expect(buffer.plannedDeletionSnapshot(characterCount: 1, movementOffset: 0) == nil)
 }
+
+/// dandy-07, 2026-11-20: a withheld agent width repaint left a zoomed pane
+/// half empty until the provider answered or the wait ran out. The width
+/// repaint keeps drawing; prompt reading still withholds its temporary grid.
+@MainActor
+@Test("An agent width repaint never withholds drawing; prompt reading still does", .timeLimit(.minutes(1)))
+func agentWidthRepaintKeepsDrawing() async throws {
+    _ = NSApplication.shared
+    let session = InMemoryTerminalSession(write: { _ in }, resize: { _ in })
+    let pane = PaneModel(profile: ConnectionProfile(name: "Width repaint", kind: .local, backend: .direct))
+    let view = pane.runtime.view
+    view.frame = NSRect(x: 0, y: 0, width: 800, height: 400)
+    view.configuration = TerminalSurfaceOptions(backend: .inMemory(session))
+    let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.contentView = view
+    window.makeKeyAndOrderFront(nil)
+    defer { view.finishViewportInspection(); window.orderOut(nil); window.contentView = nil }
+    view.fitToSize()
+    view.synchronizeAndRedraw()
+    let original = try #require(view.currentGridMetrics())
+    let wide = Int(original.columns) + 1
+
+    #expect(TerminalWidthRepaintPolicy.keepsDrawing)
+    #expect(view.beginViewportInspection(columns: wide, keepsDrawing: TerminalWidthRepaintPolicy.keepsDrawing))
+    #expect(!view.isRenderingSuppressedForInspection)
+    view.restoreViewportAfterInspection()
+    #expect(!view.isRenderingSuppressedForInspection)
+    view.finishViewportInspection()
+    #expect(!view.isRenderingSuppressedForInspection)
+    #expect(view.currentGridMetrics()?.columns == original.columns)
+
+    #expect(view.beginViewportInspection(columns: wide))
+    #expect(view.isRenderingSuppressedForInspection)
+    view.finishViewportInspection()
+    #expect(!view.isRenderingSuppressedForInspection)
+}

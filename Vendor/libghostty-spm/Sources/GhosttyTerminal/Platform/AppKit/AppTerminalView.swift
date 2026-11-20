@@ -84,8 +84,13 @@
         }
 
         @discardableResult
-        public func beginViewportInspection(columns: Int) -> Bool {
-            core.beginViewportInspection(columns: columns)
+        public func beginViewportInspection(columns: Int, keepsDrawing: Bool = false) -> Bool {
+            core.beginViewportInspection(columns: columns, keepsDrawing: keepsDrawing)
+        }
+
+        /// Whether drawing is withheld for a viewport inspection right now.
+        public var isRenderingSuppressedForInspection: Bool {
+            core.isRenderingSuppressedForInspection
         }
 
         public func restoreViewportAfterInspection() {

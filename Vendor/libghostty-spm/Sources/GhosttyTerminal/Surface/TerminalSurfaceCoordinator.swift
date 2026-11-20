@@ -93,7 +93,14 @@ final class TerminalSurfaceCoordinator {
     private var lastDamageUptime: TimeInterval?
     private var damageSinceUptime: TimeInterval?
     private var inspectionWidthPixels: UInt32?
+    /// A viewport inspection is in progress (begin → finish).
+    private var inspectionActive = false
+    /// The inspection withholds drawing. Only inspections that read the
+    /// temporary grid do; an agent width repaint keeps drawing.
     private var inspectionSuppressesRendering = false
+
+    /// Whether drawing is currently withheld for a viewport inspection.
+    var isRenderingSuppressedForInspection: Bool { inspectionSuppressesRendering }
 
     private var lastMetrics: TerminalViewportMetrics?
     private var isDisplayVisible = true
@@ -489,21 +496,32 @@ final class TerminalSurfaceCoordinator {
         armResizeThrottle()
     }
 
-    /// Repaint a wider logical grid without changing the host view or drawing
-    /// the temporary frame. Bound physical width to avoid oversized textures.
-    func beginViewportInspection(columns: Int) -> Bool {
-        guard inspectionWidthPixels == nil, !inspectionSuppressesRendering,
+    /// Repaint a wider logical grid without changing the host view. Bound
+    /// physical width to avoid oversized textures.
+    ///
+    /// `keepsDrawing: false` withholds the temporary frame (prompt reading).
+    /// `keepsDrawing: true` keeps presenting: the parser still works on a
+    /// grid as wide as the provider's frame, so scrollback wraps correctly,
+    /// and the pane is never left showing a stale frame. On dandy-07
+    /// (2026-11-20) a withheld width repaint left a zoomed pane half empty
+    /// until the provider answered or the wait ran out.
+    func beginViewportInspection(columns: Int, keepsDrawing: Bool = false) -> Bool {
+        guard inspectionWidthPixels == nil, !inspectionActive,
               !resizeSynchronizationSuspended, let metrics = surface?.size(),
               metrics.cellWidthPixels > 0, columns > Int(metrics.columns),
               columns <= 4_098 else { return false }
         let padding = max(0, Int(metrics.widthPixels) - Int(metrics.columns) * Int(metrics.cellWidthPixels))
         let pixels = columns * Int(metrics.cellWidthPixels) + padding
         guard pixels <= 8_192 else { return false }
-        inspectionSuppressesRendering = true
+        inspectionActive = true
+        inspectionSuppressesRendering = !keepsDrawing
         inspectionWidthPixels = UInt32(pixels)
-        surface?.setOcclusion(false)
-        stopDisplayLink()
+        if !keepsDrawing {
+            surface?.setOcclusion(false)
+            stopDisplayLink()
+        }
         performMetricsSync()
+        if keepsDrawing { requestFullRepaint(.inspection) }
         return true
     }
 
@@ -520,15 +538,17 @@ final class TerminalSurfaceCoordinator {
     /// Restore the view-sized grid while withholding presentation until the
     /// host has observed the provider's restored-width repaint.
     func restoreViewportAfterInspection() {
-        guard inspectionSuppressesRendering else { return }
+        guard inspectionActive else { return }
         inspectionWidthPixels = nil
         performMetricsSync()
+        if !inspectionSuppressesRendering { requestFullRepaint(.inspection) }
     }
 
     func finishViewportInspection() {
-        guard inspectionSuppressesRendering else { return }
+        guard inspectionActive else { return }
         inspectionWidthPixels = nil
         performMetricsSync()
+        inspectionActive = false
         inspectionSuppressesRendering = false
         surface?.setOcclusion(effectiveSurfaceVisible)
         requestFullRepaint(.inspection)
@@ -854,6 +874,7 @@ final class TerminalSurfaceCoordinator {
         }
         surface = nil
         inspectionWidthPixels = nil
+        inspectionActive = false
         inspectionSuppressesRendering = false
         lastMetrics = nil
         // Retire any armed timer with the surface it was armed for, and
