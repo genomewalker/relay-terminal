@@ -258,7 +258,7 @@ struct RelayAgentTimelineView: View {
             Task { await store.refreshLive() }
         }
         .onChange(of: store.control) { _, control in
-            if submitted || stopRequested, let control, control.lifecycle == "quiet",
+            if submitted || stopRequested, let control, control.readyForInput,
                control.observedAt > pane.agentLastInputAt,
                control.inputRevision == pane.agentInputRevision {
                 submitted = false
@@ -755,7 +755,7 @@ struct RelayAgentTimelineView: View {
         (pane.profile.kind != .local && pane.profile.backend != .relay) || (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachmentQueue.attachments.isEmpty) ||
             composedMessage.utf8.count > 65536 || !attachmentsReady || nativeDeliveryHeld ||
             submitting || submitted || store.busy || store.conversation.binding == nil ||
-            store.control?.lifecycle != "quiet" || store.control?.inputRevision != pane.agentInputRevision ||
+            store.control?.readyForInput != true || store.control?.inputRevision != pane.agentInputRevision ||
             (store.control?.observedAt ?? .distantPast) <= pane.agentLastInputAt || pane.pendingAgentApprovals > 0
     }
 
@@ -769,7 +769,9 @@ struct RelayAgentTimelineView: View {
         if store.conversation.binding == nil { return "Sending needs an exact conversation binding." }
         if pane.pendingAgentApprovals > 0 { return "Answer the pending approval in the original terminal first." }
         if store.control == nil { return "Authenticated lifecycle is unavailable on this host. Use the original terminal." }
-        if store.control?.lifecycle == "stop_observed" { return "Waiting for the agent to confirm it is idle." }
+        if let control = store.control, control.lifecycle == "stop_observed", !control.readyForInput {
+            return "Waiting for the agent to confirm it is idle."
+        }
         if store.control?.inputRevision != pane.agentInputRevision { return "Waiting for a new authenticated idle state after terminal input." }
         if (store.control?.observedAt ?? .distantPast) <= pane.agentLastInputAt { return "Waiting for authenticated idle confirmation after the last input or reconnect." }
         switch store.control?.lifecycle {
@@ -777,6 +779,7 @@ struct RelayAgentTimelineView: View {
         case "needs_input": return "The agent is waiting for input in the original terminal."
         case "exited": return "The agent process has exited. Nothing can be sent."
         case "quiet": break
+        case "stop_observed" where store.control?.readyForInput == true: break
         default: return "Agent state is not confirmed yet."
         }
         if composedMessage.utf8.count > 65536 { return "Message is too long." }

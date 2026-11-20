@@ -8,8 +8,15 @@ struct RelayAgentConversationControl: Equatable, Sendable {
     let checkedAt: Date
     let observedAt: Date
     let inputRevision: UInt64
+    /// The original prompt accepts a new message: Claude's idle notification,
+    /// or its Stop hook, which ends a turn about 60 s before that notification.
+    /// Automatic maintenance still requires "quiet"; this is only the composer.
+    var readyForInput: Bool { Self.readyForInput(lifecycle: lifecycle, provider: binding.provider) }
+    static func readyForInput(lifecycle: String, provider: String) -> Bool {
+        lifecycle == "quiet" || (lifecycle == "stop_observed" && provider == "claude")
+    }
     var permitsSend: Bool {
-        lifecycle == "quiet" && binding.processStart.hasPrefix("kernel:") &&
+        readyForInput && binding.processStart.hasPrefix("kernel:") &&
         !revision.isEmpty && revision.utf8.count <= 128 && Date().timeIntervalSince(checkedAt) < 5
     }
     var permitsInterrupt: Bool {
