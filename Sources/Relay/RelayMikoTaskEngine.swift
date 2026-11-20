@@ -3,7 +3,7 @@ import Foundation
 /// One instance, one owning process and one serial executor per snapshot URL.
 /// The adapter must enforce that ownership; this class never executes work.
 public final class RelayMikoTaskEngine {
-    public enum Status: String, Codable { case queued, running, waiting, reconcile, blocked, reportedComplete, cancelled }
+    public enum Status: String, Codable { case queued, running, waiting, reconcile, blocked, reportedComplete, askedUser, cancelled }
     public enum Outcome: String, Codable { case succeeded, failed, unknown }
     public enum Failure: Error { case invalid, missing, duplicateConflict, staleReceipt, notDispatchable, capacity }
     public struct ChecklistItem: Codable, Equatable {
@@ -46,7 +46,16 @@ public final class RelayMikoTaskEngine {
         public let objective: String
         public let scope: String
         public var checklist: [ChecklistItem]
-        public var status: Status
+        // Older builds can still read a waiting turn during a rollback.
+        fileprivate var storedStatus: Status
+        fileprivate var askedUser: Bool?
+        public var status: Status {
+            get { askedUser == true && storedStatus == .waiting ? .askedUser : storedStatus }
+            set {
+                askedUser = newValue == .askedUser ? true : nil
+                storedStatus = newValue == .askedUser ? .waiting : newValue
+            }
+        }
         public var events: [String: Event]
         public var pending: [String: Event]
         public var operations: [Operation]
@@ -108,7 +117,7 @@ public final class RelayMikoTaskEngine {
         guard snapshot.tasks[id] == nil else { throw Failure.duplicateConflict }
         guard snapshot.tasks.count < Self.maxTasks else { throw Failure.capacity }
         var next = snapshot
-        next.tasks[id] = Task(id: id, objective: objective, scope: scope, checklist: checklist, status: .queued,
+        next.tasks[id] = Task(id: id, objective: objective, scope: scope, checklist: checklist, storedStatus: .queued,
                               events: [:], pending: [:], operations: [], checkpoint: "")
         appendDelta(&next, id, "Task created"); try commit(next)
     }
@@ -120,7 +129,7 @@ public final class RelayMikoTaskEngine {
         if let previous = task.events[event.id] {
             guard previous == event else { throw Failure.duplicateConflict }; return false
         }
-        guard task.status != .cancelled && task.status != .reportedComplete else { throw Failure.notDispatchable }
+        guard task.status != .cancelled && task.status != .askedUser && task.status != .reportedComplete else { throw Failure.notDispatchable }
         guard task.events.count < Self.maxEvents else { throw Failure.capacity }
         try change(taskID, "Event received") { task in
             task.events[event.id] = event; task.pending[event.key] = event
@@ -197,7 +206,7 @@ public final class RelayMikoTaskEngine {
     public func checkpoint(taskID: String, text: String, completedItemIDs: Set<String>, payload: Data? = nil) throws {
         try validatePayload(payload)
         guard valid(text), let task = snapshot.tasks[taskID], task.status != .cancelled,
-              task.status != .reportedComplete, completedItemIDs.isSubset(of: Set(task.checklist.map(\.id))) else { throw Failure.invalid }
+              task.status != .askedUser && task.status != .reportedComplete, completedItemIDs.isSubset(of: Set(task.checklist.map(\.id))) else { throw Failure.invalid }
         try change(taskID, "Checkpoint updated") { task in
             task.checkpoint = text
             if let payload { task.checkpointPayload = payload }
@@ -227,7 +236,7 @@ public final class RelayMikoTaskEngine {
     /// A failed live commit leaves both records; an explicit retry may reuse identical archive bytes.
     public func archiveTerminalTask(taskID: String, archiveURL: URL) throws {
         guard let task = snapshot.tasks[taskID] else { throw Failure.missing }
-        guard [.reportedComplete, .cancelled].contains(task.status), task.pending.isEmpty,
+        guard [.reportedComplete, .askedUser, .cancelled].contains(task.status), task.pending.isEmpty,
               !task.operations.contains(where: \.unresolved) else { throw Failure.notDispatchable }
         guard archiveURL.isFileURL,
               archiveURL.standardizedFileURL.resolvingSymlinksInPath() != url.standardizedFileURL.resolvingSymlinksInPath() else {
@@ -251,9 +260,21 @@ public final class RelayMikoTaskEngine {
         try commit(next)
     }
 
+    /// The conversational turn ended with a question. Its objective remains unverified.
+    public func recordQuestion(taskID: String, question: String, payload: Data) throws {
+        try validatePayload(payload)
+        guard valid(question), let task = snapshot.tasks[taskID], task.status == .waiting,
+              task.pending.isEmpty, !task.operations.contains(where: \.unresolved) else { throw Failure.invalid }
+        try change(taskID, "Asked user for input") {
+            $0.status = .askedUser
+            $0.checkpoint = question
+            $0.checkpointPayload = payload
+        }
+    }
+
     public func reportComplete(taskID: String, report: String) throws {
         guard valid(report), let task = snapshot.tasks[taskID], task.status != .cancelled,
-              task.status != .reportedComplete, task.checklist.allSatisfy(\.done), task.pending.isEmpty,
+              task.status != .askedUser && task.status != .reportedComplete, task.checklist.allSatisfy(\.done), task.pending.isEmpty,
               !task.operations.contains(where: \.unresolved) else { throw Failure.invalid }
         try change(taskID, "Completion reported; verification pending") { $0.status = .reportedComplete; $0.completionReport = report }
     }
@@ -324,7 +345,7 @@ public final class RelayMikoTaskEngine {
             let unresolved = task.operations.filter(\.unresolved).count
             guard unresolved <= 1 else { throw Failure.invalid }
             switch task.status {
-            case .queued, .waiting, .blocked, .reportedComplete:
+            case .queued, .waiting, .blocked, .reportedComplete, .askedUser:
                 guard unresolved == 0 else { throw Failure.invalid }
             case .running, .reconcile:
                 guard unresolved == 1 else { throw Failure.invalid }
@@ -358,7 +379,9 @@ public final class RelayMikoTaskEngine {
 
 extension RelayMikoTaskEngine.Task {
     private enum CodingKeys: String, CodingKey {
-        case id, objective, scope, checklist, status, events, pending, operations, checkpoint
+        case id, objective, scope, checklist, events, pending, operations, checkpoint
+        case storedStatus = "status"
+        case askedUser
         case checkpointPayload, archivedOperationCount, completionReport, verificationEvidence
     }
 
@@ -369,7 +392,8 @@ extension RelayMikoTaskEngine.Task {
         objective = try values.decode(String.self, forKey: .objective)
         scope = try values.decode(String.self, forKey: .scope)
         checklist = try values.decode([RelayMikoTaskEngine.ChecklistItem].self, forKey: .checklist)
-        status = try values.decode(RelayMikoTaskEngine.Status.self, forKey: .status)
+        storedStatus = try values.decode(RelayMikoTaskEngine.Status.self, forKey: .storedStatus)
+        askedUser = try values.decodeIfPresent(Bool.self, forKey: .askedUser)
         events = try values.decode([String: RelayMikoTaskEngine.Event].self, forKey: .events)
         pending = try values.decode([String: RelayMikoTaskEngine.Event].self, forKey: .pending)
         operations = try values.decode([RelayMikoTaskEngine.Operation].self, forKey: .operations)

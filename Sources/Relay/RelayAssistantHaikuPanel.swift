@@ -260,7 +260,7 @@ struct RelayAssistantHaikuPanel: View {
                         ForEach(harness.taskRows) { task in
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(task.objective).font(RelayTheme.font(size: 11, weight: .medium)).lineLimit(2)
-                                Text(task.status == "reportedComplete" ? "Result reported · verification separate" : task.status)
+                                Text(task.status == "reportedComplete" ? "Result reported · verification separate" : task.status == "askedUser" ? "Asked for your input" : task.status)
                                     .font(RelayTheme.font(size: 10)).foregroundStyle(RelayTheme.textMuted)
                                 if !task.unresolved.isEmpty {
                                     Text("Unresolved operations: " + task.unresolved.joined(separator: ", "))
@@ -272,7 +272,7 @@ struct RelayAssistantHaikuPanel: View {
                                         .accessibilityIdentifier("relay.miko.task-evidence." + task.id)
                                     Button("Continue") { harness.continueTask(task.id) }
                                         .disabled(harness.isBusy || !task.canContinue)
-                                    if task.status != "reportedComplete" && task.status != "cancelled" {
+                                    if !["reportedComplete", "askedUser", "cancelled"].contains(task.status) {
                                         Button("Cancel task") { harness.cancelSavedTask(task.id) }
                                             .disabled(harness.isBusy)
                                     }

@@ -24,6 +24,7 @@ import Darwin
         var anchorPaneID: UUID?
         var paneDerived: Bool
         var messages: [RelayPaneHealthJSON]
+        var callerContext: [RelayPaneHealthJSON]? = nil
         var window = 0
         var windowSteps = 0
         var windowTools = 0
@@ -61,7 +62,7 @@ import Darwin
             while tail.utf8.count > 1000 { tail.removeFirst() }
             let answerCheckpoint = tail.isEmpty ? "" :
                 "\nSaved answer tail (earlier text is retained on disk):\n" + tail
-            messages = [
+            messages = (callerContext ?? []) + [
                 .object(["role": .string("user"), "content": .string(userTurn)]),
                 .object(["role": .string("assistant"), "content": .string(
                     "Continuing the same task after \(totalTools) settled tool calls. " +
@@ -150,6 +151,16 @@ import Darwin
     private struct HistoryIndex: Codable {
         var version = 1
         var entries: [HistoryEntry]
+        // A prior app can open its ordinary history after a preserving rollback.
+        var questions: [Int: HistoryEntry]? = nil
+
+        init(entries all: [HistoryEntry]) {
+            entries = all.filter { $0.status != .askedUser }
+            let questionsByPosition = all.enumerated().filter { $0.element.status == .askedUser }
+            if !questionsByPosition.isEmpty {
+                questions = Dictionary(uniqueKeysWithValues: questionsByPosition.map { ($0.offset, $0.element) })
+            }
+        }
     }
     static let retainedHistoryCount = 32
     private var history: [HistoryEntry] = []
@@ -183,15 +194,21 @@ import Darwin
             let data = try Data(contentsOf: historyURL)
             guard data.count <= 512 * 1024 else { throw Failure.invalidCheckpoint }
             let index = try JSONDecoder().decode(HistoryIndex.self, from: data)
-            guard index.version == 1, index.entries.count <= Self.retainedHistoryCount,
-                  Set(index.entries.map(\.id)).count == index.entries.count,
-                  index.entries.allSatisfy({
+            var entries = index.entries
+            guard entries.count + (index.questions?.count ?? 0) <= Self.retainedHistoryCount else { throw Failure.invalidCheckpoint }
+            for (position, question) in (index.questions ?? [:]).sorted(by: { $0.key < $1.key }) {
+                guard (0...entries.count).contains(position), question.status == .askedUser else { throw Failure.invalidCheckpoint }
+                entries.insert(question, at: position)
+            }
+            guard index.version == 1,
+                  Set(entries.map(\.id)).count == entries.count,
+                  entries.allSatisfy({
                       !$0.id.isEmpty && $0.id.utf8.count <= 128 &&
                       $0.objective.utf8.count <= 1000 && $0.detail.utf8.count <= 1000 &&
-                      [.reportedComplete, .cancelled].contains($0.status) &&
+                      [.reportedComplete, .askedUser, .cancelled].contains($0.status) &&
                       FileManager.default.fileExists(atPath: archiveURL($0.id).path)
                   }) else { throw Failure.invalidCheckpoint }
-            history = index.entries
+            history = entries
         }
         revision = engine.snapshot.revision
         initialized = true
@@ -270,7 +287,7 @@ import Darwin
         // complete separate artifact before freeing an active-store slot.
         if engine.snapshot.tasks.count >= RelayMikoTaskEngine.maxTasks {
             let terminal = engine.snapshot.tasks.values.filter {
-                [.reportedComplete, .cancelled].contains($0.status) &&
+                [.reportedComplete, .askedUser, .cancelled].contains($0.status) &&
                 !$0.operations.contains(where: \.unresolved) && $0.pending.isEmpty
             }.sorted { $0.id < $1.id }
             guard let old = terminal.first else { throw RelayMikoTaskEngine.Failure.capacity }
@@ -327,8 +344,13 @@ import Darwin
                     evidence: saved.lastText, payload: RelayPaneHealthJSON.data(observation), state: saved)
         return true
     }
-    func finish(_ id: String, state: State, report: String) throws {
+    func finish(_ id: String, state: State, report: String, question: String? = nil) throws {
         defer { changed() }
+        if let question {
+            try engine.recordQuestion(taskID: id, question: question, payload: try JSONEncoder().encode(state))
+            try archiveTerminalIfSettled(id)
+            return
+        }
         try engine.checkpoint(taskID: id, text: "Model response reported; independent verification not asserted.",
                               completedItemIDs: ["answer"], payload: try JSONEncoder().encode(state))
         try engine.reportComplete(taskID: id, report: Self.bounded(report, bytes: 4000))
@@ -349,7 +371,7 @@ import Darwin
     }
     private func archiveTerminalIfSettled(_ id: String) throws {
         guard let task = engine.snapshot.tasks[id],
-              [.reportedComplete, .cancelled].contains(task.status), task.pending.isEmpty,
+              [.reportedComplete, .askedUser, .cancelled].contains(task.status), task.pending.isEmpty,
               !task.operations.contains(where: \.unresolved) else { return }
         let destination = archiveURL(id)
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true,
