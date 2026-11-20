@@ -56,7 +56,13 @@ struct RelayAgentMessageView: View {
                     }
                 }
             case .tool(let name, let status, let summary):
-                RelayAgentToolRow(axID: axID, name: name, status: status, summary: summary, live: live)
+                if !live, case .toolCard(let card)? = item.blocks.dropFirst(index + 1).first {
+                    RelayAgentToolCardView(axID: axID, card: card, status: status)
+                } else {
+                    RelayAgentToolRow(axID: axID, name: name, status: status, summary: summary, live: live)
+                }
+            case .toolCard:
+                EmptyView()
             case .code(let language, let source):
                 RelayAgentCodeBlock(axID: axID, language: language, source: source)
             case .equation(let source):
@@ -94,7 +100,7 @@ struct RelayAgentMessageView: View {
             case .markdown(let text), .equation(let text), .diagram(let text): return text
             case .code(_, let source): return source
             case .tool(let name, _, let summary): return name + "\n" + summary
-            case .providerImage: return nil
+            case .providerImage, .toolCard: return nil
             case .artifact(let id, _): return id
             }
         }.joined(separator: "\n\n")

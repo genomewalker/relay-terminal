@@ -389,6 +389,7 @@ func (r *phReader) conversationSnapshot(pane string, root int64, binary string, 
 	items := pyListOf()
 	retained := 0
 	toolNames := newPyObject()
+	calls := newConversationCalls()
 	var nativeState *pyList
 	var nativeOffset int64
 	for offset < end {
@@ -420,6 +421,7 @@ func (r *phReader) conversationSnapshot(pane string, root int64, binary string, 
 			}
 		}
 		parsed := parseConversationRow(row, kind, session, lineOffset, toolNames)
+		parsed = withConversationCards(row, kind, session, lineOffset, parsed, calls)
 		for _, item := range parsed.items {
 			items.items = append(items.items, item)
 			retained += len(pyEncode(item, conversationJSON))
