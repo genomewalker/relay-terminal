@@ -327,6 +327,7 @@ struct RelayWorkspaceWindowMarker: NSViewRepresentable {
             for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
                 window.standardWindowButton(kind)?.isHidden = false
             }
+            RelayWorkspaceFullScreenMemory.shared.attach(window)
         }
     }
 
