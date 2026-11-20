@@ -432,8 +432,11 @@ final class RelayNodeTransportPool: @unchecked Sendable {
         return node?.incarnation
     }
 
-    func request(profile: ConnectionProfile, payload: Data, requiredCapability: String? = nil, timeoutSeconds: Int = 20) async throws -> Data {
-        Task { @MainActor in RelayHostRegistry.shared.register(profile, origin: "Host RPC transport; requester unspecified") }
+    func request(profile: ConnectionProfile, payload: Data, requiredCapability: String? = nil, timeoutSeconds: Int = 20,
+                 registerHost: Bool = true) async throws -> Data {
+        if registerHost {
+            Task { @MainActor in RelayHostRegistry.shared.register(profile, origin: "Host RPC transport; requester unspecified") }
+        }
         return try await withCheckedThrowingContinuation { continuation in
             while true {
                 let node = pooledNode(profile)

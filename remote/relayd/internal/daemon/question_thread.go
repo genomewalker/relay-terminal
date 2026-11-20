@@ -559,13 +559,21 @@ func questionStateRealm(ctx context.Context, deps questionThreadDeps, threadID s
 	if err != nil {
 		return "", false
 	}
-	var reply struct {
-		Realm string `json:"realm"`
+	type identity struct {
+		ThreadID string `json:"thread_id"`
+		Realm    string `json:"realm"`
 	}
-	if json.Unmarshal(raw, &reply) != nil || !questionRealm.MatchString(reply.Realm) {
+	var reply struct {
+		identity
+		Question *identity `json:"question"`
+	}
+	if json.Unmarshal(raw, &reply) != nil {
 		return "", false
 	}
-	return reply.Realm, true
+	if reply.Question != nil {
+		return reply.Question.Realm, reply.Question.ThreadID == threadID && questionRealm.MatchString(reply.Question.Realm)
+	}
+	return reply.Realm, (reply.ThreadID == "" || reply.ThreadID == threadID) && questionRealm.MatchString(reply.Realm)
 }
 
 // pollQuestionThread reads chitta events at most once per questionPollInterval

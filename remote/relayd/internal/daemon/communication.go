@@ -47,6 +47,7 @@ type CommunicationRequest struct {
 	ClientToken                string                     `json:"client_token,omitempty"`
 	ActorPaneID                string                     `json:"actor_pane_id,omitempty"`
 	ThreadID                   string                     `json:"thread_id,omitempty"`
+	QuestionBindingID          string                     `json:"question_binding_id,omitempty"`
 	Panes                      []string                   `json:"panes,omitempty"`
 	Outcome                    string                     `json:"outcome,omitempty"`
 	Realm                      string                     `json:"realm,omitempty"`
@@ -476,6 +477,9 @@ func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
 	}
 	r.SourcePaneID, r.PaneID = strings.ToLower(r.SourcePaneID), strings.ToLower(r.PaneID)
 	r.MessageID, r.LinkID = strings.ToLower(r.MessageID), strings.ToLower(r.LinkID)
+	if r.Operation == "question_evidence" {
+		return communicationQuestionEvidence(r)
+	}
 	if strings.HasPrefix(r.Operation, "question_") {
 		return communicationQuestionRequest(communicationRoot(), r)
 	}
