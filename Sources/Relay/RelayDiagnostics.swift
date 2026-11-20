@@ -93,6 +93,13 @@ final class RelayDiagnostics: @unchecked Sendable {
                         ($0.value.hasPrefix("U+") && $0.value.count <= 8 &&
                          $0.value.dropFirst(2).allSatisfy(\.isHexDigit))
                 }
+                // Quick Look click: grid position, line count and fixed labels;
+                // never the clicked text or path.
+                if ["row", "column", "lines"].contains($0.key) {
+                    return $0.value == "nil" || Int($0.value).map { $0 >= 0 && $0 <= 100_000 } == true
+                }
+                if $0.key == "source" { return ["renderer", "worker"].contains($0.value) }
+                if $0.key == "target" { return ["none", "hovered_link", "cell"].contains($0.value) }
                 if $0.key == "movement" {
                     return $0.value == "unresolved" || Int($0.value).map { abs($0) <= 1_000_000 } == true
                 }
