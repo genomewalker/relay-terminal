@@ -1,3 +1,4 @@
+import UniformTypeIdentifiers
 import AppKit
 import CryptoKit
 import Foundation
@@ -876,5 +877,12 @@ extension PaneArtifact {
     /// data-only content (a provider's inline image) keeps the in-pane preview.
     static func opensInQuickLook(_ path: String) -> Bool {
         path.hasPrefix("/") || path.hasPrefix("~/")
+    }
+}
+
+extension PaneArtifact {
+    /// The file's type, so the preview shows macOS's own icon for it.
+    var contentType: UTType {
+        UTType(filenameExtension: TerminalPathSyntax.pathExtension(remotePath)) ?? .data
     }
 }

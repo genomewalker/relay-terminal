@@ -3085,16 +3085,13 @@ struct ProcessCaptureTests {
     }
 }
 
-@Test("Floating image controls do not overlap corner resize handles")
+@Test("Floating preview controls are not covered by corner resize handles")
 func floatingImageControlsClearResizeHandles() {
-    #expect(
-        FloatingArtifactChromeMetrics.titleBarEdgeInset >=
-            FloatingArtifactChromeMetrics.resizeHandleLength
-    )
-    #expect(
-        FloatingArtifactChromeMetrics.controlLength <=
-            FloatingArtifactChromeMetrics.titleBarHeight
-    )
+    // 2026-11-20: the preview uses the shared viewer bar with close in the top
+    // corner, so only the bottom corners resize (was: controls inset by the
+    // handle width, leaving close away from the corner).
+    #expect(!FloatingArtifactChromeMetrics.resizesFromTopCorners)
+    #expect(FloatingArtifactChromeMetrics.resizeHandleLength > 0)
 }
 @Test("Relay terminfo installs idempotently and safely falls back")
 func relayTerminfoInstallation() throws {

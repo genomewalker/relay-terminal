@@ -71,4 +71,10 @@ import Testing
         #expect(PaneArtifact.opensInQuickLook("~/project/fig.pdf"))
         #expect(!PaneArtifact.opensInQuickLook("Provider image.png"))
     }
+
+    @Test func theInPanePreviewUsesTheFilesOwnType() {
+        #expect(PaneArtifact(remotePath: "/tmp/a/fig.png", data: Data()).contentType == .png)
+        #expect(PaneArtifact(remotePath: "/tmp/a/paper.pdf", data: Data()).contentType == .pdf)
+        #expect(PaneArtifact(remotePath: "/tmp/tasks/bxbck9x8v.output", data: Data()).contentType != .png)
+    }
 }

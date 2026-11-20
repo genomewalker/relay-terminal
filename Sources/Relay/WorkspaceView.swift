@@ -4599,11 +4599,10 @@ private struct EditorNavigator: View {
 }
 
 enum FloatingArtifactChromeMetrics {
-    static let titleBarHeight: CGFloat = 52
-    static let controlLength: CGFloat = 24
     static let resizeHandleLength: CGFloat = 28
-    // Keep toolbar controls out from under the invisible corner resize targets.
-    static let titleBarEdgeInset: CGFloat = resizeHandleLength + 2
+    /// The top corners belong to the viewer bar's controls (close last, in the
+    /// corner), so invisible resize targets never sit on top of them.
+    static let resizesFromTopCorners = false
 }
 
 private struct ArtifactPreview: View {
@@ -4693,25 +4692,28 @@ private struct ArtifactPreview: View {
 
     var body: some View {
         VStack(spacing: RelayTheme.spacing(0)) {
-            HStack(spacing: RelayTheme.spacing(8)) {
-                HStack(spacing: RelayTheme.spacing(7)) {
-                    Image(systemName: artifact.kind.symbol)
-                        .font(RelayTheme.font(size: 10, weight: .medium))
-                        .foregroundStyle(RelayTheme.blue)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(artifact.filename)
-                            .font(RelayTheme.font(size: 12, weight: .semibold))
-                            .foregroundStyle(RelayTheme.text)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Text(artifact.remotePath)
-                            .font(RelayTheme.font(size: 10))
-                            .foregroundStyle(RelayTheme.textMuted)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
+            // The shared viewer bar: macOS's own icon for the file type,
+            // name and path, maximise, then close last in the corner.
+            RelayViewerBarFrame(close: dismiss, closeLabel: "Close preview") {
+                HStack(spacing: RelayTheme.spacing(RelayViewerMetrics.barSpacing)) {
+                    Image(nsImage: NSWorkspace.shared.icon(for: artifact.contentType))
+                        .resizable().interpolation(.high)
+                        .frame(width: 16, height: 16)
+                        .accessibilityHidden(true)
+                    Text(artifact.filename)
+                        .font(RelayViewerMetrics.title)
+                        .foregroundStyle(RelayTheme.text)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .layoutPriority(2)
+                    Text(artifact.remotePath)
+                        .font(RelayViewerMetrics.meta)
+                        .foregroundStyle(RelayTheme.textFaint)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: RelayViewerMetrics.barSpacing)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
                 .gesture(
                     DragGesture(minimumDistance: 2, coordinateSpace: .global)
@@ -4730,44 +4732,38 @@ private struct ArtifactPreview: View {
                     }
                 }
                 .help(artifact.remotePath + "\nDrag to move · double-click to reset")
-
-                HStack(spacing: RelayTheme.spacing(0)) {
-                    control(maximized ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
-                            maximized ? "Restore preview size" : "Maximize preview", "maximize") { toggleMaximized() }
-                    control("xmark", "Close preview", "close", action: dismiss)
+            } trailing: {
+                RelayViewerIconButton(title: maximized ? "Restore preview size" : "Maximize preview",
+                                      symbol: maximized ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") {
+                    toggleMaximized()
                 }
-                .frame(height: FloatingArtifactChromeMetrics.controlLength)
+                .focusEffectDisabled()
+                .help(maximized ? "Restore preview size" : "Maximize preview")
+                .accessibilityIdentifier(Self.axID + ".maximize")
             }
-            .padding(.leading, FloatingArtifactChromeMetrics.titleBarEdgeInset)
-            .padding(.trailing, FloatingArtifactChromeMetrics.titleBarEdgeInset)
-            .frame(height: FloatingArtifactChromeMetrics.titleBarHeight)
-            .background(RelayTheme.elevated)
-
-            Divider().overlay(RelayTheme.line)
+            Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
             if artifact.failure == nil, artifact.kind != .log {
-                HStack(spacing: 6) {
+                RelayViewerStrip {
                     Text(artifact.kind == .pdf ? "PDF" : artifact.kind == .image ? "Image" : "Text")
-                        .font(RelayTheme.font(size: 11, weight: .medium))
-                        .foregroundStyle(RelayTheme.textMuted)
                     Spacer(minLength: 8)
                     kindControls
                 }
-                .padding(.horizontal, 12)
-                .frame(height: 34)
-                .background(RelayTheme.surface)
-                Divider().overlay(RelayTheme.line)
+                Rectangle().fill(RelayTheme.line.opacity(0.55)).frame(height: 1)
             }
             content.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(width: displayedSize.width, height: displayedSize.height)
-        .background(RelayTheme.elevated)
+        .background(RelayTheme.canvas)
         .clipShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8), style: .continuous))
         .overlay { RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(8)).stroke(RelayTheme.line.opacity(0.55)) }
         .shadow(color: .black.opacity(0.3), radius: 16, y: 7)
         .overlay {
             if !maximized {
                 ZStack {
-                    ForEach(ResizeCorner.allCases, id: \.self) { corner in
+                    // Only the bottom corners resize: the bar owns the top
+                    // edge, so close and maximise sit in the corner unobstructed.
+                    ForEach(FloatingArtifactChromeMetrics.resizesFromTopCorners
+                            ? ResizeCorner.allCases : [.bottomLeft, .bottomRight], id: \.self) { corner in
                         resizeHandle(corner)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: corner.alignment)
                     }
@@ -4853,9 +4849,18 @@ private struct ArtifactPreview: View {
                             .background(RelayTheme.canvas.opacity(0.6))
                             .accessibilityIdentifier(Self.axID + ".partial")
                     }
-                    RelayLogTextView(text: artifact.text ?? "")
-                        .accessibilityLabel("Log text: \(artifact.filename)")
-                        .accessibilityIdentifier(Self.axID + ".log")
+                    if (artifact.text ?? "").isEmpty {
+                        // A running task's log is often still empty when opened.
+                        Text("Empty file")
+                            .font(RelayViewerMetrics.meta)
+                            .foregroundStyle(RelayTheme.textMuted)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .accessibilityIdentifier(Self.axID + ".empty")
+                    } else {
+                        RelayLogTextView(text: artifact.text ?? "")
+                            .accessibilityLabel("Log text: \(artifact.filename)")
+                            .accessibilityIdentifier(Self.axID + ".log")
+                    }
                 }
             case .image:
                 if let image = artifact.image {
@@ -4910,12 +4915,11 @@ private struct ArtifactPreview: View {
                          action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(RelayTheme.font(size: 11, weight: .medium))
-                .frame(width: FloatingArtifactChromeMetrics.controlLength, height: FloatingArtifactChromeMetrics.controlLength)
+                .font(RelayViewerMetrics.icon)
+                .frame(width: RelayViewerMetrics.iconSize, height: RelayViewerMetrics.iconSize)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(RelayTheme.textMuted)
+        .buttonStyle(RelayViewerIconButtonStyle())
         .focusEffectDisabled()
         .disabled(disabled)
         .help(label)
@@ -4929,11 +4933,10 @@ private struct ArtifactPreview: View {
             Text(title)
                 .font(RelayTheme.font(size: 10.5, weight: .medium))
                 .padding(.horizontal, RelayTheme.spacing(7))
-                .frame(height: FloatingArtifactChromeMetrics.controlLength)
+                .frame(height: RelayViewerMetrics.iconSize)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(RelayTheme.textMuted)
+        .buttonStyle(RelayViewerIconButtonStyle())
         .focusEffectDisabled()
         .help(help ?? label)
         .accessibilityLabel(label)
@@ -5062,7 +5065,12 @@ private struct RelayLogTextView: NSViewRepresentable {
         Task { @MainActor [weak textView] in textView?.scrollToEndOfDocument(nil) }
         return scroll
     }
-    func updateNSView(_ scroll: NSScrollView, context: Context) {}
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        // A reused view must show the current file, not the first one it drew.
+        guard let textView = scroll.documentView as? NSTextView, textView.string != text else { return }
+        textView.string = text
+        textView.scrollToEndOfDocument(nil)
+    }
 }
 
 struct InlineArtifactView: View {
