@@ -926,6 +926,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
     /// Re-renders Run/Cancel when a correction changes while a card is shown.
     private var supervisionChanges: AnyCancellable?
     private let taskJournalResult: Result<RelayMikoTaskJournal, Error>
+    private let questionEvidence: RelayQuestionEvidence?
     private var taskJournalChanges: AnyCancellable?
     private var activeDurableTaskID: String?
     private var observedCancelledTaskID: String?
@@ -948,10 +949,12 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
          cardTimeout: TimeInterval = RelayAssistantHarness.cardLifetime,
          supervision: RelayMikoSupervision? = nil,
          now: @escaping () -> Date = Date.init,
-         taskJournal: RelayMikoTaskJournal? = nil) {
+         taskJournal: RelayMikoTaskJournal? = nil,
+         questionEvidence: RelayQuestionEvidence? = nil) {
         if let taskJournal { self.taskJournalResult = .success(taskJournal) }
         else if RelayLaunchMode.isRunningTests { self.taskJournalResult = Result { try RelayMikoTaskJournal.temporary() } }
         else { self.taskJournalResult = RelayMikoTaskJournal.live }
+        self.questionEvidence = questionEvidence ?? (RelayLaunchMode.isRunningTests ? nil : .live)
         self.mikoBudget = budget ?? .shared
         self.mikoPolicy = policy
         self.workspace = workspace
@@ -1089,6 +1092,17 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
         case .success(let journal): taskRows = journal.rows
         case .failure(let error): taskStoreNotice = error.localizedDescription
         }
+    }
+
+    func readSavedTaskEvidence(_ id: String) async -> RelayQuestionEvidence.Result {
+        guard let state = try? taskJournalResult.get().state(id) else { return .unavailable }
+        guard let attachment = state.questionEvidenceAttachment else { return .unattached }
+        let paneID = attachment.identity.paneID
+        guard state.anchorPaneID == paneID, let questionEvidence,
+              let profile = workspace?.panes[paneID]?.profile else { return .unavailable }
+        let result = await questionEvidence.read(attachment, profile: profile)
+        guard workspace?.panes[paneID]?.profile == profile else { return .attachmentChanged }
+        return result
     }
 
     @discardableResult
@@ -1275,6 +1289,12 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
                     if case .supervisor(let paneID, let label) = origin {
                         saved.originPaneID = paneID
                         saved.originLabel = label
+                    }
+                    if let questionEvidence, let paneID = saved.anchorPaneID,
+                       let profile = workspace.panes[paneID]?.profile {
+                        let attachment = await questionEvidence.capture(paneID: paneID, profile: profile)
+                        if workspace.panes[paneID]?.profile == profile { saved.questionEvidenceAttachment = attachment }
+                        guard !isExchangeCancelled(exchange) else { throw CancellationError() }
                     }
                     durable = saved
                     try store.create(id: id, state: saved)

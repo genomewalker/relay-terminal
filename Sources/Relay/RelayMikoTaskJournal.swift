@@ -37,6 +37,7 @@ import Darwin
         var answerPrefix: String? = nil
         var pendingExecJobs: [String: String]? = nil
         var chargedMicrousd: UInt64 = 0
+        var questionEvidenceAttachment: RelayQuestionEvidenceAttachment? = nil
 
         var windowRequestID: String {
             if window == 0 { return requestID }

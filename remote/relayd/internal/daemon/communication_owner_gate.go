@@ -25,7 +25,7 @@ var communicationAgentAncestor = ancestorAgentKind
 // spends a pane's source attestation as the app, so it is gated the same way.
 func communicationOwnerOperation(operation string) bool {
 	return strings.HasPrefix(operation, "route_") || operation == "node_trust_set" || operation == "attest_consume" ||
-		communicationCarrierOperation(operation)
+		operation == "question_evidence" || communicationCarrierOperation(operation)
 }
 
 // communicationCarrierOperation names the operations only the app's host-channel

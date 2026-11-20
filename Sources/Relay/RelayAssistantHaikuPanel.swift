@@ -10,6 +10,7 @@ struct RelayAssistantHaikuPanel: View {
     @State private var focusRequest = UUID()
     @State private var followsLatest = true
     @State private var composerHeight = RelayMikoComposerHeight.minimum
+    @State private var evidenceTask: RelayMikoTaskJournal.Row?
     /// Saved tasks, Shepherd delivery and the profile, collapsed below the chat by default.
     @State private var detailsExpanded: Bool
     private var draft: String {
@@ -267,6 +268,8 @@ struct RelayAssistantHaikuPanel: View {
                                         .foregroundStyle(RelayTheme.coral).textSelection(.enabled)
                                 }
                                 HStack {
+                                    Button("Evidence") { evidenceTask = task }
+                                        .accessibilityIdentifier("relay.miko.task-evidence." + task.id)
                                     Button("Continue") { harness.continueTask(task.id) }
                                         .disabled(harness.isBusy || !task.canContinue)
                                     if task.status != "reportedComplete" && task.status != "cancelled" {
@@ -280,6 +283,11 @@ struct RelayAssistantHaikuPanel: View {
                 }.frame(maxHeight: 170)
             }.font(RelayTheme.font(size: 11)).padding(.horizontal, 12).padding(.bottom, 8)
                 .accessibilityIdentifier("relay.miko.saved-tasks")
+                .sheet(item: $evidenceTask) { task in
+                    RelayQuestionEvidenceView(objective: task.objective) {
+                        await harness.readSavedTaskEvidence(task.id)
+                    }
+                }
         }
     }
 
