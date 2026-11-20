@@ -181,9 +181,21 @@ func privateBindingObject(path string, directory bool) error {
 	return nil
 }
 
+// claudeLaunchHookWindow bounds how long after process start Claude's launch
+// SessionStart hook is taken to have run.
+const claudeLaunchHookWindow = 2 * time.Minute
+
 // withVerifiedClaudeLifecycle overlays hook telemetry on the independently verified
 // live association. Only the lifecycle and its original observation time transfer.
 func withVerifiedClaudeLifecycle(live, stored AgentBindingRecord, startedAt time.Time) AgentBindingRecord {
+	// Before SessionStart recorded the launch prompt, it stored "unknown".
+	// Such a record, written while the process was starting and never
+	// replaced by a prompt, tool or Stop hook, is a Claude still at its
+	// launch prompt.
+	if stored.Lifecycle == "unknown" && !startedAt.IsZero() && !stored.ObservedAt.Before(startedAt) &&
+		stored.ObservedAt.Sub(startedAt) < claudeLaunchHookWindow {
+		stored.Lifecycle = "stop_observed"
+	}
 	// The private hook writer leaves Source unset. Other binding sources are explicit.
 	if live.Version != 1 || stored.Version != 1 ||
 		!nativeClaudeLifecycleSource(live.Source) ||

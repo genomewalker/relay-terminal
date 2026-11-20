@@ -27,12 +27,23 @@ type agentProducer struct {
 // Stop means the turn ended and the prompt accepts input again; the
 // conversation composer may send then. Every other notification, such as a
 // permission prompt, means the terminal is waiting for an answer.
-func claudeHookLifecycle(name, notification string) string {
+// A session that starts, resumes or clears waits at an empty prompt, as after
+// Stop. An empty result is an event that says nothing about the main turn
+// (a subagent, or compaction, which can run inside a turn): the stored
+// lifecycle of the same process and session is kept.
+func claudeHookLifecycle(name, detail string) string {
 	switch name {
 	case "Stop":
 		return "stop_observed"
+	case "SessionStart":
+		if detail == "startup" || detail == "resume" || detail == "clear" {
+			return "stop_observed"
+		}
+		return ""
+	case "SubagentStart", "SubagentStop", "PreCompact", "PostCompact":
+		return ""
 	case "Notification":
-		if notification == "idle_prompt" {
+		if detail == "idle_prompt" {
 			return "quiet"
 		}
 		return "needs_input"
@@ -44,6 +55,17 @@ func claudeHookLifecycle(name, notification string) string {
 		return "exited"
 	}
 	return "unknown"
+}
+
+// claudeHookDetail is the field claudeHookLifecycle reads: SessionStart's
+// source, otherwise the notification type.
+func claudeHookDetail(hook map[string]any) string {
+	key := "notification_type"
+	if hook["hook_event_name"] == "SessionStart" {
+		key = "source"
+	}
+	detail, _ := hook[key].(string)
+	return detail
 }
 
 // Infer the provider root from the sender's kernel ancestry. Claimed PIDs,
@@ -138,8 +160,7 @@ func StoreNativeAgentHook(pane, provider string, raw []byte) error {
 			return err
 		}
 	}
-	notification, _ := hook["notification_type"].(string)
-	state := claudeHookLifecycle(name, notification)
+	state := claudeHookLifecycle(name, claudeHookDetail(hook))
 	if err := server.storeAgentBinding(map[string]any{
 		"session_id": hook["session_id"], "transcript_path": hook["transcript_path"],
 		"lifecycle": state,
@@ -211,8 +232,7 @@ func (server *Server) forwardAuthenticatedAgentEvents(connection, worker net.Con
 		name, _ := event["hook_event_name"].(string)
 		state := "unknown"
 		if provider == "claude" {
-			notification, _ := event["notification_type"].(string)
-			state = claudeHookLifecycle(name, notification)
+			state = claudeHookLifecycle(name, claudeHookDetail(event))
 		}
 		binding["lifecycle"] = state
 		if err := server.storeAgentBinding(binding, producer); err != nil {
@@ -266,10 +286,14 @@ func (server *Server) storeAgentBinding(input map[string]any, producer agentProd
 		return err
 	}
 	lifecycle, _ := input["lifecycle"].(string)
+	observedAt := time.Now().UTC()
 	if lifecycle == "" {
 		lifecycle = "unknown"
+		if previous, ok := carriedLifecycle(directory, producer, session); ok {
+			lifecycle, observedAt = previous.Lifecycle, previous.ObservedAt
+		}
 	}
-	record := map[string]any{"lifecycle": lifecycle, "revision": revision, "version": 1, "producer": producer, "session_id": session, "transcript_path": transcript, "observed_at": time.Now().UTC().Format(time.RFC3339Nano)}
+	record := map[string]any{"lifecycle": lifecycle, "revision": revision, "version": 1, "producer": producer, "session_id": session, "transcript_path": transcript, "observed_at": observedAt.Format(time.RFC3339Nano)}
 	return writeBindingRecord(directory, producer.PaneID, record)
 }
 
@@ -347,6 +371,28 @@ func validateBindingTranscript(transcript, provider string) error {
 
 	}
 	return nil
+}
+
+// carriedLifecycle is the stored lifecycle an event without one keeps: only
+// from the same process incarnation and session, and never after exit. The
+// binding reader still verifies the whole record on every read.
+func carriedLifecycle(directory string, producer agentProducer, session string) (AgentBindingRecord, bool) {
+	var record AgentBindingRecord
+	path := filepath.Join(directory, producer.PaneID+".json")
+	if privateBindingObject(path, false) != nil {
+		return record, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > 65536 || json.Unmarshal(data, &record) != nil {
+		return record, false
+	}
+	p := record.Producer
+	ok := record.Version == 1 && p.PaneID == producer.PaneID && p.Provider == producer.Provider &&
+		p.ProcessID == producer.ProcessID && p.ProcessStart == producer.ProcessStart &&
+		p.ConfigDir == producer.ConfigDir && record.SessionID == session &&
+		knownAgentLifecycle(record.Lifecycle) && record.Lifecycle != "exited" &&
+		!record.ObservedAt.IsZero() && !record.ObservedAt.After(time.Now())
+	return record, ok
 }
 
 func writeBindingRecord(directory, pane string, record any) error {

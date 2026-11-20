@@ -1414,14 +1414,21 @@ func runEvent(arguments []string) {
 	if *bind {
 		// Local kernel/worker verification also works with a retained older
 		// supervisor. Failure remains optional telemetry and cannot block a turn.
-		if err := daemon.StoreNativeAgentHook(*session, *agent, raw); err != nil && os.Getenv("RELAY_NATIVE_BINDING_DIAGNOSTICS") == "1" {
-			message := err.Error()
+		stored := daemon.StoreNativeAgentHook(*session, *agent, raw)
+		if stored != nil && os.Getenv("RELAY_NATIVE_BINDING_DIAGNOSTICS") == "1" {
+			message := stored.Error()
 			if len(message) > 400 {
 				message = message[:400]
 			}
 			fmt.Fprintln(os.Stderr, "Relay native hook binding unavailable:", message)
 		}
-		if err := daemon.RequireAgentBindingCapability(*socket, *session); err != nil {
+		// Once the local binding is stored, the supervisor's authenticated
+		// channel would only rewrite the same record, and a supervisor that
+		// predates a lifecycle rule would undo it. The event still reaches the
+		// worker's journal through the ordinary event path.
+		if stored == nil {
+			*bind = false
+		} else if err := daemon.RequireAgentBindingCapability(*socket, *session); err != nil {
 			*bind = false
 		}
 	}
