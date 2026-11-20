@@ -591,6 +591,7 @@ func RunAgentConversation(ctx context.Context, args []string, out io.Writer) err
 	root := flags.Int64("root-pid", 0, "")
 	attachment := flags.String("attachment", "", "")
 	bindingOnly := flags.Bool("binding-only", false, "")
+	contextOnly := flags.Bool("context-only", false, "")
 	cursor := flags.Int64("before", 0, "")
 	source := flags.String("source-identity", "", "")
 	session := flags.String("session", "", "")
@@ -609,6 +610,9 @@ func RunAgentConversation(ctx context.Context, args []string, out io.Writer) err
 	if before != nil && (*before <= 0 || *source == "" || *session == "") {
 		return errors.New("invalid history cursor")
 	}
+	if *contextOnly && (*bindingOnly || *attachment != "" || before != nil || *source != "" || *session != "") {
+		return errors.New("invalid context selector")
+	}
 	if len(*source) > 80 || len(*session) > 128 || len(*attachment) > 4096 {
 		return errors.New("invalid conversation selector")
 	}
@@ -618,6 +622,9 @@ func RunAgentConversation(ctx context.Context, args []string, out io.Writer) err
 	}
 	reader := newPHReader(ctx)
 	result := nativeReaderFailure("unbound", func() *pyObject {
+		if *contextOnly {
+			return reader.conversationContext(*pane, *root, binary)
+		}
 		if *bindingOnly {
 			return reader.conversationBindingOnly(*pane, *root, binary)
 		}

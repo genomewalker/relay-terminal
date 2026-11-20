@@ -646,6 +646,68 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var uploadProgress: RelayTransferProgress?
     var uploadProgressID: UUID?
     @Published var nativeConversationVisible = false
+    @Published private var observedProviderContext: RelayProviderContext?
+    @Published private var providerContextEpoch = UUID()
+    private var observedProviderContextKey: ProviderContextKey?
+    private var providerContextObserver: UUID?
+
+    var providerContext: RelayProviderContext? {
+        observedProviderContextKey == providerContextKey ? observedProviderContext : nil
+    }
+
+    struct ProviderContextKey: Equatable {
+        let epoch: UUID
+        let provider: AgentKind
+        let rootPID: Int
+        let lastTurn: Date?
+    }
+
+    var providerContextKey: ProviderContextKey? {
+        guard contentKind == .terminal, kind.usesNativePromptEditing,
+              connectionState == .connected, !programExited else { return nil }
+        return .init(epoch: providerContextEpoch, provider: kind,
+            rootPID: profile.kind == .local ? Int(networkForegroundPID ?? 0) : 0,
+            lastTurn: lastCompletedAgentTurn)
+    }
+
+    private func invalidateProviderContext() {
+        providerContextEpoch = UUID()
+        observedProviderContextKey = nil
+        if observedProviderContext != nil { observedProviderContext = nil }
+    }
+
+    func observeProviderContext(_ key: ProviderContextKey) async {
+        guard !Task.isCancelled, providerContextKey == key else { return }
+        let observation = UUID()
+        providerContextObserver = observation
+        defer {
+            if providerContextObserver == observation {
+                providerContextObserver = nil
+                observedProviderContextKey = nil
+                if observedProviderContext != nil { observedProviderContext = nil }
+            }
+        }
+        let paneID = id.uuidString.lowercased()
+        let command = RelayHostExecution.daemonCommand(profile: profile, arguments: [
+            "agent-conversation", "--context-only", "--pane", paneID, "--root-pid", String(key.rootPID)
+        ])
+        while !Task.isCancelled, providerContextObserver == observation, providerContextKey == key {
+            let output = try? await RelayHostExecution.capture(profile: profile, command: command,
+                timeout: 10, maximumBytes: 8192)
+            guard !Task.isCancelled, providerContextObserver == observation, providerContextKey == key else { return }
+            let next: RelayProviderContext?
+            if let output, output.exitCode == 0 {
+                next = try? RelayProviderContext.decode(output.stdout, hostID: profile.id.uuidString,
+                    paneID: id, provider: key.provider)
+            } else {
+                next = nil
+            }
+            let changed = observedProviderContext != next || observedProviderContextKey != key
+            observedProviderContextKey = key
+            if changed { observedProviderContext = next }
+            do { try await Task.sleep(for: .seconds(20)) } catch { return }
+        }
+    }
     /// A tool call the conversation view scrolls to when it next shows it;
     /// set by Agent details, cleared once resolved.
     @Published var conversationFocus: RelayConversationFocus?
@@ -742,6 +804,7 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var connectionState: PaneConnectionState {
         didSet {
             guard oldValue != connectionState else { return }
+            invalidateProviderContext()
             overviewInputChanged()
             agentInputRevision &+= 1
             switch connectionState {
@@ -941,6 +1004,7 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func recordCommandCompletion(exitCode: Int?, durationNanos: UInt64) {
+        invalidateProviderContext()
         lastCommandExitCode = exitCode
         lastCommandDurationNanos = durationNanos
         // Shell integration reports completion after the foreground command
@@ -1415,6 +1479,10 @@ final class PaneModel: ObservableObject, Identifiable {
             structuredAgentRunning = true
         }
 
+        if kind.usesNativePromptEditing, agentSnapshotReplayDepth == 0,
+           ["SessionStart", "SessionEnd", "PreCompact", "PostCompact", "context_compacted"].contains(eventName) {
+            invalidateProviderContext()
+        }
         switch eventName {
         case "PermissionRequest":
             pendingAgentApprovals += 1
@@ -1756,6 +1824,7 @@ final class PaneModel: ObservableObject, Identifiable {
     }
 
     func setAgentKind(_ kind: AgentKind) {
+        if kind != self.kind { invalidateProviderContext() }
         objectWillChange.send()
         harnessIdentity = nil
         reportedHarnessName = nil

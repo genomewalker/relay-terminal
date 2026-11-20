@@ -166,6 +166,10 @@ func canonicalNativeEvent(provider string, input map[string]any) map[string]any 
 	case "thread/tokenUsage/updated":
 		event["hook_event_name"] = "ResourceUsage"
 		if usage, ok := params["tokenUsage"].(map[string]any); ok {
+			if last, ok := usage["last"].(map[string]any); ok {
+				copyContextCount(event, "context_used_tokens", last["totalTokens"], 0)
+			}
+			copyContextCount(event, "context_limit_tokens", usage["modelContextWindow"], 1)
 			if total, ok := usage["total"].(map[string]any); ok {
 				copyNumberAlias(event, total, "input_tokens", "inputTokens")
 				copyNumberAlias(event, total, "cached_input_tokens", "cachedInputTokens")
@@ -292,6 +296,12 @@ func copyNumberAlias(output, input map[string]any, destination string, candidate
 			output[destination] = value
 			return
 		}
+	}
+}
+
+func copyContextCount(event map[string]any, key string, raw any, minimum float64) {
+	if n, ok := raw.(float64); ok && n >= minimum && n < 1<<53 && n == float64(int64(n)) {
+		event[key] = n
 	}
 }
 

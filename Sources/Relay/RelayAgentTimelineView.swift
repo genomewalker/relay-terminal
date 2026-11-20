@@ -317,6 +317,14 @@ struct RelayAgentTimelineView: View {
                 RelayTimelineActivity(status: status.text, detail: pane.headerActivityDetail,
                                       since: pane.agentActivities.last?.occurredAt)
             }
+            if let binding = store.conversation.binding, !store.historical {
+                let context = pane.providerContext
+                Text(context.flatMap { $0.matches(binding) ? $0.label : nil } ?? RelayProviderContext.unknown)
+                    .font(RelayViewerMetrics.identifier).foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1)
+                    .help("Provider-reported current context tokens and context window")
+                    .accessibilityIdentifier("relay.conversation.context-usage")
+            }
             if store.busy { ProgressView().controlSize(.mini) }
             if let date = store.updatedAt {
                 Text(date, style: .time).font(RelayViewerMetrics.identifier).foregroundStyle(RelayTheme.textFaint)

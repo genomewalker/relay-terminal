@@ -3923,7 +3923,8 @@ private struct PaneView: View {
     @StateObject private var dropPreview = PaneDropPreviewModel()
 
     var body: some View {
-        VStack(spacing: RelayTheme.spacing(0)) {
+        let contextKey = networkCoverActive ? nil : pane.providerContextKey
+        return VStack(spacing: RelayTheme.spacing(0)) {
             paneHeader
             ZStack {
                 if toolWindows.rPaneIDs.contains(pane.id) && !inToolWindow {
@@ -4051,6 +4052,21 @@ private struct PaneView: View {
                     pane.dismissArtifact(artifact.id)
                 }
                 .frame(height: min(300, max(120, paneSize.height * 0.4)))
+            }
+            if contextKey != nil {
+                Text(pane.providerContext?.label ?? RelayProviderContext.unknown)
+                    .font(RelayViewerMetrics.identifier).foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.horizontal, RelayViewerMetrics.barPadding).frame(height: 18)
+                    .background(RelayTheme.canvas)
+                    .help("Provider-reported current context tokens and context window")
+                    .accessibilityIdentifier("relay.pane.context-usage")
+            }
+        }
+        .task(id: contextKey) {
+            if let contextKey, !RelayLaunchMode.isRunningTests {
+                await pane.observeProviderContext(contextKey)
             }
         }
         .onChange(of: pane.richContentRequested) { _, requested in
