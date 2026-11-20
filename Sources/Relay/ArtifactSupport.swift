@@ -869,3 +869,12 @@ enum KittyImageEncoder {
         return packets
     }
 }
+
+
+extension PaneArtifact {
+    /// A preview backed by a real file path opens in Quick Look; only
+    /// data-only content (a provider's inline image) keeps the in-pane preview.
+    static func opensInQuickLook(_ path: String) -> Bool {
+        path.hasPrefix("/") || path.hasPrefix("~/")
+    }
+}

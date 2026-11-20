@@ -3899,6 +3899,11 @@ private struct PaneLinkSelectionBar: View {
 }
 
 private struct PaneView: View {
+    /// A preview you requested of a real file goes to Quick Look.
+    static func opensInQuickLook(_ artifact: PaneArtifact) -> Bool {
+        artifact.userRequested && PaneArtifact.opensInQuickLook(artifact.remotePath)
+    }
+
     @ObservedObject private var toolWindows = RelayToolWindowCoordinator.shared
     @EnvironmentObject private var linkSelection: PaneLinkSelection
     @Environment(\.networkCoverActive) private var networkCoverActive
@@ -4007,7 +4012,7 @@ private struct PaneView: View {
                         .frame(maxHeight: .infinity, alignment: .top)
                         .padding(RelayTheme.spacing(12))
                 }
-                if let artifact = pane.artifacts.last,
+                if let artifact = pane.artifacts.last, !Self.opensInQuickLook(artifact),
                    preferences.artifactPresentation == .preview || artifact.userRequested {
                     GeometryReader { proxy in
                         let inset = RelayTheme.spacing(12)
@@ -4051,6 +4056,14 @@ private struct PaneView: View {
                     pane.dismissArtifact(artifact.id)
                 }
                 .frame(height: min(300, max(120, paneSize.height * 0.4)))
+            }
+        }
+        // A file you asked to see opens in Quick Look, the one viewer for
+        // local and remote files; the pane never draws its own copy of it.
+        .onChange(of: pane.artifacts.last?.id) { _, _ in
+            guard let artifact = pane.artifacts.last, Self.opensInQuickLook(artifact) else { return }
+            if pane.runtime.presentFileInQuickLook(path: artifact.remotePath, takeFocus: true) {
+                pane.dismissArtifact(artifact.id)
             }
         }
         .onChange(of: pane.richContentRequested) { _, requested in

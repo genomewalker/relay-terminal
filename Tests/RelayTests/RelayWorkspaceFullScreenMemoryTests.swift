@@ -55,3 +55,20 @@ import Testing
         #expect(RelayQuickLookItem(source: .web(URL(string: "https://example.org")!), openLink: "").contentType == nil)
     }
 }
+
+/// 2026-11-20: files dropped on a Mac pane were uploaded into a staging folder,
+/// and previews used Relay's own floating viewer instead of Quick Look.
+@Suite struct RelayLocalFilesTests {
+    @Test func aDropOnAMacPaneUsesTheFilesWhereTheyAre() {
+        let urls = [URL(fileURLWithPath: "/Users/me/data/a.csv"), URL(fileURLWithPath: "/tmp/b c.png")]
+        #expect(TerminalDropPolicy.localPaths(for: urls, profileKind: .local) == ["/Users/me/data/a.csv", "/tmp/b c.png"])
+        #expect(TerminalDropPolicy.localPaths(for: urls, profileKind: .ssh) == nil)
+        #expect(TerminalDropPolicy.localPaths(for: [], profileKind: .local) == nil)
+    }
+
+    @Test func previewsOfRealFilesOpenInQuickLook() {
+        #expect(PaneArtifact.opensInQuickLook("/tmp/claude-501/tasks/bxbck9x8v.output"))
+        #expect(PaneArtifact.opensInQuickLook("~/project/fig.pdf"))
+        #expect(!PaneArtifact.opensInQuickLook("Provider image.png"))
+    }
+}

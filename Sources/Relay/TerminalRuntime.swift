@@ -4423,6 +4423,12 @@ final class TerminalRuntime: NSObject {
         return presentQuickLook(targets, start: nil, takeFocus: false) ? .quickLook : nil
     }
 
+    /// Opens a file preview in Quick Look, the one viewer for local and
+    /// remote files. False when the path cannot be previewed from this pane.
+    func presentFileInQuickLook(path: String, takeFocus: Bool) -> Bool {
+        presentQuickLook([.path(path)], start: nil, takeFocus: takeFocus)
+    }
+
     private func presentQuickLook(_ targets: [RelayQuickLookTarget], start: RelayQuickLookTarget?,
                                   takeFocus: Bool = true) -> Bool {
         let location = quickLookLocation
@@ -4502,8 +4508,16 @@ final class TerminalRuntime: NSObject {
     }
 
     fileprivate func importLocalFiles(_ urls: [URL], resume: Bool = false) -> Bool {
-        guard !urls.isEmpty, fileTransferTask == nil,
-              let pane, pane.profile.backend == .relay else { return false }
+        guard !urls.isEmpty, fileTransferTask == nil, let pane else { return false }
+        // A pane on this Mac can read the dropped files where they are:
+        // insert their own paths, never a copy.
+        if let paths = TerminalDropPolicy.localPaths(for: urls, profileKind: pane.profile.kind) {
+            view.sendText(paths.map(Self.promptPath).joined(separator: " ") + " ")
+            RelayDiagnostics.shared.record(category: "transfer", name: "dropped-local-paths", details: [
+                "pane_id": pane.id.uuidString.lowercased(), "files": String(paths.count)])
+            return true
+        }
+        guard pane.profile.backend == .relay else { return false }
         let profile = pane.profile
         let paneID = pane.id.uuidString.lowercased()
         let transferID = UUID()
@@ -11601,4 +11615,15 @@ extension TerminalRuntime: RelayAgentSignInPort {
 /// `.relaySelectPane` userInfo: present and true only for a pointer click.
 enum RelaySelectPaneKey {
     static let userInitiated = "relay.select-pane.user"
+}
+
+
+/// Files dropped onto a pane on this Mac are used where they are; only a
+/// remote pane needs them copied to its host. (2026-11-20: local drops were
+/// uploaded into a staging folder and the copy's path was typed instead.)
+enum TerminalDropPolicy {
+    static func localPaths(for urls: [URL], profileKind: ConnectionKind) -> [String]? {
+        guard profileKind == .local, !urls.isEmpty, urls.allSatisfy(\.isFileURL) else { return nil }
+        return urls.map { $0.standardizedFileURL.path }
+    }
 }
