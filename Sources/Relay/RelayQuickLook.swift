@@ -557,6 +557,11 @@ final class RelayQuickLookController: NSObject, ObservableObject, NSWindowDelega
         panel.title = "Quick Look"
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
+        // The viewer bar carries close, like every pane header; hide the
+        // utility window's own buttons so there is one set of controls.
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            panel.standardWindowButton(kind)?.isHidden = true
+        }
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = true
@@ -577,9 +582,11 @@ struct RelayQuickLookView: View {
     @ObservedObject var controller: RelayQuickLookController
 
     var body: some View {
-        VStack(spacing: 0) {
+        // The pane header's bar and hairline, so the panel reads as part of
+        // Relay rather than a separate app with its own chrome.
+        RelayViewerLayout {
             header
-            Divider().overlay(RelayTheme.line)
+        } content: {
             ZStack {
                 RelayTheme.canvas
                 switch controller.content {
@@ -592,13 +599,13 @@ struct RelayQuickLookView: View {
                 case .webCard(let url):
                     VStack(spacing: 8) {
                         Image(systemName: "globe").font(.system(size: 22)).foregroundStyle(RelayTheme.textMuted)
-                        Text(url.host ?? url.absoluteString).font(.system(size: 13, weight: .semibold))
+                        Text(url.host ?? url.absoluteString).font(RelayViewerMetrics.title)
                             .foregroundStyle(RelayTheme.text)
-                        Text(url.absoluteString).font(.caption).foregroundStyle(RelayTheme.textMuted)
+                        Text(url.absoluteString).font(RelayViewerMetrics.meta).foregroundStyle(RelayTheme.textMuted)
                             .lineLimit(3).truncationMode(.middle).multilineTextAlignment(.center)
                             .textSelection(.enabled)
                         Text("Printed in the terminal. Not loaded until you ask.")
-                            .font(.caption).foregroundStyle(RelayTheme.textFaint)
+                            .font(RelayViewerMetrics.meta).foregroundStyle(RelayTheme.textFaint)
                         Button(controller.browser?.inlineWeb == false ? "Open in Browser" : "Load Page") {
                             controller.loadCurrentWeb()
                         }
@@ -609,42 +616,32 @@ struct RelayQuickLookView: View {
                 case .failed(let message):
                     VStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle").foregroundStyle(RelayTheme.warning)
-                        Text("Can't preview this item").foregroundStyle(RelayTheme.text)
-                        Text(message).font(.caption).foregroundStyle(RelayTheme.textMuted)
+                        Text("Can't preview this item").font(RelayViewerMetrics.title).foregroundStyle(RelayTheme.text)
+                        Text(message).font(RelayViewerMetrics.meta).foregroundStyle(RelayTheme.textMuted)
                             .multilineTextAlignment(.center).textSelection(.enabled)
                     }
                     .padding(24)
                 }
             }
         }
-        .background(RelayTheme.canvas)
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(controller.browser?.current.title ?? "")
-                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(RelayTheme.text)
-                    .lineLimit(1).truncationMode(.middle)
-                Text(controller.browser?.current.subtitle ?? "")
-                    .font(.system(size: 10)).foregroundStyle(RelayTheme.textFaint)
-                    .lineLimit(1).truncationMode(.middle)
-            }
-            Spacer(minLength: 8)
+        RelayViewerBar(symbol: "eye", title: controller.browser?.current.title ?? "Quick Look",
+                       detail: controller.browser?.current.subtitle, detailMonospaced: false,
+                       close: { controller.close() }, closeLabel: "Close (Esc)") {
             if let position = controller.browser?.position, !position.isEmpty {
-                Text(position).font(.system(size: 11).monospacedDigit()).foregroundStyle(RelayTheme.textMuted)
-                Button { controller.previous() } label: { Image(systemName: "chevron.left") }
+                Text(position).font(RelayViewerMetrics.identifier).foregroundStyle(RelayTheme.textFaint)
+                RelayViewerIconButton(title: "Previous", symbol: "chevron.left") { controller.previous() }
                     .help("Previous (←)")
-                Button { controller.next() } label: { Image(systemName: "chevron.right") }
+                RelayViewerIconButton(title: "Next", symbol: "chevron.right") { controller.next() }
                     .help("Next (→)")
             }
-            Button("Open") { controller.openCurrent() }.help("Open as a click would (Return)")
-            Button { controller.close() } label: { Image(systemName: "xmark") }.help("Close (Esc)")
+            RelayViewerIconButton(title: "Open", symbol: "arrow.up.forward.square") { controller.openCurrent() }
+                .help("Open as a click would (Return)")
         }
-        .buttonStyle(.borderless)
-        .foregroundStyle(RelayTheme.textMuted)
-        .padding(.leading, 76).padding(.trailing, 12).padding(.vertical, 8)
-        .background(RelayTheme.surface)
+        // The panel has no title bar of its own; the bar moves it.
+        .background(RelayWindowDragRegion())
     }
 }
 
