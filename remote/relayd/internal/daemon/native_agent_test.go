@@ -66,6 +66,34 @@ func TestCanonicalCodexTokenUsage(t *testing.T) {
 	}
 }
 
+func TestCanonicalCodexTokenUsageSeparatesCurrentContext(t *testing.T) {
+	for _, tc := range []struct {
+		usage       string
+		used, limit any
+	}{
+		{`"last":{"totalTokens":47},"modelContextWindow":272000`, float64(47), float64(272000)},
+		{`"last":{"totalTokens":0},"modelContextWindow":null`, float64(0), nil},
+		{`"last":{"inputTokens":47},"modelContextWindow":272000`, nil, float64(272000)},
+		{`"last":{"totalTokens":1.5},"modelContextWindow":-1`, nil, nil},
+	} {
+		raw := []byte(`{"method":"thread/tokenUsage/updated","params":{"threadId":"t","tokenUsage":{"total":{"inputTokens":529,"totalTokens":600},` + tc.usage + `}}}`)
+		encoded, err := CanonicalAgentEnvelope("codex", raw, "codex-app-server")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope struct {
+			Event map[string]any `json:"event"`
+		}
+		if err := json.Unmarshal(encoded, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Event["thread_id"] != "t" || envelope.Event["input_tokens"] != float64(529) ||
+			envelope.Event["context_used_tokens"] != tc.used || envelope.Event["context_limit_tokens"] != tc.limit {
+			t.Fatalf("unexpected usage for %s: %s", tc.usage, encoded)
+		}
+	}
+}
+
 func TestCanonicalClaudeStreamLifecycle(t *testing.T) {
 	encoded, err := CanonicalAgentEnvelope("claude", []byte(`{"type":"system","session_id":"claude-1"}`), "claude-stream-json")
 	if err != nil {

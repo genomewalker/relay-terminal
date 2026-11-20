@@ -14,11 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/relay-terminal/relayd/internal/contextusage"
 	"github.com/relay-terminal/relayd/internal/subscriptionquota"
 )
 
 // Claude sends current model and effort to a status-line command even while
-// idle. This command records restart metadata and subscription windows only;
+// idle. This command records restart metadata, context usage and subscription windows only;
 // it never persists prompts, transcript bodies, cost or credentials.
 type claudeQuotaWindow struct {
 	UsedPercentage float64 `json:"used_percentage"`
@@ -48,14 +49,15 @@ func claudeQuotaWindows(raw json.RawMessage) map[string]claudeQuotaWindow {
 }
 
 type claudeLiveStatus struct {
-	SessionID  string                       `json:"session_id"`
-	PaneID     string                       `json:"pane_id"`
-	Model      string                       `json:"model"`
-	Effort     string                       `json:"effort,omitempty"`
-	CWD        string                       `json:"cwd"`
-	Project    string                       `json:"project_dir"`
-	Captured   time.Time                    `json:"captured_at"`
-	RateLimits map[string]claudeQuotaWindow `json:"rate_limits,omitempty"`
+	SessionID    string                       `json:"session_id"`
+	PaneID       string                       `json:"pane_id"`
+	Model        string                       `json:"model"`
+	Effort       string                       `json:"effort,omitempty"`
+	CWD          string                       `json:"cwd"`
+	Project      string                       `json:"project_dir"`
+	Captured     time.Time                    `json:"captured_at"`
+	RateLimits   map[string]claudeQuotaWindow `json:"rate_limits,omitempty"`
+	ContextUsage *contextusage.Counts         `json:"context_usage,omitempty"`
 	// The pane's own account, so the desktop shows this pane that account's
 	// usage when one host runs several Claude accounts (dandy-07, 2026-11-19).
 	AccountScope string `json:"account_scope,omitempty"`
@@ -66,9 +68,10 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 		return errors.New("invalid Claude status pane")
 	}
 	var input struct {
-		SessionID  string          `json:"session_id"`
-		RateLimits json.RawMessage `json:"rate_limits"`
-		Model      struct {
+		SessionID     string          `json:"session_id"`
+		RateLimits    json.RawMessage `json:"rate_limits"`
+		ContextWindow json.RawMessage `json:"context_window"`
+		Model         struct {
 			ID string `json:"id"`
 		} `json:"model"`
 		Effort struct {
@@ -95,6 +98,9 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 	status := claudeLiveStatus{SessionID: input.SessionID, PaneID: pane, Model: input.Model.ID,
 		Effort: input.Effort.Level, CWD: input.CWD, Project: input.Workspace.Project, Captured: time.Now().UTC(),
 		RateLimits: claudeQuotaWindows(input.RateLimits), AccountScope: subscriptionquota.ClaudeAccountScope(home)}
+	if counts := contextusage.Claude(input.ContextWindow); counts.Used != nil || counts.Limit != nil {
+		status.ContextUsage = &counts
+	}
 	data, err := json.Marshal(status)
 	if err != nil {
 		return err

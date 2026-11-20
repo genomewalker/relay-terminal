@@ -3907,6 +3907,7 @@ private struct PaneView: View {
     @ObservedObject private var toolWindows = RelayToolWindowCoordinator.shared
     @EnvironmentObject private var linkSelection: PaneLinkSelection
     @Environment(\.networkCoverActive) private var networkCoverActive
+    @Environment(\.providerContextPresented) private var providerContextPresented
     @ObservedObject var pane: PaneModel
     @ObservedObject private var preferences = RelayPreferences.shared
     let isActive: Bool
@@ -3928,7 +3929,10 @@ private struct PaneView: View {
     @StateObject private var dropPreview = PaneDropPreviewModel()
 
     var body: some View {
-        VStack(spacing: RelayTheme.spacing(0)) {
+        let contextKey = pane.providerContextKey
+        let observesContext = RelayProviderContextWindowReader.presentsContent(size: paneSize,
+            presented: providerContextPresented, covered: networkCoverActive)
+        return VStack(spacing: RelayTheme.spacing(0)) {
             paneHeader
             ZStack {
                 if toolWindows.rPaneIDs.contains(pane.id) && !inToolWindow {
@@ -4056,6 +4060,22 @@ private struct PaneView: View {
                     pane.dismissArtifact(artifact.id)
                 }
                 .frame(height: min(300, max(120, paneSize.height * 0.4)))
+            }
+            if contextKey != nil {
+                Text(pane.providerContext?.label ?? RelayProviderContext.unknown)
+                    .font(RelayViewerMetrics.identifier).foregroundStyle(RelayTheme.textFaint)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.horizontal, RelayViewerMetrics.barPadding).frame(height: 18)
+                    .background(RelayTheme.canvas)
+                    .help("Provider-reported current context tokens and context window")
+                    .accessibilityIdentifier("relay.pane.context-usage")
+            }
+        }
+        .background {
+            if observesContext, let contextKey, !RelayLaunchMode.isRunningTests {
+                RelayProviderContextWindowReader(pane: pane, key: contextKey)
+                    .allowsHitTesting(false).accessibilityHidden(true)
             }
         }
         // A file you asked to see opens in Quick Look, the one viewer for
@@ -6000,6 +6020,7 @@ private struct RBoundedWorkspaceHost: View {
                           placementChanged: { windows.rPanelPlacements[key] = $0; workspace.persistRPresentation() }) {
                 item.content
             }.id(key)
+                .transformEnvironment(\.providerContextPresented) { $0 = $0 && !windows.minimizedRWorkspaces.contains(key) }
                 .opacity(windows.minimizedRWorkspaces.contains(key) ? 0 : 1)
                 .allowsHitTesting(!windows.minimizedRWorkspaces.contains(key))
                 .accessibilityHidden(windows.minimizedRWorkspaces.contains(key))
@@ -6246,7 +6267,8 @@ private struct RStandaloneWorkspace: View {
                     } else {
                         RLayoutResultsDock(runtime: editor.editorRuntime)
                     }
-                }.frame(width: 0, height: 0).hidden()
+                }.environment(\.providerContextPresented, false)
+                    .frame(width: 0, height: 0).hidden()
             }
         }
         }.background(RelayTheme.canvas)
@@ -6262,6 +6284,7 @@ private struct RStandaloneWorkspace: View {
                                   placementChanged: { windows.rPanelPlacements[key] = $0; workspace.persistRPresentation() }) {
                         panel.content
                     }.id(key)
+                        .transformEnvironment(\.providerContextPresented) { $0 = $0 && !windows.minimizedRPanels.contains(key) }
                         .opacity(windows.minimizedRPanels.contains(key) ? 0 : 1)
                         .allowsHitTesting(!windows.minimizedRPanels.contains(key))
                         .accessibilityHidden(windows.minimizedRPanels.contains(key))

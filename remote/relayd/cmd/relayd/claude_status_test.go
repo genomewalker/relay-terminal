@@ -84,3 +84,41 @@ func TestClaudeStatusCaptureNamesThePanesOwnAccount(t *testing.T) {
 		t.Fatal("a business pane was recorded under the personal account")
 	}
 }
+
+func TestClaudeStatusCaptureContextWithQuotaAndNullCurrentUsage(t *testing.T) {
+	const pane = "context-pane"
+	t.Setenv("RELAY_SESSION", pane)
+	home := t.TempDir()
+	path := filepath.Join(home, ".local", "share", "relay", "claude-status", pane+".json")
+	capture := func(window string) claudeLiveStatus {
+		t.Helper()
+		raw := []byte(`{"session_id":"claude-session","model":{"id":"claude"},"cwd":"/work","workspace":{"project_dir":"/work"},"rate_limits":{"five_hour":{"used_percentage":25}},"context_window":` + window + `}`)
+		if err := captureClaudeStatus(pane, raw, home); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var status claudeLiveStatus
+		if err := json.Unmarshal(data, &status); err != nil {
+			t.Fatal(err)
+		}
+		if status.RateLimits["five_hour"].UsedPercentage != 25 {
+			t.Fatalf("quota capture changed: %s", data)
+		}
+		return status
+	}
+	// Shape and counts captured from Claude Code 2.1.321 on 2026-11-20.
+	current := capture(`{"context_window_size":1000000,"total_input_tokens":12634,"used_percentage":1,"current_usage":{"input_tokens":2,"output_tokens":61,"cache_creation_input_tokens":2936,"cache_read_input_tokens":9696}}`).ContextUsage
+	if current == nil || current.Used == nil || *current.Used != 12634 || current.Limit == nil || *current.Limit != 1000000 {
+		t.Fatalf("current context was not captured: %#v", current)
+	}
+	empty := capture(`{"context_window_size":1000000,"current_usage":null,"used_percentage":null,"total_input_tokens":0}`).ContextUsage
+	if empty == nil || empty.Used != nil || empty.Limit == nil || *empty.Limit != 1000000 {
+		t.Fatalf("null current usage should stay unknown: %#v", empty)
+	}
+	if missing := capture(`null`).ContextUsage; missing != nil {
+		t.Fatalf("missing context has counts: %#v", missing)
+	}
+}
