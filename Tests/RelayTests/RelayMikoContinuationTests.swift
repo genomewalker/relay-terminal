@@ -77,6 +77,30 @@ import Combine
         #expect(rotated.contains("Which pane should move?"))
     }
 
+    @Test("Question history reopens and remains readable to an older app")
+    func questionHistoryCompatibility() throws {
+        let dir = try directory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let saved = state()
+        let id = UUID().uuidString
+        do {
+            let journal = try RelayMikoTaskJournal(directory: dir)
+            try journal.create(id: id, state: saved)
+            let op = try journal.begin(id, state: saved, instruction: "Model step", payload: Data())
+            try journal.receive(id, operation: op, outcome: .succeeded, evidence: "Model reply", payload: Data(), state: saved)
+            try journal.finish(id, state: saved, report: "Which pane?", question: "Which pane?")
+        }
+        let reopened = try RelayMikoTaskJournal(directory: dir)
+        #expect(reopened.rows.first?.status == "askedUser")
+        #expect(try reopened.state(id).objective == saved.objective)
+        let index = try JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(contentsOf: dir.appendingPathComponent("history.json")))
+        #expect(index["entries"]?.array?.isEmpty == true)
+        let archives = try FileManager.default.contentsOfDirectory(at: dir.appendingPathComponent("Archive"), includingPropertiesForKeys: nil)
+        let archive = try JSONDecoder().decode(RelayPaneHealthJSON.self, from: Data(contentsOf: #require(archives.first)))
+        #expect(archive["status"]?.string == "waiting")
+        #expect(archive["completionReport"] == nil)
+    }
+
     @Test("Checkpoint retains exact targets and usable schema fields, permits safe refresh")
     func checkpointRetainsOperatorEvidence() throws {
         var saved = state()

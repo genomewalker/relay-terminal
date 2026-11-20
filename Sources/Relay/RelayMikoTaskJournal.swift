@@ -151,6 +151,16 @@ import Darwin
     private struct HistoryIndex: Codable {
         var version = 1
         var entries: [HistoryEntry]
+        // A prior app can open its ordinary history after a preserving rollback.
+        var questions: [Int: HistoryEntry]? = nil
+
+        init(entries all: [HistoryEntry]) {
+            entries = all.filter { $0.status != .askedUser }
+            let questionsByPosition = all.enumerated().filter { $0.element.status == .askedUser }
+            if !questionsByPosition.isEmpty {
+                questions = Dictionary(uniqueKeysWithValues: questionsByPosition.map { ($0.offset, $0.element) })
+            }
+        }
     }
     static let retainedHistoryCount = 32
     private var history: [HistoryEntry] = []
@@ -184,15 +194,21 @@ import Darwin
             let data = try Data(contentsOf: historyURL)
             guard data.count <= 512 * 1024 else { throw Failure.invalidCheckpoint }
             let index = try JSONDecoder().decode(HistoryIndex.self, from: data)
-            guard index.version == 1, index.entries.count <= Self.retainedHistoryCount,
-                  Set(index.entries.map(\.id)).count == index.entries.count,
-                  index.entries.allSatisfy({
+            var entries = index.entries
+            guard entries.count + (index.questions?.count ?? 0) <= Self.retainedHistoryCount else { throw Failure.invalidCheckpoint }
+            for (position, question) in (index.questions ?? [:]).sorted(by: { $0.key < $1.key }) {
+                guard (0...entries.count).contains(position), question.status == .askedUser else { throw Failure.invalidCheckpoint }
+                entries.insert(question, at: position)
+            }
+            guard index.version == 1,
+                  Set(entries.map(\.id)).count == entries.count,
+                  entries.allSatisfy({
                       !$0.id.isEmpty && $0.id.utf8.count <= 128 &&
                       $0.objective.utf8.count <= 1000 && $0.detail.utf8.count <= 1000 &&
                       [.reportedComplete, .askedUser, .cancelled].contains($0.status) &&
                       FileManager.default.fileExists(atPath: archiveURL($0.id).path)
                   }) else { throw Failure.invalidCheckpoint }
-            history = index.entries
+            history = entries
         }
         revision = engine.snapshot.revision
         initialized = true

@@ -46,7 +46,16 @@ public final class RelayMikoTaskEngine {
         public let objective: String
         public let scope: String
         public var checklist: [ChecklistItem]
-        public var status: Status
+        // Older builds can still read a waiting turn during a rollback.
+        fileprivate var storedStatus: Status
+        fileprivate var askedUser: Bool?
+        public var status: Status {
+            get { askedUser == true && storedStatus == .waiting ? .askedUser : storedStatus }
+            set {
+                askedUser = newValue == .askedUser ? true : nil
+                storedStatus = newValue == .askedUser ? .waiting : newValue
+            }
+        }
         public var events: [String: Event]
         public var pending: [String: Event]
         public var operations: [Operation]
@@ -108,7 +117,7 @@ public final class RelayMikoTaskEngine {
         guard snapshot.tasks[id] == nil else { throw Failure.duplicateConflict }
         guard snapshot.tasks.count < Self.maxTasks else { throw Failure.capacity }
         var next = snapshot
-        next.tasks[id] = Task(id: id, objective: objective, scope: scope, checklist: checklist, status: .queued,
+        next.tasks[id] = Task(id: id, objective: objective, scope: scope, checklist: checklist, storedStatus: .queued,
                               events: [:], pending: [:], operations: [], checkpoint: "")
         appendDelta(&next, id, "Task created"); try commit(next)
     }
@@ -370,7 +379,9 @@ public final class RelayMikoTaskEngine {
 
 extension RelayMikoTaskEngine.Task {
     private enum CodingKeys: String, CodingKey {
-        case id, objective, scope, checklist, status, events, pending, operations, checkpoint
+        case id, objective, scope, checklist, events, pending, operations, checkpoint
+        case storedStatus = "status"
+        case askedUser
         case checkpointPayload, archivedOperationCount, completionReport, verificationEvidence
     }
 
@@ -381,7 +392,8 @@ extension RelayMikoTaskEngine.Task {
         objective = try values.decode(String.self, forKey: .objective)
         scope = try values.decode(String.self, forKey: .scope)
         checklist = try values.decode([RelayMikoTaskEngine.ChecklistItem].self, forKey: .checklist)
-        status = try values.decode(RelayMikoTaskEngine.Status.self, forKey: .status)
+        storedStatus = try values.decode(RelayMikoTaskEngine.Status.self, forKey: .storedStatus)
+        askedUser = try values.decodeIfPresent(Bool.self, forKey: .askedUser)
         events = try values.decode([String: RelayMikoTaskEngine.Event].self, forKey: .events)
         pending = try values.decode([String: RelayMikoTaskEngine.Event].self, forKey: .pending)
         operations = try values.decode([RelayMikoTaskEngine.Operation].self, forKey: .operations)
