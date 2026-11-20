@@ -25,6 +25,29 @@ type agentProducer struct {
 
 // Infer the provider root from the sender's kernel ancestry. Claimed PIDs,
 // working directories and transcript timestamps cannot identify a producer.
+// claudeHookLifecycle maps one Claude hook event to the binding lifecycle.
+// Stop means the turn ended and the prompt accepts input again; the
+// conversation composer may send then. Every other notification, such as a
+// permission prompt, means the terminal is waiting for an answer.
+func claudeHookLifecycle(name, notification string) string {
+	switch name {
+	case "Stop":
+		return "stop_observed"
+	case "Notification":
+		if notification == "idle_prompt" {
+			return "quiet"
+		}
+		return "needs_input"
+	case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure":
+		return "active"
+	case "PermissionRequest":
+		return "needs_input"
+	case "SessionEnd":
+		return "exited"
+	}
+	return "unknown"
+}
+
 func verifiedAgentProducer(connection net.Conn, manifest workerManifest, provider string) (agentProducer, error) {
 	uid, sender, err := PeerCredentials(connection)
 	if err != nil || uid != os.Getuid() || sender <= 1 {
@@ -115,23 +138,8 @@ func StoreNativeAgentHook(pane, provider string, raw []byte) error {
 			return err
 		}
 	}
-	state := "unknown"
-	switch name {
-	case "Stop":
-		state = "stop_observed"
-	case "Notification":
-		if hook["notification_type"] == "idle_prompt" {
-			state = "quiet"
-		} else {
-			state = "needs_input"
-		}
-	case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure":
-		state = "active"
-	case "PermissionRequest":
-		state = "needs_input"
-	case "SessionEnd":
-		state = "exited"
-	}
+	notification, _ := hook["notification_type"].(string)
+	state := claudeHookLifecycle(name, notification)
 	if err := server.storeAgentBinding(map[string]any{
 		"session_id": hook["session_id"], "transcript_path": hook["transcript_path"],
 		"lifecycle": state,
@@ -203,23 +211,8 @@ func (server *Server) forwardAuthenticatedAgentEvents(connection, worker net.Con
 		name, _ := event["hook_event_name"].(string)
 		state := "unknown"
 		if provider == "claude" {
-			switch name {
-			case "Stop":
-				state = "stop_observed"
-			case "Notification":
-				notification, _ := event["notification_type"].(string)
-				if notification == "idle_prompt" {
-					state = "quiet"
-				} else {
-					state = "needs_input"
-				}
-			case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure":
-				state = "active"
-			case "PermissionRequest":
-				state = "needs_input"
-			case "SessionEnd":
-				state = "exited"
-			}
+			notification, _ := event["notification_type"].(string)
+			state = claudeHookLifecycle(name, notification)
 		}
 		binding["lifecycle"] = state
 		if err := server.storeAgentBinding(binding, producer); err != nil {

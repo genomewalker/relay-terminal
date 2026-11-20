@@ -2801,7 +2801,7 @@ final class TerminalRuntime: NSObject {
             guard acknowledged, locallyValid() else { return .stagedOnly }
         }
         guard locallyValid(), let final = await revalidate(), final.binding == binding,
-              final.lifecycle == "quiet", Date().timeIntervalSince(final.checkedAt) < 5,
+              final.readyForInput, Date().timeIntervalSince(final.checkedAt) < 5,
               locallyValid(), RelayNativeImageComposer.acknowledges(imagePaths.count,
                 provider: binding.provider, rows: session.readViewportRows() ?? []) else { return .stagedOnly }
         if profile.backend == .relay {
