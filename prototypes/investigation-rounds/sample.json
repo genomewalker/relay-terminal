@@ -1,0 +1,82 @@
+{
+  "sources": {
+    "A": "git merge-base --is-ancestor 186d70e f9ce54c exited 1",
+    "B": "git cherry f9ce54c 186d70e 121235d returned + 186d70ec53a8a60b438c9029caffb356f4bd16fc"
+  },
+  "control": {
+    "model": "sol",
+    "answers": {
+      "A": false,
+      "B": false
+    },
+    "verified": true,
+    "seconds": 16.18,
+    "usage": {
+      "input_tokens": 30310,
+      "cached_input_tokens": 0,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 13,
+      "reasoning_output_tokens": 0
+    }
+  },
+  "branches": [
+    {
+      "model": "sol",
+      "answers": {
+        "A": false
+      },
+      "verified": true,
+      "seconds": 13.98,
+      "usage": {
+        "input_tokens": 30255,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 9,
+        "reasoning_output_tokens": 0
+      }
+    },
+    {
+      "model": "opus",
+      "answers": {
+        "B": false
+      },
+      "verified": true,
+      "seconds": 14.06,
+      "usage": {
+        "input_tokens": 2,
+        "cache_creation_input_tokens": 135112,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 29,
+        "output_tokens_details": {
+          "thinking_tokens": 21
+        },
+        "server_tool_use": {
+          "web_search_requests": 0,
+          "web_fetch_requests": 0
+        },
+        "service_tier": "standard",
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 135112,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "inference_geo": "global",
+        "iterations": [
+          {
+            "input_tokens": 2,
+            "output_tokens": 29,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 135112,
+            "cache_creation": {
+              "ephemeral_5m_input_tokens": 0,
+              "ephemeral_1h_input_tokens": 135112
+            },
+            "type": "message"
+          }
+        ],
+        "speed": "standard",
+        "fallback_credit": null
+      }
+    }
+  ],
+  "round_seconds": 14.06
+}
