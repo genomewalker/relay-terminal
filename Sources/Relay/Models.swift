@@ -654,6 +654,10 @@ final class PaneModel: ObservableObject, Identifiable {
     @Published var programStatus = RelayProgramStatusSnapshot() {
         didSet {
             overviewInputChanged()
+            // A new delivery (reconnect) clears the report until the program
+            // replays it; keep the last state so an unchanged replay keeps
+            // its start. An explicit report, empty or not, always counts.
+            guard programStatus.revision != nil else { return }
             let state = RelayWorkOverviewIndex.mostUrgentProgramState(programStatus.records.map(\.state))
             if state != programPrimary?.state { programPrimary = state.map { .init(state: $0, since: Date()) } }
         }
@@ -677,8 +681,20 @@ final class PaneModel: ObservableObject, Identifiable {
             // The overview fact reads only the detector's phase and kind.
             if detector.phase != oldValue.phase || detector.kind != oldValue.kind { overviewInputChanged() }
             if detector.phase != oldValue.phase {
-                (phaseChangedAt, runStartedAt) = RelayPaneStatusLabel.nextTimer(
-                    old: oldValue.phase, new: detector.phase, lastChange: phaseChangedAt, runStart: runStartedAt, now: Date())
+                if phaseBeforeReconnect != nil, detector.phase == .connecting {
+                    // A reconnect's reset: the timer waits for the next phase.
+                } else if let saved = phaseBeforeReconnect, oldValue.phase == .connecting {
+                    phaseBeforeReconnect = nil
+                    if saved.phase == detector.phase {
+                        (phaseChangedAt, runStartedAt) = (saved.since, saved.runStart)
+                    } else {
+                        (phaseChangedAt, runStartedAt) = RelayPaneStatusLabel.nextTimer(
+                            old: saved.phase, new: detector.phase, lastChange: saved.since, runStart: saved.runStart, now: Date())
+                    }
+                } else {
+                    (phaseChangedAt, runStartedAt) = RelayPaneStatusLabel.nextTimer(
+                        old: oldValue.phase, new: detector.phase, lastChange: phaseChangedAt, runStart: runStartedAt, now: Date())
+                }
             }
             // A wait seen in terminal output; agent events name theirs in raiseWait.
             guard agentEventInProgress == nil, detector.phase == .needsInput, oldValue.phase != .needsInput else { return }
@@ -693,6 +709,9 @@ final class PaneModel: ObservableObject, Identifiable {
     /// Start of the current run of work; survives pauses shorter than
     /// `RelayPaneStatusLabel.pauseGrace`.
     private var runStartedAt: Date?
+    /// The phase and timer a reconnect interrupted; the same phase after the
+    /// reconnect continues the same timer.
+    private var phaseBeforeReconnect: (phase: AgentPhase, since: Date, runStart: Date?)?
     /// The latest wait, so a dismissed wait is told from a later one: the
     /// agent event that asked for the user, which a snapshot replaying that
     /// same event leaves unchanged, or a count of waits seen in terminal output.
@@ -1213,6 +1232,9 @@ final class PaneModel: ObservableObject, Identifiable {
         if let exitNotice { heldExitNotice = exitNotice }
         exitNotice = nil
         connectionState = .connecting
+        if phaseBeforeReconnect == nil, detector.phase != .connecting {
+            phaseBeforeReconnect = (detector.phase, phaseChangedAt, runStartedAt)
+        }
         detector = AgentSignalDetector()
     }
 

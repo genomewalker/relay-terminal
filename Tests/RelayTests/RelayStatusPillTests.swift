@@ -81,6 +81,49 @@ struct RelayStatusPillTests {
         #expect(pane.programStatusPrimary == nil, "a report over a lost connection is not current")
     }
 
+    /// Side-agent review 2026-11-20: a reconnect starts a new delivery, which
+    /// clears the report until the program replays it. The same state after
+    /// the replay keeps its start; a different state starts a new timer.
+    @Test func aReconnectKeepsTheProgramTimerWhenTheStateIsUnchanged() throws {
+        let pane = PaneModel(profile: Self.host, customName: "codex", directory: "/tmp")
+        pane.connectionState = .connected
+        let working = try Self.records(#"[{"id":"a","state":"working"}]"#)
+        pane.programStatus.applyTransportStatus(
+            RelayStatus(state: "program_status", programStatus: working, programStatusRevision: 7), deliveryEpoch: UUID())
+        let first = try #require(pane.programStatusPrimary)
+        pane.connectionState = .reconnecting("link")
+        let epoch = UUID()
+        pane.programStatus.applyTransportStatus(RelayStatus(state: "attached"), deliveryEpoch: epoch)
+        pane.connectionState = .connected
+        #expect(pane.programStatusPrimary == nil, "no current report until the replay")
+        pane.programStatus.applyTransportStatus(
+            RelayStatus(state: "program_status", programStatus: working, programStatusRevision: 1), deliveryEpoch: epoch)
+        #expect(pane.programStatusPrimary == first, "the replayed state keeps its start")
+        pane.programStatus.applyTransportStatus(RelayStatus(state: "attached"), deliveryEpoch: UUID())
+        let idle = try Self.records(#"[{"id":"a","state":"idle"}]"#)
+        let next = UUID()
+        pane.programStatus.applyTransportStatus(
+            RelayStatus(state: "program_status", programStatus: idle, programStatusRevision: 1), deliveryEpoch: next)
+        #expect(pane.programStatusPrimary?.state == "idle")
+        pane.programStatus.applyTransportStatus(
+            RelayStatus(state: "program_status", programStatus: [], programStatusRevision: 2), deliveryEpoch: next)
+        #expect(pane.programStatusPrimary == nil, "an explicit empty report clears it")
+    }
+
+    /// A reconnect resets the output detector to Connecting, and connecting
+    /// again marks the agent active. Working before and after keeps the run.
+    @Test func aReconnectKeepsTheRunningTimerOfAWorkingAgent() throws {
+        let pane = PaneModel(profile: Self.host, customName: "claude", directory: "/tmp")
+        pane.connected()
+        #expect(pane.phase == .active)
+        let start = pane.phaseChangedAt
+        pane.reconnecting()
+        #expect(pane.phase == .connecting)
+        pane.connected()
+        #expect(pane.phase == .active)
+        #expect(pane.phaseChangedAt == start, "the run continues across the reconnect")
+    }
+
     static func records(_ json: String) throws -> [RelayProgramStatusRecord] {
         try JSONDecoder().decode([RelayProgramStatusRecord].self, from: Data(json.utf8))
     }
