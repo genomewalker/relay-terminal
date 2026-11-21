@@ -3566,6 +3566,28 @@ final class TerminalRuntime: NSObject {
         return false
     }
 
+    /// How long a fresh redraw may take to bring the agent's own screen.
+    nonisolated static let freshRedrawSettleLimit: TimeInterval = 10
+
+    /// Waits for a hidden pane's saved screen to be non-blank with output
+    /// quiet for `hiddenBounceQuiet`, up to `limit`.
+    private func awaitSettledNonBlankHiddenScreen(_ pane: PaneModel, limit: TimeInterval) async -> Bool {
+        var lastSequence: UInt64?
+        var quietSince = Date()
+        let deadline = Date().addingTimeInterval(limit)
+        while Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(100))
+            guard self.pane === pane else { return false }
+            guard case .available = io.maintenanceScreenAvailability() else { continue }
+            let sequence = io.maintenanceScreenSnapshot()?.token.sequence
+            if sequence != lastSequence { lastSequence = sequence; quietSince = Date(); continue }
+            if Self.hiddenBounceSettled(sequenceAvailable: sequence != nil,
+                                        quietFor: Date().timeIntervalSince(quietSince)),
+               !(await hiddenScreenIsBlank()) { return true }
+        }
+        return false
+    }
+
     /// How long a bounced hidden pane's output must stay unchanged before
     /// its screen is proven, and the bound on waiting for that.
     nonisolated static let hiddenBounceQuiet: TimeInterval = 1
@@ -4162,7 +4184,11 @@ final class TerminalRuntime: NSObject {
                 if outcome.hasPrefix("refused") { hiddenScreenRefreshNote = "the worker " + outcome; break }
                 if outcome.hasPrefix("done") { done = true; break }
             }
-            if done, case .available = io.maintenanceScreenAvailability(), !(await hiddenScreenIsBlank()) {
+            // fresh_redraw_done marks the reset; the agent's own redraw can
+            // follow seconds later (8baea771 on 0.5.149: done at 09:27:13 with
+            // 163 blank bytes, Codex's redraw at 09:27:32). Prove only a
+            // non-blank screen whose output has been quiet.
+            if done, await awaitSettledNonBlankHiddenScreen(pane, limit: Self.freshRedrawSettleLimit) {
                 hiddenScreenRefreshNote = nil
                 return true
             }
