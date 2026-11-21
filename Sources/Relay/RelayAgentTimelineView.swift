@@ -262,8 +262,13 @@ struct RelayAgentTimelineView: View {
             composerState.restoreIfNeeded(hostID: draftHostID, paneID: pane.id)
             store.visible = true; await store.refresh()
             refreshTerminalFooter()
+            // Messages held while this view was closed go out once it is ready.
+            deliverNextQueued()
         }
-        .onChange(of: composerFocused) { _, focused in pane.runtime.conversationComposerOwnsFocus = focused }
+        .onChange(of: composerFocused) { _, focused in
+            pane.runtime.conversationComposerOwnsFocus = focused
+            if focused { deliverNextQueued() }
+        }
         .onDisappear {
             pane.runtime.conversationComposerOwnsFocus = false
             if !draft.isEmpty || !attachmentQueue.attachments.isEmpty { persistDraft(immediate: true) }
@@ -326,12 +331,18 @@ struct RelayAgentTimelineView: View {
             if let window = event.object as? NSWindow, window.identifier?.rawValue == "relay.agent." + pane.id.uuidString, !store.visible {
                 store.visible = true; Task { await store.refresh() }
             }
+            if let window = event.object as? NSWindow, window.identifier?.rawValue == "relay.agent." + pane.id.uuidString {
+                deliverNextQueued()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { event in
             if let window = event.object as? NSWindow, window.identifier?.rawValue == "relay.agent." + pane.id.uuidString {
                 if !draft.isEmpty || !attachmentQueue.attachments.isEmpty { persistDraft(immediate: true) }
                 store.stop()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            deliverNextQueued()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             if !draft.isEmpty || !attachmentQueue.attachments.isEmpty { persistDraft(immediate: true) }
@@ -828,8 +839,10 @@ struct RelayAgentTimelineView: View {
 
     private var composerHint: String {
         if let reason = queue.pausedReason { return reason }
-        if !queue.isEmpty, deliveryReady { return "Sending the next held message…" }
-        if !queue.isEmpty { return "Held messages send one at a time when the agent is idle." }
+        if !queue.isEmpty, deliveryReady, pane.runtime.conversationComposerHasKeyFocus(paneID: pane.id) {
+            return "Sending the next held message…"
+        }
+        if !queue.isEmpty { return "Held messages send one at a time when the agent is idle and this composer has focus." }
         if canQueue { return "↩ holds this message until the agent is idle" }
         if let submissionStatus { return submissionStatus }
         if let failure = attachmentQueue.intakeFailure { return failure }
@@ -1080,8 +1093,13 @@ struct RelayAgentTimelineView: View {
     /// Sends the oldest held message once the agent confirms idle. The message
     /// leaves the queue in the same main-actor step that marks the composer as
     /// submitting, so the pane and its separate window can never both send it.
+    /// Like any composer send it types into the terminal only while this
+    /// composer has focus; until then the message waits, unpaused. A closed
+    /// view sends nothing; the pane header shows what is held.
     private func deliverNextQueued() {
-        guard deliveryReady, !stopRequested, let next = queue.takeNext(for: store.conversation.binding) else { return }
+        guard !queue.isEmpty, deliveryReady, !stopRequested,
+              pane.runtime.conversationComposerHasKeyFocus(paneID: pane.id),
+              let next = queue.takeNext(for: store.conversation.binding) else { return }
         submit(queued: next)
     }
 

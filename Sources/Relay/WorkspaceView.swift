@@ -5277,6 +5277,7 @@ struct ConnectionPath: View {
                         .foregroundStyle(RelayTheme.coral)
                         .accessibilityLabel("\(pane.pendingAgentApprovals) pending agent approvals")
                 }
+                RelayHeldMessagesBadge(pane: pane, open: toggleConversation)
                 if let usage = pane.agentResourceUsage {
                     Text("\(usage.inputTokens + usage.outputTokens) tok")
                         .font(RelayTheme.font(size: 11, weight: .medium, design: .monospaced))

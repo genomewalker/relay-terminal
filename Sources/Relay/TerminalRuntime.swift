@@ -2728,14 +2728,21 @@ final class TerminalRuntime: NSObject {
         RelayAgentTerminalFooter.rows(provider: provider, screen: session.readViewportRows() ?? [])
     }
 
+    /// The pane's conversation composer is where the user is typing: its own
+    /// window is key, or the in-pane composer has focus in the pane's window.
+    /// Composer sends type into the terminal only then. Held messages wait for it.
+    func conversationComposerHasKeyFocus(paneID: UUID) -> Bool {
+        NSApp.keyWindow?.identifier?.rawValue == "relay.agent." + paneID.uuidString ||
+            (conversationComposerOwnsFocus && NSApp.keyWindow === view.window)
+    }
+
     /// The first condition that blocks a composer send, or nil when it may send.
     private func conversationPromptRefusal(_ text: String, paneID: UUID, rootPID: Int,
                                            control: RelayAgentConversationControl) -> String? {
         guard let pane, pane.id == paneID else { return "pane" }
         guard pane.profile.kind == .local || pane.profile.backend == .relay else { return "profile" }
         guard NSApp.isActive else { return "app_inactive" }
-        guard NSApp.keyWindow?.identifier?.rawValue == "relay.agent." + paneID.uuidString ||
-              (conversationComposerOwnsFocus && NSApp.keyWindow === view.window) else { return "focus" }
+        guard conversationComposerHasKeyFocus(paneID: paneID) else { return "focus" }
         guard control.permitsSend else { return "lifecycle" }
         guard control.binding.paneID == paneID,
               control.binding.hostID == pane.profile.id.uuidString else { return "binding" }

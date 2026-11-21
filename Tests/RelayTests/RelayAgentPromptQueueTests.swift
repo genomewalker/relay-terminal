@@ -108,4 +108,10 @@ final class RelayAgentPromptQueueTests: XCTestCase {
         XCTAssertEqual(restored.draft, "held")
         XCTAssertTrue(restored.queue.isEmpty)
     }
+
+    func testHeaderBadgeNamesCountAndPause() {
+        XCTAssertEqual(RelayHeldMessagesBadge.title(count: 2, paused: false), "2 held")
+        XCTAssertEqual(RelayHeldMessagesBadge.title(count: 1, paused: true), "1 held · paused")
+        XCTAssertTrue(RelayHeldMessagesBadge.help(paused: false).contains("Open the conversation"))
+    }
 }
