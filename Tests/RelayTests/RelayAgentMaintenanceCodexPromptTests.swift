@@ -234,3 +234,25 @@ struct RelayHiddenRepaintRefusalTests {
     }
 
 }
+
+/// fd02259a on dandy-07 (2026-11-21 09:01:54-09:02:01Z): each attach reset the
+/// retry count, so a route closed during every replay reopened every 250 ms.
+@Suite("Route-closed reopen backs off across attaches")
+struct RelayRouteClosedBackoffTests {
+    @Test func closuresWithinTheWindowGrowTheDelay() {
+        var streak = 0
+        var delays: [Int] = []
+        for _ in 0..<7 {
+            streak = RelayPaneAttachPolicy.routeClosedStreak(previous: streak, secondsSinceLast: streak == 0 ? nil : 0.3)
+            delays.append(RelayPaneAttachPolicy.routeClosedDelayMilliseconds(streak: streak))
+        }
+        #expect(delays == [250, 500, 1_000, 2_000, 4_000, 4_000, 4_000])
+    }
+
+    @Test func aRouteThatStayedUpStartsAFreshStreak() {
+        #expect(RelayPaneAttachPolicy.routeClosedStreak(previous: 5, secondsSinceLast: 31) == 1)
+        #expect(RelayPaneAttachPolicy.routeClosedStreak(previous: 5, secondsSinceLast: nil) == 1)
+        #expect(RelayPaneAttachPolicy.routeClosedStreak(previous: 5, secondsSinceLast: -1) == 1)
+        #expect(RelayPaneAttachPolicy.routeClosedDelayMilliseconds(streak: 1) == 250)
+    }
+}

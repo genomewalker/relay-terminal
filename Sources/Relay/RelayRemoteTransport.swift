@@ -192,6 +192,22 @@ enum RelayPaneAttachPolicy {
         return min(5_000, 250 * (1 << min(max(0, attempt - 1), 4)))
     }
 
+    /// Route closures that follow one another within this window form one
+    /// streak. A successful attach resets the ordinary retry count, so without
+    /// the streak a route closed during each replay reopened every 250 ms
+    /// (fd02259a on dandy-07, 2026-11-21: 21 reopenings in 7 s, each sending
+    /// its full replay into the shared, already full node queue).
+    static let routeClosedStreakWindow: TimeInterval = 30
+
+    static func routeClosedStreak(previous: Int, secondsSinceLast: TimeInterval?) -> Int {
+        guard let secondsSinceLast, secondsSinceLast >= 0, secondsSinceLast < routeClosedStreakWindow else { return 1 }
+        return previous + 1
+    }
+
+    static func routeClosedDelayMilliseconds(streak: Int) -> Int {
+        min(5_000, 250 * (1 << min(max(0, streak - 1), 4)))
+    }
+
     static func shouldUseDedicatedTransport(stalls: Int) -> Bool {
         stalls >= dedicatedTransportAfterStalls
     }
@@ -298,6 +314,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private var onViewportCommitted: (@Sendable (UInt64, UUID) -> Void)?
     private var sessionEnded = false
     private var attachRetryCount = 0
+    /// Not reset by an attach: see RelayPaneAttachPolicy.routeClosedStreak.
+    private var routeClosedStreak = 0
+    private var lastRouteClosedUptime: TimeInterval?
     private var attachRetryScheduled = false
     /// Hellos the shared node left unanswered since the last attach.
     private var handshakeStallCount = 0
@@ -790,13 +809,18 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 let shouldRecover = !detached && !sessionEnded
                 deliveryEpoch = UUID()
                 attached = false
+                let now = ProcessInfo.processInfo.systemUptime
+                routeClosedStreak = RelayPaneAttachPolicy.routeClosedStreak(previous: routeClosedStreak,
+                    secondsSinceLast: lastRouteClosedUptime.map { now - $0 })
+                lastRouteClosedUptime = now
+                let streakDelay = RelayPaneAttachPolicy.routeClosedDelayMilliseconds(streak: routeClosedStreak)
                 lock.unlock()
                 guard shouldRecover else { return }
                 context.onStatus(RelayStatus(
                     state: "reconnecting",
                     message: "This pane fell behind a fast terminal redraw; replaying its current screen."
                 ), deliveryEpochSnapshot())
-                scheduleMultiplexedRetry(context, reason: .routeClosed)
+                scheduleMultiplexedRetry(context, reason: .routeClosed, minimumDelayMilliseconds: streakDelay)
                 return
             }
             if decoded.state == "exited" || decoded.state == "error" { markSessionEnded() }
@@ -847,7 +871,8 @@ final class RelayRemoteTransport: @unchecked Sendable {
 
     private func scheduleMultiplexedRetry(
         _ context: RelayConnectionContext,
-        reason: RelayMultiplexedRetryReason
+        reason: RelayMultiplexedRetryReason,
+        minimumDelayMilliseconds: Int = 0
     ) {
         let waitingForInputLease = reason == .inputLease
         lock.lock()
@@ -870,10 +895,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let attempt = attachRetryCount
         lock.unlock()
 
-        let delay = RelayPaneAttachPolicy.retryDelayMilliseconds(
+        let delay = max(minimumDelayMilliseconds, RelayPaneAttachPolicy.retryDelayMilliseconds(
             attempt: attempt,
             waitingForInputLease: waitingForInputLease
-        )
+        ))
         context.onStatus(RelayStatus(
             state: "reconnecting",
             message: waitingForInputLease

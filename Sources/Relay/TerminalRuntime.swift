@@ -4141,15 +4141,33 @@ final class TerminalRuntime: NSObject {
         return [.draftPresent, .promptUnverified, .noRendererForIdleProof].contains(refusal.code)
     }
 
-    /// One full repaint of a hidden pane's agent: the one-row bounce, a real
-    /// size change that makes the agent clear and redraw at its own grid, then
-    /// a settled, non-blank screen (f52d610f). Same guards as the
+    /// One clean screen for a hidden pane before a screen-derived refusal
+    /// stands. First the worker's fresh redraw: a reset plus the agent's own
+    /// redraw, committed as a new base with none of the old replay, so output
+    /// written at another width cannot scramble it (8baea771). Codex redraws
+    /// nothing at an unchanged grid (f52d610f), so a blank or refused fresh
+    /// screen falls back to the one-row bounce. Same guards as the
     /// installed-update refresh: connected, no surface, no other viewer.
     /// Nothing is typed.
     private func repaintHiddenScreen(_ pane: PaneModel) async -> Bool {
         guard pane.profile.backend == .relay, pane.connectionState == .connected, started,
               observeActiveScreen() == .noSurface, (pane.remoteClientCount ?? 1) <= 1 else { return false }
         recordInputDiagnostic("hidden-screen-repaint-for-resume-proof")
+        if io.requestFreshRedraw() {
+            var done = false
+            for _ in 0..<60 {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard self.pane === pane else { return false }
+                guard let outcome = io.freshRedrawOutcome else { continue }
+                if outcome.hasPrefix("refused") { hiddenScreenRefreshNote = "the worker " + outcome; break }
+                if outcome.hasPrefix("done") { done = true; break }
+            }
+            if done, case .available = io.maintenanceScreenAvailability(), !(await hiddenScreenIsBlank()) {
+                hiddenScreenRefreshNote = nil
+                return true
+            }
+        }
+        guard self.pane === pane, observeActiveScreen() == .noSurface else { return false }
         return await bounceHiddenScreenRows(pane)
     }
 
