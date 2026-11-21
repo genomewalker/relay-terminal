@@ -219,29 +219,18 @@ struct RelayCodexDisplayNameStatusLineTests {
     }
 }
 
-/// 8baea771 on dandy-07 after the 0.5.147 install (2026-11-21 08:41Z): the
-/// saved copy showed the placeholder without its faint style. It stays a draft
-/// (thePlaceholderWordsWithoutFaintStyleAreADraft); it is recognized only so the
-/// resume can ask for a full repaint instead of refusing as draft_present.
-@Suite("Codex placeholder that lost its style")
-struct RelayCodexUnstyledPlaceholderTests {
-    static let footer = "\r\n\r\n  Rosalind-6 Research high · Context 67% left · /maps/projects/faro-platform · f…\r\n" +
-        "  ← for agents · ? for shortcuts                                         ⚠ 7 warnings · f2 to view"
-    static let header = "› You are the FARO Rosalind scientific adviser on the BUSINESS account. Your sole role is…\r\n" +
-        "  Worked for 41s • 2:05 PM\r\n\r\n\r\n"
-
-    @Test func anUnstyledPlaceholderIsRecognizedButStaysADraft() {
-        let screen = Self.header + "› Ask Codex to do anything" + Self.footer
-        #expect(RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(screen))
-        #expect(RelayAgentMaintenancePrompt.hasTypedText(screen, provider: "codex"))
-        #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex"))
+/// 8baea771 on 0.5.148 (2026-11-21 08:57Z): a hidden pane's saved copy replayed
+/// at another width; the last "›" row was a transcript fragment. Screen-derived
+/// refusals of a hidden pane get one full repaint before they stand.
+@Suite("Hidden pane repaint before a screen-derived refusal")
+struct RelayHiddenRepaintRefusalTests {
+    @Test func onlyScreenDerivedRefusalsAskForARepaint() {
+        #expect(TerminalRuntime.hiddenScreenRefusalNeedsRepaint(RelayPaneOperationRefusal(.draftPresent, "typed")))
+        #expect(TerminalRuntime.hiddenScreenRefusalNeedsRepaint(RelayPaneOperationRefusal(.promptUnverified, "unrecognized")))
+        #expect(TerminalRuntime.hiddenScreenRefusalNeedsRepaint(RelayPaneOperationRefusal(.noRendererForIdleProof, "blank")))
+        #expect(!TerminalRuntime.hiddenScreenRefusalNeedsRepaint(RelayPaneOperationRefusal(.approvalPending, "approval")))
+        #expect(!TerminalRuntime.hiddenScreenRefusalNeedsRepaint(RelayPaneOperationRefusal(.unsupportedPane, "input only")))
+        #expect(!TerminalRuntime.hiddenScreenRefusalNeedsRepaint(nil))
     }
 
-    @Test func aStyledPlaceholderOrRealTextIsNotThatCase() {
-        let styled = Self.header + "› \u{1b}[2mAsk Codex to do anything\u{1b}[22m" + Self.footer
-        #expect(!RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(styled))
-        #expect(RelayAgentMaintenancePrompt.isEmpty(styled, provider: "codex"))
-        let typed = Self.header + "› Ask Codex to do anything else" + Self.footer
-        #expect(!RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(typed))
-    }
 }

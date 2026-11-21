@@ -4114,19 +4114,18 @@ final class TerminalRuntime: NSObject {
         if let snapshot = io.maintenanceScreenSnapshot() {
             vt = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport)
         } else if case .screen(let screen, _) = observeActiveScreen() { vt = screen }
-        // A hidden Codex pane whose saved copy shows the placeholder without its
-        // faint style (a byte replay that lost it, 8baea771) is repainted in
-        // full once, nothing typed, and proven again from the repaint.
-        if expected.provider == "codex", observeActiveScreen() == .noSurface,
-           RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(vt) {
-            if let pane, await repaintHiddenScreen(pane),
+        // A hidden pane's saved copy is a byte replay. Output written at another
+        // width replays scrambled (8baea771 on 0.5.148: the composer row was
+        // overwritten and a transcript fragment followed the last "›"). Before a
+        // screen-derived refusal, ask the worker once for a fresh screen (a reset
+        // and the agent's own redraw, nothing typed) and prove again from it.
+        if observeActiveScreen() == .noSurface, let current = pane,
+           Self.hiddenScreenRefusalNeedsRepaint(Self.agentResumePromptBlocker(expected: expected, vt: vt,
+               pendingApprovals: current.pendingAgentApprovals, composerBusy: false)) {
+            if await repaintHiddenScreen(current),
                let token = await agentResumePromptProof(expected: expected) { return (token, nil) }
             if let snapshot = io.maintenanceScreenSnapshot() {
                 vt = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport)
-            }
-            if RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(vt) {
-                return (nil, .init(.promptUnverified, "the saved screen shows Codex's placeholder without its style, " +
-                    "and a full repaint did not restore it" + (hiddenScreenRefreshNote.map { " (" + $0 + ")" } ?? "")))
             }
         }
         guard let pane else { return (nil, .init(.paneChanged, "the pane closed")) }
@@ -4135,12 +4134,22 @@ final class TerminalRuntime: NSObject {
             composerBusy: busy) ?? .init(.promptUnverified, "the screen changed while it was proven"))
     }
 
-    /// One full repaint of a hidden pane's agent by the one-row bounce, under
-    /// the same guards as the installed-update refresh: connected, no surface,
-    /// no other viewer. Nothing is typed.
+    /// Refusals read from the screen itself, which a scrambled replay can fake.
+    /// Approvals, Relay's own composer and the provider kind do not depend on it.
+    nonisolated static func hiddenScreenRefusalNeedsRepaint(_ refusal: RelayPaneOperationRefusal?) -> Bool {
+        guard let refusal else { return false }
+        return [.draftPresent, .promptUnverified, .noRendererForIdleProof].contains(refusal.code)
+    }
+
+    /// One full repaint of a hidden pane's agent: the one-row bounce, a real
+    /// size change that makes the agent clear and redraw at its own grid, then
+    /// a settled, non-blank screen (f52d610f). Same guards as the
+    /// installed-update refresh: connected, no surface, no other viewer.
+    /// Nothing is typed.
     private func repaintHiddenScreen(_ pane: PaneModel) async -> Bool {
         guard pane.profile.backend == .relay, pane.connectionState == .connected, started,
               observeActiveScreen() == .noSurface, (pane.remoteClientCount ?? 1) <= 1 else { return false }
+        recordInputDiagnostic("hidden-screen-repaint-for-resume-proof")
         return await bounceHiddenScreenRows(pane)
     }
 
