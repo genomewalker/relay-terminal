@@ -50,8 +50,17 @@ struct RelayAgentMessageView: View {
                 if item.role == .tool {
                     RelayAgentToolRow(axID: axID, name: "Output", status: "completed", summary: text)
                 } else {
-                    RelayAgentProse(axID: axID, source: text)
-                    ForEach(Array(RelayAgentArtifactReferences.paths(in: text).enumerated()), id: \.element) { artifact, path in
+                    let segments = RelayAgentInlineImages.segments(text)
+                    ForEach(Array(segments.enumerated()), id: \.offset) { part, segment in
+                        switch segment {
+                        case .text(let prose): RelayAgentProse(axID: part == 0 ? axID : axID + ".part." + String(part), source: prose)
+                        case .image(let path, let alt):
+                            RelayAgentInlineImageView(axID: axID + ".image." + String(part), pane: pane, path: path, alt: alt,
+                                                      baseDirectory: artifactBaseDirectory)
+                        }
+                    }
+                    let inline = Set(segments.compactMap { if case .image(let path, _) = $0 { return path } else { return nil } })
+                    ForEach(Array(RelayAgentArtifactReferences.paths(in: text).filter { !inline.contains($0) }.enumerated()), id: \.element) { artifact, path in
                         RelayAgentArtifactView(axID: axID + ".artifact." + String(artifact), pane: pane, path: path, baseDirectory: artifactBaseDirectory)
                     }
                 }
@@ -532,6 +541,101 @@ enum RelayAgentArtifactReferences {
             }
         }
         return paths
+    }
+}
+
+/// Splits a message around Markdown images of files, outside code fences and display math,
+/// so each picture is drawn in place whichever renderer draws the surrounding text.
+enum RelayAgentInlineImages {
+    enum Segment: Equatable { case text(String), image(path: String, alt: String) }
+    static let extensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "svg"]
+    static func segments(_ source: String) -> [Segment] {
+        guard source.contains("!["), source.utf8.count <= 1_048_576 else { return [.text(source)] }
+        var result: [Segment] = []
+        var text: [String] = []
+        var fence: String?
+        var images = 0
+        func flush() {
+            let joined = text.joined(separator: "\n")
+            if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { result.append(.text(joined)) }
+            text.removeAll()
+        }
+        for line in source.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let open = fence {
+                text.append(line); if trimmed == open { fence = nil }; continue
+            }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                fence = String(trimmed.prefix { $0 == trimmed.first }); text.append(line); continue
+            }
+            if trimmed == "$$" || trimmed == "\\[" { fence = trimmed == "$$" ? "$$" : "\\]"; text.append(line); continue }
+            var found: [(String, String)] = []
+            var rest = line
+            for match in line.matches(of: /!\[([^\]\n]{0,256})\]\(([^\s()]{1,4096})\)/) {
+                let raw = String(match.2)
+                guard images < 16, !raw.contains("://"), !raw.hasPrefix("data:"), !raw.contains("\u{0000}") else { continue }
+                let path = raw.removingPercentEncoding ?? raw
+                guard extensions.contains(TerminalPathSyntax.pathExtension(path).lowercased()) else { continue }
+                found.append((path, String(match.1))); images += 1
+                rest = rest.replacingOccurrences(of: String(match.0), with: "")
+            }
+            guard !found.isEmpty else { text.append(line); continue }
+            if rest.firstMatch(of: /^\s*(?:[-*+>]|\d{1,9}[.)])?\s*$/) == nil { text.append(rest) }
+            flush()
+            result.append(contentsOf: found.map { Segment.image(path: $0.0, alt: $0.1) })
+        }
+        flush()
+        return result.isEmpty ? [.text(source)] : result
+    }
+}
+
+/// A picture referenced by the message, read through the pane's own host so remote
+/// panes show their files. Bytes load when the row appears and are released when it leaves.
+struct RelayAgentInlineImageView: View {
+    let axID: String
+    @ObservedObject var pane: PaneModel
+    let path: String
+    let alt: String
+    var baseDirectory: String? = nil
+    @State private var artifact: PaneArtifact?
+    @State private var image: NSImage?
+    @State private var failure: String?
+    var body: some View {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+            if let image {
+                Button { if let artifact { pane.presentRequestedArtifact(artifact) } } label: {
+                    Image(nsImage: image).resizable().scaledToFit()
+                        .frame(maxWidth: min(560, max(1, image.size.width)), maxHeight: 360, alignment: .leading)
+                        .clipShape(RoundedRectangle(cornerRadius: RelayAgentDesign.radius))
+                }
+                .buttonStyle(.plain)
+                .help("Open in pane preview")
+                .accessibilityLabel(alt.isEmpty ? "Image " + TerminalPathSyntax.lastComponent(path) : alt)
+                .accessibilityIdentifier(axID)
+                if !alt.isEmpty {
+                    Text(alt).font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.secondaryInk)
+                }
+            } else if let failure {
+                Label((alt.isEmpty ? TerminalPathSyntax.lastComponent(path) : alt) + ": " + failure, systemImage: "photo")
+                    .font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.secondaryInk).help(path)
+            } else {
+                ProgressView(alt.isEmpty ? TerminalPathSyntax.lastComponent(path) : alt).controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .task(id: path) { await load() }
+        .onDisappear { image = nil; artifact = nil; failure = nil }
+    }
+    @MainActor private func load() async {
+        let resolved = TerminalPathSyntax.resolving(path, against: baseDirectory ?? pane.directory ?? "/")
+        do {
+            let data = try await RemoteArtifactLoader.load(path: resolved, profile: pane.profile)
+            try Task.checkCancellation()
+            let loaded = PaneArtifact(remotePath: resolved, data: data)
+            guard let picture = loaded.image else { failure = "not a readable image"; return }
+            artifact = loaded; image = picture
+        } catch is CancellationError {
+        } catch { failure = error.localizedDescription }
     }
 }
 

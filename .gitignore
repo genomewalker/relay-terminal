@@ -7,4 +7,6 @@ Relay [0-9]*.app
 *.xcuserstate
 remote/relayd/relayd
 dist/
+!Sources/Relay/Resources/RichContent/katex/dist/
+!Sources/Relay/Resources/RichContent/mermaid/dist/
 benchmark-results/

@@ -2716,6 +2716,11 @@ final class TerminalRuntime: NSObject {
             session.readViewportRows().map { RelayNativeImageComposer.promptIsEmpty(provider: provider, rows: $0) } ?? false)
     }
 
+    /// The status rows under the provider's input box, as the terminal shows them now.
+    func conversationTerminalFooter(provider: String) -> [String] {
+        RelayAgentTerminalFooter.rows(provider: provider, screen: session.readViewportRows() ?? [])
+    }
+
     /// The first condition that blocks a composer send, or nil when it may send.
     private func conversationPromptRefusal(_ text: String, paneID: UUID, rootPID: Int,
                                            control: RelayAgentConversationControl) -> String? {

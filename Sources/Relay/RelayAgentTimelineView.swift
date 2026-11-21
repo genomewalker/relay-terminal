@@ -190,6 +190,8 @@ struct RelayAgentTimelineView: View {
     @FocusState private var searchFocused: Bool
     /// The tool call Agent details asked for, outlined until the next request.
     @State private var focusedItem: String?
+    /// Rows the terminal shows under the agent's input box (cc-status, mode, model line).
+    @State private var terminalFooter: [String] = []
     init(pane: PaneModel, store: RelayAgentTimelineStore? = nil) {
         self.pane = pane; _store = StateObject(wrappedValue: store ?? RelayAgentTimelineStore(pane: pane))
         _composerState = ObservedObject(wrappedValue: pane.composerState)
@@ -246,6 +248,7 @@ struct RelayAgentTimelineView: View {
         .task {
             composerState.restoreIfNeeded(hostID: draftHostID, paneID: pane.id)
             store.visible = true; await store.refresh()
+            refreshTerminalFooter()
         }
         .onChange(of: composerFocused) { _, focused in pane.runtime.conversationComposerOwnsFocus = focused }
         .onDisappear {
@@ -277,6 +280,7 @@ struct RelayAgentTimelineView: View {
         // without starting a timer or a second provider session.
         .onReceive(pane.objectWillChange.throttle(for: .milliseconds(750), scheduler: RunLoop.main, latest: true)) { _ in
             Task { await store.refreshLive() }
+            refreshTerminalFooter()
         }
         .onChange(of: store.conversation.binding) { _, _ in closeSearch() }
         .onChange(of: contentSignature) { _, _ in if searching { updateMatches(keepCurrent: true) } }
@@ -796,8 +800,36 @@ struct RelayAgentTimelineView: View {
         return "Sends through the original terminal · ⌘↩"
     }
 
+    private func refreshTerminalFooter() {
+        let provider = store.conversation.binding?.provider ?? ""
+        let rows = provider.isEmpty ? [] : pane.runtime.conversationTerminalFooter(provider: provider)
+        if rows != terminalFooter { terminalFooter = rows }
+    }
+
+    /// The terminal's own status rows, copied as text so plugins such as cc-status
+    /// stay visible while the conversation view covers the terminal.
+    @ViewBuilder private var terminalFooterStrip: some View {
+        if !terminalFooter.isEmpty {
+            VStack(alignment: .leading, spacing: RelayTheme.spacing(1)) {
+                ForEach(Array(terminalFooter.enumerated()), id: \.offset) { _, row in
+                    Text(row).font(RelayTheme.font(size: 11, design: .monospaced))
+                        .foregroundStyle(RelayAgentDesign.tertiaryInk)
+                        .lineLimit(1).truncationMode(.tail)
+                }
+            }
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, RelayTheme.spacing(12)).padding(.top, RelayTheme.spacing(8))
+            .help("Status rows under the agent's prompt in the terminal")
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Terminal status: " + terminalFooter.joined(separator: ", "))
+            .accessibilityIdentifier("relay.agent.terminal-status")
+        }
+    }
+
     private var composer: some View {
         VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
+            terminalFooterStrip
             if !attachmentQueue.attachments.isEmpty { attachmentList }
             if nativeDeliveryHeld {
                 Button("Resolve submission…") { showingHeldResolution = true }

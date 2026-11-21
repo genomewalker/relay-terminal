@@ -62,3 +62,23 @@ import Testing
     #expect(text.runs.contains { $0.inlinePresentationIntent?.contains(.strikethrough) == true })
     #expect(text.runs.contains { $0.inlinePresentationIntent?.contains(.code) == true && $0.backgroundColor != nil })
 }
+
+@Test func terminalFooterCopiesStatusRowsUnderTheInputBox() {
+    let claude = ["⏺ Done.", "", "────────────", "❯ draft text", "  wraps here", "────────────",
+                  "  Opus 5.5 · ctx 41% · $0.94", "  ⏵⏵ bypass permissions on (shift+tab to cycle)", ""]
+    #expect(RelayAgentTerminalFooter.rows(provider: "claude", screen: claude) ==
+            ["Opus 5.5 · ctx 41% · $0.94", "⏵⏵ bypass permissions on (shift+tab to cycle)"])
+    let codex = ["• Ran tests", "", "› Ask Codex to do anything", "", "  gpt-5.5 high · 62% left · ~/dev/term"]
+    #expect(RelayAgentTerminalFooter.rows(provider: "codex", screen: codex) == ["gpt-5.5 high · 62% left · ~/dev/term"])
+    #expect(RelayAgentTerminalFooter.rows(provider: "claude", screen: ["no prompt here"]).isEmpty)
+    #expect(RelayAgentTerminalFooter.rows(provider: "shell", screen: claude).isEmpty)
+}
+
+@Test func inlineImagesSplitOutsideFencesOnly() {
+    let source = "Intro\n\n![fig](/tmp/a.png)\n\n```md\n![no](/tmp/b.png)\n```\n- ![](rel/c.svg)\nSee ![web](https://x.org/d.png) end"
+    #expect(RelayAgentInlineImages.segments(source) == [
+        .text("Intro\n"), .image(path: "/tmp/a.png", alt: "fig"),
+        .text("\n```md\n![no](/tmp/b.png)\n```"), .image(path: "rel/c.svg", alt: ""),
+        .text("See ![web](https://x.org/d.png) end")])
+    #expect(RelayAgentInlineImages.segments("plain") == [.text("plain")])
+}

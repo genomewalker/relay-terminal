@@ -60,3 +60,28 @@ enum RelayNativeImageComposer {
         return "\"" + path + "\""
     }
 }
+
+/// The rows a provider draws under its input box: cc-status and other status-line
+/// plugins, the permission mode, Codex's model and context line. Plain screen text only.
+enum RelayAgentTerminalFooter {
+    static func rows(provider: String, screen: [String]) -> [String] {
+        guard ["claude", "codex"].contains(provider) else { return [] }
+        let marker: Character = provider == "claude" ? "❯" : "›"
+        guard let start = screen.lastIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces).first == marker
+        }) else { return [] }
+        var index = start + 1
+        // Skip the rest of the input box: wrapped input rows up to Claude's
+        // closing rule, or up to Codex's blank row under its composer.
+        while index < screen.count {
+            let trimmed = screen[index].trimmingCharacters(in: .whitespaces)
+            index += 1
+            if provider == "codex" && trimmed.isEmpty { break }
+            if !trimmed.isEmpty && trimmed.allSatisfy({ "─━".contains($0) }) { break }
+        }
+        guard index <= screen.count else { return [] }
+        return screen[index...].map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.allSatisfy({ "─━".contains($0) }) }
+            .suffix(6).map { String($0.prefix(400)) }
+    }
+}
