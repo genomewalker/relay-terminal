@@ -180,3 +180,41 @@ struct RelayCodexProfileMoveTests {
         #expect(!RelayAgentAccountMovePolicy.needsRelayCodexProfile(moveCommand: keep, provider: "claude", target: personal))
     }
 }
+
+/// 99f9d58a on dandy-07 (codex-cli 0.170.0, 2026-11-21 07:00Z): an idle, empty
+/// composer whose status line names the model by its display name only. Resume
+/// was refused as prompt_unverified because the status line did not start with "gpt-".
+@Suite("Codex status line with a model display name")
+struct RelayCodexDisplayNameStatusLineTests {
+    static let screen =
+        "⚠ Heads up, you have less than 25% of your weekly limit left.\r\n\r\n" +
+        "⚠ Heads up, you have less than 10% of your weekly limit left.\r\n\r\n" +
+        "⚠ Heads up, you have less than 5% of your weekly limit left.\r\n\r\n" +
+        "  ↳ Recap: The independent scientific review is complete, checkpointed, and shared with both coordinators. It calls for freezing\r\n" +
+        "           permutation protocols before fitting.\r\n" +
+        "           Next: Should this pane implement Task C's diagnostics crate with synthetic checks only?\r\n\r\n\r\n" +
+        "› \u{1b}[2mAsk Codex to do anything\u{1b}[22m\r\n\r\n" +
+        "  Rosalind-6 Research xhigh · Context 48% left · /maps/projects/fernandezguerra/apps/repos/dart · Rosalind-6 Research · dart · mai…\r\n" +
+        "  ← for agents · ? for shortcuts                                                                         ⚠ 6 warnings · f2 to view"
+
+    @Test func anIdleComposerUnderADisplayNameStatusLineIsEmpty() {
+        #expect(RelayAgentMaintenancePrompt.isEmpty(Self.screen, provider: "codex"))
+        #expect(!RelayAgentMaintenancePrompt.hasTypedText(Self.screen, provider: "codex"))
+    }
+
+    @Test func aTypedDraftUnderTheSameStatusLineIsStillADraft() {
+        let typed = Self.screen.replacingOccurrences(of: "\u{1b}[2mAsk Codex to do anything\u{1b}[22m", with: "run the checks")
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(typed, provider: "codex"))
+        #expect(RelayAgentMaintenancePrompt.hasTypedText(typed, provider: "codex"))
+    }
+
+    @Test func aRunningTurnUnderTheSameStatusLineIsNotEmpty() {
+        let running = Self.screen.replacingOccurrences(of: "› \u{1b}[2m", with: "• Working (4s • esc to interrupt)\r\n\r\n› \u{1b}[2m")
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(running, provider: "codex"))
+    }
+
+    @Test func aNoticeRowIsNeverTakenForTheStatusLine() {
+        let notice = Self.screen.replacingOccurrences(of: "  Rosalind-6 Research xhigh", with: "  ⚠ Rosalind-6 Research xhigh")
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(notice, provider: "codex"))
+    }
+}

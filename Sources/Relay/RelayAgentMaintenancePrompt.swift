@@ -59,6 +59,16 @@ enum RelayAgentMaintenancePrompt {
     /// an unknown footer and a running Codex turn still do.
     static let allWorkExplained = Int.max - 2
 
+    /// The Codex status line opens with the model as the CLI names it:
+    /// "GPT-6.2-Astra medium", "OpenAI …", or the display name of a Rosalind
+    /// model, "Rosalind-6 Research xhigh" (99f9d58a, 2026-11-21). Only known
+    /// Codex model families count, so another tool's status line never does.
+    static func codexStatusLineModel(_ row: String) -> Bool {
+        let lower = row.lowercased()
+        return lower.hasPrefix("gpt-") || lower.hasPrefix("openai") ||
+            lower.range(of: #"^rosalind-[0-9][a-z0-9.-]* "#, options: .regularExpression) != nil
+    }
+
     /// A Codex footer row that reports background terminals.
     static func codexBackgroundRow(_ value: String) -> Bool {
         value.range(of: #"\bbackground\b"#, options: [.regularExpression, .caseInsensitive]) != nil &&
@@ -147,7 +157,7 @@ enum RelayAgentMaintenancePrompt {
                 !(codexIdleHints.contains { value.hasPrefix($0) } || codexSegmentedIdleHint(value)) &&
                     !["›", "❯", "•", "◦", "↳", "⚠", "■", "└"].contains { value.hasPrefix($0) } &&
                     // A second whole status line is a repeat, not its wrapped tail.
-                    !value.lowercased().hasPrefix("gpt-") && !value.lowercased().hasPrefix("openai") &&
+                    !codexStatusLineModel(value) &&
                     // "1 background terminal running · /ps to view" is work.
                     !value.localizedCaseInsensitiveContains("running") && !value.contains("/ps") &&
                     value.range(of: footerWork, options: [.regularExpression, .caseInsensitive]) == nil &&
@@ -155,7 +165,7 @@ enum RelayAgentMaintenancePrompt {
             }.count
             let hints = footer.dropFirst(1 + continuation)
             guard continuation <= 2, (1...2).contains(hints.count), let first = footer.first, first.contains(" · "),
-                  (first.lowercased().hasPrefix("gpt-") || first.lowercased().hasPrefix("openai")),
+                  codexStatusLineModel(first),
                   // A status line configured with two context items ("Context 36% left ·
                   // … · Context 64% used") wraps one onto its continuation row (17f3e232,
                   // 2540262d, 2026-11-15); only the status-line rows may name the context.
