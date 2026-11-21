@@ -481,6 +481,29 @@ struct MCPLaunchAgentTests {
         #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["permissionMode": "root"])) == nil)
     }
 
+    @Test func workerProfileStartsClaudeLeanBeforeTheModelAndBrief() throws {
+        typealias C = MCPLaunchAgentCommand
+        let digest = Self.digest(Self.brief)
+        let plain = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: digest))
+        #expect(!plain.contains("--strict-mcp-config") && !plain.contains("--setting-sources"))
+        let worker = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: digest,
+                                          permissionMode: "read_only", profile: "worker"))
+        // Every flag is quoted, the empty setting-sources value survives as '',
+        // and the list-valued options end before --model, so the brief stays the prompt.
+        #expect(worker.contains("/shims/claude '--strict-mcp-config' '--mcp-config' '{\"mcpServers\":{}}' '--disable-slash-commands'"
+                                + " '--setting-sources' '' '--tools' 'Bash,Read,Grep,Glob' --model 'opus' --permission-mode plan \"$relay_brief\""))
+        // Codex has no worker profile; an unknown profile refuses.
+        let codex = RelayAgentAccount(provider: "codex", label: "personal", dir: "~/.codex-personal")
+        #expect(C.build(account: codex, model: "gpt-5", cwd: "/w", briefPath: "/b", briefSHA256: digest, profile: "worker") == nil)
+        #expect(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: digest, profile: "lean") == nil)
+        let instance = UUID(), request = UUID()
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request))?.launchProfile == "default")
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["profile": "worker"]))?.launchProfile == "worker")
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["profile": "lean"])) == nil)
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, provider: "codex", model: "gpt-5",
+                                                        extra: ["profile": "worker"])) == nil)
+    }
+
     // MARK: - No exec: the pane's shell outlives the provider
 
     static func run(_ shell: String, _ command: String, environment: [String: String]) throws -> (status: Int32, out: String) {

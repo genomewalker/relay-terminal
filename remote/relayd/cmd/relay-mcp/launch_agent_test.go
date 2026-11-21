@@ -41,6 +41,29 @@ func TestLaunchAgentForwardsExactRequest(t *testing.T) {
 	}
 }
 
+func TestLaunchAgentForwardsWorkerProfile(t *testing.T) {
+	s, _, bodies, done := stackServer(t)
+	defer done()
+	args := launchArgs()
+	args["profile"] = "worker"
+	args["permission_mode"] = "read_only"
+	if code := callTool(s, "relay_launch_agent", args); code != 0 {
+		t.Fatal(code)
+	}
+	got := (*bodies)[len(*bodies)-1]
+	if got["profile"] != "worker" || got["permissionMode"] != "read_only" || len(got) != 10 {
+		t.Fatalf("forwarded %v", got)
+	}
+	args = launchArgs()
+	args["profile"] = "default"
+	if code := callTool(s, "relay_launch_agent", args); code != 0 {
+		t.Fatal(code)
+	}
+	if got := (*bodies)[len(*bodies)-1]; got["profile"] != "default" || len(got) != 9 {
+		t.Fatalf("forwarded %v", got)
+	}
+}
+
 func TestLaunchAgentRefusesInvalidArgumentsBeforeRelay(t *testing.T) {
 	s, paths, _, done := stackServer(t)
 	defer done()
@@ -60,6 +83,9 @@ func TestLaunchAgentRefusesInvalidArgumentsBeforeRelay(t *testing.T) {
 		"model subst":         func(a map[string]any) { a["model"] = "$(id)" },
 		"unknown permission":  func(a map[string]any) { a["permission_mode"] = "bypassPermissions" },
 		"permission not str":  func(a map[string]any) { a["permission_mode"] = true },
+		"unknown profile":     func(a map[string]any) { a["profile"] = "lean" },
+		"profile not str":     func(a map[string]any) { a["profile"] = true },
+		"codex worker":        func(a map[string]any) { a["profile"] = "worker"; a["provider"] = "codex" },
 		"account display":     func(a map[string]any) { a["account"] = "personal (~/.claude-personal)" },
 		"host option":         func(a map[string]any) { a["host"] = "-oProxyCommand=x" },
 		"host injection":      func(a map[string]any) { a["host"] = "h; rm -rf ~" },

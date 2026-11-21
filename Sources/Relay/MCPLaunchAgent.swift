@@ -35,9 +35,12 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
     var bridgeScope: PaneStackBridgeScope? = nil
     /// account (default: no flag, the account's own settings) | ask | read_only | yolo.
     var permissionMode: String? = nil
+    /// default (the account's full setup) | worker (Claude only: a lean start
+    /// without the account's settings, plugins, MCP servers or skills).
+    var profile: String? = nil
 
     static let required: Set<String> = ["instance", "requestID", "host", "cwd", "provider", "model", "account", "briefPath"]
-    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "callerPaneID", "bridgeScope", "permissionMode"])
+    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "callerPaneID", "bridgeScope", "permissionMode", "profile"])
     static let briefLimit = 64 << 10
 
     /// Exact keys, bounded body, and every field valid; nil otherwise.
@@ -54,10 +57,12 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
         RelayAgentAccount.providers.contains(provider) && Self.validModel(model) && RelayAgentAccount.validLabel(account) &&
             Self.validPath(cwd) && Self.validPath(briefPath) && !host.isEmpty && host.utf8.count <= 256 &&
             [targetPaneID, anchorTabID, anchorPaneID].compactMap { $0 }.count <= 1 &&
-            MCPLaunchAgentCommand.permissionModes.contains(mode)
+            MCPLaunchAgentCommand.permissionModes.contains(mode) &&
+            MCPLaunchAgentCommand.profileFlags(provider: provider, profile: launchProfile) != nil
     }
 
     var mode: String { permissionMode ?? "account" }
+    var launchProfile: String { profile ?? "default" }
 
     static func validModel(_ model: String) -> Bool {
         model.range(of: #"^[a-z0-9][a-z0-9._-]{0,63}$"#, options: .regularExpression) != nil
@@ -162,10 +167,29 @@ enum MCPLaunchAgentCommand {
         }
     }
 
+    /// Claude's flags for a lean task-pane start. The account's user, project
+    /// and local settings (with their plugins and hooks), its MCP servers and
+    /// its skills are not loaded; Relay's own --settings hooks still are, as
+    /// the managed launcher passes them separately. The list-valued options
+    /// come before --model so they can never take the brief as a value.
+    static let workerClaudeFlags = ["--strict-mcp-config", "--mcp-config", #"{"mcpServers":{}}"#,
+                                    "--disable-slash-commands", "--setting-sources", "",
+                                    "--tools", "Bash,Read,Grep,Glob"]
+
+    /// The flags for a launch profile; nil when the provider has no such profile.
+    static func profileFlags(provider: String, profile: String) -> [String]? {
+        switch (provider, profile) {
+        case (_, "default"): []
+        case ("claude", "worker"): workerClaudeFlags
+        default: nil
+        }
+    }
+
     static func build(account: RelayAgentAccount, model: String, cwd: String, briefPath: String,
                       briefSHA256: String,
-                      permissionMode: String = "account") -> String? {
-        guard let permission = permissionFlags(provider: account.provider, mode: permissionMode) else { return nil }
+                      permissionMode: String = "account", profile: String = "default") -> String? {
+        guard let permission = permissionFlags(provider: account.provider, mode: permissionMode),
+              let profileArguments = profileFlags(provider: account.provider, profile: profile) else { return nil }
         guard account.isValid, MCPLaunchAgentProposal.validModel(model),
               MCPLaunchAgentProposal.validPath(cwd), MCPLaunchAgentProposal.validPath(briefPath),
               briefSHA256.utf8.count == 64, briefSHA256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
@@ -186,6 +210,7 @@ enum MCPLaunchAgentCommand {
             + " && relay_digest=$(printf '%s' \"$relay_brief\" | (if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi))"
             + " && [ \"${relay_digest%% *}\" = " + quote(briefSHA256) + " ]"
             + " && exec " + environment + " " + RelayAgentAccount.managedShimCommand(account.provider) +
+            profileArguments.map { " " + quote($0) }.joined() +
             " " + flag + " " + quote(model) + permission.map { " " + $0 }.joined() +
             " \"$relay_brief\" || exit " + failure + ")"
         return command.utf8.count <= commandLimit ? command : nil
@@ -226,8 +251,9 @@ struct MCPLaunchAgentReceipt: Codable, Equatable {
         var briefSHA256: String
         var placement: String
         var permissionMode: String = "account"
+        var profile: String = "default"
         enum CodingKeys: String, CodingKey {
-            case host, cwd, provider, model, account, placement
+            case host, cwd, provider, model, account, placement, profile
             case permissionMode = "permission_mode"
             case configDir = "config_dir", configVariable = "config_variable", briefPath = "brief_path"
             case briefBytes = "brief_bytes", briefSHA256 = "brief_sha256"
@@ -717,7 +743,7 @@ enum MCPAgentBindingRead {
             model: proposal.model, account: proposal.account, configDir: "", configVariable: RelayAgentAccount.variable(proposal.provider),
             briefPath: proposal.briefPath, briefBytes: 0, briefSHA256: "",
             placement: proposal.placement(callerShown: proposal.callerAnchor(in: workspace) != nil),
-            permissionMode: proposal.mode)
+            permissionMode: proposal.mode, profile: proposal.launchProfile)
         entries[proposal.requestID] = Entry(proposal: proposal,
             receipt: MCPLaunchAgentReceipt(requestID: proposal.requestID.uuidString.lowercased(), request: request))
         let deadline = ContinuousClock.now + environment.launchBudget
@@ -760,7 +786,8 @@ enum MCPAgentBindingRead {
         let briefSHA256 = SHA256.hash(data: brief).map { String(format: "%02x", $0) }.joined()
         guard let command = MCPLaunchAgentCommand.build(account: account, model: proposal.model,
                                                         cwd: proposal.cwd, briefPath: proposal.briefPath,
-                                                        briefSHA256: briefSHA256, permissionMode: proposal.mode) else {
+                                                        briefSHA256: briefSHA256, permissionMode: proposal.mode,
+                                                        profile: proposal.launchProfile) else {
             return refuse("The launch command could not be built from these values")
         }
         guard needed.allSatisfy(permits) else {
