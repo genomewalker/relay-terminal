@@ -127,6 +127,19 @@ func conversationImageAttachments(content any, offset int64) *pyList {
 	return images
 }
 
+// codexContextMessage reports a user-role message that Codex itself writes:
+// AGENTS.md instructions, the environment context and similar wrappers.
+func codexContextMessage(text string) bool {
+	trimmed := strings.TrimLeft(text, " \t\r\n")
+	for _, prefix := range []string{"# AGENTS.md instructions for ", "<environment_context>", "<user_instructions>",
+		"<turn_aborted>", "<user_shell_command>", "<subagent_notification>"} {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func parseConversationRow(row *pyObject, kind, session string, offset int64, toolNames *pyObject) *pyList {
 	result := pyListOf()
 	stable := conversationString(row.Get("uuid"))
@@ -181,6 +194,12 @@ func parseConversationRow(row *pyObject, kind, session string, offset int64, too
 		if pyEqual(payload.Get("type"), "message") && phContains([]string{"user", "assistant"}, conversationString(payload.Get("role"))) {
 			role = conversationString(payload.Get("role"))
 			text, tools = conversationTextBlocks(payload.Get("content"), 0)
+			if role == "user" && codexContextMessage(text) {
+				// Codex injects instructions and its environment as user
+				// messages. They are context, not something the user sent.
+				tools = append([]conversationTool{{"Codex context", "provided", conversationPrefix(text, 32768)}}, tools...)
+				text = ""
+			}
 		} else if phContains([]string{"function_call", "function_call_output"}, conversationString(payload.Get("type"))) {
 			if id := conversationString(payload.Get("call_id")); id != "" {
 				stable = id

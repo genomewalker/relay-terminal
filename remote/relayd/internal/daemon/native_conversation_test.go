@@ -506,3 +506,23 @@ func TestConversationBoundCodexControlReadsTurnStateFromItsTranscript(t *testing
 		t.Fatalf("Claude control took a transcript state: %v", control)
 	}
 }
+
+func TestConversationCodexContextIsNotAUserMessage(t *testing.T) {
+	user := func(id, text string) string {
+		return conversationJSONLine(map[string]any{"type": "response_item", "payload": map[string]any{"id": id, "type": "message", "role": "user",
+			"content": []any{map[string]any{"type": "input_text", "text": text}}}})
+	}
+	r, _ := conversationFixture(t, "codex", "session", user("a", "# AGENTS.md instructions for /x\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>")+
+		user("b", "<environment_context>\n  <cwd>/x</cwd>\n</environment_context>")+user("c", "Reply with AGAIN")+
+		user("d", "Please read <environment_context> literally"))
+	items := r.conversationSnapshot("pane", 11, "", nil, "", "").Get("items").(*pyList)
+	var got []string
+	for _, raw := range items.items {
+		item := raw.(*pyObject)
+		got = append(got, conversationString(item.Get("role"))+"|"+conversationString(item.Get("tool_name"))+"|"+conversationPrefix(conversationString(item.Get("text")), 12))
+	}
+	want := []string{"tool|Codex context|# AGENTS.md ", "tool|Codex context|<environment", "user||Reply with A", "user||Please read "}
+	if strings.Join(got, ";") != strings.Join(want, ";") {
+		t.Fatalf("codex context items: %v", got)
+	}
+}

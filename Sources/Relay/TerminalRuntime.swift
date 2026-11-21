@@ -3845,7 +3845,7 @@ final class TerminalRuntime: NSObject {
                 io.sendUserInput(data, expectedLiveScreen: $0.live, expectedMaintenanceScreen: $0.replay)
             } ?? io.sendUserInput(data)
             guard sent else { return false }
-            view.unobservedPromptInput()
+            view.unobservedPromptSubmitted()
             pane?.userEnteredInput()
             noteProgrammaticInput("relay_prompt", prompt)
             return true
@@ -3858,6 +3858,7 @@ final class TerminalRuntime: NSObject {
         // Submit outside Ghostty's paste framing. A carriage return passed to
         // surface_text is clipboard content, not a separate Return key.
         let submitted = view.performBindingAction("text:\\r")
+        if submitted { view.unobservedPromptSubmitted() }
         pane?.userEnteredInput()
         if submitted { noteProgrammaticInput("relay_prompt", prompt) }
         return submitted
@@ -10791,6 +10792,15 @@ final class RelayGhosttyView: TerminalView, @preconcurrency NSTextInputTraits {
     fileprivate func unobservedPromptInput() {
         invalidatePromptMirror()
         hasLocalInputSincePromptBoundary = true
+    }
+
+    /// Relay wrote a whole prompt and its Return. Like the Return key, that
+    /// ends local input at this prompt: Claude and Codex report no prompt
+    /// boundary, so the flag would otherwise refuse every later composer send.
+    /// The mirror stays unreliable; the screen decides whether it is empty.
+    fileprivate func unobservedPromptSubmitted() {
+        invalidatePromptMirror()
+        hasLocalInputSincePromptBoundary = false
     }
 
     fileprivate func assistantShellPromptIsEmpty() -> Bool {
