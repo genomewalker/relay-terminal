@@ -181,6 +181,9 @@ struct RelayAgentTimelineView: View {
     @State private var unseen = false
     @State private var showingHeldResolution = false
     @FocusState private var composerFocused: Bool
+    /// Up/Down recall of the user's earlier prompts in this conversation.
+    @State private var composerHistory = RelayAgentComposerHistory()
+    @State private var recalledDraft: String?
     // Search reads only the bound, already-loaded items. It never touches the draft.
     @State private var searching = false
     @State private var query = ""
@@ -260,6 +263,8 @@ struct RelayAgentTimelineView: View {
             // An empty value is persisted only when the user emptied a real draft, so an
             // unreadable store (empty restore) can never delete what is on disk.
             if draftRestored && !submitted && (!text.isEmpty || !old.isEmpty) { persistDraft() }
+            // Editing a recalled prompt makes it the draft; Down no longer returns the old one.
+            if text != recalledDraft { composerHistory.reset(); recalledDraft = nil }
         }
         .onChange(of: attachmentQueue.attachments) { _, _ in
             if draftRestored && !submitted { persistDraft() }
@@ -797,7 +802,7 @@ struct RelayAgentTimelineView: View {
         default: return "Agent state is not confirmed yet."
         }
         if composedMessage.utf8.count > 65536 { return "Message is too long." }
-        return "Sends through the original terminal · ⌘↩"
+        return "Sends through the original terminal · ↩ send · ⇧↩ new line"
     }
 
     private func refreshTerminalFooter() {
@@ -854,6 +859,7 @@ struct RelayAgentTimelineView: View {
                     .accessibilityIdentifier("relay.agent.composer")
                     .disabled(submitting || submitted)
                     .onPasteCommand(of: [UTType.fileURL, UTType.image]) { _ = acceptAttachmentDrop($0) }
+                    .onKeyPress(keys: [.return, .escape, .upArrow, .downArrow], phases: .down) { handleComposerKey($0) }
             }
             .padding(.horizontal, RelayTheme.spacing(10)).padding(.top, RelayTheme.spacing(10))
             HStack(spacing: RelayTheme.spacing(8)) {
@@ -903,6 +909,53 @@ struct RelayAgentTimelineView: View {
         .padding(.horizontal, RelayAgentDesign.gutter).padding(.top, RelayTheme.spacing(6)).padding(.bottom, RelayTheme.spacing(14))
         .frame(maxWidth: .infinity)
     }
+    /// Return, Esc and Up/Down as in the Claude Code and Codex prompts
+    /// (`RelayAgentComposerKeys`). Everything else stays with the text view.
+    private func handleComposerKey(_ press: KeyPress) -> KeyPress.Result {
+        let editor = NSApp.keyWindow?.firstResponder as? NSTextView
+        let text = editor?.string ?? draft
+        let caret = RelayAgentComposerKeys.caretLines(text: text,
+            selection: editor?.selectedRange() ?? NSRange(location: (text as NSString).length, length: 0))
+        let key: RelayAgentComposerKeys.Key = switch press.key {
+            case .return: .returnKey
+            case .escape: .escape
+            case .upArrow: .upArrow
+            case .downArrow: .downArrow
+            default: .other
+        }
+        let working = store.control?.lifecycle == "active" && !submitting && !stopRequested &&
+            pane.pendingAgentApprovals == 0
+        switch RelayAgentComposerKeys.action(key: key, modifiers: press.modifiers,
+                                             hasMarkedText: editor?.hasMarkedText() ?? false,
+                                             caretOnFirstLine: caret.first, caretOnLastLine: caret.last,
+                                             agentWorking: working) {
+        case .send:
+            // Return never inserts a newline; the hint says why a send is unavailable.
+            if !sendDisabled { composerHistory.reset(); submit() }
+            return .handled
+        case .interrupt:
+            interrupt()
+            return .handled
+        case .historyPrevious:
+            guard let entry = composerHistory.previous(entries: RelayAgentComposerKeys.userPrompts(store.conversation.items),
+                                                       current: draft) else { return .ignored }
+            recallDraft(entry)
+            return .handled
+        case .historyNext:
+            guard let entry = composerHistory.next(entries: RelayAgentComposerKeys.userPrompts(store.conversation.items))
+            else { return .ignored }
+            recallDraft(entry)
+            return .handled
+        case .passThrough:
+            return .ignored
+        }
+    }
+
+    private func recallDraft(_ text: String) {
+        recalledDraft = text
+        draft = text
+    }
+
     private func interrupt() {
         guard let binding = store.conversation.binding, !submitting, !stopRequested else { return }
         let inputRevision = pane.agentInputRevision
