@@ -2,11 +2,14 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"github.com/relay-terminal/relayd/internal/agentaccounts"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -108,7 +111,71 @@ func codexRelaunchCommand(home, config, target string) (string, string, error) {
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 		return "", "", newPaneRefusal(PaneRefusalLauncherUnavailable, "managed Codex launcher unavailable")
 	}
-	return cwd, "cd -- " + shellQuote(cwd) + " && CODEX_HOME=" + shellQuote(config) + " " + shellQuote(shim) + " resume " + shellQuote(target), nil
+	// Resume keeps the session's own model and effort. Without them Codex
+	// falls back to the account default, which may have changed since.
+	// The scanner above buffered past the first record; read from the start.
+	flags := ""
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", "", newPaneRefusal(PaneRefusalResumeUnavailable, "saved session unreadable")
+	}
+	if model, effort := lastCodexTurnModel(bufio.NewReaderSize(file, 64<<10)); model != "" {
+		flags = " -m " + shellQuote(model)
+		if effort != "" {
+			flags += " -c " + shellQuote("model_reasoning_effort="+effort)
+		}
+	}
+	return cwd, "cd -- " + shellQuote(cwd) + " && CODEX_HOME=" + shellQuote(config) + " " + shellQuote(shim) + " resume" + flags + " " + shellQuote(target), nil
+}
+
+var (
+	codexModelPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+	codexEffortPattern = regexp.MustCompile(`^[a-z]{1,16}$`)
+)
+
+// lastCodexTurnModel returns the model and reasoning effort of the last
+// turn_context record in the rest of a rollout. Oversized lines are skipped;
+// values outside a strict charset are dropped rather than quoted onward.
+func lastCodexTurnModel(reader *bufio.Reader) (string, string) {
+	const limit = 4 << 20
+	model, effort := "", ""
+	var line []byte
+	for {
+		chunk, isPrefix, err := reader.ReadLine()
+		if err != nil {
+			break
+		}
+		if len(line)+len(chunk) <= limit {
+			line = append(line, chunk...)
+		} else {
+			line = line[:0:0]
+			for isPrefix {
+				if _, isPrefix, err = reader.ReadLine(); err != nil {
+					return model, effort
+				}
+			}
+			continue
+		}
+		if isPrefix {
+			continue
+		}
+		if bytes.Contains(line, []byte(`"turn_context"`)) {
+			var record struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Model  string `json:"model"`
+					Effort string `json:"effort"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal(line, &record) == nil && record.Type == "turn_context" && codexModelPattern.MatchString(record.Payload.Model) {
+				model, effort = record.Payload.Model, ""
+				if codexEffortPattern.MatchString(record.Payload.Effort) {
+					effort = record.Payload.Effort
+				}
+			}
+		}
+		line = line[:0]
+	}
+	return model, effort
 }
 
 // codexManagedRouteRefusal is the pre-exit check for a pane under the managed

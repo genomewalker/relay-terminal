@@ -50,6 +50,25 @@ func TestCodexRelaunchCommandIsProvenBeforeExit(t *testing.T) {
 	if err != nil || gotCwd != cwd || command != "cd -- "+shellQuote(cwd)+" && CODEX_HOME="+shellQuote(config)+" "+shellQuote(shim)+" resume "+shellQuote(session) {
 		t.Fatalf("command %q %q %v", gotCwd, command, err)
 	}
+	// The session's own model and effort survive the relaunch, whatever the
+	// account default says (bc08e46f, 2026-11-21: astra/low came back as sol/medium).
+	path := filepath.Join(config, "sessions", "2026", "11", "18", "rollout-x-"+session+".jsonl")
+	rollout, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollout = append(rollout, []byte("\n"+`{"type":"turn_context","payload":{"model":"gpt-6.2-sol","effort":"medium"}}`+"\n"+
+		`{"type":"turn_context","payload":{"model":"gpt-6.2-astra","effort":"low"}}`+"\n")...)
+	if err := os.WriteFile(path, rollout, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config, "config.toml"), []byte("model = \"gpt-6.2-sol\"\n[projects.\""+cwd+"\"]\ntrust_level = \"trusted\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, command, err = codexRelaunchCommand(home, config, session)
+	if err != nil || command != "cd -- "+shellQuote(cwd)+" && CODEX_HOME="+shellQuote(config)+" "+shellQuote(shim)+" resume -m "+shellQuote("gpt-6.2-astra")+" -c "+shellQuote("model_reasoning_effort=low")+" "+shellQuote(session) {
+		t.Fatalf("model not carried: %q %v", command, err)
+	}
 	if _, _, err := codexRelaunchCommand(home, config, "01a18b32-f284-7220-91a2-6a81cde6db15"); refusalCode(err) != PaneRefusalResumeUnavailable {
 		t.Fatalf("missing session: %v", err)
 	}
