@@ -82,3 +82,15 @@ import Testing
         .text("See ![web](https://x.org/d.png) end")])
     #expect(RelayAgentInlineImages.segments("plain") == [.text("plain")])
 }
+
+@Test func aSendThatStartedNoTurnSettlesOnlyOnAnEmptyIdlePrompt() {
+    let idle = "  Worked for 2s\r\n\r\n› \u{1b}[2mAsk Codex to do anything\u{1b}[22m\r\n\r\n" +
+        "  GPT-6.2-Astra medium · ~/dev/term\r\n  ? for shortcuts"
+    #expect(RelayAgentComposerSettle.settledWithoutTurn(vt: idle, provider: "codex", elapsed: 4))
+    #expect(!RelayAgentComposerSettle.settledWithoutTurn(vt: idle, provider: "codex", elapsed: 1))
+    let working = "• Working (2s • esc to interrupt)\r\n\r\n" + idle
+    #expect(!RelayAgentComposerSettle.settledWithoutTurn(vt: working, provider: "codex", elapsed: 4))
+    let typed = idle.replacingOccurrences(of: "\u{1b}[2mAsk Codex to do anything\u{1b}[22m", with: "/model")
+    #expect(!RelayAgentComposerSettle.settledWithoutTurn(vt: typed, provider: "codex", elapsed: 4))
+    #expect(!RelayAgentComposerSettle.settledWithoutTurn(vt: nil, provider: "codex", elapsed: 4))
+}

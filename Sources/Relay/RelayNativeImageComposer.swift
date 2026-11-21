@@ -85,3 +85,15 @@ enum RelayAgentTerminalFooter {
             .suffix(6).map { String($0.prefix(400)) }
     }
 }
+
+/// Whether a composer send that started no turn has settled: a slash command
+/// such as /model, /clear or /compact returns the agent to an empty, idle
+/// prompt without a completed turn the conversation reader could report.
+enum RelayAgentComposerSettle {
+    static let minimumWait: TimeInterval = 3
+    static func settledWithoutTurn(vt: String?, provider: String, elapsed: TimeInterval) -> Bool {
+        guard elapsed >= minimumWait, let vt,
+              RelayAgentMaintenancePrompt.inputIsEmpty(vt, provider: provider) == true else { return false }
+        return !vt.localizedCaseInsensitiveContains("esc to interrupt")
+    }
+}

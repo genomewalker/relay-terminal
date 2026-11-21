@@ -2716,6 +2716,13 @@ final class TerminalRuntime: NSObject {
             session.readViewportRows().map { RelayNativeImageComposer.promptIsEmpty(provider: provider, rows: $0) } ?? false)
     }
 
+    /// True when the provider's prompt is empty and idle again on screen at least
+    /// `RelayAgentComposerSettle.minimumWait` after a composer send.
+    func conversationSendSettledWithoutTurn(provider: String, since: Date) -> Bool {
+        guard case .screen(let vt, _) = observeActiveScreen() else { return false }
+        return RelayAgentComposerSettle.settledWithoutTurn(vt: vt, provider: provider, elapsed: Date().timeIntervalSince(since))
+    }
+
     /// The status rows under the provider's input box, as the terminal shows them now.
     func conversationTerminalFooter(provider: String) -> [String] {
         RelayAgentTerminalFooter.rows(provider: provider, screen: session.readViewportRows() ?? [])

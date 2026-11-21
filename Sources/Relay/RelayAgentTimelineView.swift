@@ -195,6 +195,8 @@ struct RelayAgentTimelineView: View {
     @State private var focusedItem: String?
     /// Rows the terminal shows under the agent's input box (cc-status, mode, model line).
     @State private var terminalFooter: [String] = []
+    /// When the last confirmed send happened, for a command that starts no turn.
+    @State private var submittedAt: Date?
     init(pane: PaneModel, store: RelayAgentTimelineStore? = nil) {
         self.pane = pane; _store = StateObject(wrappedValue: store ?? RelayAgentTimelineStore(pane: pane))
         _composerState = ObservedObject(wrappedValue: pane.composerState)
@@ -268,6 +270,21 @@ struct RelayAgentTimelineView: View {
         }
         .onChange(of: attachmentQueue.attachments) { _, _ in
             if draftRestored && !submitted { persistDraft() }
+        }
+        // A slash command (/model, /clear, /compact) starts no turn, so no completed
+        // turn unlocks the composer; the terminal returning to an empty idle prompt does.
+        .task(id: submitted) {
+            guard submitted, let since = submittedAt else { return }
+            while !Task.isCancelled, submitted {
+                try? await Task.sleep(for: .seconds(1))
+                guard submitted, let provider = store.conversation.binding?.provider else { return }
+                if store.control?.lifecycle != "active",
+                   pane.runtime.conversationSendSettledWithoutTurn(provider: provider, since: since) {
+                    submitted = false
+                    submissionStatus = nil
+                    return
+                }
+            }
         }
         .onChange(of: pane.lastCompletedAgentTurn) { _, _ in
             Task { await store.refreshLive() }
@@ -1017,6 +1034,7 @@ struct RelayAgentTimelineView: View {
                 return
             case .submitted: break
             }
+            submittedAt = Date()
             submitted = true
             // Confirmed submission is the only path that discards the stored draft on purpose.
             RelayAgentDraftStore.shared.remove(hostID: draftHostID, paneID: pane.id)
