@@ -19,6 +19,9 @@ func StockCodexLauncherStart() (uint64, error) { return processStartTime(os.Getp
 
 // The launcher remains the original frontend PID across exec. This child owns
 // one private backend and proxy; it never adopts another app server or thread.
+// ManagedCodexBackendReadyLimit bounds a managed Codex app server's start.
+const ManagedCodexBackendReadyLimit = 180 * time.Second
+
 func ServeManagedStockCodexBackend(ctx context.Context, pane string, parent int, parentStart uint64,
 	executable string, environment []string, permissions agentlaunch.CodexPermissions, ready io.Writer) error {
 	if !validSessionID.MatchString(pane) || parent <= 1 || parentStart == 0 || !filepath.IsAbs(executable) {
@@ -81,17 +84,26 @@ func ServeManagedStockCodexBackend(ctx context.Context, pane string, parent int,
 
 	// Bind readiness to the child actually listening, including an official
 	// Node launcher whose native app-server process is its descendant.
-	deadline := time.NewTimer(20 * time.Second)
+	// A cold app server can read a large state database from an NFS home
+	// for minutes (dandy-07, 2026-11-21: personal state_5.sqlite, 274 MB,
+	// no socket after 36 s under load), so 20 s was not enough. Report the
+	// wait on stderr so the pane shows why it is still starting.
+	started := time.Now()
+	deadline := time.NewTimer(ManagedCodexBackendReadyLimit)
 	defer deadline.Stop()
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
+	progress := time.NewTicker(15 * time.Second)
+	defer progress.Stop()
 	backendPID, backendStart := 0, uint64(0)
 	for backendPID == 0 {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-progress.C:
+			fmt.Fprintf(os.Stderr, "relayd: waiting for the Codex app server to start (%ds)...\n", int(time.Since(started).Seconds()))
 		case <-deadline.C:
-			return errors.New("managed Codex app server was not ready")
+			return fmt.Errorf("managed Codex app server was not ready after %ds", int(ManagedCodexBackendReadyLimit.Seconds()))
 		case <-backendDone:
 			return errors.New("managed Codex app server exited before readiness")
 		case <-tick.C:

@@ -116,7 +116,8 @@ func prepareManagedStockCodex(executable string, arguments []string, environment
 			return nil, nil, errors.New("managed Codex messaging endpoint was not ready")
 		}
 		return append([]string{"--remote", "unix://" + r.value.FrontendSocket}, frontendArguments...), stop, nil
-	case <-time.After(25 * time.Second):
+	// The backend bounds its own start; allow it that plus a margin.
+	case <-time.After(daemon.ManagedCodexBackendReadyLimit + 10*time.Second):
 		stop()
 		return nil, nil, errors.New("managed Codex messaging endpoint timed out")
 	}
