@@ -206,7 +206,7 @@ enum RelayAgentRichDetection {
 struct RelayAgentMarkdownText: View {
     let source: String
     private enum Line: Hashable {
-        case heading(Int, String), bullet(Int, String), ordered(Int, String, String), quote(String), rule, paragraph(String), table(RelayAgentMarkdownTable)
+        case heading(Int, String), bullet(Int, String), task(Int, Bool, String), ordered(Int, String, String), quote(String), rule, paragraph(String), table(RelayAgentMarkdownTable)
     }
     private var lines: [Line] {
         var result: [Line] = []
@@ -229,7 +229,11 @@ struct RelayAgentMarkdownText: View {
             } else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
                 flush(); result.append(.rule)
             } else if ["- ", "* ", "+ "].contains(where: { trimmed.hasPrefix($0) }) {
-                flush(); result.append(.bullet(min(indent, 4), String(trimmed.dropFirst(2))))
+                flush()
+                let item = String(trimmed.dropFirst(2))
+                if let task = item.firstMatch(of: /^\[([ xX])\]\s+/) {
+                    result.append(.task(min(indent, 4), task.1 != " ", String(item[task.range.upperBound...])))
+                } else { result.append(.bullet(min(indent, 4), item)) }
             } else if let marker = trimmed.firstMatch(of: /^(\d{1,4})[.)]\s+/) {
                 flush(); result.append(.ordered(min(indent, 4), String(marker.1), String(trimmed[marker.range.upperBound...])))
             } else if trimmed.hasPrefix(">") {
@@ -247,7 +251,9 @@ struct RelayAgentMarkdownText: View {
                     Self.inline(text).font(RelayTheme.font(size: level <= 1 ? 16 : level == 2 ? 14.5 : 13, weight: .semibold))
                         .padding(.top, level <= 2 ? 6 : 2)
                 case .bullet(let indent, let text):
-                    listRow(marker: "•", indent: indent, text: text)
+                    listRow(marker: ["•", "◦", "▪"][indent % 3], indent: indent, text: text)
+                case .task(let indent, let done, let text):
+                    listRow(marker: done ? "☑" : "☐", indent: indent, text: text)
                 case .ordered(let indent, let number, let text):
                     listRow(marker: number + ".", indent: indent, text: text)
                 case .quote(let text):
@@ -276,8 +282,31 @@ struct RelayAgentMarkdownText: View {
         .padding(.leading, CGFloat(indent) * 16)
     }
     static func inline(_ text: String) -> Text {
+        Text(inlineAttributed(text))
+    }
+    /// Inline Markdown plus what Foundation's parser leaves out: image references become
+    /// labelled links, bare URLs become links, and code spans get a visible background.
+    static func inlineAttributed(_ text: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return Text((try? AttributedString(markdown: text, options: options)) ?? AttributedString(text))
+        let source = text.replacing(/!\[([^\]\n]*)\]\(([^\s)]+)\)/) { match in
+            let label = match.1.isEmpty ? (match.2.split(separator: "/").last.map(String.init) ?? "image") : String(match.1)
+            return "[🖼 " + label + "](" + match.2 + ")"
+        }
+        var result = (try? AttributedString(markdown: source, options: options)) ?? AttributedString(text)
+        for run in result.runs where run.inlinePresentationIntent?.contains(.code) == true {
+            result[run.range].backgroundColor = RelayAgentDesign.codeFill
+        }
+        let plain = String(result.characters)
+        for match in plain.matches(of: /https?:\/\/[^\s<>]*[^\s<>.,;:!?)\]'"*_~`]/) {
+            guard let url = URL(string: String(match.output)) else { continue }
+            let lower = result.characters.index(result.startIndex,
+                                                offsetBy: plain.distance(from: plain.startIndex, to: match.range.lowerBound))
+            let upper = result.characters.index(lower, offsetBy: match.output.count)
+            let range = lower..<upper
+            guard result[range].runs.allSatisfy({ $0.link == nil && $0.inlinePresentationIntent?.contains(.code) != true }) else { continue }
+            result[range].link = url
+        }
+        return result
     }
 }
 

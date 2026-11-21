@@ -48,3 +48,17 @@ import Testing
     profile.command = ""
     #expect(profile.remoteCommand(forPane: UUID()) == nil)
 }
+
+@MainActor @Test func nativeInlineMarkdownLinksBareURLsImagesAndStylesCode() {
+    let text = RelayAgentMarkdownText.inlineAttributed("See https://example.com/a_b. and `https://code.example` ![fig](https://x.org/q.png) *it* ~~gone~~")
+    let plain = String(text.characters)
+    #expect(plain.contains("🖼 fig"))
+    #expect(!plain.contains("!["))
+    let links = text.runs.compactMap(\.link).map(\.absoluteString)
+    #expect(links.contains("https://example.com/a_b"))
+    #expect(links.contains("https://x.org/q.png"))
+    #expect(!links.contains("https://code.example"))
+    #expect(text.runs.contains { $0.inlinePresentationIntent?.contains(.emphasized) == true })
+    #expect(text.runs.contains { $0.inlinePresentationIntent?.contains(.strikethrough) == true })
+    #expect(text.runs.contains { $0.inlinePresentationIntent?.contains(.code) == true && $0.backgroundColor != nil })
+}

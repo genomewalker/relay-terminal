@@ -59,18 +59,33 @@ window.renderRelayAgentMessage = async function(input) {
     try { katex.render(source, node, {displayMode:display, throwOnError:true, trust:false, strict:'error', maxExpand:1000, maxSize:20}); }
     catch (_) { node.textContent = (display ? '$$' : '$') + source + (display ? '$$' : '$'); }
   }
-  function inline(parent, source) {
+  function safeURL(url) { return /^(https?:|mailto:)/i.test(url) ? url : null; }
+  function inline(parent, source, depth) {
     // Parse source delimiters; code is consumed before math, and raw HTML is always text.
-    const token = /(`[^`\n]+`|\\\([\s\S]*?\\\)|\$[^$\n]+\$|\*\*[^*]+\*\*|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/g;
+    depth = depth || 0;
+    const token = /(`[^`\n]+`|\\\([\s\S]*?\\\)|(?<![\\$\w])\$(?=\S)[^$\n]{1,400}(?<=\S)\$(?![\w$])|!\[[^\]\n]*\]\([^\s)]+\)|\[[^\]\n]+\]\([^\s)]+\)|<https?:\/\/[^\s>]+>|https?:\/\/[^\s<>]*[^\s<>.,;:!?)\]'"*_~`]|\*\*(?!\s)[^\n]+?(?<!\s)\*\*|__(?!\s)[^\n]+?(?<!\s)__|~~(?!\s)[^~\n]+?(?<!\s)~~|(?<![\w*])\*(?![\s*])[^*\n]+?(?<![\s*])\*(?![\w*])|(?<![\w_])_(?![\s_])[^_\n]+?(?<![\s_])_(?![\w_]))/g;
     let previous = 0, match;
     while ((match = token.exec(source))) {
       parent.append(document.createTextNode(source.slice(previous, match.index)));
       const value = match[0];
+      const wrap = (tag, inner) => { const node=document.createElement(tag); if(depth<4) inline(node,inner,depth+1); else node.textContent=inner; parent.append(node); };
+      const link = (text, url, image) => {
+        const href = safeURL(url), node = document.createElement(href ? 'a' : 'span');
+        if (href) node.href = href; else node.title = url;
+        if (image) { node.className='agent-image-ref'; node.textContent='🖼 ' + (text || url.split('/').pop()); }
+        else if (depth<4) inline(node,text,depth+1); else node.textContent=text;
+        parent.append(node);
+      };
       if (value.startsWith('`')) { const code=document.createElement('code'); code.textContent=value.slice(1,-1); parent.append(code); }
       else if (value.startsWith('\\(')) math(parent,value.slice(2,-2),false);
       else if (value.startsWith('$')) math(parent,value.slice(1,-1),false);
-      else if (value.startsWith('**')) { const strong=document.createElement('strong'); strong.textContent=value.slice(2,-2); parent.append(strong); }
-      else { const split=value.indexOf(']('), link=document.createElement('a'); link.textContent=value.slice(1,split); link.href=value.slice(split+2,-1); parent.append(link); }
+      else if (value.startsWith('![')) { const split=value.indexOf(']('); link(value.slice(2,split),value.slice(split+2,-1),true); }
+      else if (value.startsWith('[')) { const split=value.indexOf(']('); link(value.slice(1,split),value.slice(split+2,-1),false); }
+      else if (value.startsWith('<')) link(value.slice(1,-1),value.slice(1,-1),false);
+      else if (/^https?:/i.test(value)) link(value,value,false);
+      else if (value.startsWith('**') || value.startsWith('__')) wrap('strong',value.slice(2,-2));
+      else if (value.startsWith('~~')) wrap('del',value.slice(2,-2));
+      else wrap('em',value.slice(1,-1));
       previous = token.lastIndex;
     }
     parent.append(document.createTextNode(source.slice(previous)));
@@ -114,13 +129,13 @@ window.renderRelayAgentMessage = async function(input) {
     }
     return {header,delimiters,rows,next};
   }
-  const lines=input.source.split('\n');
+  async function blocks(output, lines, depth) {
   for (let i=0;i<lines.length;i++) {
-    const line=lines[i], fence=line.match(/^\s*```([A-Za-z0-9_-]*)\s*$/);
+    const line=lines[i], fence=line.match(/^\s*(```|~~~)([A-Za-z0-9_+-]*)\s*$/);
     if (fence) {
-      let end=i+1; while(end<lines.length && !/^\s*```\s*$/.test(lines[end])) end++;
+      let end=i+1; while(end<lines.length && lines[end].trim()!==fence[1]) end++;
       if(end===lines.length) { const pre=document.createElement('pre'); pre.textContent=lines.slice(i).join('\n'); output.append(pre); break; }
-      const source=lines.slice(i+1,end).join('\n'), language=fence[1].toLowerCase(); i=end;
+      const source=lines.slice(i+1,end).join('\n'), language=fence[2].toLowerCase(); i=end;
       if (['math','latex','tex'].includes(language)) math(output,source,true);
       else if(language==='mermaid') {
         const node=document.createElement('div'); output.append(node);
@@ -130,7 +145,11 @@ window.renderRelayAgentMessage = async function(input) {
           const result=await mermaid.render('agentDiagram'+current+'_'+i,source);
           if(current!==agentRevision) return; node.innerHTML=result.svg;
         } catch(_) { const pre=document.createElement('pre'); pre.textContent=source; node.append(pre); }
-      } else { const pre=document.createElement('pre'), code=document.createElement('code'); code.textContent=source; pre.append(code); output.append(pre); }
+      } else {
+        const pre=document.createElement('pre'), code=document.createElement('code'); code.textContent=source;
+        if(language) { const label=document.createElement('div'); label.className='agent-code-label'; label.textContent=language; pre.append(label); }
+        pre.append(code); output.append(pre);
+      }
       continue;
     }
     const parsed=tableAt(lines,i);
@@ -158,11 +177,30 @@ window.renderRelayAgentMessage = async function(input) {
       if(stop>=0) { math(output,body.slice(0,stop),true); if(body.slice(stop+close.length).trim()) { const p=document.createElement('p'); inline(p,body.slice(stop+close.length)); output.append(p); } i=end; continue; }
     }
     if(!line.trim()) continue;
-    const heading=line.match(/^(#{1,6})\s+(.+)$/), bullet=line.match(/^\s*(?:[-*+]\s+|\d+\.\s+)(.+)$/);
-    const node=document.createElement(heading ? 'h'+heading[1].length : 'p');
-    if(bullet) { node.className='agent-list-item'; inline(node,'• '+bullet[1]); }
-    else inline(node,heading ? heading[2] : line);
-    output.append(node);
+    if(/^\s{0,3}>/.test(line)) {
+      let end=i; const inner=[];
+      while(end<lines.length && /^\s{0,3}>/.test(lines[end])) inner.push(lines[end++].replace(/^\s{0,3}> ?/,''));
+      const quote=document.createElement('blockquote'); output.append(quote);
+      if(depth<4) await blocks(quote,inner,depth+1); else quote.textContent=inner.join('\n');
+      if(current!==agentRevision) return; i=end-1; continue;
+    }
+    if(/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) { output.append(document.createElement('hr')); continue; }
+    const heading=line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if(heading) { const node=document.createElement('h'+heading[1].length); inline(node,heading[2]); output.append(node); continue; }
+    const item=line.match(/^(\s*)([-*+]|\d{1,9}[.)])\s+(?:\[([ xX])\]\s+)?(.*)$/);
+    if(item) {
+      const level=Math.min(6,Math.floor(item[1].replace(/\t/g,'    ').length/2));
+      const node=document.createElement('div'); node.className='agent-list-item'; node.style.paddingLeft=(4+level*18)+'px';
+      const marker=document.createElement('span'); marker.className='agent-list-marker';
+      if(item[3]!==undefined) { marker.textContent=item[3]===' ' ? '☐' : '☑'; marker.classList.add('agent-task'); if(item[3]!==' ') node.classList.add('agent-task-done'); }
+      else marker.textContent=/\d/.test(item[2]) ? item[2].replace(')','.') : ['•','◦','▪'][level%3];
+      const text=document.createElement('span'); inline(text,item[4]);
+      node.append(marker,text); output.append(node); continue;
+    }
+    const node=document.createElement('p'); inline(node,line); output.append(node);
   }
+  }
+  await blocks(output, input.source.split('\n'), 0);
+  if(current!==agentRevision) return;
   requestAnimationFrame(measure);
 };
