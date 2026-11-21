@@ -125,9 +125,7 @@ enum RelayAgentMaintenancePrompt {
             let text = String(String.UnicodeScalarView(prompt.cells.map(\.character)))
                 .split(whereSeparator: \.isWhitespace).joined(separator: " ")
             if provider == "codex" {
-                guard ["Ask Codex to do anything", "Ask a follow-up question", "Find and fix a bug in @filename",
-                       "Explain this codebase", "Write tests for @filename", "Implement {feature}",
-                       "Run /review on my current changes"].contains(text) else { return false }
+                guard codexPlaceholders.contains(text) else { return false }
             } else {
                 // Claude generates arbitrary suggestions, including short
                 // answers. Their native faint style identifies the unaccepted
@@ -240,6 +238,23 @@ enum RelayAgentMaintenancePrompt {
         let input = typed(prompt.cells)
         return !input.isEmpty && !input.allSatisfy(\.faint)
     }
+
+    /// Codex's own placeholder text on the composer row without the faint
+    /// style that marks it. A screen rebuilt from a worker's byte replay can
+    /// lose that style (8baea771, 2026-11-21). It stays a draft for every
+    /// check; this only lets the caller ask the agent for a full repaint.
+    static func codexPlaceholderLostStyle(_ vt: String?) -> Bool {
+        guard let prompt = prompt(vt, provider: "codex") else { return false }
+        let input = typed(prompt.cells)
+        guard !input.isEmpty, !input.allSatisfy(\.faint) else { return false }
+        let text = String(String.UnicodeScalarView(prompt.cells.map(\.character)))
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return codexPlaceholders.contains(text)
+    }
+
+    static let codexPlaceholders: Set<String> = ["Ask Codex to do anything", "Ask a follow-up question",
+        "Find and fix a bug in @filename", "Explain this codebase", "Write tests for @filename",
+        "Implement {feature}", "Run /review on my current changes"]
 
     /// Claude's settings overlay (/status, /config, /usage, /stats) and nothing
     /// else: its tab row, "Esc to cancel" as the last line, and no prompt line.

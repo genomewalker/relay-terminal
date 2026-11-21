@@ -4114,10 +4114,34 @@ final class TerminalRuntime: NSObject {
         if let snapshot = io.maintenanceScreenSnapshot() {
             vt = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport)
         } else if case .screen(let screen, _) = observeActiveScreen() { vt = screen }
+        // A hidden Codex pane whose saved copy shows the placeholder without its
+        // faint style (a byte replay that lost it, 8baea771) is repainted in
+        // full once, nothing typed, and proven again from the repaint.
+        if expected.provider == "codex", observeActiveScreen() == .noSurface,
+           RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(vt) {
+            if let pane, await repaintHiddenScreen(pane),
+               let token = await agentResumePromptProof(expected: expected) { return (token, nil) }
+            if let snapshot = io.maintenanceScreenSnapshot() {
+                vt = await RelayAgentMaintenanceScreen.read(snapshot.data, viewport: snapshot.token.viewport)
+            }
+            if RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(vt) {
+                return (nil, .init(.promptUnverified, "the saved screen shows Codex's placeholder without its style, " +
+                    "and a full repaint did not restore it" + (hiddenScreenRefreshNote.map { " (" + $0 + ")" } ?? "")))
+            }
+        }
         guard let pane else { return (nil, .init(.paneChanged, "the pane closed")) }
         let busy = pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true
         return (nil, Self.agentResumePromptBlocker(expected: expected, vt: vt, pendingApprovals: pane.pendingAgentApprovals,
             composerBusy: busy) ?? .init(.promptUnverified, "the screen changed while it was proven"))
+    }
+
+    /// One full repaint of a hidden pane's agent by the one-row bounce, under
+    /// the same guards as the installed-update refresh: connected, no surface,
+    /// no other viewer. Nothing is typed.
+    private func repaintHiddenScreen(_ pane: PaneModel) async -> Bool {
+        guard pane.profile.backend == .relay, pane.connectionState == .connected, started,
+              observeActiveScreen() == .noSurface, (pane.remoteClientCount ?? 1) <= 1 else { return false }
+        return await bounceHiddenScreenRows(pane)
     }
 
     /// Why `agentResumePromptAdmits` refuses, each cause by its own code; nil

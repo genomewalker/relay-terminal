@@ -218,3 +218,30 @@ struct RelayCodexDisplayNameStatusLineTests {
         #expect(!RelayAgentMaintenancePrompt.isEmpty(notice, provider: "codex"))
     }
 }
+
+/// 8baea771 on dandy-07 after the 0.5.147 install (2026-11-21 08:41Z): the
+/// saved copy showed the placeholder without its faint style. It stays a draft
+/// (thePlaceholderWordsWithoutFaintStyleAreADraft); it is recognized only so the
+/// resume can ask for a full repaint instead of refusing as draft_present.
+@Suite("Codex placeholder that lost its style")
+struct RelayCodexUnstyledPlaceholderTests {
+    static let footer = "\r\n\r\n  Rosalind-6 Research high · Context 67% left · /maps/projects/faro-platform · f…\r\n" +
+        "  ← for agents · ? for shortcuts                                         ⚠ 7 warnings · f2 to view"
+    static let header = "› You are the FARO Rosalind scientific adviser on the BUSINESS account. Your sole role is…\r\n" +
+        "  Worked for 41s • 2:05 PM\r\n\r\n\r\n"
+
+    @Test func anUnstyledPlaceholderIsRecognizedButStaysADraft() {
+        let screen = Self.header + "› Ask Codex to do anything" + Self.footer
+        #expect(RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(screen))
+        #expect(RelayAgentMaintenancePrompt.hasTypedText(screen, provider: "codex"))
+        #expect(!RelayAgentMaintenancePrompt.isEmpty(screen, provider: "codex"))
+    }
+
+    @Test func aStyledPlaceholderOrRealTextIsNotThatCase() {
+        let styled = Self.header + "› \u{1b}[2mAsk Codex to do anything\u{1b}[22m" + Self.footer
+        #expect(!RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(styled))
+        #expect(RelayAgentMaintenancePrompt.isEmpty(styled, provider: "codex"))
+        let typed = Self.header + "› Ask Codex to do anything else" + Self.footer
+        #expect(!RelayAgentMaintenancePrompt.codexPlaceholderLostStyle(typed))
+    }
+}
