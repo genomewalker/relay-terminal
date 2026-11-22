@@ -131,15 +131,48 @@ struct RelayBackgroundAttachPolicyTests {
             settled: { _ in true }, now: 3 * gap + settle).isEmpty)
     }
 
-    @Test("Waiting panes on one host are woken one at a time")
+    @Test("Waiting panes on one host are woken one at a time, at the longer wake gap")
     func wakesOneAtATimePerHost() {
         var policy = RelayBackgroundAttachPolicy()
+        let wakeGap = RelayBackgroundAttachPolicy.wakeGapNanoseconds
         var first = candidate(connecting: false), second = candidate(connecting: false)
         first.waitingAfterReconnect = true
         second.waitingAfterReconnect = true
         #expect(policy.next([first, second], nodes: ["dandy": ready], settled: { _ in false }, now: 0) == [first])
-        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in false }, now: gap).isEmpty)
-        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: gap) == [second])
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in false }, now: wakeGap).isEmpty,
+            "the woken pane holds its host until connected")
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: wakeGap - 1).isEmpty,
+            "settled, but within the wake gap")
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: wakeGap) == [second])
+    }
+
+    // 57c1 review: the 12:52Z drop followed a wave of multi-MB replays. If
+    // wakes drop the node again, every pane waits again; waking them again
+    // would loop. A host whose node reconnects within the drop window of a
+    // wake holds its wakes for that generation; a later reconnect clears it.
+    @Test("A reconnect soon after a wake holds that host's wakes until a later reconnect")
+    func reconnectAfterWakeHoldsWakes() {
+        var policy = RelayBackgroundAttachPolicy()
+        let settle = RelayBackgroundAttachPolicy.settleAfterRestartNanoseconds
+        let window = RelayBackgroundAttachPolicy.wakeDropWindowNanoseconds
+        func waiting() -> RelayBackgroundAttachCandidate {
+            var c = candidate(connecting: false); c.waitingAfterReconnect = true; return c
+        }
+        func node(_ generation: Int) -> RelayBackgroundAttachNode { .init(phase: .ready, generation: generation, heartbeatCurrent: true) }
+        let a = waiting(), b = waiting(), fresh = candidate()
+        #expect(policy.next([a], nodes: ["dandy": node(2)], settled: { _ in true }, now: 0) == [a])
+        // The node drops 30 s after the wake.
+        let drop: UInt64 = 30_000_000_000
+        #expect(policy.next([a, b], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop).isEmpty)
+        #expect(policy.next([a, b], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + settle + window).isEmpty,
+            "no wake in the generation the wakes may have caused")
+        #expect(!policy.pending(a) && !policy.pending(b), "held panes do not keep the scheduler running")
+        #expect(policy.next([a, fresh], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + settle + window) == [fresh],
+            "a never-started pane still attaches")
+        // A later reconnect, long after the last wake, wakes again.
+        let later = drop + settle + 2 * window
+        #expect(policy.next([a, b], nodes: ["dandy": node(4)], settled: { _ in true }, now: later).isEmpty)
+        #expect(policy.next([a, b], nodes: ["dandy": node(4)], settled: { _ in true }, now: later + settle) == [a])
     }
 
     @Test("A pane is attempted once")
@@ -252,7 +285,7 @@ struct RelayBackgroundAttachSchedulerTests {
         #expect(woken.count == 1, "a woken pane holds its host until it is connected")
         for pane in panes where woken.contains(pane.id) { pane.connectionState = .connected }
         for _ in 0..<10 where woken.count < panes.count {
-            now += RelayBackgroundAttachPolicy.gapNanoseconds
+            now += RelayBackgroundAttachPolicy.wakeGapNanoseconds
             scheduler.step()
             for pane in panes where woken.contains(pane.id) { pane.connectionState = .connected }
         }

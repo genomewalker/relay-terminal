@@ -35,6 +35,14 @@ struct RelayBackgroundAttachPolicy {
     static let attachTimeoutNanoseconds: UInt64 = 20_000_000_000
     /// A node that restarted gets this long to settle before the next attach.
     static let settleAfterRestartNanoseconds: UInt64 = 15_000_000_000
+    /// Minimum time between two wakes on one host. Wakes replay whole saved
+    /// screens (2.8-6.6 MB on dandy-07); the 2026-11-22 12:52Z drop ended a
+    /// wave of about 30 such replays at the 1.5 s attach gap.
+    static let wakeGapNanoseconds: UInt64 = 5_000_000_000
+    /// A node that reconnects this soon after a wake on its host may have been
+    /// dropped by the wakes themselves; that host's waiting panes are then
+    /// left to be shown or sent input, so a reconnect cannot loop.
+    static let wakeDropWindowNanoseconds: UInt64 = 120_000_000_000
 
     private struct HostState {
         var inFlight: UUID?
@@ -42,6 +50,9 @@ struct RelayBackgroundAttachPolicy {
         var lastStart: UInt64?
         var generation: Int?
         var quietUntil: UInt64 = 0
+        var lastWake: UInt64?
+        /// The node generation in which this host's waiting panes are not woken.
+        var wakesHeldInGeneration: Int?
     }
 
     private var hosts: [String: HostState] = [:]
@@ -68,7 +79,10 @@ struct RelayBackgroundAttachPolicy {
     /// Eligible and not yet handled: a first start happens once per pane, a
     /// wake whenever a reconnect leaves the pane waiting again.
     func pending(_ candidate: RelayBackgroundAttachCandidate) -> Bool {
-        Self.eligible(candidate) && (candidate.waitingAfterReconnect || !attempted.contains(candidate.paneID))
+        guard Self.eligible(candidate) else { return false }
+        guard candidate.waitingAfterReconnect else { return !attempted.contains(candidate.paneID) }
+        let host = hosts[candidate.hostKey]
+        return host?.generation == nil || host?.wakesHeldInGeneration != host?.generation
     }
 
     var isIdle: Bool { hosts.values.allSatisfy { $0.inFlight == nil } }
@@ -96,6 +110,9 @@ struct RelayBackgroundAttachPolicy {
             if let node {
                 if let known = state.generation, known != node.generation {
                     state.quietUntil = now &+ Self.settleAfterRestartNanoseconds
+                    if let wake = state.lastWake, now &- wake < Self.wakeDropWindowNanoseconds {
+                        state.wakesHeldInGeneration = node.generation
+                    }
                 }
                 state.generation = node.generation
             }
@@ -103,8 +120,11 @@ struct RelayBackgroundAttachPolicy {
                 guard settled(inFlight) || now &- state.inFlightSince >= Self.attachTimeoutNanoseconds else { continue }
                 state.inFlight = nil
             }
-            guard let candidate = byHost[key]?.first, now >= state.quietUntil else { continue }
+            let wakesHeld = state.generation != nil && state.wakesHeldInGeneration == state.generation
+            guard let candidate = byHost[key]?.first(where: { !(wakesHeld && $0.waitingAfterReconnect) }),
+                  now >= state.quietUntil else { continue }
             if let last = state.lastStart, now &- last < Self.gapNanoseconds { continue }
+            if candidate.waitingAfterReconnect, let wake = state.lastWake, now &- wake < Self.wakeGapNanoseconds { continue }
             // No node yet: the first attach opens the host's shared link. A
             // node whose last pane left is stopped and restarts only when a
             // pane joins it, so it is treated the same: on dandy-07
@@ -115,6 +135,7 @@ struct RelayBackgroundAttachPolicy {
             state.inFlight = candidate.paneID
             state.inFlightSince = now
             state.lastStart = now
+            if candidate.waitingAfterReconnect { state.lastWake = now }
             chosen.append(candidate)
         }
         return chosen
