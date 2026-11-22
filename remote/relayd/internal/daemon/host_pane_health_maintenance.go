@@ -1777,6 +1777,20 @@ func phSubagentSettled(path string) bool {
 // phSubagentWork is subagent_work(path, session): whether any in-process
 // subagent of the session may still be working; nil when unknown.
 func phSubagentWork(path string, session any) any {
+	return phSubagentWorkSince(path, session, time.Time{})
+}
+
+// phSubagentIncarnationSkew tolerates clock skew between a networked
+// filesystem's modification times and the local kernel's process start.
+const phSubagentIncarnationSkew = 2 * time.Minute
+
+// phSubagentWorkSince is phSubagentWork for the agent process that started at
+// started. An in-process subagent cannot outlive its process, so a subagent
+// whose own transcript was last written before this process started belongs
+// to an earlier incarnation of the resumed session and is not working,
+// whatever its lifecycle records say. Such leftovers otherwise hold every
+// account move of the pane forever. A zero started applies no such filter.
+func phSubagentWorkSince(path string, session any, started time.Time) any {
 	var result any
 	if phCatch(func() {
 		text, ok := session.(string)
@@ -1815,9 +1829,17 @@ func phSubagentWork(path string, session any) any {
 			if !strings.HasPrefix(name, "agent-") || !strings.HasSuffix(name, ".jsonl") {
 				continue
 			}
-			if len(ids) >= phSubagentLimit || !phMustStat(phJoin(subagents, name), false).Mode().IsRegular() {
+			if len(ids) >= phSubagentLimit {
 				result = nil
 				return
+			}
+			info := phMustStat(phJoin(subagents, name), false)
+			if !info.Mode().IsRegular() {
+				result = nil
+				return
+			}
+			if !started.IsZero() && info.ModTime().Before(started.Add(-phSubagentIncarnationSkew)) {
+				continue
 			}
 			ids = append(ids, strings.TrimSuffix(name[len("agent-"):], ".jsonl"))
 		}
@@ -2059,7 +2081,11 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 			entries := r.configuredMCPCommands(pid, account, r.arguments(pid))
 			return entries, entries != nil
 		})
-		subagents = phSubagentWork(path, session)
+		var started time.Time
+		if value, ok := processStart.(int64); ok && value > 0 {
+			started = processStartWallTime(uint64(value))
+		}
+		subagents = phSubagentWorkSince(path, session, started)
 		harness = r.harnessStatus(pid, account)
 		hostJobs = r.backgroundAgentJobs(pid, account)
 	}
