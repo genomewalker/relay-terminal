@@ -230,6 +230,12 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
                 try refuse("the host's plan names a different provider or pane", .paneChanged); return
             }
             if let mismatch = Self.sessionRefusal(request, plan: plan) { try refuse(mismatch.blocker, mismatch.code); return }
+            // An agent the worker started without a shell (its shell pid is the
+            // agent itself) leaves no prompt to resume in once it exits: pane
+            // 48005fe5 on dandy-07, 2026-11-22, ended with no agent and no shell.
+            if Self.agentIsItsOwnShell(plan.owner) {
+                try refuse("the agent runs without a shell under the pane worker; exiting it would leave no shell to resume the session in", .resumeUnavailable); return
+            }
             let checked = await pane.runtime.agentResumePromptCheck(expected: plan.owner)
             guard let proof = checked.token else {
                 let why = checked.refusal ?? .init(.promptUnverified, "the screen or owner changed")
@@ -355,6 +361,11 @@ struct RelayCodexPaneResumeRequest: Codable, Equatable {
     nonisolated static func shellClearKey(typedPolls: Int, clearsSent: Int) -> String? {
         guard typedPolls >= 2, clearsSent < 2 else { return nil }
         return clearsSent == 0 ? "u" : "k"
+    }
+    /// The worker started the agent directly: the owner's shell is the agent
+    /// process itself, so nothing remains at a prompt after it exits.
+    nonisolated static func agentIsItsOwnShell(_ owner: RelayPromptOwnerBinding) -> Bool {
+        owner.provider != "shell" && owner.shellPid == owner.processId && owner.shellStart == owner.processStart
     }
     static func sameRetainedShell(_ before: RelayPromptOwnerBinding, _ after: RelayPromptOwnerBinding) -> Bool {
         before.paneId == after.paneId && before.nodeBootId == after.nodeBootId && before.workerPid == after.workerPid && before.workerStart == after.workerStart && before.shellPid == after.shellPid && before.shellStart == after.shellStart

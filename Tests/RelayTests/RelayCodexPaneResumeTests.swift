@@ -18,6 +18,18 @@ struct RelayCodexPaneResumeTests {
               shellPid: 11, shellStart: 101, provider: "codex", processId: process, processStart: 200,
               sessionId: session, transcriptIdentity: "transcript")
     }
+    // dandy-07 48005fe5, 2026-11-22: Codex started by the worker with no shell
+    // (shell pid == agent pid) exited and left the pane with nothing to resume in.
+    @Test func agentWithoutItsOwnShellIsNotResumable() {
+        let normal = owner(session: "s")
+        #expect(!RelayCodexPaneResume.agentIsItsOwnShell(normal))
+        let shellless = RelayPromptOwnerBinding(version: 1, paneId: "pane", nodeBootId: "boot", workerPid: 2382, workerStart: 100,
+            shellPid: 2419, shellStart: 104, provider: "codex", processId: 2419, processStart: 104, sessionId: "s", transcriptIdentity: "t")
+        #expect(RelayCodexPaneResume.agentIsItsOwnShell(shellless))
+        let shell = RelayPromptOwnerBinding(version: 1, paneId: "pane", nodeBootId: "boot", workerPid: 1, workerStart: 1,
+            shellPid: 5, shellStart: 6, provider: "shell", processId: 5, processStart: 6, sessionId: nil, transcriptIdentity: nil)
+        #expect(!RelayCodexPaneResume.agentIsItsOwnShell(shell))
+    }
     @Test @MainActor func codexPaneResumeVerificationRequiresExactSessionAndRetainedProcesses() {
         let target = UUID(), before = owner(session: UUID().uuidString.lowercased())
         let correct = owner(session: target.uuidString.lowercased(), process: 21)
