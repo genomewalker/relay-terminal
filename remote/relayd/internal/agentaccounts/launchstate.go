@@ -461,7 +461,7 @@ func PrepareLaunch(home, provider, value string) string {
 	}
 	unlock, err := lockAccounts(home, false)
 	if err != nil {
-		return "an accounts change is in progress, so first-run settings were not copied into this account"
+		return lockRefusal(err) + ", so first-run settings were not copied into this account"
 	}
 	defer unlock()
 	if _, _, err := mergeLaunchState(home, *account); err != nil {

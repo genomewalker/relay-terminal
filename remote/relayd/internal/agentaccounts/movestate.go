@@ -86,7 +86,7 @@ func PrepareClaudeMove(home, source, target, dir string) (MoveOnboarding, error)
 	}
 	unlock, err := lockAccounts(home, false)
 	if err != nil {
-		return MoveOnboarding{}, errors.New("an accounts change is in progress; try the move again when it finishes")
+		return MoveOnboarding{}, errors.New(lockRefusal(err) + "; try the move again when it finishes")
 	}
 	defer unlock()
 	links := linkMoveTarget(home, to, time.Now())

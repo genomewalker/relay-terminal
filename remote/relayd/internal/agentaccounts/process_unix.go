@@ -3,6 +3,7 @@
 package agentaccounts
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -94,7 +95,12 @@ func lockAccounts(home string, wait bool) (unlock func(), err error) {
 	}
 	if err != nil {
 		syscall.Close(fd)
-		return nil, err
+		if err == syscall.EWOULDBLOCK {
+			return nil, errAccountsBusy
+		}
+		// Another failure, such as ENOLCK on an NFS home, is not a change
+		// in progress; report it as itself.
+		return nil, fmt.Errorf("the accounts lock could not be taken: %w", err)
 	}
 	return func() { syscall.Close(fd) }, nil
 }
