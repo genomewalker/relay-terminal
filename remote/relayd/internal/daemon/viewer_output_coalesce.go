@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/binary"
+	"encoding/json"
 
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
@@ -76,7 +77,7 @@ func (viewer *client) makeRoom(n int) bool {
 			drained = true
 		}
 	}
-	compacted, total := compactQueuedOutput(pending)
+	compacted, total := compactQueuedOutput(dropSupersededProgramStatus(pending))
 	for _, frame := range compacted {
 		viewer.frames <- frame
 	}
@@ -104,4 +105,42 @@ func compactQueuedOutput(frames []protocol.Frame) ([]protocol.Frame, int) {
 		out = append(out, frame)
 	}
 	return out, total
+}
+
+// dropSupersededProgramStatus keeps only the last live program_status update
+// in a full queue. Each update is a complete snapshot with a revision, so an
+// earlier one that has not been sent yet carries nothing the last one lacks.
+// Claude's redraws arrive interleaved with these updates (2026-11-22, c0441e7b
+// and 32655e54): with an update between every two output frames nothing could
+// merge and the full queue cut the view. Replay snapshots, sent when a viewer
+// attaches, and every other frame keep their place.
+func dropSupersededProgramStatus(frames []protocol.Frame) []protocol.Frame {
+	last := -1
+	for i, frame := range frames {
+		if liveProgramStatus(frame) {
+			last = i
+		}
+	}
+	if last < 0 {
+		return frames
+	}
+	out := frames[:0:0]
+	for i, frame := range frames {
+		if i != last && liveProgramStatus(frame) {
+			continue
+		}
+		out = append(out, frame)
+	}
+	return out
+}
+
+func liveProgramStatus(frame protocol.Frame) bool {
+	if frame.Type != protocol.Status {
+		return false
+	}
+	var status struct {
+		State  string `json:"state"`
+		Replay bool   `json:"program_status_replay"`
+	}
+	return json.Unmarshal(frame.Payload, &status) == nil && status.State == "program_status" && !status.Replay
 }

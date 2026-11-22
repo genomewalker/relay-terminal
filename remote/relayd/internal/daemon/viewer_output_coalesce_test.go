@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/relay-terminal/relayd/internal/programstatus"
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
@@ -123,5 +124,75 @@ func TestCompactQueuedOutputKeepsOrderAndCopiesSharedPayloads(t *testing.T) {
 	}
 	if sequence, data, _ := protocol.ParseOutput(shared); sequence != 1 || string(data) != "a" {
 		t.Fatal("merging changed a frame another viewer shares")
+	}
+}
+
+func programStatusTestFrame(t *testing.T, revision uint64, replay bool) protocol.Frame {
+	t.Helper()
+	records := []programstatus.Record{}
+	frame, err := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
+		State: "program_status", ProgramStatus: &records, ProgramStatusRevision: revision, ProgramStatusReplay: replay,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frame
+}
+
+// 2026-11-22: scrolling a Claude pane still showed "Reconnecting" (c0441e7b
+// 10:03, 32655e54 12:40) on workers that already merge output. Claude's
+// redraws arrive interleaved with program status updates, so no two output
+// frames were adjacent, nothing merged, and the full queue cut the view.
+func TestFullViewerQueueDropsSupersededProgramStatusBetweenOutput(t *testing.T) {
+	viewer := newClient(512)
+	var want bytes.Buffer
+	sequence := uint64(0)
+	replay := programStatusTestFrame(t, 1, true)
+	viewer.frames <- replay
+	var latest protocol.Frame
+	for len(viewer.frames) < cap(viewer.frames) {
+		if len(viewer.frames)%2 == 1 {
+			sequence++
+			chunk := []byte{byte(sequence), '\x1b', '[', 'K'}
+			want.Write(chunk)
+			viewer.frames <- protocol.OutputFrame(sequence, chunk)
+		} else {
+			latest = programStatusTestFrame(t, sequence+1, false)
+			viewer.frames <- latest
+		}
+	}
+	if !viewer.makeRoom(1) {
+		t.Fatal("output interleaved with program status cut the view")
+	}
+	var got bytes.Buffer
+	statuses, replays := 0, 0
+	last := uint64(0)
+	var lastStatus protocol.Frame
+	for len(viewer.frames) > 0 {
+		frame := <-viewer.frames
+		if frame.Type == protocol.Status {
+			var payload protocol.StatusPayload
+			if err := protocol.DecodeJSON(frame, &payload); err != nil || payload.State != "program_status" {
+				t.Fatalf("unexpected status %q err=%v", payload.State, err)
+			}
+			statuses++
+			if payload.ProgramStatusReplay {
+				replays++
+			}
+			lastStatus = frame
+			continue
+		}
+		seq, data, err := protocol.ParseOutput(frame)
+		if err != nil || seq <= last {
+			t.Fatalf("output out of order: %d after %d err=%v", seq, last, err)
+		}
+		last = seq
+		got.Write(data)
+	}
+	if !bytes.Equal(got.Bytes(), want.Bytes()) || last != sequence {
+		t.Fatalf("output changed: %d bytes to %d; want %d bytes to %d", got.Len(), last, want.Len(), sequence)
+	}
+	if replays != 1 || statuses != 2 || !bytes.Equal(lastStatus.Payload, latest.Payload) {
+		t.Fatalf("statuses=%d replays=%d; want the replay snapshot and only the latest update", statuses, replays)
 	}
 }
