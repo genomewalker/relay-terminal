@@ -23,6 +23,7 @@ const (
 	PaneRefusalInvalidRequest      = "invalid_request"
 	PaneRefusalTrustPrompt         = "trust_prompt"
 	PaneRefusalOutsideProxy        = "native_outside_proxy"
+	PaneRefusalInitialPrompt       = "initial_prompt_unproven"
 	PaneRefusalUnclassified        = "unclassified"
 )
 
@@ -49,6 +50,7 @@ var paneRefusalClearing = map[string]string{
 	PaneRefusalInvalidRequest:      "Pass the exact pane and session UUIDs.",
 	PaneRefusalTrustPrompt:         "Trust the folder in the Codex account's config.toml (or enable Relay's matching-parent trust setting), then retry; Relay never answers the trust dialog.",
 	PaneRefusalOutsideProxy:        "Exit this Codex yourself (or close its task in Codex desktop), then relaunch the conversation from Relay's launch form (relay_launch_agent), which runs it through Relay's proxy.",
+	PaneRefusalInitialPrompt:       "The launch prompt could not be matched to a completed turn of this conversation; restart the agent by hand.",
 	PaneRefusalUnclassified:        "Read the blocker text; it names what held the operation.",
 }
 
@@ -64,6 +66,7 @@ func newPaneRefusal(code, blocker string) *PaneRefusal {
 // maintenance reader raises from deep inside its checks. Order matters: the
 // first matching fragment wins.
 var paneRefusalPatterns = []struct{ fragment, code string }{
+	{"initial Claude prompt is not verified", PaneRefusalInitialPrompt},
 	{"needs a manual restart", PaneRefusalManualRestart},
 	{"ChatGPT", PaneRefusalLoginMismatch},
 	{"logged in", PaneRefusalLoginMismatch},

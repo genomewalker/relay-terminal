@@ -34,7 +34,8 @@ func TestPaneRefusalClassifiesExistingHostTexts(t *testing.T) {
 		"The exact agent resume command is unavailable.":                                        PaneRefusalResumeUnavailable,
 		"saved session is missing or ambiguous in the original account":                         PaneRefusalResumeUnavailable,
 		"The saved Codex sandbox is unavailable on this host; automatic restart is held.":       PaneRefusalResumeUnavailable,
-		"something new": PaneRefusalUnclassified,
+		phClaudeInitialPromptRefusal:                                                            PaneRefusalInitialPrompt,
+		"something new":                                                                         PaneRefusalUnclassified,
 	} {
 		if got := classifyPaneRefusal(message); got != code {
 			t.Fatalf("%q: %s, want %s", message, got, code)

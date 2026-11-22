@@ -372,8 +372,7 @@ enum RelayAgentMaintenancePolicy {
         }
         guard inputAge >= 15 else { return Refusal(.userTyping, "Waiting until you finish typing") }
         if requiresResume, proof.resumeCommand == nil {
-            let code = proof.resumeErrorCode.flatMap(Refusal.Code.init(rawValue:)) ??
-                (proof.resumeError.map(Refusal.classify) ?? .resumeUnavailable)
+            let code = Refusal.code(host: proof.resumeErrorCode, message: proof.resumeError, fallback: .resumeUnavailable)
             return Refusal(code, proof.resumeError ?? "The exact agent resume command is unavailable")
         }
         return nil

@@ -229,6 +229,12 @@ func phClaudeOnlyToolResults(content any) bool {
 // exactly once among the session's user turns, at or after the process start
 // (an older matching turn cannot stand in for a still-pending prompt), and be
 // followed by a completed assistant turn before any other user message.
+//
+// Claude may compact a large conversation between reading the prompt and
+// answering it. A compaction while the prompt is pending is accepted only when
+// a later api-request-blob of the session (role user) ends with the prompt's
+// exact text, showing the post-compaction request still carried it; each
+// compaction needs its own later blob. A Claude that writes no blob fails.
 func phProveResumedClaudePrompt(path, session string, arguments []string, prompt, revision string, uid int, started time.Time, fail func()) *phClaudeInitialPromptProof {
 	file := phOpenNoFollow(path)
 	defer file.Close()
@@ -245,6 +251,9 @@ func phProveResumedClaudePrompt(path, session string, arguments []string, prompt
 	consumed := 0
 	matches := 0
 	pending, completed := false, false
+	// compacted: a compaction happened while pending and no later request
+	// blob has shown the prompt as the final text yet.
+	compacted := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		consumed += len(line) + 1
@@ -265,13 +274,24 @@ func phProveResumedClaudePrompt(path, session string, arguments []string, prompt
 			continue
 		}
 		kind, _ := row["type"].(string)
+		message, _ := row["message"].(map[string]any)
+		if kind == "api-request-blob" {
+			if pending && compacted && row["sessionId"] == session && message != nil && message["role"] == "user" &&
+				phClaudeRequestEndsWithPrompt(message["content"], prompt) {
+				compacted = false
+			}
+			continue
+		}
 		if kind != "user" && kind != "assistant" && kind != "system" {
 			continue
 		}
 		if pending && (row["isCompactSummary"] == true || row["isVisibleInTranscriptOnly"] == true) {
-			fail()
+			if row["sessionId"] != session || row["isCompactSummary"] != true {
+				fail()
+			}
+			compacted = true
+			continue
 		}
-		message, _ := row["message"].(map[string]any)
 		switch {
 		case kind == "user" && row["sessionId"] == session && message != nil && message["role"] == "user" &&
 			row["isCompactSummary"] != true && row["isVisibleInTranscriptOnly"] != true &&
@@ -298,14 +318,22 @@ func phProveResumedClaudePrompt(path, session string, arguments []string, prompt
 				fail()
 			}
 			if message["stop_reason"] == "end_turn" || message["stop_reason"] == "stop_sequence" {
+				if compacted {
+					fail()
+				}
 				pending, completed = false, true
 			}
+		case row["sessionId"] == session && row["subtype"] == "compact_boundary":
+			compacted = true
 		case row["sessionId"] == session && row["subtype"] == "turn_duration":
+			if compacted {
+				fail()
+			}
 			pending, completed = false, true
 		}
 	}
 	// A transcript that ends with the prompt still pending refuses, even idle.
-	if scanner.Err() != nil || matches != 1 || pending || !completed {
+	if scanner.Err() != nil || matches != 1 || pending || compacted || !completed {
 		fail()
 	}
 	after, err := file.Stat()
@@ -321,4 +349,15 @@ func phProveResumedClaudePrompt(path, session string, arguments []string, prompt
 		fail()
 	}
 	return &phClaudeInitialPromptProof{session: session, text: prompt, argumentsSHA: phClaudeArgumentsSHA(arguments)}
+}
+
+// phClaudeRequestEndsWithPrompt reports whether a recorded API request's user
+// content ends with a text block whose text is exactly prompt, under the same
+// rules as phClaudePromptText.
+func phClaudeRequestEndsWithPrompt(content any, prompt string) bool {
+	blocks, ok := content.([]any)
+	if !ok || len(blocks) == 0 {
+		return false
+	}
+	return phClaudePromptText([]any{blocks[len(blocks)-1]}) == prompt
 }

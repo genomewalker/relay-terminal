@@ -165,6 +165,14 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
         ["reason_code": code.rawValue, "blocker": blocker, "how_to_clear": howToClear]
     }
 
+    /// The code for a host refusal: relayd's own code, unless it is missing or
+    /// "unclassified" (an older relayd that does not know the text), then
+    /// Relay's table for the text, then `fallback` when there is no text.
+    static func code(host: String?, message: String?, fallback: Code) -> Code {
+        if let code = host.flatMap(Code.init(rawValue:)), code != .unclassified { return code }
+        return message.map(classify) ?? fallback
+    }
+
     /// The code for an existing refusal text that carries none (an older
     /// relayd's resume_error, or a refusal site with no code of its own).
     /// First match wins; anything else is unclassified.

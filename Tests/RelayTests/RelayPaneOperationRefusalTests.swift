@@ -83,6 +83,15 @@ struct RelayPaneOperationRefusalTests {
         #expect(reason(unresumable)?.code == .manualRestartRequired)
         unresumable.resumeErrorCode = "relaunch_unavailable"
         #expect(reason(unresumable)?.code == .relaunchUnavailable)
+        // relayd 0.5.77 sends this live text (2026-11-22, f62dee0f) with code
+        // "unclassified"; Relay's table still names it.
+        let live = "The initial Claude prompt is not verified incorporated in an idle conversation."
+        unresumable.resumeError = live; unresumable.resumeErrorCode = "unclassified"
+        #expect(reason(unresumable)?.code == .initialPromptUnproven)
+        unresumable.resumeErrorCode = "initial_prompt_unproven"
+        #expect(reason(unresumable)?.code == .initialPromptUnproven)
+        unresumable.resumeError = "something entirely new"; unresumable.resumeErrorCode = "unclassified"
+        #expect(reason(unresumable)?.code == .unclassified)
         unresumable.resumeError = nil; unresumable.resumeErrorCode = nil
         #expect(reason(unresumable) == Refusal(.resumeUnavailable, "The exact agent resume command is unavailable"))
     }
@@ -95,6 +104,11 @@ struct RelayPaneOperationRefusalTests {
         let refusal = RelayAgentAccountMovePolicy.refusalReason(proof, paneID: Self.pane, target: Self.target, emptyPrompt: true,
             hasDraft: false, pendingApprovals: 0, inputAge: 60)
         #expect(refusal?.code == .targetAccountUnavailable)
+        var unproven = proof
+        unproven.moveError = "The initial Claude prompt is not verified incorporated in an idle conversation."
+        unproven.moveErrorCode = "unclassified"
+        #expect(RelayAgentAccountMovePolicy.refusalReason(unproven, paneID: Self.pane, target: Self.target, emptyPrompt: true,
+            hasDraft: false, pendingApprovals: 0, inputAge: 60)?.code == .initialPromptUnproven)
         #expect(refusal?.blocker == RelayAgentAccountMovePolicy.refusal(proof, paneID: Self.pane, target: Self.target,
             emptyPrompt: true, hasDraft: false, pendingApprovals: 0, inputAge: 60))
         let claude = RelayAgentAccount(provider: "claude", label: "max", dir: "~/.claude-max")

@@ -150,3 +150,67 @@ func TestClaudeResumedPromptRefusesUnprovenShapes(t *testing.T) {
 		mrRaise(t, "not verified", func() { initialProof(path, rev, args) })
 	})
 }
+
+// On 2026-11-22 f62dee0f and 10c81cc6 still refused after the resumed-prompt
+// proof shipped: Claude auto-compacted the large conversation right after the
+// note arrived, then answered it. The post-compaction API request blob ended
+// with the note verbatim. Shape taken from that transcript, content replaced.
+func TestClaudeResumedPromptSurvivesCompactionCarriedByRequestBlob(t *testing.T) {
+	started := time.Now().Add(-time.Hour)
+	after := started.Add(time.Minute)
+	note := "Note from the user: this conversation was moved. Reply with one line, then wait."
+	args := []string{"claude", "--settings", "/h.json", "--model", "opus", "--resume", initialSession, note}
+	boundary := func(at time.Time) map[string]any {
+		return map[string]any{"type": "system", "subtype": "compact_boundary", "sessionId": initialSession,
+			"timestamp": at.UTC().Format(time.RFC3339Nano)}
+	}
+	summary := func(at time.Time) map[string]any {
+		row := resumedRow("user", "This session is being continued from a previous conversation.", "", at)
+		row["isCompactSummary"], row["isVisibleInTranscriptOnly"] = true, true
+		return row
+	}
+	blob := func(session string, texts ...string) map[string]any {
+		var blocks []any
+		for _, text := range texts {
+			blocks = append(blocks, map[string]any{"type": "text", "text": text})
+		}
+		return map[string]any{"type": "api-request-blob", "sessionId": session,
+			"message": map[string]any{"role": "user", "content": blocks}}
+	}
+	turnDone := map[string]any{"type": "system", "subtype": "turn_duration", "sessionId": initialSession}
+	noteRow := resumedRow("user", note, "", after)
+	reply := resumedRow("assistant", "Acknowledged.", "end_turn", after.Add(time.Minute))
+	accepted := []map[string]any{noteRow, boundary(after), summary(after),
+		blob(initialSession, "<system-reminder>context</system-reminder>", "summary", note), reply, turnDone}
+	path, rev := initialTranscript(t, accepted...)
+	proof := resumedProof(path, rev, args, started)
+	if proof == nil || proof.text != note {
+		t.Fatalf("proof %+v", proof)
+	}
+
+	refuse := map[string][]map[string]any{
+		"no_blob":             {noteRow, boundary(after), summary(after), reply, turnDone},
+		"blob_last_differs":   {noteRow, boundary(after), summary(after), blob(initialSession, note, "something else"), reply},
+		"blob_before_compact": {noteRow, blob(initialSession, note), boundary(after), summary(after), reply},
+		"blob_other_session":  {noteRow, boundary(after), summary(after), blob("other-session", note), reply},
+		"second_compact_without_new_blob": {noteRow, boundary(after), summary(after), blob(initialSession, note),
+			boundary(after), summary(after), reply},
+		"boundary_only_no_blob": {noteRow, boundary(after), turnDone},
+	}
+	sidechain := blob(initialSession, note)
+	sidechain["isSidechain"] = true
+	refuse["blob_sidechain"] = []map[string]any{noteRow, boundary(after), summary(after), sidechain, reply}
+	for name, rows := range refuse {
+		t.Run(name, func(t *testing.T) {
+			path, rev := initialTranscript(t, rows...)
+			mrRaise(t, "not verified", func() { resumedProof(path, rev, args, started) })
+		})
+	}
+	t.Run("second_compact_with_new_blob", func(t *testing.T) {
+		path, rev := initialTranscript(t, noteRow, boundary(after), summary(after), blob(initialSession, note),
+			boundary(after), summary(after), blob(initialSession, "summary", note), reply)
+		if resumedProof(path, rev, args, started) == nil {
+			t.Fatal("no proof")
+		}
+	})
+}

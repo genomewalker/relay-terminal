@@ -77,8 +77,7 @@ enum RelayAgentAccountMovePolicy {
             return held
         }
         guard proof.moveCommand != nil else {
-            let code = proof.moveErrorCode.flatMap(Refusal.Code.init(rawValue:)) ??
-                (proof.moveError.map(Refusal.classify) ?? .resumeUnavailable)
+            let code = Refusal.code(host: proof.moveErrorCode, message: proof.moveError, fallback: .resumeUnavailable)
             return Refusal(code, proof.moveError ?? "This relayd cannot prepare an account move; update Relay on that host.")
         }
         return nil
