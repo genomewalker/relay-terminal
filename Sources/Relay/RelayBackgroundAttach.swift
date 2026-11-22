@@ -13,6 +13,9 @@ struct RelayBackgroundAttachCandidate: Equatable, Sendable {
     /// Already started, but its node reconnected and holds the pane's route
     /// until the pane is shown or sent input (cb9f8636).
     var waitingAfterReconnect = false
+    /// Started and connected, but its saved screen was cut short at restore,
+    /// so it cannot be read until the worker sends a fresh screen.
+    var screenCutShort = false
 }
 
 /// What the pooled node connection for one host reports right now.
@@ -57,6 +60,12 @@ struct RelayBackgroundAttachPolicy {
 
     private var hosts: [String: HostState] = [:]
     private(set) var attempted: Set<UUID> = []
+    /// Panes asked once for a fresh screen while cut short. Forgotten when the
+    /// pane is seen readable, so a later cut-short restore asks again.
+    private(set) var refreshed: Set<UUID> = []
+
+    mutating func forgetRefresh(_ paneID: UUID) { refreshed.remove(paneID) }
+    mutating func forgetRefreshes() { refreshed.removeAll() }
 
     /// Local workers need the same background attachment as remote workers.
     /// Only an existing worker is ever attached: a Hello without
@@ -72,7 +81,7 @@ struct RelayBackgroundAttachPolicy {
     /// Woken one at a time per host, their screens are still not resent at once.
     static func eligible(_ candidate: RelayBackgroundAttachCandidate) -> Bool {
         guard candidate.isTerminal else { return false }
-        if candidate.waitingAfterReconnect { return true }
+        if candidate.waitingAfterReconnect || candidate.screenCutShort { return true }
         return candidate.requiresExistingWorker && candidate.connecting && candidate.savedViewport != nil
     }
 
@@ -80,6 +89,7 @@ struct RelayBackgroundAttachPolicy {
     /// wake whenever a reconnect leaves the pane waiting again.
     func pending(_ candidate: RelayBackgroundAttachCandidate) -> Bool {
         guard Self.eligible(candidate) else { return false }
+        if candidate.screenCutShort, !candidate.waitingAfterReconnect { return !refreshed.contains(candidate.paneID) }
         guard candidate.waitingAfterReconnect else { return !attempted.contains(candidate.paneID) }
         let host = hosts[candidate.hostKey]
         return host?.generation == nil || host?.wakesHeldInGeneration != host?.generation
@@ -131,7 +141,7 @@ struct RelayBackgroundAttachPolicy {
             // (2026-10-30 08:14Z) waiting for it to become ready left 19
             // panes in "Connecting" until the app relaunched.
             if let node, node.phase != .inactive, node.phase != .ready || !node.heartbeatCurrent { continue }
-            attempted.insert(candidate.paneID)
+            if candidate.screenCutShort { refreshed.insert(candidate.paneID) } else { attempted.insert(candidate.paneID) }
             state.inFlight = candidate.paneID
             state.inFlightSince = now
             state.lastStart = now
@@ -178,6 +188,20 @@ struct RelayBackgroundAttachPolicy {
     /// Whether a started hidden pane's route waits after a node reconnect.
     var waiting: @MainActor (PaneModel) -> Bool = { $0.runtime.isWaitingUntilShownAfterReconnect }
     var wake: @MainActor (PaneModel) -> Void = { $0.runtime.wakeWaitingRouteInBackground() }
+    /// Whether a started hidden pane's restored screen was cut short.
+    var cutShort: @MainActor (PaneModel) -> Bool = { pane in
+        pane.kind != .shell &&
+            !RelayHiddenScreenRefresh.excluded(pane.id, protected: RelayPreferences.shared.maintenanceProtectedPanes) &&
+            pane.runtime.hiddenScreenCutShort
+    }
+    /// Asks for one fresh screen; it may decline (busy agent, draft, approval).
+    var refresh: @MainActor (PaneModel) async -> Bool = { await RelayHiddenScreenRefresh.refresh($0) }
+    /// Refreshes still running; each holds its host until it returns.
+    private var refreshing: Set<UUID> = []
+    /// A pane was asked and is still cut short (its agent was busy, or the
+    /// screen did not arrive): the loop is run again after this delay.
+    static let refreshRetryMilliseconds = 60_000
+    private(set) var refreshRetryDue = false
     /// Woken panes still on their way to "Connected"; they hold their host.
     private var woken: Set<UUID> = []
     private var nodeReadyObserver: NSObjectProtocol?
@@ -206,7 +230,12 @@ struct RelayBackgroundAttachPolicy {
                 guard let self, self.step() else { break }
                 try? await Task.sleep(for: .milliseconds(Self.tickMilliseconds))
             }
-            self?.task = nil
+            guard let self else { return }
+            self.task = nil
+            if self.refreshRetryDue {
+                self.policy.forgetRefreshes()
+                self.run(after: Self.refreshRetryMilliseconds)
+            }
         }
     }
 
@@ -236,6 +265,16 @@ struct RelayBackgroundAttachPolicy {
                 candidates.append(Self.candidate(pane, savedViewport: nil, waitingAfterReconnect: true))
                 continue
             }
+            if pane.connectionState == .connected {
+                if cutShort(pane) {
+                    var candidate = Self.candidate(pane, savedViewport: nil)
+                    candidate.screenCutShort = true
+                    candidates.append(candidate)
+                } else {
+                    policy.forgetRefresh(pane.id)
+                }
+                continue
+            }
             // Read a log header only for a pane that could use it, once.
             guard RelayBackgroundAttachPolicy.eligible(Self.candidate(pane, savedViewport: .default)),
                   !policy.attempted.contains(pane.id) else { continue }
@@ -252,9 +291,11 @@ struct RelayBackgroundAttachPolicy {
                 heartbeatCurrent: snapshot.isCurrent(at: now))
         }
         woken = woken.filter { byID[$0].map { $0.connectionState != .connected } ?? false }
+        refreshRetryDue = candidates.contains { $0.screenCutShort && !policy.pending($0) && !refreshing.contains($0.paneID) }
         let chosen = policy.next(candidates, nodes: nodeStates,
-            settled: { [woken] id in
+            settled: { [woken, refreshing] id in
                 guard let pane = byID[id] else { return true }
+                if refreshing.contains(id) { return false }
                 return woken.contains(id) ? pane.connectionState == .connected : pane.connectionState != .connecting
             }, now: now)
         for candidate in chosen {
@@ -263,6 +304,15 @@ struct RelayBackgroundAttachPolicy {
                 record("background-wake", ["pane_id": pane.id.uuidString.lowercased(), "profile": pane.profile.name])
                 woken.insert(pane.id)
                 wake(pane)
+                continue
+            }
+            if candidate.screenCutShort {
+                record("background-screen-refresh", ["pane_id": pane.id.uuidString.lowercased(), "profile": pane.profile.name])
+                refreshing.insert(pane.id)
+                Task { @MainActor [weak self, refresh] in
+                    _ = await refresh(pane)
+                    self?.refreshing.remove(pane.id)
+                }
                 continue
             }
             guard let saved = candidate.savedViewport else { continue }

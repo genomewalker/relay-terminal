@@ -355,6 +355,27 @@ struct RelayPromptControlTransportTests {
         #expect(snapshot.data.range(of: Data("delta".utf8)) == nil || snapshot.data.range(of: Data("\u{1b}c".utf8)) != nil)
     }
 
+    /// The background refresh of a cut-short hidden screen needs the same
+    /// idle proof as an installed update, but no update.
+    @MainActor @Test
+    func hiddenScreenRefreshNeedsAnIdleAgentWithNoDraftOrApproval() throws {
+        let paneID = RelayMaintenanceOrchestrationTests.paneID
+        var proof = try RelayMaintenanceOrchestrationTests.probe()
+        proof.installedUpdate = false
+        proof.harnessStatus = "idle"
+        let admits = { (p: RelayAgentMaintenanceProbe, draft: Bool, approvals: Int) in
+            RelayHiddenScreenRefresh.admits(p, paneID: paneID, hasDraft: draft, pendingApprovals: approvals)
+        }
+        #expect(admits(proof, false, 0), "no update is needed")
+        #expect(!admits(proof, true, 0))
+        #expect(!admits(proof, false, 1))
+        var busy = proof; busy.harnessStatus = "busy"
+        #expect(!admits(busy, false, 0))
+        var unknown = proof; unknown.harnessStatus = nil
+        #expect(!admits(unknown, false, 0))
+        #expect(!RelayHiddenScreenRefresh.admits(proof, paneID: UUID(), hasDraft: false, pendingApprovals: 0))
+    }
+
     @MainActor @Test
     func installedUpdateScreenRefreshNeedsAnIdleUpdateWithNoDraftOrApproval() throws {
         let paneID = RelayMaintenanceOrchestrationTests.paneID

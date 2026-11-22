@@ -294,6 +294,65 @@ struct RelayBackgroundAttachSchedulerTests {
         #expect(!scheduler.step())
     }
 
+    // 2026-11-22 13:35Z relaunch: 81 hidden dandy-07 panes restored only a
+    // cursor (viewport-mismatch-cursor-restored); connected, but every read
+    // of them was refused (no_renderer_for_idle_proof) until shown.
+    @Test("A connected hidden pane with a cut-short screen is asked once for a fresh screen, one per host at a time")
+    func refreshesCutShortScreensOneAtATime() async {
+        let scheduler = RelayBackgroundAttachScheduler()
+        let panes = (0..<3).map { _ -> PaneModel in let p = pane("dandy.invalid"); p.connectionState = .connected; return p }
+        var now: UInt64 = 0
+        var cut = Set(panes.map(\.id))
+        var asked: [UUID] = []
+        var release: [UUID: CheckedContinuation<Bool, Never>] = [:]
+        scheduler.panes = { panes }
+        scheduler.nodes = { [self] in [node(panes[0], .ready, generation: 1, confirmed: now)] }
+        scheduler.uptime = { now }
+        scheduler.savedViewport = { _ in .init(columns: 112, rows: 34) }
+        scheduler.start = { _, _ in Issue.record("a connected pane is never started again") }
+        scheduler.waiting = { _ in false }
+        scheduler.cutShort = { cut.contains($0.id) }
+        scheduler.refresh = { pane in
+            asked.append(pane.id)
+            return await withCheckedContinuation { release[pane.id] = $0 }
+        }
+        scheduler.record = { _, _ in }
+        func settle() async { for _ in 0..<20 { await Task.yield() } }
+        #expect(scheduler.step())
+        await settle()
+        #expect(asked.count == 1)
+        now += 10 * RelayBackgroundAttachPolicy.gapNanoseconds
+        scheduler.step(); await settle()
+        #expect(asked.count == 1, "a refresh holds its host while it runs")
+        // It arrives: the pane is readable and the refresh returns.
+        cut.remove(asked[0]); release[asked[0]]?.resume(returning: true)
+        await settle()
+        now += RelayBackgroundAttachPolicy.gapNanoseconds
+        scheduler.step(); await settle()
+        #expect(asked.count == 2)
+        // This one declines (busy agent): the host is free at once, the pane is
+        // not asked again in this pass, and a retry is due.
+        release[asked[1]]?.resume(returning: false)
+        await settle()
+        now += RelayBackgroundAttachPolicy.gapNanoseconds
+        scheduler.step(); await settle()
+        #expect(asked.count == 3)
+        cut.remove(asked[2]); release[asked[2]]?.resume(returning: true)
+        await settle()
+        for _ in 0..<5 { now += RelayBackgroundAttachPolicy.gapNanoseconds; scheduler.step(); await settle() }
+        #expect(asked.count == 3, "a declined pane is not asked again until the retry")
+        #expect(Set(asked) == Set(panes.map(\.id)))
+        #expect(scheduler.refreshRetryDue)
+        #expect(!scheduler.step(), "the loop ends; the retry runs it again later")
+    }
+
+    @Test("A protected pane is never asked for a fresh screen")
+    func protectedPanesAreNotRefreshed() {
+        let id = UUID()
+        #expect(RelayHiddenScreenRefresh.excluded(id, protected: [id.uuidString.lowercased()]))
+        #expect(!RelayHiddenScreenRefresh.excluded(id, protected: [UUID().uuidString.lowercased()]))
+    }
+
     @Test("A host held with waiting panes is recorded after 30 s, then at most once a minute")
     func recordsAHeldHost() {
         let scheduler = RelayBackgroundAttachScheduler()

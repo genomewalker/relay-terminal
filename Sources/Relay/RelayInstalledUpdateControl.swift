@@ -57,6 +57,39 @@ enum RelayInstalledUpdatePostcondition {
 /// fresh screen. Only a pane with an installed update to adopt, a verified
 /// identity, relayd's idle harness proof, no draft and no pending approval.
 /// The runtime adds its own checks (no surface, one viewer, copy cut short).
+/// 2026-11-22: when background attach may ask a hidden agent pane for a
+/// fresh screen with no update pending. A restart restores a hidden pane's
+/// saved screen only as a cursor when its grid changed (81 dandy-07 panes
+/// after the 13:35Z relaunch), so the copy stays cut short and every read
+/// is refused until the idle agent repaints, which it never does by itself.
+/// The same proof as an installed update, without the update.
+enum RelayHiddenScreenRefresh {
+    @MainActor
+    static func admits(_ proof: RelayAgentMaintenanceProbe, paneID: UUID, pane: PaneModel) -> Bool {
+        let draft = pane.composerStateIfCreated?.hasPendingInput ?? false
+        return admits(proof, paneID: paneID, hasDraft: draft, pendingApprovals: pane.pendingAgentApprovals)
+    }
+
+    static func admits(_ proof: RelayAgentMaintenanceProbe, paneID: UUID, hasDraft: Bool, pendingApprovals: Int) -> Bool {
+        proof.valid(for: paneID) && proof.harnessStatus == "idle" && !hasDraft && pendingApprovals == 0
+    }
+
+    /// A pane the user protected from automatic maintenance is never asked.
+    static func excluded(_ paneID: UUID, protected: [String]) -> Bool {
+        protected.contains(paneID.uuidString.lowercased())
+    }
+
+    /// One fresh screen for a hidden idle agent pane; nothing is typed.
+    @MainActor
+    static func refresh(_ pane: PaneModel) async -> Bool {
+        guard pane.kind != .shell, !excluded(pane.id, protected: RelayPreferences.shared.maintenanceProtectedPanes),
+              pane.runtime.hiddenScreenCutShort,
+              let proof = try? await RelayAgentMaintenanceReader.inspect(pane),
+              admits(proof, paneID: pane.id, pane: pane), pane.runtime.hiddenScreenCutShort else { return false }
+        return await pane.runtime.refreshHiddenScreenBaseForInstalledUpdate()
+    }
+}
+
 enum RelayInstalledUpdateScreenRefresh {
     @MainActor
     static func admits(_ proof: RelayAgentMaintenanceProbe, paneID: UUID, pane: PaneModel) -> Bool {

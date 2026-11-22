@@ -3550,6 +3550,16 @@ final class TerminalRuntime: NSObject {
         return await bounceHiddenScreenRows(pane)
     }
 
+    /// A started, connected, hidden pane with one viewer whose saved screen
+    /// was cut short at restore: every screen read is refused until a fresh
+    /// screen arrives. Cheap checks first; this runs on background ticks.
+    var hiddenScreenCutShort: Bool {
+        guard started, let pane, pane.profile.backend == .relay, pane.contentKind == .terminal,
+              pane.connectionState == .connected, view.window == nil,
+              (pane.remoteClientCount ?? 1) <= 1 else { return false }
+        return io.maintenanceScreenAvailability().reason == TerminalIOBridge.savedCopyCutShort
+    }
+
     /// The hidden pane's saved screen has no visible character.
     func hiddenScreenIsBlank() async -> Bool {
         guard let snapshot = io.maintenanceScreenSnapshot() else { return false }
