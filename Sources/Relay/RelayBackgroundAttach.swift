@@ -42,10 +42,18 @@ struct RelayBackgroundAttachPolicy {
     /// screens (2.8-6.6 MB on dandy-07); the 2026-11-22 12:52Z drop ended a
     /// wave of about 30 such replays at the 1.5 s attach gap.
     static let wakeGapNanoseconds: UInt64 = 5_000_000_000
+    /// A wake whose pane connected waits only this long after it: the link
+    /// carries one replay at a time either way. With the fixed 5 s gap, 127
+    /// dandy-07 panes took ~10 min to return after each install (2026-11-22).
+    static let wakeAfterSettleNanoseconds: UInt64 = 1_000_000_000
     /// A node that reconnects this soon after a wake on its host may have been
     /// dropped by the wakes themselves; that host's waiting panes are then
     /// left to be shown or sent input, so a reconnect cannot loop.
     static let wakeDropWindowNanoseconds: UInt64 = 120_000_000_000
+    /// Held wakes resume after this, at the full wake gap: the reconnect may
+    /// have had another cause (2026-11-22 21:15:39Z, an ssh ended on purpose,
+    /// left 126 dandy-07 panes waiting for the whole generation).
+    static let wakeHoldNanoseconds: UInt64 = 60_000_000_000
 
     private struct HostState {
         var inFlight: UUID?
@@ -54,8 +62,13 @@ struct RelayBackgroundAttachPolicy {
         var generation: Int?
         var quietUntil: UInt64 = 0
         var lastWake: UInt64?
+        /// When the host's last in-flight pane was seen connected.
+        var settledAt: UInt64?
         /// The node generation in which this host's waiting panes are not woken.
         var wakesHeldInGeneration: Int?
+        var wakesHeldUntil: UInt64 = 0
+        /// Wakes resumed after a hold keep the full gap for that generation.
+        var cautiousGeneration: Int?
     }
 
     private var hosts: [String: HostState] = [:]
@@ -91,8 +104,8 @@ struct RelayBackgroundAttachPolicy {
         guard Self.eligible(candidate) else { return false }
         if candidate.screenCutShort, !candidate.waitingAfterReconnect { return !refreshed.contains(candidate.paneID) }
         guard candidate.waitingAfterReconnect else { return !attempted.contains(candidate.paneID) }
-        let host = hosts[candidate.hostKey]
-        return host?.generation == nil || host?.wakesHeldInGeneration != host?.generation
+        // Held wakes stay pending: the loop keeps running until the hold ends.
+        return true
     }
 
     var isIdle: Bool { hosts.values.allSatisfy { $0.inFlight == nil } }
@@ -122,19 +135,32 @@ struct RelayBackgroundAttachPolicy {
                     state.quietUntil = now &+ Self.settleAfterRestartNanoseconds
                     if let wake = state.lastWake, now &- wake < Self.wakeDropWindowNanoseconds {
                         state.wakesHeldInGeneration = node.generation
+                        state.wakesHeldUntil = now &+ Self.wakeHoldNanoseconds
                     }
                 }
                 state.generation = node.generation
             }
             if let inFlight = state.inFlight {
-                guard settled(inFlight) || now &- state.inFlightSince >= Self.attachTimeoutNanoseconds else { continue }
+                let didSettle = settled(inFlight)
+                guard didSettle || now &- state.inFlightSince >= Self.attachTimeoutNanoseconds else { continue }
                 state.inFlight = nil
+                if didSettle { state.settledAt = now }
+            }
+            if let held = state.wakesHeldInGeneration, now >= state.wakesHeldUntil {
+                state.wakesHeldInGeneration = nil
+                state.cautiousGeneration = held
             }
             let wakesHeld = state.generation != nil && state.wakesHeldInGeneration == state.generation
             guard let candidate = byHost[key]?.first(where: { !(wakesHeld && $0.waitingAfterReconnect) }),
                   now >= state.quietUntil else { continue }
             if let last = state.lastStart, now &- last < Self.gapNanoseconds { continue }
-            if candidate.waitingAfterReconnect, let wake = state.lastWake, now &- wake < Self.wakeGapNanoseconds { continue }
+            if candidate.waitingAfterReconnect, let wake = state.lastWake, now &- wake < Self.wakeGapNanoseconds {
+                // Only a wake that finished early shortens the gap; one that
+                // timed out keeps the full gap.
+                guard state.cautiousGeneration == nil || state.cautiousGeneration != state.generation,
+                      let settledAt = state.settledAt, settledAt >= wake,
+                      now &- settledAt >= Self.wakeAfterSettleNanoseconds else { continue }
+            }
             // No node yet: the first attach opens the host's shared link. A
             // node whose last pane left is stopped and restarts only when a
             // pane joins it, so it is treated the same: on dandy-07
@@ -245,17 +271,19 @@ struct RelayBackgroundAttachPolicy {
         let now = uptime()
         let current: [PaneModel]
         if let panes {
-            current = Self.attachOrder(panes())
+            current = Self.attachOrder(panes(), tabDistance: tabDistance)
         } else {
             owners.removeAll(keepingCapacity: true)
             var hidden: [PaneModel] = []
+            var distance: [UUID: Int] = [:]
             for workspace in workspaces.compactMap(\.value) {
+                distance.merge(Self.tabDistances(workspace)) { min($0, $1) }
                 for pane in Self.hiddenPanes(workspace) {
                     owners[pane.id] = WeakWorkspace(workspace)
                     hidden.append(pane)
                 }
             }
-            current = Self.attachOrder(hidden)
+            current = Self.attachOrder(hidden, tabDistance: distance)
         }
         var byID: [UUID: PaneModel] = [:]
         var candidates: [RelayBackgroundAttachCandidate] = []
@@ -335,16 +363,32 @@ struct RelayBackgroundAttachPolicy {
     /// hidden pane, so each pane's key is computed once and the ID order
     /// compares raw bytes: `uuidString` is their uppercase hex with hyphens
     /// at fixed places, which orders the same without building strings.
-    static func attachOrder(_ panes: [PaneModel]) -> [PaneModel] {
+    /// Tests may give each pane's distance from the selected tab.
+    var tabDistance: [UUID: Int] = [:]
+
+    /// How many tabs each pane's tab is from the selected tab: the panes next
+    /// to where the user is looking come back first.
+    static func tabDistances(_ workspace: WorkspaceModel) -> [UUID: Int] {
+        let tabs = workspace.tabs
+        let selected = tabs.firstIndex { $0.id == workspace.selectedTabID } ?? 0
+        var distance: [UUID: Int] = [:]
+        for (index, tab) in tabs.enumerated() {
+            for id in tab.allPaneIDs { distance[id] = abs(index - selected) }
+        }
+        return distance
+    }
+
+    static func attachOrder(_ panes: [PaneModel], tabDistance: [UUID: Int] = [:]) -> [PaneModel] {
         // Plain integers, so the sort moves no references.
-        var keys: [(shell: Bool, high: UInt64, low: UInt64, index: Int)] = []
+        var keys: [(shell: Bool, distance: Int, high: UInt64, low: UInt64, index: Int)] = []
         keys.reserveCapacity(panes.count)
         for (index, pane) in panes.enumerated() {
             let id = orderKey(pane.id)
-            keys.append((pane.kind == .shell, id.0, id.1, index))
+            keys.append((pane.kind == .shell, tabDistance[pane.id] ?? Int.max, id.0, id.1, index))
         }
         keys.sort { lhs, rhs in
             if lhs.shell != rhs.shell { return !lhs.shell }
+            if lhs.distance != rhs.distance { return lhs.distance < rhs.distance }
             if lhs.high != rhs.high { return lhs.high < rhs.high }
             return lhs.low < rhs.low
         }

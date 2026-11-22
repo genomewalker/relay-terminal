@@ -517,6 +517,31 @@ struct RelayWheelCoalescingTests {
         #expect(batch.suffix(1) == key && batch.count <= 8 * up.count + key.count)
     }
 
+    // d62c62eb, 2026-11-22 21:15Z: "cannot even scroll". Withheld steps
+    // must never wait on an ack that does not come.
+    @MainActor @Test
+    func withNoAckForASecondNothingIsWithheld() throws {
+        let writer = OwnedPromptFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer,
+            profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
+            capabilities: ["input_ack_v1"], controlGranted: true)
+        defer { transport.detach() }
+        var clock: UInt64 = 1_000_000_000
+        transport.inputClock = { clock }
+        let up = Data("\u{1B}[<64;10;5M".utf8), key = Data("q".utf8)
+        #expect(transport.sendInput(key))                     // outstanding, never acknowledged
+        #expect(transport.sendInput(up)); #expect(transport.sendInput(up))
+        #expect(transport.sendInput(key))                     // held behind the wheel steps
+        #expect(writer.inputs.count == 1)
+        clock += RelayRemoteTransport.inputStallNanoseconds
+        #expect(transport.sendInput(up))                      // stalled: everything goes now, in order
+        #expect(writer.inputs.count == 2)
+        #expect(writer.inputs[1].dropFirst(24) == up + up + key + up)
+        #expect(transport.heldInputForTesting.isEmpty && transport.deferredWheelForTesting == nil)
+        #expect(transport.sendInput(up))                      // still stalled: sent directly
+        #expect(writer.inputs.count == 3)
+    }
+
     @MainActor @Test
     func aKeyAfterDeferredWheelStepsKeepsItsOrder() throws {
         let writer = OwnedPromptFrameWriter()

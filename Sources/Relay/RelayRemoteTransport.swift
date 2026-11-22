@@ -311,6 +311,14 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// per round trip; keys typed after a fast scroll no longer wait behind it.
     private var deferredWheel: RelayCoalescedWheel?
     static let maximumCoalescedWheelSteps = 8
+    /// Uptime of the last acknowledgement, or of the send that made input
+    /// outstanding. Withholding input is only safe while acks keep arriving:
+    /// with no progress for `inputStallNanoseconds` nothing is withheld, so a
+    /// lost or refused ack can never strand wheel steps or keys, and the 64 KiB
+    /// unacknowledged limit still reattaches the pane as before.
+    private var lastInputProgress: UInt64 = 0
+    static let inputStallNanoseconds: UInt64 = 1_000_000_000
+    var inputClock: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     private var inputOverflowed = false
     private var attachRepaintPending = false
     private var attached = false {
@@ -1647,6 +1655,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         if let removed = pendingInputs.removeValue(forKey: sequence) {
             pendingInputBytes = max(0, pendingInputBytes - removed.count)
         }
+        lastInputProgress = inputClock()
         automationInputSequences.remove(sequence)
         signalPromptEditorLeaseChangedLocked()
         var held: Data?
@@ -1701,7 +1710,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
         guard !data.isEmpty else { return false }
         lock.lock()
-        if supportsInputAcknowledgements, pendingInputBytes > 0, writer != nil, attached,
+        let now = inputClock()
+        let stalled = pendingInputBytes > 0 && now &- lastInputProgress >= Self.inputStallNanoseconds
+        if supportsInputAcknowledgements, pendingInputBytes > 0, !stalled, writer != nil, attached,
            TerminalInputDiagnosticReport.name(data) == "mouse_motion" {
             // Only the pointer's latest position matters; send it once the
             // worker has caught up, never ahead of or instead of a keystroke.
@@ -1709,7 +1720,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             lock.unlock()
             return true
         }
-        if supportsInputAcknowledgements, pendingInputBytes > 0, writer != nil, attached,
+        if supportsInputAcknowledgements, pendingInputBytes > 0, !stalled, writer != nil, attached,
            let step = RelayWheelStep(data) {
             if deferredWheel == nil || deferredWheel?.accepts(step) == true {
                 var wheel = deferredWheel ?? RelayCoalescedWheel(step)
@@ -1726,7 +1737,11 @@ final class RelayRemoteTransport: @unchecked Sendable {
             deferredWheel = nil
             heldInput.append(wheel.reports)
         }
-        if supportsInputAcknowledgements, writer != nil, attached,
+        if stalled, !heldInput.isEmpty {
+            // No ack for a second: stop withholding and send in order now.
+            data = heldInput + data
+            heldInput.removeAll(keepingCapacity: false)
+        } else if supportsInputAcknowledgements, writer != nil, attached,
            !heldInput.isEmpty || pendingInputs.count >= Self.maximumOutstandingInputFrames {
             if pendingInputBytes + heldInput.count + data.count <= 64 << 10 {
                 heldInput.append(data)
@@ -1754,6 +1769,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         if canSend && acknowledged && !mustBacklog && pendingInputBytes + data.count <= 64 << 10 {
             let sequence = RelayInputSequenceAllocator.shared.next()
             inputSequence = sequence
+            if pendingInputBytes == 0 { lastInputProgress = now }
             pendingInputs[sequence] = data
             pendingInputBytes += data.count
         } else if canSend && acknowledged {

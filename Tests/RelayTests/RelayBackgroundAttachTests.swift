@@ -141,20 +141,49 @@ struct RelayBackgroundAttachPolicyTests {
         #expect(policy.next([first, second], nodes: ["dandy": ready], settled: { _ in false }, now: 0) == [first])
         #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in false }, now: wakeGap).isEmpty,
             "the woken pane holds its host until connected")
-        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: wakeGap - 1).isEmpty,
-            "settled, but within the wake gap")
-        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: wakeGap) == [second])
+        let settleGap = RelayBackgroundAttachPolicy.wakeAfterSettleNanoseconds
+        let seen = wakeGap / 2   // the woken pane is first seen connected here
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: seen).isEmpty,
+            "connected, but just now")
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: seen + settleGap - 1).isEmpty)
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: seen + settleGap) == [second],
+            "a wake that connected early frees its host 1 s later, not at the fixed 5 s gap")
+    }
+
+    @Test("A wake that times out keeps the full wake gap")
+    func timedOutWakeKeepsTheFullGap() {
+        var policy = RelayBackgroundAttachPolicy()
+        var first = candidate(connecting: false), second = candidate(connecting: false)
+        first.waitingAfterReconnect = true
+        second.waitingAfterReconnect = true
+        #expect(policy.next([first, second], nodes: ["dandy": ready], settled: { _ in false }, now: 0) == [first])
+        let timeout = RelayBackgroundAttachPolicy.attachTimeoutNanoseconds
+        let gap = RelayBackgroundAttachPolicy.wakeGapNanoseconds
+        #expect(timeout >= gap)
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in false }, now: timeout) == [second],
+            "released by the timeout, past the full gap")
+    }
+
+    @MainActor @Test("Hidden panes nearer the selected tab attach first; agents before shells")
+    func nearerTabsFirst() {
+        let profile = ConnectionProfile(name: "Order fixture", host: "order-fixture.invalid")
+        let near = PaneModel(profile: profile), far = PaneModel(profile: profile)
+        let unknown = PaneModel(profile: profile)
+        let ordered = RelayBackgroundAttachScheduler.attachOrder([unknown, far, near],
+            tabDistance: [near.id: 1, far.id: 7])
+        #expect(ordered.map(\.id) == [near.id, far.id, unknown.id])
     }
 
     // 57c1 review: the 12:52Z drop followed a wave of multi-MB replays. If
     // wakes drop the node again, every pane waits again; waking them again
     // would loop. A host whose node reconnects within the drop window of a
     // wake holds its wakes for that generation; a later reconnect clears it.
-    @Test("A reconnect soon after a wake holds that host's wakes until a later reconnect")
+    @Test("A reconnect soon after a wake holds that host's wakes for a minute, then wakes at the full gap")
     func reconnectAfterWakeHoldsWakes() {
         var policy = RelayBackgroundAttachPolicy()
         let settle = RelayBackgroundAttachPolicy.settleAfterRestartNanoseconds
-        let window = RelayBackgroundAttachPolicy.wakeDropWindowNanoseconds
+        let hold = RelayBackgroundAttachPolicy.wakeHoldNanoseconds
+        let gap = RelayBackgroundAttachPolicy.wakeGapNanoseconds
         func waiting() -> RelayBackgroundAttachCandidate {
             var c = candidate(connecting: false); c.waitingAfterReconnect = true; return c
         }
@@ -164,15 +193,16 @@ struct RelayBackgroundAttachPolicyTests {
         // The node drops 30 s after the wake.
         let drop: UInt64 = 30_000_000_000
         #expect(policy.next([a, b], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop).isEmpty)
-        #expect(policy.next([a, b], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + settle + window).isEmpty,
-            "no wake in the generation the wakes may have caused")
-        #expect(!policy.pending(a) && !policy.pending(b), "held panes do not keep the scheduler running")
-        #expect(policy.next([a, fresh], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + settle + window) == [fresh],
+        #expect(policy.next([a, b], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + settle).isEmpty,
+            "no wake right after a reconnect the wakes may have caused")
+        #expect(policy.pending(a) && policy.pending(b), "held panes keep the loop running until the hold ends")
+        #expect(policy.next([a, fresh], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + settle) == [fresh],
             "a never-started pane still attaches")
-        // A later reconnect, long after the last wake, wakes again.
-        let later = drop + settle + 2 * window
-        #expect(policy.next([a, b], nodes: ["dandy": node(4)], settled: { _ in true }, now: later).isEmpty)
-        #expect(policy.next([a, b], nodes: ["dandy": node(4)], settled: { _ in true }, now: later + settle) == [a])
+        // 2026-11-22 21:15:39Z: the reconnect had another cause; panes must not wait for good.
+        #expect(policy.next([a, b], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + hold) == [a])
+        #expect(policy.next([b], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + hold + gap - 1).isEmpty,
+            "after a hold, wakes keep the full gap even when the last one connected")
+        #expect(policy.next([b], nodes: ["dandy": node(3)], settled: { _ in true }, now: drop + hold + gap) == [b])
     }
 
     @Test("A pane is attempted once")
