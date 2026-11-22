@@ -135,6 +135,7 @@ private struct WorkspaceNavigationRowSegment: ViewModifier {
 /// forward before it, Pinned and Saved views (with their sheets) after it.
 @MainActor private struct WorkspaceNavigationBar: View {
     enum Edge { case leading, trailing }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @ObservedObject var workspace: WorkspaceModel
     @ObservedObject var organization: WorkspaceOrganizationController
@@ -160,6 +161,8 @@ private struct WorkspaceNavigationRowSegment: ViewModifier {
             }
         }
         .padding(.leading, workspace.sidebarVisible ? 6 : 34)
+        // Moves on the navigator's curve, with the tab strip.
+        .animation(RelaySidebarMotion.animation(reduceMotion: reduceMotion), value: workspace.sidebarVisible)
         .modifier(WorkspaceNavigationRowSegment())
     }
 
