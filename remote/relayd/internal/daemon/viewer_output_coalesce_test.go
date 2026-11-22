@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/relay-terminal/relayd/internal/programstatus"
@@ -194,5 +195,74 @@ func TestFullViewerQueueDropsSupersededProgramStatusBetweenOutput(t *testing.T) 
 	}
 	if replays != 1 || statuses != 2 || !bytes.Equal(lastStatus.Payload, latest.Payload) {
 		t.Fatalf("statuses=%d replays=%d; want the replay snapshot and only the latest update", statuses, replays)
+	}
+}
+
+func agentEventTestFrame(n int) protocol.Frame {
+	return protocol.Frame{Type: protocol.AgentEvent, Payload: []byte(fmt.Sprintf(`{"sequence":%d}`, n))}
+}
+
+// Dense agent events (a Claude turn streaming transcript events while it
+// redraws) interleave with output the same way program status does. Events
+// are sequenced and cannot be dropped or merged, so a full queue moves them
+// after the output they separate: each stream keeps its order, artifacts and
+// statuses stay where they are, and the output merges.
+func TestFullViewerQueueMovesAgentEventsBehindOutputWithoutReorderingEither(t *testing.T) {
+	viewer := newClient(512)
+	var want bytes.Buffer
+	var wantEvents []string
+	sequence, events := uint64(0), 0
+	artifactAt, seqAtArtifact := 300, uint64(0)
+	for len(viewer.frames) < cap(viewer.frames) {
+		switch {
+		case len(viewer.frames) == artifactAt:
+			seqAtArtifact = sequence
+			viewer.frames <- protocol.ArtifactFrame("/tmp/a.png", []byte("img"))
+		case len(viewer.frames)%2 == 0:
+			sequence++
+			chunk := []byte{byte(sequence), byte(sequence >> 8), '\x1b', '[', 'K'}
+			want.Write(chunk)
+			viewer.frames <- protocol.OutputFrame(sequence, chunk)
+		default:
+			events++
+			frame := agentEventTestFrame(events)
+			wantEvents = append(wantEvents, string(frame.Payload))
+			viewer.frames <- frame
+		}
+	}
+	if !viewer.makeRoom(1) {
+		t.Fatal("output interleaved with agent events cut the view")
+	}
+	var got bytes.Buffer
+	var gotEvents []string
+	last := uint64(0)
+	artifactSeen, crossed := false, false
+	for len(viewer.frames) > 0 {
+		frame := <-viewer.frames
+		switch frame.Type {
+		case protocol.AgentEvent:
+			gotEvents = append(gotEvents, string(frame.Payload))
+		case protocol.Output:
+			seq, data, err := protocol.ParseOutput(frame)
+			if err != nil || seq <= last {
+				t.Fatalf("output out of order: %d after %d err=%v", seq, last, err)
+			}
+			if artifactSeen != (seq > seqAtArtifact) {
+				crossed = true
+			}
+			last = seq
+			got.Write(data)
+		default:
+			artifactSeen = true
+		}
+	}
+	if !bytes.Equal(got.Bytes(), want.Bytes()) || last != sequence {
+		t.Fatalf("output changed: %d bytes to %d; want %d bytes to %d", got.Len(), last, want.Len(), sequence)
+	}
+	if fmt.Sprint(gotEvents) != fmt.Sprint(wantEvents) {
+		t.Fatalf("agent events lost or reordered: %d of %d", len(gotEvents), len(wantEvents))
+	}
+	if !artifactSeen || crossed {
+		t.Fatalf("output crossed the artifact barrier (artifact seen=%v)", artifactSeen)
 	}
 }

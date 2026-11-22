@@ -77,7 +77,7 @@ func (viewer *client) makeRoom(n int) bool {
 			drained = true
 		}
 	}
-	compacted, total := compactQueuedOutput(dropSupersededProgramStatus(pending))
+	compacted, total := compactQueuedOutput(gatherOutputPastAgentEvents(dropSupersededProgramStatus(pending)))
 	for _, frame := range compacted {
 		viewer.frames <- frame
 	}
@@ -143,4 +143,34 @@ func liveProgramStatus(frame protocol.Frame) bool {
 		Replay bool   `json:"program_status_replay"`
 	}
 	return json.Unmarshal(frame.Payload, &status) == nil && status.State == "program_status" && !status.Replay
+}
+
+// gatherOutputPastAgentEvents moves agent event frames in a full queue after
+// the sequenced output they are interleaved with, so that output becomes
+// adjacent and merges. Events are sequenced and cannot be dropped or merged,
+// but they are a separate stream with their own cursor: each stream keeps
+// its own order, and only their interleaving changes. Every other frame
+// (artifacts, which belong to the output before them, and statuses) is a
+// barrier that neither stream crosses. Raising the queue's frame count
+// instead would let 32 KiB reads hold far more memory before compacting.
+func gatherOutputPastAgentEvents(frames []protocol.Frame) []protocol.Frame {
+	out := make([]protocol.Frame, 0, len(frames))
+	var events []protocol.Frame
+	flush := func() {
+		out = append(out, events...)
+		events = events[:0]
+	}
+	for _, frame := range frames {
+		switch {
+		case frame.Type == protocol.AgentEvent:
+			events = append(events, frame)
+		case sequencedOutput(frame):
+			out = append(out, frame)
+		default:
+			flush()
+			out = append(out, frame)
+		}
+	}
+	flush()
+	return out
 }
