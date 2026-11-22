@@ -442,10 +442,9 @@ enum RelayStockRotationPolicy {
 }
 
 extension PaneModel {
-    /// An unsent composer draft, attachment, submission or held native delivery.
+    /// An unsent composer draft, attachment, held message, submission or held native delivery.
     var contextRotationDraftPending: Bool {
-        composerStateIfCreated.map { !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty ||
-            $0.submitting || $0.nativeDeliveryHeld } ?? false
+        composerStateIfCreated?.hasPendingInput ?? false
     }
 }
 

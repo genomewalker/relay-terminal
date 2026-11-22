@@ -2963,7 +2963,7 @@ final class TerminalRuntime: NSObject {
     /// Positive evidence only: a visible typed draft, as maintenance reads it.
     private func assistantPromptHasTypedTextNow(_ observation: RelayActiveScreenCache.Observation) -> Bool {
         guard let pane else { return false }
-        if let composer = pane.composerStateIfCreated, !composer.draft.isEmpty || !composer.attachmentQueue.attachments.isEmpty {
+        if let composer = pane.composerStateIfCreated, !composer.draft.isEmpty || !composer.attachmentQueue.attachments.isEmpty || !composer.queue.isEmpty {
             return true
         }
         switch pane.kind {
@@ -4038,7 +4038,7 @@ final class TerminalRuntime: NSObject {
               await readPromptOwnerBinding() == proof.owner,
               let pane, preparedTerminalEdit?.token == proof.token,
               Self.agentResumePromptAdmits(expected: expected, vt: vt, pendingApprovals: pane.pendingAgentApprovals,
-                  composerBusy: pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true,
+                  composerBusy: pane.composerStateIfCreated?.hasPendingInput == true,
                   admitTypedShell: admitTypedShell)
         else { return nil }
         return proof.token
@@ -4158,7 +4158,7 @@ final class TerminalRuntime: NSObject {
             }
         }
         guard let pane else { return (nil, .init(.paneChanged, "the pane closed")) }
-        let busy = pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true
+        let busy = pane.composerStateIfCreated?.hasPendingInput == true
         return (nil, Self.agentResumePromptBlocker(expected: expected, vt: vt, pendingApprovals: pane.pendingAgentApprovals,
             composerBusy: busy) ?? .init(.promptUnverified, "the screen changed while it was proven"))
     }

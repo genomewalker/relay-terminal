@@ -109,6 +109,18 @@ final class RelayAgentPromptQueueTests: XCTestCase {
         XCTAssertTrue(restored.queue.isEmpty)
     }
 
+    @MainActor
+    func testHeldMessageAloneIsPendingInput() {
+        let state = PaneComposerState()
+        XCTAssertFalse(state.hasPendingInput)
+        state.queue.enqueue("held", binding: binding())
+        XCTAssertTrue(state.draft.isEmpty)
+        XCTAssertFalse(state.submitting)
+        XCTAssertTrue(state.hasPendingInput)
+        state.queue.cancel(state.queue.items[0].id)
+        XCTAssertFalse(state.hasPendingInput)
+    }
+
     func testHeaderBadgeNamesCountAndPause() {
         XCTAssertEqual(RelayHeldMessagesBadge.title(count: 2, paused: false), "2 held")
         XCTAssertEqual(RelayHeldMessagesBadge.title(count: 1, paused: true), "1 held · paused")

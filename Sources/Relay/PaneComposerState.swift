@@ -21,6 +21,14 @@ final class PaneComposerState: ObservableObject {
     /// Shared by every view of this pane, so a message is taken exactly once.
     @Published var queue = RelayAgentPromptQueue()
 
+    /// Anything the user wrote that has not certainly reached the agent: a
+    /// draft, attachments, held messages, or a send in flight or held. A
+    /// restart, rotation or resume must wait while this is true; held messages
+    /// were written for the current conversation.
+    var hasPendingInput: Bool {
+        !draft.isEmpty || !attachmentQueue.attachments.isEmpty || !queue.isEmpty || submitting || nativeDeliveryHeld
+    }
+
     /// Loads a saved draft once. A stored draft never replaces typed text.
     func restoreIfNeeded(hostID: String, paneID: UUID, store: RelayAgentDraftStore = .shared) {
         guard !restored else { return }

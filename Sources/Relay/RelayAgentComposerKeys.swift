@@ -4,9 +4,11 @@ import SwiftUI
 /// Keys in the agent conversation composer, matching the Claude Code and Codex
 /// prompts: Return sends, Shift/Option/Control-Return insert a newline, Esc
 /// interrupts a working agent, and Up/Down at the first/last line recall
-/// earlier prompts. While the agent works, Return queues the message until it
-/// is idle. Where the pane's transport can steer a running turn (Codex), Return
-/// steers and Tab queues, as in the Codex prompt. Keys pressed while an input method holds marked text always
+/// earlier prompts. While the agent works, Return holds the message and Relay
+/// sends it once the agent is idle; nothing reaches the running turn. Steering
+/// a running turn (Return steers, Tab holds, as in the Codex prompt) is not
+/// wired yet: callers pass `canSteer: false` until a transport can steer
+/// without typing into the terminal. Keys pressed while an input method holds marked text always
 /// stay with the text system, so IME composition is never sent or interrupted.
 enum RelayAgentComposerKeys {
     enum Key: Equatable { case returnKey, tab, escape, upArrow, downArrow, other }
