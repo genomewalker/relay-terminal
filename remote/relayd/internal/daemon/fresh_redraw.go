@@ -83,12 +83,14 @@ func (session *Session) queueFreshRedrawStatus(viewer *client, state, message st
 	if _, attached := session.clients[viewer]; !attached {
 		return
 	}
-	select {
-	case viewer.frames <- frame:
-	default:
+	// A redraw fills the queue with exactly the output that merges; make room
+	// as every other producer does before cutting the view.
+	if !viewer.makeRoom(1) {
 		viewer.markLagged()
 		delete(session.clients, viewer)
+		return
 	}
+	viewer.frames <- frame
 }
 
 // An agent under load can take longer than an attach allows to start its

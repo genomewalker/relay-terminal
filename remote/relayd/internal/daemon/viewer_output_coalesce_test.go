@@ -266,3 +266,34 @@ func TestFullViewerQueueMovesAgentEventsBehindOutputWithoutReorderingEither(t *t
 		t.Fatalf("output crossed the artifact barrier (artifact seen=%v)", artifactSeen)
 	}
 }
+
+// A fresh redraw's done status arrives after the redraw it waited for, so the
+// queue it joins is full of exactly that mergeable output. It must make room
+// like every other producer instead of cutting the view (d0b0ff50, 2026-11-22).
+func TestFreshRedrawStatusMakesRoomInsteadOfCuttingTheView(t *testing.T) {
+	session := &Session{
+		clients: make(map[*client]struct{}), agentClients: make(map[*client]struct{}),
+		activeSubagents: make(map[string][]byte), eventHashes: make(map[[32]byte]struct{}),
+	}
+	viewer := newClient(512)
+	session.clients[viewer] = struct{}{}
+	for i := 0; i < 512; i++ {
+		session.publish([]byte{'x'})
+	}
+	if len(viewer.frames) != cap(viewer.frames) {
+		t.Fatalf("queue holds %d of %d frames; the test needs it full", len(viewer.frames), cap(viewer.frames))
+	}
+	session.queueFreshRedrawStatus(viewer, freshRedrawDone, "repainted", 512)
+	select {
+	case <-viewer.lagged:
+		t.Fatal("a fresh redraw status cut a view whose queue held only mergeable output")
+	default:
+	}
+	var last protocol.Frame
+	for len(viewer.frames) > 0 {
+		last = <-viewer.frames
+	}
+	if last.Type != protocol.Status || !bytes.Contains(last.Payload, []byte(freshRedrawDone)) {
+		t.Fatalf("the done status is not last in the queue: type %v", last.Type)
+	}
+}

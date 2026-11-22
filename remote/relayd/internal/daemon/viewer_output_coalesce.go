@@ -3,6 +3,10 @@ package daemon
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
 
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
@@ -81,7 +85,48 @@ func (viewer *client) makeRoom(n int) bool {
 	for _, frame := range compacted {
 		viewer.frames <- frame
 	}
-	return total <= viewerCompactTotalBytes && cap(viewer.frames)-len(viewer.frames) >= n
+	fits := total <= viewerCompactTotalBytes && cap(viewer.frames)-len(viewer.frames) >= n
+	if !fits {
+		// The caller cuts this viewer next. Say why: which frames could not
+		// merge and how many bytes were waiting. Without this a cut view on a
+		// live host could not be told apart from any other closed route.
+		fmt.Fprintf(os.Stderr, "relay: viewer cut: queue %d of %d frames after compaction (%d before), %d bytes, needed %d; %s\n",
+			len(compacted), cap(viewer.frames), len(pending), total, n, queuedFrameKinds(compacted))
+	}
+	return fits
+}
+
+// queuedFrameKinds counts queued frames by kind for the cut log.
+func queuedFrameKinds(frames []protocol.Frame) string {
+	counts := map[string]int{}
+	for _, frame := range frames {
+		kind := fmt.Sprintf("type%d", frame.Type)
+		switch {
+		case sequencedOutput(frame):
+			kind = "output"
+		case frame.Type == protocol.Output:
+			kind = "output-unsequenced"
+		case frame.Type == protocol.AgentEvent:
+			kind = "agent-event"
+		case frame.Type == protocol.Status:
+			var status struct {
+				State string `json:"state"`
+			}
+			_ = json.Unmarshal(frame.Payload, &status)
+			kind = "status:" + status.State
+		}
+		counts[kind]++
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, counts[key]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // compactQueuedOutput merges each run of adjacent sequenced output frames,
