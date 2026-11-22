@@ -60,23 +60,40 @@ struct RelayActiveScreenCache {
     /// rows that cannot be read, or any state change between the two reads
     /// make the sample unstable.
     static func sample(state: () -> InMemoryTerminalScreenState?, rows: () -> [String]?) -> Sample {
-        guard let first = state() else { return .noSurface }
-        guard !first.mutationInFlight, let rows = rows(), let second = state(), second == first else {
-            return .unstable
-        }
-        return .stable(Key(state: first, rows: rows))
+        sampleWithReason(state: state, rows: rows).sample
     }
+
+    /// The same single sample, with the condition that made it unstable
+    /// (diagnostics only; it never changes the sample).
+    static func sampleWithReason(state: () -> InMemoryTerminalScreenState?,
+                                 rows: () -> [String]?) -> (sample: Sample, reason: String?) {
+        guard let first = state() else { return (.noSurface, nil) }
+        guard !first.mutationInFlight else { return (.unstable, "mutation_in_flight") }
+        guard let rows = rows() else { return (.unstable, "rows_unreadable") }
+        guard let second = state(), second == first else { return (.unstable, "screen_state_changing") }
+        return (.stable(Key(state: first, rows: rows)), nil)
+    }
+
+    /// Diagnostics only: which read step last returned `.unstable`.
+    private(set) var lastUnstableStep: String?
 
     mutating func read(sample: () -> Sample, dump: () -> String?) -> Observation {
         let before = sample()
         guard case .stable(let key) = before else {
             entry = nil
+            lastUnstableStep = before == .noSurface ? nil : "sample"
             return before == .noSurface ? .noSurface : .unstable
         }
         if let entry, entry.key == key { return .screen(entry.screen, key) }
         dumps += 1
-        guard let screen = dump(), sample() == .stable(key) else {
+        guard let screen = dump() else {
             entry = nil
+            lastUnstableStep = "screen_dump_failed"
+            return .unstable
+        }
+        guard sample() == .stable(key) else {
+            entry = nil
+            lastUnstableStep = "screen_changed_during_dump"
             return .unstable
         }
         entry = (key, screen)
@@ -91,5 +108,10 @@ extension InMemoryTerminalSession {
     /// Safe off the main actor: both reads hold the surface alive.
     func activeScreenSample() -> RelayActiveScreenCache.Sample {
         RelayActiveScreenCache.sample(state: { screenState }, rows: { readViewportRows() })
+    }
+
+    /// The same sample with its unstable condition, for diagnostics.
+    func activeScreenSampleWithReason() -> (sample: RelayActiveScreenCache.Sample, reason: String?) {
+        RelayActiveScreenCache.sampleWithReason(state: { screenState }, rows: { readViewportRows() })
     }
 }

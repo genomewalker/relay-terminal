@@ -3132,23 +3132,25 @@ final class TerminalRuntime: NSObject {
         // the send fence rechecks the phase under outputOrderingLock.
         if io.outputPhaseOpenNow {
             activeScreenCache.invalidate()
+            lastActiveScreenUnstableGate = "output_phase"
             return .unstable
         }
         let session = session
-        let sample = activeScreenSampleForTesting ?? { session.activeScreenSample() }
-        return activeScreenCache.read(sample: sample, dump: { session.readActiveScreenVT() })
+        var sampleReason: String?
+        let sample = activeScreenSampleForTesting ?? {
+            let result = session.activeScreenSampleWithReason()
+            if result.reason != nil { sampleReason = result.reason }
+            return result.sample
+        }
+        let observation = activeScreenCache.read(sample: sample, dump: { session.readActiveScreenVT() })
+        if observation == .unstable {
+            lastActiveScreenUnstableGate = sampleReason ?? activeScreenCache.lastUnstableStep ?? "unknown"
+        }
+        return observation
     }
-    /// Diagnostics only: why observeActiveScreen is unstable right now. It
-    /// never admits anything; a refusal names it so a stuck gate is visible.
-    func activeScreenUnstableGate() -> String {
-        if let phase = io.outputPhaseGateNow { return phase }
-        guard let first = session.screenState else { return "no_surface" }
-        if first.mutationInFlight { return "mutation_in_flight" }
-        guard session.readViewportRows() != nil else { return "rows_unreadable" }
-        guard session.screenState == first else { return "screen_state_changing" }
-        return "screen_dump_unstable"
-    }
-
+    /// Diagnostics only: the gate behind the last `.unstable` observation,
+    /// recorded during that observation without any extra screen read.
+    private(set) var lastActiveScreenUnstableGate: String?
     /// Tests only: replaces the admission's in-memory sample. The send fence
     /// in TerminalIOBridge always samples the real session.
     var activeScreenSampleForTesting: (() -> RelayActiveScreenCache.Sample)?
@@ -4015,9 +4017,8 @@ final class TerminalRuntime: NSObject {
             guard case .screen(_, let key) = observation else {
                 var reason = "No complete ordered snapshot or current native renderer; no focus change was attempted."
                 if observation == .unstable {
-                    let gate = activeScreenUnstableGate()
+                    let gate = lastActiveScreenUnstableGate ?? "unknown"
                     reason = "The pane's screen is not settled (\(gate)); no complete ordered snapshot; no focus change was attempted."
-                    recordInputDiagnostic("edit-state-unstable", details: ["gate": gate])
                 }
                 return ["status": observation == .noSurface ? "unavailable" : "changed", "reason": reason]
             }
