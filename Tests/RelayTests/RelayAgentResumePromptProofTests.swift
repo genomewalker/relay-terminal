@@ -101,6 +101,11 @@ extension RelayTerminalEditTests {
             return .init(hostID: profile.id, binding: change == "owner" && reads > 1 ? successor : original)
         }
         if change == "composer" { pane.composerState.draft = "unsent composer draft" }
+        if change == "held" {
+            // Only a held message: the draft is empty and nothing is in flight.
+            pane.composerState.queue.enqueue("held for the idle agent", binding: RelayAgentConversationBinding(
+                hostID: "h", paneID: pane.id, provider: expected, processID: 1, processStart: "t0", sessionID: "s1", sourceIdentity: nil))
+        }
         let token = await runtime.agentResumePromptProof(expected: binding(pane, provider: expected), admitTypedShell: admitTypedShell)
         return Observed(token: token, writer: writer, runtime: runtime) {
             _ = runtime.ioForTesting.removeTransport(); transport.detach(); runtime.stop(); window.contentView = nil; window.close()
@@ -130,6 +135,7 @@ extension RelayTerminalEditTests {
             ("busy", ResumeScreen.codex(above: "• Working (3s • esc to interrupt)"), "codex", "codex", "none"),
             ("owner change", ResumeScreen.codex(), "codex", "codex", "owner"),
             ("composer draft", ResumeScreen.codex(), "codex", "codex", "composer"),
+            ("held message", ResumeScreen.codex(), "codex", "codex", "held"),
             ("owner is another provider", ResumeScreen.codex(), "claude", "codex", "none"),
             ("Codex screen read as Claude", ResumeScreen.codex(), "claude", "claude", "none"),
         ]
@@ -241,6 +247,7 @@ extension RelayTerminalEditTests {
             ("background shells", ResumeScreen.claude(footerSuffix: " · 2 shells"), "claude", "claude", "none"),
             ("owner change", ResumeScreen.claude(), "claude", "claude", "owner"),
             ("composer draft", ResumeScreen.claude(), "claude", "claude", "composer"),
+            ("held message", ResumeScreen.claude(), "claude", "claude", "held"),
             ("Claude screen as Codex", ResumeScreen.claude(), "codex", "codex", "none"),
             ("Codex screen as Claude", ResumeScreen.codex(), "claude", "claude", "none"),
             ("owner is another provider", ResumeScreen.claude(), "codex", "claude", "none"),

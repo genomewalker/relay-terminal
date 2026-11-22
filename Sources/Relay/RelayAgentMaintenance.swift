@@ -1142,7 +1142,7 @@ enum RelayAgentMaintenanceRestartAdmission {
             completeHaikuTool(pane, state: "held", message: statuses[pane.id]!, proof: proof)
             return
         }
-        let draft = pane.composerStateIfCreated.map { !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld } ?? false
+        let draft = pane.composerStateIfCreated?.hasPendingInput ?? false
         if pane.composerStateIfCreated.map({ $0.submitting || $0.nativeDeliveryHeld }) == true {
             statuses[pane.id] = "Waiting for the current prompt delivery to finish"
             return

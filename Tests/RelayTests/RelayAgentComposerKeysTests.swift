@@ -6,9 +6,27 @@ import XCTest
 final class RelayAgentComposerKeysTests: XCTestCase {
     private func action(_ key: RelayAgentComposerKeys.Key, _ modifiers: EventModifiers = [],
                         marked: Bool = false, first: Bool = true, last: Bool = true,
-                        working: Bool = false) -> RelayAgentComposerKeys.Action {
+                        working: Bool = false, steer: Bool = false) -> RelayAgentComposerKeys.Action {
         RelayAgentComposerKeys.action(key: key, modifiers: modifiers, hasMarkedText: marked,
-                                      caretOnFirstLine: first, caretOnLastLine: last, agentWorking: working)
+                                      caretOnFirstLine: first, caretOnLastLine: last, agentWorking: working,
+                                      canSteer: steer)
+    }
+
+    func testReturnHoldsTheMessageWhileTheAgentWorks() {
+        XCTAssertEqual(action(.returnKey, working: true), .queue)
+        XCTAssertEqual(action(.returnKey, .command, working: true), .queue)
+        XCTAssertEqual(action(.returnKey, .shift, working: true), .passThrough)
+        // Tab stays with the text view unless Return steers.
+        XCTAssertEqual(action(.tab, working: true), .passThrough)
+        XCTAssertEqual(action(.tab, working: false, steer: true), .passThrough)
+    }
+
+    func testSteerableTransportUsesTheCodexKeys() {
+        XCTAssertEqual(action(.returnKey, working: true, steer: true), .steer)
+        XCTAssertEqual(action(.tab, working: true, steer: true), .queue)
+        XCTAssertEqual(action(.tab, .shift, working: true, steer: true), .passThrough)
+        XCTAssertEqual(action(.returnKey, working: false, steer: true), .send)
+        XCTAssertEqual(action(.tab, marked: true, working: true, steer: true), .passThrough)
     }
 
     func testReturnSendsAndModifiedReturnInsertsNewline() {

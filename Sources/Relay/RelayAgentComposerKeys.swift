@@ -4,19 +4,29 @@ import SwiftUI
 /// Keys in the agent conversation composer, matching the Claude Code and Codex
 /// prompts: Return sends, Shift/Option/Control-Return insert a newline, Esc
 /// interrupts a working agent, and Up/Down at the first/last line recall
-/// earlier prompts. Keys pressed while an input method holds marked text always
+/// earlier prompts. While the agent works, Return holds the message and Relay
+/// sends it once the agent is idle; nothing reaches the running turn. Steering
+/// a running turn (Return steers, Tab holds, as in the Codex prompt) is not
+/// wired yet: callers pass `canSteer: false` until a transport can steer
+/// without typing into the terminal. Keys pressed while an input method holds marked text always
 /// stay with the text system, so IME composition is never sent or interrupted.
 enum RelayAgentComposerKeys {
-    enum Key: Equatable { case returnKey, escape, upArrow, downArrow, other }
-    enum Action: Equatable { case send, interrupt, historyPrevious, historyNext, passThrough }
+    enum Key: Equatable { case returnKey, tab, escape, upArrow, downArrow, other }
+    enum Action: Equatable { case send, queue, steer, interrupt, historyPrevious, historyNext, passThrough }
 
     static func action(key: Key, modifiers: EventModifiers, hasMarkedText: Bool,
-                       caretOnFirstLine: Bool, caretOnLastLine: Bool, agentWorking: Bool) -> Action {
+                       caretOnFirstLine: Bool, caretOnLastLine: Bool, agentWorking: Bool,
+                       canSteer: Bool = false) -> Action {
         guard !hasMarkedText else { return .passThrough }
         switch key {
         case .returnKey:
             // Shift, Option or Control keep the platform newline; ⌘↩ still sends.
-            return modifiers.isDisjoint(with: [.shift, .option, .control]) ? .send : .passThrough
+            guard modifiers.isDisjoint(with: [.shift, .option, .control]) else { return .passThrough }
+            guard agentWorking else { return .send }
+            return canSteer ? .steer : .queue
+        case .tab:
+            // Tab queues only where Return steers; otherwise it stays with the text view.
+            return modifiers.isEmpty && agentWorking && canSteer ? .queue : .passThrough
         case .escape:
             return modifiers.isEmpty && agentWorking ? .interrupt : .passThrough
         case .upArrow:

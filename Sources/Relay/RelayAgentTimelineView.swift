@@ -197,6 +197,10 @@ struct RelayAgentTimelineView: View {
     @State private var terminalFooter: [String] = []
     /// When the last confirmed send happened, for a command that starts no turn.
     @State private var submittedAt: Date?
+    /// Set while a confirmed send empties the draft, so that empty draft is not saved.
+    @State private var clearingSubmittedDraft = false
+    /// A held message is being sent; the draft is not involved and stays editable.
+    @State private var deliveringQueued = false
     init(pane: PaneModel, store: RelayAgentTimelineStore? = nil) {
         self.pane = pane; _store = StateObject(wrappedValue: store ?? RelayAgentTimelineStore(pane: pane))
         _composerState = ObservedObject(wrappedValue: pane.composerState)
@@ -227,6 +231,10 @@ struct RelayAgentTimelineView: View {
         get { composerState.submissionStatus }
         nonmutating set { composerState.submissionStatus = newValue }
     }
+    private var queue: RelayAgentPromptQueue {
+        get { composerState.queue }
+        nonmutating set { composerState.queue = newValue }
+    }
     var body: some View {
         RelayViewerLayout {
             header
@@ -254,8 +262,13 @@ struct RelayAgentTimelineView: View {
             composerState.restoreIfNeeded(hostID: draftHostID, paneID: pane.id)
             store.visible = true; await store.refresh()
             refreshTerminalFooter()
+            // Messages held while this view was closed go out once it is ready.
+            deliverNextQueued()
         }
-        .onChange(of: composerFocused) { _, focused in pane.runtime.conversationComposerOwnsFocus = focused }
+        .onChange(of: composerFocused) { _, focused in
+            pane.runtime.conversationComposerOwnsFocus = focused
+            if focused { deliverNextQueued() }
+        }
         .onDisappear {
             pane.runtime.conversationComposerOwnsFocus = false
             if !draft.isEmpty || !attachmentQueue.attachments.isEmpty { persistDraft(immediate: true) }
@@ -264,7 +277,8 @@ struct RelayAgentTimelineView: View {
         .onChange(of: draft) { old, text in
             // An empty value is persisted only when the user emptied a real draft, so an
             // unreadable store (empty restore) can never delete what is on disk.
-            if draftRestored && !submitted && (!text.isEmpty || !old.isEmpty) { persistDraft() }
+            if clearingSubmittedDraft { clearingSubmittedDraft = false }
+            else if draftRestored && (!text.isEmpty || !old.isEmpty) { persistDraft() }
             // Editing a recalled prompt makes it the draft; Down no longer returns the old one.
             if text != recalledDraft { composerHistory.reset(); recalledDraft = nil }
         }
@@ -285,6 +299,12 @@ struct RelayAgentTimelineView: View {
                     return
                 }
             }
+        }
+        // Held messages go out one per confirmed idle, through the same gates as Send.
+        .onChange(of: deliveryReady) { _, ready in if ready { deliverNextQueued() } }
+        .onChange(of: composerState.queue) { old, new in
+            if draftRestored && old.items != new.items { persistDraft() }
+            if deliveryReady { deliverNextQueued() }
         }
         .onChange(of: pane.lastCompletedAgentTurn) { _, _ in
             Task { await store.refreshLive() }
@@ -311,12 +331,18 @@ struct RelayAgentTimelineView: View {
             if let window = event.object as? NSWindow, window.identifier?.rawValue == "relay.agent." + pane.id.uuidString, !store.visible {
                 store.visible = true; Task { await store.refresh() }
             }
+            if let window = event.object as? NSWindow, window.identifier?.rawValue == "relay.agent." + pane.id.uuidString {
+                deliverNextQueued()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { event in
             if let window = event.object as? NSWindow, window.identifier?.rawValue == "relay.agent." + pane.id.uuidString {
                 if !draft.isEmpty || !attachmentQueue.attachments.isEmpty { persistDraft(immediate: true) }
                 store.stop()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            deliverNextQueued()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             if !draft.isEmpty || !attachmentQueue.attachments.isEmpty { persistDraft(immediate: true) }
@@ -784,15 +810,40 @@ struct RelayAgentTimelineView: View {
         return accepted
     }
 
+    /// The agent can take a message now: the gates every send passes, draft or queued.
+    private var deliveryReady: Bool {
+        !(pane.profile.kind != .local && pane.profile.backend != .relay) && !nativeDeliveryHeld &&
+            !submitting && !submitted && !store.busy && store.conversation.binding != nil &&
+            store.control?.readyForInput == true && store.control?.inputRevision == pane.agentInputRevision &&
+            (store.control?.observedAt ?? .distantPast) > pane.agentLastInputAt && pane.pendingAgentApprovals == 0
+    }
+
     private var sendDisabled: Bool {
-        (pane.profile.kind != .local && pane.profile.backend != .relay) || (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachmentQueue.attachments.isEmpty) ||
-            composedMessage.utf8.count > 65536 || !attachmentsReady || nativeDeliveryHeld ||
-            submitting || submitted || store.busy || store.conversation.binding == nil ||
-            store.control?.readyForInput != true || store.control?.inputRevision != pane.agentInputRevision ||
-            (store.control?.observedAt ?? .distantPast) <= pane.agentLastInputAt || pane.pendingAgentApprovals > 0
+        !deliveryReady || (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachmentQueue.attachments.isEmpty) ||
+            composedMessage.utf8.count > 65536 || !attachmentsReady ||
+            // Held messages go first; a new message waits behind them.
+            !queue.isEmpty
+    }
+
+    /// A message that cannot go out now can be held while the agent is busy with
+    /// a turn, or behind messages already held. Text only: attachments wait for idle.
+    private var canQueue: Bool {
+        guard sendDisabled, store.conversation.binding != nil, let control = store.control,
+              !(pane.profile.kind != .local && pane.profile.backend != .relay), !nativeDeliveryHeld,
+              attachmentQueue.attachments.isEmpty,
+              !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, draft.utf8.count <= 65536
+        else { return false }
+        return control.lifecycle == "active" || control.lifecycle == "stop_observed" ||
+            submitting || submitted || !queue.isEmpty
     }
 
     private var composerHint: String {
+        if let reason = queue.pausedReason { return reason }
+        if !queue.isEmpty, deliveryReady, pane.runtime.conversationComposerHasKeyFocus(paneID: pane.id) {
+            return "Sending the next held message…"
+        }
+        if !queue.isEmpty { return "Held messages send one at a time when the agent is idle and this composer has focus." }
+        if canQueue { return "↩ holds this message until the agent is idle" }
         if let submissionStatus { return submissionStatus }
         if let failure = attachmentQueue.intakeFailure { return failure }
         if !attachmentQueue.uploading.isEmpty { return "Preparing attached files…" }
@@ -811,7 +862,10 @@ struct RelayAgentTimelineView: View {
         if store.control?.inputRevision != pane.agentInputRevision { return "Waiting for a new authenticated idle state after terminal input." }
         if (store.control?.observedAt ?? .distantPast) <= pane.agentLastInputAt { return "Waiting for authenticated idle confirmation after the last input or reconnect." }
         switch store.control?.lifecycle {
-        case "active": return "The agent is working. Send when it confirms idle."
+        case "active":
+            return attachmentQueue.attachments.isEmpty
+                ? "The agent is working · ↩ holds the message until it is idle · Esc stops"
+                : "The agent is working. Attachments send when it confirms idle."
         case "needs_input": return "The agent is waiting for input in the original terminal."
         case "exited": return "The agent process has exited. Nothing can be sent."
         case "quiet": break
@@ -853,6 +907,7 @@ struct RelayAgentTimelineView: View {
         VStack(alignment: .leading, spacing: RelayTheme.spacing(0)) {
             terminalFooterStrip
             if !attachmentQueue.attachments.isEmpty { attachmentList }
+            if !queue.isEmpty { queuedList }
             if nativeDeliveryHeld {
                 Button("Resolve submission…") { showingHeldResolution = true }
                     .buttonStyle(RelayAgentQuietButtonStyle())
@@ -874,9 +929,10 @@ struct RelayAgentTimelineView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityLabel("Message to the existing agent")
                     .accessibilityIdentifier("relay.agent.composer")
-                    .disabled(submitting || submitted)
+                    // Typing stays possible during a turn, so the next message can be held.
+                    .disabled(submitting && !deliveringQueued)
                     .onPasteCommand(of: [UTType.fileURL, UTType.image]) { _ = acceptAttachmentDrop($0) }
-                    .onKeyPress(keys: [.return, .escape, .upArrow, .downArrow], phases: .down) { handleComposerKey($0) }
+                    .onKeyPress(keys: [.return, .tab, .escape, .upArrow, .downArrow], phases: .down) { handleComposerKey($0) }
             }
             .padding(.horizontal, RelayTheme.spacing(10)).padding(.top, RelayTheme.spacing(10))
             HStack(spacing: RelayTheme.spacing(8)) {
@@ -901,11 +957,19 @@ struct RelayAgentTimelineView: View {
                         .accessibilityIdentifier("relay.agent.stop")
                         .disabled(submitting || stopRequested || pane.pendingAgentApprovals > 0)
                 }
-                Button("Send") { submit() }
-                    .buttonStyle(RelayAgentPrimaryButtonStyle())
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .accessibilityIdentifier("relay.agent.send")
-                    .disabled(sendDisabled)
+                if canQueue {
+                    Button("Hold") { enqueueDraft() }
+                        .buttonStyle(RelayAgentPrimaryButtonStyle())
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .help("Send this message when the agent is idle")
+                        .accessibilityIdentifier("relay.agent.queue")
+                } else {
+                    Button("Send") { submit() }
+                        .buttonStyle(RelayAgentPrimaryButtonStyle())
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .accessibilityIdentifier("relay.agent.send")
+                        .disabled(sendDisabled)
+                }
             }
             .padding(.horizontal, RelayTheme.spacing(10)).padding(.vertical, RelayTheme.spacing(8))
         }
@@ -935,6 +999,7 @@ struct RelayAgentTimelineView: View {
             selection: editor?.selectedRange() ?? NSRange(location: (text as NSString).length, length: 0))
         let key: RelayAgentComposerKeys.Key = switch press.key {
             case .return: .returnKey
+            case .tab: .tab
             case .escape: .escape
             case .upArrow: .upArrow
             case .downArrow: .downArrow
@@ -945,10 +1010,16 @@ struct RelayAgentTimelineView: View {
         switch RelayAgentComposerKeys.action(key: key, modifiers: press.modifiers,
                                              hasMarkedText: editor?.hasMarkedText() ?? false,
                                              caretOnFirstLine: caret.first, caretOnLastLine: caret.last,
-                                             agentWorking: working) {
+                                             agentWorking: working, canSteer: canSteer) {
         case .send:
             // Return never inserts a newline; the hint says why a send is unavailable.
             if !sendDisabled { composerHistory.reset(); submit() }
+            else if canQueue { enqueueDraft() }
+            return .handled
+        case .queue, .steer:
+            // Steering needs the pane's structured transport; until it reports one,
+            // canSteer is false and Return holds the message instead.
+            if canQueue { enqueueDraft() }
             return .handled
         case .interrupt:
             interrupt()
@@ -987,57 +1058,162 @@ struct RelayAgentTimelineView: View {
                 return
             }
             stopRequested = true
+            queue.pause("Stopped. Held messages wait until you resume them.")
             submissionStatus = "Stop requested once. Waiting for the agent to confirm it is idle."
             Task { await store.refreshLive() }
         }
     }
 
-    private func submit() {
-        guard !sendDisabled, let binding = store.conversation.binding else { return }
-        let message = composedMessage
-        let attachmentSnapshot = attachmentQueue.attachments
+    /// Whether this pane's transport can steer a running turn. Only a managed
+    /// Codex pane's structured transport can; relayd does not report it yet.
+    private var canSteer: Bool { false }
+
+    private func enqueueDraft() {
+        guard canQueue, let binding = store.conversation.binding,
+              queue.enqueue(draft, binding: binding) else { return }
+        composerHistory.reset()
+        draft = ""
+    }
+
+    private func cancelQueued(_ id: UUID) { queue.cancel(id) }
+
+    /// Moves a held message back into an empty composer for editing.
+    private func editQueued(_ item: RelayAgentQueuedPrompt) {
+        guard draft.isEmpty, queue.cancel(item.id) != nil else { return }
+        draft = item.text
+        composerFocused = true
+    }
+
+    private func resumeQueue() {
+        if let binding = store.conversation.binding { queue.rebind(to: binding) }
+        queue.resume()
+        if deliveryReady { deliverNextQueued() }
+    }
+
+    /// Sends the oldest held message once the agent confirms idle. The message
+    /// leaves the queue in the same main-actor step that marks the composer as
+    /// submitting, so the pane and its separate window can never both send it.
+    /// Like any composer send it types into the terminal only while this
+    /// composer has focus; until then the message waits, unpaused. A closed
+    /// view sends nothing; the pane header shows what is held.
+    private func deliverNextQueued() {
+        guard !queue.isEmpty, deliveryReady, !stopRequested,
+              pane.runtime.conversationComposerHasKeyFocus(paneID: pane.id),
+              let next = queue.takeNext(for: store.conversation.binding) else { return }
+        submit(queued: next)
+    }
+
+    private var queuedList: some View {
+        VStack(alignment: .leading, spacing: RelayTheme.spacing(4)) {
+            ForEach(queue.items) { item in
+                HStack(spacing: RelayTheme.spacing(6)) {
+                    Text(queue.paused ? "Paused" : "Held")
+                        .font(RelayAgentDesign.meta.weight(.semibold))
+                        .foregroundStyle(RelayAgentDesign.secondaryInk)
+                        .padding(.horizontal, RelayTheme.spacing(6)).padding(.vertical, RelayTheme.spacing(1))
+                        .background(Color.primary.opacity(0.07), in: Capsule())
+                    Text(item.text.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? item.text)
+                        .font(RelayAgentDesign.meta).foregroundStyle(RelayAgentDesign.secondaryInk)
+                        .lineLimit(1).truncationMode(.tail)
+                        .help(item.text)
+                    Spacer(minLength: 4)
+                    if draft.isEmpty {
+                        Button { editQueued(item) } label: { Image(systemName: "pencil") }
+                            .buttonStyle(RelayAgentQuietButtonStyle())
+                            .help("Edit this message in the composer")
+                            .accessibilityLabel("Edit held message")
+                    }
+                    Button { cancelQueued(item.id) } label: { Image(systemName: "xmark") }
+                        .buttonStyle(RelayAgentQuietButtonStyle())
+                        .help("Cancel this held message")
+                        .accessibilityLabel("Cancel held message")
+                        .accessibilityIdentifier("relay.agent.queued.cancel")
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("relay.agent.queued")
+            }
+            if queue.paused {
+                Button("Resume sending") { resumeQueue() }
+                    .buttonStyle(RelayAgentQuietButtonStyle())
+                    .accessibilityIdentifier("relay.agent.queued.resume")
+            }
+        }
+        .padding(.horizontal, RelayTheme.spacing(10)).padding(.top, RelayTheme.spacing(8))
+    }
+
+    /// Sends the draft, or a held message when `queued` is given. Both pass the
+    /// same refresh, binding and idle checks; a held message is never retried:
+    /// any outcome short of a confirmed submit returns it to the queue, paused.
+    private func submit(queued: RelayAgentQueuedPrompt? = nil) {
+        if queued == nil { guard !sendDisabled else { return } }
+        guard let binding = store.conversation.binding else {
+            if let queued { queue.putBack(queued, reason: "Not sent. The conversation binding is unavailable.") }
+            return
+        }
+        let message = queued?.text ?? composedMessage
+        let attachmentSnapshot = queued == nil ? attachmentQueue.attachments : []
         let inputRevision = pane.agentInputRevision
         submitting = true
+        deliveringQueued = queued != nil
         Task { @MainActor in
-            defer { submitting = false }
-            guard await attachmentQueue.validateForSend(binding: binding),
-                  attachmentQueue.attachments == attachmentSnapshot,
+            defer { submitting = false; deliveringQueued = false }
+            func held(_ reason: String) {
+                if let queued { queue.putBack(queued, reason: reason) }
+            }
+            var attachmentsValid = true
+            if queued == nil {
+                attachmentsValid = await attachmentQueue.validateForSend(binding: binding)
+                    && attachmentQueue.attachments == attachmentSnapshot
+            }
+            guard attachmentsValid,
                   pane.agentInputRevision == inputRevision,
                   await store.refresh(),
                   pane.agentInputRevision == inputRevision,
                   store.conversation.binding == binding, store.failure == nil,
                   let control = store.control else {
-                submissionStatus = "Not sent. Check the attached files and the original terminal."
+                if queued != nil { held("Not sent. The agent state changed; resume to try again.") }
+                else { submissionStatus = "Not sent. Check the attached files and the original terminal." }
                 return
             }
             let images = attachmentSnapshot.filter { $0.kind == .image }.compactMap(\.uploadedPath)
             let result = await pane.runtime.sendConversationPrompt(message, imagePaths: images,
                 paneID: pane.id, rootPID: store.rootPID, control: control) {
-                    guard attachmentQueue.attachments == attachmentSnapshot,
-                          await attachmentQueue.validateForSend(binding: binding),
-                          await store.refresh(), store.failure == nil,
-                          attachmentQueue.attachments == attachmentSnapshot,
+                    if queued == nil {
+                        guard attachmentQueue.attachments == attachmentSnapshot,
+                              await attachmentQueue.validateForSend(binding: binding) else { return nil }
+                    }
+                    guard await store.refresh(), store.failure == nil,
+                          queued != nil || attachmentQueue.attachments == attachmentSnapshot,
                           store.conversation.binding == binding else { return nil }
                     return store.control
                 }
             switch result {
             case .notSent:
-                submissionStatus = "Not sent. Check the original terminal is ready and its prompt is empty."
+                if queued != nil { held("Not sent. Check the original terminal is ready, then resume.") }
+                else { submissionStatus = "Not sent. Check the original terminal is ready and its prompt is empty." }
                 return
             case .stagedOnly:
                 nativeDeliveryHeld = true
+                held("A held message may be in the original terminal. Check it there; cancel it here if it was sent.")
                 submissionStatus = "Input may remain in the original terminal. No submit was attempted; review it there."
                 return
             case .submissionUncertain:
                 nativeDeliveryHeld = true
+                held("A held message may have been sent. Check the original terminal; cancel it here if it was.")
                 submissionStatus = "Submission outcome is unknown. Check the original terminal before sending again."
                 return
             case .submitted: break
             }
             submittedAt = Date()
             submitted = true
+            if queued != nil {
+                submissionStatus = queue.isEmpty ? "Held message sent once. Waiting for a completed turn."
+                    : "Held message sent once. \(queue.items.count) more held."
+                return
+            }
             // Confirmed submission is the only path that discards the stored draft on purpose.
             RelayAgentDraftStore.shared.remove(hostID: draftHostID, paneID: pane.id)
+            clearingSubmittedDraft = !draft.isEmpty
             draft = ""
             for item in attachmentQueue.attachments { attachmentQueue.remove(item.id) }
             submissionStatus = "Submitted once. Waiting for a completed turn; reconnect never resends it."

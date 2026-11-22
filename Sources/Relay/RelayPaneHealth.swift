@@ -62,9 +62,7 @@ struct RelayPaneHealthFacts: Codable, Equatable, Sendable {
         let agentValid = !ended && proof?.valid(for: pane.id) == true
         let shellValid = !ended && proof?.validShell(for: pane.id) == true
         let valid = agentValid || shellValid
-        let draft = pane.composerStateIfCreated.map {
-            !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld
-        } ?? false
+        let draft = pane.composerStateIfCreated?.hasPendingInput ?? false
         let explained = proof.map { RelayAgentMaintenancePolicy.explainedFooterAgents($0, subagents: pane.subagents) } ?? 0
         let empty = pane.runtime.agentMaintenancePromptIsEmpty(explainedAgents: explained)
         let inputIdle = Date().timeIntervalSince(pane.agentLastInputAt) >= 15

@@ -60,9 +60,7 @@ enum RelayInstalledUpdatePostcondition {
 enum RelayInstalledUpdateScreenRefresh {
     @MainActor
     static func admits(_ proof: RelayAgentMaintenanceProbe, paneID: UUID, pane: PaneModel) -> Bool {
-        let draft = pane.composerStateIfCreated.map {
-            !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld
-        } ?? false
+        let draft = pane.composerStateIfCreated?.hasPendingInput ?? false
         return admits(proof, paneID: paneID, hasDraft: draft, pendingApprovals: pane.pendingAgentApprovals)
     }
 

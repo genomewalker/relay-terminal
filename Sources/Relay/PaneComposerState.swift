@@ -17,6 +17,17 @@ final class PaneComposerState: ObservableObject {
     @Published var nativeDeliveryHeld = false
     @Published var stopRequested = false
     @Published var submissionStatus: String?
+    /// Messages written while the agent was busy, sent one per confirmed idle.
+    /// Shared by every view of this pane, so a message is taken exactly once.
+    @Published var queue = RelayAgentPromptQueue()
+
+    /// Anything the user wrote that has not certainly reached the agent: a
+    /// draft, attachments, held messages, or a send in flight or held. A
+    /// restart, rotation or resume must wait while this is true; held messages
+    /// were written for the current conversation.
+    var hasPendingInput: Bool {
+        !draft.isEmpty || !attachmentQueue.attachments.isEmpty || !queue.isEmpty || submitting || nativeDeliveryHeld
+    }
 
     /// Loads a saved draft once. A stored draft never replaces typed text.
     func restoreIfNeeded(hostID: String, paneID: UUID, store: RelayAgentDraftStore = .shared) {
@@ -30,9 +41,9 @@ final class PaneComposerState: ObservableObject {
 
     func persist(hostID: String, paneID: UUID, immediate: Bool, store: RelayAgentDraftStore = .shared) {
         if immediate {
-            store.saveNow(draft, hostID: hostID, paneID: paneID, attachments: attachmentQueue.attachments)
+            store.saveNow(queue.textForSaving(draft), hostID: hostID, paneID: paneID, attachments: attachmentQueue.attachments)
         } else {
-            store.save(draft, hostID: hostID, paneID: paneID, attachments: attachmentQueue.attachments)
+            store.save(queue.textForSaving(draft), hostID: hostID, paneID: paneID, attachments: attachmentQueue.attachments)
         }
     }
 

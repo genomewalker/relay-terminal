@@ -2728,14 +2728,21 @@ final class TerminalRuntime: NSObject {
         RelayAgentTerminalFooter.rows(provider: provider, screen: session.readViewportRows() ?? [])
     }
 
+    /// The pane's conversation composer is where the user is typing: its own
+    /// window is key, or the in-pane composer has focus in the pane's window.
+    /// Composer sends type into the terminal only then. Held messages wait for it.
+    func conversationComposerHasKeyFocus(paneID: UUID) -> Bool {
+        NSApp.keyWindow?.identifier?.rawValue == "relay.agent." + paneID.uuidString ||
+            (conversationComposerOwnsFocus && NSApp.keyWindow === view.window)
+    }
+
     /// The first condition that blocks a composer send, or nil when it may send.
     private func conversationPromptRefusal(_ text: String, paneID: UUID, rootPID: Int,
                                            control: RelayAgentConversationControl) -> String? {
         guard let pane, pane.id == paneID else { return "pane" }
         guard pane.profile.kind == .local || pane.profile.backend == .relay else { return "profile" }
         guard NSApp.isActive else { return "app_inactive" }
-        guard NSApp.keyWindow?.identifier?.rawValue == "relay.agent." + paneID.uuidString ||
-              (conversationComposerOwnsFocus && NSApp.keyWindow === view.window) else { return "focus" }
+        guard conversationComposerHasKeyFocus(paneID: paneID) else { return "focus" }
         guard control.permitsSend else { return "lifecycle" }
         guard control.binding.paneID == paneID,
               control.binding.hostID == pane.profile.id.uuidString else { return "binding" }
@@ -2956,7 +2963,7 @@ final class TerminalRuntime: NSObject {
     /// Positive evidence only: a visible typed draft, as maintenance reads it.
     private func assistantPromptHasTypedTextNow(_ observation: RelayActiveScreenCache.Observation) -> Bool {
         guard let pane else { return false }
-        if let composer = pane.composerStateIfCreated, !composer.draft.isEmpty || !composer.attachmentQueue.attachments.isEmpty {
+        if let composer = pane.composerStateIfCreated, !composer.draft.isEmpty || !composer.attachmentQueue.attachments.isEmpty || !composer.queue.isEmpty {
             return true
         }
         switch pane.kind {
@@ -4031,7 +4038,7 @@ final class TerminalRuntime: NSObject {
               await readPromptOwnerBinding() == proof.owner,
               let pane, preparedTerminalEdit?.token == proof.token,
               Self.agentResumePromptAdmits(expected: expected, vt: vt, pendingApprovals: pane.pendingAgentApprovals,
-                  composerBusy: pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true,
+                  composerBusy: pane.composerStateIfCreated?.hasPendingInput == true,
                   admitTypedShell: admitTypedShell)
         else { return nil }
         return proof.token
@@ -4151,7 +4158,7 @@ final class TerminalRuntime: NSObject {
             }
         }
         guard let pane else { return (nil, .init(.paneChanged, "the pane closed")) }
-        let busy = pane.composerStateIfCreated.map({ !$0.draft.isEmpty || !$0.attachmentQueue.attachments.isEmpty || $0.submitting || $0.nativeDeliveryHeld }) == true
+        let busy = pane.composerStateIfCreated?.hasPendingInput == true
         return (nil, Self.agentResumePromptBlocker(expected: expected, vt: vt, pendingApprovals: pane.pendingAgentApprovals,
             composerBusy: busy) ?? .init(.promptUnverified, "the screen changed while it was proven"))
     }
