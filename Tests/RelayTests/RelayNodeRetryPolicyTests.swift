@@ -31,8 +31,11 @@ struct RelayNodeRetryPolicyTests {
     @Test func repeatedRouteFailuresPauseWithExponentialBackoff() {
         #expect(!RelayNodeRetryPolicy.isPaused(pausingFailures: 5))
         #expect(RelayNodeRetryPolicy.isPaused(pausingFailures: 6))
-        let delays = (6...12).map { RelayNodeRetryPolicy.delayMilliseconds(attempt: 900, failure: Self.route, pausingFailures: $0) }
-        #expect(delays == [30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000])
+        let proxied = (6...12).map { RelayNodeRetryPolicy.delayMilliseconds(attempt: 900, failure: Self.route, pausingFailures: $0, throughLocalProxy: true) }
+        #expect(proxied == [30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000])
+        // A direct host (dandy-07) never waits more than 30 s, paused or not.
+        let direct = (6...12).map { RelayNodeRetryPolicy.delayMilliseconds(attempt: 900, failure: Self.route, pausingFailures: $0) }
+        #expect(direct.allSatisfy { $0 == 30_000 })
         // Below the pause the existing schedule is unchanged.
         #expect(RelayNodeRetryPolicy.delayMilliseconds(attempt: 3, failure: Self.route, pausingFailures: 3) == 600)
     }

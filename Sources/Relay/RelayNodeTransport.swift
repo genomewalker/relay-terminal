@@ -1296,7 +1296,8 @@ final class RelayNodeConnection: @unchecked Sendable {
         pendingRPC.removeAll()
         pausingFailures = RelayNodeRetryPolicy.countsTowardPause(failure) ? pausingFailures + 1 : 0
         let delay = RelayNodeRetryPolicy.delayMilliseconds(attempt: attempt, failure: failure,
-                                                           pausingFailures: pausingFailures)
+                                                           pausingFailures: pausingFailures,
+                                                           throughLocalProxy: (localProxyPort ?? nil) != nil)
         let paused = RelayNodeRetryPolicy.isPaused(pausingFailures: pausingFailures)
         retryNotBeforeUptime = paused ? DispatchTime.now().uptimeNanoseconds &+ UInt64(delay) * 1_000_000 : 0
         lock.unlock()
@@ -1415,12 +1416,15 @@ enum RelayNodeRetryPolicy {
     /// the fast 3 s cap; permanent failures retry slowly.
     ///
     /// After `pauseAfterFailures` consecutive route or permanent failures the
-    /// host is paused: the wait doubles up to five minutes, and host requests
-    /// and waiting panes no longer restart it early (2026-11-22: denbi-h-micro
-    /// restarted every 5 s through demand restarts). Only a network change or
-    /// a successful connection ends the pause.
-    static func delayMilliseconds(attempt: Int, failure: SSHConnectionFailure, pausingFailures: Int = 0) -> Int {
+    /// host is paused: host requests and waiting panes no longer restart it
+    /// early (2026-11-22: denbi-h-micro restarted every 5 s through demand
+    /// restarts). A direct host keeps the 30 s ceiling, so a VPN that returns
+    /// unannounced costs at most 30 s; a host behind a local proxy doubles up
+    /// to five minutes. Only a network change or a success ends the pause.
+    static func delayMilliseconds(attempt: Int, failure: SSHConnectionFailure, pausingFailures: Int = 0,
+                                  throughLocalProxy: Bool = false) -> Int {
         if isPaused(pausingFailures: pausingFailures) {
+            guard throughLocalProxy else { return 30_000 }
             let doublings = min(pausingFailures - pauseAfterFailures, 4)
             return min(maximumPausedDelayMilliseconds, 30_000 << doublings)
         }
