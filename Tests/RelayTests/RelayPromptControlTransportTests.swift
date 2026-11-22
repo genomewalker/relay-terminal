@@ -398,3 +398,38 @@ struct RelayPromptControlTransportTests {
         #expect(!RelayInstalledUpdateScreenRefresh.admits(proof, paneID: UUID(), hasDraft: false, pendingApprovals: 0))
     }
 }
+
+// dandy-07 d62c62eb, 2026-11-22: agents enable any-motion mouse tracking
+// (1003), so every pointer move over a busy agent queued another report ahead
+// of the next keystroke (1.9 s median input delay). Motion with no button held
+// waits for earlier input to be acknowledged and only its latest position is sent.
+@Suite(.serialized)
+struct RelayPointerMotionCoalescingTests {
+    @MainActor @Test
+    func pointerMotionWaitsBehindUnacknowledgedInputAndKeepsOnlyTheLatest() throws {
+        let profile = ConnectionProfile(name: "Motion fixture", host: "motion-fixture.invalid")
+        let writer = OwnedPromptFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer, profile: profile, paneID: UUID(),
+            capabilities: ["input_ack_v1"], controlGranted: true)
+        defer { transport.detach() }
+        let motion1 = Data("\u{1B}[<35;10;5M".utf8), motion2 = Data("\u{1B}[<35;11;5M".utf8)
+        let key = Data("a".utf8), wheel = Data("\u{1B}[<64;11;5M".utf8)
+        #expect(transport.sendInput(motion1))           // nothing outstanding: sent
+        #expect(writer.inputs.count == 1)
+        #expect(transport.sendInput(motion2))           // behind motion1: withheld
+        #expect(transport.sendInput(Data("\u{1B}[<35;12;5M".utf8)))  // replaces motion2
+        #expect(writer.inputs.count == 1)
+        #expect(transport.sendInput(key))               // keys are never withheld
+        #expect(transport.sendInput(wheel))             // neither are wheel reports
+        #expect(writer.inputs.count == 3)
+        #expect(writer.inputs[1].dropFirst(24) == key && writer.inputs[2].dropFirst(24) == wheel)
+        let sequences = transport.pendingInputSequencesForTesting
+        transport.acknowledgeInput(sequence: sequences[0], pane: "p")
+        #expect(writer.inputs.count == 3)               // still outstanding input
+        transport.acknowledgeInput(sequence: sequences[1], pane: "p")
+        transport.acknowledgeInput(sequence: sequences[2], pane: "p")
+        #expect(writer.inputs.count == 4)               // latest position, once
+        #expect(writer.inputs[3].dropFirst(24) == Data("\u{1B}[<35;12;5M".utf8))
+        #expect(transport.deferredMotionReportForTesting == nil)
+    }
+}

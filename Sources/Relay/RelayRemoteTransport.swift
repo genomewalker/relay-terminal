@@ -291,6 +291,11 @@ final class RelayRemoteTransport: @unchecked Sendable {
     private let inputClientID = RelayInputClientIdentity.id
     private var pendingInputs: [UInt64: Data] = [:]
     private var pendingInputBytes = 0
+    /// The latest pointer-motion report (no button held) withheld while earlier
+    /// input is unacknowledged. Agents enable any-motion tracking (1003), so
+    /// every pointer move over a busy agent queued another report ahead of the
+    /// next keystroke: 1.9 s median input delay on dandy-07 d62c62eb.
+    private var deferredMotionReport: Data?
     private var inputOverflowed = false
     private var attachRepaintPending = false
     private var attached = false {
@@ -491,6 +496,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         pendingInputs.removeAll(keepingCapacity: true)
         automationInputSequences.removeAll(keepingCapacity: true)
         pendingInputBytes = 0
+        deferredMotionReport = nil
         inputOverflowed = false
         attachRepaintPending = forceAttachRepaint
         deliveryEpoch = UUID()
@@ -877,14 +883,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             receiveAgentEvent(frame.payload, context: context)
         case .inputAck:
             if let acknowledgement = RelayWireFrame.parseInputAck(frame.payload), acknowledgement.clientID == inputClientID {
-                lock.lock()
-                if let removed = pendingInputs.removeValue(forKey: acknowledgement.sequence) {
-                    pendingInputBytes = max(0, pendingInputBytes - removed.count)
-                }
-                automationInputSequences.remove(acknowledgement.sequence)
-                signalPromptEditorLeaseChangedLocked()
-                lock.unlock()
-                RelayPaneDelayStore.shared.inputAcknowledged(pane: context.sessionID, sequence: acknowledgement.sequence)
+                acknowledgeInput(sequence: acknowledgement.sequence, pane: context.sessionID)
             }
         case .viewportAck:
             receiveViewportAck(frame.payload)
@@ -1264,14 +1263,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
             case .inputAck:
                 if let acknowledgement = RelayWireFrame.parseInputAck(frame.payload),
                    acknowledgement.clientID == self.inputClientID {
-                    self.lock.lock()
-                    if let removed = self.pendingInputs.removeValue(forKey: acknowledgement.sequence) {
-                        self.pendingInputBytes = max(0, self.pendingInputBytes - removed.count)
-                    }
-                    self.automationInputSequences.remove(acknowledgement.sequence)
-                    self.signalPromptEditorLeaseChangedLocked()
-                    self.lock.unlock()
-                    RelayPaneDelayStore.shared.inputAcknowledged(pane: context.sessionID, sequence: acknowledgement.sequence)
+                    self.acknowledgeInput(sequence: acknowledgement.sequence, pane: context.sessionID)
                 }
             case .viewportAck:
                 self.receiveViewportAck(frame.payload)
@@ -1628,6 +1620,29 @@ final class RelayRemoteTransport: @unchecked Sendable {
         let backlogBytes: Int
         let unacknowledgedBytes: Int
     }
+    /// The worker wrote this input to the terminal. Sends a withheld pointer
+    /// position once nothing else is outstanding.
+    func acknowledgeInput(sequence: UInt64, pane: String) {
+        lock.lock()
+        if let removed = pendingInputs.removeValue(forKey: sequence) {
+            pendingInputBytes = max(0, pendingInputBytes - removed.count)
+        }
+        automationInputSequences.remove(sequence)
+        signalPromptEditorLeaseChangedLocked()
+        let motion = takeDeferredMotionLocked()
+        lock.unlock()
+        RelayPaneDelayStore.shared.inputAcknowledged(pane: pane, sequence: sequence)
+        if let motion { sendInput(motion) }
+    }
+    var pendingInputSequencesForTesting: [UInt64] { lock.lock(); defer { lock.unlock() }; return pendingInputs.keys.sorted() }
+    /// Caller holds `lock`. The withheld pointer position, once nothing is
+    /// left unacknowledged.
+    private func takeDeferredMotionLocked() -> Data? {
+        guard pendingInputBytes == 0, let motion = deferredMotionReport else { return nil }
+        deferredMotionReport = nil
+        return motion
+    }
+    var deferredMotionReportForTesting: Data? { lock.lock(); defer { lock.unlock() }; return deferredMotionReport }
     func inputDeliveryState() -> InputDeliveryState {
         lock.lock(); defer { lock.unlock() }
         return .init(attached: attached && writer != nil, acknowledgements: supportsInputAcknowledgements,
@@ -1641,6 +1656,14 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
         guard !data.isEmpty else { return false }
         lock.lock()
+        if supportsInputAcknowledgements, pendingInputBytes > 0, writer != nil, attached,
+           TerminalInputDiagnosticReport.name(data) == "mouse_motion" {
+            // Only the pointer's latest position matters; send it once the
+            // worker has caught up, never ahead of or instead of a keystroke.
+            deferredMotionReport = data
+            lock.unlock()
+            return true
+        }
         let writer = self.writer
         let canSend = writer != nil && attached
         let acknowledged = supportsInputAcknowledgements
