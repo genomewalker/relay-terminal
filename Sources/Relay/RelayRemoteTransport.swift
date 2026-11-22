@@ -65,8 +65,20 @@ struct SSHConnectionFailure: Equatable, Sendable {
             .contains(where: detail.contains)
     }
 
+    static let localProxyPrefix = "Local proxy on port "
+
+    /// The host's ssh ProxyCommand goes through a port on this Mac that is closed.
+    static func localProxyUnavailable(port: Int) -> SSHConnectionFailure {
+        SSHConnectionFailure(kind: .networkRoute,
+            detail: localProxyPrefix + "\(port) is not listening. Relay connects when it is back.")
+    }
+
+    var isLocalProxy: Bool { kind == .networkRoute && detail.hasPrefix(Self.localProxyPrefix) }
+
     var userMessage: String {
         switch kind {
+        case .networkRoute where isLocalProxy:
+            detail
         case .networkRoute:
             isNameLookup
                 ? "Can't look up this host's name (DNS). If the VPN is connected, macOS may still be using an old lookup; Relay keeps retrying."

@@ -410,7 +410,7 @@ final class RelayNodeTransportPool: @unchecked Sendable {
         lock.lock()
         let pooled = nodes[profile.connectionKey] === node
         lock.unlock()
-        if pooled { node.resumeAfterNetworkChange() }
+        if pooled { node.resumeOnDemand() }
         return !pooled
     }
 
@@ -523,6 +523,14 @@ final class RelayNodeConnection: @unchecked Sendable {
         retainsHostConnection = true
         pendingRPC[id] = PendingRPC(payload: payload, requiredCapability: requiredCapability, completion: completion)
         resumeLocked()
+        if !ready, process == nil, DispatchTime.now().uptimeNanoseconds < retryNotBeforeUptime,
+           let unsent = pendingRPC.removeValue(forKey: id) {
+            // A paused host would hold this request for minutes; it was never sent.
+            lock.unlock()
+            unsent.completion(.failure(RelayHostRPCError.hostUnavailable(
+                "the host is paused after repeated connection failures; Relay retries it on its own")))
+            return true
+        }
         let canSend = ready
         lock.unlock()
         if canSend { flushHostRequests() }
@@ -618,6 +626,14 @@ final class RelayNodeConnection: @unchecked Sendable {
     private var generation = 0
     private var reconnectAttempt = 0
     private var lastStartUptime: UInt64 = 0
+    /// Consecutive failures that count toward the pause (route or permanent).
+    private var pausingFailures = 0
+    /// While paused, demand restarts wait until this uptime.
+    private var retryNotBeforeUptime: UInt64 = 0
+    /// The ssh config's local proxy port, resolved once (nil: none).
+    private var localProxyPort: Int??
+    private var localProxyDown = false
+    private var localProxyPollScheduled = false
     private var attachedPeer = false
     /// Set once, under this lock, when the pool evicts the idle node.
     private var retired = false
@@ -870,26 +886,101 @@ final class RelayNodeConnection: @unchecked Sendable {
     /// A stopped node starts. A node whose transport ended and is waiting for
     /// a retry (no process) starts now, at most once per few seconds, so a
     /// host request or pane reconnect never waits on a parked transport.
-    private func resumeLocked() {
+    private func resumeLocked(networkChanged: Bool = false) {
         if stopped {
             stopped = false
             startLocked()
-        } else if process == nil, !attachedPeer,
-                  DispatchTime.now().uptimeNanoseconds &- lastStartUptime >= Self.demandRestartInterval {
+            return
+        }
+        guard process == nil, !attachedPeer else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if networkChanged { retryNotBeforeUptime = 0 }
+        if RelayNodeRetryPolicy.demandRestartAllowed(now: now, lastStart: lastStartUptime,
+                                                     notBefore: retryNotBeforeUptime) {
             startLocked()
         }
     }
 
-    private static let demandRestartInterval: UInt64 = 5_000_000_000
-
-    /// Wake and network-path recovery: start any parked transport now.
-    func resumeAfterNetworkChange() {
+    /// A host request or a waiting pane: start a parked transport, unless the
+    /// host is paused after repeated failures.
+    func resumeOnDemand() {
         lock.lock()
         if !stopped { resumeLocked() }
         lock.unlock()
     }
 
+    /// Wake and network-path recovery: start any parked transport now, even a
+    /// paused one; the route may be back.
+    func resumeAfterNetworkChange() {
+        lock.lock()
+        if !stopped { resumeLocked(networkChanged: true) }
+        lock.unlock()
+    }
+
+    /// Requests that were queued but never written, failed at once so callers
+    /// do not wait out a pause.
+    private func failUnsentRequestsLocked() -> [PendingRPC] {
+        let unsent = Array(pendingRPC.values)
+        pendingRPC.removeAll()
+        return unsent
+    }
+
+    /// Hosts reached through a local proxy (ssh ProxyCommand to localhost)
+    /// stay parked while that port is closed: no ssh is started, the port is
+    /// checked every few seconds, and the host connects as soon as it opens.
+    /// Returns true when the start must wait.
+    private func waitForLocalProxyLocked() -> Bool {
+        if localProxyPort == nil {
+            localProxyPort = .some(profile.kind == .local ? nil : RelayLocalProxyGate.port(for: profile))
+        }
+        guard let port = localProxyPort ?? nil else { return false }
+        if RelayLocalProxyGate.isListening(port: port) {
+            if localProxyDown {
+                localProxyDown = false
+                reconnectAttempt = 0
+                pausingFailures = 0
+                retryNotBeforeUptime = 0
+                RelayDiagnostics.shared.record(category: "connection", name: "local-proxy-available", details: [
+                    "connection_id": diagnosticConnectionID, "port": String(port),
+                ])
+            }
+            return false
+        }
+        lastStartUptime = DispatchTime.now().uptimeNanoseconds
+        let unsent = failUnsentRequestsLocked()
+        let firstMiss = !localProxyDown
+        localProxyDown = true
+        let failure = SSHConnectionFailure.localProxyUnavailable(port: port)
+        if firstMiss {
+            for subscription in subscriptions.values {
+                subscription.frameDispatcher.enqueueLifecycle { subscription.onDisconnect(failure) }
+            }
+            RelayDiagnostics.shared.record(category: "connection", name: "local-proxy-unavailable", details: [
+                "connection_id": diagnosticConnectionID, "port": String(port),
+            ])
+        }
+        if !localProxyPollScheduled {
+            localProxyPollScheduled = true
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + .milliseconds(RelayLocalProxyGate.pollMilliseconds)
+            ) { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                self.localProxyPollScheduled = false
+                if !self.stopped, self.process == nil, !self.attachedPeer { self.startLocked() }
+                self.lock.unlock()
+            }
+        }
+        if !unsent.isEmpty {
+            DispatchQueue.global(qos: .utility).async {
+                unsent.forEach { $0.completion(.failure(RelayHostRPCError.hostUnavailable(failure.userMessage))) }
+            }
+        }
+        return true
+    }
+
     private func startLocked() {
+        if waitForLocalProxyLocked() { return }
         lastStartUptime = DispatchTime.now().uptimeNanoseconds
         generation += 1
         let currentGeneration = generation
@@ -1102,6 +1193,8 @@ final class RelayNodeConnection: @unchecked Sendable {
             lastProtocolConfirmation = DispatchTime.now().uptimeNanoseconds
             capabilities = Set(status.capabilities ?? [])
             reconnectAttempt = 0
+            pausingFailures = 0
+            retryNotBeforeUptime = 0
             heartbeatTimer.schedule(
                 deadline: .now() + .seconds(RelayHeartbeatPolicy.intervalSeconds),
                 repeating: .seconds(RelayHeartbeatPolicy.intervalSeconds),
@@ -1201,6 +1294,11 @@ final class RelayNodeConnection: @unchecked Sendable {
         }
         let interrupted = Array(pendingRPC.values)
         pendingRPC.removeAll()
+        pausingFailures = RelayNodeRetryPolicy.countsTowardPause(failure) ? pausingFailures + 1 : 0
+        let delay = RelayNodeRetryPolicy.delayMilliseconds(attempt: attempt, failure: failure,
+                                                           pausingFailures: pausingFailures)
+        let paused = RelayNodeRetryPolicy.isPaused(pausingFailures: pausingFailures)
+        retryNotBeforeUptime = paused ? DispatchTime.now().uptimeNanoseconds &+ UInt64(delay) * 1_000_000 : 0
         lock.unlock()
         Task { @MainActor [profile] in RelayHostRegistry.shared.connection(profile, ready: false) }
         interrupted.forEach { $0.completion(.failure(RelayHostRPCError.outcomeUnknown)) }
@@ -1209,12 +1307,13 @@ final class RelayNodeConnection: @unchecked Sendable {
             "status": String(status),
             "reason": failure.userMessage,
             "retry": String(failure.shouldRetry),
+            "retry_ms": String(delay),
+            "paused": String(paused),
         ])
         // A failure classed as permanent (authentication, remote install, a
         // stream closed before the handshake) can still clear outside Relay,
         // e.g. after a network drop or an ssh-agent unlock. Keep retrying
         // slowly; never leave the node parked with no process until restart.
-        let delay = RelayNodeRetryPolicy.delayMilliseconds(attempt: attempt, failure: failure)
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
             guard let self else { return }
             self.lock.lock()
@@ -1292,14 +1391,17 @@ final class RelayNodeConnection: @unchecked Sendable {
     }
 }
 
- enum RelayHostRPCError: LocalizedError {
+ enum RelayHostRPCError: LocalizedError, Equatable {
     case invalidRequest, duplicateRequest, unsupported, outcomeUnknown
+    /// Not sent: the host is waiting for its route or local proxy.
+    case hostUnavailable(String)
     var errorDescription: String? {
         switch self {
         case .invalidRequest: return "Invalid host request"
         case .duplicateRequest: return "Request ID is already in flight"
         case .unsupported: return "Host daemon needs the host_rpc_v1 capability"
         case .outcomeUnknown: return "Host request outcome unknown; query the same job ID, never replay with a new job ID"
+        case .hostUnavailable(let reason): return "Host request not sent: \(reason)"
         }
     }
 }
@@ -1311,12 +1413,110 @@ enum RelayNodeRetryPolicy {
     /// change and opening one of its panes still restart it at once
     /// (`resumeAfterNetworkChange`, demand restart). Other retryable drops keep
     /// the fast 3 s cap; permanent failures retry slowly.
-    static func delayMilliseconds(attempt: Int, failure: SSHConnectionFailure) -> Int {
+    ///
+    /// After `pauseAfterFailures` consecutive route or permanent failures the
+    /// host is paused: the wait doubles up to five minutes, and host requests
+    /// and waiting panes no longer restart it early (2026-11-22: denbi-h-micro
+    /// restarted every 5 s through demand restarts). Only a network change or
+    /// a successful connection ends the pause.
+    static func delayMilliseconds(attempt: Int, failure: SSHConnectionFailure, pausingFailures: Int = 0) -> Int {
+        if isPaused(pausingFailures: pausingFailures) {
+            let doublings = min(pausingFailures - pauseAfterFailures, 4)
+            return min(maximumPausedDelayMilliseconds, 30_000 << doublings)
+        }
         let step = 150 * (1 << min(max(attempt, 1) - 1, 8))
         guard failure.shouldRetry else { return 30_000 }
         // A name lookup can recover with no path change to wake the node
         // (dandy-07, 08:00-08:04 UTC), so it keeps the fast cap.
         return failure.kind == .networkRoute && !failure.isNameLookup ? min(30_000, step) : min(3_000, step)
+    }
+
+    static let pauseAfterFailures = 6
+    static let maximumPausedDelayMilliseconds = 300_000
+    static let demandRestartIntervalNanoseconds: UInt64 = 5_000_000_000
+
+    /// Route failures (not name lookups, which recover without a path change)
+    /// and permanent failures count toward the pause; any other ends the run.
+    static func countsTowardPause(_ failure: SSHConnectionFailure) -> Bool {
+        !failure.shouldRetry || (failure.kind == .networkRoute && !failure.isNameLookup)
+    }
+
+    static func isPaused(pausingFailures: Int) -> Bool { pausingFailures >= pauseAfterFailures }
+
+    /// A demand restart (host request, waiting pane) runs at most every 5 s
+    /// and never before a paused host's next retry.
+    static func demandRestartAllowed(now: UInt64, lastStart: UInt64, notBefore: UInt64) -> Bool {
+        now &- lastStart >= demandRestartIntervalNanoseconds && now >= notBefore
+    }
+}
+
+/// A host whose ssh config reaches it through a proxy on this Mac (a
+/// ProxyCommand to localhost, such as a SOCKS forward) cannot connect while
+/// that port is closed, so Relay does not start ssh until it listens again.
+enum RelayLocalProxyGate {
+    static let pollMilliseconds = 5_000
+
+    static func port(for profile: ConnectionProfile) -> Int? {
+        let ssh = Process()
+        ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        ssh.arguments = ["-G"] + profile.sshConnectionArguments.filter { $0 != "-T" }
+        let output = Pipe()
+        ssh.standardOutput = output
+        ssh.standardError = FileHandle.nullDevice
+        ssh.standardInput = FileHandle.nullDevice
+        guard (try? ssh.run()) != nil else { return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        ssh.waitUntilExit()
+        guard ssh.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else { return nil }
+        let line = text.split(separator: "\n").first { $0.lowercased().hasPrefix("proxycommand ") }
+        return line.flatMap { localPort(proxyCommand: String($0.dropFirst("proxycommand ".count))) }
+    }
+
+    /// The local port of a proxy command that goes through this Mac: socat
+    /// `socks4a:localhost:%h:%p,socksport=N`, nc `-x localhost:N`, or a
+    /// `socks5h://127.0.0.1:N` URL. Anything else is not gated.
+    static func localPort(proxyCommand: String) -> Int? {
+        let command = proxyCommand.lowercased()
+        let local = #"(?:localhost|127\.0\.0\.1|\[::1\])"#
+        let patterns = [
+            #"socks[a-z0-9]*:"# + local + #":[^,\s]*,(?:[^\s]*,)?socksport=(\d{1,5})"#,
+            #"-x\s*"# + local + #":(\d{1,5})"#,
+            #"socks[a-z0-9]*://"# + local + #":(\d{1,5})"#,
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: command, range: NSRange(command.startIndex..., in: command)),
+                  let range = Range(match.range(at: 1), in: command),
+                  let port = Int(command[range]), (1...65_535).contains(port) else { continue }
+            return port
+        }
+        return nil
+    }
+
+    /// A non-blocking loopback connect: no ssh, no network traffic.
+    static func isListening(port: Int) -> Bool {
+        let socketFD = socket(AF_INET, SOCK_STREAM, 0)
+        guard socketFD >= 0 else { return true }
+        defer { close(socketFD) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(UInt16(port).bigEndian)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        _ = fcntl(socketFD, F_SETFL, fcntl(socketFD, F_GETFL, 0) | O_NONBLOCK)
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if result == 0 { return true }
+        guard errno == EINPROGRESS else { return false }
+        var descriptor = pollfd(fd: socketFD, events: Int16(POLLOUT), revents: 0)
+        guard poll(&descriptor, 1, 300) == 1 else { return false }
+        var error: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(socketFD, SOL_SOCKET, SO_ERROR, &error, &length)
+        return error == 0
     }
 }
 
