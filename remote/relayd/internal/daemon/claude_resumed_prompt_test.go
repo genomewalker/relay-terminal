@@ -114,12 +114,27 @@ func TestClaudeResumedPromptRefusesUnprovenShapes(t *testing.T) {
 		"continue":            {"claude", "--continue", "--resume", initialSession, note},
 		"session_id":          {"claude", "--session-id", initialSession, "--resume", initialSession, note},
 		"selector_value_last": {"claude", note, "--resume", initialSession},
-		"no_prompt":           {"claude", "--resume", initialSession},
+
+		"no_prompt": {"claude", "--resume", initialSession},
 	} {
 		t.Run("argv_"+name, func(t *testing.T) {
 			mrRaise(t, "not verified", func() { resumedProof(path, rev, argv, started) })
 		})
 	}
+	// A joined short form (-r<id>) is not a recognised selector. On a real
+	// resumed transcript the note is not the first turn, so the original-launch
+	// proof refuses; and even where it were the first turn, the resume builder
+	// refuses the unknown argument as a custom launch.
+	t.Run("short_form_joined", func(t *testing.T) {
+		joined := []string{"claude", "-r" + initialSession, note}
+		history, histRev := initialTranscript(t, resumedRow("user", "original work", "", before), done(before),
+			resumedRow("user", note, "", after), done(after))
+		mrRaise(t, "not verified", func() { resumedProof(history, histRev, joined, started) })
+		proof := resumedProof(path, rev, joined, started)
+		mrRaise(t, "custom Claude launch", func() {
+			phClaudeResumeCommandWithPrompt(joined, initialSession, []string{"relayd", "agent", "claude"}, "", proof)
+		})
+	})
 	t.Run("no_process_start", func(t *testing.T) {
 		mrRaise(t, "not verified", func() { resumedProof(path, rev, args, time.Time{}) })
 	})
