@@ -6,6 +6,7 @@ import (
 	"github.com/relay-terminal/relayd/internal/protocol"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -204,5 +205,71 @@ func TestFragmentedViewerIncarnationsKeepLogicalRoutes(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("detach timeout")
 		}
+	}
+}
+
+// A GUI that stops reading for a few seconds (dandy-07, 2026-11-22 20:51:26Z,
+// 5 s deadline) must keep its viewer; only a stall past the deadline ends it.
+func TestViewerSurvivesStallShorterThanWriteDeadline(t *testing.T) {
+	if viewerWriteTimeout < 30*time.Second {
+		t.Fatalf("viewer write deadline %v is shorter than 30s", viewerWriteTimeout)
+	}
+	stall := func(timeout, pause time.Duration) (delivered bool, reasons []string) {
+		saved := viewerWriteTimeout
+		viewerWriteTimeout = timeout
+		defer func() { viewerWriteTimeout = saved }()
+		var mu sync.Mutex
+		Logf = func(format string, args ...any) {
+			mu.Lock()
+			reasons = append(reasons, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		}
+		defer func() { Logf = func(string, ...any) {} }()
+		b := New(&bytes.Buffer{}, protocol.Frame{Type: protocol.Status})
+		app, conn := net.Pipe()
+		defer app.Close()
+		done := make(chan struct{})
+		go func() { _ = b.Serve(conn); close(done) }()
+		if _, err := protocol.ReadFrame(app); err != nil {
+			t.Fatal(err)
+		}
+		b.mu.Lock()
+		b.viewer.reverse["route"] = "pane"
+		b.mu.Unlock()
+		b.RemoteFrame(protocol.HostEventFrame("route", protocol.Frame{Type: protocol.Output, Payload: []byte("after-stall")}))
+		time.Sleep(pause) // the GUI is not reading
+		_ = app.SetReadDeadline(time.Now().Add(time.Second))
+		frame, err := protocol.ReadFrame(app)
+		if err == nil {
+			_, inner, _ := protocol.ParseHostEvent(frame)
+			delivered = string(inner.Payload) == "after-stall"
+		}
+		if delivered {
+			b.mu.Lock()
+			alive := b.viewer != nil && !b.viewer.closed
+			b.mu.Unlock()
+			if !alive {
+				t.Fatal("viewer closed although the frame was delivered")
+			}
+		} else {
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed-out viewer did not end")
+			}
+		}
+		mu.Lock()
+		got := append([]string(nil), reasons...)
+		mu.Unlock()
+		_ = app.Close()
+		<-done // let this viewer finish logging before the next run
+		return delivered, got
+	}
+	if delivered, reasons := stall(800*time.Millisecond, 300*time.Millisecond); !delivered || len(reasons) != 0 {
+		t.Fatalf("short stall dropped the viewer: delivered=%v reasons=%q", delivered, reasons)
+	}
+	delivered, reasons := stall(200*time.Millisecond, 600*time.Millisecond)
+	if delivered || !strings.Contains(strings.Join(reasons, "\n"), "writing to viewer 1 failed") {
+		t.Fatalf("stall past the deadline was not reported: delivered=%v reasons=%q", delivered, reasons)
 	}
 }

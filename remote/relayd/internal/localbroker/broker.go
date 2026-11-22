@@ -19,6 +19,12 @@ const (
 	viewerQueueBytes  = 32 << 20
 )
 
+// viewerWriteTimeout bounds one frame write to the GUI. At 5 s a short GUI
+// stall dropped the viewer and every dandy-07 pane reattached (2026-11-22
+// 20:51:26Z). The byte cap above bounds memory, so wait longer. A timed-out
+// write may be partial, which breaks framing, so it still ends the viewer.
+var viewerWriteTimeout = 30 * time.Second
+
 // Logf receives the reason a viewer was closed. The broker runs detached with
 // no stderr, so the caller points this at a file.
 var Logf = func(format string, args ...any) {}
@@ -158,7 +164,7 @@ func (b *Broker) Serve(conn net.Conn) (served error) {
 	}()
 	go func() {
 		writer := v.writer
-		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_ = conn.SetWriteDeadline(time.Now().Add(viewerWriteTimeout))
 		if writer.Write(b.ready) != nil {
 			_ = conn.Close()
 			return
@@ -166,7 +172,7 @@ func (b *Broker) Serve(conn net.Conn) (served error) {
 		for {
 			select {
 			case frame := <-v.frames:
-				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				_ = conn.SetWriteDeadline(time.Now().Add(viewerWriteTimeout))
 				if err := writer.Write(frame); err != nil {
 					Logf("relay-connection: writing to viewer %d failed: %v", epoch, err)
 					_ = conn.Close()
