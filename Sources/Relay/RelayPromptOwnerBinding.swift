@@ -43,6 +43,9 @@ struct RelayPromptOwnerBinding: Equatable, Codable, Sendable {
     }
 
     var isInputOnly: Bool { inputOnly == true }
+    /// relayd's transcript identity for an owner that names no conversation.
+    static let preSessionIdentity = "presession"
+    var isPreSession: Bool { inputOnly == true && transcriptIdentity == Self.preSessionIdentity }
 
     func isValid(for paneID: UUID) -> Bool {
         guard version == 1, paneId == paneID.uuidString.lowercased(),
@@ -53,6 +56,12 @@ struct RelayPromptOwnerBinding: Equatable, Codable, Sendable {
             return processId == shellPid && processStart == shellStart &&
                 sessionId == nil && transcriptIdentity == nil && inputOnly != true
         }
+        if inputOnly == true, transcriptIdentity == Self.preSessionIdentity {
+            // The live agent frontend before its first session (a startup
+            // dialog such as folder trust): input only, no conversation.
+            return ["claude", "codex"].contains(provider) && sessionId == nil
+        }
+        if transcriptIdentity == Self.preSessionIdentity { return false }
         if inputOnly == true {
             guard let identity = transcriptIdentity, identity.hasPrefix("input:") else { return false }
             let epoch = identity.dropFirst(6)

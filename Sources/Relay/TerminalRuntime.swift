@@ -3982,7 +3982,9 @@ final class TerminalRuntime: NSObject {
             return ["status": "unavailable", "reason": "No current terminal editing surface; no focus change was attempted."]
         }
         let profile = pane.profile, revision = pane.agentInputRevision
-        guard let owner = await readPromptOwnerBinding() else { return ["status": "changed"] }
+        guard let owner = await readPromptOwnerBinding() else {
+            return ["status": "changed", "reason": "The host could not verify which program owns this pane's prompt; no focus change was attempted."]
+        }
         let screen: TerminalEditScreen, plain: String, source: String
         if let snapshot = io.maintenanceScreenSnapshot() {
             guard let text = await RelayAgentMaintenanceScreen.editingScreen(snapshot.data,

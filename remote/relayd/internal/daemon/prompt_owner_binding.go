@@ -73,16 +73,44 @@ func (server *Server) readVerifiedPromptOwnerBinding(pane string) (PromptOwnerBi
 		record, e := ReadVerifiedAgentBinding(pane)
 		if e != nil || record.Producer.ProcessID != pid || record.Producer.Provider != provider || record.TranscriptPath == "" {
 			bootstrap, err := server.readVerifiedPromptBootstrapOwner(pane)
-			if err != nil || provider != "claude" || bootstrap.Producer.ProcessID != pid ||
-				(e == nil && record.SessionID != "" && record.SessionID != bootstrap.SessionID) {
+			// Stored records are read unverified as well: a record naming this
+			// exact process that fails verification must still refuse.
+			stored, _ := readStoredVerifiedAgentBinding(pane)
+			rawBootstrap, _ := server.readPromptBootstrapOwner(pane)
+			evidence := promptOwnerEvidence{
+				Provider:          provider,
+				PID:               pid,
+				RecordNamesPID:    e == nil && record.Producer.ProcessID == pid,
+				StoredNamesPID:    stored.Producer.ProcessID == pid,
+				BootstrapVerified: err == nil && bootstrap.Producer.ProcessID == pid,
+				BootstrapNamesPID: rawBootstrap.Producer.ProcessID == pid,
+				SessionConflict:   e == nil && err == nil && record.SessionID != "" && record.SessionID != bootstrap.SessionID,
+			}
+			switch promptOwnerFallback(evidence) {
+			case promptOwnerBootstrap:
+				result.Provider = provider
+				result.ProcessID = pid
+				result.ProcessStart = bootstrap.Producer.ProcessStart
+				result.SessionID = bootstrap.SessionID
+				result.TranscriptIdentity = "input:" + bootstrap.Revision
+				result.InputOnly = true
+			case promptOwnerPreSession:
+				// The agent is in a startup dialog (folder trust, sign-in)
+				// before any session or hook exists, and no record names it.
+				// The live frontend, fenced by its kernel start, owns the
+				// prompt for input only; it names no conversation.
+				start, startErr := NativeAgentIncarnation(pane, pid, provider)
+				if startErr != nil || start == 0 {
+					return empty, errors.New("prompt agent binding unavailable")
+				}
+				result.Provider = provider
+				result.ProcessID = pid
+				result.ProcessStart = start
+				result.TranscriptIdentity = PromptOwnerPreSessionIdentity
+				result.InputOnly = true
+			default:
 				return empty, errors.New("prompt agent binding unavailable")
 			}
-			result.Provider = provider
-			result.ProcessID = pid
-			result.ProcessStart = bootstrap.Producer.ProcessStart
-			result.SessionID = bootstrap.SessionID
-			result.TranscriptIdentity = "input:" + bootstrap.Revision
-			result.InputOnly = true
 		} else {
 			file, e := os.Lstat(record.TranscriptPath)
 			if e != nil || !file.Mode().IsRegular() {
@@ -126,4 +154,53 @@ func (server *Server) readVerifiedPromptOwnerBinding(pane string) (PromptOwnerBi
 		return empty, errors.New("prompt frontend changed")
 	}
 	return result, nil
+}
+
+// PromptOwnerPreSessionIdentity marks an input-only owner that names no
+// conversation: the live agent frontend before its first session exists.
+const PromptOwnerPreSessionIdentity = "presession"
+
+type promptOwnerChoice int
+
+const (
+	promptOwnerRefuse promptOwnerChoice = iota
+	promptOwnerBootstrap
+	promptOwnerPreSession
+)
+
+// promptOwnerEvidence is what the records say about the live frontend when no
+// complete transcript binding names it.
+type promptOwnerEvidence struct {
+	Provider string
+	PID      int
+	// A verified agent binding names this process (without a transcript).
+	RecordNamesPID bool
+	// The stored agent binding names this process, verified or not.
+	StoredNamesPID bool
+	// A verified SessionStart bootstrap names this process.
+	BootstrapVerified bool
+	// The stored bootstrap record names this process, verified or not.
+	BootstrapNamesPID bool
+	// The verified binding and bootstrap name different sessions.
+	SessionConflict bool
+}
+
+// promptOwnerFallback chooses an owner when no transcript binding names the
+// live frontend. A verified Claude bootstrap wins. Only when no record of any
+// kind names this exact process is the process itself the input-only owner;
+// a record for this process that is incomplete or unverifiable refuses.
+func promptOwnerFallback(evidence promptOwnerEvidence) promptOwnerChoice {
+	if evidence.PID <= 1 || (evidence.Provider != "claude" && evidence.Provider != "codex") {
+		return promptOwnerRefuse
+	}
+	if evidence.BootstrapVerified {
+		if evidence.Provider != "claude" || evidence.SessionConflict {
+			return promptOwnerRefuse
+		}
+		return promptOwnerBootstrap
+	}
+	if evidence.RecordNamesPID || evidence.StoredNamesPID || evidence.BootstrapNamesPID {
+		return promptOwnerRefuse
+	}
+	return promptOwnerPreSession
 }

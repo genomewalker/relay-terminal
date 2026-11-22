@@ -75,3 +75,28 @@ import Testing
     #expect(!(try decoder.decode(RelayPromptOwnerBinding.self,
         from: JSONSerialization.data(withJSONObject: missingFlag))).isValid(for: pane))
 }
+
+@Test func preSessionOwnerIsInputOnlyAndNamesNoConversation() throws {
+    let pane = UUID()
+    let row: [String: Any] = ["version": 1, "pane_id": pane.uuidString.lowercased(),
+        "node_boot_id": "kernel-boot", "worker_pid": 100, "worker_start": 1001,
+        "shell_pid": 101, "shell_start": 1002, "provider": "claude", "process_id": 102,
+        "process_start": 1003, "transcript_identity": "presession", "input_only": true]
+    let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+    func owner(_ changes: [String: Any] = [:], removing: String? = nil) throws -> RelayPromptOwnerBinding {
+        var value = row.merging(changes) { _, new in new }
+        if let removing { value.removeValue(forKey: removing) }
+        return try decoder.decode(RelayPromptOwnerBinding.self, from: JSONSerialization.data(withJSONObject: value))
+    }
+    let startup = try owner()
+    #expect(startup.isValid(for: pane) && startup.isPreSession && startup.isInputOnly && startup.sessionId == nil)
+    #expect(try owner(["provider": "codex"]).isValid(for: pane))
+    #expect(try decoder.decode(RelayPromptOwnerBinding.self, from: JSONEncoder().encode(startup)) == startup)
+    // Any other shape refuses: a session, a missing input-only flag, a shell or unknown provider.
+    #expect(!(try owner(["session_id": "a-session"])).isValid(for: pane))
+    #expect(!(try owner(removing: "input_only")).isValid(for: pane))
+    #expect(!(try owner(["input_only": false])).isValid(for: pane))
+    #expect(!(try owner(["provider": "shell"])).isValid(for: pane))
+    #expect(!(try owner(["provider": "other"])).isValid(for: pane))
+    #expect(!(try owner(["process_start": 0])).isValid(for: pane))
+}
