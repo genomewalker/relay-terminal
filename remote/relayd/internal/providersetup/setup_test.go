@@ -415,7 +415,7 @@ func TestSettingsScalarAndOutputBounds(t *testing.T) {
 }
 
 func TestEmbeddedAssetsMatchPrimaryBytes(t *testing.T) {
-	expected := map[string]string{"relay-prompt.bash": "1b8c47e648dff7877a967b0ebe9a89d24300e8300d5856d67fcd8c654c55730a", "relay-cc-status.sh": "a0bbd465ad5e7f6e8f9d2554216479b3d96f49126ab374b2259efff8bc72060c"}
+	expected := map[string]string{"relay-prompt.bash": "1b8c47e648dff7877a967b0ebe9a89d24300e8300d5856d67fcd8c654c55730a", "relay-cc-status.sh": "49beb5c0c8a40e8c02fb9be3aa5fe53cf2e8688574b5826a605279bd4f91b740"}
 	for name, want := range expected {
 		if hash(DefaultAssets()[name]) != want {
 			t.Fatalf("canonical shell asset changed %s", name)
