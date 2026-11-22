@@ -17,6 +17,8 @@ final class RelayAgentDraftStore: @unchecked Sendable {
         let text: String
         let updatedAt: Date
         let attachments: [RelayAgentDraftAttachment]?
+        /// Optional, so older records and older Relay builds read the same file.
+        let heldMessages: Int?
     }
 
     private let directory: URL
@@ -56,13 +58,15 @@ final class RelayAgentDraftStore: @unchecked Sendable {
               record.text.utf8.count <= Self.maximumDraftBytes,
               Self.validAttachments(record.attachments ?? [], hostID: hostID, paneID: paneID),
               !record.text.isEmpty || !(record.attachments ?? []).isEmpty else { return nil }
-        return RelayAgentStoredDraft(text: record.text, attachments: record.attachments ?? [])
+        return RelayAgentStoredDraft(text: record.text, attachments: record.attachments ?? [],
+                                     heldMessages: max(0, min(record.heldMessages ?? 0, 1_000)))
     }
 
     /// Saves the latest draft; writes are coalesced so only the newest edit is written.
     /// Empty text removes the stored draft. Oversized text leaves the previous stored
     /// draft unchanged (the composer already refuses to send it).
-    func save(_ text: String, hostID: String, paneID: UUID, attachments: [RelayAgentDraftAttachment] = []) {
+    func save(_ text: String, hostID: String, paneID: UUID, attachments: [RelayAgentDraftAttachment] = [],
+              heldMessages: Int = 0) {
         guard persistenceEnabled, let key = Self.key(hostID: hostID, paneID: paneID) else { return }
         guard text.utf8.count <= Self.maximumDraftBytes, Self.validAttachments(attachments, hostID: hostID, paneID: paneID) else {
             record("save-skipped-oversize", key: key, reason: "draft exceeds limit")
@@ -70,7 +74,8 @@ final class RelayAgentDraftStore: @unchecked Sendable {
         }
         let generation = nextGeneration(key)
         let entry = Record(version: 1, hostID: hostID, paneID: paneID.uuidString.lowercased(),
-                           text: text, updatedAt: Date(), attachments: attachments)
+                           text: text, updatedAt: Date(), attachments: attachments,
+                           heldMessages: heldMessages > 0 ? heldMessages : nil)
         queue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self, self.isCurrent(key, generation) else { return }
             let url = self.fileURL(key)
@@ -94,12 +99,14 @@ final class RelayAgentDraftStore: @unchecked Sendable {
 
     /// Writes immediately (window close or app termination) so a pending coalesced
     /// write is not lost. Waits only for this one small bounded file.
-    func saveNow(_ text: String, hostID: String, paneID: UUID, attachments: [RelayAgentDraftAttachment] = []) {
+    func saveNow(_ text: String, hostID: String, paneID: UUID, attachments: [RelayAgentDraftAttachment] = [],
+                 heldMessages: Int = 0) {
         guard persistenceEnabled, text.utf8.count <= Self.maximumDraftBytes, Self.validAttachments(attachments, hostID: hostID, paneID: paneID),
               let key = Self.key(hostID: hostID, paneID: paneID) else { return }
         let generation = nextGeneration(key)
         let entry = Record(version: 1, hostID: hostID, paneID: paneID.uuidString.lowercased(),
-                           text: text, updatedAt: Date(), attachments: attachments)
+                           text: text, updatedAt: Date(), attachments: attachments,
+                           heldMessages: heldMessages > 0 ? heldMessages : nil)
         queue.sync {
             guard isCurrent(key, generation) else { return }
             let url = fileURL(key)

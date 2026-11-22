@@ -843,6 +843,9 @@ struct RelayAgentTimelineView: View {
             return "Sending the next held message…"
         }
         if !queue.isEmpty { return "Held messages send one at a time when the agent is idle and this composer has focus." }
+        if !draft.isEmpty, let warning = PaneComposerState.restoredHeldWarning(count: composerState.restoredHeldMessages) {
+            return warning
+        }
         if canQueue { return "↩ holds this message until the agent is idle" }
         if let submissionStatus { return submissionStatus }
         if let failure = attachmentQueue.intakeFailure { return failure }
