@@ -122,6 +122,8 @@ struct RelayPaneOperationRefusalTests {
         #expect(Refusal.classify("A permission prompt is waiting for your answer; a forced move does not answer it.") == .approvalPending)
         #expect(Refusal.classify("The agent changed while the move was being checked; nothing was sent.") == .paneChanged)
         #expect(Refusal.classify("Only the user can force an account move.") == .notAuthorized)
+        // relayd's phClaudeInitialPromptRefusal: a launch prompt it cannot prove completed.
+        #expect(Refusal.classify("The initial Claude prompt is not verified incorporated in an idle conversation.") == .initialPromptUnproven)
         #expect(Refusal.classify("The \("personal") account is not ready for this conversation; nothing was sent.") == .targetAccountUnavailable)
         #expect(Refusal.classify("something entirely new") == .unclassified)
     }

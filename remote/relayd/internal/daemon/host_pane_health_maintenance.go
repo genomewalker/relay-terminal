@@ -2137,7 +2137,11 @@ func (r *phReader) inspectAccounts(pane, binary string, expect, target *string) 
 				}
 				idle := bound && quiet == "quiet" && pyEqual(backgroundWork, false) && pyEqual(subagents, false) &&
 					(harness == nil || pyEqual(harness, "idle")) && pyEqual(hostJobs, int64(0))
-				proof := phProveClaudeInitialPrompt(path, sessionText, arguments, revision, r.uid, idle)
+				var started time.Time
+				if value, ok := processStart.(int64); ok && value > 0 {
+					started = processStartWallTime(uint64(value))
+				}
+				proof := phProveClaudeInitialPromptSince(path, sessionText, arguments, revision, r.uid, idle, started)
 				base = phClaudeResumeCommandWithPrompt(arguments, sessionText, launcher, native, proof)
 			}
 			command = phAccountCommand(base, provider, account)

@@ -63,6 +63,9 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
         case inputUnconfirmed = "input_unconfirmed"
         /// The worker took the input but the pane's screen has not updated.
         case rendererStale = "renderer_stale"
+        /// The agent was launched with a prompt argument that Relay cannot
+        /// prove the conversation already completed, so it is not replayed.
+        case initialPromptUnproven = "initial_prompt_unproven"
         case unclassified
 
         /// What the operator or an MCP client does to clear this refusal.
@@ -135,6 +138,8 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
                 return "Do not resend. The screen Relay holds is old; reconnect the pane (relay_recover_pane) and read it again to see whether the input took effect."
             case .nativeOutsideProxy:
                 return "Exit this Codex yourself (or close its task in Codex desktop), then relaunch the conversation from Relay's launch form (relay_launch_agent), which runs it through Relay's proxy."
+            case .initialPromptUnproven:
+                return "The launch prompt could not be matched to a completed turn of this conversation; restart the agent by hand."
             case .unclassified: return "Read the blocker text; it names what held the operation."
             }
         }
@@ -165,6 +170,7 @@ struct RelayPaneOperationRefusal: Error, Equatable, Sendable, LocalizedError {
     /// First match wins; anything else is unclassified.
     static func classify(_ message: String) -> Code {
         let table: [(String, Code)] = [
+            ("initial Claude prompt is not verified", .initialPromptUnproven),
             ("needs a manual restart", .manualRestartRequired),
             ("ChatGPT", .loginMismatch), ("logged in", .loginMismatch),
             ("not visible from the target account", .targetAccountUnavailable),
