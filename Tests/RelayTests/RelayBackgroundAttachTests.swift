@@ -109,6 +109,39 @@ struct RelayBackgroundAttachPolicyTests {
         #expect(policy.next([second, third], nodes: ["dandy": restarted], settled: { _ in true }, now: gap + settle) == [second])
     }
 
+    // dandy-07, 2026-11-22 12:52Z: the node reconnected in place within a
+    // second; 68 hidden agent panes attached before it stayed "Reconnecting"
+    // because each was already attempted and its route waited to be shown.
+    @Test("A pane started before an in-place reconnect is woken after it, once per reconnect, after the settle")
+    func wakesAPaneLeftWaitingByAReconnect() {
+        var policy = RelayBackgroundAttachPolicy()
+        let id = UUID()
+        let started = candidate(id: id)
+        let settle = RelayBackgroundAttachPolicy.settleAfterRestartNanoseconds
+        #expect(policy.next([started], nodes: ["dandy": ready], settled: { _ in true }, now: 0) == [started])
+        var waiting = candidate(id: id, connecting: false, viewport: nil)
+        waiting.waitingAfterReconnect = true
+        #expect(RelayBackgroundAttachPolicy.eligible(waiting))
+        #expect(policy.pending(waiting), "already attempted, but a waiting pane is still pending")
+        let reconnected = RelayBackgroundAttachNode(phase: .ready, generation: 2, heartbeatCurrent: true)
+        #expect(policy.next([waiting], nodes: ["dandy": reconnected], settled: { _ in true }, now: gap).isEmpty)
+        #expect(policy.next([waiting], nodes: ["dandy": reconnected], settled: { _ in true }, now: gap + settle) == [waiting])
+        // Woken: it no longer reports waiting, so it is not chosen again.
+        #expect(policy.next([candidate(id: id, connecting: false)], nodes: ["dandy": reconnected],
+            settled: { _ in true }, now: 3 * gap + settle).isEmpty)
+    }
+
+    @Test("Waiting panes on one host are woken one at a time")
+    func wakesOneAtATimePerHost() {
+        var policy = RelayBackgroundAttachPolicy()
+        var first = candidate(connecting: false), second = candidate(connecting: false)
+        first.waitingAfterReconnect = true
+        second.waitingAfterReconnect = true
+        #expect(policy.next([first, second], nodes: ["dandy": ready], settled: { _ in false }, now: 0) == [first])
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in false }, now: gap).isEmpty)
+        #expect(policy.next([second], nodes: ["dandy": ready], settled: { _ in true }, now: gap) == [second])
+    }
+
     @Test("A pane is attempted once")
     func attemptedOnce() {
         var policy = RelayBackgroundAttachPolicy()
@@ -181,6 +214,50 @@ struct RelayBackgroundAttachSchedulerTests {
             scheduler.step()
         }
         #expect(Set(started) == Set(panes.map(\.id)))
+        #expect(!scheduler.step())
+    }
+
+    @Test("A started hidden pane left waiting by a node reconnect is woken, not restarted, and holds its host until connected")
+    func wakesStartedPanesAfterAReconnect() {
+        let scheduler = RelayBackgroundAttachScheduler()
+        let panes = (0..<3).map { _ in pane("dandy.invalid") }
+        var now: UInt64 = 0
+        var generation = 1
+        var waiting: Set<UUID> = []
+        var started: [UUID] = [], woken: [UUID] = []
+        scheduler.panes = { panes }
+        scheduler.nodes = { [self] in [node(panes[0], .ready, generation: generation, confirmed: now)] }
+        scheduler.uptime = { now }
+        scheduler.savedViewport = { _ in .init(columns: 112, rows: 34) }
+        scheduler.start = { pane, _ in started.append(pane.id); pane.connectionState = .connected }
+        scheduler.waiting = { waiting.contains($0.id) }
+        scheduler.wake = { pane in woken.append(pane.id); waiting.remove(pane.id) }
+        scheduler.record = { _, _ in }
+        for _ in 0..<10 where started.count < panes.count {
+            scheduler.step()
+            now += RelayBackgroundAttachPolicy.gapNanoseconds
+        }
+        #expect(Set(started) == Set(panes.map(\.id)))
+        #expect(!scheduler.step())
+        // The node reconnects in place: every hidden pane's route now waits.
+        generation = 2
+        for pane in panes { pane.connectionState = .reconnecting("Connection interrupted."); waiting.insert(pane.id) }
+        #expect(scheduler.step(), "waiting panes keep the scheduler running")
+        #expect(woken.isEmpty, "the host settles after its node restarted")
+        now += RelayBackgroundAttachPolicy.settleAfterRestartNanoseconds
+        scheduler.step()
+        #expect(woken.count == 1)
+        now += 2 * RelayBackgroundAttachPolicy.gapNanoseconds
+        scheduler.step()
+        #expect(woken.count == 1, "a woken pane holds its host until it is connected")
+        for pane in panes where woken.contains(pane.id) { pane.connectionState = .connected }
+        for _ in 0..<10 where woken.count < panes.count {
+            now += RelayBackgroundAttachPolicy.gapNanoseconds
+            scheduler.step()
+            for pane in panes where woken.contains(pane.id) { pane.connectionState = .connected }
+        }
+        #expect(Set(woken) == Set(panes.map(\.id)))
+        #expect(started.count == panes.count, "no pane is started a second time")
         #expect(!scheduler.step())
     }
 

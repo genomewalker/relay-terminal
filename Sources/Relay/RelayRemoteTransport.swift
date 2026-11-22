@@ -585,6 +585,27 @@ final class RelayRemoteTransport: @unchecked Sendable {
         channel?.setShown(value)
     }
 
+    /// The pane's own route is held by its node after a reconnect because the
+    /// pane is hidden (cb9f8636). It stays "Reconnecting" until woken.
+    var isWaitingUntilShown: Bool {
+        lock.lock()
+        guard !attached, !detached, !sessionEnded, let channel = nodeChannel else { lock.unlock(); return false }
+        lock.unlock()
+        return channel.isWaitingUntilShown
+    }
+
+    /// Resumes a route its node holds until shown, as input to it would.
+    /// Returns whether a waiting route was asked to resume.
+    @discardableResult
+    func wakeWaitingRoute() -> Bool {
+        lock.lock()
+        guard !attached, !detached, !sessionEnded, let channel = nodeChannel else { lock.unlock(); return false }
+        lock.unlock()
+        guard channel.isWaitingUntilShown else { return false }
+        channel.requestResume()
+        return true
+    }
+
     /// The shared-node channel this pane currently uses (tests).
     var currentNodeChannel: RelayNodeChannel? {
         lock.lock()

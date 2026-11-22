@@ -1611,6 +1611,23 @@ final class TerminalRuntime: NSObject {
         }
     }
 
+    /// A started, hidden pane whose node reconnected and holds its route
+    /// until the pane is shown or sent input.
+    var isWaitingUntilShownAfterReconnect: Bool {
+        guard started, let pane, pane.profile.backend == .relay, pane.contentKind == .terminal,
+              view.window == nil else { return false }
+        return io.routeWaitingUntilShown
+    }
+
+    /// Resumes such a pane's route without showing it; nothing is typed.
+    @discardableResult
+    func wakeWaitingRouteInBackground() -> Bool {
+        guard isWaitingUntilShownAfterReconnect else { return false }
+        let woken = io.wakeWaitingRoute()
+        recordInputDiagnostic(woken ? "hidden-route-woken" : "hidden-route-wake-unavailable")
+        return woken
+    }
+
     private var canStartInBackground: Bool {
         guard !started, let pane else { return false }
         return pane.profile.backend == .relay && pane.contentKind == .terminal && view.window == nil
@@ -5325,6 +5342,22 @@ final class TerminalIOBridge: @unchecked Sendable {
         let currentTransport = transport
         resizeLock.unlock()
         return currentTransport?.sendHiddenRowBounceStep(columns: viewport.columns, rows: viewport.rows) == true
+    }
+
+    /// Whether the node holds this hidden pane's route after a reconnect.
+    var routeWaitingUntilShown: Bool {
+        resizeLock.lock()
+        let currentTransport = transport
+        resizeLock.unlock()
+        return currentTransport?.isWaitingUntilShown == true
+    }
+
+    /// Resumes a route its node holds until shown.
+    func wakeWaitingRoute() -> Bool {
+        resizeLock.lock()
+        let currentTransport = transport
+        resizeLock.unlock()
+        return currentTransport?.wakeWaitingRoute() == true
     }
 
     /// Asks the worker for one screen from a reset and the agent's redraw.

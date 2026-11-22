@@ -10,6 +10,9 @@ struct RelayBackgroundAttachCandidate: Equatable, Sendable {
     let connecting: Bool
     /// The grid the pane's snapshot log was saved at.
     let savedViewport: RelayViewport?
+    /// Already started, but its node reconnected and holds the pane's route
+    /// until the pane is shown or sent input (cb9f8636).
+    var waitingAfterReconnect = false
 }
 
 /// What the pooled node connection for one host reports right now.
@@ -49,9 +52,23 @@ struct RelayBackgroundAttachPolicy {
     /// require_existing_worker would start a new shell on the host. Without a
     /// saved grid the Hello would carry the 120×36 default and the worker
     /// would resize the running program to it, so such a pane waits for its tab.
+    ///
+    /// A started pane whose node reconnected in place is also eligible: its
+    /// route waits until shown, so without a wake a hidden pane stayed
+    /// "Reconnecting" for good. On dandy-07 (2026-11-22 12:52Z) the node
+    /// reconnected within a second, and 68 hidden agent panes, all attached
+    /// before it, never attached again while every not-yet-started pane did.
+    /// Woken one at a time per host, their screens are still not resent at once.
     static func eligible(_ candidate: RelayBackgroundAttachCandidate) -> Bool {
-        candidate.isTerminal && candidate.requiresExistingWorker &&
-            candidate.connecting && candidate.savedViewport != nil
+        guard candidate.isTerminal else { return false }
+        if candidate.waitingAfterReconnect { return true }
+        return candidate.requiresExistingWorker && candidate.connecting && candidate.savedViewport != nil
+    }
+
+    /// Eligible and not yet handled: a first start happens once per pane, a
+    /// wake whenever a reconnect leaves the pane waiting again.
+    func pending(_ candidate: RelayBackgroundAttachCandidate) -> Bool {
+        Self.eligible(candidate) && (candidate.waitingAfterReconnect || !attempted.contains(candidate.paneID))
     }
 
     var isIdle: Bool { hosts.values.allSatisfy { $0.inFlight == nil } }
@@ -66,7 +83,7 @@ struct RelayBackgroundAttachPolicy {
     ) -> [RelayBackgroundAttachCandidate] {
         var byHost: [String: [RelayBackgroundAttachCandidate]] = [:]
         var hostOrder: [String] = []
-        for candidate in candidates where Self.eligible(candidate) && !attempted.contains(candidate.paneID) {
+        for candidate in candidates where pending(candidate) {
             if byHost[candidate.hostKey] == nil { hostOrder.append(candidate.hostKey) }
             byHost[candidate.hostKey, default: []].append(candidate)
         }
@@ -137,15 +154,33 @@ struct RelayBackgroundAttachPolicy {
     var start: @MainActor (PaneModel, RelayViewport) -> Void = { pane, viewport in
         pane.runtime.startInBackground(viewport: viewport)
     }
+    /// Whether a started hidden pane's route waits after a node reconnect.
+    var waiting: @MainActor (PaneModel) -> Bool = { $0.runtime.isWaitingUntilShownAfterReconnect }
+    var wake: @MainActor (PaneModel) -> Void = { $0.runtime.wakeWaitingRouteInBackground() }
+    /// Woken panes still on their way to "Connected"; they hold their host.
+    private var woken: Set<UUID> = []
+    private var nodeReadyObserver: NSObjectProtocol?
     var record: (String, [String: String]) -> Void = { RelayDiagnostics.shared.record(category: "pane", name: $0, details: $1) }
 
     func remember(_ workspace: WorkspaceModel) {
         guard !RelayLaunchMode.isRunningTests else { return }
         workspaces.removeAll { $0.value == nil }
         if !workspaces.contains(where: { $0.value === workspace }) { workspaces.append(.init(workspace)) }
-        guard task == nil else { return }
+        if nodeReadyObserver == nil {
+            // A node that reconnects leaves its hidden panes waiting; the
+            // loop has usually ended by then, so each ready restarts it.
+            nodeReadyObserver = NotificationCenter.default.addObserver(forName: .relayNodeReady, object: nil,
+                queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.run(after: Self.firstPassDelayMilliseconds) }
+            }
+        }
+        run(after: Self.firstPassDelayMilliseconds)
+    }
+
+    private func run(after delayMilliseconds: Int) {
+        guard task == nil, !workspaces.isEmpty else { return }
         task = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(Self.firstPassDelayMilliseconds))
+            try? await Task.sleep(for: .milliseconds(delayMilliseconds))
             while !Task.isCancelled {
                 guard let self, self.step() else { break }
                 try? await Task.sleep(for: .milliseconds(Self.tickMilliseconds))
@@ -176,6 +211,10 @@ struct RelayBackgroundAttachPolicy {
         var candidates: [RelayBackgroundAttachCandidate] = []
         for pane in current {
             byID[pane.id] = pane
+            if waiting(pane) {
+                candidates.append(Self.candidate(pane, savedViewport: nil, waitingAfterReconnect: true))
+                continue
+            }
             // Read a log header only for a pane that could use it, once.
             guard RelayBackgroundAttachPolicy.eligible(Self.candidate(pane, savedViewport: .default)),
                   !policy.attempted.contains(pane.id) else { continue }
@@ -191,10 +230,21 @@ struct RelayBackgroundAttachPolicy {
             nodeStates[snapshot.id] = .init(phase: snapshot.phase, generation: snapshot.generation,
                 heartbeatCurrent: snapshot.isCurrent(at: now))
         }
+        woken = woken.filter { byID[$0].map { $0.connectionState != .connected } ?? false }
         let chosen = policy.next(candidates, nodes: nodeStates,
-            settled: { byID[$0].map { $0.connectionState != .connecting } ?? true }, now: now)
+            settled: { [woken] id in
+                guard let pane = byID[id] else { return true }
+                return woken.contains(id) ? pane.connectionState == .connected : pane.connectionState != .connecting
+            }, now: now)
         for candidate in chosen {
-            guard let pane = byID[candidate.paneID], let saved = candidate.savedViewport else { continue }
+            guard let pane = byID[candidate.paneID] else { continue }
+            if candidate.waitingAfterReconnect {
+                record("background-wake", ["pane_id": pane.id.uuidString.lowercased(), "profile": pane.profile.name])
+                woken.insert(pane.id)
+                wake(pane)
+                continue
+            }
+            guard let saved = candidate.savedViewport else { continue }
             let layout = layoutViewport.map { $0(pane) } ??
                 owners[pane.id]?.value.flatMap { RelayHiddenPaneGrid.viewport(for: pane.id, in: $0) }
             let viewport = layout ?? saved
@@ -207,7 +257,7 @@ struct RelayBackgroundAttachPolicy {
             start(pane, viewport)
         }
         recordHeldHosts(candidates, nodes: nodeStates, started: Set(chosen.map(\.hostKey)), now: now)
-        return !policy.isIdle || candidates.contains { RelayBackgroundAttachPolicy.eligible($0) && !policy.attempted.contains($0.paneID) }
+        return !policy.isIdle || candidates.contains(where: policy.pending)
     }
 
     /// Agents before shells, then by pane ID. This runs every tick over every
@@ -246,8 +296,7 @@ struct RelayBackgroundAttachPolicy {
     private func recordHeldHosts(_ candidates: [RelayBackgroundAttachCandidate],
         nodes: [String: RelayBackgroundAttachNode], started: Set<String>, now: UInt64) {
         var waiting: [String: Int] = [:]
-        for candidate in candidates where RelayBackgroundAttachPolicy.eligible(candidate) &&
-            !policy.attempted.contains(candidate.paneID) {
+        for candidate in candidates where policy.pending(candidate) {
             waiting[candidate.hostKey, default: 0] += 1
         }
         for key in Set(heldSince.keys).union(waiting.keys) {
@@ -273,14 +322,16 @@ struct RelayBackgroundAttachPolicy {
         return workspace.panes.values.filter { !shown.contains($0.id) }
     }
 
-    static func candidate(_ pane: PaneModel, savedViewport: RelayViewport?) -> RelayBackgroundAttachCandidate {
+    static func candidate(_ pane: PaneModel, savedViewport: RelayViewport?,
+        waitingAfterReconnect: Bool = false) -> RelayBackgroundAttachCandidate {
         RelayBackgroundAttachCandidate(
             paneID: pane.id, hostKey: pane.profile.connectionKey,
             isLocal: pane.profile.kind == .local || pane.profile.backend != .relay,
             isTerminal: pane.contentKind == .terminal && pane.profile.backend == .relay,
             requiresExistingWorker: pane.requiresExistingWorker,
             connecting: pane.connectionState == .connecting,
-            savedViewport: savedViewport
+            savedViewport: savedViewport,
+            waitingAfterReconnect: waitingAfterReconnect
         )
     }
 }

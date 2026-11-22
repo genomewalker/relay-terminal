@@ -94,6 +94,11 @@ final class RelayNodeChannel: RelayFrameWriting, @unchecked Sendable {
         openConnection?.requestResume(sessionID: sessionID, channel: self)
     }
 
+    /// Whether a reconnect left this hidden route waiting to be shown.
+    var isWaitingUntilShown: Bool {
+        openConnection?.isWaitingUntilShown(sessionID: sessionID, channel: self) == true
+    }
+
     /// Tells the node whether this pane is on screen (resumed first on reconnect).
     func setShown(_ shown: Bool) {
         openConnection?.setShown(sessionID: sessionID, shown: shown, channel: self)
@@ -554,6 +559,15 @@ final class RelayNodeConnection: @unchecked Sendable {
         lock.lock()
         if subscriptions[sessionID]?.channel === channel { resumeLocked(sessionID, generation: generation, pendingOnly: true) }
         lock.unlock()
+    }
+
+    /// A ready node holds this route after a reconnect until it is shown or
+    /// has input. Staggered routes that did not ask to wait are not counted.
+    func isWaitingUntilShown(sessionID: String, channel: RelayNodeChannel) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return ready && !stopped && subscriptions[sessionID]?.channel === channel &&
+            waitUntilShownRoutes.contains(sessionID) && pendingResume.contains(sessionID)
     }
 
     func setShown(sessionID: String, shown: Bool, channel: RelayNodeChannel) {
