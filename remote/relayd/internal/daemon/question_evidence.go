@@ -98,12 +98,23 @@ func readQuestionEvidence(ctx context.Context, deps questionThreadDeps, r Commun
 			return status("unavailable"), nil
 		}
 	}
-	if _, unavailable = load(); unavailable != "" {
+	if b, unavailable = load(); unavailable != "" {
 		return status(unavailable), nil
 	}
 	sort.SliceStable(payload.Rows, func(i, j int) bool { return payload.Rows[i].Revision > payload.Rows[j].Revision })
 	result["status"] = "ready"
 	result["total"] = len(payload.Rows)
 	result["rows"] = payload.Rows[:min(len(payload.Rows), questionEvidenceLimit)]
+	notices := make([]researchNotice, 0, len(b.ResearchConclusions))
+	for _, notice := range b.ResearchConclusions {
+		notices = append(notices, notice)
+	}
+	sort.Slice(notices, func(i, j int) bool {
+		if notices[i].QuestionID == notices[j].QuestionID {
+			return notices[i].Revision < notices[j].Revision
+		}
+		return notices[i].QuestionID < notices[j].QuestionID
+	})
+	result["research_conclusions"] = notices
 	return result, nil
 }

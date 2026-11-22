@@ -61,7 +61,7 @@ func (s *server) currentInstalledCatalogAndPlanMode() ([]map[string]any, string,
 func (s *server) currentInstalledCall(name string, args map[string]json.RawMessage) (any, bool) {
 	if s.daemonHelper != "" {
 		switch name {
-		case "relay_register_research_question", "relay_research_job_status", "relay_link_panes", "relay_unlink_panes", "relay_list_pane_links", "relay_message_pane", "relay_pane_message_receipt", "relay_bind_question_thread", "relay_unbind_question_thread":
+		case "relay_publish_research_conclusion", "relay_register_research_question", "relay_research_job_status", "relay_link_panes", "relay_unlink_panes", "relay_list_pane_links", "relay_message_pane", "relay_pane_message_receipt", "relay_bind_question_thread", "relay_unbind_question_thread":
 			return nil, false
 		}
 	}

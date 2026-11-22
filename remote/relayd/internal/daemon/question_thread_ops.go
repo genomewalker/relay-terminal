@@ -364,6 +364,8 @@ func communicationQuestionRequest(root string, r CommunicationRequest) (map[stri
 		return nil, err
 	}
 	switch r.Operation {
+	case "question_research_publish":
+		return communicationResearchPublish(r)
 	case "question_research_register":
 		return communicationResearchRegister(r)
 	case "question_research_status":

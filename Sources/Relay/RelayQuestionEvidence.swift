@@ -96,7 +96,7 @@ struct RelayQuestionEvidenceEntry: Decodable, Identifiable {
 @MainActor struct RelayQuestionEvidence {
     enum Result {
         case unattached, attachmentChanged, unavailable
-        case ready(RelayQuestionEvidenceAttachment.Identity, [RelayQuestionEvidenceEntry], total: Int)
+        case ready(RelayQuestionEvidenceAttachment.Identity, [RelayQuestionEvidenceEntry], total: Int, conclusions: [RelayResearchConclusion])
     }
 
     private struct Response: Decodable {
@@ -104,6 +104,7 @@ struct RelayQuestionEvidenceEntry: Decodable, Identifiable {
             let status: String
             let attachment: RelayQuestionEvidenceAttachment.Identity?
             let rows: [RelayQuestionEvidenceEntry]?
+            let research_conclusions: [RelayResearchConclusion]?
             let total: Int?
         }
         let result: Value?
@@ -133,7 +134,10 @@ struct RelayQuestionEvidenceEntry: Decodable, Identifiable {
             guard response.attachment == identity, let rows = response.rows, let total = response.total,
                   rows.count <= 16, rows.count <= total, Set(rows.map(\.id)).count == rows.count,
                   rows.allSatisfy({ $0.threadID == identity.threadID }) else { return .unavailable }
-            return .ready(identity, rows, total: total)
+            let conclusions = response.research_conclusions ?? []
+            guard conclusions.allSatisfy(\.hasValidIdentity),
+                  Set(conclusions.map(\.deliveryKey)).count == conclusions.count else { return .unavailable }
+            return .ready(identity, rows, total: total, conclusions: conclusions)
         default: return .unavailable
         }
     }

@@ -62,7 +62,7 @@ const noSenderRefusal = "source_pane_id is required: this helper has no register
 func (s *server) daemonCommunication(name string, arguments map[string]json.RawMessage) (any, bool) {
 	operations := map[string]string{"relay_link_panes": "link", "relay_unlink_panes": "unlink", "relay_list_pane_links": "list",
 		"relay_message_pane": "send", "relay_pane_message_receipt": "receipt",
-		"relay_register_research_question": "question_research_register", "relay_research_job_status": "question_research_status", "relay_bind_question_thread": "question_bind", "relay_unbind_question_thread": "question_unbind", "relay_read_desktop_inbox": "desktop_inbox_read"}
+		"relay_publish_research_conclusion": "question_research_publish", "relay_register_research_question": "question_research_register", "relay_research_job_status": "question_research_status", "relay_bind_question_thread": "question_bind", "relay_unbind_question_thread": "question_unbind", "relay_read_desktop_inbox": "desktop_inbox_read"}
 	operation, ok := operations[name]
 	if !ok {
 		return nil, false
@@ -158,10 +158,13 @@ func (s *server) daemonCommunication(name string, arguments map[string]json.RawM
 	}
 	allowed := map[string]bool{"source_pane_id": true, "pane_id": true, "message_id": true, "text": true, "link_id": true,
 		"thread_id": true, "realm": true, "ttl": true, "target_session_id": true}
-	if operation == "question_research_status" || operation == "question_research_register" {
+	if operation == "question_research_publish" || operation == "question_research_status" || operation == "question_research_register" {
 		allowed = map[string]bool{"job_id": true}
 		if operation == "question_research_register" {
 			allowed = map[string]bool{"question_binding_id": true, "steering_path": true, "steering_sha256": true}
+		}
+		if operation == "question_research_publish" {
+			allowed = map[string]bool{"question_binding_id": true, "question_id": true, "research_revision": true, "delivery_key": true}
 		}
 		if actor == "" || actorErr != nil || s.callerToken == "" {
 			return map[string]any{"content": []any{map[string]string{"type": "text", "text": "registered kernel-verified pane required"}}, "isError": true}, true

@@ -43,10 +43,10 @@ struct RelayQuestionEvidenceView: View {
             Text("The task’s Chitta thread is no longer attached to its original pane and host.")
         case .unavailable:
             Text("Evidence is unavailable. Freshness is unknown.")
-        case .ready(let attachment, let entries, let total):
+        case .ready(let attachment, let entries, let total, let conclusions):
             Text("\(attachment.realm) / \(attachment.threadID)")
                 .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-            if entries.isEmpty {
+            if entries.isEmpty && conclusions.isEmpty {
                 Text("The attached Chitta thread has no evidence entries.")
             } else {
                 if total > entries.count {
@@ -54,6 +54,17 @@ struct RelayQuestionEvidenceView: View {
                 }
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(conclusions) { notice in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(verbatim: notice.question).font(.headline)
+                                Text(notice.disposition.rawValue.capitalized).font(.caption.bold())
+                                Text(verbatim: notice.rationale)
+                                Text("Revision \(notice.revision) · SHA-256 \(notice.evidenceSHA256)")
+                                    .font(.caption.monospaced()).foregroundStyle(.secondary)
+                            }
+                            .accessibilityIdentifier("relay.research.conclusion." + notice.deliveryKey)
+                            Divider()
+                        }
                         ForEach(entries) { entry in
                             evidenceRow(entry)
                             Divider()

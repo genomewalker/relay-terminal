@@ -22,6 +22,8 @@ struct RelayQuestionEvidenceTests {
         let identity = ["pane_id": pane.uuidString.lowercased(), "binding_id": binding.uuidString.lowercased(),
                         "realm": "test-realm", "thread_id": "test-thread"]
         let backend = Backend()
+        let deliveryKey = String(repeating: "a", count: 64)
+        let questionID = UUID()
         let evidence = RelayQuestionEvidence { _, payload, _ in
             let packet = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
             #expect(packet["operation"] as? String == "communication")
@@ -48,7 +50,10 @@ struct RelayQuestionEvidenceTests {
                  "refs": [], "freshness": []],
             ]
             return try JSONSerialization.data(withJSONObject: ["result": ["status": "ready", "attachment": identity,
-                                                                           "total": entries.count, "rows": entries]])
+                                                                           "total": entries.count, "rows": entries, "research_conclusions": [
+                          ["schema": "research.conclusion_notice/1", "question_id": questionID.uuidString, "revision": 1,
+                           "delivery_key": deliveryKey, "evidence_sha256": String(repeating: "b", count: 64),
+                           "question": "Which candidate passed?", "disposition": "answered", "rationale": "A passed."]]]])
         }
         let attachment = try #require(await evidence.capture(paneID: pane, profile: profile))
         let state = RelayMikoTaskJournal.State(requestID: "request", objective: "Inspect the fixture", originKind: "user",
@@ -65,11 +70,13 @@ struct RelayQuestionEvidenceTests {
         let journalURL = directory.appendingPathComponent("tasks.json")
         let before = try Data(contentsOf: journalURL)
         for _ in 0..<2 {
-            guard case .ready(let observed, let rows, let total) = await harness.readSavedTaskEvidence("fixture") else {
+            guard case .ready(let observed, let rows, let total, let conclusions) = await harness.readSavedTaskEvidence("fixture") else {
                 Issue.record("Saved-task detail failed to reopen evidence")
                 return
             }
             #expect(observed == attachment.identity)
+            #expect(conclusions.map(\.id) == [deliveryKey])
+            #expect(conclusions.first?.questionID == questionID)
             #expect(total == 3)
             #expect(rows.map(\.id) == ["checked", "failed", "unknown"])
             #expect(rows.first?.verification == "verified")

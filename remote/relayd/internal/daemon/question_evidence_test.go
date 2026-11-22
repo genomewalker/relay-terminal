@@ -18,6 +18,11 @@ func TestQuestionEvidenceReadsExactAttachmentWithoutWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	notice := researchNotice{QuestionID: "6fd184c4-5705-445c-b3b7-be1d5f951266", Revision: 1, Disposition: "answered"}
+	binding.ResearchConclusions = map[string]researchNotice{notice.QuestionID + "/1": notice}
+	if err := fx.deps.store.save(binding); err != nil {
+		t.Fatal(err)
+	}
 	path, err := fx.deps.store.path("pane-1")
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +60,7 @@ func TestQuestionEvidenceReadsExactAttachmentWithoutWrites(t *testing.T) {
 		if err != nil || got["status"] != expected {
 			t.Fatalf("got %v, %v; expected %s", got, err, expected)
 		}
-		if expected != "ready" && got["rows"] != nil {
+		if expected != "ready" && (got["rows"] != nil || got["research_conclusions"] != nil) {
 			t.Fatal("rows leaked when attachment or backend was unavailable")
 		}
 		return got
@@ -73,6 +78,9 @@ func TestQuestionEvidenceReadsExactAttachmentWithoutWrites(t *testing.T) {
 		t.Fatalf("attachment lookup or mismatch should not touch Chitta, got %v", calls)
 	}
 	got := read(request, "ready")
+	if !reflect.DeepEqual(got["research_conclusions"], []researchNotice{notice}) {
+		t.Fatal("registered conclusion missing from saved task")
+	}
 	if returned := got["rows"].([]questionEvidenceRow); len(returned) != 2 ||
 		returned[0].EntryID != "failed-attempt" || returned[1].Verification != "verified" {
 		t.Fatalf("wrong evidence returned: %+v", returned)
