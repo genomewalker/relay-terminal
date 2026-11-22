@@ -3138,6 +3138,17 @@ final class TerminalRuntime: NSObject {
         let sample = activeScreenSampleForTesting ?? { session.activeScreenSample() }
         return activeScreenCache.read(sample: sample, dump: { session.readActiveScreenVT() })
     }
+    /// Diagnostics only: why observeActiveScreen is unstable right now. It
+    /// never admits anything; a refusal names it so a stuck gate is visible.
+    func activeScreenUnstableGate() -> String {
+        if let phase = io.outputPhaseGateNow { return phase }
+        guard let first = session.screenState else { return "no_surface" }
+        if first.mutationInFlight { return "mutation_in_flight" }
+        guard session.readViewportRows() != nil else { return "rows_unreadable" }
+        guard session.screenState == first else { return "screen_state_changing" }
+        return "screen_dump_unstable"
+    }
+
     /// Tests only: replaces the admission's in-memory sample. The send fence
     /// in TerminalIOBridge always samples the real session.
     var activeScreenSampleForTesting: (() -> RelayActiveScreenCache.Sample)?
@@ -4002,8 +4013,13 @@ final class TerminalRuntime: NSObject {
             // constructed here, and an absent/retired surface cannot prove it.
             let observation = observeActiveScreen()
             guard case .screen(_, let key) = observation else {
-                return ["status": observation == .noSurface ? "unavailable" : "changed",
-                    "reason": "No complete ordered snapshot or current native renderer; no focus change was attempted."]
+                var reason = "No complete ordered snapshot or current native renderer; no focus change was attempted."
+                if observation == .unstable {
+                    let gate = activeScreenUnstableGate()
+                    reason = "The pane's screen is not settled (\(gate)); no complete ordered snapshot; no focus change was attempted."
+                    recordInputDiagnostic("edit-state-unstable", details: ["gate": gate])
+                }
+                return ["status": observation == .noSurface ? "unavailable" : "changed", "reason": reason]
             }
             screen = .renderer(.live(key)); plain = key.rows.joined(separator: "\n")
             source = view.window == nil ? "retained_native_renderer" : "attached_native_renderer"
@@ -6746,6 +6762,19 @@ final class TerminalIOBridge: @unchecked Sendable {
     /// An unlocked read of the phase, for admissions and tests. Only the read
     /// under outputOrderingLock inside the send fence decides a send.
     var outputPhaseOpenNow: Bool { outputPhaseIsOpen() }
+
+    /// Diagnostics only: which output phase is open, or nil. Never a gate.
+    var outputPhaseGateNow: String? {
+        replayLock.lock()
+        let replay = replaying, commit = replayCommitGeneration != nil
+        replayLock.unlock()
+        presentationLock.lock()
+        let transition = viewportTransitionActive
+        presentationLock.unlock()
+        if replay { return "replay" }
+        if commit { return "replay_commit" }
+        return transition ? "viewport_transition" : nil
+    }
 
     /// Read-only admission for retained renderers. A stable native grid alone
     /// is insufficient when new output is still in the display pipeline or
