@@ -78,6 +78,9 @@ func questionOperation(ctx context.Context, deps questionThreadDeps, r Communica
 			result["reason"] = questionLeaseUnconfirmedReason
 			result["message"] = "the lease is not confirmed: an earlier lease mutation on this thread has no known outcome, so notices, polling and the classifier opt-in stay off until it is reconciled"
 		}
+		if !binding.LeasePending {
+			result["question_binding_id"] = binding.Incarnation
+		}
 		result["status"] = status
 		return result, nil
 	case "question_unbind":
@@ -361,6 +364,10 @@ func communicationQuestionRequest(root string, r CommunicationRequest) (map[stri
 		return nil, err
 	}
 	switch r.Operation {
+	case "question_research_register":
+		return communicationResearchRegister(r)
+	case "question_research_status":
+		return communicationResearchStatus(root, r)
 	case "question_bind", "question_unbind":
 		return communicationQuestionOperation(r)
 	case "question_notices":

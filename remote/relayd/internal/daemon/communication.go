@@ -47,6 +47,9 @@ type CommunicationRequest struct {
 	ClientToken                string                     `json:"client_token,omitempty"`
 	ActorPaneID                string                     `json:"actor_pane_id,omitempty"`
 	ThreadID                   string                     `json:"thread_id,omitempty"`
+	SteeringPath               string                     `json:"steering_path,omitempty"`
+	SteeringSHA256             string                     `json:"steering_sha256,omitempty"`
+	ResearchJobID              string                     `json:"job_id,omitempty"`
 	QuestionBindingID          string                     `json:"question_binding_id,omitempty"`
 	Panes                      []string                   `json:"panes,omitempty"`
 	Outcome                    string                     `json:"outcome,omitempty"`

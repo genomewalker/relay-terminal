@@ -122,6 +122,52 @@ func wait(t *testing.T, m *Manager, jobID string) Job {
 	return job
 }
 
+func TestLiveWorkerReceiptMustMatchAssignment(t *testing.T) {
+	e := newEnv(t)
+	run := e.manager.run
+	e.manager.run = func(ctx context.Context, request researchworker.Request) (researchworker.Receipt, error) {
+		receipt, err := run(ctx, request)
+		receipt.Binding.AssignmentID = "other-assignment"
+		return receipt, err
+	}
+	request := e.request(researchworker.ProviderClaude, "ok")
+	request.AssignmentID = "expected-assignment"
+	job, _, err := e.manager.Admit(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := wait(t, e.manager, job.JobID)
+	if done.State != StateUnknown || done.Result != nil || done.Verified || done.TurnID != "" {
+		t.Fatalf("unexpected job after receipt mismatch: %+v", done)
+	}
+}
+
+func TestJobBindsResultToAssignmentAcrossReplay(t *testing.T) {
+	e := newEnv(t)
+	request := e.request(researchworker.ProviderClaude, "ok")
+	request.AssignmentID = "assignment-1"
+	job, admitted, err := e.manager.Admit(request)
+	if err != nil || !admitted {
+		t.Fatalf("admit: %v", err)
+	}
+	done := wait(t, e.manager, job.JobID)
+	if done.State != StateCompleted || done.Result == nil || done.Binding.AssignmentID != request.AssignmentID {
+		t.Fatalf("terminal assignment: %+v", done)
+	}
+	fresh, err := NewManager(e.jobs, e.workers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, admitted, err := fresh.Admit(request)
+	if err != nil || admitted || replayed.JobID != job.JobID || replayed.Binding.AssignmentID != request.AssignmentID {
+		t.Fatalf("replay: %+v admitted=%v err=%v", replayed, admitted, err)
+	}
+	request.AssignmentID = "assignment-2"
+	if _, _, err := fresh.Admit(request); err != ErrBoundToMore {
+		t.Fatalf("changed assignment: %v", err)
+	}
+}
+
 func TestJobCompletesWithATerminalRecord(t *testing.T) {
 	e := newEnv(t)
 	job, admitted, err := e.manager.Admit(e.request(researchworker.ProviderClaude, "ok"))
@@ -393,5 +439,45 @@ func TestManagerRefusesSharedRootsAndBadRequests(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(e.jobs, "jobs"))
 	if len(entries) != 0 || e.runs() != 0 {
 		t.Fatal("a refused request created a job or started a worker")
+	}
+}
+
+func TestStatusUsesConfirmedQuestionBinding(t *testing.T) {
+	const owner = "719feeb9-193e-4cf5-a5f0-5cc724938dfb"
+	const other = "2bc16fcd-e346-4ea9-a6c4-78cc82810ae0"
+	for _, binding := range []string{owner, ""} {
+		e := newEnv(t)
+		request := e.request(researchworker.ProviderClaude, "ok")
+		request.QuestionBindingID = binding
+		job, _, err := e.manager.Admit(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wait(t, e.manager, job.JobID)
+		fresh, err := NewManager(e.jobs, e.workers)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, caller := range []string{owner, other, ""} {
+			got, err := fresh.GetForQuestion(job.JobID, caller)
+			switch {
+			case caller == "":
+				if err != ErrInvalidID {
+					t.Fatalf("empty caller: %v", err)
+				}
+			case binding == caller:
+				if err != nil || got.Result == nil || got.JobID != job.JobID {
+					t.Fatalf("owner lookup: %v %+v", err, got)
+				}
+			default:
+				if err != ErrNotFound || got.Result != nil {
+					t.Fatalf("foreign or legacy lookup: %v %+v", err, got)
+				}
+			}
+		}
+		request.QuestionBindingID = other
+		if _, _, err := fresh.Admit(request); err != ErrBoundToMore {
+			t.Fatalf("rebound request: %v", err)
+		}
 	}
 }

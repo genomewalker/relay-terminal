@@ -293,6 +293,10 @@ func (m *Manager) execute(ctx context.Context, job Job, request researchworker.R
 
 // terminal maps a worker receipt to the job's terminal record.
 func terminal(job Job, receipt researchworker.Receipt) Job {
+	if receipt.Binding != job.Binding {
+		job.State, job.Failure = StateUnknown, "worker receipt does not match the admitted binding"
+		return job
+	}
 	job.TurnID = receipt.SessionID
 	job.WorkerDir = receipt.WorkerDir
 	if !receipt.StartedAt.IsZero() {
@@ -369,7 +373,7 @@ func (m *Manager) reconcile(job Job) Job {
 	}
 	raw, err := os.ReadFile(filepath.Join(m.workersRoot, job.RequestID, "receipt.json"))
 	var receipt researchworker.Receipt
-	if err == nil && json.Unmarshal(raw, &receipt) == nil && receipt.Binding == job.Binding {
+	if err == nil && json.Unmarshal(raw, &receipt) == nil {
 		job = terminal(job, receipt)
 	} else {
 		job.State, job.Failure = StateUnknown, "the job's runner stopped before a terminal record; outcome unknown and it is not started again"
@@ -378,8 +382,33 @@ func (m *Manager) reconcile(job Job) Job {
 	return job
 }
 
-// Get returns the job with this exact job_id.
+// Get returns the job with this exact job_id for trusted local callers.
 func (m *Manager) Get(jobID string) (Job, error) {
+	return m.get(jobID, "", true)
+}
+
+// GetForQuestion reads a job for the authenticated owner lease. The caller
+// must derive bindingID from the current lease, independently of the request.
+func (m *Manager) GetForQuestion(jobID, bindingID string) (Job, error) {
+	if !uuidPattern.MatchString(bindingID) {
+		return Job{}, ErrInvalidID
+	}
+	return m.get(jobID, bindingID, true)
+}
+
+// ReadForQuestion reads the last persisted state from a separate status process.
+// Only the manager that owns the runner may reconcile its active jobs.
+func ReadForQuestion(jobsRoot, jobID, bindingID string) (Job, error) {
+	if !uuidPattern.MatchString(bindingID) {
+		return Job{}, ErrInvalidID
+	}
+	if err := private(jobsRoot); err != nil {
+		return Job{}, err
+	}
+	return (&Manager{jobsRoot: jobsRoot}).get(jobID, bindingID, false)
+}
+
+func (m *Manager) get(jobID, bindingID string, reconcile bool) (Job, error) {
 	if !uuidPattern.MatchString(jobID) {
 		return Job{}, ErrInvalidID
 	}
@@ -399,7 +428,13 @@ func (m *Manager) Get(jobID string) (Job, error) {
 	if job.JobID != jobID {
 		return Job{}, errors.New("job index does not match its record")
 	}
-	return m.reconcile(job), nil
+	if bindingID != "" && job.Binding.QuestionBindingID != bindingID {
+		return Job{}, ErrNotFound
+	}
+	if reconcile {
+		return m.reconcile(job), nil
+	}
+	return job, nil
 }
 
 // GetByRequest returns the job admitted for this exact request_id.

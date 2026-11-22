@@ -759,6 +759,10 @@ func TestQuestionAppPacketReachesBindAndRefusesForeignPane(t *testing.T) {
 	if reply["status"] != "bound" || fx.chitta.count("lease_claim") != 1 {
 		t.Fatalf("reply %v calls %v", reply, fx.chitta.calls)
 	}
+	stored, found, err := fx.deps.loadQuestionState(request.PaneID)
+	if err != nil || !found || stored.Incarnation == "" || reply["question_binding_id"] != stored.Incarnation {
+		t.Fatalf("bind response must identify the persisted lease incarnation: reply=%v err=%v", reply, err)
+	}
 	foreign := request
 	foreign.SourcePaneID = "22222222-2222-4222-8222-222222222222"
 	if _, err := questionOperation(context.Background(), fx.deps, foreign); err == nil || err.Error() != "a question thread binds only the caller's own pane" {

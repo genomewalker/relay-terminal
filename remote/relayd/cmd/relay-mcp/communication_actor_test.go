@@ -146,3 +146,22 @@ func TestCommunicationProofForAnotherClientWithoutSessionEnvironmentGetsNoActor(
 		t.Fatal("another client's proof was accepted", packet)
 	}
 }
+
+func TestResearchJobStatusUsesProvenActor(t *testing.T) {
+	const pane = "800c06ef-203f-4401-bf7a-c67b15985f33"
+	s, wire := actorTestHelper(t, pane, os.Getpid())
+	s.callerToken = "fixture"
+	params := json.RawMessage(`{"name":"relay_research_job_status","arguments":{"job_id":"7cca9135-83ed-46f9-ad6b-32df6e580b03"}}`)
+	reply, code, detail := s.handle(request{Method: "tools/call", Params: params})
+	raw, err := os.ReadFile(wire)
+	if err != nil || code != 0 {
+		t.Fatalf("%v %s %v %v", err, detail, code, reply)
+	}
+	var packet map[string]any
+	if err := json.Unmarshal(raw, &packet); err != nil {
+		t.Fatal(err)
+	}
+	if packet["source_pane_id"] != pane || packet["actor_pane_id"] != pane || packet["operation"] != "question_research_status" || packet["job_id"] != "7cca9135-83ed-46f9-ad6b-32df6e580b03" {
+		t.Fatalf("unexpected packet: %+v", packet)
+	}
+}

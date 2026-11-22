@@ -58,25 +58,30 @@ var requestUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 var ErrAlreadyAdmitted = errors.New("request_id was already admitted with an unknown outcome; not started again")
 
 type Request struct {
-	RequestID   string
-	Policy      Policy
-	Prompt      string
-	WorkersRoot string   // private (0700, owned) directory holding one folder per request
-	Env         []string // base environment; RELAY_* variables are removed
-	CodexHome   string   // optional: where to find the Codex rollout for verification
-	SQLite3     string   // optional: absolute sqlite3 CLI path, to read paginated Codex thread state
+	// QuestionBindingID comes from the daemon-confirmed owner lease.
+	QuestionBindingID string
+	AssignmentID      string
+	RequestID         string
+	Policy            Policy
+	Prompt            string
+	WorkersRoot       string   // private (0700, owned) directory holding one folder per request
+	Env               []string // base environment; RELAY_* variables are removed
+	CodexHome         string   // optional: where to find the Codex rollout for verification
+	SQLite3           string   // optional: absolute sqlite3 CLI path, to read paginated Codex thread state
 }
 
 type Binding struct {
-	Version        int    `json:"version"`
-	RequestID      string `json:"request_id"`
-	ContractSHA256 string `json:"contract_sha256"`
-	Provider       string `json:"provider"`
-	Model          string `json:"model"`
-	Effort         string `json:"effort"`
-	ArgvSHA256     string `json:"argv_sha256"`
-	PromptSHA256   string `json:"prompt_sha256"`
-	Budget         Budget `json:"budget"`
+	QuestionBindingID string `json:"question_binding_id,omitempty"`
+	AssignmentID      string `json:"assignment_id,omitempty"`
+	Version           int    `json:"version"`
+	RequestID         string `json:"request_id"`
+	ContractSHA256    string `json:"contract_sha256"`
+	Provider          string `json:"provider"`
+	Model             string `json:"model"`
+	Effort            string `json:"effort"`
+	ArgvSHA256        string `json:"argv_sha256"`
+	PromptSHA256      string `json:"prompt_sha256"`
+	Budget            Budget `json:"budget"`
 }
 
 // USDUnknown is the status when the provider reports no cost.
@@ -194,6 +199,9 @@ func (c *cappedFile) Write(p []byte) (int, error) {
 }
 
 func prepare(request Request) (Launch, Binding, string, error) {
+	if request.QuestionBindingID != "" && !requestUUID.MatchString(request.QuestionBindingID) {
+		return Launch{}, Binding{}, "", errors.New("question binding ID must be a lowercase UUID")
+	}
 	if !requestUUID.MatchString(request.RequestID) {
 		return Launch{}, Binding{}, "", errors.New("request_id must be a lowercase UUID")
 	}
@@ -215,7 +223,7 @@ func prepare(request Request) (Launch, Binding, string, error) {
 		return Launch{}, Binding{}, "", err
 	}
 	argv, _ := json.Marshal(launch.Argv)
-	binding := Binding{Version: 1, RequestID: request.RequestID, ContractSHA256: request.Policy.ContractSHA256, Provider: request.Policy.Provider,
+	binding := Binding{QuestionBindingID: request.QuestionBindingID, AssignmentID: request.AssignmentID, Version: 1, RequestID: request.RequestID, ContractSHA256: request.Policy.ContractSHA256, Provider: request.Policy.Provider,
 		Model: request.Policy.Model, Effort: request.Policy.Effort, ArgvSHA256: digestString(string(argv)), PromptSHA256: digestString(request.Prompt), Budget: request.Policy.Budget}
 	return launch, binding, dir, nil
 }

@@ -59,21 +59,22 @@ type questionThreadDeps struct {
 }
 
 type questionThreadBinding struct {
-	Version      int                   `json:"version"`
-	PaneID       string                `json:"pane_id"`
-	SessionID    string                `json:"session_id"`
-	Provider     string                `json:"provider"`
-	ProcessID    int                   `json:"process_id"`
-	ProcessStart uint64                `json:"process_start"`
-	ThreadID     string                `json:"thread_id"`
-	Realm        string                `json:"realm"`
-	Generation   uint64                `json:"generation"`
-	TTLSeconds   int                   `json:"ttl_seconds"`
-	RenewAt      time.Time             `json:"renew_at"`
-	Cursor       uint64                `json:"cursor"`
-	PolledAt     time.Time             `json:"polled_at"`
-	Outbox       []questionOutboxEntry `json:"outbox,omitempty"`
-	Acks         []questionNoticeAck   `json:"acks,omitempty"`
+	ResearchQuestions map[string]researchRegistration `json:"research_questions,omitempty"`
+	Version           int                             `json:"version"`
+	PaneID            string                          `json:"pane_id"`
+	SessionID         string                          `json:"session_id"`
+	Provider          string                          `json:"provider"`
+	ProcessID         int                             `json:"process_id"`
+	ProcessStart      uint64                          `json:"process_start"`
+	ThreadID          string                          `json:"thread_id"`
+	Realm             string                          `json:"realm"`
+	Generation        uint64                          `json:"generation"`
+	TTLSeconds        int                             `json:"ttl_seconds"`
+	RenewAt           time.Time                       `json:"renew_at"`
+	Cursor            uint64                          `json:"cursor"`
+	PolledAt          time.Time                       `json:"polled_at"`
+	Outbox            []questionOutboxEntry           `json:"outbox,omitempty"`
+	Acks              []questionNoticeAck             `json:"acks,omitempty"`
 	// ReleaseStage is persisted before a release starts, so a failed step is
 	// retried as the same step and never turns into a new lease claim.
 	ReleaseStage string `json:"release_stage,omitempty"`
