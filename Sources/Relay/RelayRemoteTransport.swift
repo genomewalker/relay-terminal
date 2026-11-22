@@ -848,6 +848,13 @@ final class RelayRemoteTransport: @unchecked Sendable {
                 lastRouteClosedUptime = now
                 let streakDelay = RelayPaneAttachPolicy.routeClosedDelayMilliseconds(streak: routeClosedStreak)
                 lock.unlock()
+                // The host says which side closed the route; keep it, since the
+                // status shown below is the same for every cause.
+                RelayDiagnostics.shared.record(category: "pane", name: "route-closed", details: [
+                    "pane_id": context.sessionID.lowercased(),
+                    "reason": String((decoded.message ?? "").prefix(300)),
+                    "streak": String(routeClosedStreak),
+                ])
                 guard shouldRecover else { return }
                 context.onStatus(RelayStatus(
                     state: "reconnecting",
