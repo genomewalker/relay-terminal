@@ -21,6 +21,8 @@ func TestMikoCatalogComplete(t *testing.T) {
 		}
 		switch name {
 		case "relay_read_desktop_inbox", "relay_ask_miko", "relay_register_caller", "relay_control_caller", "relay_begin_terminal_control", "relay_authorize_r_session", "relay_call_tool", "relay_available_tools", "relay_research_capability", "relay_prompt_provenance", "relay_wait_for_command",
+			// These operations require the verified pane that owns the question.
+			"relay_register_research_question", "relay_research_job_status", "relay_publish_research_conclusion",
 			"relay_broadcast_message", // not offered to Miko yet
 			"relay_launch_agent":      // not offered to Miko yet
 			continue

@@ -23,6 +23,8 @@ func mikoExcluded(name string) bool {
 	switch name {
 	case "relay_read_desktop_inbox", // only a verified Claude desktop session reads its own inbox
 		"relay_ask_miko", "relay_register_caller", "relay_control_caller", "relay_begin_terminal_control", "relay_authorize_r_session", "relay_available_tools", "relay_call_tool", "relay_research_capability", "relay_prompt_provenance",
+		// These operations require the verified pane that owns the question.
+		"relay_register_research_question", "relay_research_job_status", "relay_publish_research_conclusion",
 		// A blocking wait would hold Miko's turn; Miko reads the viewport instead.
 		"relay_wait_for_command",
 		// Miko does not broadcast yet; its catalog and card policy would need it first.
