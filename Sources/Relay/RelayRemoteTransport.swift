@@ -296,6 +296,14 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// every pointer move over a busy agent queued another report ahead of the
     /// next keystroke: 1.9 s median input delay on dandy-07 d62c62eb.
     private var deferredMotionReport: Data?
+    /// Input that arrived while `maximumOutstandingInputFrames` frames were
+    /// unacknowledged. dandy-07 d62c62eb, 2026-11-22: 300 wheel reports to a
+    /// busy agent, one frame each, filled the supervisor's 128-frame route queue
+    /// ("client frames to the worker are not draining"); every reattach resent
+    /// them one frame each and closed the route again for 30 s. Held bytes go
+    /// out as one frame, in order, when the worker catches up.
+    private var heldInput = Data()
+    static let maximumOutstandingInputFrames = 32
     private var inputOverflowed = false
     private var attachRepaintPending = false
     private var attached = false {
@@ -497,6 +505,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         automationInputSequences.removeAll(keepingCapacity: true)
         pendingInputBytes = 0
         deferredMotionReport = nil
+        heldInput.removeAll(keepingCapacity: false)
         inputOverflowed = false
         attachRepaintPending = forceAttachRepaint
         deliveryEpoch = UUID()
@@ -1408,7 +1417,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         supportsViewportCommits = RelayTransportCapabilityPolicy.supportsViewportCommit(capabilities)
         supportsExactViewportCommits = RelayTransportCapabilityPolicy.supportsExactViewportCommit(capabilities)
         let needsPostAttachResize = RelayTransportCapabilityPolicy.needsPostAttachResize(capabilities)
-        let backlog = inputBacklog
+        // Held input predates anything typed while the route was down.
+        let backlog = heldInput + inputBacklog
+        heldInput.removeAll(keepingCapacity: false)
         inputBacklog.removeAll(keepingCapacity: true)
         signalPromptEditorLeaseChangedLocked()
         let resize = latestResize
@@ -1629,11 +1640,18 @@ final class RelayRemoteTransport: @unchecked Sendable {
         }
         automationInputSequences.remove(sequence)
         signalPromptEditorLeaseChangedLocked()
-        let motion = takeDeferredMotionLocked()
+        var held: Data?
+        if !heldInput.isEmpty, pendingInputs.count < Self.maximumOutstandingInputFrames {
+            held = heldInput
+            heldInput.removeAll(keepingCapacity: false)
+        }
+        let motion = held == nil ? takeDeferredMotionLocked() : nil
         lock.unlock()
         RelayPaneDelayStore.shared.inputAcknowledged(pane: pane, sequence: sequence)
+        if let held { sendInput(held) }
         if let motion { sendInput(motion) }
     }
+    var heldInputForTesting: Data { lock.lock(); defer { lock.unlock() }; return heldInput }
     var pendingInputSequencesForTesting: [UInt64] { lock.lock(); defer { lock.unlock() }; return pendingInputs.keys.sorted() }
     /// Caller holds `lock`. The withheld pointer position, once nothing is
     /// left unacknowledged.
@@ -1664,6 +1682,21 @@ final class RelayRemoteTransport: @unchecked Sendable {
             lock.unlock()
             return true
         }
+        var data = data
+        var mustBacklog = false
+        if supportsInputAcknowledgements, writer != nil, attached,
+           !heldInput.isEmpty || pendingInputs.count >= Self.maximumOutstandingInputFrames {
+            if pendingInputBytes + heldInput.count + data.count <= 64 << 10 {
+                heldInput.append(data)
+                lock.unlock()
+                return true
+            }
+            // Over the unacknowledged limit: reattach with everything held as
+            // one backlog frame, exactly as a single oversized input does.
+            data = heldInput + data
+            heldInput.removeAll(keepingCapacity: false)
+            mustBacklog = true
+        }
         let writer = self.writer
         let canSend = writer != nil && attached
         let acknowledged = supportsInputAcknowledgements
@@ -1676,7 +1709,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         var multiplexedRetryContext: RelayConnectionContext?
         var wakeChannel: RelayNodeChannel?
         var admitted = canSend
-        if canSend && acknowledged && pendingInputBytes + data.count <= 64 << 10 {
+        if canSend && acknowledged && !mustBacklog && pendingInputBytes + data.count <= 64 << 10 {
             let sequence = RelayInputSequenceAllocator.shared.next()
             inputSequence = sequence
             pendingInputs[sequence] = data

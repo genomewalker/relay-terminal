@@ -433,3 +433,40 @@ struct RelayPointerMotionCoalescingTests {
         #expect(transport.deferredMotionReportForTesting == nil)
     }
 }
+
+// dandy-07 d62c62eb, 2026-11-22: 300 wheel reports at 10 ms to a busy agent,
+// one frame each, overflowed the supervisor's 128-frame route queue and every
+// reattach resent them one by one. Beyond 32 outstanding frames, input is held
+// and sent in order as one frame when the worker catches up.
+@Suite(.serialized)
+struct RelayOutstandingInputFrameCapTests {
+    @MainActor @Test
+    func inputBeyondTheFrameCapIsHeldAndSentInOrderAsOneFrame() throws {
+        let profile = ConnectionProfile(name: "Cap fixture", host: "cap-fixture.invalid")
+        let writer = OwnedPromptFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer, profile: profile, paneID: UUID(),
+            capabilities: ["input_ack_v1"], controlGranted: true)
+        defer { transport.detach() }
+        let cap = RelayRemoteTransport.maximumOutstandingInputFrames
+        let up = Data("\u{1B}[<64;10;5M".utf8), down = Data("\u{1B}[<65;10;5M".utf8)
+        for i in 0..<300 { #expect(transport.sendInput(i % 2 == 0 ? up : down)) }
+        #expect(writer.inputs.count == cap)
+        #expect(transport.sendInput(Data("x".utf8)))   // a key queues behind held wheels
+        var expectedHeld = Data()
+        for i in cap..<300 { expectedHeld.append(i % 2 == 0 ? up : down) }
+        expectedHeld.append(Data("x".utf8))
+        #expect(transport.heldInputForTesting == expectedHeld)
+        let first = transport.pendingInputSequencesForTesting[0]
+        transport.acknowledgeInput(sequence: first, pane: "p")
+        #expect(writer.inputs.count == cap + 1)        // one frame, all bytes in order
+        #expect(writer.inputs[cap].dropFirst(24) == expectedHeld)
+        #expect(transport.heldInputForTesting.isEmpty)
+        // 31 original frames plus the flushed one: at the cap again, so new
+        // input is held until another acknowledgement.
+        #expect(transport.sendInput(up))
+        #expect(writer.inputs.count == cap + 1 && transport.heldInputForTesting == up)
+        let next = transport.pendingInputSequencesForTesting[0]
+        transport.acknowledgeInput(sequence: next, pane: "p")
+        #expect(writer.inputs.count == cap + 2 && writer.inputs[cap + 1].dropFirst(24) == up)
+    }
+}
