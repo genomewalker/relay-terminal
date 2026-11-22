@@ -535,9 +535,20 @@ import SwiftUI
                 }
             }
             if desired.enabled, let generation = result.configuration?.generation {
-                let inputFacts = references.values.compactMap(\.pane).filter {
+                let inputPanes = references.values.compactMap(\.pane).filter {
                     $0.profile.connectionKey == key && desired.panes.contains($0.id.uuidString.lowercased())
-                }.sorted { $0.id.uuidString < $1.id.uuidString }.map { facts($0) }
+                }.sorted { $0.id.uuidString < $1.id.uuidString }
+                // Each pane's facts may read its whole screen. Read them one
+                // at a time and give the main thread back in between: reading
+                // every pane of a host in one turn held scrolling and drawing
+                // for about 0.5 s every 15 s (2026-11-22, 146 dandy-07 panes).
+                var inputFacts: [RelayPaneHealthFacts] = []
+                inputFacts.reserveCapacity(inputPanes.count)
+                for pane in inputPanes {
+                    guard !Task.isCancelled else { return }
+                    inputFacts.append(facts(pane))
+                    await Task.yield()
+                }
                 for start in stride(from: 0, to: inputFacts.count, by: 64) {
                     result = try await RelayPaneHealthHostControllerRPC.send(profile: profile, action: "desktop_facts",
                         operationID: RelayHostRotationRPC.newOperationID(), owner: desired.owner, generation: generation,
