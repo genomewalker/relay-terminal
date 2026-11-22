@@ -228,7 +228,69 @@ final class RelayCapacityManagementTests: XCTestCase {
         // closed even in a test process. Test mode never means unmanaged.
         let combined = await coordinator.shouldUseCombined(pane)
         XCTAssertTrue(combined, "DEFAULT_OWNERSHIP_TRANSPORT_FAILURE_AUTHORIZED_LEGACY_EXIT")
-        XCTAssertEqual(reads, 1, "DEFAULT_OWNERSHIP_ENTRY_BYPASSED_READ")
+        // The read-only status is read again once after a failure.
+        XCTAssertEqual(reads, 2, "DEFAULT_OWNERSHIP_ENTRY_BYPASSED_READ")
+        XCTAssertNotNil(coordinator.ownershipErrors[pane.id], "OWNERSHIP_READ_ERROR_NOT_RECORDED")
+    }
+    private func status(_ request: Data, managed: Bool, operation: Bool = false) throws -> Data {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: request) as? [String: Any])
+        let id = try XCTUnwrap(object["request_id"] as? String)
+        var reply = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture(id)) as? [String: Any])
+        var result = try XCTUnwrap(reply["result"] as? [String: Any])
+        result["managed"] = managed; result["enabled"] = managed
+        if operation { result["operation"] = ["state": "planned", "reason": "manual move"] }
+        reply["result"] = result
+        return try JSONSerialization.data(withJSONObject: reply)
+    }
+    // 2026-11-22 a7d91d37: one failed ownership read after an app restart sent an
+    // unenrolled pane down the capacity route, which then held the move.
+    @MainActor func testATransientOwnershipFailureIsReadAgainBeforeHolding() async throws {
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let pane = try XCTUnwrap(workspace.activePane)
+        var reads = 0
+        let coordinator = RelayCapacityManagementCoordinator(readExchange: { bytes in
+            reads += 1
+            if reads == 1 { throw RelayHostRotationRPC.Failure.unavailable }
+            return try self.status(bytes, managed: false)
+        })
+        let combined = await coordinator.shouldUseCombined(pane)
+        XCTAssertFalse(combined, "TRANSIENT_OWNERSHIP_FAILURE_HELD_AN_UNMANAGED_PANE")
+        XCTAssertEqual(reads, 2)
+        XCTAssertNil(coordinator.ownershipErrors[pane.id])
+    }
+    @MainActor func testAPaneWithAnActiveCapacityOperationKeepsTheCombinedRoute() async throws {
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let pane = try XCTUnwrap(workspace.activePane)
+        let coordinator = RelayCapacityManagementCoordinator(readExchange: { bytes in
+            try self.status(bytes, managed: true, operation: true)
+        })
+        let combined = await coordinator.shouldUseCombined(pane)
+        XCTAssertTrue(combined, "MANAGED_PANE_WITH_OPERATION_LEFT_THE_COMBINED_ROUTE")
+    }
+    @MainActor func testAMisroutedUnmanagedPaneSendsNoCapacityMove() async throws {
+        let workspace = WorkspaceModel(restoreSavedWorkspace: false)
+        defer { workspace.shutdown() }
+        let pane = try XCTUnwrap(workspace.activePane)
+        var reads = 0
+        var operations: [String] = []
+        let coordinator = RelayCapacityManagementCoordinator(readExchange: { bytes in
+            reads += 1
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            let forward = try XCTUnwrap((object["host_accounts"] as? [String: Any])?["request"] as? [String: Any])
+            operations.append(try XCTUnwrap(forward["operation"] as? String))
+            if reads <= 2 { throw RelayHostRotationRPC.Failure.unavailable }
+            return try self.status(bytes, managed: false)
+        })
+        let misrouted = await coordinator.shouldUseCombined(pane)
+        XCTAssertTrue(misrouted)
+        let target = RelayAgentAccount(provider: "claude", label: "personal", dir: "~/.claude-personal")
+        let message = await coordinator.requestManual(pane, target: target)
+        XCTAssertTrue(message.hasPrefix("Held: capacity ownership could not be read"), message)
+        XCTAssertTrue(message.contains("Nothing was sent"), message)
+        XCTAssertEqual(operations, ["capacity_status", "capacity_status", "capacity_status"], "CAPACITY_MOVE_SENT_FOR_UNMANAGED_PANE")
+        XCTAssertNil(coordinator.ownershipErrors[pane.id])
     }
     @MainActor func testLegacyMoverUsesCombinedNativeLaneBeforeAnyExit() async throws {
         let workspace = WorkspaceModel(restoreSavedWorkspace: false)

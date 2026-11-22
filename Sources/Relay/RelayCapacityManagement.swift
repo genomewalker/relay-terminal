@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SwiftUI
 
 /// A user policy edit is bound to the exact pane and complete connection
@@ -515,6 +516,9 @@ enum RelayCapacitySchedule {
     private var newPanes = Set<UUID>()
     private var submitted = Set<UUID>()
     private let readExchange: ((Data) async throws -> Data)?
+    /// Why the last ownership read for a pane failed, for the held message.
+    private(set) var ownershipErrors: [UUID: String] = [:]
+    private static let log = Logger(subsystem: "dev.vaklab.relay", category: "capacity")
     /// CC-S2: the Miko-owned supervisor that observes each pane natively and may hold a submission.
     let budget: RelayBudgetSupervisor
     init(readExchange: ((Data) async throws -> Data)? = nil, budget: RelayBudgetSupervisor = .shared) {
@@ -607,15 +611,38 @@ enum RelayCapacitySchedule {
     /// Existing panes without that explicit enrollment retain legacy behavior.
     func shouldUseCombined(_ pane: PaneModel, exchange: ((Data) async throws -> Data)? = nil) async -> Bool {
         guard pane.profile.backend == .relay, pane.contentKind == .terminal else { return false }
-        do { return try await read(pane, exchange: exchange).managed }
+        // capacity_status is read-only, so one transient failure (a connection
+        // that is still settling after a restart) is read again once.
+        var failure: Error?
+        for attempt in 0..<2 {
+            do {
+                let managed = try await read(pane, exchange: exchange).managed
+                ownershipErrors[pane.id] = nil
+                return managed
+            } catch {
+                failure = error
+                if attempt == 0, case RelayHostRotationRPC.Failure.changedConnection = error { break }
+            }
+        }
         // A fresh app may have no cache while the host still owns a paused or
         // uncertain operation. Missing ownership evidence must hold the move,
         // never grant the legacy executor permission to exit that source.
-        catch { return true }
+        let reason = String((failure?.localizedDescription ?? "unknown").prefix(240))
+        ownershipErrors[pane.id] = reason
+        Self.log.error("capacity ownership unreadable for pane \(pane.id.uuidString, privacy: .public): \(reason, privacy: .public)")
+        return true
     }
     func requestManual(_ pane: PaneModel, target: RelayAgentAccount) async -> String {
         do {
             let current = try await read(pane)
+            // The combined route was taken only because ownership could not be
+            // read; the host now says no capacity lane owns this pane. Nothing
+            // is sent: the move is retried on the ordinary route.
+            if let earlier = ownershipErrors[pane.id], !current.managed, current.operation == nil {
+                ownershipErrors[pane.id] = nil
+                return "Held: capacity ownership could not be read when the move started (" + earlier +
+                    "); the pane is not capacity-managed, so retry the move. Nothing was sent."
+            }
             let value = try await RelayCapacityManagement.send(.init(operation: "capacity_manual_move", id: RelayHostRotationRPC.newOperationID(), expectedRevision: current.revision, paneId: pane.id.uuidString.lowercased(), targetAccount: target.label), profile: pane.profile)
             statuses[pane.id] = value
             return value.state + ": " + value.reason

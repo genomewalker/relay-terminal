@@ -376,12 +376,16 @@ func capacityNativeObserve(ctx context.Context, pane string) (capacity.Source, c
 	source = capacity.Source{Host: host, Boot: manifest.NodeBootID, Pane: pane, WorkerPID: manifest.WorkerPID, WorkerStart: manifest.WorkerStartTime, Provider: b.Producer.Provider, Session: b.SessionID, PID: b.Producer.ProcessID, Start: b.Producer.ProcessStart, Account: label, Config: config, Binding: b.Revision, Root: candidate.CWD}
 
 	enrollment := hostRotationEnrollment{SessionID: source.Session, Client: source.Provider, CWD: source.Root, PaneID: pane, AgentPID: source.PID, AgentStart: source.Start, WorkerPID: source.WorkerPID, WorkerStart: source.WorkerStart, NodeBootID: source.Boot}
-	raw, err := readHostRotationLedgerStatus(ctx, enrollment)
-	if err == nil {
+	raw, ledgerErr := readHostRotationLedgerStatus(ctx, enrollment)
+	if ledgerErr == nil {
 		c = capacityCountersFromLedger(raw)
 		source.Model = capacityModelFromLedger(raw)
 	}
 	if !source.Valid() {
+		if ledgerErr != nil {
+			// The model comes only from the rotation ledger; name why it is missing.
+			return source, c, errors.New("native capacity model unavailable: rotation ledger status unreadable: " + ledgerErr.Error())
+		}
 		return source, c, errors.New("native capacity source/model evidence incomplete")
 	}
 
