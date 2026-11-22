@@ -581,6 +581,19 @@ func capacityRevokeHumanInput(root, pane string) error {
 		return nil
 	}
 	j := capacity.Journal{Root: directory}
+	// Every human keystroke comes through here before the pty write. On an NFS
+	// home the exclusive flock alone can take hundreds of milliseconds, so a
+	// pane that is not managed, or already taken over, is answered from an
+	// unlocked read. Only a managed pane without takeover takes the lock, and
+	// NativeEvent checks again under it. An unreadable or torn read also takes
+	// the locked path.
+	if d, err := j.Peek(); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err == nil {
+		if current, ok := d.Entries[pane]; !ok || !current.Managed || current.Takeover {
+			return nil
+		}
+	}
 	id := "human-" + capacity.Hash([]byte(pane + time.Now().UTC().Format(time.RFC3339Nano)))[:32]
 	_, err := j.NativeEvent(id, capacity.Hash([]byte(id)), func(d *capacity.Disk) error {
 		current, ok := d.Entries[pane]

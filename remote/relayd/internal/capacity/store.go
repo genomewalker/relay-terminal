@@ -260,6 +260,26 @@ func load(file *os.File) (Disk, string, error) {
 	}
 	return state, previous, nil
 }
+
+// Peek reads the journal without taking policy.lock. A concurrent or torn
+// append, or any unreadable or non-private file, returns an error, and the
+// caller must then use a locked call. os.ErrNotExist means no journal yet.
+func (j Journal) Peek() (Disk, error) {
+	fd, err := syscall.Open(filepath.Join(j.Root, "policy.jsonl"), syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return Empty(), os.ErrNotExist
+		}
+		return Empty(), err
+	}
+	f := os.NewFile(uintptr(fd), "policy.jsonl")
+	defer f.Close()
+	if st, err := f.Stat(); err != nil || !private(st, false) {
+		return Empty(), errors.New("capacity state file is not private")
+	}
+	state, _, err := load(f)
+	return state, err
+}
 func (j Journal) Load() (Disk, error) {
 	var state Disk
 	err := j.locked(func(f *os.File) error { var e error; state, _, e = load(f); return e })
