@@ -96,6 +96,16 @@ func serve(socket, executable string, args []string) error {
 			return err
 		}
 	}
+	// Detached with stderr on /dev/null: keep why viewers and the stream ended.
+	if logFile, err := os.OpenFile(socket+".log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600); err == nil {
+		defer logFile.Close()
+		if info, err := logFile.Stat(); err == nil && info.Size() > 1<<20 {
+			_ = logFile.Truncate(0)
+		}
+		localbroker.Logf = func(format string, args ...any) {
+			fmt.Fprintf(logFile, time.Now().UTC().Format(time.RFC3339Nano)+" "+format+"\n", args...)
+		}
+	}
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		return err
@@ -157,6 +167,7 @@ func serve(socket, executable string, args []string) error {
 		for {
 			frame, err := remoteReader.Read()
 			if err != nil {
+				localbroker.Logf("relay-connection: remote stream ended: %v", err)
 				broker.Close()
 				_ = listener.Close()
 				return
@@ -168,11 +179,15 @@ func serve(socket, executable string, args []string) error {
 	// the socket, allowing the next attachment to establish a fresh incarnation.
 	go keepalive(func() int64 { return time.Now().UnixNano() },
 		func() bool { time.Sleep(heartbeatInterval); return true },
-		&lastInbound, broker.Ping, func() { _ = cmd.Process.Kill() })
+		&lastInbound, broker.Ping, func() {
+			localbroker.Logf("relay-connection: remote silent past heartbeat; ending ssh")
+			_ = cmd.Process.Kill()
+		})
 	for {
 		_ = listener.(*net.UnixListener).SetDeadline(time.Now().Add(10 * time.Minute))
 		conn, err := listener.Accept()
 		if err != nil {
+			localbroker.Logf("relay-connection: broker exiting: %v", err)
 			return err
 		}
 		_ = broker.Serve(conn)

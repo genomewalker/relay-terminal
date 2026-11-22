@@ -2,8 +2,10 @@ package localbroker
 
 import (
 	"bytes"
+	"fmt"
 	"github.com/relay-terminal/relayd/internal/protocol"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -87,16 +89,38 @@ func TestSlowViewerOverflowIsExplicitAndBounded(t *testing.T) {
 	b := New(&bytes.Buffer{}, protocol.Frame{})
 	app, conn := net.Pipe()
 	defer app.Close()
-	v := &viewer{conn: conn, frames: make(chan protocol.Frame, 16), routes: map[string]string{}, reverse: map[string]string{"route": "pane"}, stop: make(chan struct{})}
+	v := &viewer{conn: conn, frames: make(chan protocol.Frame, viewerQueueFrames), routes: map[string]string{}, reverse: map[string]string{"route": "pane"}, stop: make(chan struct{})}
 	b.viewer = v
-	payload := bytes.Repeat([]byte("x"), 5<<20)
+	var reasons []string
+	Logf = func(format string, args ...any) { reasons = append(reasons, fmt.Sprintf(format, args...)) }
+	defer func() { Logf = func(string, ...any) {} }()
+	payload := bytes.Repeat([]byte("x"), 20<<20)
 	b.RemoteFrame(protocol.HostEventFrame("route", protocol.Frame{Type: protocol.Output, Payload: payload}))
 	b.RemoteFrame(protocol.HostEventFrame("route", protocol.Frame{Type: protocol.Output, Payload: payload}))
 	if !v.closed || b.viewer != nil {
 		t.Fatal("overflow was silently dropped")
 	}
-	if v.bytes > 8<<20 {
+	if v.bytes > viewerQueueBytes {
 		t.Fatal("viewer queue exceeded budget")
+	}
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "not draining") {
+		t.Fatalf("overflow reason not logged: %q", reasons)
+	}
+}
+
+// A scroll burst on dandy-07 (2026-11-22) was hundreds of small frames while
+// the GUI was briefly busy; it must not cut the whole node connection.
+func TestBurstOfSmallFramesKeepsTheViewer(t *testing.T) {
+	b := New(&bytes.Buffer{}, protocol.Frame{})
+	app, conn := net.Pipe()
+	defer app.Close()
+	v := &viewer{conn: conn, frames: make(chan protocol.Frame, viewerQueueFrames), routes: map[string]string{}, reverse: map[string]string{"route": "pane"}, stop: make(chan struct{})}
+	b.viewer = v
+	for i := 0; i < 2000; i++ {
+		b.RemoteFrame(protocol.HostEventFrame("route", protocol.Frame{Type: protocol.Output, Payload: bytes.Repeat([]byte("y"), 512)}))
+	}
+	if v.closed || b.viewer != v || len(v.frames) != 2000 {
+		t.Fatalf("burst closed the viewer: closed=%v queued=%d", v.closed, len(v.frames))
 	}
 }
 
