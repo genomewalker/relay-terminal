@@ -2416,11 +2416,17 @@ final class TerminalRuntime: NSObject {
             try Task.checkCancellation()
             guard self.pane?.id == paneID, self.pane?.profile.id == hostID,
                   result.exitCode == 0 else { return nil }
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
-            let binding = try decoder.decode(RelayPromptOwnerBinding.self, from: result.stdout)
-            return binding.isValid(for: paneID) ? RelayPromptOwnerIdentity(hostID: hostID, binding: binding) : nil
+            guard let binding = try Self.decodePromptOwnerBinding(result.stdout, paneID: paneID) else { return nil }
+            return RelayPromptOwnerIdentity(hostID: hostID, binding: binding)
         } catch { return nil }
+    }
+
+    /// relayd's prompt-owner-binding output, accepted only in a valid shape.
+    nonisolated static func decodePromptOwnerBinding(_ data: Data, paneID: UUID) throws -> RelayPromptOwnerBinding? {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let binding = try decoder.decode(RelayPromptOwnerBinding.self, from: data)
+        return binding.isValid(for: paneID) ? binding : nil
     }
 
     var canConfigureHostRotation: Bool {

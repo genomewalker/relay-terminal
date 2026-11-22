@@ -1,6 +1,9 @@
 package daemon
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestPromptOwnerFallbackAdmitsOnlyAnUnnamedLiveFrontend(t *testing.T) {
 	cases := []struct {
@@ -25,5 +28,21 @@ func TestPromptOwnerFallbackAdmitsOnlyAnUnnamedLiveFrontend(t *testing.T) {
 		if got := promptOwnerFallback(test.evidence); got != test.want {
 			t.Errorf("%s: got %d, want %d", test.name, got, test.want)
 		}
+	}
+}
+
+// The Mac decodes exactly this JSON (RelayPromptOwnerBindingTests pins the
+// same bytes): no session_id, input_only true, transcript_identity presession.
+func TestPromptOwnerPreSessionWireShape(t *testing.T) {
+	owner := PromptOwnerBinding{Version: 1, PaneID: "a83d388b-ec10-4776-af1e-398b8e5111d1", NodeBootID: "kernel-boot",
+		WorkerPID: 100, WorkerStart: 1001, ShellPID: 101, ShellStart: 1002, Provider: "claude",
+		ProcessID: 102, ProcessStart: 1003, TranscriptIdentity: PromptOwnerPreSessionIdentity, InputOnly: true}
+	data, err := json.Marshal(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"version":1,"pane_id":"a83d388b-ec10-4776-af1e-398b8e5111d1","node_boot_id":"kernel-boot","worker_pid":100,"worker_start":1001,"shell_pid":101,"shell_start":1002,"provider":"claude","process_id":102,"process_start":1003,"transcript_identity":"presession","input_only":true}`
+	if string(data) != want {
+		t.Fatalf("wire shape changed:\n got %s\nwant %s", data, want)
 	}
 }

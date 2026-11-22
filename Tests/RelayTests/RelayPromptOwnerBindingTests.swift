@@ -100,3 +100,16 @@ import Testing
     #expect(!(try owner(["provider": "other"])).isValid(for: pane))
     #expect(!(try owner(["process_start": 0])).isValid(for: pane))
 }
+
+/// relayd's exact bytes for a pre-session owner (pinned by
+/// TestPromptOwnerPreSessionWireShape), decoded as readPromptOwnerBinding does.
+@Test func relaydPreSessionOwnerBytesDecodeAndValidate() throws {
+    let pane = UUID(uuidString: "a83d388b-ec10-4776-af1e-398b8e5111d1")!
+    let wire = #"{"version":1,"pane_id":"a83d388b-ec10-4776-af1e-398b8e5111d1","node_boot_id":"kernel-boot","worker_pid":100,"worker_start":1001,"shell_pid":101,"shell_start":1002,"provider":"claude","process_id":102,"process_start":1003,"transcript_identity":"presession","input_only":true}"#
+    let owner = try TerminalRuntime.decodePromptOwnerBinding(Data(wire.utf8), paneID: pane)
+    #expect(owner?.isPreSession == true && owner?.sessionId == nil)
+    let withSession = wire.replacingOccurrences(of: #""transcript_identity""#, with: #""session_id":"7dddfbc8-2121-43b7-ab00-000000000000","transcript_identity""#)
+    #expect(try TerminalRuntime.decodePromptOwnerBinding(Data(withSession.utf8), paneID: pane) == nil)
+    let notInputOnly = wire.replacingOccurrences(of: #","input_only":true"#, with: "")
+    #expect(try TerminalRuntime.decodePromptOwnerBinding(Data(notInputOnly.utf8), paneID: pane) == nil)
+}
