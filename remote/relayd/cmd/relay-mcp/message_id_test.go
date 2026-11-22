@@ -110,7 +110,7 @@ func TestDesktopMessageGeneratesAMessageIDWhenOmitted(t *testing.T) {
 	if code != 0 || !uuidV4.MatchString(generated) || len(*seen) != 1 || (*seen)[0] != generated {
 		t.Fatalf("omitted id: code=%d generated=%q seen=%v", code, generated, *seen)
 	}
-	if text := encodedText(t, first); !strings.Contains(text, "relay_message_read_receipt") {
+	if text := encodedText(t, first); !strings.Contains(text, "relay_message_read_receipt") || !strings.Contains(text, "original reply_name") {
 		t.Fatalf("result does not say how to read the receipt: %s", text)
 	}
 	second, _ := call(base())

@@ -418,6 +418,19 @@ func communicationPair(source, target string) (string, []string, error) {
 // ExecuteCommunication is also used by the node-local MCP transport. Native
 // process and recipient session checks are repeated on the server per send.
 func ExecuteCommunication(r CommunicationRequest) (map[string]any, error) {
+	result, err := executeCommunication(r)
+	if err == nil && r.Operation == "receipt" {
+		switch result["status"] {
+		case "written_to_socket":
+			result["receipt_detail"] = "Relay wrote the message to the recipient socket. This receipt contains no evidence that the recipient processed it."
+		case "accepted_by_provider":
+			result["receipt_detail"] = "The provider accepted this message. This receipt contains no completion or read acknowledgement."
+		}
+	}
+	return result, err
+}
+
+func executeCommunication(r CommunicationRequest) (map[string]any, error) {
 	if r.Operation == "group_receipt" {
 		qualified, err := communicationUseQualifiedFanout(communicationRoot(), currentCommunicationNodeID(), r)
 		if err != nil {

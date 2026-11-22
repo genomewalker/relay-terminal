@@ -43,8 +43,12 @@ func withGeneratedMessageID(result any, id, receipt string) any {
 	if !ok {
 		return result
 	}
-	text := "Relay generated message_id " + id + " for this message. Read its outcome with " + receipt +
-		" and this ID; retry only under the same ID, never a new one."
+	lookup := receipt + " with this ID"
+	if receipt == "relay_message_read_receipt" {
+		lookup += " and the original reply_name"
+	}
+	text := "Relay generated message_id " + id + ". Check the recorded delivery evidence using " +
+		lookup + ". Keep this ID. Do not replay an uncertain send."
 	switch content := value["content"].(type) {
 	case []any:
 		value["content"] = append(content, map[string]string{"type": "text", "text": text})
