@@ -413,14 +413,14 @@ struct RelayPointerMotionCoalescingTests {
             capabilities: ["input_ack_v1"], controlGranted: true)
         defer { transport.detach() }
         let motion1 = Data("\u{1B}[<35;10;5M".utf8), motion2 = Data("\u{1B}[<35;11;5M".utf8)
-        let key = Data("a".utf8), wheel = Data("\u{1B}[<64;11;5M".utf8)
+        let key = Data("a".utf8), wheel = Data("\u{1B}[<0;11;5M".utf8)  // a click
         #expect(transport.sendInput(motion1))           // nothing outstanding: sent
         #expect(writer.inputs.count == 1)
         #expect(transport.sendInput(motion2))           // behind motion1: withheld
         #expect(transport.sendInput(Data("\u{1B}[<35;12;5M".utf8)))  // replaces motion2
         #expect(writer.inputs.count == 1)
         #expect(transport.sendInput(key))               // keys are never withheld
-        #expect(transport.sendInput(wheel))             // neither are wheel reports
+        #expect(transport.sendInput(wheel))             // nor are clicks
         #expect(writer.inputs.count == 3)
         #expect(writer.inputs[1].dropFirst(24) == key && writer.inputs[2].dropFirst(24) == wheel)
         let sequences = transport.pendingInputSequencesForTesting
@@ -448,7 +448,8 @@ struct RelayOutstandingInputFrameCapTests {
             capabilities: ["input_ack_v1"], controlGranted: true)
         defer { transport.detach() }
         let cap = RelayRemoteTransport.maximumOutstandingInputFrames
-        let up = Data("\u{1B}[<64;10;5M".utf8), down = Data("\u{1B}[<65;10;5M".utf8)
+        // Keys, not wheel steps: wheel steps are coalesced separately.
+        let up = Data("j".utf8), down = Data("k".utf8)
         for i in 0..<300 { #expect(transport.sendInput(i % 2 == 0 ? up : down)) }
         #expect(writer.inputs.count == cap)
         #expect(transport.sendInput(Data("x".utf8)))   // a key queues behind held wheels
@@ -468,5 +469,69 @@ struct RelayOutstandingInputFrameCapTests {
         let next = transport.pendingInputSequencesForTesting[0]
         transport.acknowledgeInput(sequence: next, pane: "p")
         #expect(writer.inputs.count == cap + 2 && writer.inputs[cap + 1].dropFirst(24) == up)
+    }
+}
+
+// dandy-07 d62c62eb, 2026-11-22: an idle Claude took ~10 s to drain 300 wheel
+// reports, so typing after a fast scroll waited. While input is unacknowledged,
+// wheel steps of one kind collapse to a capped net count sent once caught up.
+@Suite(.serialized)
+struct RelayWheelCoalescingTests {
+    @MainActor @Test
+    func wheelStepsWhileBehindCancelAndAreCapped() throws {
+        let writer = OwnedPromptFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer,
+            profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
+            capabilities: ["input_ack_v1"], controlGranted: true)
+        defer { transport.detach() }
+        let up = Data("\u{1B}[<64;10;5M".utf8), down = Data("\u{1B}[<65;10;5M".utf8)
+        #expect(transport.sendInput(up))                      // caught up: sent at once
+        #expect(writer.inputs.count == 1)
+        for _ in 0..<15 { #expect(transport.sendInput(up)) }   // +15
+        for _ in 0..<5 { #expect(transport.sendInput(down)) }  // capped at +8, then -5
+        #expect(writer.inputs.count == 1)
+        var three = Data(); for _ in 0..<3 { three.append(up) }
+        #expect(transport.deferredWheelForTesting == three)
+        transport.acknowledgeInput(sequence: transport.pendingInputSequencesForTesting[0], pane: "p")
+        #expect(writer.inputs.count == 2 && writer.inputs[1].dropFirst(24) == three)
+        // Up and down cancel completely: nothing is sent.
+        #expect(transport.sendInput(up)); #expect(transport.sendInput(down))
+        transport.acknowledgeInput(sequence: transport.pendingInputSequencesForTesting[0], pane: "p")
+        #expect(writer.inputs.count == 2)
+    }
+
+    @MainActor @Test
+    func aThreeHundredStepBurstSendsTwoFramesAndTheKeyGoesOutOnTheNextAck() throws {
+        let writer = OwnedPromptFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer,
+            profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
+            capabilities: ["input_ack_v1"], controlGranted: true)
+        defer { transport.detach() }
+        let up = Data("\u{1B}[<64;10;5M".utf8), down = Data("\u{1B}[<65;10;5M".utf8), key = Data("x".utf8)
+        for i in 0..<300 { #expect(transport.sendInput((i / 15) % 2 == 0 ? up : down)) }
+        #expect(transport.sendInput(key))
+        #expect(writer.inputs.count == 1)                     // the first step only
+        transport.acknowledgeInput(sequence: transport.pendingInputSequencesForTesting[0], pane: "p")
+        #expect(writer.inputs.count == 2)                     // net steps (<= 8) then the key, one frame
+        let batch = writer.inputs[1].dropFirst(24)
+        #expect(batch.suffix(1) == key && batch.count <= 8 * up.count + key.count)
+    }
+
+    @MainActor @Test
+    func aKeyAfterDeferredWheelStepsKeepsItsOrder() throws {
+        let writer = OwnedPromptFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer,
+            profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
+            capabilities: ["input_ack_v1"], controlGranted: true)
+        defer { transport.detach() }
+        let up = Data("\u{1B}[<64;10;5M".utf8), key = Data("q".utf8)
+        #expect(transport.sendInput(key))
+        #expect(transport.sendInput(up)); #expect(transport.sendInput(up))
+        #expect(transport.sendInput(key))                     // after the wheel steps
+        #expect(writer.inputs.count == 1)
+        transport.acknowledgeInput(sequence: transport.pendingInputSequencesForTesting[0], pane: "p")
+        #expect(writer.inputs.count == 2 && writer.inputs[1].dropFirst(24) == up + up + key)
+        #expect(RelayWheelStep(Data("\u{1B}[<35;10;5M".utf8)) == nil)   // motion is not a wheel step
+        #expect(RelayWheelStep(Data("\u{1B}[<80;10;5M".utf8))?.kind == 80)  // ctrl+wheel up keeps its kind
     }
 }

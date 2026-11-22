@@ -304,6 +304,13 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// out as one frame, in order, when the worker catches up.
     private var heldInput = Data()
     static let maximumOutstandingInputFrames = 32
+    /// Wheel steps that arrived while input was unacknowledged, as a net count
+    /// of one SGR wheel kind. A Claude TUI drains about 30 wheel reports a
+    /// second (d62c62eb, 2026-11-22: 300 steps queued 10 s of input), so
+    /// opposite steps cancel and at most `maximumCoalescedWheelSteps` go out
+    /// per round trip; keys typed after a fast scroll no longer wait behind it.
+    private var deferredWheel: RelayCoalescedWheel?
+    static let maximumCoalescedWheelSteps = 8
     private var inputOverflowed = false
     private var attachRepaintPending = false
     private var attached = false {
@@ -505,6 +512,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         automationInputSequences.removeAll(keepingCapacity: true)
         pendingInputBytes = 0
         deferredMotionReport = nil
+        deferredWheel = nil
         heldInput.removeAll(keepingCapacity: false)
         inputOverflowed = false
         attachRepaintPending = forceAttachRepaint
@@ -1418,8 +1426,9 @@ final class RelayRemoteTransport: @unchecked Sendable {
         supportsExactViewportCommits = RelayTransportCapabilityPolicy.supportsExactViewportCommit(capabilities)
         let needsPostAttachResize = RelayTransportCapabilityPolicy.needsPostAttachResize(capabilities)
         // Held input predates anything typed while the route was down.
-        let backlog = heldInput + inputBacklog
+        let backlog = heldInput + (deferredWheel?.reports ?? Data()) + inputBacklog
         heldInput.removeAll(keepingCapacity: false)
+        deferredWheel = nil
         inputBacklog.removeAll(keepingCapacity: true)
         signalPromptEditorLeaseChangedLocked()
         let resize = latestResize
@@ -1645,13 +1654,31 @@ final class RelayRemoteTransport: @unchecked Sendable {
             held = heldInput
             heldInput.removeAll(keepingCapacity: false)
         }
-        let motion = held == nil ? takeDeferredMotionLocked() : nil
+        var wheel: Data?
+        if held == nil, pendingInputBytes == 0, let coalesced = deferredWheel {
+            deferredWheel = nil
+            wheel = coalesced.reports
+        }
+        let motion = held == nil && wheel?.isEmpty != false ? takeDeferredMotionLocked() : nil
         lock.unlock()
         RelayPaneDelayStore.shared.inputAcknowledged(pane: pane, sequence: sequence)
         if let held { sendInput(held) }
+        if let wheel, !wheel.isEmpty { sendBatchedInput(wheel) }
         if let motion { sendInput(motion) }
     }
     var heldInputForTesting: Data { lock.lock(); defer { lock.unlock() }; return heldInput }
+    var deferredWheelForTesting: Data? { lock.lock(); defer { lock.unlock() }; return deferredWheel?.reports }
+    /// Sends coalesced wheel reports as one frame, bypassing the wheel check.
+    private func sendBatchedInput(_ data: Data) {
+        lock.lock()
+        if pendingInputBytes > 0 || !heldInput.isEmpty {
+            heldInput.append(data)   // something got ahead; keep order
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        sendInput(data)
+    }
     var pendingInputSequencesForTesting: [UInt64] { lock.lock(); defer { lock.unlock() }; return pendingInputs.keys.sorted() }
     /// Caller holds `lock`. The withheld pointer position, once nothing is
     /// left unacknowledged.
@@ -1682,8 +1709,23 @@ final class RelayRemoteTransport: @unchecked Sendable {
             lock.unlock()
             return true
         }
+        if supportsInputAcknowledgements, pendingInputBytes > 0, writer != nil, attached,
+           let step = RelayWheelStep(data) {
+            if deferredWheel == nil || deferredWheel?.accepts(step) == true {
+                var wheel = deferredWheel ?? RelayCoalescedWheel(step)
+                if deferredWheel != nil { wheel.add(step, cap: Self.maximumCoalescedWheelSteps) }
+                deferredWheel = wheel
+                lock.unlock()
+                return true
+            }
+        }
         var data = data
         var mustBacklog = false
+        // Anything else keeps its place after the wheel steps already taken.
+        if let wheel = deferredWheel {
+            deferredWheel = nil
+            heldInput.append(wheel.reports)
+        }
         if supportsInputAcknowledgements, writer != nil, attached,
            !heldInput.isEmpty || pendingInputs.count >= Self.maximumOutstandingInputFrames {
             if pendingInputBytes + heldInput.count + data.count <= 64 << 10 {
@@ -2358,5 +2400,50 @@ final class RelayWireWriter: RelayFrameWriting, @unchecked Sendable {
         reportedFailure = true
         lock.unlock()
         onError(error.localizedDescription)
+    }
+}
+
+
+/// One SGR wheel report (`ESC [ < b ; x ; y M`), and only that.
+struct RelayWheelStep: Equatable {
+    let kind: Int          // button code without the direction bit
+    let direction: Int     // +1 for up/left, -1 for down/right
+    let column: Int, row: Int
+    init?(_ data: Data) {
+        let bytes = Array(data)
+        guard bytes.count >= 9, bytes.count <= 32, bytes.starts(with: [0x1B, 0x5B, 0x3C]), bytes.last == 0x4D else { return nil }
+        let fields = bytes.dropFirst(3).dropLast().split(separator: 0x3B, omittingEmptySubsequences: false)
+        guard fields.count == 3,
+              fields.allSatisfy({ !$0.isEmpty && $0.allSatisfy { (0x30...0x39).contains($0) } }),
+              let button = Int(String(decoding: fields[0], as: UTF8.self)),
+              let column = Int(String(decoding: fields[1], as: UTF8.self)),
+              let row = Int(String(decoding: fields[2], as: UTF8.self)),
+              button & 64 != 0, button & (128 | 32) == 0 else { return nil }
+        kind = button & ~1
+        direction = button & 1 == 0 ? 1 : -1
+        self.column = column
+        self.row = row
+    }
+}
+
+/// Net wheel steps of one kind (axis and modifiers): opposite steps cancel and
+/// the net is capped, so a fast scroll costs the agent at most `cap` reports.
+struct RelayCoalescedWheel: Equatable {
+    private(set) var kind: Int
+    private(set) var net: Int
+    private(set) var column: Int, row: Int
+    init(_ step: RelayWheelStep) { kind = step.kind; net = step.direction; column = step.column; row = step.row }
+    func accepts(_ step: RelayWheelStep) -> Bool { step.kind == kind }
+    mutating func add(_ step: RelayWheelStep, cap: Int) {
+        net = max(-cap, min(cap, net + step.direction))
+        column = step.column
+        row = step.row
+    }
+    var reports: Data {
+        let button = net > 0 ? kind : kind | 1
+        let one = Data("\u{1B}[<\(button);\(column);\(row)M".utf8)
+        var data = Data()
+        for _ in 0..<abs(net) { data.append(one) }
+        return data
     }
 }
