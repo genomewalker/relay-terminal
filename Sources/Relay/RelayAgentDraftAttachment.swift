@@ -48,4 +48,7 @@ struct RelayAgentDraftAttachment: Codable, Equatable, Identifiable, Sendable {
 struct RelayAgentStoredDraft: Equatable, Sendable {
     let text: String
     let attachments: [RelayAgentDraftAttachment]
+    /// How many held messages were saved into `text` behind the draft, so a
+    /// restored composer can warn that Return would send them as one message.
+    var heldMessages: Int = 0
 }

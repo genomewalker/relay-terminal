@@ -5,7 +5,13 @@ import Foundation
 /// are cancelled only when the pane itself is closed.
 @MainActor
 final class PaneComposerState: ObservableObject {
-    @Published var draft = ""
+    @Published var draft = "" {
+        // Once the restored text is sent or cleared, the warning no longer applies.
+        didSet { if draft.isEmpty { restoredHeldMessages = 0 } }
+    }
+    /// Held messages from before a restart that came back inside `draft`.
+    /// They are only text now: Return would send them with the draft as one message.
+    @Published private(set) var restoredHeldMessages = 0
     let attachmentQueue = RelayAgentAttachmentQueue()
     /// Whether the saved draft has been loaded into this state.
     var restored = false
@@ -36,15 +42,31 @@ final class PaneComposerState: ObservableObject {
         guard draft.isEmpty, attachmentQueue.attachments.isEmpty,
               let saved = store.loadDraft(hostID: hostID, paneID: paneID) else { return }
         draft = saved.text
+        restoredHeldMessages = saved.text.isEmpty ? 0 : saved.heldMessages
         attachmentQueue.restore(saved.attachments)
     }
 
     func persist(hostID: String, paneID: UUID, immediate: Bool, store: RelayAgentDraftStore = .shared) {
         if immediate {
-            store.saveNow(queue.textForSaving(draft), hostID: hostID, paneID: paneID, attachments: attachmentQueue.attachments)
+            store.saveNow(queue.textForSaving(draft), hostID: hostID, paneID: paneID, attachments: attachmentQueue.attachments,
+                          heldMessages: heldMessagesForSaving)
         } else {
-            store.save(queue.textForSaving(draft), hostID: hostID, paneID: paneID, attachments: attachmentQueue.attachments)
+            store.save(queue.textForSaving(draft), hostID: hostID, paneID: paneID, attachments: attachmentQueue.attachments,
+                       heldMessages: heldMessagesForSaving)
         }
+    }
+
+    /// Held messages in the saved text: the live queue plus any restored ones
+    /// still inside the draft, so the warning survives a second restart.
+    private var heldMessagesForSaving: Int {
+        queue.items.count + (draft.isEmpty ? 0 : restoredHeldMessages)
+    }
+
+    /// The composer hint for a restored draft that contains held messages.
+    nonisolated static func restoredHeldWarning(count: Int) -> String? {
+        guard count > 0 else { return nil }
+        let messages = count == 1 ? "1 held message" : "\(count) held messages"
+        return "This draft includes \(messages) from before Relay restarted. ↩ sends all of it as one message; edit it first to send them separately."
     }
 
     /// Called by `WorkspaceModel` when the pane is closed, never on view disappearance.

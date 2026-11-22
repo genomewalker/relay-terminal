@@ -121,6 +121,54 @@ final class RelayAgentPromptQueueTests: XCTestCase {
         XCTAssertFalse(state.hasPendingInput)
     }
 
+    @MainActor
+    func testRestoredDraftWarnsAboutHeldMessagesUntilCleared() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = RelayAgentDraftStore(directory: dir)
+        let state = PaneComposerState()
+        state.draft = "draft"
+        state.queue.enqueue("one", binding: binding()); state.queue.enqueue("two", binding: binding())
+        state.persist(hostID: "h", paneID: pane, immediate: true, store: store)
+        XCTAssertEqual(store.loadDraft(hostID: "h", paneID: pane)?.heldMessages, 2)
+
+        let restored = PaneComposerState()
+        restored.restoreIfNeeded(hostID: "h", paneID: pane, store: store)
+        XCTAssertEqual(restored.draft, "draft\n\none\n\ntwo")
+        XCTAssertTrue(restored.queue.isEmpty)
+        XCTAssertEqual(restored.restoredHeldMessages, 2)
+
+        // A second restart before sending keeps the warning.
+        restored.persist(hostID: "h", paneID: pane, immediate: true, store: store)
+        let again = PaneComposerState()
+        again.restoreIfNeeded(hostID: "h", paneID: pane, store: store)
+        XCTAssertEqual(again.restoredHeldMessages, 2)
+
+        // Sending or clearing the draft ends the warning.
+        again.draft = ""
+        XCTAssertEqual(again.restoredHeldMessages, 0)
+    }
+
+    @MainActor
+    func testPlainDraftRestoresWithoutWarning() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = RelayAgentDraftStore(directory: dir)
+        store.saveNow("just a draft", hostID: "h", paneID: pane)
+        XCTAssertEqual(store.loadDraft(hostID: "h", paneID: pane)?.heldMessages, 0)
+        let restored = PaneComposerState()
+        restored.restoreIfNeeded(hostID: "h", paneID: pane, store: store)
+        XCTAssertEqual(restored.restoredHeldMessages, 0)
+        XCTAssertNil(PaneComposerState.restoredHeldWarning(count: restored.restoredHeldMessages))
+    }
+
+    func testRestoredHeldWarningText() {
+        XCTAssertNil(PaneComposerState.restoredHeldWarning(count: 0))
+        XCTAssertTrue(PaneComposerState.restoredHeldWarning(count: 1)!.contains("1 held message from before Relay restarted"))
+        XCTAssertTrue(PaneComposerState.restoredHeldWarning(count: 3)!.contains("3 held messages"))
+        XCTAssertTrue(PaneComposerState.restoredHeldWarning(count: 3)!.contains("as one message"))
+    }
+
     func testHeaderBadgeNamesCountAndPause() {
         XCTAssertEqual(RelayHeldMessagesBadge.title(count: 2, paused: false), "2 held")
         XCTAssertEqual(RelayHeldMessagesBadge.title(count: 1, paused: true), "1 held · paused")
