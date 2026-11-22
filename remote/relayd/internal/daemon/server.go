@@ -319,6 +319,7 @@ type multiplexedSession struct {
 	outbound         chan protocol.Frame
 	closed           chan struct{}
 	closeOnce        sync.Once
+	closeReason      atomic.Value // string: why the supervisor closed this route
 	capabilitiesMu   sync.RWMutex
 	capabilitiesSeen bool
 	viewportCommitV2 bool
@@ -379,6 +380,28 @@ func (session *multiplexedSession) close() {
 	})
 }
 
+// closeWith records why the supervisor closed the route before closing it, so
+// the route_closed status and the supervisor log can say which side cut the
+// view. The first reason wins; a route closes once.
+func (session *multiplexedSession) closeWith(reason string) {
+	session.closeReason.CompareAndSwap(nil, reason)
+	session.close()
+}
+
+func (session *multiplexedSession) recordedCloseReason() string {
+	reason, _ := session.closeReason.Load().(string)
+	return reason
+}
+
+// enqueueOrClose forwards one client frame to the worker, or closes the route
+// with the reason when the worker has stopped draining its input.
+func (session *multiplexedSession) enqueueOrClose(frame protocol.Frame) {
+	if !session.enqueue(frame) {
+		session.closeWith(fmt.Sprintf("client frames to the worker are not draining (queue of %d full, frame type %d)",
+			cap(session.outbound), frame.Type))
+	}
+}
+
 // The node reader must never wait for one pane's worker. A stopped foreground
 // process can fill its PTY input queue and block the worker's protocol reader;
 // queue that pane independently so heartbeats and sibling panes keep moving.
@@ -403,8 +426,8 @@ func (session *multiplexedSession) forwardToWorker() {
 	for {
 		select {
 		case frame := <-session.outbound:
-			if writer.Write(frame) != nil {
-				session.close()
+			if err := writer.Write(frame); err != nil {
+				session.closeWith("writing to the worker failed: " + err.Error())
 				return
 			}
 		case <-session.closed:
@@ -593,6 +616,9 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 			go virtual.forwardToWorker()
 			go server.serveConnection(serverSide)
 			go func(id string, session *multiplexedSession) {
+				// Without a supervisor-side reason the worker ended the route:
+				// it cut a viewer that fell behind (its log says why) or exited.
+				workerEnd := "the worker ended the route"
 				defer func() {
 					// A pane worker deliberately disconnects a viewer whose bounded
 					// output queue fell behind. On a dedicated SSH connection that EOF
@@ -602,10 +628,15 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 					// shell prompt disappear forever. Tell only the current route to
 					// reopen from its last acknowledged sequence. A route superseded by
 					// a newer Hello must not close that replacement.
+					reason := session.recordedCloseReason()
+					if reason == "" {
+						reason = workerEnd
+					}
 					if closeSession(id, session) {
+						fmt.Fprintf(os.Stderr, "relay: route %s closed: %s\n", id, reason)
 						status, _ := protocol.JSONFrame(protocol.Status, protocol.StatusPayload{
 							State:   "route_closed",
-							Message: "Pane output route closed; replay is required.",
+							Message: "Pane output route closed (" + reason + "); replay is required.",
 						})
 						_ = writer.Write(protocol.HostEventFrame(id, status))
 					}
@@ -616,6 +647,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 				for {
 					frame, readErr := protocol.ReadFrame(session.connection)
 					if readErr != nil {
+						workerEnd = "the worker ended the route: " + readErr.Error()
 						_ = batch.flush()
 						return
 					}
@@ -626,14 +658,13 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 					if session.terminalOnly && frame.Type == protocol.AgentEvent {
 						continue
 					}
-					if batch.write(frame) != nil {
+					if err := batch.write(frame); err != nil {
+						workerEnd = "forwarding worker output to the client failed: " + err.Error()
 						return
 					}
 				}
 			}(sessionID, virtual)
-			if !virtual.enqueue(inner) {
-				virtual.close()
-			}
+			virtual.enqueueOrClose(inner)
 			continue
 		}
 
@@ -652,15 +683,11 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 				if loadErr == nil && manifest.supports("viewport_commit_v2") {
 					// The status and manifest normally agree. Prefer the durable
 					// capability if a commit raced the routed attached status.
-					if !virtual.enqueue(inner) {
-						virtual.close()
-					}
+					virtual.enqueueOrClose(inner)
 					continue
 				}
 				if loadErr != nil {
-					if !virtual.enqueue(inner) {
-						virtual.close()
-					}
+					virtual.enqueueOrClose(inner)
 					continue
 				}
 				generation, cols, rows, parseErr := protocol.ParseViewportCommit(inner)
@@ -698,9 +725,7 @@ func (server *Server) serveNodeMultiplex(connection net.Conn) {
 				}
 			}
 		}
-		if !virtual.enqueue(inner) {
-			virtual.close()
-		}
+		virtual.enqueueOrClose(inner)
 	}
 }
 
