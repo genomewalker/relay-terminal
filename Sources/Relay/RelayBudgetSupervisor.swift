@@ -110,10 +110,7 @@ struct RelayBudgetObservation {
             default: return false
             }
         }
-        overview = { pane in
-            RelayPaneHealthCoordinator.shared.hostOverviews().flatMap(\.livePanes)
-                .first { $0.paneID == pane.id.uuidString.lowercased() }
-        }
+        overview = { pane in RelayPaneHealthCoordinator.shared.paneOverview(pane) }
         accountUsage = { pane in RelayBudgetSupervisor.readings(RelayControlCenterState.accountUsage(pane)) }
         notify = { notice in RelayAttentionNotifier.shared.postBudgetNotice(notice) }
     }

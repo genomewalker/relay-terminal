@@ -305,6 +305,19 @@ import SwiftUI
         }
     }
 
+    /// One pane's row of `hostOverviews()`, without building every host's
+    /// rows: the budget supervisor asks for each pane in turn, and the full
+    /// build per pane made that O(panes²) on the main thread.
+    func paneOverview(_ pane: PaneModel, now: Date = Date()) -> PaneOverview? {
+        let key = pane.profile.connectionKey
+        guard journal.hosts[key] != nil, let tracked = references[pane.id]?.pane,
+              tracked.profile.connectionKey == key else { return nil }
+        let (state, fresh) = observationState(tracked, now: now)
+        let proof = fresh ? observations[tracked.id]?.proof : nil
+        return PaneOverview(paneID: tracked.id.uuidString.lowercased(), name: tracked.title,
+            observationState: state, worker: proof?.worker, context: proof?.context)
+    }
+
     func observe(_ pane: PaneModel, proof: RelayAgentMaintenanceProbe, now: Date = Date()) {
         observations[pane.id] = Observation(proof: proof, at: now)
         revision &+= 1

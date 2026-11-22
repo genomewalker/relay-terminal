@@ -64,7 +64,12 @@ struct RelayPaneHealthFacts: Codable, Equatable, Sendable {
         let valid = agentValid || shellValid
         let draft = pane.composerStateIfCreated?.hasPendingInput ?? false
         let explained = proof.map { RelayAgentMaintenancePolicy.explainedFooterAgents($0, subagents: pane.subagents) } ?? 0
-        let empty = pane.runtime.agentMaintenancePromptIsEmpty(explainedAgents: explained)
+        // Reading a prompt dumps the pane's screen on the main thread. A pane
+        // that is not connected, or whose program ended, can never read empty,
+        // so do not read it: with ~200 panes this check took a quarter of the
+        // main thread every 15 s (Relay 0.5.160 sample, 2026-11-22).
+        let readable = !ended && pane.connectionState == .connected
+        let empty = readable && pane.runtime.agentMaintenancePromptIsEmpty(explainedAgents: explained)
         let inputIdle = Date().timeIntervalSince(pane.agentLastInputAt) >= 15
         let connection: String
         switch pane.connectionState {
@@ -107,7 +112,8 @@ struct RelayPaneHealthFacts: Codable, Equatable, Sendable {
         // whose screen was never read, a changing screen, a guard). Say which,
         // so a hold is not mistaken for typed text. Unknown still holds.
         if !empty {
-            fields["prompt_blocker"] = .string(pane.runtime.agentMaintenancePromptBlocker(explainedAgents: explained)
+            fields["prompt_blocker"] = .string(!readable ? "the pane is not connected"
+                : pane.runtime.agentMaintenancePromptBlocker(explainedAgents: explained)
                 ?? "the screen changed while it was read")
             if let proof {
                 fields["footer_agent_facts"] = .string(RelayAgentMaintenancePolicy.footerAgentFacts(proof,
