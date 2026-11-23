@@ -170,7 +170,7 @@ struct WorkspaceView: View {
             .onChange(of: sidebarTarget) { _, target in moveSidebar(to: target) }
             }
             if !workspace.networkVisible {
-                RBoundedWorkspaceHost(workspace: workspace)
+                RBoundedWorkspaceHost(workspace: workspace, sidebar: sidebarLayoutState)
                     .padding(.trailing, RelayTheme.spacing(220))
                     .zIndex(100)
             }
@@ -6082,6 +6082,9 @@ private struct RPresentationPersistence: ViewModifier {
 
 private struct RBoundedWorkspaceHost: View {
     @ObservedObject var workspace: WorkspaceModel
+    /// The navigator's motion: the panel slides with the panes on the same
+    /// curve and takes its new bounds once, when the motion ends.
+    let sidebar: RelaySidebarLayoutState
     @ObservedObject private var windows = RelayToolWindowCoordinator.shared
 
     var body: some View {
@@ -6113,8 +6116,8 @@ private struct RBoundedWorkspaceHost: View {
             }
             }
                 .padding(.top, workspace.isFullScreen ? 40 : 46)
-                .padding(.leading, workspace.sidebarVisible
-                         ? (RelayPreferences.shared.compactInterface ? 245 : 261) : 0)
+                .padding(.leading, sidebar.heldWidth)
+                .offset(x: sidebar.slideOffset)
         }
     }
 }
