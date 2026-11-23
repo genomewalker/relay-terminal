@@ -51,123 +51,71 @@ struct WorkspaceView: View {
     @State private var paneCloseNoticeTask: Task<Void, Never>?
     @AppStorage("relay.relayd-onboarding-seen.v1") private var relaydOnboardingSeen = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var sidebarLayout: RelaySidebarLayoutState?
-
-    private var sidebarWidth: CGFloat { preferences.compactInterface ? 244 : 260 }
-    /// The navigator's full width with its edge rule, or nothing when hidden.
-    private var sidebarTarget: CGFloat { workspace.sidebarVisible ? sidebarWidth + 1 : 0 }
-    private var sidebarLayoutState: RelaySidebarLayoutState { sidebarLayout ?? .init(target: sidebarTarget) }
-
-    /// Every way the navigator is shown or hidden (button, shortcut, menu,
-    /// full screen, restore) arrives here, so it always ends with one resize.
-    private func moveSidebar(to target: CGFloat) {
-        var state = sidebarLayoutState
-        guard let animation = RelaySidebarMotion.animation(reduceMotion: reduceMotion) else {
-            state.finish(target, generation: nil)
-            sidebarLayout = state
-            return
-        }
-        let generation = state.begin(target)
-        withAnimation(animation) {
-            sidebarLayout = state
-        } completion: {
-            // Read the live target: a reversal mid-motion has its own completion.
-            guard var settled = sidebarLayout else { return }
-            settled.finish(sidebarTarget, generation: generation)
-            sidebarLayout = settled
-        }
-    }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
         HStack(spacing: RelayTheme.spacing(0)) {
             WorkspaceToolRail(workspace: workspace)
-            // The navigator's edge, the tab strip and the panes move together;
-            // the panes keep their width until the motion ends, then resize once.
-            GeometryReader { geometry in
-                let layout = sidebarLayoutState
-                ZStack(alignment: .topLeading) {
-                    if layout.mounted {
-                        HStack(spacing: RelayTheme.spacing(0)) {
-                            WorkspaceSidebar(workspace: workspace) {
-                                SessionManager(workspace: workspace)
-                            }
-                            .frame(width: sidebarWidth)
-                            Rectangle().fill(RelayTheme.line.opacity(0.38)).frame(width: 1)
-                        }
-                        // Rows keep their width and the reveal clips them.
-                        .frame(width: sidebarWidth + 1, alignment: .leading)
-                        .frame(width: max(0, layout.revealWidth), alignment: .leading)
-                        .clipped()
-                        .opacity(RelaySidebarMotion.navigatorOpacity(reveal: layout.revealWidth, full: sidebarWidth + 1))
-                        .transition(.identity)
+                if workspace.sidebarVisible {
+                    WorkspaceSidebar(workspace: workspace) {
+                        SessionManager(workspace: workspace)
                     }
-                    VStack(spacing: RelayTheme.spacing(0)) {
-                        WorkspaceNavigationHeader(workspace: workspace) {
-                            WorkspaceTabRail(workspace: workspace)
-                        }
-                            // Above the rule below, so the selected tab can join the panes.
-                            .zIndex(1)
-                            if let issue = workspace.workspacePersistenceIssue {
-                                Label(issue, systemImage: "exclamationmark.triangle")
-                                    .font(RelayTheme.font(size: 11, weight: .medium))
-                                    .foregroundStyle(.orange)
-                                    .padding(.horizontal, RelayTheme.spacing(12))
-                                    .padding(.vertical, RelayTheme.spacing(7))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(RelayTheme.surface)
-                            } else if workspace.workspacePendingChanges > 0 {
-                                Label("\(workspace.workspacePendingChanges) saved workspace change drafts await recovery", systemImage: "tray.full")
-                                    .font(RelayTheme.font(size: 11, weight: .medium))
-                                    .padding(.horizontal, RelayTheme.spacing(12))
-                                    .padding(.vertical, RelayTheme.spacing(7))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(RelayTheme.surface)
-                            }
-                            if RelayLaunchMode.isSafeMode {
-                                HStack(spacing: RelayTheme.spacing(7)) {
-                                    Image(systemName: "shield")
-                                    Text("Safe mode · workspace restore and artifact previews are disabled")
-                                    Spacer()
-                                }
-                                .font(RelayTheme.font(size: 10.5, weight: .medium))
-                                .foregroundStyle(RelayTheme.textMuted)
-                                .padding(.horizontal, RelayTheme.spacing(12))
-                                .frame(height: 30)
-                                .background(RelayTheme.surface)
-                                .accessibilityLabel("Relay is running in safe mode")
-                            }
-                            PaneLinkSelectionBar(workspace: workspace, selection: workspace.paneLinkSelection)
-                            Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
-                            ZStack {
-                            WorkspaceNavigationContent(workspace: workspace) {
-                                if let tab = workspace.visibleTab {
-                                    WorkspaceDockLayout(tab: tab, workspace: workspace)
-                                        .environment(\.networkCoverActive, workspace.networkVisible)
-                                        .background(RelayTheme.terminalCanvas)
-                                } else if workspace.selectedWorkspaceID != nil {
-                                    EmptyWorkspaceView(workspace: workspace)
-                                }
-                            }
-                            .opacity(workspace.networkVisible ? 0.42 : 1)
-                            .allowsHitTesting(!workspace.networkVisible)
-                            .accessibilityHidden(workspace.networkVisible)
-                            if workspace.networkVisible {
-                                PeerNetworkView(workspace: workspace)
-                            }
-                            }
-                        }
-                    .frame(width: max(0, geometry.size.width - layout.heldWidth),
-                           height: geometry.size.height, alignment: .topLeading)
-                    .coordinateSpace(name: RelaySidebarMotion.panelSpace)
-                    .offset(x: layout.revealWidth)
-                }
-                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
-                // Uncovered while closing, until the panes take the freed width.
-                .background(RelayTheme.terminalCanvas)
-                .clipped()
+                        .frame(width: preferences.compactInterface ? 244 : 260)
+                    Rectangle().fill(RelayTheme.line.opacity(0.38)).frame(width: 1)
             }
-            .onChange(of: sidebarTarget) { _, target in moveSidebar(to: target) }
+            VStack(spacing: RelayTheme.spacing(0)) {
+                WorkspaceNavigationHeader(workspace: workspace) {
+                    WorkspaceTabRail(workspace: workspace)
+                }
+                    if let issue = workspace.workspacePersistenceIssue {
+                        Label(issue, systemImage: "exclamationmark.triangle")
+                            .font(RelayTheme.font(size: 11, weight: .medium))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, RelayTheme.spacing(12))
+                            .padding(.vertical, RelayTheme.spacing(7))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RelayTheme.surface)
+                    } else if workspace.workspacePendingChanges > 0 {
+                        Label("\(workspace.workspacePendingChanges) saved workspace change drafts await recovery", systemImage: "tray.full")
+                            .font(RelayTheme.font(size: 11, weight: .medium))
+                            .padding(.horizontal, RelayTheme.spacing(12))
+                            .padding(.vertical, RelayTheme.spacing(7))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RelayTheme.surface)
+                    }
+                    if RelayLaunchMode.isSafeMode {
+                        HStack(spacing: RelayTheme.spacing(7)) {
+                            Image(systemName: "shield")
+                            Text("Safe mode · workspace restore and artifact previews are disabled")
+                            Spacer()
+                        }
+                        .font(RelayTheme.font(size: 10.5, weight: .medium))
+                        .foregroundStyle(RelayTheme.textMuted)
+                        .padding(.horizontal, RelayTheme.spacing(12))
+                        .frame(height: 30)
+                        .background(RelayTheme.surface)
+                        .accessibilityLabel("Relay is running in safe mode")
+                    }
+                    PaneLinkSelectionBar(workspace: workspace, selection: workspace.paneLinkSelection)
+                    Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1)
+                    ZStack {
+                    WorkspaceNavigationContent(workspace: workspace) {
+                        if let tab = workspace.visibleTab {
+                            WorkspaceDockLayout(tab: tab, workspace: workspace)
+                                .environment(\.networkCoverActive, workspace.networkVisible)
+                                .background(RelayTheme.terminalCanvas)
+                        } else if workspace.selectedWorkspaceID != nil {
+                            EmptyWorkspaceView(workspace: workspace)
+                        }
+                    }
+                    .opacity(workspace.networkVisible ? 0.42 : 1)
+                    .allowsHitTesting(!workspace.networkVisible)
+                    .accessibilityHidden(workspace.networkVisible)
+                    if workspace.networkVisible {
+                        PeerNetworkView(workspace: workspace)
+                    }
+                    }
+                }
             }
             if !workspace.networkVisible {
                 RBoundedWorkspaceHost(workspace: workspace)
@@ -1287,20 +1235,15 @@ struct WorkspaceTabRail: View {
                                 } catch { dropFailure = error.localizedDescription }
                             }
                         )
-                        // Down to the row's bottom and one point past it, over
-                        // the rule above the panes, so the selected tab joins them.
-                        .frame(width: 158, height: 37, alignment: .bottom)
+                        .frame(width: 158)
                     }
                     ChromeButton(symbol: "plus", help: "New tab in this workspace · ⌘T") {
                         workspace.newTabInActiveSession()
                     }
                     .padding(.leading, RelayTheme.spacing(3))
                 }
-                // Room for the selected tab's flares inside the scroll clip.
-                .padding(.horizontal, max(RelayTheme.spacing(4), RelaySidebarMotion.tabRadius))
+                .padding(.horizontal, RelayTheme.spacing(4))
             }
-            .frame(height: 37)
-            .padding(.bottom, -1)
             Spacer(minLength: 0)
             if let dropFailure {
                 Button { self.dropFailure = nil } label: {
@@ -1316,9 +1259,8 @@ struct WorkspaceTabRail: View {
         }
         .padding(.horizontal, RelayTheme.spacing(8))
         .frame(height: 36)
-        // Under the tabs, so the selected one covers it.
-        .background(alignment: .bottom) { Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1) }
         .background(RelayTheme.canvas)
+        .overlay(alignment: .bottom) { Rectangle().fill(RelayTheme.line.opacity(0.45)).frame(height: 1) }
         .relayStatusMarkVisibility()
     }
 }
@@ -1441,7 +1383,7 @@ private struct WorkspaceToolRail: View {
 
     var body: some View {
         VStack(spacing: RelayTheme.spacing(6)) {
-            ChromeButton(symbol: RelaySidebarMotion.toggleSymbol,
+            ChromeButton(symbol: workspace.sidebarVisible ? "sidebar.left" : "sidebar.right",
                          help: workspace.sidebarVisible ? "Hide navigator" : "Show navigator") {
                 workspace.sidebarVisible.toggle()
             }
@@ -1486,10 +1428,6 @@ private struct WorkspaceTab: View {
     @State private var paneRefusal: String?
     @State private var dropPlacement: TabMovePlacement?
     @State private var tabWidth: CGFloat = 1
-    /// Distance from this tab's leading edge to the panes' leading edge.
-    @State private var panelGap: CGFloat = .infinity
-
-    private var selectedForeground: Color { Color(white: 0.93) }
 
     var body: some View {
         HStack(spacing: RelayTheme.spacing(1)) {
@@ -1521,27 +1459,15 @@ private struct WorkspaceTab: View {
                     .frame(width: 22, height: 33)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(isSelected ? Color(white: 0.7) : RelayTheme.textMuted)
+            .foregroundStyle(RelayTheme.textMuted)
             .opacity(isSelected || hovering ? 1 : 0)
             .allowsHitTesting(isSelected || hovering)
             .accessibilityHidden(!isSelected && !hovering)
             .accessibilityLabel("Close \(label) tab")
         }
-        // The selected tab takes the panes' canvas, which is dark in both
-        // appearances, so its label is light in both.
-        .foregroundStyle(isSelected ? selectedForeground : RelayTheme.textMuted)
-        .background {
-            if isSelected {
-                let radius = RelaySidebarMotion.tabRadius
-                RelayJoinedTabShape(radius: radius,
-                                    leadingFlare: RelaySidebarMotion.facingRadius(radius, gap: panelGap),
-                                    trailingFlare: radius)
-                    .fill(RelayTheme.terminalCanvas)
-            } else if hovering {
-                RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6), style: .continuous)
-                    .fill(RelayTheme.hover.opacity(0.45))
-            }
-        }
+        .foregroundStyle(isSelected ? RelayTheme.text : RelayTheme.textMuted)
+        .background(isSelected ? RelayTheme.surface : hovering ? RelayTheme.hover.opacity(0.45) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6), style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: RelayTheme.cornerRadius(6), style: .continuous))
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay(alignment: .leading) {
@@ -1567,11 +1493,8 @@ private struct WorkspaceTab: View {
         }
         .background {
             GeometryReader { proxy in
-                let gap = proxy.frame(in: .named(RelaySidebarMotion.panelSpace)).minX
                 Color.clear
                     .preference(key: WorkspaceTabWidthPreferenceKey.self, value: proxy.size.width)
-                    .onAppear { panelGap = gap }
-                    .onChange(of: gap) { _, new in if isSelected { panelGap = new } }
             }
         }
         .onPreferenceChange(WorkspaceTabWidthPreferenceKey.self) { tabWidth = max($0, 1) }
