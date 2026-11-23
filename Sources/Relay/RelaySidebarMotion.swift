@@ -67,10 +67,6 @@ struct RelaySidebarLayoutState: Equatable {
         mounted = target > 0
     }
 
-    /// How far content laid out for `heldWidth` is drawn from its place
-    /// while the navigator's edge moves; zero at rest.
-    var slideOffset: CGFloat { revealWidth - heldWidth }
-
     /// Start moving toward `target`; returns the motion's generation.
     mutating func begin(_ target: CGFloat) -> Int {
         generation += 1

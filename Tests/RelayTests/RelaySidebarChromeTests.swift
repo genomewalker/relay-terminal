@@ -47,22 +47,6 @@ struct RelaySidebarChromeTests {
         #expect(state.heldWidth == 0 && !state.mounted)
     }
 
-    @Test func overlaysSlideWithTheEdgeAndSettleAtRest() {
-        // The R workspace panel is laid out for heldWidth and drawn at
-        // heldWidth + slideOffset, which is the navigator's moving edge.
-        var state = RelaySidebarLayoutState(target: 0)
-        #expect(state.slideOffset == 0)
-        let opening = state.begin(261)
-        #expect(state.heldWidth + state.slideOffset == state.revealWidth)
-        #expect(state.slideOffset == 261)
-        state.finish(261, generation: opening)
-        #expect(state.slideOffset == 0)
-        let closing = state.begin(0)
-        #expect(state.slideOffset == -261)
-        state.finish(0, generation: closing)
-        #expect(state.slideOffset == 0)
-    }
-
     @Test func aReversalIgnoresTheSupersededCompletion() {
         var state = RelaySidebarLayoutState(target: 0)
         let opening = state.begin(261)
