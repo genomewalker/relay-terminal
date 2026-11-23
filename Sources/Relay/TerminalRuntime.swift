@@ -711,17 +711,30 @@ enum TerminalViewportOwnershipPolicy {
 /// and resize barriers continue to bypass this delay.
 enum TerminalDisplayBatchPolicy {
     static let liveMilliseconds = 16
-    /// An echo or other small update after a quiet period is drawn at once.
-    /// Only sustained output waits, so a packet burst stays one Ghostty write.
-    static let interactiveBytes = 1024
+    /// Output reaches Ghostty as soon as it arrives. Bytes that arrive while
+    /// a drain is already queued join it, so a packet burst is still one
+    /// Ghostty write without a timer. Only a flood waits for the rest of the
+    /// frame: more than this many bytes, or more than `floodDrainsPerFrame`
+    /// drains, within one `liveMilliseconds` frame. A remote agent's stream
+    /// or its redraw after a scroll step is far below either bound; waiting a
+    /// frame for it added about 16 ms to every remote echo and scroll step.
+    static let floodBytesPerFrame = 256 * 1024
+    static let floodDrainsPerFrame = 8
 
+    /// - Parameters:
+    ///   - frameElapsedMilliseconds: time since the current frame window
+    ///     began (its first drain), or nil when there is no open window.
+    ///   - bytesDrainedThisFrame, drainsThisFrame: what that window drained.
     static func drainDelayMilliseconds(
-        immediate: Bool, pendingBytes: Int, millisecondsSinceLastDrain: Double?
+        immediate: Bool, pendingBytes: Int, frameElapsedMilliseconds: Double?,
+        bytesDrainedThisFrame: Int, drainsThisFrame: Int
     ) -> Int {
         if immediate { return 0 }
-        guard pendingBytes <= interactiveBytes else { return liveMilliseconds }
-        guard let elapsed = millisecondsSinceLastDrain else { return 0 }
-        return elapsed >= Double(liveMilliseconds) ? 0 : liveMilliseconds
+        guard let elapsed = frameElapsedMilliseconds, elapsed < Double(liveMilliseconds) else { return 0 }
+        let flooding = bytesDrainedThisFrame + pendingBytes > floodBytesPerFrame ||
+            drainsThisFrame >= floodDrainsPerFrame
+        guard flooding else { return 0 }
+        return max(1, liveMilliseconds - Int(elapsed))
     }
 }
 
@@ -5088,8 +5101,11 @@ final class TerminalIOBridge: @unchecked Sendable {
         displayLock.lock(); defer { displayLock.unlock() }
         return displayBytesInTransit
     }
-    /// Uptime of the last display drain; guarded by displayLock.
-    private var lastDisplayDrainUptime: UInt64?
+    /// The current display frame window: when its first drain ran, and the
+    /// bytes and drains it has delivered since. Guarded by displayLock.
+    private var displayFrameStartUptime: UInt64?
+    private var displayFrameBytes = 0
+    private var displayFrameDrains = 0
     /// Live browser companions observe the exact byte stream delivered to
     /// Ghostty. This dictionary is confined to displayQueue so a viewer cannot
     /// contend with terminal input or the PTY reader.
@@ -6729,11 +6745,12 @@ final class TerminalIOBridge: @unchecked Sendable {
             return
         }
         displayDrainScheduled = true
-        let elapsed = lastDisplayDrainUptime.map {
+        let elapsed = displayFrameStartUptime.map {
             Double(DispatchTime.now().uptimeNanoseconds &- $0) / 1_000_000
         }
         let delay = TerminalDisplayBatchPolicy.drainDelayMilliseconds(
-            immediate: immediate, pendingBytes: displayBuffer.count, millisecondsSinceLastDrain: elapsed
+            immediate: immediate, pendingBytes: displayBuffer.count, frameElapsedMilliseconds: elapsed,
+            bytesDrainedThisFrame: displayFrameBytes, drainsThisFrame: displayFrameDrains
         )
         displayLock.unlock()
         displayQueue.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
@@ -6759,7 +6776,16 @@ final class TerminalIOBridge: @unchecked Sendable {
         pendingObservedRepaintFrame = nil
         displayBuffer = Data()
         displayDrainScheduled = false
-        lastDisplayDrainUptime = DispatchTime.now().uptimeNanoseconds
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let start = displayFrameStartUptime,
+           now &- start < UInt64(TerminalDisplayBatchPolicy.liveMilliseconds) * 1_000_000 {
+            displayFrameBytes += batch.count
+            displayFrameDrains += 1
+        } else {
+            displayFrameStartUptime = now
+            displayFrameBytes = batch.count
+            displayFrameDrains = 1
+        }
         displayLock.unlock()
         // Hide rendering, not terminal emulation. A bounded byte suffix cannot
         // reconstruct an arbitrary terminal, especially after an alternate-

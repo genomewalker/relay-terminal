@@ -20,6 +20,15 @@ struct TerminalRepaintPolicyTests {
         #expect(p.action(canRender: true, composing: false, now: 10, lastApplied: 10 - 2 * p.coalesceInterval) == .apply)
     }
 
+    @Test("A wheel event repaints the viewport only when Ghostty itself scrolls")
+    func wheelRepaint() {
+        // Mouse captured: the wheel is report bytes for the program, and its
+        // redraw arrives as damaged output.
+        #expect(!TerminalRepaintPolicy.repaintsAfterWheel(applicationCapturesMouse: true))
+        // Not captured: Ghostty moves its own viewport, every row is stale.
+        #expect(TerminalRepaintPolicy.repaintsAfterWheel(applicationCapturesMouse: false))
+    }
+
     @Test("Only size and scale changes get a trailing repaint")
     func trailing() {
         let trailing = TerminalRepaintReason.allCases.filter(TerminalRepaintPolicy.needsTrailingRepaint)

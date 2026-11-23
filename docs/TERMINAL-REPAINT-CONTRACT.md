@@ -98,7 +98,7 @@ Other options considered:
 |---|---|---|
 | Size | `AppTerminalView.setFrameSize` when the size really changed (`.size`), plus a trailing repaint 150 ms later for the resize throttle's last size | grid rebuild only when rows/columns changed |
 | Scale / screen | `viewDidChangeBackingProperties`, `windowDidChangeScreen` (`.scale`, with trailing) | tick only |
-| Scroll | `scrollWheel`, `scrollToRow`, `jumpToPrompt` (`.scroll`) | none from the view; relied on Ghostty's viewport-pin redraw |
+| Scroll | `scrollWheel` (only when the program does not capture the mouse), `scrollToRow`, `jumpToPrompt` (`.scroll`) | none from the view; relied on Ghostty's viewport-pin redraw |
 | Replay / presentation | `synchronizeAndRenderImmediately` (`.replay`), used by TerminalRuntime after an attach replay and when a pane is presented or resumed | `refresh()` (renderer wakeup only) |
 | Visibility | coordinator `setDisplayVisible(true)`, `setApplicationActive(true)` (`.visibility`) | tick only, no rebuild |
 | Attach | `viewDidMoveToWindow` with a window (`.attach`) | tick only |

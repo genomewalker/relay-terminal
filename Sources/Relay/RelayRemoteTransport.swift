@@ -311,6 +311,12 @@ final class RelayRemoteTransport: @unchecked Sendable {
     /// per round trip; keys typed after a fast scroll no longer wait behind it.
     private var deferredWheel: RelayCoalescedWheel?
     static let maximumCoalescedWheelSteps = 8
+    /// Wheel steps are only merged while acknowledgements lag: no ack, and no
+    /// newly outstanding input, for this long. On a healthy link (dandy-07
+    /// acks in about 6 ms after 0.5.82) every step goes out at once, so a
+    /// scroll is not held for a round trip per batch; a slow or busy worker
+    /// still gets the merged, capped steps.
+    static let wheelLagNanoseconds: UInt64 = 100_000_000
     /// Uptime of the last acknowledgement, or of the send that made input
     /// outstanding. Withholding input is only safe while acks keep arriving:
     /// with no progress for `inputStallNanoseconds` nothing is withheld, so a
@@ -1712,6 +1718,7 @@ final class RelayRemoteTransport: @unchecked Sendable {
         lock.lock()
         let now = inputClock()
         let stalled = pendingInputBytes > 0 && now &- lastInputProgress >= Self.inputStallNanoseconds
+        let lagging = pendingInputBytes > 0 && now &- lastInputProgress >= Self.wheelLagNanoseconds
         if supportsInputAcknowledgements, pendingInputBytes > 0, !stalled, writer != nil, attached,
            TerminalInputDiagnosticReport.name(data) == "mouse_motion" {
             // Only the pointer's latest position matters; send it once the
@@ -1720,8 +1727,10 @@ final class RelayRemoteTransport: @unchecked Sendable {
             lock.unlock()
             return true
         }
-        if supportsInputAcknowledgements, pendingInputBytes > 0, !stalled, writer != nil, attached,
-           let step = RelayWheelStep(data) {
+        if supportsInputAcknowledgements, !stalled, writer != nil, attached,
+           let step = RelayWheelStep(data), lagging || deferredWheel != nil {
+            // Once merging has begun, later steps join it so they keep their
+            // order behind the steps already withheld.
             if deferredWheel == nil || deferredWheel?.accepts(step) == true {
                 var wheel = deferredWheel ?? RelayCoalescedWheel(step)
                 if deferredWheel != nil { wheel.add(step, cap: Self.maximumCoalescedWheelSteps) }

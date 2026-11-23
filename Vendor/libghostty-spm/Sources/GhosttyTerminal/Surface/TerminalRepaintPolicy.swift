@@ -26,6 +26,17 @@ public enum TerminalRepaintReason: String, Sendable, CaseIterable {
 /// Pure decisions of the repaint contract, kept free of the surface so they
 /// can be tested directly.
 public enum TerminalRepaintPolicy {
+    /// Whether a wheel event repaints the whole viewport. When the running
+    /// program captures the mouse (Claude Code, Codex, vim with mouse on),
+    /// the wheel becomes report bytes for that program and Ghostty's own
+    /// viewport does not move, so there is nothing stale to repaint; the
+    /// program's redraw arrives as ordinary damaged output. Rebuilding every
+    /// row per wheel event there only competed with a streaming agent's
+    /// output (f42326bf, 2026-11-23).
+    public static func repaintsAfterWheel(applicationCapturesMouse: Bool) -> Bool {
+        !applicationCapturesMouse
+    }
+
     /// Quiet time after the last damage before one full rebuild.
     public static let settleDelay: TimeInterval = 0.3
     /// Under continuous damage, the longest stretch without a full rebuild.

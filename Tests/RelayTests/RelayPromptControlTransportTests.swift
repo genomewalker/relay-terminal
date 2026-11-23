@@ -484,9 +484,12 @@ struct RelayWheelCoalescingTests {
             profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
             capabilities: ["input_ack_v1"], controlGranted: true)
         defer { transport.detach() }
+        var clock: UInt64 = 1_000_000_000
+        transport.inputClock = { clock }
         let up = Data("\u{1B}[<64;10;5M".utf8), down = Data("\u{1B}[<65;10;5M".utf8)
         #expect(transport.sendInput(up))                      // caught up: sent at once
         #expect(writer.inputs.count == 1)
+        clock += RelayRemoteTransport.wheelLagNanoseconds    // the ack is lagging
         for _ in 0..<15 { #expect(transport.sendInput(up)) }   // +15
         for _ in 0..<5 { #expect(transport.sendInput(down)) }  // capped at +8, then -5
         #expect(writer.inputs.count == 1)
@@ -495,6 +498,7 @@ struct RelayWheelCoalescingTests {
         transport.acknowledgeInput(sequence: transport.pendingInputSequencesForTesting[0], pane: "p")
         #expect(writer.inputs.count == 2 && writer.inputs[1].dropFirst(24) == three)
         // Up and down cancel completely: nothing is sent.
+        clock += RelayRemoteTransport.wheelLagNanoseconds
         #expect(transport.sendInput(up)); #expect(transport.sendInput(down))
         transport.acknowledgeInput(sequence: transport.pendingInputSequencesForTesting[0], pane: "p")
         #expect(writer.inputs.count == 2)
@@ -507,8 +511,13 @@ struct RelayWheelCoalescingTests {
             profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
             capabilities: ["input_ack_v1"], controlGranted: true)
         defer { transport.detach() }
+        var clock: UInt64 = 1_000_000_000
+        transport.inputClock = { clock }
         let up = Data("\u{1B}[<64;10;5M".utf8), down = Data("\u{1B}[<65;10;5M".utf8), key = Data("x".utf8)
-        for i in 0..<300 { #expect(transport.sendInput((i / 15) % 2 == 0 ? up : down)) }
+        for i in 0..<300 {
+            #expect(transport.sendInput((i / 15) % 2 == 0 ? up : down))
+            if i == 0 { clock += RelayRemoteTransport.wheelLagNanoseconds }   // a busy worker
+        }
         #expect(transport.sendInput(key))
         #expect(writer.inputs.count == 1)                     // the first step only
         transport.acknowledgeInput(sequence: transport.pendingInputSequencesForTesting[0], pane: "p")
@@ -530,6 +539,7 @@ struct RelayWheelCoalescingTests {
         transport.inputClock = { clock }
         let up = Data("\u{1B}[<64;10;5M".utf8), key = Data("q".utf8)
         #expect(transport.sendInput(key))                     // outstanding, never acknowledged
+        clock += RelayRemoteTransport.wheelLagNanoseconds    // lagging: steps are merged
         #expect(transport.sendInput(up)); #expect(transport.sendInput(up))
         #expect(transport.sendInput(key))                     // held behind the wheel steps
         #expect(writer.inputs.count == 1)
@@ -549,8 +559,11 @@ struct RelayWheelCoalescingTests {
             profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
             capabilities: ["input_ack_v1"], controlGranted: true)
         defer { transport.detach() }
+        var clock: UInt64 = 1_000_000_000
+        transport.inputClock = { clock }
         let up = Data("\u{1B}[<64;10;5M".utf8), key = Data("q".utf8)
         #expect(transport.sendInput(key))
+        clock += RelayRemoteTransport.wheelLagNanoseconds
         #expect(transport.sendInput(up)); #expect(transport.sendInput(up))
         #expect(transport.sendInput(key))                     // after the wheel steps
         #expect(writer.inputs.count == 1)
@@ -558,5 +571,37 @@ struct RelayWheelCoalescingTests {
         #expect(writer.inputs.count == 2 && writer.inputs[1].dropFirst(24) == up + up + key)
         #expect(RelayWheelStep(Data("\u{1B}[<35;10;5M".utf8)) == nil)   // motion is not a wheel step
         #expect(RelayWheelStep(Data("\u{1B}[<80;10;5M".utf8))?.kind == 80)  // ctrl+wheel up keeps its kind
+    }
+
+    // f42326bf, 2026-11-23: scrolling a streaming remote agent felt stuck
+    // while dandy-07 acknowledged in about 1 ms. With acks flowing, every
+    // wheel step goes out at once instead of waiting a round trip per batch.
+    @MainActor @Test
+    func onAHealthyLinkEveryWheelStepIsSentAtOnce() throws {
+        let writer = OwnedPromptFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer,
+            profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
+            capabilities: ["input_ack_v1"], controlGranted: true)
+        defer { transport.detach() }
+        var clock: UInt64 = 1_000_000_000
+        transport.inputClock = { clock }
+        let up = Data("\u{1B}[<64;10;5M".utf8), down = Data("\u{1B}[<65;10;5M".utf8)
+        for i in 0..<20 {
+            #expect(transport.sendInput(i % 3 == 2 ? down : up))
+            clock += 5_000_000                                // 5 ms apart, none acknowledged yet
+        }
+        #expect(writer.inputs.count == 20)                    // nothing merged, cancelled or held
+        #expect(transport.deferredWheelForTesting == nil)
+        #expect(writer.inputs[2].dropFirst(24) == down)       // each step unchanged, in order
+        // Acks keep arriving: still sent directly.
+        transport.acknowledgeInput(sequence: transport.pendingInputSequencesForTesting[0], pane: "p")
+        clock += 5_000_000
+        #expect(transport.sendInput(up))
+        #expect(writer.inputs.count == 21)
+        // No progress for the lag interval: merging starts.
+        clock += RelayRemoteTransport.wheelLagNanoseconds
+        #expect(transport.sendInput(up)); #expect(transport.sendInput(up))
+        #expect(writer.inputs.count == 21)
+        #expect(transport.deferredWheelForTesting == up + up)
     }
 }

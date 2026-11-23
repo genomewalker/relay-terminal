@@ -254,13 +254,17 @@
                 precision: event.hasPreciseScrollingDeltas,
                 momentum: TerminalScrollModifiers.momentumFrom(phase: event.momentumPhase)
             )
+            // Read before sending: the scroll itself never changes the mode.
+            let captured = surface?.applicationIsCapturingMouse ?? false
             surface?.sendMouseScroll(
                 x: event.scrollingDeltaX,
                 y: event.scrollingDeltaY,
                 mods: scrollMods.rawValue
             )
             // Requests within one frame share a rebuild (coalesceInterval).
-            core.requestFullRepaint(.scroll)
+            if TerminalRepaintPolicy.repaintsAfterWheel(applicationCapturesMouse: captured) {
+                core.requestFullRepaint(.scroll)
+            }
         }
 
         private func updatePointerSelectionRect(to point: CGPoint) {
