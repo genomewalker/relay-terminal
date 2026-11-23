@@ -1728,9 +1728,12 @@ final class RelayRemoteTransport: @unchecked Sendable {
             return true
         }
         if supportsInputAcknowledgements, !stalled, writer != nil, attached,
-           let step = RelayWheelStep(data), lagging || deferredWheel != nil {
+           let step = RelayWheelStep(data),
+           lagging || deferredWheel != nil || pendingInputs.count >= Self.maximumOutstandingInputFrames {
             // Once merging has begun, later steps join it so they keep their
-            // order behind the steps already withheld.
+            // order behind the steps already withheld. At the outstanding-frame
+            // cap a fast scroll merges too: holding every step in full behind
+            // 32 frames made scrolling saturate (Kapk on dandy-07, 2026-11-23).
             if deferredWheel == nil || deferredWheel?.accepts(step) == true {
                 var wheel = deferredWheel ?? RelayCoalescedWheel(step)
                 if deferredWheel != nil { wheel.add(step, cap: Self.maximumCoalescedWheelSteps) }

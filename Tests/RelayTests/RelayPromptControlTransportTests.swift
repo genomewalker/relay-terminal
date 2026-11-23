@@ -604,4 +604,32 @@ struct RelayWheelCoalescingTests {
         #expect(writer.inputs.count == 21)
         #expect(transport.deferredWheelForTesting == up + up)
     }
+
+    // Kapk on dandy-07, 2026-11-23: a fast scroll was quick "until a point".
+    // At the 32-frame cap later steps were held in full; now they merge.
+    @MainActor @Test
+    func atTheFrameCapAFastScrollMergesInsteadOfQueueing() throws {
+        let writer = OwnedPromptFrameWriter()
+        let transport = RelayRemoteTransport(attachedFrameWriter: writer,
+            profile: ConnectionProfile(name: "Wheel fixture", host: "wheel-fixture.invalid"), paneID: UUID(),
+            capabilities: ["input_ack_v1"], controlGranted: true)
+        defer { transport.detach() }
+        var clock: UInt64 = 1_000_000_000
+        transport.inputClock = { clock }
+        let up = Data("\u{1B}[<64;10;5M".utf8), down = Data("\u{1B}[<65;10;5M".utf8)
+        let cap = RelayRemoteTransport.maximumOutstandingInputFrames
+        for _ in 0..<cap { #expect(transport.sendInput(up)); clock += 1_000_000 }
+        #expect(writer.inputs.count == cap)
+        for _ in 0..<100 { #expect(transport.sendInput(up)) }   // far more than the cap
+        for _ in 0..<3 { #expect(transport.sendInput(down)) }
+        #expect(writer.inputs.count == cap)
+        #expect(transport.heldInputForTesting.isEmpty)          // nothing queued in full
+        var five = Data(); for _ in 0..<5 { five.append(up) }
+        #expect(transport.deferredWheelForTesting == five)       // capped at +8, then -3
+        // Acks drain the outstanding frames; the merged steps go out once.
+        while let sequence = transport.pendingInputSequencesForTesting.first {
+            transport.acknowledgeInput(sequence: sequence, pane: "p")
+        }
+        #expect(writer.inputs.count == cap + 1 && writer.inputs[cap].dropFirst(24) == five)
+    }
 }
