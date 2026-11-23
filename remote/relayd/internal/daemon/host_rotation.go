@@ -98,6 +98,61 @@ type hostRotationSupervisor struct {
 	// Root completed turns seen by this worker, enrolled or not. In memory
 	// only: it explains status and never schedules an evaluation itself.
 	observation hostRotationObservation
+	// Durable capacity revocation for human input runs here, off the
+	// keystroke path (see humanInput).
+	capacityRevoke capacityRevoker
+}
+
+// capacityRevokeHumanInputFunc is replaced by tests to make revocation slow.
+var capacityRevokeHumanInputFunc = capacityRevokeHumanInput
+
+// capacityRevoker runs one revocation at a time in the background. Input that
+// arrives while one runs sets pending, and a single further run follows, so a
+// burst of keystrokes costs at most two journal checks and never waits for
+// the filesystem.
+type capacityRevoker struct {
+	mu      sync.Mutex
+	idle    *sync.Cond
+	running bool
+	pending bool
+}
+
+func (r *capacityRevoker) schedule(run func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.running {
+		r.pending = true
+		return
+	}
+	r.running = true
+	go func() {
+		for {
+			run()
+			r.mu.Lock()
+			if !r.pending {
+				r.running = false
+				if r.idle != nil {
+					r.idle.Broadcast()
+				}
+				r.mu.Unlock()
+				return
+			}
+			r.pending = false
+			r.mu.Unlock()
+		}
+	}()
+}
+
+// wait returns once no revocation is running or pending.
+func (r *capacityRevoker) wait() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.idle == nil {
+		r.idle = sync.NewCond(&r.mu)
+	}
+	for r.running {
+		r.idle.Wait()
+	}
 }
 
 type hostRotationObservation struct {
@@ -261,11 +316,15 @@ func (s *hostRotationSupervisor) snapshot() hostRotationRecord {
 
 // Called before a human input write, under Session.inputMu. Invalidation is
 // immediate in memory and durable before a later scheduling attempt can run.
+// The capacity journal lives on the (possibly NFS) home, so its takeover
+// record is written in the background: the keystroke reaches the program
+// without waiting for the filesystem.
 func (s *hostRotationSupervisor) humanInput() {
 	// This is native input invalidation, not process quiescence or permission.
 	pane := strings.TrimSuffix(filepath.Base(s.path), ".json")
 	if validSessionID.MatchString(pane) {
-		_ = capacityRevokeHumanInput(filepath.Dir(filepath.Dir(s.path)), pane)
+		root := filepath.Dir(filepath.Dir(s.path))
+		s.capacityRevoke.schedule(func() { _ = capacityRevokeHumanInputFunc(root, pane) })
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

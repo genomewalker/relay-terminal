@@ -259,12 +259,14 @@ func TestCapacityNativeHumanInputRevokesIndependentEnrollment(t *testing.T) {
 	}
 	s := &hostRotationSupervisor{path: filepath.Join(root, "rotation-supervision", "pane.json"), record: hostRotationRecord{Enabled: false}}
 	s.humanInput()
+	s.capacityRevoke.wait()
 	d, err := j.Load()
 	if err != nil || d.Entries["pane"].Enabled || !d.Entries["pane"].Takeover || d.Entries["pane"].UserGeneration != 1 {
 		t.Fatal("NATIVE_HUMAN_INPUT_DID_NOT_REVOKE", d, err)
 	}
 	before := d.Revision
 	s.humanInput()
+	s.capacityRevoke.wait()
 	d, err = j.Load()
 	if err != nil || d.Revision != before {
 		t.Fatal("REPEATED_INPUT_TOMBSTONE_CHURN", err)

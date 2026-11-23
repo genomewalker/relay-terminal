@@ -325,7 +325,23 @@ type multiplexedSession struct {
 	viewportCommitV2 bool
 	manifestCached   bool
 	manifest         workerManifest
+	// Client frames that arrived while outbound was full, in order. A slow
+	// worker slows the pane's input instead of cutting its route; only a
+	// worker that stops draining past these bounds closes it.
+	overflowMu     sync.Mutex
+	overflow       []protocol.Frame
+	overflowBytes  int
+	overflowSignal chan struct{}
 }
+
+// Bounds for client frames held while a worker is slow to take input. They
+// are type-ahead sized, like a PTY input buffer: the app keeps at most 32
+// unacknowledged input frames, so the overflow only absorbs a reattach resend
+// or a stall burst. A worker that leaves more than this unread is stopped.
+const (
+	routeOverflowFrames = 512
+	routeOverflowBytes  = 256 << 10
+)
 
 // One active legacy repaint and one replaceable pending repaint per durable
 // worker. Slow TUIs cannot accumulate a goroutine for every drag-resize frame.
@@ -369,6 +385,7 @@ func newMultiplexedSession(
 		connection: connection, terminalOnly: terminalOnly,
 		durableSessionID: durableSessionID,
 		outbound:         make(chan protocol.Frame, 128),
+		overflowSignal:   make(chan struct{}, 1),
 		closed:           make(chan struct{}),
 	}
 }
@@ -393,12 +410,37 @@ func (session *multiplexedSession) recordedCloseReason() string {
 	return reason
 }
 
-// enqueueOrClose forwards one client frame to the worker, or closes the route
-// with the reason when the worker has stopped draining its input.
+// enqueueOrClose forwards one client frame to the worker. When the worker is
+// slow and outbound is full, the frame waits in the route's overflow, after
+// any earlier overflowed frames, so input slows down instead of the route
+// closing and the pane replaying. Only a worker that leaves the overflow full
+// as well is treated as stopped, and its route is closed with the reason.
 func (session *multiplexedSession) enqueueOrClose(frame protocol.Frame) {
-	if !session.enqueue(frame) {
-		session.closeWith(fmt.Sprintf("client frames to the worker are not draining (queue of %d full, frame type %d)",
-			cap(session.outbound), frame.Type))
+	session.overflowMu.Lock()
+	if len(session.overflow) == 0 && session.enqueue(frame) {
+		session.overflowMu.Unlock()
+		return
+	}
+	select {
+	case <-session.closed:
+		session.overflowMu.Unlock()
+		return
+	default:
+	}
+	size := len(frame.Payload)
+	if len(session.overflow) >= routeOverflowFrames || session.overflowBytes+size > routeOverflowBytes {
+		held := len(session.overflow)
+		session.overflowMu.Unlock()
+		session.closeWith(fmt.Sprintf("client frames to the worker are not draining (queue of %d full and %d more held, frame type %d)",
+			cap(session.outbound), held, frame.Type))
+		return
+	}
+	session.overflow = append(session.overflow, frame)
+	session.overflowBytes += size
+	session.overflowMu.Unlock()
+	select {
+	case session.overflowSignal <- struct{}{}:
+	default:
 	}
 }
 
@@ -421,15 +463,56 @@ func (session *multiplexedSession) enqueue(frame protocol.Frame) bool {
 	}
 }
 
+// nextOverflow takes the oldest held frame once outbound is empty, so held
+// frames are written after every frame queued before them.
+func (session *multiplexedSession) nextOverflow() (protocol.Frame, bool) {
+	session.overflowMu.Lock()
+	defer session.overflowMu.Unlock()
+	if len(session.overflow) == 0 || len(session.outbound) > 0 {
+		return protocol.Frame{}, false
+	}
+	frame := session.overflow[0]
+	session.overflow[0] = protocol.Frame{}
+	session.overflow = session.overflow[1:]
+	session.overflowBytes -= len(frame.Payload)
+	if len(session.overflow) == 0 {
+		session.overflow = nil
+	}
+	return frame, true
+}
+
 func (session *multiplexedSession) forwardToWorker() {
 	writer := protocol.NewWriter(session.connection)
+	write := func(frame protocol.Frame) bool {
+		if err := writer.Write(frame); err != nil {
+			session.closeWith("writing to the worker failed: " + err.Error())
+			return false
+		}
+		return true
+	}
 	for {
 		select {
 		case frame := <-session.outbound:
-			if err := writer.Write(frame); err != nil {
-				session.closeWith("writing to the worker failed: " + err.Error())
+			if !write(frame) {
 				return
 			}
+			continue
+		case <-session.closed:
+			return
+		default:
+		}
+		if frame, ok := session.nextOverflow(); ok {
+			if !write(frame) {
+				return
+			}
+			continue
+		}
+		select {
+		case frame := <-session.outbound:
+			if !write(frame) {
+				return
+			}
+		case <-session.overflowSignal:
 		case <-session.closed:
 			return
 		}

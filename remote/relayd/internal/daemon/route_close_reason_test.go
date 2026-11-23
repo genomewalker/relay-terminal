@@ -8,14 +8,16 @@ import (
 	"github.com/relay-terminal/relayd/internal/protocol"
 )
 
-// A route whose worker stops draining client frames is closed by the
+// A route whose worker stops draining client frames, past the queue and its
+// overflow, is closed by the
 // supervisor, and the route_closed status must say so: the app cannot tell
 // this cut from a worker that cut a lagging viewer (2026-11-22, d0b0ff50).
 func TestFullInputQueueRecordsWhyTheRouteClosed(t *testing.T) {
 	supervisorSide, workerSide := net.Pipe()
 	defer workerSide.Close()
 	session := newMultiplexedSession(supervisorSide, false, "pane")
-	for i := 0; i < cap(session.outbound); i++ {
+	// The queue and the whole overflow fill without closing the route.
+	for i := 0; i < cap(session.outbound)+routeOverflowFrames; i++ {
 		session.enqueueOrClose(protocol.Frame{Type: protocol.Input, Payload: []byte{'x'}})
 	}
 	if session.recordedCloseReason() != "" {
