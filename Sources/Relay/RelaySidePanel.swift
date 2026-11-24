@@ -1176,6 +1176,10 @@ final class RelaySidePanelServer: ObservableObject {
         return response
     }
 
+    static func evidenceResponse(_ value: [String: Any]) -> RelaySidePanelHTTPResponse {
+        (try? .jsonObject(value)) ?? .text("Operation evidence could not be encoded", status: 500, reason: "Internal Server Error")
+    }
+
     static func paneLinkProposalResponse(status: Int, value: [String: Any]) -> RelaySidePanelHTTPResponse {
         guard let response = try? RelaySidePanelHTTPResponse.jsonObject(value) else {
             return .text("Pane-link proposal reply could not be encoded", status: 500, reason: "Internal Server Error")
@@ -1415,6 +1419,28 @@ final class RelaySidePanelServer: ObservableObject {
                 return .text("Invalid or stale account move receipt request", status: 400, reason: "Bad Request")
             }
             return .json(accountMoveReceipts.result(id) ?? ["status": "unknown", "message": "No retained receipt. This receipt read did not initiate a move."])
+        }
+        if request.method == "GET", request.path.hasPrefix(RelayOperationEvidence.pathPrefix) {
+            // Read-only incident reconstruction from existing receipts; it
+            // never sends, retries or repeats the operation.
+            switch RelayOperationEvidence.route(request.path) {
+            case let .accountMove(instance, id)? where instance == agentInputRequests.instance:
+                let source = RelayOperationEvidence.Source(name: "app_account_move_receipt", observedAt: Date(),
+                                                           record: accountMoveReceipts.result(id))
+                return Self.evidenceResponse(RelayOperationEvidence.export(kind: .accountMove, id: id, sources: [source], now: Date()))
+            case let .message(id)?:
+                let source: RelayOperationEvidence.Source
+                do {
+                    source = .init(name: "pane_message_receipt", observedAt: Date(),
+                                   record: try await paneMessaging.receipt(id, workspace: workspace))
+                } catch {
+                    source = .init(name: "pane_message_receipt", observedAt: Date(), record: nil,
+                                   error: error.localizedDescription)
+                }
+                return Self.evidenceResponse(RelayOperationEvidence.export(kind: .message, id: id, sources: [source], now: Date()))
+            default:
+                return .text("Invalid or stale operation evidence request", status: 400, reason: "Bad Request")
+            }
         }
         if request.method == "POST", request.path == "/api/private-secret/request" {
             guard mcpWorkspaceGrant.permits(.input),
