@@ -38,9 +38,12 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
     /// default (the account's full setup) | worker (Claude only: a lean start
     /// without the account's settings, plugins, MCP servers or skills).
     var profile: String? = nil
+    /// worker only: the built-in tools Claude keeps, comma-separated, from
+    /// MCPLaunchAgentCommand.workerTools (default: all of them).
+    var tools: String? = nil
 
     static let required: Set<String> = ["instance", "requestID", "host", "cwd", "provider", "model", "account", "briefPath"]
-    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "callerPaneID", "bridgeScope", "permissionMode", "profile"])
+    static let keys: Set<String> = required.union(["targetPaneID", "anchorTabID", "anchorPaneID", "callerPaneID", "bridgeScope", "permissionMode", "profile", "tools"])
     static let briefLimit = 64 << 10
 
     /// Exact keys, bounded body, and every field valid; nil otherwise.
@@ -58,11 +61,15 @@ struct MCPLaunchAgentProposal: Codable, Equatable {
             Self.validPath(cwd) && Self.validPath(briefPath) && !host.isEmpty && host.utf8.count <= 256 &&
             [targetPaneID, anchorTabID, anchorPaneID].compactMap { $0 }.count <= 1 &&
             MCPLaunchAgentCommand.permissionModes.contains(mode) &&
-            MCPLaunchAgentCommand.profileFlags(provider: provider, profile: launchProfile) != nil
+            MCPLaunchAgentCommand.profileFlags(provider: provider, profile: launchProfile, tools: tools) != nil
     }
 
     var mode: String { permissionMode ?? "account" }
     var launchProfile: String { profile ?? "default" }
+    /// The enforced tool set of a worker launch; nil for other profiles.
+    var workerTools: [String]? {
+        launchProfile == "worker" ? MCPLaunchAgentCommand.workerToolSet(tools) : nil
+    }
 
     static func validModel(_ model: String) -> Bool {
         model.range(of: #"^[a-z0-9][a-z0-9._-]{0,63}$"#, options: .regularExpression) != nil
@@ -173,23 +180,37 @@ enum MCPLaunchAgentCommand {
     /// the managed launcher passes them separately. The list-valued options
     /// come before --model so they can never take the brief as a value.
     static let workerClaudeFlags = ["--strict-mcp-config", "--mcp-config", #"{"mcpServers":{}}"#,
-                                    "--disable-slash-commands", "--setting-sources", "",
-                                    "--tools", "Bash,Read,Grep,Glob"]
+                                    "--disable-slash-commands", "--setting-sources", "", "--tools"]
+    /// The built-in tools a worker may keep. Claude enforces the --tools set
+    /// at launch. Bash is a shell: a set with it does not contain the worker.
+    static let workerTools = ["Bash", "Read", "Grep", "Glob"]
 
-    /// The flags for a launch profile; nil when the provider has no such profile.
-    static func profileFlags(provider: String, profile: String) -> [String]? {
+    /// A worker's tool set: nil (all workerTools) or 1 to 4 distinct names
+    /// from workerTools, comma-separated in the caller's order.
+    static func workerToolSet(_ tools: String?) -> [String]? {
+        guard let tools else { return workerTools }
+        let names = tools.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        guard !names.isEmpty, names.count <= workerTools.count, Set(names).count == names.count,
+              names.allSatisfy(workerTools.contains) else { return nil }
+        return names
+    }
+
+    /// The flags for a launch profile; nil when the provider has no such
+    /// profile or the tool set does not qualify. tools applies to worker only.
+    static func profileFlags(provider: String, profile: String, tools: String? = nil) -> [String]? {
         switch (provider, profile) {
-        case (_, "default"): []
-        case ("claude", "worker"): workerClaudeFlags
+        case (_, "default") where tools == nil: []
+        case ("claude", "worker"): workerToolSet(tools).map { workerClaudeFlags + [$0.joined(separator: ",")] }
         default: nil
         }
     }
 
     static func build(account: RelayAgentAccount, model: String, cwd: String, briefPath: String,
                       briefSHA256: String,
-                      permissionMode: String = "account", profile: String = "default") -> String? {
+                      permissionMode: String = "account", profile: String = "default",
+                      tools: String? = nil) -> String? {
         guard let permission = permissionFlags(provider: account.provider, mode: permissionMode),
-              let profileArguments = profileFlags(provider: account.provider, profile: profile) else { return nil }
+              let profileArguments = profileFlags(provider: account.provider, profile: profile, tools: tools) else { return nil }
         guard account.isValid, MCPLaunchAgentProposal.validModel(model),
               MCPLaunchAgentProposal.validPath(cwd), MCPLaunchAgentProposal.validPath(briefPath),
               briefSHA256.utf8.count == 64, briefSHA256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
@@ -252,9 +273,12 @@ struct MCPLaunchAgentReceipt: Codable, Equatable {
         var placement: String
         var permissionMode: String = "account"
         var profile: String = "default"
+        /// worker only: the enforced built-in tool set, and whether it holds a shell.
+        var tools: [String]? = nil
+        var shellTool: Bool? = nil
         enum CodingKeys: String, CodingKey {
-            case host, cwd, provider, model, account, placement, profile
-            case permissionMode = "permission_mode"
+            case host, cwd, provider, model, account, placement, profile, tools
+            case permissionMode = "permission_mode", shellTool = "shell_tool"
             case configDir = "config_dir", configVariable = "config_variable", briefPath = "brief_path"
             case briefBytes = "brief_bytes", briefSHA256 = "brief_sha256"
         }
@@ -743,7 +767,8 @@ enum MCPAgentBindingRead {
             model: proposal.model, account: proposal.account, configDir: "", configVariable: RelayAgentAccount.variable(proposal.provider),
             briefPath: proposal.briefPath, briefBytes: 0, briefSHA256: "",
             placement: proposal.placement(callerShown: proposal.callerAnchor(in: workspace) != nil),
-            permissionMode: proposal.mode, profile: proposal.launchProfile)
+            permissionMode: proposal.mode, profile: proposal.launchProfile,
+            tools: proposal.workerTools, shellTool: proposal.workerTools.map { $0.contains("Bash") })
         entries[proposal.requestID] = Entry(proposal: proposal,
             receipt: MCPLaunchAgentReceipt(requestID: proposal.requestID.uuidString.lowercased(), request: request))
         let deadline = ContinuousClock.now + environment.launchBudget
@@ -787,7 +812,7 @@ enum MCPAgentBindingRead {
         guard let command = MCPLaunchAgentCommand.build(account: account, model: proposal.model,
                                                         cwd: proposal.cwd, briefPath: proposal.briefPath,
                                                         briefSHA256: briefSHA256, permissionMode: proposal.mode,
-                                                        profile: proposal.launchProfile) else {
+                                                        profile: proposal.launchProfile, tools: proposal.tools) else {
             return refuse("The launch command could not be built from these values")
         }
         guard needed.allSatisfy(permits) else {

@@ -23,7 +23,8 @@ func (b *Bridge) launchAgent(r *http.Request, caller string, allowed map[string]
 		}
 	}
 	required := []string{"instance", "requestID", "host", "cwd", "provider", "model", "account", "briefPath", "callerPaneID"}
-	keys := append(append([]string{}, required...), "permissionMode", "targetPaneID", "anchorTabID", "anchorPaneID")
+	// profile and tools are passed through as strings; Relay validates them.
+	keys := append(append([]string{}, required...), "permissionMode", "profile", "tools", "targetPaneID", "anchorTabID", "anchorPaneID")
 	req, status, reason := strictStrings(raw, keys, "Unknown relay_launch_agent field")
 	if req == nil {
 		return jsonReply(status, reason)

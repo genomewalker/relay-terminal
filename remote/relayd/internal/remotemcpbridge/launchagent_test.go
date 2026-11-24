@@ -20,7 +20,9 @@ const (
 )
 
 func laBridge(forwarded *[]fwd) *Bridge {
-	pane := func(id, host string) map[string]any { return map[string]any{"id": id, "host": host, "contentKind": "terminal"} }
+	pane := func(id, host string) map[string]any {
+		return map[string]any{"id": id, "host": host, "contentKind": "terminal"}
+	}
 	state := map[string]any{"sessions": []any{
 		map[string]any{"id": "S1", "tabs": []any{
 			map[string]any{"id": "T1", "panes": []any{pane(laCaller, "dandy-07")}},
@@ -58,6 +60,9 @@ func TestLaunchAgentPassesWithinTheCallersOwnScope(t *testing.T) {
 		"anchored on a sibling tab":  {"callerPaneID": laCaller, "anchorTabID": "T2"},
 		"anchored on a sibling pane": {"callerPaneID": laCaller, "anchorPaneID": laSibling},
 		"stacked on the caller":      {"callerPaneID": laCaller, "targetPaneID": laCaller},
+		// 2026-11-24: the bridge dropped profile, so a dandy-07 coordinator
+		// could not start a restricted worker.
+		"read-only worker": {"callerPaneID": laCaller, "provider": "claude", "profile": "worker", "tools": "Read,Grep,Glob"},
 	}
 	for name, extra := range cases {
 		var got []fwd
@@ -72,6 +77,11 @@ func TestLaunchAgentPassesWithinTheCallersOwnScope(t *testing.T) {
 		if json.Unmarshal(got[0].body, &sent) != nil || fmt.Sprint(sent["bridgeScope"]) != "map[host:dandy-07]" ||
 			sent["callerPaneID"] != laCaller || sent["host"] != "dandy-07" {
 			t.Fatalf("%s: forwarded body %s", name, got[0].body)
+		}
+		for k, v := range extra {
+			if sent[k] != v {
+				t.Fatalf("%s: %s not forwarded exactly: %s", name, k, got[0].body)
+			}
 		}
 	}
 }

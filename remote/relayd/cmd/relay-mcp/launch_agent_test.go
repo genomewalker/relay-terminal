@@ -62,6 +62,16 @@ func TestLaunchAgentForwardsWorkerProfile(t *testing.T) {
 	if got := (*bodies)[len(*bodies)-1]; got["profile"] != "default" || len(got) != 9 {
 		t.Fatalf("forwarded %v", got)
 	}
+	// A read-only worker: the set Relay passes to --tools has no shell.
+	args = launchArgs()
+	args["profile"] = "worker"
+	args["tools"] = []string{"Read", "Grep", "Glob"}
+	if code := callTool(s, "relay_launch_agent", args); code != 0 {
+		t.Fatal(code)
+	}
+	if got := (*bodies)[len(*bodies)-1]; got["tools"] != "Read,Grep,Glob" || got["profile"] != "worker" || len(got) != 10 {
+		t.Fatalf("forwarded %v", got)
+	}
 }
 
 func TestLaunchAgentRefusesInvalidArgumentsBeforeRelay(t *testing.T) {
@@ -69,23 +79,35 @@ func TestLaunchAgentRefusesInvalidArgumentsBeforeRelay(t *testing.T) {
 	defer done()
 	pane := "33333333-3333-4333-8333-333333333333"
 	cases := map[string]func(map[string]any){
-		"missing brief":       func(a map[string]any) { delete(a, "brief_path") },
-		"relative cwd":        func(a map[string]any) { a["cwd"] = "project" },
-		"tilde cwd":           func(a map[string]any) { a["cwd"] = "~/project" },
-		"newline in cwd":      func(a map[string]any) { a["cwd"] = "/tmp/a\nrm -rf ~" },
-		"newline in brief":    func(a map[string]any) { a["brief_path"] = "/tmp/b\n.md" },
-		"relative brief":      func(a map[string]any) { a["brief_path"] = "brief.md" },
-		"unknown provider":    func(a map[string]any) { a["provider"] = "gemini" },
-		"model with space":    func(a map[string]any) { a["model"] = "opus; rm -rf ~" },
-		"model with quote":    func(a map[string]any) { a["model"] = "o'pus" },
-		"model upper":         func(a map[string]any) { a["model"] = "Opus" },
-		"model too long":      func(a map[string]any) { a["model"] = strings.Repeat("a", 65) },
-		"model subst":         func(a map[string]any) { a["model"] = "$(id)" },
-		"unknown permission":  func(a map[string]any) { a["permission_mode"] = "bypassPermissions" },
-		"permission not str":  func(a map[string]any) { a["permission_mode"] = true },
-		"unknown profile":     func(a map[string]any) { a["profile"] = "lean" },
-		"profile not str":     func(a map[string]any) { a["profile"] = true },
-		"codex worker":        func(a map[string]any) { a["profile"] = "worker"; a["provider"] = "codex" },
+		"missing brief":         func(a map[string]any) { delete(a, "brief_path") },
+		"relative cwd":          func(a map[string]any) { a["cwd"] = "project" },
+		"tilde cwd":             func(a map[string]any) { a["cwd"] = "~/project" },
+		"newline in cwd":        func(a map[string]any) { a["cwd"] = "/tmp/a\nrm -rf ~" },
+		"newline in brief":      func(a map[string]any) { a["brief_path"] = "/tmp/b\n.md" },
+		"relative brief":        func(a map[string]any) { a["brief_path"] = "brief.md" },
+		"unknown provider":      func(a map[string]any) { a["provider"] = "gemini" },
+		"model with space":      func(a map[string]any) { a["model"] = "opus; rm -rf ~" },
+		"model with quote":      func(a map[string]any) { a["model"] = "o'pus" },
+		"model upper":           func(a map[string]any) { a["model"] = "Opus" },
+		"model too long":        func(a map[string]any) { a["model"] = strings.Repeat("a", 65) },
+		"model subst":           func(a map[string]any) { a["model"] = "$(id)" },
+		"unknown permission":    func(a map[string]any) { a["permission_mode"] = "bypassPermissions" },
+		"permission not str":    func(a map[string]any) { a["permission_mode"] = true },
+		"unknown profile":       func(a map[string]any) { a["profile"] = "lean" },
+		"profile not str":       func(a map[string]any) { a["profile"] = true },
+		"codex worker":          func(a map[string]any) { a["profile"] = "worker"; a["provider"] = "codex" },
+		"tools without worker":  func(a map[string]any) { a["tools"] = []string{"Read"} },
+		"tools default profile": func(a map[string]any) { a["profile"] = "default"; a["tools"] = []string{"Read"} },
+		"tool outside the set":  func(a map[string]any) { a["profile"] = "worker"; a["tools"] = []string{"Read", "Write"} },
+		"duplicate tool":        func(a map[string]any) { a["profile"] = "worker"; a["tools"] = []string{"Read", "Read"} },
+		"empty tools":           func(a map[string]any) { a["profile"] = "worker"; a["tools"] = []string{} },
+		"tools as string":       func(a map[string]any) { a["profile"] = "worker"; a["tools"] = "Read,Grep" },
+		"tool with comma":       func(a map[string]any) { a["profile"] = "worker"; a["tools"] = []string{"Read,Write"} },
+		"codex worker tools": func(a map[string]any) {
+			a["profile"] = "worker"
+			a["provider"] = "codex"
+			a["tools"] = []string{"Read"}
+		},
 		"account display":     func(a map[string]any) { a["account"] = "personal (~/.claude-personal)" },
 		"host option":         func(a map[string]any) { a["host"] = "-oProxyCommand=x" },
 		"host injection":      func(a map[string]any) { a["host"] = "h; rm -rf ~" },

@@ -504,6 +504,37 @@ struct MCPLaunchAgentTests {
                                                         extra: ["profile": "worker"])) == nil)
     }
 
+    /// 2026-11-24: a research coordinator needs a worker whose tool set is
+    /// fixed at launch, and read-only workers must not get a shell.
+    @Test func workerToolSetIsPassedToToolsAndRecorded() throws {
+        typealias C = MCPLaunchAgentCommand
+        let digest = Self.digest(Self.brief)
+        let reader = try #require(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: digest,
+                                          permissionMode: "read_only", profile: "worker", tools: "Read,Grep,Glob"))
+        #expect(reader.contains(" '--tools' 'Read,Grep,Glob' --model 'opus' --permission-mode plan \"$relay_brief\""))
+        #expect(!reader.contains("Bash"))
+        for refused in ["Read,Write", "Read,Read", "", "Read,", "read", "Bash,Read,Grep,Glob,Edit", "Read Grep"] {
+            #expect(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: digest,
+                            profile: "worker", tools: refused) == nil, "tools \(refused)")
+        }
+        // tools applies to the worker profile only.
+        #expect(C.build(account: Self.personal, model: "opus", cwd: "/w", briefPath: "/b", briefSHA256: digest, tools: "Read") == nil)
+        let instance = UUID(), request = UUID()
+        let proposal = try #require(MCPLaunchAgentProposal.decode(Self.body(instance, request,
+                                                                             extra: ["profile": "worker", "tools": "Read,Grep"])))
+        #expect(proposal.workerTools == ["Read", "Grep"])
+        #expect(try #require(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["profile": "worker"]))).workerTools
+                == ["Bash", "Read", "Grep", "Glob"])
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["tools": "Read"])) == nil)
+        #expect(MCPLaunchAgentProposal.decode(Self.body(instance, request, extra: ["profile": "worker", "tools": "Write"])) == nil)
+        // The receipt says whether the set holds a shell.
+        let encoded = try JSONEncoder().encode(MCPLaunchAgentReceipt.Request(host: "h", cwd: "/w", provider: "claude", model: "opus",
+            account: "personal", configDir: "", configVariable: "CLAUDE_CONFIG_DIR", briefPath: "/b", briefBytes: 1, briefSHA256: digest,
+            placement: "stack", profile: "worker", tools: ["Read", "Grep"], shellTool: false))
+        let fields = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(fields["tools"] as? [String] == ["Read", "Grep"] && fields["shell_tool"] as? Bool == false)
+    }
+
     // MARK: - No exec: the pane's shell outlives the provider
 
     static func run(_ shell: String, _ command: String, environment: [String: String]) throws -> (status: Int32, out: String) {
