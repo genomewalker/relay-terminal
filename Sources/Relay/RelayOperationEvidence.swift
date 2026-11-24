@@ -124,7 +124,7 @@ enum RelayOperationEvidence {
             ($0.element.observedAt, $0.offset) < ($1.element.observedAt, $1.offset)
         }.map(\.element)
         for source in ordered {
-            var entry: [String: Any] = ["source": redact(source.name), "observed_at": timestamp(source.observedAt)]
+            var entry: [String: Any] = ["source": redactSourceLabel(source.name), "observed_at": timestamp(source.observedAt)]
             let stage: Stage
             if let error = source.error {
                 stage = .readFailed
@@ -250,6 +250,23 @@ enum RelayOperationEvidence {
         case let number as Double: number
         default: nil
         }
+    }
+
+    private static func redactSourceLabel(_ label: String) -> String {
+        for prefix in ["daemon_receipt ssh:", "daemon_receipt config:"] where label.hasPrefix(prefix) {
+            let destination = label.dropFirst(prefix.count)
+            if let separator = destination.lastIndex(of: "@") {
+                let host = destination[destination.index(after: separator)...]
+                // Preserve whole-address redaction for qualified hosts.
+                let placeholder = "redacted@"
+                let masked = redact(placeholder + host)
+                if masked.hasPrefix(placeholder) {
+                    return redact(prefix + "<user>@" + host)
+                }
+                return prefix + masked
+            }
+        }
+        return redact(label)
     }
 
     /// Diagnostics redaction (secrets, tokens, home paths) plus email

@@ -27,11 +27,17 @@ struct RelayOperationEvidenceTests {
     }
 
     @Test func sourceLabelsUseTheExportRedactionPolicy() {
-        let result = export(.message, [source(nil, name: "daemon_receipt ssh:operator@example.org:22")])
-        let timeline = result["timeline"] as? [[String: Any]]
-        let label = timeline?.first?["source"] as? String
-        #expect(label?.contains("operator@example.org") == false)
-        #expect(label?.contains("<email>") == true)
+        for (input, expected) in [
+            ("ssh:operator@example.org:22", "ssh:<email>:22"),
+            ("ssh:someuser@dandy-07:22", "ssh:<user>@dandy-07:22"),
+            ("config:someuser@dandy-07", "config:<user>@dandy-07"),
+            ("ssh:someuser@[::1]:22", "ssh:<user>@[::1]:22"),
+            ("ssh:dandy-07:22", "ssh:dandy-07:22"),
+        ] {
+            let result = export(.message, [source(nil, name: "daemon_receipt " + input)])
+            let timeline = result["timeline"] as? [[String: Any]]
+            #expect(timeline?.first?["source"] as? String == "daemon_receipt " + expected)
+        }
     }
 
     @Test func transportAndProviderCompletionHaveDistinctConclusions() {
