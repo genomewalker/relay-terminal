@@ -41,6 +41,7 @@ if [[ "${RELAY_BUILD_LOCK_HELD:-}" != "$build_lock" ]]; then
 fi
 cd "$project_root"
 source "$project_root/scripts/build-app-steps.sh"
+checkout_at_start="$(checkout_at_build_start "$project_root")"
 check_rotation_resources "$project_root"
 check_native_library "$project_root/Vendor/libghostty-spm"
 if [[ -n "${RELAY_GO_REMOTE:-}" ]]; then
@@ -310,6 +311,9 @@ if [[ -z "$installation_id" && "${RELAY_FRESH_INSTALL:-0}" != "1" ]]; then
 fi
 if [[ ! "$installation_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
     installation_id="$(/usr/bin/uuidgen)"
+fi
+if [[ -n "$checkout_at_start" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :RelaySourceCheckoutAtBuildStart string $checkout_at_start" "$app_path/Contents/Info.plist"
 fi
 /usr/libexec/PlistBuddy -c "Add :RelayInstallationID string $installation_id" "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :RelaydVersion string $relayd_version" "$app_path/Contents/Info.plist"
