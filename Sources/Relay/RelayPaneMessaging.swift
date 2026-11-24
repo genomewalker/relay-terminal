@@ -414,12 +414,20 @@ import CryptoKit
         return result
     }
 
-    func receipt(_ id: UUID, workspace: WorkspaceModel) async throws -> [String: Any]? {
+    func receipt(_ id: UUID, workspace: WorkspaceModel, reportUnavailableSource: Bool = false) async throws -> [String: Any]? {
+        var unavailable: Error?
         for profile in daemonProfiles(workspace) {
-            if let result = try? await daemonRequest(profile: profile, packet: ["operation": "receipt", "message_id": id.uuidString.lowercased()]),
-               result["status"] as? String != "unknown" { return result }
+            do {
+                let result = try await daemonRequest(profile: profile, packet: ["operation": "receipt", "message_id": id.uuidString.lowercased()])
+                if result["status"] as? String != "unknown" { return result }
+            } catch {
+                unavailable = error
+            }
         }
-        guard let record = try receipts.read(intent: id.uuidString, action: "send") else { return nil }
+        guard let record = try receipts.read(intent: id.uuidString, action: "send") else {
+            if reportUnavailableSource, let unavailable { throw unavailable }
+            return nil
+        }
         guard let result = record.result else {
             return ["message_id": id.uuidString.lowercased(), "status": "outcome_unknown", "replay_permitted": false]
         }

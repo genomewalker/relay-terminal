@@ -239,3 +239,30 @@ func TestAccountMoveReceiptCompilesReadOnlyWithExactOriginalIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestOperationEvidenceUsesReadOnlyRoute(t *testing.T) {
+	const id = "8b6fdc5b-25df-468c-933b-4162aacb4aa1"
+	const instance = "3473935d-01c1-45d7-9e51-0399a97b2e1f"
+	for _, tc := range []struct {
+		args map[string]string
+		path string
+	}{
+		{map[string]string{"operation": "message", "id": id}, "/api/operation-evidence/message/" + id},
+		{map[string]string{"operation": "account_move", "instance": instance, "id": id}, "/api/operation-evidence/account-move/" + instance + "/" + id},
+		{map[string]string{"operation": "account_move", "id": id}, ""},
+		{map[string]string{"operation": "message", "instance": instance, "id": id}, ""},
+		{map[string]string{"operation": "message", "id": "invalid"}, ""},
+	} {
+		wire, _ := json.Marshal(map[string]any{"tool_name": "relay_read_operation_evidence", "arguments": tc.args})
+		plan, err := compileMikoPlan(wire)
+		if tc.path == "" {
+			if err == nil {
+				t.Fatalf("accepted invalid arguments %v", tc.args)
+			}
+			continue
+		}
+		if err != nil || plan.Method != "GET" || plan.Tier != "read" || plan.Path != tc.path {
+			t.Fatalf("unexpected evidence plan %+v: %v", plan, err)
+		}
+	}
+}

@@ -1432,7 +1432,7 @@ final class RelaySidePanelServer: ObservableObject {
                 let source: RelayOperationEvidence.Source
                 do {
                     source = .init(name: "pane_message_receipt", observedAt: Date(),
-                                   record: try await paneMessaging.receipt(id, workspace: workspace))
+                                   record: try await paneMessaging.receipt(id, workspace: workspace, reportUnavailableSource: true))
                 } catch {
                     source = .init(name: "pane_message_receipt", observedAt: Date(), record: nil,
                                    error: error.localizedDescription)

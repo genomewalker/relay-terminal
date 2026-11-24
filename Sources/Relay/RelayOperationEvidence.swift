@@ -102,7 +102,7 @@ enum RelayOperationEvidence {
                 entry["error"] = redact(error)
             } else if let record = source.record {
                 stage = Self.stage(kind: kind, status: record["status"] as? String)
-                let (fields, omitted) = redactedFields(record)
+                let (fields, omitted) = redactedFields(record, kind: kind)
                 entry["fields"] = fields
                 if !omitted.isEmpty { entry["omitted_fields"] = omitted }
             } else {
@@ -123,8 +123,7 @@ enum RelayOperationEvidence {
             "evidence_ends_at": evidenceEnd(kind: kind, stages: stages, conclusion: conclusion),
             "gaps": gaps(kind: kind, stages: stages),
             "timeline": timeline,
-            "note": "Built from existing receipts only; nothing was sent, retried or repeated. " +
-                "Retry an uncertain operation only under its original id.",
+            "note": "Read-only evidence from retained receipts.",
         ]
         if conclusion == "conflicting" {
             result["conflict"] = "Sources disagree; each source's stage is listed in the timeline."
@@ -194,11 +193,11 @@ enum RelayOperationEvidence {
 
     /// Keeps known plain fields, redacts explanatory text, and lists every
     /// other key by name only.
-    static func redactedFields(_ record: [String: Any]) -> ([String: Any], [String]) {
+    static func redactedFields(_ record: [String: Any], kind: Kind) -> ([String: Any], [String]) {
         var kept: [String: Any] = [:]
         var omitted: [String] = []
         for (key, value) in record {
-            if contentFields.contains(key) { omitted.append(key); continue }
+            if contentFields.contains(key) || (kind == .message && key == "message") { omitted.append(key); continue }
             if keptFields.contains(key), let plain = plainValue(value) {
                 kept[key] = (plain as? String).map { redact($0) } ?? plain
             } else if explanatoryFields.contains(key), let text = value as? String {
