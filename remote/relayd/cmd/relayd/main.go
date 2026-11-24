@@ -322,6 +322,8 @@ func main() {
 		runRotationStatus(os.Args[2:])
 	case "rotation-text-reconcile":
 		runRotationTextReconcile(os.Args[2:])
+	case "question-lease":
+		runQuestionLease(os.Args[2:])
 	case "codex-runtime":
 		runCodexRuntime(os.Args[2:])
 	case "codex-start-parameters":

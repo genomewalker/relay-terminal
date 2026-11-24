@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"sync"
 	"time"
@@ -75,21 +76,49 @@ func newHostNativeUUID() (string, error) {
 	return value[:8] + "-" + value[8:12] + "-" + value[12:16] + "-" + value[16:20] + "-" + value[20:], nil
 }
 
+// nativeLedgerRefusal is a ledger operation chitta rejected while validating its
+// references, before it staged any change. Its outcome is known: nothing was
+// applied. Every other error stays an unknown outcome.
+type nativeLedgerRefusal struct{ Message string }
+
+func (r *nativeLedgerRefusal) Error() string {
+	return "chitta refused the ledger operation: " + r.Message
+}
+
+// nativeLedgerReferenceRefusal matches chitta's TaskLedger require() error. It is
+// thrown before change() stages a row, and finish() persists only staged rows,
+// so the operation changed nothing (chitta task_ledger.hpp run/require).
+var nativeLedgerReferenceRefusal = regexp.MustCompile(`^unknown [a-z_]{1,64} reference$`)
+
 func decodeHostNativeLedgerResponse(raw []byte) (json.RawMessage, error) {
 	var response struct {
 		Version string          `json:"jsonrpc"`
 		ID      int             `json:"id"`
 		Error   json.RawMessage `json:"error"`
 		Result  struct {
-			IsError    bool `json:"isError"`
+			IsError bool `json:"isError"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
 			Structured struct {
 				Value json.RawMessage `json:"value"`
 			} `json:"structured"`
 		} `json:"result"`
 	}
 	if len(raw) > 262144 || !rotationSourceJSONUnambiguous(raw) || json.Unmarshal(raw, &response) != nil ||
-		response.Version != "2.0" || response.ID != 1 || (len(response.Error) > 0 && string(response.Error) != "null") ||
-		response.Result.IsError || len(response.Result.Structured.Value) == 0 || string(response.Result.Structured.Value) == "null" {
+		response.Version != "2.0" || response.ID != 1 || (len(response.Error) > 0 && string(response.Error) != "null") {
+		return nil, errors.New("native ledger outcome unavailable")
+	}
+	if response.Result.IsError {
+		// Only a single plain reference refusal is a known outcome.
+		if len(response.Result.Content) == 1 && response.Result.Content[0].Type == "text" &&
+			nativeLedgerReferenceRefusal.MatchString(response.Result.Content[0].Text) {
+			return nil, &nativeLedgerRefusal{Message: response.Result.Content[0].Text}
+		}
+		return nil, errors.New("native ledger outcome unavailable")
+	}
+	if len(response.Result.Structured.Value) == 0 || string(response.Result.Structured.Value) == "null" {
 		return nil, errors.New("native ledger outcome unavailable")
 	}
 	return response.Result.Structured.Value, nil
@@ -97,7 +126,7 @@ func decodeHostNativeLedgerResponse(raw []byte) (json.RawMessage, error) {
 func callHostNativeLedger(ctx context.Context, operation string, args any) (json.RawMessage, error) {
 	switch operation {
 	case "rotation_native_claim", "rotation_native_release", "rotation_native_intent", "rotation_native_register", "rotation_native_ack", "rotation_native_abort", "rotation_status", "session_get":
-	case "session_bind", "lease_claim", "lease_release", "question_events", "question_state", "evidence_get":
+	case "session_bind", "lease_claim", "lease_release", "lease_list", "question_events", "question_state", "evidence_get":
 		// Question-thread ops are fenced by questionLedger callers, not generic rotation.
 	default:
 		return nil, errors.New("unsupported native ledger operation")

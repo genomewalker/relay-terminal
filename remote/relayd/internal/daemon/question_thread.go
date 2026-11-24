@@ -236,6 +236,10 @@ func finishQuestionBind(ctx context.Context, deps questionThreadDeps, reservatio
 		return abandon(errors.New("question thread realm does not match chitta"))
 	}
 	claim, held, err := claimTrackedLease(ctx, deps, record.SessionID, reservation.ThreadID, reservation.TTLSeconds)
+	if err != nil && isLeaseRefusal(err) {
+		// chitta refused the claim and granted nothing; report its reason.
+		return abandon(err)
+	}
 	if err != nil {
 		// The claim may have been granted, so its lease is recorded to be released.
 		orphanErr := deps.saveQuestionOrphan(record.SessionID, reservation.ThreadID, nil)
@@ -311,6 +315,10 @@ func releaseClaimedQuestionLease(ctx context.Context, deps questionThreadDeps, b
 func claimQuestionLease(ctx context.Context, deps questionThreadDeps, sessionID, threadID string, ttl int) (questionLeaseReply, error) {
 	raw, err := questionCall(ctx, deps, "lease_claim", map[string]any{"thread_id": threadID, "session_id": sessionID, "ttl": ttl})
 	if err != nil {
+		var refusal *nativeLedgerRefusal
+		if errors.As(err, &refusal) {
+			return questionLeaseReply{}, refusal
+		}
 		return questionLeaseReply{}, errors.New("chitta lease claim unavailable")
 	}
 	var reply questionLeaseReply

@@ -192,10 +192,22 @@ func claimTrackedLease(ctx context.Context, deps questionThreadDeps, sessionID, 
 		return questionLeaseReply{}, true, nil
 	}
 	reply, err = claimQuestionLease(ctx, deps, sessionID, threadID, ttl)
+	var refusal *nativeLedgerRefusal
+	if errors.As(err, &refusal) {
+		// chitta answered and applied nothing: a known outcome, so the mutation
+		// is resolved and no lease can exist for it.
+		return reply, false, errors.Join(err, deps.finishLeaseOp(op))
+	}
 	if err != nil {
 		return reply, false, err
 	}
 	return reply, false, deps.finishLeaseOp(op)
+}
+
+// isLeaseRefusal reports a claim chitta rejected without applying anything.
+func isLeaseRefusal(err error) bool {
+	var refusal *nativeLedgerRefusal
+	return errors.As(err, &refusal)
 }
 
 // leaseReleaseArgs builds a lease_release call. The epoch is sent only when chitta
