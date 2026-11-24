@@ -51,6 +51,10 @@ enum RelaySurfaceHTTP {
               let (id, host) = resolvePane(value.paneID), id == value.paneID else {
             return .text("Invalid publication or pane", status: 400, reason: "Bad Request")
         }
+        if let refusal = RelayRequestDeadline.refusal(request, now: Date()) {
+            try? callerControl.record(caller: principal, request: request, outcome: "expired")
+            return refusal
+        }
         do { try callerControl.record(caller: principal, request: request, outcome: "admitted") }
         catch { return .text("Audit unavailable; publication not dispatched", status: 503, reason: "Service Unavailable") }
         do {

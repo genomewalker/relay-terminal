@@ -1148,6 +1148,12 @@ final class RelaySidePanelServer: ObservableObject {
             try? callerControl.record(caller: identity, request: request, outcome: "blocked")
             return .text("This Relay caller is paused", status: 403, reason: "Forbidden")
         }
+        // A mutation whose caller stopped waiting (the main actor was held up
+        // past the client's deadline) is refused, never run late.
+        if let refusal = RelayRequestDeadline.refusal(request, now: Date()) {
+            try? callerControl.record(caller: identity, request: request, outcome: "expired")
+            return refusal
+        }
         do { try callerControl.record(caller: identity, request: request, outcome: "admitted") }
         catch { return .text("Audit could not be persisted; operation not dispatched", status: 503, reason: "Service Unavailable") }
         // Focus before the request runs: an action that touched another pane

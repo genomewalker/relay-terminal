@@ -144,8 +144,15 @@ func (s *server) exchange(method, path string, body []byte) (string, error) {
 	if s.callerToken != "" {
 		req.Header.Set("x-relay-caller-token", s.callerToken)
 	}
+	deadline, stamped := requestDeadline(time.Now(), s.client.Timeout, ctx)
+	if stamped {
+		req.Header.Set(deadlineHeader, strconv.FormatInt(deadline.UnixMilli(), 10))
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
+		if stamped {
+			return "", fmt.Errorf("Relay request failed; submission outcome may be unknown. Relay refuses it if not admitted by %s. Never retry input automatically; inspect its receipt", deadline.UTC().Format("15:04:05.000Z"))
+		}
 		return "", fmt.Errorf("Relay request failed; submission outcome may be unknown. Never retry input automatically; inspect its receipt")
 	}
 	defer resp.Body.Close()
@@ -175,6 +182,27 @@ func (s *server) exchange(method, path string, body []byte) (string, error) {
 		return "", fmt.Errorf("Relay returned invalid JSON")
 	}
 	return string(data), nil
+}
+
+// deadlineHeader carries the moment this client stops waiting for a reply,
+// in Unix milliseconds. Relay refuses a mutation it admits after that moment,
+// so a request whose caller already reported an unknown outcome never runs
+// late (2026-11-24: a relay_exec queued behind a stalled Relay main thread
+// started a second service 24 minutes after its caller gave up).
+const deadlineHeader = "x-relay-deadline-ms"
+
+// requestDeadline is the earlier of the HTTP client timeout and the context
+// deadline. Without either the request waits indefinitely and is not stamped.
+func requestDeadline(now time.Time, clientTimeout time.Duration, ctx context.Context) (time.Time, bool) {
+	var deadline time.Time
+	stamped := false
+	if clientTimeout > 0 {
+		deadline, stamped = now.Add(clientTimeout), true
+	}
+	if d, ok := ctx.Deadline(); ok && (!stamped || d.Before(deadline)) {
+		deadline, stamped = d, true
+	}
+	return deadline, stamped
 }
 
 // callerAdminRefusal is the fixed reply to the removed caller-admin tools.
