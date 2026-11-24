@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -98,10 +99,21 @@ func TestStatusLauncherKeepsEachSessionsLineForTheTTL(t *testing.T) {
 	if other, _ := h.run(b); other != "status 2 "+b+"\n" || h.nodeRuns() != 2 {
 		t.Fatalf("second session: %q runs %d", other, h.nodeRuns())
 	}
-	// After the TTL the line is made again.
+	// The kept line is private and starts with the time it was made.
 	kept := filepath.Join(h.home, ".cache/relay/cc-status-out/aaa-1")
-	old := time.Now().Add(-61 * time.Second)
-	if e := os.Chtimes(kept, old, old); e != nil {
+	info, e := os.Stat(kept)
+	if e != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("kept line mode %v %v", info, e)
+	}
+	raw, _ := os.ReadFile(kept)
+	stamp, body, _ := strings.Cut(string(raw), "\n")
+	made, e := strconv.ParseInt(stamp, 10, 64)
+	if e != nil || time.Now().Unix()-made > 5 || body != first {
+		t.Fatalf("kept line %q", raw)
+	}
+	// After the TTL the line is made again.
+	old := strconv.FormatInt(time.Now().Unix()-61, 10) + "\n" + body
+	if e := os.WriteFile(kept, []byte(old), 0o600); e != nil {
 		t.Fatal(e)
 	}
 	if fresh, _ := h.run(a); fresh != "status 3 "+a+"\n" || h.nodeRuns() != 3 {
@@ -153,6 +165,48 @@ func TestStatusLauncherWithoutASessionOrAfterAFailureRunsNodeEachTime(t *testing
 	}
 	if out, code := h.run(s); code != 0 || h.nodeRuns() != 6 || !strings.HasPrefix(out, "status 6") {
 		t.Fatalf("recovery after failure: %q code %d", out, code)
+	}
+}
+
+func TestStatusLauncherShowsAKeptLineWithoutStartingAProcess(t *testing.T) {
+	bash, e := exec.LookPath("bash")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if v, _ := exec.Command(bash, "-c", `(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2) )) && echo ok`).Output(); string(v) != "ok\n" {
+		t.Skip("bash older than 4.2 reads the time with date; the hosts run 4.4 and 5.x")
+	}
+	h := newStatusLauncherHost(t)
+	s := `{"session_id":"nofork"}`
+	first, _ := h.run(s)
+	// Every command the launcher could start records itself instead.
+	stubs := t.TempDir()
+	starts := filepath.Join(t.TempDir(), "starts")
+	for _, name := range []string{"cat", "date", "stat", "sed", "grep", "find", "nice", "mv", "rm", "mkdir", "head", "tail", "env", "printf", "read", "node", "bash", "sh"} {
+		body := "#!/bin/sh\necho " + name + " >> " + starts + "\n"
+		if e := os.WriteFile(filepath.Join(stubs, name), []byte(body), 0o700); e != nil {
+			t.Fatal(e)
+		}
+	}
+	cmd := exec.Command(bash, h.launcher)
+	cmd.Env = []string{"HOME=" + h.home, "PATH=" + stubs}
+	cmd.Stdin = strings.NewReader(s)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, e := cmd.Output()
+	if e != nil || string(out) != first || stderr.Len() != 0 {
+		t.Fatalf("kept line: %q %v stderr %q", out, e, stderr.String())
+	}
+	if raw, _ := os.ReadFile(starts); len(raw) != 0 || h.nodeRuns() != 1 {
+		t.Fatalf("a kept line started processes: %q, node runs %d", raw, h.nodeRuns())
+	}
+	// A line kept by the previous launcher has no time and is made again.
+	kept := filepath.Join(h.home, ".cache/relay/cc-status-out/nofork")
+	if e := os.WriteFile(kept, []byte("status old\n"), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	if fresh, _ := h.run(s); fresh != "status 2 "+s+"\n" || h.nodeRuns() != 2 {
+		t.Fatalf("previous format: %q runs %d", fresh, h.nodeRuns())
 	}
 }
 

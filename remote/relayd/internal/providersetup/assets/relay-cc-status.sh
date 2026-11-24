@@ -9,21 +9,33 @@ cache="${XDG_CACHE_HOME:-$HOME/.cache}/relay/cc-status.resolved"
 # Each refresh also started Node itself: on a busy host (dandy-07, load 131,
 # 2026-11-23) about eight ran at once. Each session's line is kept for
 # CC_STATUS_TTL seconds (60; 0 turns it off) and Node runs at lower priority.
+# A kept line is shown without starting any process (bash 4.2 or later): a
+# process start cost 4-70 ms on a busy Mac. The file's first line is the time
+# it was made.
 out_dir="${XDG_CACHE_HOME:-$HOME/.cache}/relay/cc-status-out"
 ttl=${CC_STATUS_TTL:-60}
 [[ $ttl =~ ^[0-9]{1,6}$ ]] || ttl=60
-session='' input=''
+set_now() {
+    if [ -n "${EPOCHSECONDS:-}" ]; then
+        now=$EPOCHSECONDS
+    elif ! printf -v now '%(%s)T' -1 2>/dev/null || [[ ! $now =~ ^[0-9]+$ ]]; then
+        now=$(date +%s)
+    fi
+}
+session='' input='' now=0
 if [ "${1:-}" != --check ]; then
-    input=$(cat; printf x); input=${input%x}
+    IFS= read -r -d '' input || true
     if [[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9._-]{1,128})\" ]]; then
         session=${BASH_REMATCH[1]}
     fi
 fi
 if [ -n "$session" ] && (( ttl > 0 )) && [ -f "$out_dir/$session" ]; then
-    mtime=$(stat -c %Y "$out_dir/$session" 2>/dev/null || stat -f %m "$out_dir/$session" 2>/dev/null)
-    now=${EPOCHSECONDS:-$(date +%s)}
-    if [[ $mtime =~ ^[0-9]+$ ]] && (( now >= mtime && now - mtime < ttl )); then
-        cat "$out_dir/$session" && exit 0
+    stamp='' body=''
+    { IFS= read -r stamp; IFS= read -r -d '' body; } < "$out_dir/$session"
+    set_now
+    if [[ $stamp =~ ^[0-9]+$ ]] && (( now >= stamp && now - stamp < ttl )); then
+        printf '%s' "$body"
+        exit 0
     fi
 fi
 run_status() {
@@ -31,14 +43,18 @@ run_status() {
         printf '%s' "$input" | nice -n 10 "$1" "$2"
         exit
     fi
+    umask 077
     # Lines of sessions that ended are removed after an hour.
     find "$out_dir" -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null
-    local tmp="$out_dir/.$session.$$" status
-    printf '%s' "$input" | nice -n 10 "$1" "$2" > "$tmp"
+    local tmp="$out_dir/.$session.$$" status body=''
+    set_now
+    printf '%s\n' "$now" > "$tmp"
+    printf '%s' "$input" | nice -n 10 "$1" "$2" >> "$tmp"
     status=$?
-    cat "$tmp" 2>/dev/null
+    { IFS= read -r _; IFS= read -r -d '' body; } < "$tmp"
+    printf '%s' "$body"
     # A failed run is shown once but not kept, so the next refresh retries.
-    if (( status == 0 )) && [ -s "$tmp" ]; then
+    if (( status == 0 )) && [ -n "$body" ]; then
         mv -f "$tmp" "$out_dir/$session" 2>/dev/null || rm -f "$tmp"
         exit 0
     fi
