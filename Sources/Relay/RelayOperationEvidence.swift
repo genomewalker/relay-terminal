@@ -32,6 +32,8 @@ enum RelayOperationEvidence {
     enum Stage: String {
         case requested
         case inProgress = "in_progress"
+        case socketWrite = "written_to_socket"
+        case turnCompleted = "provider_turn_completed"
         case admitted
         case providerTurnStarted = "provider_turn_started"
         case acknowledged
@@ -48,9 +50,9 @@ enum RelayOperationEvidence {
         var progress: Int? {
             switch self {
             case .requested, .inProgress: 1
-            case .admitted: 2
+            case .socketWrite, .admitted: 2
             case .providerTurnStarted: 3
-            case .acknowledged, .completed: 4
+            case .acknowledged, .completed, .turnCompleted: 4
             default: nil
             }
         }
@@ -63,7 +65,9 @@ enum RelayOperationEvidence {
         switch (kind, status) {
         case (.message, "pending"): return .requested
         case (.message, "not_sent"): return .notSent
-        case (.message, "written_to_socket"), (.message, "admitted_not_processed"),
+        case (.message, "written_to_socket"): return .socketWrite
+        case (.message, "turn_completed"): return .turnCompleted
+        case (.message, "admitted_not_processed"),
              (.message, "accepted_by_provider"): return .admitted
         case (.message, "turn_started"): return .providerTurnStarted
         case (.message, "read_acknowledged"): return .acknowledged
@@ -141,8 +145,10 @@ enum RelayOperationEvidence {
         }
         if stages.contains(.completed) { return "completed" }
         if stages.contains(.acknowledged) { return "acknowledged" }
+        if stages.contains(.turnCompleted) { return Stage.turnCompleted.rawValue }
         if stages.contains(.providerTurnStarted) { return "provider_turn_started" }
         if stages.contains(.admitted) { return "admitted_processing_unproven" }
+        if stages.contains(.socketWrite) { return Stage.socketWrite.rawValue }
         if stages.contains(.held) { return "held" }
         if progress != nil { return "in_progress" }
         if stages.contains(.unknown) || stages.contains(.readFailed) { return "unknown" }
@@ -151,6 +157,8 @@ enum RelayOperationEvidence {
 
     static func evidenceEnd(kind: Kind, stages: [Stage], conclusion: String) -> String {
         switch conclusion {
+        case "written_to_socket": return "Relay wrote to the recipient socket. Provider admission is unconfirmed."
+        case "provider_turn_completed": return "The provider recorded completion of the turn associated with this message."
         case "completed": return "The move was verified: the same conversation resumed on the target account."
         case "acknowledged": return "The recipient acknowledged reading the message."
         case "provider_turn_started": return "The recipient's provider started a turn for the message; its completion is not recorded."
@@ -174,7 +182,7 @@ enum RelayOperationEvidence {
         switch kind {
         case .message:
             if !stages.contains(.acknowledged) {
-                gaps.append("Recipient processing is recorded only when the recipient acknowledges; no acknowledgement is retained.")
+                gaps.append("No separate read acknowledgement is retained.")
             }
         case .accountMove:
             gaps.append("Account move receipts live in the running app for 15 minutes and are lost when Relay restarts.")

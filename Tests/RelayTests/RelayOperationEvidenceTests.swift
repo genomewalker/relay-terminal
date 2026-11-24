@@ -26,6 +26,13 @@ struct RelayOperationEvidenceTests {
         #expect(result["read_only"] as? Bool == true)
     }
 
+    @Test func transportAndProviderCompletionHaveDistinctConclusions() {
+        for (status, expected) in [("written_to_socket", "written_to_socket"), ("turn_completed", "provider_turn_completed")] {
+            let result = export(.message, [source(["status": status])])
+            #expect(result["conclusion"] as? String == expected)
+        }
+    }
+
     @Test("An outcome-unknown receipt stays unknown, not failed")
     func unknownStaysUnknown() {
         let result = export(.message, [source(["status": "outcome_unknown", "replay_permitted": false])])

@@ -149,7 +149,7 @@ import Testing
     }
 
     @Test func bundledCatalogMatchesRecoverySemantics() {
-        #expect(RelayMikoToolCatalog.names.count == 100)   // source23 adds guarded installed-update request and receipt; relay_update_host_relayd; relay_show; relay_browser
+        #expect(RelayMikoToolCatalog.names.count == 101)   // source23 adds guarded installed-update request and receipt; relay_update_host_relayd; relay_show; relay_browser
         let description = RelayMikoToolCatalog.definition("relay_recover_pane")?["description"]?.string ?? ""
         #expect(description.contains("an identical repeat returns pending"))
         #expect(description.contains("After an app restart reconcile"))

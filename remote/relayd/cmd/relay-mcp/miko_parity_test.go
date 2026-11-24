@@ -38,7 +38,7 @@ func TestMikoCatalogComplete(t *testing.T) {
 			t.Fatal("Miko can impersonate a caller")
 		}
 	}
-	if !reflect.DeepEqual(actual, expected) || len(actual) != 100 {
+	if !reflect.DeepEqual(actual, expected) || len(actual) != 101 {
 		t.Fatalf("catalog omission or self/grant exposure: got %d expected %d", len(actual), len(expected))
 	}
 	file, e := os.ReadFile("../../../../Sources/Relay/Resources/Rotation/miko_tool_catalog.json")
