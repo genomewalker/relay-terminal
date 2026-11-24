@@ -3359,6 +3359,18 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
             if let refusal = navigationRefusal([.navigate]) { return refusal }
             guard admit("select_pane", tab: snapshot.pane(id)?.tabID, pane: id) else { return (unrecorded, true) }
             captureUndo()
+            // A hidden Relay is unhidden before the tab changes
+            // (NavigationUnhideOrdering); the reveal follows the unhide.
+            if let pane = workspace.panes[id], NavigationUnhideOrdering.deferIfHidden(
+                NavigationUnhideOrdering.application, reveal: { [weak workspace, weak pane] in
+                    guard let workspace, let pane, workspace.panes[pane.id] === pane else { return }
+                    workspace.revealPane(pane.id, origin: .programmatic)
+                    if let zoomed = workspace.zoomedPaneID, zoomed != pane.id { workspace.zoomedPaneID = nil }
+                    if workspace.activePaneID == pane.id { workspace.activateSelectedWorkspacePane(pane) }
+                }) {
+                settle("select_pane", ok: true)
+                return (["ok": .bool(true), "selected_pane_id": idString(id), "revealed_after_unhide": .bool(true)], false)
+            }
             workspace.revealPane(id, origin: .programmatic)
             if let zoomed = workspace.zoomedPaneID, zoomed != id { workspace.zoomedPaneID = nil }
             let ok = workspace.activePaneID == id

@@ -1085,6 +1085,7 @@ final class WorkspaceModel: ObservableObject {
     @discardableResult
     func sidePanelReveal(_ paneID: UUID) -> Bool {
         guard let pane = panes[paneID] else { return false }
+        if revealAfterUnhidingIfHidden(pane, origin: .programmatic) { return true }
         revealPane(paneID, origin: .programmatic)
         activateSelectedWorkspacePane(pane)
         return true

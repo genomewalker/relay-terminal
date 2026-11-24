@@ -488,6 +488,20 @@ extension WorkspaceModel {
         }
     }
 
+    /// When Relay is hidden, unhides it and reveals and activates `pane` only
+    /// after the unhide has been laid out (`NavigationUnhideOrdering`).
+    /// Returns false, doing nothing, when Relay is visible.
+    func revealAfterUnhidingIfHidden(
+        _ pane: PaneModel, origin: PaneSelectionOrigin,
+        application: NavigationUnhideOrdering.Application = NavigationUnhideOrdering.application
+    ) -> Bool {
+        NavigationUnhideOrdering.deferIfHidden(application) { [weak self, weak pane] in
+            guard let self, let pane, self.panes[pane.id] === pane else { return }
+            self.revealPane(pane.id, origin: origin)
+            if self.activePaneID == pane.id { self.activateSelectedWorkspacePane(pane) }
+        }
+    }
+
     /// Agents and tools select programmatically; only a user's own choice
     /// (such as clicking an attention notification) passes `.user`.
     func selectWorkspacePane(_ paneID: UUID, origin: PaneSelectionOrigin = .programmatic) throws -> (UUID, UUID) {
@@ -495,6 +509,7 @@ extension WorkspaceModel {
         guard let pane = panes[paneID], let tabID = tabID(containingPane: paneID) else {
             throw PluginError.invalid("Pane no longer exists")
         }
+        if revealAfterUnhidingIfHidden(pane, origin: origin) { return (tabID, pane.id) }
         revealPane(paneID, origin: origin)
         guard selectedTabID == tabID, activePaneID == pane.id else {
             throw PluginError.invalid("Pane selection failed")
@@ -580,6 +595,10 @@ extension WorkspaceModel {
             return newTab(inSession: source.sessionID, profile: profile ?? expected.profile, directory: proposal.directory,
                           origin: .agent(sourcePane: proposal.paneID), sourcePaneID: proposal.paneID)
                 .map { ($0.tabID, $0.paneID) }
+        }
+        if proposal.action == .select, let tabID = tabID(containingPane: proposal.paneID),
+           revealAfterUnhidingIfHidden(expected, origin: .programmatic) {
+            return (tabID, proposal.paneID)
         }
         revealPane(proposal.paneID, origin: .programmatic)
         guard let tab = selectedTab, tab.allPaneIDs.contains(proposal.paneID) else { return nil }
