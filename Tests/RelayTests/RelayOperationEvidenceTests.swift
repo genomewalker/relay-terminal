@@ -100,6 +100,46 @@ struct RelayOperationEvidenceTests {
         #expect(export(.message, [source(["status": "read_acknowledged"])])["conclusion"] as? String == "acknowledged")
     }
 
+    private struct Unreachable: LocalizedError {
+        var errorDescription: String? { "relayd unreachable for a.person@example.org" }
+    }
+
+    @Test("An unreadable daemon stays in the timeline even when the desktop has a record")
+    func unreadableDaemonIsNotHiddenByDesktopRecord() {
+        let sources = RelayOperationEvidence.messageSources(
+            daemon: [(name: "daemon_receipt dandy-07", result: .failure(Unreachable()))],
+            desktop: .success(["status": "not_sent"]), observedAt: now)
+        let result = export(.message, sources)
+        let timeline = result["timeline"] as? [[String: Any]] ?? []
+        #expect(timeline.map { $0["source"] as? String } == ["daemon_receipt dandy-07", "desktop_intent_record"])
+        #expect(timeline.map { $0["stage"] as? String } == ["read_failed", "not_sent"])
+        #expect((timeline.first?["error"] as? String)?.contains("example.org") == false)
+        // The daemon may hold proof of delivery, so not_sent is not concluded.
+        #expect(result["conclusion"] as? String == "unknown")
+        #expect((result["gaps"] as? [String])?.contains { $0.contains("could not be read") } == true)
+    }
+
+    @Test("A daemon without a record and a desktop admission conclude from the desktop")
+    func daemonUnknownIsNoRecord() {
+        let sources = RelayOperationEvidence.messageSources(
+            daemon: [(name: "daemon_receipt a", result: .success(["status": "unknown"])),
+                     (name: "daemon_receipt b", result: .success(["status": "accepted_by_provider"]))],
+            desktop: .success(nil), observedAt: now)
+        let result = export(.message, sources)
+        let stages = (result["timeline"] as? [[String: Any]])?.map { $0["stage"] as? String }
+        #expect(stages == ["no_record", "admitted", "no_record"])
+        #expect(result["conclusion"] as? String == "admitted_processing_unproven")
+    }
+
+    @Test("Proof of progress survives an unreadable source")
+    func progressSurvivesReadFailure() {
+        let sources = RelayOperationEvidence.messageSources(
+            daemon: [(name: "daemon_receipt a", result: .failure(Unreachable())),
+                     (name: "daemon_receipt b", result: .success(["status": "turn_started"]))],
+            desktop: .failure(Unreachable()), observedAt: now)
+        #expect(export(.message, sources)["conclusion"] as? String == "provider_turn_started")
+    }
+
     @Test("Only the two documented paths route")
     func routes() {
         let instance = UUID()

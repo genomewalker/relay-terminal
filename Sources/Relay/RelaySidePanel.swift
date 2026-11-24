@@ -1429,15 +1429,8 @@ final class RelaySidePanelServer: ObservableObject {
                                                            record: accountMoveReceipts.result(id))
                 return Self.evidenceResponse(RelayOperationEvidence.export(kind: .accountMove, id: id, sources: [source], now: Date()))
             case let .message(id)?:
-                let source: RelayOperationEvidence.Source
-                do {
-                    source = .init(name: "pane_message_receipt", observedAt: Date(),
-                                   record: try await paneMessaging.receipt(id, workspace: workspace, reportUnavailableSource: true))
-                } catch {
-                    source = .init(name: "pane_message_receipt", observedAt: Date(), record: nil,
-                                   error: error.localizedDescription)
-                }
-                return Self.evidenceResponse(RelayOperationEvidence.export(kind: .message, id: id, sources: [source], now: Date()))
+                let sources = await paneMessaging.receiptEvidence(id, workspace: workspace)
+                return Self.evidenceResponse(RelayOperationEvidence.export(kind: .message, id: id, sources: sources, now: Date()))
             default:
                 return .text("Invalid or stale operation evidence request", status: 400, reason: "Bad Request")
             }

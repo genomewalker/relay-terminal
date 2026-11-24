@@ -91,10 +91,39 @@ enum RelayOperationEvidence {
     static let contentFields: Set<String> = ["text", "content", "prompt", "body", "draft", "message_text"]
     static let textLimit = 500
 
+    /// The sources of a pane-message receipt read, each on its own: every
+    /// daemon consulted, then the desktop's intent record. A daemon that
+    /// could not be read stays in the timeline as read_failed even when the
+    /// desktop has a record, and a daemon's "unknown" means it has none.
+    static func messageSources(daemon: [(name: String, result: Result<[String: Any], Error>)],
+                               desktop: Result<[String: Any]?, Error>, observedAt: Date) -> [Source] {
+        var sources = daemon.map { entry -> Source in
+            switch entry.result {
+            case let .success(record):
+                return Source(name: entry.name, observedAt: observedAt,
+                              record: record["status"] as? String == "unknown" ? nil : record)
+            case let .failure(error):
+                return Source(name: entry.name, observedAt: observedAt, record: nil, error: error.localizedDescription)
+            }
+        }
+        switch desktop {
+        case let .success(record):
+            sources.append(Source(name: "desktop_intent_record", observedAt: observedAt, record: record))
+        case let .failure(error):
+            sources.append(Source(name: "desktop_intent_record", observedAt: observedAt, record: nil,
+                                  error: error.localizedDescription))
+        }
+        return sources
+    }
+
     static func export(kind: Kind, id: UUID, sources: [Source], now: Date) -> [String: Any] {
         var timeline: [[String: Any]] = []
         var stages: [Stage] = []
-        for source in sources.sorted(by: { $0.observedAt < $1.observedAt }) {
+        // Time order; sources observed together keep the order given.
+        let ordered = sources.enumerated().sorted {
+            ($0.element.observedAt, $0.offset) < ($1.element.observedAt, $1.offset)
+        }.map(\.element)
+        for source in ordered {
             var entry: [String: Any] = ["source": source.name, "observed_at": timestamp(source.observedAt)]
             let stage: Stage
             if let error = source.error {
@@ -140,6 +169,9 @@ enum RelayOperationEvidence {
             // A refusal or not-sent beside proof the operation went further
             // cannot both be right.
             if let progress, progress >= 2 { return "conflicting" }
+            // A source that could not be read may hold that proof, so a
+            // negative record alone no longer settles the outcome.
+            if stages.contains(.readFailed) { return "unknown" }
             return negative.rawValue
         }
         if stages.contains(.completed) { return "completed" }
