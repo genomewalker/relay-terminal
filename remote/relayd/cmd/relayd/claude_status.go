@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -15,6 +16,9 @@ import (
 	"time"
 
 	"github.com/relay-terminal/relayd/internal/contextusage"
+	"github.com/relay-terminal/relayd/internal/daemon"
+	"github.com/relay-terminal/relayd/internal/protocol"
+	"github.com/relay-terminal/relayd/internal/seatlimit"
 	"github.com/relay-terminal/relayd/internal/subscriptionquota"
 )
 
@@ -61,6 +65,9 @@ type claudeLiveStatus struct {
 	// The pane's own account, so the desktop shows this pane that account's
 	// usage when one host runs several Claude accounts (dandy-07, 2026-11-19).
 	AccountScope string `json:"account_scope,omitempty"`
+	// The conversation's current seat/usage-limit refusal (HTTP 429), read
+	// from the transcript tail. Claude fires no Stop hook for that turn.
+	SeatLimit *seatlimit.Event `json:"seat_limit,omitempty"`
 }
 
 func captureClaudeStatus(pane string, raw []byte, home string) error {
@@ -77,8 +84,9 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 		Effort struct {
 			Level string `json:"level"`
 		} `json:"effort"`
-		CWD       string `json:"cwd"`
-		Workspace struct {
+		CWD            string `json:"cwd"`
+		TranscriptPath string `json:"transcript_path"`
+		Workspace      struct {
 			Project string `json:"project_dir"`
 		} `json:"workspace"`
 	}
@@ -100,6 +108,17 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 		RateLimits: claudeQuotaWindows(input.RateLimits), AccountScope: subscriptionquota.ClaudeAccountScope(home)}
 	if counts := contextusage.Claude(input.ContextWindow); counts.Used != nil || counts.Limit != nil {
 		status.ContextUsage = &counts
+	}
+	statusPath := filepath.Join(directory, pane+".json")
+	if filepath.IsAbs(input.TranscriptPath) && len(input.TranscriptPath) <= 4096 {
+		if tail, err := seatlimit.ReadTail(input.TranscriptPath, seatlimit.TailBytes); err == nil {
+			status.SeatLimit = seatlimit.Latest(tail)
+		}
+	}
+	if status.SeatLimit != nil && status.SeatLimit.ID != previousSeatLimitID(statusPath) {
+		// Before the status file names it: a lost update re-sends it, and the
+		// desktop records each limit occurrence once.
+		_ = emitSeatLimitEvent(pane, input.SessionID, status.AccountScope, status.SeatLimit)
 	}
 	data, err := json.Marshal(status)
 	if err != nil {
@@ -126,7 +145,7 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, filepath.Join(directory, pane+".json")); err != nil {
+	if err := os.Rename(temporary, statusPath); err != nil {
 		return err
 	}
 	dir, err := os.Open(directory)
@@ -135,6 +154,68 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+// previousSeatLimitID is the refusal the pane's last status already named.
+func previousSeatLimitID(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > 1<<20 {
+		return ""
+	}
+	var previous struct {
+		SeatLimit *seatlimit.Event `json:"seat_limit"`
+	}
+	if json.Unmarshal(data, &previous) != nil || previous.SeatLimit == nil {
+		return ""
+	}
+	return previous.SeatLimit.ID
+}
+
+// seatLimitHookEvent is the agent event the desktop reads: a synthetic
+// "SeatLimit" hook with only content-free fields and Claude's short notice.
+func seatLimitHookEvent(session, accountScope string, event *seatlimit.Event) map[string]any {
+	hook := map[string]any{
+		"hook_event_name": "SeatLimit", "session_id": session, "occurred_at": event.At.Format(time.RFC3339Nano),
+		"message": event.Text, "limit_kind": event.Kind, "seat_limit_id": event.ID,
+	}
+	if event.Model != "" {
+		hook["limit_model"] = event.Model
+	}
+	if event.ResetsAt > 0 {
+		hook["resets_at"] = event.ResetsAt
+	}
+	if accountScope != "" && len(accountScope) <= 512 {
+		hook["account_scope"] = accountScope
+	}
+	return hook
+}
+
+// emitSeatLimitEvent sends the event on the pane's ordinary (unbound) event
+// channel, as a one-shot hook does. It never touches the agent binding.
+func emitSeatLimitEvent(pane, session, accountScope string, event *seatlimit.Event) error {
+	raw, err := json.Marshal(seatLimitHookEvent(session, accountScope, event))
+	if err != nil {
+		return err
+	}
+	envelope, err := daemon.CanonicalAgentEnvelope("claude", raw, "hook")
+	if err != nil {
+		return err
+	}
+	connection, err := net.DialTimeout("unix", defaultSocket(), 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	writer := protocol.NewWriter(connection)
+	hello, err := protocol.JSONFrame(protocol.Hello, protocol.HelloPayload{Version: 1, SessionID: pane, EventOnly: true})
+	if err != nil {
+		return err
+	}
+	if err := writer.Write(hello); err != nil {
+		return err
+	}
+	return writer.Write(protocol.Frame{Type: protocol.AgentEvent, Payload: envelope})
 }
 
 func runClaudeStatusCapture(arguments []string) {

@@ -271,6 +271,9 @@ func copyAgentMetadata(input map[string]any) map[string]any {
 		// Conversation identity, not content: host rotation matches a Stop to
 		// the enrolled session and skips subagent (parented) completions.
 		"session_id": true, "parent_session_id": true,
+		// A seat/usage-limit refusal read from the transcript (SeatLimit).
+		"limit_kind": true, "limit_model": true, "resets_at": true,
+		"seat_limit_id": true, "account_scope": true,
 	}
 	result := make(map[string]any)
 	for key, value := range input {

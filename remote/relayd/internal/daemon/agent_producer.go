@@ -40,7 +40,7 @@ func claudeHookLifecycle(name, detail string) string {
 			return "stop_observed"
 		}
 		return ""
-	case "SubagentStart", "SubagentStop", "PreCompact", "PostCompact":
+	case "SubagentStart", "SubagentStop", "PreCompact", "PostCompact", "SeatLimit":
 		return ""
 	case "Notification":
 		if detail == "idle_prompt" {

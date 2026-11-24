@@ -181,6 +181,9 @@ func indexedAgentPayload(payload []byte, sequence uint64) []byte {
 				"session_id": true, "parent_session_id": true,
 				// Content-free prompt provenance (lengths and hash prefixes only).
 				"prompt_length": true, "prompt_sha256_prefix": true, "prompt_peer_message_id": true,
+				// Seat/usage-limit refusal (SeatLimit): window, reset, row ID.
+				"limit_kind": true, "limit_model": true, "resets_at": true,
+				"seat_limit_id": true, "account_scope": true,
 			}
 			minimal := make(map[string]any, len(event))
 			for key, value := range event {
