@@ -21,21 +21,80 @@ struct RelaySeatLimitEvent: Codable, Equatable, Sendable {
     /// The pane's account label when the event arrived.
     var account: String?
 
-    /// The relayd event's fields; nil for anything malformed.
+    /// The relayd event's fields; nil for anything malformed. A pane worker
+    /// started before relayd learned SeatLimit keeps only `message`,
+    /// `session_id` and `occurred_at` in its journal; the window and reset are
+    /// then read from Claude's own notice text.
     static func parse(_ event: [String: Any], paneID: UUID, host: String, account: String?) -> Self? {
-        guard event["hook_event_name"] as? String == "SeatLimit",
-              let kind = event["limit_kind"] as? String, kind.range(of: #"^[a-z0-9_]{1,40}$"#, options: .regularExpression) != nil,
-              let row = event["seat_limit_id"] as? String, !row.isEmpty, row.utf8.count <= 80 else { return nil }
-        let reset = (event["resets_at"] as? NSNumber).map(\.doubleValue)
-            .flatMap { $0 > 0 && $0 < 253_402_300_800 ? Date(timeIntervalSince1970: $0) : nil }
+        guard event["hook_event_name"] as? String == "SeatLimit" else { return nil }
+        let text = String((event["message"] as? String ?? "").prefix(300))
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let raw = event["occurred_at"] as? String ?? ""
-        let at = formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) ?? Date()
-        let model = (event["limit_model"] as? String).flatMap { $0.isEmpty || $0.utf8.count > 40 ? nil : $0 }
+        guard let at = formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) else { return nil }
+        let fromText = textLimit(text)
+        var kind = event["limit_kind"] as? String ?? fromText?.kind ?? ""
+        if event["limit_kind"] == nil, fromText == nil { return nil }
+        guard kind.range(of: #"^[a-z0-9_]{1,40}$"#, options: .regularExpression) != nil else { return nil }
+        if kind == "unknown", let fromText { kind = fromText.kind }
+        let row = (event["seat_limit_id"] as? String).flatMap { $0.isEmpty || $0.utf8.count > 80 ? nil : $0 }
+            ?? "text:" + String(raw.prefix(60))
+        let reset = (event["resets_at"] as? NSNumber).map(\.doubleValue)
+            .flatMap { $0 > 0 && $0 < 253_402_300_800 ? Date(timeIntervalSince1970: $0) : nil }
+            ?? resetFromText(text, after: at)
+        let model = (event["limit_model"] as? String).flatMap { $0.isEmpty || $0.utf8.count > 40 ? nil : $0 } ?? fromText?.model
         let session = (event["session_id"] as? String).flatMap { $0.isEmpty || $0.utf8.count > 128 ? nil : $0 }
         return .init(paneID: paneID, host: host, kind: kind, model: model, resetsAt: reset, rowID: row, sessionID: session,
-                     text: String((event["message"] as? String ?? "").prefix(300)), occurredAt: at, account: account)
+                     text: text, occurredAt: at, account: account)
+    }
+
+    /// "You've hit your session/5-hour/weekly limit", "You've reached your Fable limit".
+    static func textLimit(_ text: String) -> (kind: String, model: String?)? {
+        guard let match = text.range(of: #"(?i)you'?ve (hit|reached) your (.{1,40}?) limit"#, options: .regularExpression) else { return nil }
+        var name = String(text[match])
+        for prefix in ["you've hit your ", "you've reached your ", "youve hit your ", "youve reached your "] where name.lowercased().hasPrefix(prefix) {
+            name = String(name.dropFirst(prefix.count))
+        }
+        name = String(name.dropLast(" limit".count)).trimmingCharacters(in: .whitespaces)
+        switch name.lowercased() {
+        case "session", "5-hour", "five-hour": return ("five_hour", nil)
+        case "weekly": return ("seven_day", nil)
+        default: return ("model", name)
+        }
+    }
+
+    /// "resets 3:10pm (Europe/Copenhagen)", "resets 9am (…)", "resets Nov 22,
+    /// 9am (…)" or "resets Nov 5 at 1am (…)": the first such time after `after`.
+    static func resetFromText(_ text: String, after: Date) -> Date? {
+        let pattern = #"resets (?:([A-Z][a-z]{2}) (\d{1,2})(?:,| at) )?(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?: \(([A-Za-z_]+(?:/[A-Za-z_+\-]+)*)\))?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let m = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return nil }
+        func group(_ i: Int) -> String? { Range(m.range(at: i), in: text).map { String(text[$0]) } }
+        var calendar = Calendar(identifier: .gregorian)
+        if let zone = group(6) {
+            guard let tz = TimeZone(identifier: zone) else { return nil }
+            calendar.timeZone = tz
+        } else {
+            calendar.timeZone = TimeZone(identifier: "UTC")!
+        }
+        guard let hour12 = group(3).flatMap(Int.init), (1...12).contains(hour12) else { return nil }
+        let minute = group(4).flatMap(Int.init) ?? 0
+        guard minute < 60 else { return nil }
+        let hour = hour12 % 12 + (group(5)?.lowercased() == "pm" ? 12 : 0)
+        var parts = calendar.dateComponents([.year, .month, .day], from: after)
+        parts.hour = hour; parts.minute = minute; parts.second = 0
+        if let month = group(1) {
+            let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+            guard let index = months.firstIndex(of: month.lowercased()), let day = group(2).flatMap(Int.init),
+                  (1...31).contains(day) else { return nil }
+            parts.month = index + 1; parts.day = day
+            guard var date = calendar.date(from: parts) else { return nil }
+            if date <= after { date = calendar.date(byAdding: .year, value: 1, to: date) ?? date }
+            return date
+        }
+        guard var date = calendar.date(from: parts) else { return nil }
+        if date <= after { date = calendar.date(byAdding: .day, value: 1, to: date) ?? date }
+        return date
     }
 
     /// "weekly", "5-hour", "Fable": how the notification names the limit.
@@ -54,6 +113,11 @@ struct RelaySeatLimitEvent: Codable, Equatable, Sendable {
         let reset = resetsAt.map { String(Int($0.timeIntervalSince1970 / 60)) } ?? "row:" + rowID
         return [paneID.uuidString.lowercased(), kind, model ?? "", reset].joined(separator: "|")
     }
+
+    /// A refusal is news only shortly after Claude wrote it. relayd sends it
+    /// within seconds; an older row is a resumed conversation's history (it
+    /// may name another account) or a replay.
+    static let freshness: TimeInterval = 30 * 60
 
     /// Whether the refusal still describes a current limit.
     func current(now: Date) -> Bool {
@@ -99,7 +163,7 @@ enum RelaySeatLimitPolicy {
     /// host's only other Claude account. Never a guess.
     static func otherAccount(current: String?, registry: [RelayAgentAccount]?,
                              settings: RelayClaudeQuotaSettings) -> Result<RelayAgentAccount, Refusal> {
-        guard let registry else { return .failure(.init("this host's Claude account list has not been read yet")) }
+        guard let registry else { return .failure(.init("this host's Claude account list has not been read yet", retryable: true)) }
         guard let current else { return .failure(.init("Relay does not know which Claude account this pane uses")) }
         let accounts = registry.filter { $0.provider == "claude" && $0.isValid }
         let label: String?
@@ -116,7 +180,11 @@ enum RelaySeatLimitPolicy {
         return .success(account)
     }
 
-    struct Refusal: Error, Equatable { let text: String; init(_ text: String) { self.text = text } }
+    struct Refusal: Error, Equatable {
+        let text: String
+        var retryable = false
+        init(_ text: String, retryable: Bool = false) { self.text = text; self.retryable = retryable }
+    }
 
     struct Decision: Equatable {
         var target: RelayAgentAccount?
@@ -128,6 +196,9 @@ enum RelaySeatLimitPolicy {
         var autoMove = false
         /// Why Relay does not move it itself although automatic moves are on.
         var autoHold: String?
+        /// The hold may clear by itself (an account list or usage reading
+        /// not yet available): the automatic lane keeps checking.
+        var retryable = false
     }
 
     static func decide(target: Result<RelayAgentAccount, Refusal>, health: RelaySeatLimitTargetHealth,
@@ -136,6 +207,7 @@ enum RelaySeatLimitPolicy {
         switch target {
         case .failure(let refusal):
             decision.moveRefusal = refusal.text
+            decision.retryable = refusal.retryable
             return decision
         case .success(let account):
             decision.target = account
@@ -157,7 +229,10 @@ enum RelaySeatLimitPolicy {
         if let protection { decision.autoHold = protection + "; it is never moved automatically"; return decision }
         guard automatic else { return decision }
         if let ruleHold { decision.autoHold = ruleHold }
-        else if case .unknown(let reason) = health { decision.autoHold = "automatic moves need a current reading: " + reason }
+        else if case .unknown(let reason) = health {
+            decision.autoHold = "automatic moves need a current usage reading: " + reason
+            decision.retryable = true
+        }
         else { decision.autoMove = true }
         return decision
     }
@@ -230,7 +305,7 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
     /// a resumed transcript's old row).
     mutating func admit(_ event: RelaySeatLimitEvent, now: Date) -> Bool {
         seen = seen.filter { $0.value > now }
-        guard event.current(now: now) else { return false }
+        guard event.current(now: now), now.timeIntervalSince(event.occurredAt) < RelaySeatLimitEvent.freshness else { return false }
         let occurrence = event.occurrenceKey
         let row = "row|" + event.paneID.uuidString.lowercased() + "|" + event.rowID
         guard seen[occurrence] == nil, seen[row] == nil else { return false }
@@ -277,7 +352,9 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
     private let url: URL?
     private weak var workspace: WorkspaceModel?
     private struct Intent: Equatable { let pane: UUID; let label: String; let dir: String; let account: String?; let session: String? }
-    private var intent: Intent?
+    /// One exact intent per pane: a limit hits every pane of an account at once.
+    private var intents: [UUID: Intent] = [:]
+    private var refreshes: [String: Task<Void, Never>] = [:]
     private var autoTasks: [UUID: Task<Void, Never>] = [:]
     var autoRetryInterval: TimeInterval = 30
     var autoAttempts = 40
@@ -327,14 +404,14 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
         Task { @MainActor [weak self] in
             guard let self else { return }
             // Readings older than two minutes are not move evidence.
-            await self.refreshUsage(pane.profile)
+            await self.refresh(pane.profile)
             guard var current = self.offers[pane.id], current.event == event else { return }
             current.decision = self.evaluate(event, pane: pane, now: Date())
             // The banner reads this offer while the entry is recorded.
             self.offers[pane.id] = current
             let inboxID = self.notify(self.inboxEvent(current))
             self.offers[pane.id]?.inboxID = inboxID
-            if current.decision.autoMove { self.startAutomatic(pane.id) }
+            if current.decision.autoMove || self.automaticEnabled() && current.decision.retryable { self.startAutomatic(pane.id) }
         }
     }
 
@@ -391,7 +468,7 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
     /// Exact authority for one automatic move, checked twice by the mover:
     /// before anything is read, and against the native agent it inspected.
     func authorizes(_ pane: UUID, target: RelayAgentAccount, proof: RelayAgentMaintenanceProbe? = nil) -> Bool {
-        guard let intent, intent.pane == pane, target.provider == "claude", target.label == intent.label,
+        guard let intent = intents[pane], target.provider == "claude", target.label == intent.label,
               target.dir == intent.dir, automaticEnabled() else { return false }
         guard let proof else { return true }
         guard proof.valid(for: pane), proof.provider == "claude" else { return false }
@@ -436,7 +513,7 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
             guard var offer = offers[id], let pane = workspace?.panes[id] else { continue }
             offer.decision = evaluate(offer.event, pane: pane, now: Date())
             offers[id] = offer
-            if offer.decision.autoMove { startAutomatic(id) }
+            if offer.decision.autoMove || offer.decision.retryable { startAutomatic(id) }
         }
     }
 
@@ -457,10 +534,11 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
     /// One move() per attempt. Only a deferred outcome (nothing was sent) is
     /// tried again; refused, held and unknown outcomes end the lane.
     func runAutomatic(_ paneID: UUID) async {
+        var last = "automatic moves are off"
         for attempt in 0..<autoAttempts {
             if attempt > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(autoRetryInterval * 1e9))
-                if let profile = workspace?.panes[paneID]?.profile { await refreshUsage(profile) }
+                if let profile = workspace?.panes[paneID]?.profile { await refresh(profile) }
             }
             guard !Task.isCancelled, var offer = offers[paneID], !offer.moving, offer.event.current(now: Date()) else { return }
             guard let workspace, let pane = workspace.panes[paneID] else {
@@ -468,26 +546,55 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
             }
             offer.decision = evaluate(offer.event, pane: pane, now: Date())
             guard offer.decision.autoMove, let target = offer.decision.target else {
-                offer.status = "Not moved automatically: " + (offer.decision.moveRefusal ?? offer.decision.autoHold ?? "automatic moves are off") + "."
-                offers[paneID] = offer
+                last = offer.decision.moveRefusal ?? offer.decision.autoHold ?? "automatic moves are off"
+                if offer.decision.retryable, automaticEnabled() {
+                    offer.status = "Waiting to move automatically: " + last + "."
+                    offers[paneID] = offer
+                    continue
+                }
+                stopped(paneID, reason: last)
                 return
             }
             offer.moving = true
             offer.status = "Moving to \(target.label) automatically…"
             offers[paneID] = offer
-            intent = .init(pane: paneID, label: target.label, dir: target.dir, account: offer.event.account, session: offer.event.sessionID)
+            intents[paneID] = .init(pane: paneID, label: target.label, dir: target.dir, account: offer.event.account, session: offer.event.sessionID)
             let outcome = await mover(pane, workspace, target, .seatLimit)
-            intent = nil
+            intents[paneID] = nil
             if outcome.state == "deferred" {
                 guard var waiting = offers[paneID] else { return }
                 waiting.moving = false
-                waiting.status = "Waiting to move automatically: " + outcome.displayMessage
+                last = outcome.displayMessage
+                waiting.status = "Waiting to move automatically: " + last
                 offers[paneID] = waiting
                 continue
             }
             finished(paneID, target: target, outcome: outcome, automatic: true)
             return
         }
+        stopped(paneID, reason: "still not possible after \(autoAttempts) checks: " + last)
+    }
+
+    /// The automatic lane ended without a move: the card and the inbox say why.
+    private func stopped(_ paneID: UUID, reason: String) {
+        guard var offer = offers[paneID] else { return }
+        offer.moving = false
+        offer.status = "Not moved automatically: " + reason
+        offers[paneID] = offer
+        _ = notify(AgentInboxEvent(paneID: paneID, host: offer.event.host, provider: .claude, kind: .failure,
+            title: "Seat limit: \(offer.paneName) was not moved",
+            detail: RelaySeatLimitText.headline(offer.event, pane: offer.paneName) + " Relay did not move it automatically: " + reason,
+            sourceID: "seat-limit-stopped:" + offer.event.occurrenceKey, alert: .needsInput))
+    }
+
+    /// One usage refresh per host at a time; panes on one host share it.
+    private func refresh(_ profile: ConnectionProfile) async {
+        let host = RelayAgentAccountDirectory.hostKey(profile)
+        if let running = refreshes[host] { await running.value; return }
+        let task = Task { @MainActor [refreshUsage] in await refreshUsage(profile) }
+        refreshes[host] = task
+        await task.value
+        refreshes[host] = nil
     }
 
     private func finished(_ paneID: UUID, target: RelayAgentAccount, outcome: RelayAgentAccountMove.Outcome, automatic: Bool) {
@@ -503,17 +610,18 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
                 sourceID: "seat-limit-moved:" + offer.event.occurrenceKey, alert: automatic ? .done : nil))
             return
         }
-        offer.status = (automatic ? "Automatic move stopped: " : "Move \(outcome.state): ") + outcome.displayMessage
         offers[paneID] = offer
+        if automatic { stopped(paneID, reason: "the move was \(outcome.state): " + outcome.displayMessage); return }
+        offers[paneID]?.status = "Move \(outcome.state): " + outcome.displayMessage
     }
 
     // Test support
     func resetForTesting() {
-        ledger = .init(); offers = [:]; intent = nil
+        ledger = .init(); offers = [:]; intents = [:]
         autoTasks.values.forEach { $0.cancel() }; autoTasks = [:]
     }
     func setIntentForTesting(pane: UUID, target: RelayAgentAccount) {
-        intent = .init(pane: pane, label: target.label, dir: target.dir, account: nil, session: nil)
+        intents[pane] = .init(pane: pane, label: target.label, dir: target.dir, account: nil, session: nil)
     }
 }
 

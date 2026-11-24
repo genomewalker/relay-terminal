@@ -13,9 +13,10 @@ struct RelaySeatLimitTests {
     static let personal = RelayAgentAccount(provider: "claude", label: "personal", dir: "~/.claude-personal")
 
     static func raw(kind: String, reset: Double?, row: String = "row-1", model: String? = nil,
+                    occurredAt: String = ISO8601DateFormatter().string(from: Date()),
                     text: String = "You've hit your weekly limit · resets Nov 22, 9am (Europe/Copenhagen)") -> [String: Any] {
         var event: [String: Any] = ["hook_event_name": "SeatLimit", "limit_kind": kind, "seat_limit_id": row,
-            "message": text, "session_id": "s-1", "occurred_at": "2026-11-20T08:00:00.000Z"]
+            "message": text, "session_id": "s-1", "occurred_at": occurredAt]
         if let reset { event["resets_at"] = NSNumber(value: reset) }
         if let model { event["limit_model"] = model }
         return event
@@ -41,6 +42,70 @@ struct RelaySeatLimitTests {
         #expect(RelaySeatLimitText.headline(weekly, pane: "api-work").hasPrefix("Claude in api-work hit the business weekly limit (resets "))
         #expect(RelaySeatLimitEvent.parse(["hook_event_name": "Stop"], paneID: Self.pane, host: "h", account: nil) == nil)
         #expect(RelaySeatLimitEvent.parse(Self.raw(kind: "Bad Kind", reset: nil), paneID: Self.pane, host: "h", account: nil) == nil)
+    }
+
+    @Test("A pane worker older than SeatLimit keeps only the message: the window and reset come from its text")
+    func parsesTextOnlyEvent() throws {
+        let weekly = try #require(RelaySeatLimitEvent.parse(["hook_event_name": "SeatLimit", "session_id": "s",
+            "occurred_at": "2026-11-18T08:00:00.000Z",
+            "message": "You've hit your weekly limit · resets Nov 22, 9am (Europe/Copenhagen)"], paneID: Self.pane, host: "h", account: "business"))
+        #expect(weekly.kind == "seven_day" && weekly.resetsAt == Date(timeIntervalSince1970: Self.weeklyReset))
+        let five = try #require(RelaySeatLimitEvent.parse(["hook_event_name": "SeatLimit", "occurred_at": "2026-11-20T12:00:00Z",
+            "message": "You've hit your 5-hour limit · resets 3:10pm (Europe/Copenhagen)"], paneID: Self.pane, host: "h", account: nil))
+        #expect(five.kind == "five_hour" && five.resetsAt == Date(timeIntervalSince1970: 1_795_183_800))
+        let fable = try #require(RelaySeatLimitEvent.parse(["hook_event_name": "SeatLimit", "occurred_at": "2026-11-20T12:00:00Z",
+            "message": "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."],
+            paneID: Self.pane, host: "h", account: nil))
+        #expect(fable.kind == "model" && fable.model == "Fable" && fable.resetsAt == nil)
+        #expect(RelaySeatLimitEvent.parse(["hook_event_name": "SeatLimit", "occurred_at": "2026-11-20T12:00:00Z",
+            "message": "something else"], paneID: Self.pane, host: "h", account: nil) == nil)
+    }
+
+    @Test("A refusal first seen long after Claude wrote it (a resumed conversation's history) is not news")
+    func oldRowIgnored() {
+        var ledger = RelaySeatLimitLedger()
+        var old = Self.event(Self.raw(kind: "seven_day", reset: Self.weeklyReset))
+        old.occurredAt = Self.now.addingTimeInterval(-3600)
+        let admitted = ledger.admit(old, now: Self.now)
+        #expect(!admitted && ledger.limits.isEmpty)
+    }
+
+    @Test("Simultaneous limits on two panes each get their own automatic move")
+    func twoPanesMoveIndependently() async throws {
+        let (coordinator, workspace, first, box) = try harness(automatic: true, decision: .init(target: Self.personal, autoMove: true))
+        workspace.newTab(profile: .sshConfigHost("seat-limit-2.invalid"))
+        let second = try #require(workspace.activePane)
+        second.recordAgentAccount(Self.business)
+        coordinator.mover = { pane, _, target, origin in
+            box.moves.append((target.label, origin))
+            // Both lanes are inside move() at once; each intent is its own.
+            try? await Task.sleep(nanoseconds: 30_000_000)
+            #expect(coordinator.authorizes(pane.id, target: target))
+            return .init(state: "verified", message: "Moved")
+        }
+        let reset = Date().timeIntervalSince1970 + 86_400
+        coordinator.observe(Self.raw(kind: "seven_day", reset: reset, row: "a"), pane: first)
+        coordinator.observe(Self.raw(kind: "seven_day", reset: reset, row: "b"), pane: second)
+        await settle { box.moves.count == 2 && coordinator.offers.isEmpty }
+        #expect(box.moves.count == 2 && box.moves.allSatisfy { $0.1 == .seatLimit } && coordinator.offers.isEmpty)
+        withExtendedLifetime(workspace) {}
+    }
+
+    @Test("A deferred automatic move is tried again; a lane that cannot finish posts why")
+    func deferredThenStopped() async throws {
+        let (coordinator, workspace, pane, box) = try harness(automatic: true, decision: .init(target: Self.personal, autoMove: true))
+        coordinator.autoRetryInterval = 0.01
+        coordinator.autoAttempts = 3
+        coordinator.mover = { _, _, target, origin in
+            box.moves.append((target.label, origin))
+            return .init(state: "deferred", message: "Waiting for the current turn to finish")
+        }
+        coordinator.observe(Self.raw(kind: "five_hour", reset: Date().timeIntervalSince1970 + 3600), pane: pane)
+        await settle { box.notices.count >= 2 }
+        #expect(box.moves.count == 3)
+        #expect(box.notices.last?.title.contains("was not moved") == true)
+        #expect(box.notices.last?.detail.contains("Waiting for the current turn to finish") == true)
+        withExtendedLifetime(workspace) {}
     }
 
     @Test("Once per limit occurrence: retries, replays and old rows do not repeat")

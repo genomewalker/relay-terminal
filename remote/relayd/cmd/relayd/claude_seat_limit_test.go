@@ -12,8 +12,9 @@ import (
 )
 
 // The status line reads the transcript tail and sends one SeatLimit event per
-// refusal row on the pane's unbound event channel; repeated status updates
-// for the same row send nothing more.
+// refusal row on the pane's unbound event channel. A row is recorded in the
+// status only after it was sent; an old row (a resumed conversation's
+// history) is never reported.
 func TestClaudeStatusSendsSeatLimitOncePerRefusal(t *testing.T) {
 	const pane = "12345678-1234-4234-8234-123456789abc"
 	t.Setenv("RELAY_SESSION", pane)
@@ -23,6 +24,31 @@ func TestClaudeStatusSendsSeatLimitOncePerRefusal(t *testing.T) {
 	}
 	defer os.RemoveAll(runtime)
 	t.Setenv("XDG_RUNTIME_DIR", runtime)
+	home := t.TempDir()
+	transcript := filepath.Join(home, "t.jsonl")
+	input := []byte(`{"session_id":"aaaaaaaa-1234-4234-8234-123456789abc","transcript_path":"` + transcript + `","model":{"id":"claude-opus-5"},"cwd":"/work","workspace":{"project_dir":"/work"}}`)
+	statusFile := filepath.Join(home, ".local", "share", "relay", "claude-status", pane+".json")
+	writeRow := func(at time.Time) {
+		row := `{"isSidechain":false,"type":"assistant","uuid":"row-1","timestamp":"` + at.UTC().Format(time.RFC3339Nano) +
+			`","message":{"model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"You've hit your weekly limit · resets Nov 5 at 1am (Europe/Copenhagen)"}]},` +
+			`"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1793836800,"rateLimitType":"seven_day"}},` +
+			`"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}` + "\n"
+		if err := os.WriteFile(transcript, []byte(row), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	named := func() string { return previousSeatLimitID(statusFile) }
+
+	writeRow(time.Now().Add(-time.Hour))
+	if err := captureClaudeStatus(pane, input, home); err != nil || named() != "" {
+		t.Fatalf("old refusal reported: %v %q", err, named())
+	}
+	// No supervisor listening: the send fails and the status does not name it.
+	writeRow(time.Now())
+	if err := captureClaudeStatus(pane, input, home); err != nil || named() != "" {
+		t.Fatalf("unsent refusal recorded: %v %q", err, named())
+	}
+
 	listener, err := net.Listen("unix", filepath.Join(runtime, "relayd.sock"))
 	if err != nil {
 		t.Fatal(err)
@@ -53,13 +79,6 @@ func TestClaudeStatusSendsSeatLimitOncePerRefusal(t *testing.T) {
 			connection.Close()
 		}
 	}()
-	home := t.TempDir()
-	transcript := filepath.Join(home, "t.jsonl")
-	row := `{"isSidechain":false,"type":"assistant","uuid":"row-1","timestamp":"2026-11-03T21:05:15.651Z","message":{"model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"You've hit your weekly limit · resets Nov 5 at 1am (Europe/Copenhagen)"}]},"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1793836800,"rateLimitType":"seven_day"}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}` + "\n"
-	if err := os.WriteFile(transcript, []byte(row), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	input := []byte(`{"session_id":"aaaaaaaa-1234-4234-8234-123456789abc","transcript_path":"` + transcript + `","model":{"id":"claude-opus-5"},"cwd":"/work","workspace":{"project_dir":"/work"}}`)
 	for range 2 {
 		if err := captureClaudeStatus(pane, input, home); err != nil {
 			t.Fatal(err)
@@ -79,9 +98,7 @@ func TestClaudeStatusSendsSeatLimitOncePerRefusal(t *testing.T) {
 		t.Fatalf("repeated event for the same refusal: %+v", event)
 	case <-time.After(300 * time.Millisecond):
 	}
-	data, _ := os.ReadFile(filepath.Join(home, ".local", "share", "relay", "claude-status", pane+".json"))
-	var status claudeLiveStatus
-	if json.Unmarshal(data, &status) != nil || status.SeatLimit == nil || status.SeatLimit.ID != "row-1" {
-		t.Fatalf("status does not name the refusal: %s", data)
+	if named() != "row-1" {
+		t.Fatalf("status does not name the sent refusal: %q", named())
 	}
 }

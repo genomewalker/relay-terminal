@@ -249,6 +249,53 @@ struct RelayAgentAccountMoveDraftTests {
         #expect(outcome.state == "refused")
     }
 
+    @Test("An automatic seat-limit move without the coordinator's intent is refused before anything is read")
+    func seatLimitMoveNeedsIntent() async throws {
+        let agent = MovedAgent()
+        agent.workerScreen = true
+        let (mover, workspace, pane, _) = try harness(agent)
+        defer { workspace.shutdown() }
+        let coordinator = RelaySeatLimitCoordinator.shared
+        coordinator.resetForTesting()
+        let outcome = await mover.move(pane, in: workspace, to: personal, origin: .seatLimit, inputGranted: false)
+        #expect(outcome.state == "refused" && outcome.message.contains("No automatic seat-limit move"))
+        #expect(!agent.events.contains("inspect") && !agent.events.contains("exit") && agent.presented == 0)
+    }
+
+    @Test("An automatic seat-limit move never shows a hidden pane: it defers and sends nothing")
+    func seatLimitMoveNeverChangesFocus() async throws {
+        let agent = MovedAgent()
+        let (mover, workspace, pane, other) = try harness(agent)
+        defer { workspace.shutdown() }
+        let coordinator = RelaySeatLimitCoordinator.shared
+        let enabled = coordinator.automaticEnabled
+        defer { coordinator.automaticEnabled = enabled; coordinator.resetForTesting() }
+        coordinator.automaticEnabled = { true }
+        coordinator.setIntentForTesting(pane: pane.id, target: personal)
+        let outcome = await mover.move(pane, in: workspace, to: personal, origin: .seatLimit, inputGranted: false)
+        #expect(outcome.state == "deferred", "\(outcome.message)")
+        #expect(agent.presented == 0 && !agent.events.contains("present"))
+        #expect(!agent.events.contains("inspect") && !agent.events.contains("exit"))
+        #expect(workspace.activePaneID == other.id)
+    }
+
+    @Test("An authorized automatic seat-limit move of a readable hidden pane is verified without showing it")
+    func seatLimitMoveVerifiedWithoutFocus() async throws {
+        let agent = MovedAgent()
+        agent.workerScreen = true
+        let (mover, workspace, pane, other) = try harness(agent)
+        defer { workspace.shutdown() }
+        let coordinator = RelaySeatLimitCoordinator.shared
+        let enabled = coordinator.automaticEnabled
+        defer { coordinator.automaticEnabled = enabled; coordinator.resetForTesting() }
+        coordinator.automaticEnabled = { true }
+        coordinator.setIntentForTesting(pane: pane.id, target: personal)
+        let outcome = await mover.move(pane, in: workspace, to: personal, origin: .seatLimit, inputGranted: false)
+        #expect(outcome.state == "verified", "\(outcome.message)")
+        #expect(agent.presented == 0 && workspace.activePaneID == other.id)
+        #expect(mover.audit.memory.last?.origin == .seatLimit)
+    }
+
     @Test("A pane not shown since launch is shown, read once its screen is complete, moved, and the earlier selection returns")
     func unopenedPaneIsShownThenMoved() async throws {
         let agent = MovedAgent()

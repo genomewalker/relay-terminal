@@ -115,10 +115,17 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 			status.SeatLimit = seatlimit.Latest(tail)
 		}
 	}
+	if status.SeatLimit != nil && time.Since(status.SeatLimit.At) > seatLimitFreshness {
+		// A resumed conversation's old refusal, possibly from another account.
+		status.SeatLimit = nil
+	}
 	if status.SeatLimit != nil && status.SeatLimit.ID != previousSeatLimitID(statusPath) {
-		// Before the status file names it: a lost update re-sends it, and the
-		// desktop records each limit occurrence once.
-		_ = emitSeatLimitEvent(pane, input.SessionID, status.AccountScope, status.SeatLimit)
+		// The status file names a refusal only once it was sent, so a failed
+		// send is tried again at the next update; the desktop records each
+		// limit occurrence once.
+		if emitSeatLimitEvent(pane, input.SessionID, status.AccountScope, status.SeatLimit) != nil {
+			status.SeatLimit = nil
+		}
 	}
 	data, err := json.Marshal(status)
 	if err != nil {
@@ -155,6 +162,10 @@ func captureClaudeStatus(pane string, raw []byte, home string) error {
 	defer dir.Close()
 	return dir.Sync()
 }
+
+// seatLimitFreshness bounds how old a refusal row may be when first seen.
+// The status line runs every 10 s, so a new refusal is seen within seconds.
+const seatLimitFreshness = 15 * time.Minute
 
 // previousSeatLimitID is the refusal the pane's last status already named.
 func previousSeatLimitID(path string) string {
