@@ -196,7 +196,35 @@ final class RelayAttentionNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.threadIdentifier = item.paneID.uuidString.lowercased()
         content.userInfo = ["pane_id": item.paneID.uuidString.lowercased()]
         if alert.playsSound { content.sound = .default }
+        if let offer = RelaySeatLimitCoordinator.shared.offer(forInboxItem: item.id) {
+            content.body = item.detail
+            content.categoryIdentifier = seatLimitCategory(offer)
+        }
         deliver(UNNotificationRequest(identifier: item.id, content: content, trigger: nil))
+    }
+
+    static let seatLimitMoveAction = "relay.seat-limit.move"
+    static let seatLimitAutomaticAction = "relay.seat-limit.automatic"
+    private var seatLimitCategories: [String: UNNotificationCategory] = [:]
+
+    /// A seat-limit banner's actions: "Move to <account>" and, while automatic
+    /// moves are off, the offer to turn them on. Neither changes focus; only
+    /// the banner itself opens the pane.
+    private func seatLimitCategory(_ offer: RelaySeatLimitCoordinator.Offer) -> String {
+        let target = offer.decision.moveRefusal == nil ? offer.decision.target?.label : nil
+        let automatic = RelayPreferences.shared.seatLimitAutoMove
+        let id = "relay.seat-limit." + (target ?? "none") + (automatic ? "" : ".offer-automatic")
+        guard seatLimitCategories[id] == nil else { return id }
+        var actions: [UNNotificationAction] = []
+        if let target { actions.append(.init(identifier: Self.seatLimitMoveAction, title: "Move to \(target)")) }
+        if !automatic {
+            actions.append(.init(identifier: Self.seatLimitAutomaticAction, title: "Move automatically from now on"))
+        }
+        seatLimitCategories[id] = UNNotificationCategory(identifier: id, actions: actions, intentIdentifiers: [])
+        if Self.bannersAvailable {
+            UNUserNotificationCenter.current().setNotificationCategories(Set(seatLimitCategories.values))
+        }
+        return id
     }
 
     /// An agent action outside focus, while Relay is in the background: a
@@ -294,7 +322,14 @@ final class RelayAttentionNotifier: NSObject, UNUserNotificationCenterDelegate {
             await MainActor.run { _ = NSApp?.activate(ignoringOtherApps: true) }
             return
         }
-        await MainActor.run { self.open(paneID) }
+        switch response.actionIdentifier {
+        case Self.seatLimitMoveAction:
+            await MainActor.run { RelaySeatLimitCoordinator.shared.moveNow(paneID) }
+        case Self.seatLimitAutomaticAction:
+            await MainActor.run { RelaySeatLimitCoordinator.shared.enableAutomatic() }
+        default:
+            await MainActor.run { self.open(paneID) }
+        }
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,

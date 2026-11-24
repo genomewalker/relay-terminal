@@ -1514,6 +1514,10 @@ final class PaneModel: ObservableObject, Identifiable {
             invalidateProviderContext()
         }
         switch eventName {
+        case "SeatLimit":
+            // relayd's status line found a 429 seat-limit refusal in this
+            // conversation; the coordinator notifies once per occurrence.
+            RelaySeatLimitCoordinator.shared.observe(event, pane: self)
         case "PermissionRequest":
             pendingAgentApprovals += 1
             raiseWait(kind: kind, excerpt: "Approval: \(tool ?? "permission requested")")

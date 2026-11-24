@@ -7,6 +7,10 @@ import Foundation
 /// maintenance cannot switch accounts.
 enum RelayAgentAccountMoveOrigin: String, Codable, Sendable {
     case user, mcp, assistant, maintenance, quotaFailover
+    /// Relay's automatic move of a pane that hit a seat limit, only while the
+    /// user's "Move panes automatically" setting is on, fenced by the seat-
+    /// limit coordinator's exact in-memory intent for this pane and target.
+    case seatLimit
     /// Not a move: Relay updated a pane's recorded account to the configured
     /// account its running agent was found using. Logged so an account change
     /// made outside Relay stays visible.
@@ -16,7 +20,10 @@ enum RelayAgentAccountMoveOrigin: String, Codable, Sendable {
 enum RelayAgentAccountMovePolicy {
     /// Quota failover selects an already configured account. Only an explicit
     /// manual move may copy onboarding/trust answers into a target config.
-    static func preparesTarget(_ origin: RelayAgentAccountMoveOrigin) -> Bool { origin != .quotaFailover }
+    static func preparesTarget(_ origin: RelayAgentAccountMoveOrigin) -> Bool { !automatic(origin) }
+    /// Moves Relay starts on its own. They take a verified empty prompt, never
+    /// capture a draft, and report a held check as deferred, not refused.
+    static func automatic(_ origin: RelayAgentAccountMoveOrigin) -> Bool { origin == .quotaFailover || origin == .seatLimit }
     /// Removing an account is the user's own action from Settings only; an
     /// MCP client, Miko and maintenance never remove one, whatever grant.
     static func removalRefusal(_ origin: RelayAgentAccountMoveOrigin) -> String? {
@@ -36,6 +43,7 @@ enum RelayAgentAccountMovePolicy {
         switch origin {
         case .user: return nil
         case .quotaFailover: return nil // additionally fenced by the durable scheduler intent below
+        case .seatLimit: return nil // additionally fenced by the seat-limit coordinator's intent below
         case .mcp: return inputGranted ? nil : "Moving a pane to another account requires the terminal input grant."
         case .assistant, .maintenance, .observed:
             return "Moving a pane to another account is user-initiated only; Miko and maintenance never switch accounts."
@@ -282,13 +290,17 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
             guard RelayClaudeQuotaScheduler.shared.authorizes(pane.id, target: target) else {
                 return finish("refused", "No durable quota failover intent authorizes this move.")
             }
+        } else if origin == .seatLimit {
+            guard RelaySeatLimitCoordinator.shared.authorizes(pane.id, target: target) else {
+                return finish("refused", "No automatic seat-limit move is authorized for this pane and account.")
+            }
         } else if !RelayLaunchMode.isRunningTests {
             RelayClaudeQuotaScheduler.shared.userClaimed(pane)
         }
         guard workspace.panes[pane.id] === pane, pane.contentKind == .terminal, pane.profile.backend == .relay,
               target.isValid else { return finish("refused", "The pane cannot be moved.", nil, .unsupportedPane) }
         guard RelayAgentMaintenance.shared.hold(pane.id) else {
-            return finish(origin == .quotaFailover ? "deferred" : "refused", "Maintenance or another move is acting on this pane; try again when it finishes.")
+            return finish(RelayAgentAccountMovePolicy.automatic(origin) ? "deferred" : "refused", "Maintenance or another move is acting on this pane; try again when it finishes.")
         }
         defer { RelayAgentMaintenance.shared.release(pane.id) }
         guard pane.connectionState == .connected else {
@@ -318,6 +330,12 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
         // is the pane shown, as before.
         if screenRefusal(pane) != nil, await refreshWorkerScreen(pane), screenRefusal(pane) == nil {
             statuses[pane.id] = "Read the hidden pane's screen from its worker"
+        }
+        if screenRefusal(pane) != nil, origin == .seatLimit, workspace.activePaneID != pane.id {
+            // An automatic seat-limit move never changes focus; only the
+            // user's click on its notification shows the pane.
+            return finish("deferred", "Relay cannot read this hidden pane's screen without showing it, and an automatic " +
+                "move never changes focus; nothing was sent.", nil, .noRendererForIdleProof)
         }
         if screenRefusal(pane) != nil {
             if workspace.activePaneID != pane.id {
@@ -370,9 +388,14 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
             let revision = pane.agentInputRevision
             var proof = try await read()
             guard workspace.panes[pane.id] === pane, pane.profile == profile else { return finish("refused", "The pane changed.") }
-            if origin == .quotaFailover {
-                guard RelayClaudeQuotaScheduler.shared.authorizes(pane.id, target: target, proof: proof) else {
-                    return finish("refused", "The native agent changed after the quota move was scheduled.", proof)
+            if origin == .seatLimit, !RelaySeatLimitCoordinator.shared.authorizes(pane.id, target: target, proof: proof) {
+                return finish("refused", "The native agent is no longer the one that hit the seat limit.", proof)
+            }
+            if RelayAgentAccountMovePolicy.automatic(origin) {
+                if origin == .quotaFailover {
+                    guard RelayClaudeQuotaScheduler.shared.authorizes(pane.id, target: target, proof: proof) else {
+                        return finish("refused", "The native agent changed after the quota move was scheduled.", proof)
+                    }
                 }
                 let prompt = await readPrompt(pane, proof)
                 guard prompt.empty, !prompt.typed, !prompt.delivering, !prompt.overlay else {
@@ -436,7 +459,7 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
                 record("force_background", proof, commands.isEmpty ? "none" : commands.map(\.command).joined(separator: " | "))
             }
             if let refused = await admission(pane, proof: proof, target: target).refusal {
-                return finish(origin == .quotaFailover && proof.moveCommand != nil && proof.resumeCommand != nil ? "deferred" : "refused",
+                return finish(RelayAgentAccountMovePolicy.automatic(origin) && proof.moveCommand != nil && proof.resumeCommand != nil ? "deferred" : "refused",
                               refused.blocker, proof, refused.code)
             }
             // A second native read fences a turn, a draft or a session switch
@@ -448,10 +471,10 @@ final class RelayAgentAccountMoveAudit: @unchecked Sendable {
             }
             let admitted = await admission(pane, proof: fresh, target: target)
             if let refused = admitted.refusal {
-                return finish(origin == .quotaFailover && fresh.moveCommand != nil && fresh.resumeCommand != nil ? "deferred" : "refused",
+                return finish(RelayAgentAccountMovePolicy.automatic(origin) && fresh.moveCommand != nil && fresh.resumeCommand != nil ? "deferred" : "refused",
                               refused.blocker, fresh, refused.code)
             }
-            if origin == .quotaFailover && !admitted.prompt.empty {
+            if RelayAgentAccountMovePolicy.automatic(origin) && !admitted.prompt.empty {
                 return finish("deferred", "A draft appeared during the automatic move; nothing was sent.", fresh)
             }
             guard let command = fresh.moveCommand, let exit = RelayAgentMaintenancePolicy.exitCommand(provider: fresh.provider) else {

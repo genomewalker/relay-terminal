@@ -561,6 +561,7 @@ struct RelayApp: App {
         RelayTerminfo.bootstrap()
         let workspace = WorkspaceModel()
         RelayAttentionNotifier.shared.install(workspace: workspace)
+        RelaySeatLimitCoordinator.shared.install(workspace: workspace)
         // Saved auto-link scopes keep working after a relaunch.
         if !RelayLaunchMode.isRunningTests { RelayAutoLinker.shared.attach(workspace) }
         _workspace = StateObject(wrappedValue: workspace)
