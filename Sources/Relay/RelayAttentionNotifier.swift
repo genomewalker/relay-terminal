@@ -196,7 +196,7 @@ final class RelayAttentionNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.threadIdentifier = item.paneID.uuidString.lowercased()
         content.userInfo = ["pane_id": item.paneID.uuidString.lowercased()]
         if alert.playsSound { content.sound = .default }
-        if let offer = RelaySeatLimitCoordinator.shared.offer(forInboxItem: item.id) {
+        if let offer = RelaySeatLimitCoordinator.shared.offer(for: item) {
             content.body = item.detail
             content.categoryIdentifier = seatLimitCategory(offer)
         }

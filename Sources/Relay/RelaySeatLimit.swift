@@ -330,8 +330,10 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
             await self.refreshUsage(pane.profile)
             guard var current = self.offers[pane.id], current.event == event else { return }
             current.decision = self.evaluate(event, pane: pane, now: Date())
-            current.inboxID = self.notify(self.inboxEvent(current))
+            // The banner reads this offer while the entry is recorded.
             self.offers[pane.id] = current
+            let inboxID = self.notify(self.inboxEvent(current))
+            self.offers[pane.id]?.inboxID = inboxID
             if current.decision.autoMove { self.startAutomatic(pane.id) }
         }
     }
@@ -372,13 +374,19 @@ struct RelaySeatLimitLedger: Codable, Equatable, Sendable {
             else if !automaticEnabled() { detail += " You can let Relay move such panes automatically." }
         }
         return AgentInboxEvent(paneID: offer.event.paneID, host: offer.event.host, provider: .claude, kind: .attention,
-            title: "Seat limit: " + offer.event.limitName + (offer.event.account.map { " (\($0))" } ?? ""),
+            title: Self.inboxTitlePrefix + offer.event.limitName + (offer.event.account.map { " (\($0))" } ?? ""),
             detail: detail, occurredAt: offer.event.occurredAt,
             sourceID: "seat-limit:" + offer.event.occurrenceKey, alert: .needsInput)
     }
 
-    /// The offer behind an inbox item, for the banner's actions.
-    func offer(forInboxItem id: String) -> Offer? { offers.values.first { $0.inboxID == id } }
+    static let inboxTitlePrefix = "Seat limit: "
+
+    /// The offer behind an inbox item, for the banner's actions. The banner is
+    /// posted while the item is recorded, before its ID is returned.
+    func offer(for item: AgentInboxItem) -> Offer? {
+        guard item.kind == .attention, item.title.hasPrefix(Self.inboxTitlePrefix) else { return nil }
+        return offers[item.paneID]
+    }
 
     /// Exact authority for one automatic move, checked twice by the mover:
     /// before anything is read, and against the native agent it inspected.
