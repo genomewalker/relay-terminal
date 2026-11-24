@@ -124,7 +124,7 @@ enum RelayOperationEvidence {
             ($0.element.observedAt, $0.offset) < ($1.element.observedAt, $1.offset)
         }.map(\.element)
         for source in ordered {
-            var entry: [String: Any] = ["source": source.name, "observed_at": timestamp(source.observedAt)]
+            var entry: [String: Any] = ["source": redact(source.name), "observed_at": timestamp(source.observedAt)]
             let stage: Stage
             if let error = source.error {
                 stage = .readFailed

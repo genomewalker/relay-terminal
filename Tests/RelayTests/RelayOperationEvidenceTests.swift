@@ -26,6 +26,14 @@ struct RelayOperationEvidenceTests {
         #expect(result["read_only"] as? Bool == true)
     }
 
+    @Test func sourceLabelsUseTheExportRedactionPolicy() {
+        let result = export(.message, [source(nil, name: "daemon_receipt ssh:operator@example.org:22")])
+        let timeline = result["timeline"] as? [[String: Any]]
+        let label = timeline?.first?["source"] as? String
+        #expect(label?.contains("operator@example.org") == false)
+        #expect(label?.contains("<email>") == true)
+    }
+
     @Test func transportAndProviderCompletionHaveDistinctConclusions() {
         for (status, expected) in [("written_to_socket", "written_to_socket"), ("turn_completed", "provider_turn_completed")] {
             let result = export(.message, [source(["status": status])])
