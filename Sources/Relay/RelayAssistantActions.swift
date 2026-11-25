@@ -229,6 +229,30 @@ enum RelayAssistantActions {
                 return .success(.agentContext(try pane().get().id, query: nil))
             case .readViewport:
                 return .success(.viewport(try pane().get().id))
+            case .describePanes:
+                let paneID = fields["pane_id"] == nil ? nil : try pane().get().id
+                let query = string("query")
+                guard fields["query"] == nil || (query.map { $0.count <= 80 && !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? false) else {
+                    return fail("query must be 1 to 80 characters: a pane title, tab, workspace, short ID, agent or host.")
+                }
+                guard paneID == nil || query == nil else { return fail("Give pane_id or query, not both.") }
+                let scope: RelayMikoPaneOverview.Scope
+                switch fields["scope"] {
+                case nil: scope = paneID != nil || query != nil ? .pane : .all
+                case .string(let raw)?:
+                    guard let value = RelayMikoPaneOverview.Scope(rawValue: raw) else { return fail("scope must be pane, matching or all.") }
+                    scope = value
+                default: return fail("scope must be pane, matching or all.")
+                }
+                guard scope != .pane || paneID != nil || query != nil else {
+                    return fail("scope pane needs pane_id or query; use scope all for every pane.")
+                }
+                var includeViewport = true
+                if let value = fields["include_viewport"] {
+                    guard case .bool(let flag) = value else { return fail("include_viewport must be a boolean.") }
+                    includeViewport = flag
+                }
+                return .success(.describePanes(paneID: paneID, query: query, scope: scope, includeViewport: includeViewport))
             case .readHandoff:
                 switch (string("memory_id"), string("checkpoint_key")) {
                 case (let id?, nil):

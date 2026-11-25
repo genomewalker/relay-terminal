@@ -53,8 +53,9 @@ enum RelayWorkOverviewIndex {
             return changedAt == nil ? .other : .recent
         }
     }
-    /// Public navigation metadata only. Selecting a destination opens controls;
-    /// neither indexing nor filtering executes a setting or assistant request.
+    /// Public navigation metadata only. Selecting a destination opens controls
+    /// (choosing Ask Miko with text sends that text to Miko); neither indexing
+    /// nor filtering executes a setting or assistant request.
     static func navigationEntries(query: String) -> [Entry] {
         var entries = RelaySettingsSearch.sections.map { section in
             Entry(id: "settings:" + section.id, title: section.title + " settings",
@@ -74,8 +75,12 @@ enum RelayWorkOverviewIndex {
             symbol: "rectangle.grid.1x2", destination: .fleetBoard,
             searchFields: ["fleet board agents running waiting disconnected idle hosts overview"],
             needsAttention: false, isCurrent: false, changedAt: nil))
+        // Title and status stay fixed so ranking never depends on the text.
+        let asks = !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         entries.append(Entry(id: "action:miko", title: "Ask Miko", location: "Workspace assistant",
-            status: "Open composer", details: "Open Miko without sending a message. Your existing conversation and draft are preserved; enter your request in the composer.",
+            status: "Open composer", details: asks
+                ? "Send your text to Miko as a new message. No pane is selected or focused; Miko reads only the panes your question is about."
+                : "Open Miko without sending a message. Your existing conversation and draft are preserved; enter your request in the composer.",
             symbol: "sparkles", destination: .askMiko, searchFields: ["assistant help", query],
             needsAttention: false, isCurrent: false, changedAt: nil))
         return entries
