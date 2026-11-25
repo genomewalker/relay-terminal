@@ -32,6 +32,8 @@ struct RelayNativeConversationView: View {
     @State private var text = ""
     @State private var images: [String] = []
     @State private var observation = UUID()
+    @State private var history = RelayAgentComposerHistory()
+    @State private var historyEntries: [String] = []
     @State private var pendingDraft: RelayNativeDraft?
     private let observeLive: Bool
     init(binding: RelayNativeBinding) {
@@ -148,10 +150,26 @@ struct RelayNativeConversationView: View {
                         Button("Remove") { images = [] }
                     }
                 }
-                TextEditor(text: $text).font(.body).frame(height: 76)
+                TextEditor(text: Binding(get: { text }, set: { edited in
+                    history.reset()
+                    text = edited
+                })).font(.body).frame(height: 76)
                     .scrollContentBackground(.hidden).padding(.horizontal, 4)
                     .accessibilityLabel("Message")
                 HStack {
+                    Menu {
+                        Button("Previous prompt") {
+                            if !history.browsing { historyEntries = userPrompts }
+                            if let previous = history.previous(entries: historyEntries, current: text) {
+                                text = previous
+                            }
+                        }.disabled(!history.browsing && userPrompts.isEmpty)
+                        Button("Next prompt") {
+                            if let next = history.next(entries: historyEntries) { text = next }
+                        }.disabled(!history.browsing)
+                    } label: {
+                        Label("Prompt history", systemImage: "clock.arrow.circlepath")
+                    }
                     Button("Attach image", systemImage: "paperclip", action: selectImages)
                         .disabled(unavailable || images.count >= 4)
                     Spacer()
@@ -195,6 +213,12 @@ struct RelayNativeConversationView: View {
         let known = Set(current.map(\.id))
         return conversation.older.filter { !known.contains($0.id) } + current
     }
+    private var userPrompts: [String] {
+        items.compactMap { item in
+            guard item.role == "user", item.truncated != true, !item.text.isEmpty else { return nil }
+            return item.text
+        }
+    }
     private func resume() {
         guard let workspace = RelayAgentAccountDirectory.shared.workspace,
               let paneID = UUID(uuidString: conversation.binding.identity.pane) else { return }
@@ -215,6 +239,7 @@ struct RelayNativeConversationView: View {
     }
     private func clearDraftIfSent(_ draft: RelayNativeDraft, outcome: RelayNativeActionOutcome) {
         if draft.shouldClear(current: RelayNativeDraft(text: text, images: images), outcome: outcome) {
+            history.reset()
             text = ""; images = []
         }
     }

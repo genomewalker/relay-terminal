@@ -419,6 +419,28 @@ import CryptoKit
             if let result = try? await daemonRequest(profile: profile, packet: ["operation": "receipt", "message_id": id.uuidString.lowercased()]),
                result["status"] as? String != "unknown" { return result }
         }
+        return try desktopReceipt(id)
+    }
+
+    /// Every source the receipt read consults, each reported on its own,
+    /// so an unreachable daemon is not hidden behind the desktop's record.
+    /// Read-only: it asks for receipts and never sends.
+    func receiptEvidence(_ id: UUID, workspace: WorkspaceModel) async -> [RelayOperationEvidence.Source] {
+        var daemon: [(name: String, result: Result<[String: Any], Error>)] = []
+        for profile in daemonProfiles(workspace) {
+            let result: Result<[String: Any], Error>
+            do {
+                result = .success(try await daemonRequest(profile: profile, packet: ["operation": "receipt", "message_id": id.uuidString.lowercased()]))
+            } catch {
+                result = .failure(error)
+            }
+            daemon.append((name: "daemon_receipt " + profile.connectionKey, result: result))
+        }
+        let desktop = Result { try desktopReceipt(id) }
+        return RelayOperationEvidence.messageSources(daemon: daemon, desktop: desktop, observedAt: Date())
+    }
+
+    private func desktopReceipt(_ id: UUID) throws -> [String: Any]? {
         guard let record = try receipts.read(intent: id.uuidString, action: "send") else { return nil }
         guard let result = record.result else {
             return ["message_id": id.uuidString.lowercased(), "status": "outcome_unknown", "replay_permitted": false]

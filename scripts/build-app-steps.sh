@@ -7,6 +7,20 @@ relay_build_helper() {
 # Packaging steps sourced by build-app.sh. Each one is a plain shell function so
 # scripts/tests/test-build-app-steps.sh can exercise it on a fixture tree.
 
+# Record the checkout at build start. An archive without Git metadata can
+# still use RELAY_SOURCE_DIGEST in the release manifest.
+checkout_at_build_start() {
+    local root="$1" revision changes
+    [[ -e "$root/.git" ]] || return 0
+    revision="$(git -C "$root" rev-parse --verify HEAD)" || return 1
+    changes="$(git -C "$root" status --porcelain --untracked-files=normal)" || return 1
+    if [[ -n "$changes" ]]; then
+        printf '%s+dirty' "$revision"
+    else
+        printf '%s' "$revision"
+    fi
+}
+
 # Native ports use pinned reference vectors; no interpreter asset may be shipped.
 check_rotation_resources() {
     relay_build_helper rotation-check "$1" || return 1

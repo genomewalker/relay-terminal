@@ -301,7 +301,6 @@ enum RelaydRemoteClient {
         "relay-codex-session",
         "relay-mcp-desktop",
         "relay-settings",
-        "relay-check-website",
         "relay-provider-setup",
         "relay-install-shell-ui",
         "relay-repair-chitta-failure",
