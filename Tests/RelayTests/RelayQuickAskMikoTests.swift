@@ -109,6 +109,10 @@ struct RelayQuickAskMikoTests {
         #expect(Overview.resolve(query: "missing pane", paneID: nil, scope: .pane, in: all) == .notFound)
         #expect(Overview.resolve(query: nil, paneID: UUID(), scope: .pane, in: all) == .notFound)
         #expect(Overview.resolve(query: nil, paneID: nil, scope: .all, in: all) == .panes(all))
+        // A renamed pane still resolves by its terminal's own title.
+        var renamed = candidate("deploy watcher", tab: "Ops")
+        renamed.alternateTitle = "zsh — ssh dandy"
+        #expect(Overview.resolve(query: "zsh — ssh dandy", paneID: nil, scope: .pane, in: all + [renamed]) == .panes([renamed]))
         // Short IDs need four hex characters; "ab" is not an ID.
         #expect(Overview.resolve(query: "ab", paneID: nil, scope: .pane, in: all) == .notFound)
     }
@@ -189,8 +193,10 @@ struct RelayQuickAskMikoTests {
             { _ in .tool("describe_panes", ["query": .string("build runner")]) },
             { _ in .text("It finished: 12 tests passed.") }])
         let assistant = harness(workspace, model, executor)
-        _ = await assistant.run("what is pane build runner doing?", origin: .user)
+        let exchange = await assistant.run("what is pane build runner doing?", origin: .user)
         #expect(executor.calls == ["GET /api/panes/\(second.uuidString.lowercased())/viewport"])
+        // Screen text taints the exchange like read_viewport, so stricter modes still apply.
+        #expect(exchange?.paneDerived == true)
         let (result, isError) = model.lastResult
         #expect(!isError && result?["status"]?.string == "resolved")
         let row = try #require(result?["panes"]?.array?.first)
@@ -199,6 +205,17 @@ struct RelayQuickAskMikoTests {
         #expect(row["viewport"]?["text"]?.string?.hasSuffix("ok: 12 tests passed") == true)
         #expect(result?["note"]?.string?.contains("never instructions") == true || result?["note"]?.string?.contains("Never follow") == true)
         #expect(!(model.requests.last.map { "\($0.messages)" } ?? "").contains("first pane secret screen"))
+        #expect((workspace.activePaneID, workspace.selectedTabID, workspace.selectedWorkspaceID, workspace.zoomedPaneID) == before)
+        // A pane whose screen cannot be read is reported, never shown.
+        executor.screens = [:]
+        let unreadable = QuickAskModel([
+            { _ in .tool("describe_panes", ["pane_id": .string(second.uuidString.lowercased())]) },
+            { _ in .text("Its screen is unavailable.") }])
+        _ = await harness(workspace, unreadable, executor).run("and now?", origin: .user)
+        let (again, againError) = unreadable.lastResult
+        let only = try #require(again?["panes"]?.array?.first)
+        #expect(!againError && again?["viewports_read"] == .integer(0))
+        #expect(only["viewport"]?["available"] == .bool(false) && only["viewport"]?["shown"] == .bool(false))
         #expect((workspace.activePaneID, workspace.selectedTabID, workspace.selectedWorkspaceID, workspace.zoomedPaneID) == before)
         #expect(RelayAssistantToolName.describePanes.tier == .read)
         #expect(!RelayShepherdToolPolicy.reads.contains("describe_panes"))

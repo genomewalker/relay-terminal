@@ -157,6 +157,7 @@ struct RelayQuickNavigate: View {
     /// message once the overview has closed. No pane is selected or focused.
     private func askMiko() {
         let text = query
+        workspace.networkVisible = false
         workspace.quickNavigateDidChooseAction { [weak workspace] in
             workspace?.askMikoFromNavigator(text)
         }

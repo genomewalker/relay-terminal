@@ -30,6 +30,8 @@ enum RelayMikoPaneOverview {
         var activityLabel: String? = nil
         var activityAt: Date? = nil
         var programReports: [String] = []
+        /// The terminal's own title when the user renamed the pane.
+        var alternateTitle: String? = nil
         var shortID: String { String(id.uuidString.lowercased().prefix(8)) }
     }
 
@@ -68,12 +70,12 @@ enum RelayMikoPaneOverview {
         let words = q.split(whereSeparator: \.isWhitespace).map(String.init)
         let tiers: [(Candidate) -> Bool] = [
             { q.count >= 4 && q.allSatisfy { $0.isHexDigit || $0 == "-" } && $0.id.uuidString.lowercased().hasPrefix(q) },
-            { eq($0.title) },
+            { eq($0.title) || eq($0.alternateTitle) },
             { eq($0.tab) || eq($0.workspace) },
             { eq($0.agent) || eq($0.host) || eq($0.account) },
             { candidate in
-                let haystack = [candidate.title, candidate.tab, candidate.workspace, candidate.agent, candidate.host,
-                                candidate.account ?? ""].joined(separator: " ").lowercased()
+                let haystack = [candidate.title, candidate.alternateTitle ?? "", candidate.tab, candidate.workspace,
+                                candidate.agent, candidate.host, candidate.account ?? ""].joined(separator: " ").lowercased()
                 return words.allSatisfy { haystack.contains($0) }
             },
         ]
@@ -196,9 +198,28 @@ enum RelayMikoPaneOverview {
 
     // MARK: Live workspace
 
-    /// Every pane's state as the fleet board and Go to pane show it. Reads
-    /// metadata only; no terminal text.
+    /// Every pane's state as the fleet board and Go to pane show it, plus
+    /// editor panes (which the board leaves out) so a name never resolves to
+    /// "not found" for a pane that exists. Reads metadata only; no terminal text.
     @MainActor static func candidates(_ workspace: WorkspaceModel, snapshot: RelayAssistantSnapshot) -> [Candidate] {
+        var rows = terminalCandidates(workspace, snapshot: snapshot)
+        let listed = Set(rows.map(\.id))
+        for tab in workspace.tabs {
+            let owner = workspace.ownership.owner(of: tab.id).flatMap { workspace.ownership.workspace($0)?.name } ?? "Workspace"
+            for id in workspace.paneIDs(inTab: tab.id) where !listed.contains(id) {
+                guard let pane = workspace.panes[id] else { continue }
+                rows.append(Candidate(id: id, title: pane.displayName, tab: tab.name.isEmpty ? "Untitled tab" : tab.name,
+                    workspace: owner, agent: pane.kind.rawValue, host: pane.profile.kind == .local ? "This Mac" : pane.profile.host,
+                    account: snapshot.pane(id)?.account, content: pane.contentKind.rawValue, connection: pane.connectionStatusLabel,
+                    phase: pane.phase.rawValue, status: pane.contentKind == .editor ? "Editor" : pane.phase.label,
+                    hidden: tab.hiddenStackPaneIDs.contains(id), selected: id == workspace.activePaneID,
+                    alternateTitle: pane.customName == nil ? nil : pane.title))
+            }
+        }
+        return rows
+    }
+
+    @MainActor private static func terminalCandidates(_ workspace: WorkspaceModel, snapshot: RelayAssistantSnapshot) -> [Candidate] {
         RelayWorkOverviewIndex.paneFacts(workspace).compactMap { fact in
             guard let pane = workspace.panes[fact.paneID] else { return nil }
             let activity = pane.agentActivities.last
@@ -210,7 +231,7 @@ enum RelayMikoPaneOverview {
                 selected: fact.paneID == workspace.activePaneID, activityLabel: activity?.label, activityAt: activity?.occurredAt,
                 programReports: pane.programStatus.records.map { record in
                     [record.title ?? record.app ?? "Program", record.state, record.message ?? ""].filter { !$0.isEmpty }.joined(separator: ": ")
-                })
+                }, alternateTitle: pane.customName == nil ? nil : pane.title)
         }
     }
 }

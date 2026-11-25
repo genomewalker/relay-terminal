@@ -3050,7 +3050,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
         for id in targets {
             let hidden = candidates.first { $0.id == id }?.hidden == true
             let unavailable = hidden
-                ? "Hidden stack member: its screen is not readable without showing the pane, and Relay did not show it."
+                ? "Hidden stack member: its screen could not be read without showing it, and Relay did not show it."
                 : "No readable terminal screen (not a terminal pane, not connected, or no screen yet)."
             guard let executor else { viewports[id] = .unavailable("Relay's control server is not running."); continue }
             let (status, body) = await executor.perform(method: "GET", path: "/api/panes/\(id.uuidString.lowercased())/viewport", body: Data())
