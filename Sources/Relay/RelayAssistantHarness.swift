@@ -53,6 +53,7 @@ enum RelayAssistantToolName: String, CaseIterable, Sendable {
     case readAgentContext = "read_agent_context"
     case searchAgentContext = "search_agent_context"
     case readViewport = "read_viewport"
+    case describePanes = "describe_panes"
     case readHandoff = "read_handoff"
     case stageMigrationPlan = "stage_migration_plan"
     case applyMigration = "apply_migration"
@@ -63,7 +64,7 @@ enum RelayAssistantToolName: String, CaseIterable, Sendable {
         switch self {
         case .relayTools, .listPanes, .getPaneHealth, .getRotationStatus, .listRecoverablePanes, .execStatus,
              .findProjectFolder, .listPaneLinks, .recallMemory, .readAgentContext, .searchAgentContext,
-             .readViewport, .readHandoff, .messageReceipt, .readAssistantInbox, .nativeSnapshot, .nativeReceipt: .read
+             .readViewport, .describePanes, .readHandoff, .messageReceipt, .readAssistantInbox, .nativeSnapshot, .nativeReceipt: .read
         case .selectPane, .zoomPane, .focusTab: .navigate
         default: .change
         }
@@ -73,7 +74,7 @@ enum RelayAssistantToolName: String, CaseIterable, Sendable {
         switch self {
         case .relayTools: []
         case .relayToolCall: ["tool_name", "arguments_json"]
-        case .listPanes, .newLocalTab, .newTabLayout, .listPaneLinks: []
+        case .listPanes, .newLocalTab, .newTabLayout, .listPaneLinks, .describePanes: []
         case .proposePlan: ["steps"]
         case .findProjectFolder: ["host", "name"]
         case .linkPanes: ["pane_id", "source_pane_id"]
@@ -116,6 +117,7 @@ enum RelayAssistantToolName: String, CaseIterable, Sendable {
         switch self {
         case .relayTools: ["query", "tool_name", "offset"]
         case .listPanes: ["query", "offset"]
+        case .describePanes: ["pane_id", "query", "scope", "include_viewport"]
         case .requestCapacityAction: ["target_account"]
         case .nativeSnapshot: ["before", "afterRevision", "waitMillis"]
         case .execCommand: ["cwd", "timeout_seconds"]
@@ -164,6 +166,7 @@ enum RelayAssistantToolCall: Equatable, Sendable {
     case recall(query: String, limit: Int)
     case agentContext(UUID, query: String?)
     case viewport(UUID)
+    case describePanes(paneID: UUID?, query: String?, scope: RelayMikoPaneOverview.Scope, includeViewport: Bool)
     case handoff(RelayAssistantExactMemory)
 }
 
@@ -1162,14 +1165,22 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
         continuation.resume(returning: decision)
     }
 
-    func submit(_ raw: String) {
-        guard !isBusy, task == nil else { return }
+    /// True when a request can start now: not busy and not switched off.
+    var acceptsSubmission: Bool { !isBusy && task == nil && !supervision.isDisabled("*") }
+
+    /// False when nothing started (busy or switched off), so a caller holding
+    /// text the user has not seen in the composer can keep it.
+    @discardableResult
+    func submit(_ raw: String) -> Bool {
+        guard acceptsSubmission else { return false }
         task = Task { [weak self] in
             guard let self else { return }
-            // The only `.user` origin: the user typed this into Miko's chat.
+            // The only `.user` origin: the user typed this into Miko's chat
+            // (or into Go to pane, which hands it over unchanged).
             _ = await self.run(raw, origin: .user)
             self.task = nil
         }
+        return true
     }
 
     /// A proven agent pane's `relay_ask_miko`. It runs as the panel's task, so
@@ -1896,6 +1907,11 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
             return (Self.encode(value), isError, 0)
         case .success(.viewport(let pane)):
             let (value, isError) = await viewport(pane)
+            exchange.toolLog.append(call.name + (isError ? " · error" : ""))
+            return (Self.encode(value), isError, 0)
+        case .success(.describePanes(let pane, let query, let scope, let includeViewport)):
+            let (value, isError) = await describePanes(paneID: pane, query: query, scope: scope, includeViewport: includeViewport,
+                                                       snapshot: snapshot, workspace: workspace)
             exchange.toolLog.append(call.name + (isError ? " · error" : ""))
             return (Self.encode(value), isError, 0)
         case .success(.handoff(let target)):
@@ -3019,6 +3035,36 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
                  "note": .string(RelayAssistantRedaction.untrusted)], false)
     }
 
+    /// describe_panes: state and latest activity from the live workspace, and a
+    /// viewport tail only for the panes `RelayMikoPaneOverview.viewportTargets`
+    /// allows, through the same read-only route as read_viewport. Nothing is
+    /// selected, focused or shown; a screen that cannot be read without showing
+    /// its pane is reported unavailable.
+    private func describePanes(paneID: UUID?, query: String?, scope: RelayMikoPaneOverview.Scope, includeViewport: Bool,
+                               snapshot: RelayAssistantSnapshot, workspace: WorkspaceModel) async -> ([String: RelayPaneHealthJSON], Bool) {
+        let candidates = RelayMikoPaneOverview.candidates(workspace, snapshot: snapshot)
+        let resolution = RelayMikoPaneOverview.resolve(query: query, paneID: paneID, scope: scope, in: candidates)
+        let targets = RelayMikoPaneOverview.viewportTargets(resolution, includeViewport: includeViewport)
+        var viewports: [UUID: RelayMikoPaneOverview.Viewport] = [:]
+        let executor = targets.isEmpty ? nil : executorProvider()
+        for id in targets {
+            let hidden = candidates.first { $0.id == id }?.hidden == true
+            let unavailable = hidden
+                ? "Hidden stack member: its screen could not be read without showing it, and Relay did not show it."
+                : "No readable terminal screen (not a terminal pane, not connected, or no screen yet)."
+            guard let executor else { viewports[id] = .unavailable("Relay's control server is not running."); continue }
+            let (status, body) = await executor.perform(method: "GET", path: "/api/panes/\(id.uuidString.lowercased())/viewport", body: Data())
+            if (200..<300).contains(status), let value = try? JSONDecoder().decode(RelayPaneHealthJSON.self, from: body),
+               let text = value["text"]?.string {
+                viewports[id] = .text(text)
+            } else {
+                viewports[id] = .unavailable(unavailable)
+            }
+        }
+        let value = RelayMikoPaneOverview.result(resolution, scope: scope, query: query, viewports: viewports, now: now())
+        return (value, resolution == .notFound)
+    }
+
     /// One handoff or checkpoint by its exact chitta ID or ledger key; never a
     /// search, so a missing record is reported as missing, not replaced.
     private func handoff(_ target: RelayAssistantExactMemory) async -> ([String: RelayPaneHealthJSON], Bool) {
@@ -3402,7 +3448,7 @@ struct RelayAssistantSentMessage: Identifiable, Equatable, Sendable {
             settle("focus_tab", ok: ok)
             return (["ok": .bool(ok), "selected_tab_id": workspace.selectedTabID.map(idString) ?? .null], !ok)
         case .listRecoverable, .execStatus, .change, .plan, .findFolder, .listLinks, .recall, .agentContext,
-             .viewport, .handoff, .message, .messageReceipt, .assistantInbox:
+             .viewport, .describePanes, .handoff, .message, .messageReceipt, .assistantInbox:
             // Handled asynchronously by execute(); never reached.
             return (["error": .string("Unsupported here.")], true)
         }

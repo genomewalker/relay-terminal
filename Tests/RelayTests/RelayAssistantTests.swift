@@ -235,7 +235,7 @@ struct RelayAssistantHarnessTests {
                  "exec_command", "workspace_action", "new_local_tab",
                  "tab_action", "open_file_preview", "new_tab_layout", "propose_plan", "find_project_folder",
                  "list_pane_links", "link_panes", "unlink_panes", "bind_question_thread", "unbind_question_thread",
-                 "recall_memory", "remember", "read_agent_context", "search_agent_context", "read_viewport", "read_handoff",
+                 "recall_memory", "remember", "read_agent_context", "search_agent_context", "read_viewport", "describe_panes", "read_handoff",
                  "message_pane", "message_receipt", "read_assistant_inbox",
                  "stage_migration_plan", "apply_migration", "undo_migration"])
     }

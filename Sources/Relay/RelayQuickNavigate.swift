@@ -83,6 +83,21 @@ struct RelayQuickNavigate: View {
         return Index.results(entries, query: query)
     }
 
+    /// Free text worth sending: anything but whitespace.
+    nonisolated static func asksMiko(_ query: String) -> Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The Ask Miko row shows what it will send. Display only: ranking still
+    /// uses the entry's own title and status, so navigation is unchanged.
+    nonisolated static func displayTitle(_ entry: RelayWorkOverviewIndex.Entry, query: String) -> String {
+        guard entry.destination == .askMiko, asksMiko(query) else { return entry.title }
+        return "Ask Miko: " + query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    nonisolated static func displayStatus(_ entry: RelayWorkOverviewIndex.Entry, query: String) -> String {
+        entry.destination == .askMiko && asksMiko(query) ? "Send to Miko" : entry.status
+    }
+
     /// A pane's status in the fleet board's words: a lost, returning or
     /// failed terminal says so; otherwise its agent phase, approvals or
     /// program report.
@@ -132,14 +147,20 @@ struct RelayQuickNavigate: View {
             }
             return
         case .askMiko:
-            workspace.quickNavigateDidChooseAction { [weak workspace] in
-                guard let workspace else { return }
-                if !workspace.haikuAssistantVisible { workspace.toggleHaikuAssistant() }
-                NotificationCenter.default.post(name: .relayMikoComposerFocus, object: workspace)
-            }
+            askMiko()
             return
         }
         workspace.quickNavigateDidChooseDestination()
+    }
+
+    /// Ask Miko row or ⌘Return: the typed text goes to Miko as the user's
+    /// message once the overview has closed. No pane is selected or focused.
+    private func askMiko() {
+        let text = query
+        workspace.networkVisible = false
+        workspace.quickNavigateDidChooseAction { [weak workspace] in
+            workspace?.askMikoFromNavigator(text)
+        }
     }
 
     private func move(_ offset: Int) {
@@ -148,7 +169,7 @@ struct RelayQuickNavigate: View {
 
     private func announceSelection(_ row: Index.Entry?) {
         guard let window = NSApp.keyWindow else { return }
-        let message = row.map { "\($0.title). \($0.status). \($0.location). Press Return to open." } ?? "No matching work"
+        let message = row.map { "\(Self.displayTitle($0, query: query)). \(Self.displayStatus($0, query: query)). \($0.location). Press Return to open." } ?? "No matching work"
         NSAccessibility.post(element: window, notification: .announcementRequested,
                              userInfo: [.announcement: message,
                                         .priority: NSAccessibilityPriorityLevel.medium.rawValue])
@@ -159,7 +180,8 @@ struct RelayQuickNavigate: View {
     /// ⌘I is on; the pointer shows them as a tooltip.
     private func row(_ result: Index.Entry, selected: Bool) -> some View {
         let expanded = selected && showsDetails
-        let secondary = [result.status, result.location].filter { !$0.isEmpty }.joined(separator: " · ")
+        let title = Self.displayTitle(result, query: query), status = Self.displayStatus(result, query: query)
+        let secondary = [status, result.location].filter { !$0.isEmpty }.joined(separator: " · ")
         return VStack(alignment: .leading, spacing: RelayTheme.Space.xxs) {
             Button { open(result) } label: {
                 HStack(alignment: .firstTextBaseline, spacing: RelayTheme.Space.md) {
@@ -168,7 +190,7 @@ struct RelayQuickNavigate: View {
                         .foregroundStyle(result.statusRole?.color ?? RelayTheme.textFaint)
                         .frame(width: 18)
                         .accessibilityHidden(true)
-                    Text(result.title).relayText(.label).foregroundStyle(RelayTheme.text).lineLimit(1)
+                    Text(title).relayText(.label).foregroundStyle(RelayTheme.text).lineLimit(1)
                         .layoutPriority(1)
                     Text(secondary).relayText(.caption).foregroundStyle(RelayTheme.textMuted)
                         .lineLimit(1).truncationMode(.middle)
@@ -177,7 +199,7 @@ struct RelayQuickNavigate: View {
             }
             .buttonStyle(.plain)
             .help(result.details)
-            .accessibilityLabel("\(result.title), \(result.status), \(result.location)")
+            .accessibilityLabel("\(title), \(status), \(result.location)")
             .accessibilityAddTraits(selected ? [.isSelected] : [])
             .accessibilityAction(named: expanded ? "Hide details" : "Show details") {
                 selectionID = result.id
@@ -204,11 +226,17 @@ struct RelayQuickNavigate: View {
                     .textFieldStyle(.plain).focused($searchFocused)
                     .onSubmit { if let row = rows.first(where: { $0.id == selected }) { open(row) } }
                     .accessibilityLabel(Self.title)
-                    .accessibilityHint("Use up and down arrows to select a result, Return to open, Command-I to show details, Escape to return to the original pane")
+                    .accessibilityHint("Use up and down arrows to select a result, Return to open, Command-Return to ask Miko, Command-I to show details, Escape to return to the original pane")
                     .accessibilityIdentifier("relay.overview.search")
                     .onKeyPress(.downArrow) { move(1); return .handled }
                     .onKeyPress(.upArrow) { move(-1); return .handled }
                     .onKeyPress(.escape) { workspace.isQuickNavigatePresented = false; return .handled }
+                    .onKeyPress(keys: [.return]) { press in
+                        // ⌘Return sends the typed text to Miko whatever is selected.
+                        guard press.modifiers == .command, Self.asksMiko(query) else { return .ignored }
+                        askMiko()
+                        return .handled
+                    }
                     .onKeyPress(keys: ["i"]) { press in
                         guard press.modifiers == .command, selected != nil else { return .ignored }
                         showsDetails.toggle()
@@ -241,7 +269,7 @@ struct RelayQuickNavigate: View {
             }
             Divider()
             HStack {
-                Text("↑↓ Select   ↵ Open   ⌘I Details   esc Close")
+                Text("↑↓ Select   ↵ Open   ⌘↵ Ask Miko   ⌘I Details   esc Close")
                 Spacer()
                 Text("\(rows.count) results")
             }.font(.caption).foregroundStyle(RelayTheme.textMuted).padding(12)
@@ -256,5 +284,27 @@ struct RelayQuickNavigate: View {
             switch direction { case .down: move(1); case .up: move(-1); default: break }
         }
         .onExitCommand { workspace.isQuickNavigatePresented = false }
+    }
+}
+
+extension WorkspaceModel {
+    enum QuickAskOutcome: Equatable { case opened, submitted, drafted }
+
+    /// Go to pane's free text: open Miko and send the text as the user's own
+    /// message, with no retyping. It never selects, focuses or reveals a pane;
+    /// Miko's "here" stays the pane that was active. While Miko is busy or
+    /// switched off, the text waits in the composer instead of being dropped,
+    /// and an existing draft is kept.
+    @discardableResult
+    func askMikoFromNavigator(_ raw: String) -> QuickAskOutcome {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !haikuAssistantVisible { toggleHaikuAssistant() }
+        defer { NotificationCenter.default.post(name: .relayMikoComposerFocus, object: self) }
+        guard !text.isEmpty else { return .opened }
+        if haikuAssistant.submit(text) { return .submitted }
+        let draft = haikuAssistantDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if draft.isEmpty { haikuAssistantDraft = text }
+        else if !draft.contains(text) { haikuAssistantDraft += "\n" + text }
+        return .drafted
     }
 }
