@@ -77,6 +77,9 @@ type hostJobRecord struct {
 	ExitCode     *int   `json:"exit_code,omitempty"`
 	Error        string `json:"error,omitempty"`
 	Successor    string `json:"successor,omitempty"`
+	// Origin marks Relay's own channel jobs (host_upgrade_channel.go), which
+	// an upgrade waits for instead of counting as blockers.
+	Origin string `json:"origin,omitempty"`
 	// A listener's route and owner, kept in the ledger so a later supervisor
 	// can follow a disconnect along the successor chain.
 	Listener  *peerListenerBinding `json:"listener,omitempty"`
@@ -474,7 +477,7 @@ func (s *Server) launchHostJobLocked(r hostRequest, fingerprint, directory strin
 	if e := os.Mkdir(directory, 0700); e != nil {
 		return nil, errors.New("job ID already reserved")
 	}
-	job := &hostJob{notify: make(chan struct{}, 1), directory: directory, inputHashes: make(map[int64][32]byte), listener: r.Listener, record: hostJobRecord{JobID: r.JobID, Fingerprint: fingerprint, Kind: r.Kind, Listener: r.Listener.binding(), State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Ledger: hostJobLedgerTombstones, Retention: hostJobQueryRetention(r)}}
+	job := &hostJob{notify: make(chan struct{}, 1), directory: directory, inputHashes: make(map[int64][32]byte), listener: r.Listener, record: hostJobRecord{JobID: r.JobID, Fingerprint: fingerprint, Kind: r.Kind, Listener: r.Listener.binding(), State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Ledger: hostJobLedgerTombstones, Retention: hostJobQueryRetention(r), Origin: relayChannelOrigin(r)}}
 	if e := job.save(); e != nil {
 		return nil, e
 	}

@@ -46,70 +46,26 @@ var (
 func (s *Server) prepareHostUpgrade() error {
 	s.hostJobsMu.Lock()
 	defer s.hostJobsMu.Unlock()
-	blockers := 0
-	known := map[string]bool{}
-	listeners := []*hostJob{}
-	s.hostJobs.Range(func(key, value any) bool {
-		job := value.(*hostJob)
-		job.mu.Lock()
-		known[key.(string)] = true
-		if job.record.State == "starting" || job.record.State == "running" {
-			if s.verifiedHostListener(job) {
-				listeners = append(listeners, job)
-			} else {
-				blockers++
-			}
-		}
-		job.mu.Unlock()
-		return true
-	})
-	entries, err := os.ReadDir(filepath.Join(s.stateDir, "host-jobs"))
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("cannot inspect host jobs: %w", err)
+	listeners, channels, err := s.scanHostUpgradeLocked()
+	if err != nil {
+		return err
 	}
-	if len(entries) > hostUpgradeLedgerEntryLimit {
-		return errors.New("host job ledger exceeds upgrade inspection limit")
-	}
-	scanDeadline := time.Now().Add(hostUpgradeScanBudget)
-	unfinished := 0
-	for _, entry := range entries {
-		if !entry.IsDir() || known[entry.Name()] {
-			continue
+	// Relay's own channel jobs finish under the barrier; they are waited for,
+	// never signalled. The scan is repeated afterwards because hostJobsMu was
+	// released while waiting.
+	restore, waited := s.hostUpgradeUntil, false
+	if len(channels) > 0 {
+		if restore, err = s.waitRelayChannelsLocked(channels); err != nil {
+			return err
 		}
-		if time.Now().After(scanDeadline) {
-			return errors.New("host job ledger inspection exceeded its time budget; upgrade deferred")
+		waited = true
+		if listeners, channels, err = s.scanHostUpgradeLocked(); err == nil && len(channels) > 0 {
+			err = fmt.Errorf("upgrade deferred: %d Relay channel jobs still running", len(channels))
 		}
-		if !validSessionID.MatchString(entry.Name()) {
-			return errors.New("invalid host job ledger entry")
+		if err != nil {
+			s.hostUpgradeUntil = restore
+			return err
 		}
-		path := filepath.Join(s.stateDir, "host-jobs", entry.Name(), "record.json")
-		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() > 65536 {
-			return errors.New("unreadable host job reservation; upgrade blocked")
-		}
-		data, err := os.ReadFile(path)
-		var record hostJobRecord
-		if err != nil || json.Unmarshal(data, &record) != nil || record.JobID != entry.Name() {
-			return errors.New("invalid host job reservation; upgrade blocked")
-		}
-		if record.State == "exited" || record.State == "failed" {
-			continue
-		}
-		if unfinished++; unfinished > hostUpgradeUnfinishedLimit {
-			return errors.New("host job ledger exceeds upgrade inspection limit")
-		}
-		// Quiescence concerns the recorded process incarnation, not a reused
-		// PID. A proven replacement cannot be the old job. Unknown identity
-		// still blocks; this does not establish the old execution's outcome
-		// or grant permission to rerun it. The ledger remains unchanged.
-		switch hostJobProcessState(record) {
-		case "absent", "replaced":
-		default:
-			blockers++
-		}
-	}
-	if blockers > 0 {
-		return fmt.Errorf("upgrade deferred: %d active or unresolved host jobs; terminal workers are unaffected", blockers)
 	}
 	// Only now stop listeners, so a deferred upgrade never disturbs them. They
 	// drain one at a time in a fixed order: the first that does not drain
@@ -123,6 +79,9 @@ func (s *Server) prepareHostUpgrade() error {
 			// This supervisor keeps serving: listeners drained so far, and one
 			// that failed while draining, resume here from the registry rather
 			// than waiting for a successor that is not coming.
+			if waited {
+				s.hostUpgradeUntil = restore
+			}
 			s.resumePeerListenersLocked()
 			return fmt.Errorf("upgrade deferred: %v; %d listeners drained before it were resumed here", err, drained)
 		}
@@ -136,6 +95,85 @@ func (s *Server) prepareHostUpgrade() error {
 	// listeners an earlier one drained still suspended, and owns them.
 	time.AfterFunc(hostUpgradeHandoff, func() { s.resumeAfterAbandonedUpgrade(until) })
 	return nil
+}
+
+// scanHostUpgradeLocked counts what would defer the upgrade. Verified peer
+// listeners and Relay channel jobs are returned separately; any other active
+// or unprovable job is an error. The caller holds hostJobsMu.
+func (s *Server) scanHostUpgradeLocked() ([]*hostJob, []hostUpgradeChannel, error) {
+	blockers := 0
+	known := map[string]bool{}
+	listeners := []*hostJob{}
+	channels := []hostUpgradeChannel{}
+	s.hostJobs.Range(func(key, value any) bool {
+		job := value.(*hostJob)
+		job.mu.Lock()
+		known[key.(string)] = true
+		if job.record.State == "starting" || job.record.State == "running" {
+			if s.verifiedHostListener(job) {
+				listeners = append(listeners, job)
+			} else if job.record.Origin == hostJobOriginRelayChannel && job.record.Kind == "" {
+				channels = append(channels, memoryChannel(job))
+			} else {
+				blockers++
+			}
+		}
+		job.mu.Unlock()
+		return true
+	})
+	entries, err := os.ReadDir(filepath.Join(s.stateDir, "host-jobs"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, fmt.Errorf("cannot inspect host jobs: %w", err)
+	}
+	if len(entries) > hostUpgradeLedgerEntryLimit {
+		return nil, nil, errors.New("host job ledger exceeds upgrade inspection limit")
+	}
+	scanDeadline := time.Now().Add(hostUpgradeScanBudget)
+	unfinished := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || known[entry.Name()] {
+			continue
+		}
+		if time.Now().After(scanDeadline) {
+			return nil, nil, errors.New("host job ledger inspection exceeded its time budget; upgrade deferred")
+		}
+		if !validSessionID.MatchString(entry.Name()) {
+			return nil, nil, errors.New("invalid host job ledger entry")
+		}
+		path := filepath.Join(s.stateDir, "host-jobs", entry.Name(), "record.json")
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > 65536 {
+			return nil, nil, errors.New("unreadable host job reservation; upgrade blocked")
+		}
+		data, err := os.ReadFile(path)
+		var record hostJobRecord
+		if err != nil || json.Unmarshal(data, &record) != nil || record.JobID != entry.Name() {
+			return nil, nil, errors.New("invalid host job reservation; upgrade blocked")
+		}
+		if record.State == "exited" || record.State == "failed" {
+			continue
+		}
+		if unfinished++; unfinished > hostUpgradeUnfinishedLimit {
+			return nil, nil, errors.New("host job ledger exceeds upgrade inspection limit")
+		}
+		// Quiescence concerns the recorded process incarnation, not a reused
+		// PID. A proven replacement cannot be the old job. Unknown identity
+		// still blocks; this does not establish the old execution's outcome
+		// or grant permission to rerun it. The ledger remains unchanged.
+		// A channel job from an earlier supervisor generation is waited for
+		// only while its exact incarnation is provably alive.
+		switch state := hostJobProcessState(record); {
+		case state == "absent" || state == "replaced":
+		case state == "alive" && record.Origin == hostJobOriginRelayChannel && record.Kind == "":
+			channels = append(channels, ledgerChannel(record))
+		default:
+			blockers++
+		}
+	}
+	if blockers > 0 {
+		return nil, nil, fmt.Errorf("upgrade deferred: %d active or unresolved host jobs; terminal workers are unaffected", blockers)
+	}
+	return listeners, channels, nil
 }
 
 // The supervisor has no SIGTERM handler, so a replaced one never gets here.
