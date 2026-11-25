@@ -109,6 +109,10 @@ func main() {
 		if err := daemon.RunAgentConversation(context.Background(), os.Args[2:], os.Stdout); err != nil {
 			fatal(err.Error())
 		}
+	case "agent-inventory":
+		if err := runAgentInventory(os.Args[2:], os.Stdout); err != nil {
+			fatal(err.Error())
+		}
 	case "agent-maintenance":
 		if err := daemon.RunAgentMaintenance(context.Background(), os.Args[2:], os.Stdout); err != nil {
 			fatal(err.Error())
