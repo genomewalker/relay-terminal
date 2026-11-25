@@ -2153,6 +2153,8 @@ struct AttentionInboxSection: View {
     var identifier = "relay.sidebar.attention-inbox"
 
     var body: some View {
+        // Seat-limit offers (move to the other account) above the rows.
+        RelaySeatLimitOffersView(workspace: workspace)
         // Waiting is a pane phase; the activity index redraws on it.
         AttentionInboxRows(workspace: workspace, activityIndex: workspace.activityIndex, inbox: inbox,
                            hold: workspace.navigatorHoldState, identifier: identifier)

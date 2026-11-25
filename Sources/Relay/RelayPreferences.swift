@@ -157,6 +157,10 @@ final class RelayPreferences: ObservableObject {
     @Published private(set) var keyBindings: [String: RelayKeyBinding] { didSet { save() } }
 
     @Published var claudeQuotaFailover: RelayClaudeQuotaSettings { didSet { save() } }
+    /// Move a Claude pane to the other account as soon as it hits a seat
+    /// limit (429). Off by default; native Settings and the seat-limit
+    /// notification are its only writers (not an MCP setting).
+    @Published var seatLimitAutoMove: Bool { didSet { save() } }
 
     private let defaults: UserDefaults
 
@@ -169,6 +173,7 @@ final class RelayPreferences: ObservableObject {
     init(defaults: UserDefaults = RelayStateProfile.defaults) {
         self.defaults = defaults
         claudeQuotaFailover = .restored(defaults.data(forKey: "relay.settings.claude-quota-failover"))
+        seatLimitAutoMove = defaults.object(forKey: "relay.settings.seat-limit-auto-move") as? Bool ?? false
         mikoAutonomy = RelayMikoPolicySettings.Autonomy(rawValue: defaults.string(forKey: "relay.settings.miko-autonomy") ?? "") ?? .autonomous
         mikoMinute = (defaults.object(forKey: "relay.settings.miko-minute") as? Int ?? 60)
         mikoHour = (defaults.object(forKey: "relay.settings.miko-hour") as? Int ?? 600)
@@ -415,6 +420,7 @@ final class RelayPreferences: ObservableObject {
         defaults.set(mikoHostKey, forKey: "relay.settings.miko-host")
         RelayAssistantHotkeyStorage.save(enabled: assistantHotkeyEnabled, hotkey: assistantHotkey, to: defaults)
         RelayKeyBindingStorage.save(keyBindings, to: defaults)
+        defaults.set(seatLimitAutoMove, forKey: "relay.settings.seat-limit-auto-move")
         if let data = try? JSONEncoder().encode(claudeQuotaFailover) {
             defaults.set(data, forKey: "relay.settings.claude-quota-failover")
         }

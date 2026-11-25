@@ -8,6 +8,14 @@ import SwiftUI
     private var settings: Binding<RelayClaudeQuotaSettings> { $preferences.claudeQuotaFailover }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Text("Claude seat limits").font(.headline)
+            Toggle("Move panes automatically when they hit a seat limit", isOn: $preferences.seatLimitAutoMove)
+                .accessibilityIdentifier("relay.settings.seat-limit-auto-move")
+            Text("When a Claude pane's agent is refused with a usage limit (429), Relay notifies you with a link and offers to " +
+                 "resume the same conversation on the other account. With this on, Relay moves it itself once the move's " +
+                 "checks pass. Protected panes are never moved automatically.")
+                .font(.caption).foregroundStyle(.secondary)
+            Divider()
             Text("Claude quota failover").font(.headline)
             Toggle("Automatically move Claude panes when the source quota is high", isOn: settings.enabled)
                 .accessibilityIdentifier("relay.settings.claude-quota-failover.enabled")
